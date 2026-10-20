@@ -265,7 +265,7 @@ fn commands(
                     // Unlocked: the errlog thread prints to stderr while this
                     // waits for it.
                     &mut std::io::stdout(),
-                    &mut std::io::stderr(),
+                    &mut epics_rs::base::runtime::log::StagedStderr,
                 );
                 Ok(CommandOutcome::Continue)
             }
@@ -383,7 +383,7 @@ fn commands(
                 let args: [Option<String>; 4] = std::array::from_fn(|i| sval(args, i));
                 match ioc::setup_pki_args(args.each_ref().map(|a| a.as_deref())) {
                     Some([root, "", "", ""]) => connector.set_pki_root(root),
-                    Some(_) => eprintln!(
+                    Some(_) => epics_rs::base::stderr_println!(
                         "opcuaSetupPKI: this port's client (async-opcua) derives trusted/, \
                          rejected/ and issuers/ from one PKI root; the four-argument form, which \
                          names each location separately, has no equivalent. Use \
@@ -412,11 +412,11 @@ fn commands(
                     .pki_root
                     .unwrap_or_else(|| opcua::client::DEFAULT_PKI_DIR.to_string());
                 match sval(args, 0).filter(|s| !s.is_empty()) {
-                    Some(location) => eprintln!(
+                    Some(location) => epics_rs::base::stderr_println!(
                         "opcuaSaveRejected: '{location}' ignored — this port's client saves \
                          rejected server certificates under '{pki}/rejected', which it fixes."
                     ),
-                    None => eprintln!(
+                    None => epics_rs::base::stderr_println!(
                         "opcuaSaveRejected: rejected server certificates are saved under \
                          '{pki}/rejected'."
                     ),
@@ -468,7 +468,7 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: opcua-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: opcua-ioc <st.cmd>");
         std::process::exit(1);
     };
 

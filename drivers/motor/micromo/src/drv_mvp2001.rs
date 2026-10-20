@@ -161,11 +161,11 @@ impl Mvp2001Build {
 
 impl BuildTrans for Mvp2001Build {
     /// A raw limit past the controller's is ERROR and resets the record's
-    /// dial limit to it. C writes DHLM for SET_HIGH_LIMIT and DLLM for
-    /// SET_LOW_LIMIT at |MRES|, but under MRES < 0 the record sends DHLM as
-    /// SET_LOW_LIMIT (motorRecord.cc:4246), so C leaves the refused DHLM
-    /// past the controller and rewrites DLLM: here the dial limit the raw
-    /// one maps to is reset, which is C's for MRES > 0.
+    /// dial limit to it. devMVP2001.cc:436/447 write DHLM for
+    /// SET_HIGH_LIMIT and DLLM for SET_LOW_LIMIT, but under MRES < 0 the
+    /// record sends DHLM as SET_LOW_LIMIT (motorRecord.cc:4246), so C resets
+    /// the other dial limit. That C defect is not copied: the dial limit
+    /// the raw one maps to is reset.
     fn limit(&self, high: bool, raw: f64, mres: f64) -> LimitBuild {
         let (low, high_limit) = self.limits;
         let (limit, past) = if high {

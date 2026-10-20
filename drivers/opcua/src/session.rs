@@ -205,7 +205,10 @@ impl SessionConfig {
     /// the C's exception (an illegal `autoconnect`), which ends the option list.
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), String> {
         if self.debug > 0 || name == "debug" {
-            eprintln!("Session {}: setting option {name} to {value}", self.name);
+            epics_rs::base::stderr_println!(
+                "Session {}: setting option {name} to {value}",
+                self.name
+            );
         }
         // C reads every count with strtoul and stores it narrowed.
         let count = || strtoul(value) as u32;
@@ -896,7 +899,7 @@ impl SessionWorker {
     /// (`SessionOpen62541.cpp:605-613`).
     fn disconnect_down(&self, down: &mut Down) {
         if matches!(down, Down::NoClient) && self.debug() > 0 {
-            eprintln!("Session {} already disconnected", self.handle.name);
+            epics_rs::base::stderr_println!("Session {} already disconnected", self.handle.name);
         }
         *down = Down::NoClient;
     }
@@ -913,7 +916,7 @@ impl SessionWorker {
             client.connect_status = StatusCode::Good;
             if channel != client.channel {
                 if debug {
-                    eprintln!(
+                    epics_rs::base::stderr_println!(
                         "Session {name}: secure channel state changed from {} to {channel}",
                         client.channel
                     );
@@ -922,7 +925,7 @@ impl SessionWorker {
             }
             if session != client.session {
                 if debug {
-                    eprintln!(
+                    epics_rs::base::stderr_println!(
                         "Session {name}: session state changed from {} to {session}",
                         client.session
                     );
@@ -1040,7 +1043,7 @@ impl SessionWorker {
                 } else if config.debug > 0 {
                     // The worker thread gives up and deletes the client
                     // (`SessionOpen62541.cpp:1487-1491`).
-                    eprintln!(
+                    epics_rs::base::stderr_println!(
                         "Session {} worker thread error: status:{}",
                         self.handle.name,
                         status_name(status)
@@ -1103,8 +1106,11 @@ impl SessionWorker {
         // C's connect starts the worker thread (`SessionOpen62541.cpp:577-598`,
         // `:1467`).
         if fresh && config.debug > 0 {
-            eprintln!("Session {}: connect service succeeded", self.handle.name);
-            eprintln!("Session {} worker thread starts", self.handle.name);
+            epics_rs::base::stderr_println!(
+                "Session {}: connect service succeeded",
+                self.handle.name
+            );
+            epics_rs::base::stderr_println!("Session {} worker thread starts", self.handle.name);
         }
         Some(Ok(Connected { client, connection }))
     }
@@ -1135,7 +1141,7 @@ impl SessionWorker {
                     }
                     Some((Order::Connect { manual }, _)) => {
                         if manual || self.debug() > 0 {
-                            eprintln!(
+                            epics_rs::base::stderr_println!(
                                 "Session {} already connected ({})",
                                 self.handle.name,
                                 self.handle.client.lock().session
@@ -1716,7 +1722,7 @@ impl SessionWorker {
                         );
                     }
                 } else {
-                    eprintln!(
+                    epics_rs::base::stderr_println!(
                         "OPC UA record {} monitored item {} failed with error {}",
                         item.addressing_record(),
                         item.wire_node_id(),
@@ -1748,7 +1754,7 @@ impl SessionWorker {
                 if self.debug() > 0 {
                     // The worker thread finds the client gone
                     // (`SessionOpen62541.cpp:1473-1476`).
-                    eprintln!(
+                    epics_rs::base::stderr_println!(
                         "Session {} worker thread: client destroyed. Exiting.",
                         self.handle.name
                     );

@@ -35,16 +35,24 @@ impl Iface {
             // C's EOF is a std::system_error the boost catch does not take.
             Iface::Receive => match e {
                 UrError::PeerClosed => {
-                    eprintln!("RTDEReceiveInterface: Robot closed the connection!")
+                    epics_rs::base::stderr_println!(
+                        "RTDEReceiveInterface: Robot closed the connection!"
+                    )
                 }
-                e => eprintln!("RTDEReceiveInterface boost system Exception: {e}"),
+                e => epics_rs::base::stderr_println!(
+                    "RTDEReceiveInterface boost system Exception: {e}"
+                ),
             },
             Iface::Control => {
                 if matches!(e, UrError::PeerClosed) {
-                    eprintln!("RTDEControlInterface: Robot closed the connection!");
+                    epics_rs::base::stderr_println!(
+                        "RTDEControlInterface: Robot closed the connection!"
+                    );
                 }
-                eprintln!("RTDEControlInterface: Could not receive data from robot...");
-                eprintln!("RTDEControlInterface Exception: {e}");
+                epics_rs::base::stderr_println!(
+                    "RTDEControlInterface: Could not receive data from robot..."
+                );
+                epics_rs::base::stderr_println!("RTDEControlInterface Exception: {e}");
             }
         }
     }

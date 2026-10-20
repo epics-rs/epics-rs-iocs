@@ -884,7 +884,7 @@ pub struct Stream2Frame {
 pub struct Reported;
 
 fn err(function: &str, msg: &str) -> Reported {
-    eprintln!("Stream2Api::{function}: {msg}");
+    epics_rs::base::stderr_println!("Stream2Api::{function}: {msg}");
     Reported
 }
 
@@ -904,11 +904,14 @@ pub struct Stream2Api {
 
 impl Stream2Api {
     pub async fn connect(hostname: &str) -> Result<Self, String> {
+        Self::connect_to(&format!("tcp://{hostname}:{ZMQ_PORT}")).await
+    }
+
+    pub(crate) async fn connect_to(addr: &str) -> Result<Self, String> {
         use zeromq::Socket;
         let mut socket = zeromq::PullSocket::new();
-        let addr = format!("tcp://{hostname}:{ZMQ_PORT}");
         socket
-            .connect(&addr)
+            .connect(addr)
             .await
             .map_err(|e| format!("connect {addr}: {e}"))?;
         Ok(Self {
@@ -940,7 +943,7 @@ impl Stream2Api {
 
     fn parse(buf: &[u8]) -> Result<Msg, Stream2Error> {
         parse_msg(buf).map_err(|e| {
-            eprintln!("error: error {} parsing message", e as i32);
+            epics_rs::base::stderr_println!("error: error {} parsing message", e as i32);
             Stream2Error::Parse(e)
         })
     }

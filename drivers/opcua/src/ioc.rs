@@ -225,7 +225,7 @@ pub fn session_command(
     }
     for (key, value) in &options {
         if let Err(e) = session.set_option(key, value) {
-            eprintln!("ERROR : {e}");
+            epics_rs::base::stderr_println!("ERROR : {e}");
             return;
         }
     }
@@ -443,7 +443,7 @@ pub fn options_command(registry: &Registry, pattern: Option<&str>, options: &[&s
         })
     };
     if let Err(e) = applied {
-        eprintln!("ERROR : {e}");
+        epics_rs::base::stderr_println!("ERROR : {e}");
     }
 }
 

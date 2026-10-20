@@ -286,25 +286,25 @@ impl Instrument {
     }
 
     /// `gm10_channel_get_egu` (`drvGM10.c:1831-1853`).
-    pub fn channel_get_egu(&self, family: ChannelFamily, channel: u32) -> String {
+    pub fn channel_get_egu(&self, family: ChannelFamily, channel: u32) -> Vec<u8> {
         let cache = self.cache();
         let idx = (channel - 1) as usize;
         match family {
             ChannelFamily::Signal => match cache.meas_type[idx] {
-                ChannelType::None | ChannelType::Unknown => String::new(),
+                ChannelType::None | ChannelType::Unknown => Vec::new(),
                 _ => cache.meas_info[idx].unit.clone(),
             },
             ChannelFamily::Math => cache.calc_info[idx].unit.clone(),
             ChannelFamily::Comm => cache.comm_info[idx].unit.clone(),
-            ChannelFamily::Const | ChannelFamily::VarConst => String::new(),
+            ChannelFamily::Const | ChannelFamily::VarConst => Vec::new(),
         }
     }
 
     /// `gm10_channel_get_expr` (`drvGM10.c:1855-1861`).
-    pub fn channel_get_expr(&self, channel: u32) -> String {
+    pub fn channel_get_expr(&self, channel: u32) -> Vec<u8> {
         let cache = self.cache();
         let mut expr = cache.calc_expr[(channel - 1) as usize].expr.clone();
-        expr.truncate(expr.floor_char_boundary(39));
+        expr.truncate(39);
         expr
     }
 
@@ -376,12 +376,12 @@ impl Instrument {
     }
 
     /// `gm10_get_error` (`drvGM10.c:1968-1977`): `channel` is 1-3.
-    pub fn get_error(&self, channel: u32) -> String {
+    pub fn get_error(&self, channel: u32) -> Vec<u8> {
         let cache = self.cache();
         if cache.error_flag {
             cache.error.strings[(channel - 1) as usize].clone()
         } else {
-            String::new()
+            Vec::new()
         }
     }
 
@@ -404,15 +404,15 @@ impl Instrument {
     pub fn module_presence(&self, module: usize) -> bool {
         self.cache().modules[module].use_flag
     }
-    pub fn module_string(&self, module: usize) -> String {
+    pub fn module_string(&self, module: usize) -> Vec<u8> {
         let cache = self.cache();
         let m = &cache.modules[module];
         if m.use_flag {
             m.module_string.clone()
         } else if !m.module_string.is_empty() {
-            format!("(unused) {}", m.module_string)
+            [b"(unused) ", &m.module_string[..]].concat()
         } else {
-            "(empty)".to_string()
+            b"(empty)".to_vec()
         }
     }
 
@@ -516,8 +516,7 @@ impl Actor {
                     "_ERR query did not return ASCII",
                 ));
             };
-            let payload = String::from_utf8_lossy(wire::ascii_payload(&ascii_raw)).into_owned();
-            if let Some(msg) = extract_quoted_message(&payload) {
+            if let Some(msg) = extract_quoted_message(wire::ascii_payload(&ascii_raw)) {
                 self.cache.lock().error.strings = split_error_message(msg);
             }
             self.interrupts.fire(InterruptCategory::Error);
@@ -1031,26 +1030,31 @@ impl Registry {
 /// `drvGM10.report`, `gm10_report` (`drvGM10.c:265-311`).
 impl DriverSupport for Registry {
     fn report(&self, level: i32) -> Option<Vec<u8>> {
-        let mut out = String::new();
+        let mut out = Vec::new();
         for (cnt, (name, instrument)) in self.instruments.lock().iter().enumerate() {
-            out += &format!(
-                "    Yokogawa GM10 #{}: {name} @ {}\n",
-                cnt + 1,
-                instrument.peer_address
+            out.extend_from_slice(
+                format!(
+                    "    Yokogawa GM10 #{}: {name} @ {}\n",
+                    cnt + 1,
+                    instrument.peer_address
+                )
+                .as_bytes(),
             );
             if level != 0 {
-                out += "        Modules:\n";
+                out.extend_from_slice(b"        Modules:\n");
                 let cache = instrument.cache();
                 for (i, m) in cache.modules.iter().take(6).enumerate() {
+                    out.extend_from_slice(format!("        #{}: ", i + 1).as_bytes());
                     if m.use_flag {
-                        out += &format!("        #{}: {}\n", i + 1, m.module_string);
+                        out.extend_from_slice(&m.module_string);
                     } else {
-                        out += &format!("        #{}: empty\n", i + 1);
+                        out.extend_from_slice(b"empty");
                     }
+                    out.push(b'\n');
                 }
             }
         }
-        Some(out.into_bytes())
+        Some(out)
     }
 }
 
@@ -1105,10 +1109,11 @@ pub(crate) mod test_support {
     }
 
     #[test]
-    fn channel_get_expr_cuts_on_char_boundary() {
+    fn channel_get_expr_cuts_at_byte_39() {
         let instrument = Instrument::new("127.0.0.1".into());
-        instrument.cache().calc_expr[0].expr = format!("{}\u{b0}C", "x".repeat(38));
-        assert_eq!(instrument.channel_get_expr(1), "x".repeat(38));
+        let expr = format!("{}\u{b0}C", "x".repeat(38)).into_bytes();
+        instrument.cache().calc_expr[0].expr = expr.clone();
+        assert_eq!(instrument.channel_get_expr(1), &expr[..39]);
     }
 
     pub(crate) fn ascii_frame(body: &[u8]) -> Vec<u8> {
@@ -1258,7 +1263,10 @@ mod tests {
         let instrument = Instrument::connect_to(addr).unwrap();
 
         assert!(instrument.module_presence(0));
-        assert_eq!(instrument.channel_get_egu(ChannelFamily::Signal, 1), "DEGC");
+        assert_eq!(
+            instrument.channel_get_egu(ChannelFamily::Signal, 1),
+            b"DEGC"
+        );
         assert_eq!(instrument.analog_get(ChannelFamily::Signal, 1), 1.234);
         assert_eq!(instrument.analog_get(ChannelFamily::Const, 1), 12.5);
         assert_eq!(instrument.analog_get(ChannelFamily::VarConst, 1), -7.5);
@@ -1267,7 +1275,7 @@ mod tests {
         let mut error_rx = instrument.register_interrupt(InterruptCategory::Error);
         instrument.submit(Command::ClearError);
         assert!(instrument.get_error_flag());
-        assert_eq!(instrument.get_error(1), "Something broke");
+        assert_eq!(instrument.get_error(1), b"Something broke");
         assert!(error_rx.try_recv().is_ok());
 
         let received = device.join().unwrap();
@@ -1287,6 +1295,50 @@ mod tests {
                 "OErrorClear,0\r\n",
                 "_ERR,205\r\n",
             ]
+        );
+    }
+
+    #[test]
+    fn device_text_reaches_records_and_the_report_byte_for_byte() {
+        fn bytes(v: impl AsRef<[u8]>) -> Vec<u8> {
+            v.as_ref().to_vec()
+        }
+        let module = b"GX90XA-06\xff";
+        let mut fsysconf = b"Unit:00  00:".to_vec();
+        for _ in 0..2 {
+            fsysconf.extend_from_slice(module);
+            fsysconf.extend_from_slice(&[b' '; 7]);
+        }
+        fsysconf.extend_from_slice(b"----------------\r\nE");
+        let mut responses = default_init_responses();
+        responses[0] = ascii_frame(&fsysconf);
+        responses[3] = ascii_frame(b"N 0001 DEG\xff ,3\nE");
+        responses[6] = ascii_frame(b"xxxxxxxxxxx0001,'A\xff1'\nE");
+        responses.push(b"E1,205:1:12\r\n".to_vec());
+        responses.push(ascii_frame(b"junk 'bad \xff text' junk"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ClearError);
+        device.join().unwrap();
+
+        assert_eq!(bytes(instrument.module_string(0)), module);
+        assert_eq!(
+            bytes(instrument.channel_get_egu(ChannelFamily::Signal, 1)),
+            b"DEG\xff"
+        );
+        assert_eq!(bytes(instrument.channel_get_expr(1)), b"A\xff1");
+        assert_eq!(bytes(instrument.get_error(1)), b"bad \xff text");
+
+        let registry = Registry::new();
+        registry.insert("gm".into(), instrument).unwrap();
+        let report = registry.report(1).unwrap();
+        let line = b"        #1: GX90XA-06\xff\n";
+        assert!(
+            report.windows(line.len()).any(|w| w == line),
+            "{}",
+            String::from_utf8_lossy(&report)
         );
     }
 

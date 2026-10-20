@@ -44,9 +44,10 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynResult, OctetStep};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::atof;
@@ -82,6 +83,9 @@ pub struct C300Controller {
     num_axes: usize,
     /// Each axis's positions, by axis number, where the report reads them.
     axes: Vec<AxisState>,
+    /// C `inString_`: what the last read delivered, whatever its status. A
+    /// failed write skips the read and leaves it as it was.
+    in_string: String,
 }
 
 /// C `C300Axis`'s `bitsPerUnit_`, `encoderPosition_` and `theoryPosition_`.
@@ -104,6 +108,7 @@ impl C300Controller {
             handle,
             num_axes,
             axes,
+            in_string: String::new(),
         };
         // C ignores the unlock's status (C300MotorDriver.cpp:68-69).
         let _ = ctrl.write_only("SYS:PASS:CEN \"nPoint\"");
@@ -122,22 +127,44 @@ impl C300Controller {
         out
     }
 
-    /// Write a command with no reply expected (C `writeController`).
+    /// Write a command with no reply expected (C `writeController`), and
+    /// print it whatever the write returned (C300MotorDriver.cpp:171-172).
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        Ok(())
+        let status = self.handle.write_octet(0, &Self::framed(cmd)).map(drop);
+        self.handle.print(
+            0,
+            TraceMask::IO_DRIVER,
+            format_args!("C300MotorDriver:writeController: {cmd}\n"),
+        );
+        status
     }
 
-    /// Write a query and return its reply (C `writeReadController`).
-    fn query(&self, cmd: &str) -> AsynResult<String> {
+    /// Write a query and return its reply (C `writeReadController`), printing
+    /// the command and `inString_` whatever the exchange returned
+    /// (C300MotorDriver.cpp:203-204).
+    fn query(&mut self, cmd: &str) -> AsynResult<String> {
         let (raw, status) = self
             .handle
             .write_read(0, &Self::framed(cmd), READ_BUF)
             .into_parts();
+        let read = match &status {
+            Err(e) => e.octet_step() == Some(OctetStep::Read),
+            Ok(()) => true,
+        };
+        if read {
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            self.in_string = String::from_utf8_lossy(&raw[..end]).into_owned();
+        }
+        self.handle.print(
+            0,
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "C300MotorDriver:writeReadController: output: {cmd}  input: {}\n",
+                self.in_string
+            ),
+        );
         status?;
-        Ok(String::from_utf8_lossy(&raw)
-            .trim_matches(['\r', '\n', '\0'])
-            .to_string())
+        Ok(self.in_string.trim_matches(['\r', '\n', '\0']).to_string())
     }
 
     /// Probe axis `index` (0-based) at construction: query the stage range (to
@@ -358,6 +385,88 @@ mod tests {
         let controller = Arc::new(Mutex::new(C300Controller::new(handle, 1)));
         let axis = C300Axis::new(controller, 0);
         assert!(!axis.has_encoder);
+    }
+
+    /// C prints `inString_` after every exchange: what a failed read
+    /// delivered, and the previous reply when the write failed.
+    #[test]
+    fn write_read_controller_prints_the_reply_whatever_the_status() {
+        use std::sync::Mutex as StdMutex;
+
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use motor_common::testing::LineRig;
+
+        let name = "c300TraceLine";
+        let (rig, handle) = LineRig::failing(
+            name,
+            |cmd| match cmd {
+                c if c.starts_with("CHAN1:DATA?") => "D1".into(),
+                _ => "P1".into(),
+            },
+            |line| line.starts_with("CHAN1:POS?"),
+        );
+        let path = std::env::temp_dir().join(format!("c300-trace-{}", std::process::id()));
+        let file = Arc::new(StdMutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some(name), TraceFile::File(file.clone()));
+        trace.set_device_trace_mask(name, 0, TraceMask::ERROR | TraceMask::IO_DRIVER);
+        trace.set_device_trace_file(name, 0, TraceFile::File(file));
+
+        let mut ctrl = C300Controller::new(handle, 1);
+        assert_eq!(ctrl.query("CHAN1:DATA?").unwrap(), "D1");
+        assert!(ctrl.query("CHAN1:POS?").is_err());
+        drop(rig);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mine: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.split_once("C300MotorDriver:").map(|(_, m)| m))
+            .collect();
+        assert_eq!(
+            mine,
+            [
+                "writeController: SYS:PASS:CEN \"nPoint\"",
+                "writeReadController: output: CHAN1:DATA?  input: D1",
+                "writeReadController: output: CHAN1:POS?  input: D1",
+            ],
+            "{text}"
+        );
+    }
+
+    /// A reply cut by a timeout is what C's line prints.
+    #[test]
+    fn a_cut_reply_is_printed() {
+        use std::sync::Mutex as StdMutex;
+
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use motor_common::testing::LineRig;
+
+        let name = "c300CutLine";
+        let (_rig, handle) = LineRig::cut(name, |_| "12.5".into(), |c| c.starts_with("CHAN1"));
+        let path = std::env::temp_dir().join(format!("c300-cut-{}", std::process::id()));
+        let file = Arc::new(StdMutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(name), TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some(name), TraceFile::File(file.clone()));
+        trace.set_device_trace_mask(name, 0, TraceMask::IO_DRIVER);
+        trace.set_device_trace_file(name, 0, TraceFile::File(file));
+
+        let mut ctrl = C300Controller::new(handle, 1);
+        assert!(ctrl.query("CHAN1:POS?").is_err());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.lines().any(|l| l
+                .ends_with("C300MotorDriver:writeReadController: output: CHAN1:POS?  input: 12.5")),
+            "{text}"
+        );
     }
 
     #[test]

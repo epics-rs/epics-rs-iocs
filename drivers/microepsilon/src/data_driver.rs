@@ -102,8 +102,6 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::exit::at_exit;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
-use epics_rs::base::server::recgbl::alarm_status;
-use epics_rs::base::server::record::AlarmSeverity;
 
 use crate::packet::{self, MAX_CHANNELS, PushUpdate, ReadOutcome, ReaderState};
 
@@ -339,13 +337,7 @@ impl DataDriver {
         for (i, &value) in update.values.iter().enumerate() {
             let addr = (i + 1) as i32;
             self.base.set_float64_param(self.disp_reason, addr, value)?;
-            self.base.set_param_status(
-                self.disp_reason,
-                addr,
-                status,
-                alarm_status::NO_ALARM,
-                AlarmSeverity::NoAlarm as u16,
-            )?;
+            self.base.set_param_status(self.disp_reason, addr, status)?;
             // C calls every client on each push, changed value or not.
             self.base.mark_param_changed(self.disp_reason, addr)?;
             self.base.call_param_callbacks(addr)?;
@@ -730,6 +722,7 @@ pub fn configure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::base::server::recgbl::alarm_status;
 
     /// A timeout counts as one, not as a read error, and a failed read's
     /// bytes never reach the packet buffer (`capaNCDT6200Sup.c:321`, `:420`).
@@ -873,6 +866,7 @@ mod tests {
             assert_eq!(
                 driver
                     .base
+                    .params
                     .get_param_status(driver.disp_reason, addr)
                     .unwrap(),
                 (AsynStatus::Error, alarm_status::NO_ALARM, 0)

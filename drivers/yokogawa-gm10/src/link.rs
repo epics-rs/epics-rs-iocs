@@ -13,6 +13,8 @@
 //! `MAX_CALC_CHAN` = 200 (`drvGM10.c:238`), the same over-wide-bound defect
 //! family as K/W, just via a bare literal instead of a stale macro.
 
+use std::ffi::c_long;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelFamily {
     Signal,
@@ -37,18 +39,24 @@ pub struct ParsedLink<'a> {
     pub arg: Option<&'a str>,
 }
 
+/// C `isblank`, the only separator `gm10_parse_link` splits on.
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
 pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
-    let text = text.trim_start();
-    let sep = text.find(char::is_whitespace)?;
-    let device = &text[..sep];
-    if device.is_empty() {
+    // C returns 1 on a leading blank, and reads past the NUL when there is
+    // no blank at all.
+    if text.starts_with(is_blank) {
         return None;
     }
-    let rest = text[sep..].trim_start();
+    let sep = text.find(is_blank)?;
+    let device = &text[..sep];
+    let rest = text[sep..].trim_start_matches(is_blank);
     if rest.is_empty() {
         return None;
     }
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let end = rest.find(is_blank).unwrap_or(rest.len());
     let cmd_and_arg = &rest[..end];
     let (command, arg) = match cmd_and_arg.split_once(':') {
         Some((c, a)) => (c, Some(a)),
@@ -64,11 +72,12 @@ pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
     })
 }
 
-/// C `strtol(s, &end, 10)`: optional leading whitespace and sign, then
-/// decimal digits, stopping at the first non-digit. Returns the value
-/// (saturated, where C `atoi` overflow is UB) and the unparsed tail, which
-/// is `s` itself when there are no digits.
-pub fn strtol(s: &str) -> (i64, &str) {
+/// C `int i = strtol(s, &end, 10)`, which every devGM10 `atoi`/`strtol`
+/// caller writes: optional leading whitespace and sign, then decimal
+/// digits, stopping at the first non-digit and saturating at `LONG_MIN` /
+/// `LONG_MAX` before the `int` conversion. Returns that `int` and the
+/// unparsed tail, which is `s` itself when there are no digits.
+pub fn strtol(s: &str) -> (i32, &str) {
     let body = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
     let (neg, unsigned) = match body.as_bytes().first() {
         Some(b'-') => (true, &body[1..]),
@@ -79,10 +88,16 @@ pub fn strtol(s: &str) -> (i64, &str) {
     if n == 0 {
         return (0, s);
     }
-    let mag = unsigned[..n].bytes().fold(0i64, |acc, d| {
-        acc.saturating_mul(10).saturating_add(i64::from(d - b'0'))
+    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
+    let long = unsigned[..n].bytes().fold(0 as c_long, |acc, d| {
+        let d = c_long::from(d - b'0');
+        if neg {
+            acc.saturating_mul(10).saturating_sub(d)
+        } else {
+            acc.saturating_mul(10).saturating_add(d)
+        }
     });
-    (if neg { -mag } else { mag }, &unsigned[n..])
+    (long as i32, &unsigned[n..])
 }
 
 /// Parse a family-prefixed channel address: bare digits (`Signal`, 1-999),
@@ -96,7 +111,7 @@ pub fn parse_channel_address(arg: &str) -> Option<ChannelAddress> {
 
 fn parse_channel_address_tail(arg: &str) -> Option<(ChannelAddress, &str)> {
     let first = arg.chars().next()?;
-    let (family, digits, max): (_, &str, i64) = match first {
+    let (family, digits, max): (_, &str, i32) = match first {
         '0'..='9' => (ChannelFamily::Signal, arg, 999),
         'A' => (ChannelFamily::Math, &arg[1..], 200),
         'C' => (ChannelFamily::Comm, &arg[1..], 500),
@@ -151,6 +166,17 @@ mod tests {
         assert!(parse_link("hdl").is_none());
         assert!(parse_link("").is_none());
         assert!(parse_link("   ").is_none());
+    }
+
+    #[test]
+    fn splits_on_c_isblank_only_and_refuses_a_leading_blank() {
+        assert!(parse_link(" hdl VAL:1").is_none());
+        assert!(parse_link("\thdl VAL:1").is_none());
+        assert!(parse_link("hdl\u{a0}VAL:1").is_none());
+        let l = parse_link("h\x0cdl\tVAL:1\x0bx").unwrap();
+        assert_eq!(l.device, "h\x0cdl");
+        assert_eq!(l.command, "VAL");
+        assert_eq!(l.arg, Some("1\x0bx"));
     }
 
     #[test]
@@ -245,5 +271,21 @@ mod tests {
         assert_eq!(parse_channel_address("99999999999999999999999"), None);
         assert_eq!(strtol("  -42rest"), (-42, "rest"));
         assert_eq!(strtol("x1"), (0, "x1"));
+    }
+
+    /// Every devGM10 caller stores strtol/atoi in an `int i`.
+    #[test]
+    fn address_number_is_strtol_stored_in_an_int() {
+        use std::ffi::c_long;
+        let int = |n: i128| n.clamp(c_long::MIN as i128, c_long::MAX as i128) as c_long as i32;
+        let huge = 99_999_999_999_999_999_999_i128;
+        assert_eq!(strtol("-99999999999999999999").0, int(-huge));
+        assert_eq!(strtol("99999999999999999999").0, int(huge));
+        let n = i128::from(u32::MAX) + 2;
+        let want = Some(int(n)).filter(|i| (1..=999).contains(i));
+        assert_eq!(
+            parse_channel_address(&n.to_string()).map(|a| a.index as i32),
+            want
+        );
     }
 }

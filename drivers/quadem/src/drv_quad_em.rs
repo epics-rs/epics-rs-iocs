@@ -38,10 +38,11 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::InterfaceMask;
-use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::exit::at_exit;
 
 /// Number of data items published per sample (C++ `QE_MAX_DATA`).
 pub const QE_MAX_DATA: usize = 11;
@@ -860,6 +861,10 @@ pub trait QuadEmDevice {
     }
     /// `drvQuadEM::reset` is pure virtual; [`Self::base_reset`] is its body.
     fn reset(&mut self) -> AsynResult<()>;
+    /// `drvQuadEM::exitHandler`, run at IOC exit by the hook
+    /// [`start_callback_task`] arms. The base's is empty (drvQuadEM.cpp:656)
+    /// and every C driver overrides it, so each driver here states its own.
+    fn exit_handler(&mut self);
 
     /// C++ `drvQuadEM::writeInt32`. Every step runs whatever an earlier one
     /// returned, as C's `status |=` does; the first failure is what the record
@@ -951,9 +956,12 @@ pub trait QuadEmDevice {
             ));
         }
 
-        // C's callParamCallbacks() posts address 0 only; the other addresses
-        // post from computePositions while data flows.
+        // drvQuadEM.cpp:517 posts address 0 only, leaving a channel write's
+        // readback to the next data post (:280): a C defect, not copied.
         status.add(self.qe_base().port_base.call_param_callbacks(0));
+        if channel != 0 {
+            status.add(self.qe_base().port_base.call_param_callbacks(channel));
+        }
         qe_write_result(
             &self.qe_base().port_base,
             status,
@@ -989,7 +997,11 @@ pub trait QuadEmDevice {
             status.add(self.read_status());
         }
 
+        // Address 0 only at drvQuadEM.cpp:572 too, the same C defect.
         status.add(self.qe_base().port_base.call_param_callbacks(0));
+        if channel != 0 {
+            status.add(self.qe_base().port_base.call_param_callbacks(channel));
+        }
         qe_write_result(
             &self.qe_base().port_base,
             status,
@@ -1201,8 +1213,9 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     };
 
     let counter = ctx.shared.array_counter.fetch_add(1, Ordering::SeqCst) + 1;
-    let ts = EpicsTimestamp::now();
-    let time_stamp = ts.as_f64();
+    // Only the double timeStamp: C never sets an array's epicsTS, so it stays
+    // the constructor's zero (drvQuadEM.cpp:335-336, NDArray.cpp:31-32).
+    let time_stamp = EpicsTimestamp::now().as_f64();
 
     // Address 11: the whole [QE_MAX_DATA, numRead] array, sample-major on disk
     // exactly as the C++ ring layout.
@@ -1217,7 +1230,6 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
         NDDataBuffer::F64(flat),
     ) {
         all.unique_id = counter;
-        all.timestamp = ts;
         all.time_stamp = time_stamp;
         ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
             .publish(all)
@@ -1234,7 +1246,6 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
             continue;
         };
         single.unique_id = counter;
-        single.timestamp = ts;
         single.time_stamp = time_stamp;
         ArrayPublisher::new(ctx.outputs[item].clone())
             .publish(single)
@@ -1323,8 +1334,21 @@ pub async fn callback_loop(mut ctx: CallbackContext) {
     }
 }
 
-/// Spawn the callback task on its own thread (C++ `drvQuadEMCallbackTask`).
-pub fn start_callback_task(ctx: CallbackContext) -> std::thread::JoinHandle<()> {
+/// The tail of C++'s drvQuadEM constructor: spawn the callback task on its own
+/// thread (`drvQuadEMCallbackTask`) and arm `epicsAtExit(exitHandlerC, this)`
+/// (drvQuadEM.cpp:154). The hook runs `D::exit_handler` on the port's actor,
+/// C's `lock()`; armed after the port's own exit callback, it runs before
+/// that one stops the actor.
+pub fn start_callback_task<D>(ctx: CallbackContext) -> std::thread::JoinHandle<()>
+where
+    D: QuadEmDevice + PortDriver,
+{
+    let port = ctx.handle.downgrade();
+    at_exit(format!("drvQuadEM {}", ctx.handle.port_name()), move || {
+        if let Some(handle) = port.upgrade() {
+            let _ = handle.with_driver_blocking(|driver: &mut D| driver.exit_handler());
+        }
+    });
     rt::run_thread_named("drvQuadEMCallbackTask", move || callback_loop(ctx))
 }
 
@@ -1573,6 +1597,7 @@ mod tests {
         fn reset(&mut self) -> AsynResult<()> {
             self.step("reset")
         }
+        fn exit_handler(&mut self) {}
     }
 
     /// The status C's write returns, in its numbering, and its errorMessage.
@@ -1875,5 +1900,39 @@ mod tests {
                 "read_status"
             ]
         );
+    }
+
+    #[test]
+    fn a_channel_write_posts_its_own_address_with_no_data_running() {
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let mut m = FakeMeter::new(&[]);
+        let (range, offset) = (m.base.params.range, m.base.params.current_offset);
+        m.base.port_base.own_interrupts(InterruptGate::opened());
+        // The boot sweep's post of what the constructor set.
+        m.base.port_base.call_param_callbacks(2).unwrap();
+        let filter = InterruptFilter {
+            addr: Some(2),
+            ..Default::default()
+        };
+        let mut rx = m
+            .base
+            .port_base
+            .interrupts
+            .subscribe_async_filtered(filter, 16, 0)
+            .unwrap();
+        m.qe_write_int32(&AsynUser::new(range).with_addr(2), 3)
+            .unwrap();
+        m.qe_write_float64(&AsynUser::new(offset).with_addr(2), 1.5)
+            .unwrap();
+        let posted: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|v| match v.value {
+                ParamValue::Int32(n) => format!("{} {n}", v.reason),
+                ParamValue::Float64(x) => format!("{} {x}", v.reason),
+                _ => format!("{} other", v.reason),
+            })
+            .collect();
+        assert_eq!(posted, [format!("{range} 3"), format!("{offset} 1.5")]);
     }
 }

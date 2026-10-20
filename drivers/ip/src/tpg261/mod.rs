@@ -612,7 +612,7 @@ impl DeviceSupport for DevTpg261 {
     }
 
     /// `writeX` with `pact == 1`: an empty `recBuf` alarms.
-    fn async_write_completed(&mut self) {
+    fn async_write_completed(&mut self, _record: &mut dyn Record) {
         if self.rec_buf().is_empty() {
             raise(&mut self.alarm, READ_ALARM, AlarmSeverity::Invalid);
             self.error(format_args!(

@@ -1858,6 +1858,43 @@ mod tests {
         assert_eq!(controller.axis_scale(1), 4);
     }
 
+    /// pmacController.cpp:317, 324, 349: FLOW on the controller, then the
+    /// command and the response on the low-level port whatever the status;
+    /// a cut read prints what it delivered, a failed write no reply.
+    #[test]
+    fn low_level_write_read_prints_command_and_response() {
+        let (_rt, rig) = publish_scripted("pmacIoLow");
+        let controller = PmacController::new(
+            "pmacIoCtl",
+            "pmacIoLow",
+            0,
+            low_level_port_connect("pmacIoCtl", "pmacIoLow", 0),
+        );
+        let own = TraceCapture::on("pmacIoCtl");
+        let low = TraceCapture::on("pmacIoLow");
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("pmacIoCtl"), TraceMask::FLOW);
+        trace.set_trace_mask(Some("pmacIoLow"), TraceMask::IO_DRIVER);
+        trace.set_device_trace_mask("pmacIoLow", 0, TraceMask::IO_DRIVER);
+        rig.answer("I100", b"5\r");
+        rig.cut("I200", b"7");
+        rig.refuse("I300");
+        let _ = controller.reply("I100");
+        let _ = controller.reply("I200");
+        let _ = controller.reply("I300");
+        assert_eq!(own.take(), "pmacController::lowLevelWriteRead\n".repeat(3));
+        assert_eq!(
+            low.take(),
+            "pmacController::lowLevelWriteRead: command: I100\n\
+             pmacController::lowLevelWriteRead: response: 5\r\n\
+             pmacController::lowLevelWriteRead: command: I200\n\
+             pmacController::lowLevelWriteRead: response: 7\n\
+             pmacController::lowLevelWriteRead: command: I300\n\
+             pmacController::lowLevelWriteRead: response: \n"
+        );
+    }
+
     /// `port`'s trace, address 0 included, without the prefix, so what it
     /// holds is the driver's own bytes.
     struct TraceCapture {

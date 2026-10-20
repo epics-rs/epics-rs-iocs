@@ -362,7 +362,7 @@ fn receive_packet(
         ReceivedPacket::ConfigReadback { .. } | ReceivedPacket::Ack { .. } => {}
         ReceivedPacket::Error { .. } => {
             // C spelling (`ConsoleHelper.cpp:725`).
-            eprintln!("Error recevied");
+            epics_rs::base::stderr_println!("Error recevied");
             return None;
         }
         ReceivedPacket::Unprocessed => return None,
@@ -564,14 +564,13 @@ impl AmptekDriver {
 
     /// `drvAmptek::setParamsAlarm` (`drvAmptek.cpp:237-248`): every MCA and
     /// Amptek param, at every SCA address, gets the same alarm status/
-    /// severity. C calls only `setParamAlarmStatus`/`setParamAlarmSeverity`,
-    /// so each param's asyn status is kept as it is.
+    /// severity.
     fn set_params_alarm(&mut self, alarm_status: u16, alarm_severity: u16) -> AsynResult<()> {
         for addr in 0..MAX_SCAS as i32 {
             for &idx in self.mca.iter().chain(self.amptek.iter()) {
-                let (status, _, _) = self.base.get_param_status(idx, addr)?;
+                self.base.set_param_alarm_status(idx, addr, alarm_status)?;
                 self.base
-                    .set_param_status(idx, addr, status, alarm_status, alarm_severity)?;
+                    .set_param_alarm_severity(idx, addr, alarm_severity)?;
             }
             self.base.call_param_callbacks(addr)?;
         }
@@ -2147,7 +2146,7 @@ mod tests {
         let gain = driver.amptek[AmptekReason::Gain as usize];
         driver
             .base
-            .set_param_status(gain, 3, AsynStatus::Timeout, 0, 0)
+            .set_param_status(gain, 3, AsynStatus::Timeout)
             .unwrap();
         if let DppLink::Ethernet { dpp_addr, .. } = &mut driver.link {
             *dpp_addr = Some(Ipv4Addr::LOCALHOST);
@@ -2156,11 +2155,11 @@ mod tests {
 
         let invalid = AlarmSeverity::Invalid as u16;
         assert_eq!(
-            driver.base.get_param_status(gain, 3).unwrap(),
+            driver.base.params.get_param_status(gain, 3).unwrap(),
             (AsynStatus::Timeout, alarm_status::COMM_ALARM, invalid)
         );
         assert_eq!(
-            driver.base.get_param_status(gain, 0).unwrap(),
+            driver.base.params.get_param_status(gain, 0).unwrap(),
             (AsynStatus::Success, alarm_status::COMM_ALARM, invalid)
         );
     }

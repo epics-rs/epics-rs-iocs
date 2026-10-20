@@ -53,7 +53,7 @@ impl Drop for Console {
     fn drop(&mut self) {
         self.restore();
         if std::thread::panicking() {
-            eprint!(
+            epics_rs::base::stderr_print!(
                 "{}",
                 std::fs::read_to_string(self.sink.path()).unwrap_or_default()
             );

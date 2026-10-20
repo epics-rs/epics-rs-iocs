@@ -132,29 +132,25 @@ fn scanf_int(s: &str) -> Option<(i32, &str)> {
 /// `chopstring40` (`drvGM10.c:330-356`): split off a chunk of at most 39
 /// chars, breaking at the last space within the first 40 chars when `src`
 /// is 40 chars or longer. Returns `(chunk, remainder)`.
-pub fn chop_string_40(src: &str) -> (String, Option<String>) {
+pub fn chop_string_40(src: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
     if src.len() < 40 {
-        return (src.to_string(), None);
+        return (src.to_vec(), None);
     }
-    let bytes = src.as_bytes();
     let mut i = 39usize;
-    loop {
-        if bytes[i] == b' ' {
-            return (src[..i].to_string(), Some(src[i + 1..].to_string()));
-        }
-        if i == 0 {
-            // C cuts at byte 39; never split a UTF-8 char here.
-            let cut = src.floor_char_boundary(39);
-            return (src[..cut].to_string(), Some(src[cut..].to_string()));
-        }
+    while src[i] != b' ' {
         i -= 1;
+        // C cuts here without testing `src[0]`.
+        if i == 0 {
+            return (src[..39].to_vec(), Some(src[39..].to_vec()));
+        }
     }
+    (src[..i].to_vec(), Some(src[i + 1..].to_vec()))
 }
 
 /// The `_ERR,<code>` reply's single-quoted message, chopped into up to 3
 /// 40-char-max chunks (`response_reader`, `drvGM10.c:384-403`).
-pub fn split_error_message(msg: &str) -> [String; 3] {
-    let mut out = [String::new(), String::new(), String::new()];
+pub fn split_error_message(msg: &[u8]) -> [Vec<u8>; 3] {
+    let mut out = [Vec::new(), Vec::new(), Vec::new()];
     let (first, rest) = chop_string_40(msg);
     out[0] = first;
     if let Some(rest) = rest {
@@ -170,11 +166,10 @@ pub fn split_error_message(msg: &str) -> [String; 3] {
 /// Extract the single-quoted message body from an `_ERR,<code>` ASCII
 /// reply payload (`drvGM10.c:384-388`: `ptr = strchr(ptr,'\'')+1; eptr =
 /// strchr(ptr,'\'')`).
-pub fn extract_quoted_message(payload: &str) -> Option<&str> {
-    let start = payload.find('\'')? + 1;
-    let rest = &payload[start..];
-    let end = rest.find('\'')?;
-    Some(&rest[..end])
+pub fn extract_quoted_message(payload: &[u8]) -> Option<&[u8]> {
+    let start = find_byte(payload, 0, b'\'')? + 1;
+    let end = find_byte(payload, start, b'\'')?;
+    Some(&payload[start..end])
 }
 
 // ---------------------------------------------------------------------
@@ -184,12 +179,12 @@ pub fn extract_quoted_message(payload: &str) -> Option<&str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleLine {
     pub index: usize,
-    pub set_message: String,
-    pub status_message: String,
-    pub error_message: String,
+    pub set_message: Vec<u8>,
+    pub status_message: Vec<u8>,
+    pub error_message: Vec<u8>,
 }
 
-const NO_ERROR: &str = "----------------";
+const NO_ERROR: &[u8] = b"----------------";
 
 /// Parses the `FSysConf` ASCII body (after the `"Unit:00"` prefix check).
 /// Returns `None` on a malformed body (matches C `load_modules`'s `return 1`
@@ -231,7 +226,7 @@ pub fn parse_fsysconf(payload: &[u8]) -> Option<Vec<ModuleLine>> {
 /// fill out the 17-byte slot (`drvGM10.c:459-463`: `ptr += (17 - i)` after
 /// a copy loop that already advanced by `i`, so the field is 17 bytes wide
 /// in total regardless of the string's own length).
-fn read_field_17(payload: &[u8], start: usize) -> Option<(String, usize)> {
+fn read_field_17(payload: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
     let mut i = 0usize;
     while start + i < payload.len() && payload[start + i] != b' ' {
         i += 1;
@@ -239,11 +234,10 @@ fn read_field_17(payload: &[u8], start: usize) -> Option<(String, usize)> {
             return None;
         }
     }
-    let s = String::from_utf8_lossy(&payload[start..start + i]).into_owned();
-    Some((s, start + 17))
+    Some((payload[start..start + i].to_vec(), start + 17))
 }
 
-fn read_field_until(payload: &[u8], start: usize, terminator: u8) -> Option<(String, usize)> {
+fn read_field_until(payload: &[u8], start: usize, terminator: u8) -> Option<(Vec<u8>, usize)> {
     let mut i = 0usize;
     while start + i < payload.len() && payload[start + i] != terminator {
         i += 1;
@@ -251,8 +245,7 @@ fn read_field_until(payload: &[u8], start: usize, terminator: u8) -> Option<(Str
     if start + i >= payload.len() {
         return None;
     }
-    let s = String::from_utf8_lossy(&payload[start..start + i]).into_owned();
-    Some((s, start + i))
+    Some((payload[start..start + i].to_vec(), start + i))
 }
 
 /// Whether a parsed [`ModuleLine`] indicates a present, error-free module
@@ -268,31 +261,27 @@ pub fn module_line_ok(line: &ModuleLine) -> bool {
 /// type and `[input_count, output_count]` (`drvGM10.c:500-574`). Returns
 /// `None` for anything not matching the `GX90` + recognized-subtype +
 /// `-`-separator shape (C's `continue` paths).
-pub fn classify_module(set_message: &str) -> Option<(ModuleType, [i32; 2])> {
-    let rest = set_message.strip_prefix("GX90")?;
-    let mut chars = rest.chars();
-    let c0 = chars.next()?;
-    let c1 = chars.next()?;
+pub fn classify_module(set_message: &[u8]) -> Option<(ModuleType, [i32; 2])> {
+    let [c0, c1, after_subtype @ ..] = set_message.strip_prefix(b"GX90")? else {
+        return None;
+    };
     let module_type = match (c0, c1) {
-        ('U', 'T') => ModuleType::Pid,
-        ('X', 'A') => ModuleType::InputAnalog,
-        ('X', 'D') => ModuleType::InputDigital,
-        ('X', 'P') => ModuleType::InputPulse,
-        ('Y', 'A') => ModuleType::OutputAnalog,
-        ('Y', 'D') => ModuleType::OutputDigital,
-        ('W', 'D') => ModuleType::InputOutputDigital,
+        (b'U', b'T') => ModuleType::Pid,
+        (b'X', b'A') => ModuleType::InputAnalog,
+        (b'X', b'D') => ModuleType::InputDigital,
+        (b'X', b'P') => ModuleType::InputPulse,
+        (b'Y', b'A') => ModuleType::OutputAnalog,
+        (b'Y', b'D') => ModuleType::OutputDigital,
+        (b'W', b'D') => ModuleType::InputOutputDigital,
         _ => return None,
     };
-    let after_subtype = chars.as_str();
-    let after_dash = after_subtype.strip_prefix('-')?;
+    let after_dash = after_subtype.strip_prefix(b"-")?;
     if module_type == ModuleType::Pid {
         // C `continue`s before assigning channel_number for PID/UNKNOWN.
         return Some((module_type, [0, 0]));
     }
-    let digits_end = after_dash
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(after_dash.len());
-    let v: i32 = after_dash[..digits_end].parse().ok()?;
+    let digits = &after_dash[..scan_digits(after_dash, 0)];
+    let v: i32 = std::str::from_utf8(digits).ok()?.parse().ok()?;
     let channel_number = match module_type {
         ModuleType::InputAnalog | ModuleType::InputDigital | ModuleType::InputPulse => [v, 0],
         ModuleType::OutputAnalog | ModuleType::OutputDigital => [0, v],
@@ -319,7 +308,7 @@ pub struct ChannelInfoLine {
     /// 0-based array index (`address = atoi(ptr) - 1`).
     pub index: usize,
     pub status: u8, // CH_STATUS_{SKIP=0,NORMAL=1,DIFF=2,UNKNOWN=3}
-    pub unit: String,
+    pub unit: Vec<u8>,
     pub scale: u8,
 }
 
@@ -410,7 +399,7 @@ pub fn parse_fchinfo(payload: &[u8]) -> Vec<ChannelInfoLine> {
                 family,
                 index,
                 status,
-                unit: "----".to_string(),
+                unit: b"----".to_vec(),
                 scale: 0,
             });
             p = nl + 1;
@@ -420,13 +409,13 @@ pub fn parse_fchinfo(payload: &[u8]) -> Vec<ChannelInfoLine> {
         // Unit field: up to 10 chars, stopping early at a space
         // (`drvGM10.c:754-759` — note the source `char unit[7]` buffer is
         // only sized for 6 chars + NUL, a stack buffer overflow the Rust
-        // `String` here structurally cannot reproduce).
+        // `Vec` here structurally cannot reproduce).
         let unit_start = p;
         let mut i = 0usize;
         while i < 10 && unit_start + i < payload.len() && payload[unit_start + i] != b' ' {
             i += 1;
         }
-        let unit = String::from_utf8_lossy(&payload[unit_start..unit_start + i]).into_owned();
+        let unit = payload[unit_start..unit_start + i].to_vec();
         p = unit_start + i;
         let Some(comma) = find_byte(payload, p, b',') else {
             break;
@@ -541,7 +530,7 @@ pub fn parse_srangedo(payload: &[u8]) -> Result<Vec<ChannelModeLine>, Vec<Channe
 pub struct ExprLine {
     pub index: usize,
     pub on_flag: bool,
-    pub expr: String,
+    pub expr: Vec<u8>,
 }
 
 pub fn parse_srangemath(payload: &[u8]) -> Vec<ExprLine> {
@@ -563,7 +552,7 @@ pub fn parse_srangemath(payload: &[u8]) -> Vec<ExprLine> {
             out.push(ExprLine {
                 index,
                 on_flag: false,
-                expr: String::new(),
+                expr: Vec::new(),
             });
             let Some(nl) = find_byte(payload, p, b'\n') else {
                 break;
@@ -577,7 +566,7 @@ pub fn parse_srangemath(payload: &[u8]) -> Vec<ExprLine> {
         let Some(q2) = find_byte(payload, q1 + 1, b'\'') else {
             break;
         };
-        let expr = String::from_utf8_lossy(&payload[q1 + 1..q2]).into_owned();
+        let expr = payload[q1 + 1..q2].to_vec();
         out.push(ExprLine {
             index,
             on_flag: true,
@@ -666,37 +655,29 @@ pub struct ConstLine {
 /// prefix (`drvGM10.c:1109,1137`: `p += 8`, unexamined by C either), then
 /// `<digits>,<float>\n`.
 pub fn parse_const_lines(payload: &[u8]) -> Vec<ConstLine> {
-    let text = String::from_utf8_lossy(payload);
     let mut out = Vec::new();
-    let mut rest: &str = text.as_ref();
-    while !rest.is_empty() && !rest.starts_with('E') {
+    let mut rest = payload;
+    while !rest.is_empty() && rest[0] != b'E' {
         let Some(after_prefix) = rest.get(8..) else {
             break;
         };
-        let digits_end = after_prefix
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(after_prefix.len());
-        let Ok(addr1): Result<i64, _> = after_prefix[..digits_end].parse() else {
+        let Some(index) = parse_1based_index(after_prefix, 0, scan_digits(after_prefix, 0)) else {
             break;
         };
-        if addr1 < 1 {
-            break;
-        }
-        let Some(comma) = after_prefix.find(',') else {
+        let Some(comma) = find_byte(after_prefix, 0, b',') else {
             break;
         };
         let after_comma = &after_prefix[comma + 1..];
-        let Some(nl) = after_comma.find('\n') else {
+        let Some(nl) = find_byte(after_comma, 0, b'\n') else {
             break;
         };
-        let value_str = after_comma[..nl].trim_end_matches('\r');
-        let Ok(value) = value_str.parse::<f64>() else {
+        let Some(value) = std::str::from_utf8(&after_comma[..nl])
+            .ok()
+            .and_then(|s| s.trim_end_matches('\r').parse::<f64>().ok())
+        else {
             break;
         };
-        out.push(ConstLine {
-            index: (addr1 - 1) as usize,
-            value,
-        });
+        out.push(ConstLine { index, value });
         rest = &after_comma[nl + 1..];
     }
     out
@@ -770,43 +751,51 @@ mod tests {
 
     #[test]
     fn chop_string_40_short_string_no_remainder() {
-        let (chunk, rest) = chop_string_40("short message");
-        assert_eq!(chunk, "short message");
+        let (chunk, rest) = chop_string_40(b"short message");
+        assert_eq!(chunk, b"short message");
         assert_eq!(rest, None);
     }
 
     #[test]
-    fn chop_string_40_no_space_cuts_on_char_boundary() {
+    fn chop_string_40_no_space_cuts_at_byte_39() {
         let msg = format!("{}\u{b0}{}", "x".repeat(38), "y".repeat(10));
-        let (chunk, rest) = chop_string_40(&msg);
-        assert_eq!(chunk, "x".repeat(38));
-        assert_eq!(rest.unwrap(), format!("\u{b0}{}", "y".repeat(10)));
+        let (chunk, rest) = chop_string_40(msg.as_bytes());
+        assert_eq!(chunk, &msg.as_bytes()[..39]);
+        assert_eq!(rest.unwrap(), &msg.as_bytes()[39..]);
+    }
+
+    #[test]
+    fn chop_string_40_never_breaks_at_byte_0() {
+        let msg = format!(" {}", "x".repeat(45));
+        let (chunk, rest) = chop_string_40(msg.as_bytes());
+        assert_eq!(chunk, &msg.as_bytes()[..39]);
+        assert_eq!(rest.unwrap(), &msg.as_bytes()[39..]);
     }
 
     #[test]
     fn chop_string_40_breaks_at_last_space_within_40() {
         // 45-char message; the space nearest-but-before index 39 is at 33.
-        let msg = "This is a long error message that continues";
+        let msg = b"This is a long error message that continues";
         let (chunk, rest) = chop_string_40(msg);
-        assert_eq!(chunk, "This is a long error message that");
-        assert_eq!(rest, Some("continues".to_string()));
+        assert_eq!(chunk, b"This is a long error message that");
+        assert_eq!(rest.unwrap(), b"continues");
     }
 
     #[test]
     fn split_error_message_cascades_and_clears_unused_slots() {
-        let out = split_error_message("short");
-        assert_eq!(out[0], "short");
-        assert_eq!(out[1], "");
-        assert_eq!(out[2], "");
+        let out = split_error_message(b"short");
+        assert_eq!(out[0], b"short");
+        assert_eq!(out[1], b"");
+        assert_eq!(out[2], b"");
     }
 
     #[test]
     fn extract_quoted_message_pulls_body_between_quotes() {
         assert_eq!(
-            extract_quoted_message("junk 'hello world' junk"),
-            Some("hello world")
+            extract_quoted_message(b"junk 'hello world' junk"),
+            Some(&b"hello world"[..])
         );
-        assert_eq!(extract_quoted_message("no quotes"), None);
+        assert_eq!(extract_quoted_message(b"no quotes"), None);
     }
 
     #[test]
@@ -824,7 +813,7 @@ mod tests {
         let modules = parse_fsysconf(&payload).unwrap();
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].index, 0);
-        assert_eq!(modules[0].set_message, "GX90XA-06");
+        assert_eq!(modules[0].set_message, b"GX90XA-06");
         assert!(module_line_ok(&modules[0]));
         let (mtype, count) = classify_module(&modules[0].set_message).unwrap();
         assert_eq!(mtype, ModuleType::InputAnalog);
@@ -838,12 +827,12 @@ mod tests {
 
     #[test]
     fn classify_module_rejects_non_gx90() {
-        assert_eq!(classify_module("OTHER-01"), None);
+        assert_eq!(classify_module(b"OTHER-01"), None);
     }
 
     #[test]
     fn classify_module_input_output_digital_splits_count() {
-        let (mtype, count) = classify_module("GX90WD-0816").unwrap();
+        let (mtype, count) = classify_module(b"GX90WD-0816").unwrap();
         assert_eq!(mtype, ModuleType::InputOutputDigital);
         assert_eq!(count, [8, 16]);
     }
@@ -859,7 +848,7 @@ mod tests {
         assert_eq!(lines[0].family, InfoFamily::Signal);
         assert_eq!(lines[0].index, 0);
         assert_eq!(lines[0].status, CH_STATUS_NORMAL);
-        assert_eq!(lines[0].unit, "DEGC");
+        assert_eq!(lines[0].unit, b"DEGC");
         assert_eq!(lines[0].scale, 3);
     }
 
@@ -870,7 +859,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].index, 0);
         assert_eq!(lines[0].status, CH_STATUS_SKIP);
-        assert_eq!(lines[0].unit, "----");
+        assert_eq!(lines[0].unit, b"----");
         assert_eq!(lines[0].scale, 0);
     }
 
@@ -912,17 +901,17 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].index, 0);
         assert!(!lines[0].on_flag);
-        assert_eq!(lines[0].expr, "");
+        assert_eq!(lines[0].expr, b"");
     }
 
     #[test]
     fn srangemath_on_channel_extracts_quoted_expr() {
-        let payload = "xxxxxxxxxxx0001,'A002+A003'\nE".as_bytes();
+        let payload = b"xxxxxxxxxxx0001,'A002+A003'\nE";
         let lines = parse_srangemath(payload);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].index, 0);
         assert!(lines[0].on_flag);
-        assert_eq!(lines[0].expr, "A002+A003");
+        assert_eq!(lines[0].expr, b"A002+A003");
     }
 
     #[test]
@@ -943,6 +932,18 @@ mod tests {
                 index: 1,
                 value: -3.25
             }
+        );
+    }
+
+    #[test]
+    fn const_lines_skip_the_prefix_by_bytes() {
+        let lines = parse_const_lines(b"aaaa\xffaaa001,12.5\nE");
+        assert_eq!(
+            lines,
+            [ConstLine {
+                index: 0,
+                value: 12.5
+            }]
         );
     }
 

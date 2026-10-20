@@ -38,7 +38,9 @@ fn set_input_eos(port: &PortHandle, port_name: &str, addr: i32) {
         match port.set_input_eos_blocking(eos_user(addr), eos) {
             Ok(()) => return,
             Err(e) if eos.len() == 1 => {
-                eprintln!("{port_name}: warning: pasynOctet->setInputEos() failed: {e}")
+                epics_rs::base::stderr_println!(
+                    "{port_name}: warning: pasynOctet->setInputEos() failed: {e}"
+                )
             }
             Err(_) => {}
         }

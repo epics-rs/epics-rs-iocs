@@ -400,7 +400,7 @@ fn apply_info_defaults(
 ) -> Result<(), LinkError> {
     fn deprecated<'a>(record: &str, tag: &'a Option<String>) -> Option<&'a str> {
         tag.as_deref().inspect(|_| {
-            eprintln!(
+            epics_rs::base::stderr_println!(
                 "{record} DEPRECATION WARNING: setting parameters through info items is deprecated; \
                  use link parameters instead."
             )

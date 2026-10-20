@@ -191,7 +191,7 @@ impl Registry {
             }
             // C's `add_record` refuses each linking record (`devOpcua.cpp:107`).
             for leaf in &item.leaves {
-                eprintln!(
+                epics_rs::base::stderr_println!(
                     "{} Error in add_record : opcuaItemRecord '{name}' was not initialized correctly",
                     leaf.lock().record
                 );
