@@ -223,7 +223,6 @@ impl AsynMotor for Smc100Axis {
             protocol::parse_value(&self.write_read(&protocol::cmd_query_position(self.axis))?)
                 .ok_or_else(|| parse_error("TP"))?;
         status.position = position_units / self.step_size;
-        status.encoder_position = status.position;
 
         // Status (TS): moving / limits / at-home.
         let ts = protocol::parse_status(&self.write_read(&protocol::cmd_query_status(self.axis))?)
@@ -282,6 +281,23 @@ mod tests {
             ]
         );
         assert_eq!(axis.polled(&user).unwrap().position, 50000.0);
+    }
+
+    /// SMC100Axis::poll sets motorPosition_ only (SMC100Driver.cpp:312):
+    /// the record's REP stays 0.
+    #[test]
+    fn the_poll_sets_no_encoder_position() {
+        let (_line, io) = LineRig::new("smc100_no_rep", |last| {
+            match last {
+                "1TP" => "1TP2.5",
+                "1TS" => "1TS000033",
+                _ => "",
+            }
+            .to_string()
+        });
+        let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("SMC100_T", 0));
+        let status = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!((status.position, status.encoder_position), (2.5, 0.0));
     }
 
     /// C sets `status =` on each write and returns the last
