@@ -13,7 +13,6 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
-use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -52,16 +51,14 @@ enum CommState {
 /// One Soloist: its port and communication state.
 pub struct SoloistCard {
     handle: SyncIOHandle,
-    addr: i32,
     comm: CommState,
 }
 
 impl SoloistCard {
-    /// `handle` connected at asyn address `addr`.
-    pub fn new(handle: SyncIOHandle, addr: i32) -> Self {
+    /// `handle` connected at the card's asyn address.
+    pub fn new(handle: SyncIOHandle) -> Self {
         Self {
             handle,
-            addr,
             comm: CommState::Normal,
         }
     }
@@ -91,10 +88,7 @@ impl SoloistCard {
 
     /// `pasynOctetSyncIO->flush`.
     fn flush(&self) {
-        if let Ok(port) = self.handle.port() {
-            let user = AsynUser::new(0).with_addr(self.addr);
-            let _ = port.submit_blocking(RequestOp::Flush, user);
-        }
+        let _ = self.handle.flush(0);
     }
 }
 
@@ -470,7 +464,7 @@ mod tests {
         use motor_common::testing::LineRig;
         let init = |name, reply: &'static str, encoder| {
             let (_line, io) = LineRig::new(name, move |_| reply.into());
-            let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+            let card = Arc::new(Mutex::new(SoloistCard::new(io)));
             let setup = AxisSetup {
                 encoder,
                 gain: true,
@@ -496,13 +490,35 @@ mod tests {
         );
     }
 
+    /// drvSoloist.cc:587: the init flush is `pasynOctetSyncIO->flush`, which
+    /// prints its TRACEIO_DEVICE line.
+    #[test]
+    fn the_init_flush_is_asyn_octet_sync_io_s() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use motor_common::testing::LineRig;
+
+        let name = "soloistFlush";
+        let (_line, io) = LineRig::new(name, |_| String::new());
+        let trace = io.port().unwrap().trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        SoloistCard::new(io).flush();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("asynOctetSyncIO flush\n"), "{text}");
+    }
+
     /// motorRecord.cc:2141, :3068: a jog's SET_ACCEL goes out at any rate,
     /// a move's only at a positive one (:874).
     #[test]
     fn a_jog_sends_set_accel_at_a_zero_rate() {
         use motor_common::testing::LineRig;
         let (line, io) = LineRig::new("soloistJogAccel", |_| "%0".into());
-        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let card = Arc::new(Mutex::new(SoloistCard::new(io)));
         let setup = AxisSetup {
             encoder: false,
             gain: false,
@@ -527,7 +543,7 @@ mod tests {
     fn units_print_a_non_finite_value_as_c() {
         use motor_common::testing::LineRig;
         let (_line, io) = LineRig::new("soloistNan", |_| "%0".into());
-        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let card = Arc::new(Mutex::new(SoloistCard::new(io)));
         let setup = AxisSetup {
             encoder: false,
             gain: false,
@@ -553,7 +569,7 @@ mod tests {
                 "%0".into()
             }
         });
-        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let card = Arc::new(Mutex::new(SoloistCard::new(io)));
         let setup = AxisSetup {
             encoder: false,
             gain: false,
@@ -584,7 +600,7 @@ mod tests {
                 "%0".into()
             }
         });
-        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let card = Arc::new(Mutex::new(SoloistCard::new(io)));
         let setup = AxisSetup {
             encoder: false,
             gain: false,
@@ -627,7 +643,7 @@ mod tests {
                 "%0".into()
             }
         });
-        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let card = Arc::new(Mutex::new(SoloistCard::new(io)));
         let setup = AxisSetup {
             encoder: true,
             gain: false,

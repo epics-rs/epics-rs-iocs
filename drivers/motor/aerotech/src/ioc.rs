@@ -375,7 +375,7 @@ pub fn soloist_config_command() -> CommandDef {
                 if connected.is_err() {
                     return;
                 }
-                let controller = SoloistCard::new(handle, addr);
+                let controller = SoloistCard::new(handle);
                 let Some(found) = drv_soloist::motor_init(&controller) else {
                     return;
                 };

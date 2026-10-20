@@ -10,7 +10,6 @@ use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
 /// The address every `asynMotorController` constructor connects its octet
@@ -74,12 +73,8 @@ pub fn connect_controller(
 /// (OEMMotorDriver.cpp:54-55, smarActMCS2MotorDriver.cpp:64-65). On a user
 /// of a missing port both are refused at `lockPort`.
 pub fn set_eos_ignored(handle: &SyncIOHandle, input_eos: &[u8], output_eos: &[u8]) {
-    let Ok(port) = handle.port() else {
-        return;
-    };
-    let user = || AsynUser::new(0).with_addr(CONTROLLER_ADDR);
-    let _ = port.set_input_eos_blocking(user(), input_eos);
-    let _ = port.set_output_eos_blocking(user(), output_eos);
+    let _ = handle.set_input_eos(0, input_eos);
+    let _ = handle.set_output_eos(0, output_eos);
 }
 
 /// What a refused EOS set does to a controller's create, and the order the
@@ -125,10 +120,9 @@ impl From<EosConnectError> for String {
     }
 }
 
-/// [`connect_serial`] at `addr`, then the EOS the C driver sets on its
-/// `pasynUser` right after `pasynOctetSyncIO->connect`, so the wire framing
-/// does not depend on st.cmd. EOS lives on the port per address, so it is set
-/// on the `PortHandle` at `addr` before wrapping.
+/// [`connect_serial`] at `addr`, then the EOS the C driver sets with
+/// `pasynOctetSyncIO->setInputEos`/`setOutputEos` right after the connect, so
+/// the wire framing does not depend on st.cmd.
 pub fn connect_with_eos(
     port_name: &str,
     addr: i32,
@@ -139,15 +133,15 @@ pub fn connect_with_eos(
 ) -> Result<SyncIOHandle, EosConnectError> {
     let port =
         get_port(port_name).ok_or_else(|| EosConnectError::PortNotFound(port_name.to_string()))?;
-    let user = || AsynUser::new(0).with_addr(addr);
+    let handle = SyncIOHandle::from_handle(port.handle.clone(), addr, timeout);
     let set_input = || {
-        port.handle
-            .set_input_eos_blocking(user(), input_eos)
+        handle
+            .set_input_eos(0, input_eos)
             .map_err(|e| EosConnectError::InputEos(port_name.to_string(), e))
     };
     let set_output = || {
-        port.handle
-            .set_output_eos_blocking(user(), output_eos)
+        handle
+            .set_output_eos(0, output_eos)
             .map_err(|e| EosConnectError::OutputEos(port_name.to_string(), e))
     };
     match refusal {
@@ -164,11 +158,7 @@ pub fn connect_with_eos(
             set_output()?;
         }
     }
-    Ok(SyncIOHandle::from_handle(
-        port.handle.clone(),
-        addr,
-        timeout,
-    ))
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -179,6 +169,7 @@ mod tests {
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::user::AsynUser;
 
     /// A port with no EOS support of its own: both sets are refused.
     struct Bare(PortDriverBase);
@@ -203,6 +194,24 @@ mod tests {
             &mut self.0
         }
         fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Takes both EOS.
+    struct Serial(PortDriverBase);
+
+    impl PortDriver for Serial {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_output_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
             Ok(())
         }
     }
@@ -264,6 +273,43 @@ mod tests {
     fn refusals_are_ignored_where_the_c_driver_ignores_them() {
         publish("eosBareIgnored", Bare);
         assert!(connect("eosBareIgnored", EosRefusal::Ignored).is_ok());
+    }
+
+    /// C's `pasynOctetSyncIO->setInputEos`/`setOutputEos` take `lockPort`,
+    /// which has no enable gate, and print their TRACEIO_DEVICE lines
+    /// (asynOctetSyncIO.c:300-364).
+    #[test]
+    fn the_eos_is_set_as_asyn_octet_sync_io_on_a_disabled_port() {
+        use epics_rs::asyn::request::RequestOp;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let name = "eosSyncIoDisabled";
+        publish(name, Serial);
+        let port = get_port(name).unwrap().handle;
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        port.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        port.trace()
+            .set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        port.submit_blocking(RequestOp::SetEnable { yes: false }, AsynUser::default())
+            .unwrap();
+
+        let status = connect(name, EosRefusal::BothFatal);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(status, Ok(()));
+        assert!(
+            text.contains("asynOctetSyncIO setInputEos eoslen 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("asynOctetSyncIO setOutputEos eoslen 1\n"),
+            "{text}"
+        );
     }
 
     #[test]

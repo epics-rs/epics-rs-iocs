@@ -45,7 +45,6 @@ use epics_rs::asyn::interfaces::motor::{
     AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure,
 };
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
@@ -110,14 +109,9 @@ fn smartmotor_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-fn eos_user() -> AsynUser {
-    AsynUser::new(0).with_addr(0)
-}
-
 /// Shared controller endpoint: owns the serial port for one SmartMotor or a
 /// daisy chain of them.
 pub struct SmartMotorController {
-    port: PortHandle,
     writer: SyncIOHandle,
     reader: SyncIOHandle,
     /// Daisy-chain echo mode (C `num_motors != 1` in `send_mess`).
@@ -143,12 +137,12 @@ impl SmartMotorController {
     pub fn new(port: PortHandle, timeout: Duration) -> AsynResult<Self> {
         // C ignores every setInputEos/setOutputEos status
         // (drvSmartMotor.cc:449-454, 598-601).
-        let _ = port.set_output_eos_blocking(eos_user(), OUTPUT_EOS);
-        let _ = port.set_input_eos_blocking(eos_user(), INPUT_EOS);
+        let writer = SyncIOHandle::from_handle(port.clone(), 0, timeout);
+        let _ = writer.set_output_eos(0, OUTPUT_EOS);
+        let _ = writer.set_input_eos(0, INPUT_EOS);
         let mut ctrl = Self {
-            writer: SyncIOHandle::from_handle(port.clone(), 0, timeout),
-            reader: SyncIOHandle::from_handle(port.clone(), 0, RECV_TIMEOUT),
-            port,
+            writer,
+            reader: SyncIOHandle::from_handle(port, 0, RECV_TIMEOUT),
             echo: false,
             num_axes: 0,
             comm_state: CommState::Normal,
@@ -191,8 +185,7 @@ impl SmartMotorController {
     }
 
     fn flush(&self) {
-        let user = AsynUser::new(0).with_addr(0).with_timeout(RECV_TIMEOUT);
-        let _ = self.port.submit_blocking(RequestOp::Flush, user);
+        let _ = self.writer.flush(0);
     }
 
     /// Write one command to `axis` (C `send_mess`). In echo mode it carries the
@@ -210,12 +203,12 @@ impl SmartMotorController {
             out.push(FIRST_ADDR + axis as u8);
             out.extend_from_slice(cmd);
             let _ = self.writer.write_octet(0, &out);
-            let _ = self.port.set_input_eos_blocking(eos_user(), ECHO_EOS);
+            let _ = self.writer.set_input_eos(0, ECHO_EOS);
             let _ = self.reader.read_octet(0, READ_BUF);
         } else {
             let _ = self.writer.write_octet(0, cmd);
         }
-        let _ = self.port.set_input_eos_blocking(eos_user(), INPUT_EOS);
+        let _ = self.writer.set_input_eos(0, INPUT_EOS);
     }
 
     /// Send a query to `axis` and return its `\r`-terminated reply (trimmed).
@@ -512,9 +505,10 @@ mod tests {
     }
 
     /// A daisy chain of one echoing SmartMotor on a port with no EOS support
-    /// of its own, so every EOS set is refused.
+    /// of its own unless `takes_eos`, so every EOS set is refused.
     struct Chain {
         base: epics_rs::asyn::port::PortDriverBase,
+        takes_eos: bool,
         replies: std::collections::VecDeque<Vec<u8>>,
         refuse_writes: Arc<std::sync::atomic::AtomicBool>,
         silent: Arc<std::sync::atomic::AtomicBool>,
@@ -531,6 +525,7 @@ mod tests {
                 epics_rs::asyn::port::InterfaceMask::UNMIGRATED_ALL,
                 epics_rs::asyn::port::InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
+            takes_eos: false,
             replies: Default::default(),
             refuse_writes: Default::default(),
             silent: Default::default(),
@@ -545,6 +540,15 @@ mod tests {
         }
         fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
             &mut self.base
+        }
+        fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            match self.takes_eos {
+                true => Ok(()),
+                false => Err(smartmotor_err("no EOS support")),
+            }
+        }
+        fn set_output_eos(&mut self, user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+            self.set_input_eos(user, eos)
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             if self
@@ -591,10 +595,51 @@ mod tests {
         )
         .unwrap();
         let port = rt.port_handle().clone();
-        assert!(port.set_input_eos_blocking(eos_user(), INPUT_EOS).is_err());
+        assert!(
+            port.set_input_eos_blocking(AsynUser::new(0), INPUT_EOS)
+                .is_err()
+        );
         let ctrl = SmartMotorController::new(port, Duration::from_secs(1)).unwrap();
         assert!(ctrl.echo);
         assert_eq!(ctrl.num_axes(), 1);
+    }
+
+    /// drvSmartMotor.cc:598-604, :622, :449-453: every flush and EOS set is
+    /// `pasynOctetSyncIO`'s, which prints its TRACEIO_DEVICE line.
+    #[test]
+    fn init_flushes_and_sets_the_eos_as_asyn_octet_sync_io() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+
+        let name = "smartSyncIo";
+        let mut chain = chain(name);
+        chain.takes_eos = true;
+        let (rt, _actor) =
+            create_port_runtime(&claim_port(name).unwrap(), chain, RuntimeConfig::default())
+                .unwrap();
+        let trace = rt.port_handle().trace();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(ctrl.echo);
+        // The init flush and the echo restart's.
+        assert_eq!(text.matches("asynOctetSyncIO flush\n").count(), 2, "{text}");
+        assert!(
+            text.contains("asynOctetSyncIO setOutputEos eoslen 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("asynOctetSyncIO setInputEos eoslen 1\n"),
+            "{text}"
+        );
     }
 
     #[test]
