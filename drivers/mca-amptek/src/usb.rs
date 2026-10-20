@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use epics_rs::base::types::c_parse::atoi;
+
 use crate::protocol::{self, TransmitPacketType};
 
 /// `DppLibUsb.h:20-33`.
@@ -92,27 +94,6 @@ pub trait UsbHandle: Send + Sync {
 /// `CDppLibUsb::isAmptekDP5Device` (`DppLibUsb.cpp:140-148`).
 fn is_amptek_dp5((vendor, product): (u16, u16)) -> bool {
     vendor == AMPTEK_DP5_VENDOR_ID && product == AMPTEK_DP5_PRODUCT_ID
-}
-
-/// glibc `atoi`: `(int) strtol(s, NULL, 10)`.
-fn atoi(s: &str) -> i32 {
-    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let (negative, digits) = match s.as_bytes().first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let mut value: i64 = 0;
-    for d in digits.bytes().take_while(u8::is_ascii_digit) {
-        let d = i64::from(d - b'0');
-        value = value.saturating_mul(10);
-        value = if negative {
-            value.saturating_sub(d)
-        } else {
-            value.saturating_add(d)
-        };
-    }
-    value as i32
 }
 
 /// `CDppLibUsb` with `CConsoleHelper`'s `LibUsb_*` state.
@@ -596,12 +577,24 @@ mod tests {
         }
     }
 
+    /// C passes `atoi(addressInfo)` to the `unsigned int` serial
+    /// (ConsoleHelper.cpp:41-43): glibc cuts 4294967297 to 1 and saturates
+    /// 99999999999999999999 to -1.
     #[test]
-    fn atoi_is_glibc_atoi() {
-        assert_eq!(atoi(" 12ab"), 12);
-        assert_eq!(atoi("-7"), -7);
-        assert_eq!(atoi("abc"), 0);
-        assert_eq!(atoi("99999999999999999999"), -1);
+    fn the_serial_is_glibc_atoi() {
+        for (address, serial) in [
+            (" 12ab", 12),
+            ("4294967297", 1),
+            ("99999999999999999999", u32::MAX),
+        ] {
+            let (mut usb, _) = usb(vec![FakeDevice::dp5(|_| Ok(vec![1]))]);
+            let mut asked = None;
+            usb.connect(address, |_, sn| {
+                asked = Some(sn);
+                false
+            });
+            assert_eq!(asked, Some(serial), "{address}");
+        }
     }
 
     /// An empty address opens the first DP5, skipping other devices.
