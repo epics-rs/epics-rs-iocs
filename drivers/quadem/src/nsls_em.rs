@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
@@ -37,7 +38,6 @@ use crate::drv_quad_em::{
 use crate::nsls_em_proto::{self as proto, PingPong};
 use crate::octet::{OctetIo, create_ip_port, outcome};
 use crate::{asyn_print, trace};
-use epics_rs::base::calc::engine::cvt::fmt_e;
 
 /// C++ `epicsThreadSleep(0.01)` handshake poll.
 const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
@@ -508,7 +508,7 @@ impl PortDriver for NslsEmDriver {
             let _ = writeln!(out, "  IP address:       {}", self.ip_address);
             let _ = writeln!(out, "  Module ID:        {}", self.module_id);
             let _ = writeln!(out, "  Firmware version: {}", self.firmware_version);
-            let _ = writeln!(out, "  Scale factor:     {}", fmt_e(scale_factor, 6, false));
+            let _ = writeln!(out, "  Scale factor:     {:e}", CFloat(scale_factor));
         }
         let _ = writeln!(
             out,
