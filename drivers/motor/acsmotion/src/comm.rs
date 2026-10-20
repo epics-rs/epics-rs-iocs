@@ -207,7 +207,8 @@ impl SpiiPlusComm {
     /// `writeReadBinary`: send a query frame, read its `in_bytes` reply,
     /// and return the data with whether another slice is waiting.
     fn write_read_binary(&self, frame: Vec<u8>, in_bytes: usize) -> AsynResult<(Vec<u8>, bool)> {
-        let (reply, status) = self.port()?.lock_port_blocking(move |calls| {
+        let port = self.port()?;
+        let (reply, status) = port.lock_port_blocking(user(CMD_TIMEOUT), move |calls| {
             calls.call(&RequestOp::Flush, user(CMD_TIMEOUT))?;
             calls.call(
                 &RequestOp::OctetWriteBinary { data: frame },
@@ -246,7 +247,8 @@ impl SpiiPlusComm {
     /// controller answers [`ACKNOWLEDGE`] and the command id, or an error.
     fn write_read_ack_binary(&self, frame: Vec<u8>) -> AsynResult<()> {
         let id = frame[1];
-        let (reply, status) = self.port()?.lock_port_blocking(move |calls| {
+        let port = self.port()?;
+        let (reply, status) = port.lock_port_blocking(user(ARRAY_TIMEOUT), move |calls| {
             calls.call(&RequestOp::Flush, user(ARRAY_TIMEOUT))?;
             calls.call(
                 &RequestOp::OctetWriteBinary { data: frame },
