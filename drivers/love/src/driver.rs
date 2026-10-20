@@ -794,7 +794,7 @@ impl LoveDriver {
         // write and read are refused here instead.
         let result = self
             .serial
-            .lock_port_blocking(move |calls| command.execute(calls))
+            .lock_port_blocking(command.serial_user(), move |calls| command.execute(calls))
             .map_err(|e| AsynError::Status {
                 status: e.status(),
                 message: format!("{} error {}", self.ser_name, e.message()),
