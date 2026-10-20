@@ -16,7 +16,10 @@ use epics_rs::base::server::ioc_builder::IocBuilder;
 use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use epics_rs::base::types::EpicsValue;
 use opcua::device_support;
+use opcua::item::Leaf;
+use opcua::queue::ProcessReason;
 use opcua::registry::Registry;
+use parking_lot::Mutex;
 
 use common::{Server, registry};
 
@@ -70,6 +73,15 @@ async fn not_read(db: &PvDatabase, records: usize, wait: Duration) -> usize {
     missing()
 }
 
+/// Whether `leaf`'s queue empties within `wait`.
+async fn drained(leaf: &Mutex<Leaf>, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    while !leaf.lock().queue().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    leaf.lock().queue().is_empty()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_read_queued_behind_the_connection_loss_still_reaches_the_record() {
     let (registry, db) = ioc(1).await;
@@ -98,4 +110,26 @@ async fn every_record_of_a_large_database_takes_its_initial_read() {
         0,
         "of {RECORDS}"
     );
+}
+
+/// The pulse is C's `callbackRequest` (`RecordConnector.cpp:200-201`), which
+/// `iocPause` does not hold back the way it holds `scanIoRequest`, so an
+/// update that lands while the IOC is paused is taken then, and so is the one
+/// after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_that_lands_while_the_ioc_is_paused_still_reaches_the_record() {
+    let (registry, db) = ioc(1).await;
+    registry.start();
+    assert_eq!(not_read(&db, 1, Duration::from_secs(2)).await, 0);
+    let leaf = {
+        let session = registry.session("S1").unwrap();
+        let items = session.items.lock();
+        items[0].lock().leaves[0].clone()
+    };
+    assert!(drained(&leaf, Duration::from_secs(2)).await);
+    db.scan_control().pause();
+    for reason in [ProcessReason::ReadFailure, ProcessReason::WriteFailure] {
+        leaf.lock().request_processing(reason);
+        assert!(drained(&leaf, Duration::from_secs(2)).await, "{reason:?}");
+    }
 }

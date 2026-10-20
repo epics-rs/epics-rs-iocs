@@ -922,6 +922,13 @@ impl DeviceSupport for OpcuaDevice {
         true
     }
 
+    /// That `callbackRequest` is not `scanIoRequest`: `iocPause` does not
+    /// stop it, so a pulse that lands while paused is a pass then. Dropping
+    /// it would leave an update queued with no pulse to take it.
+    fn io_intr_processes_directly(&self) -> bool {
+        true
+    }
+
     /// The pass an update's pulse runs takes the update into an output record
     /// and writes nothing: the C write dsets pop it in place of writing
     /// (`devOpcua.cpp:418-435`).
