@@ -844,6 +844,64 @@ mod tests {
         .unwrap()
     }
 
+    /// C `setIntegerParam(merlinEnableCounter1, atoi(fromLabviewValue))`
+    /// (merlinDetector.cpp:575): glibc's atoi stops at the first non-digit.
+    #[test]
+    fn a_read_back_mode_is_atoi() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            loop {
+                let mut header = [0u8; MPX_FRAME_HEADER_LEN];
+                if sock.read_exact(&mut header).is_err() {
+                    return;
+                }
+                let len: usize = std::str::from_utf8(&header[4..14])
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut body = vec![0u8; len - 1];
+                sock.read_exact(&mut body).unwrap();
+                let body = String::from_utf8(body).unwrap();
+                let mut f = body.split(',');
+                let (kind, name) = (f.next().unwrap(), f.next().unwrap());
+                let reply = match (kind, name) {
+                    ("GET", MPXVAR_ENABLECOUNTER1) => format!("GET,{name},1x,0"),
+                    ("GET", _) => format!("GET,{name},0,0"),
+                    _ => format!("{kind},{name},0"),
+                };
+                let msg = format!("MPX,{:010},{reply}", reply.len() + 1);
+                sock.write_all(msg.as_bytes()).unwrap();
+            }
+        });
+        let ip = "MERLIN_ATOI_CMD";
+        let driver = DrvAsynIPPort::new(ip, &addr.to_string()).unwrap();
+        let (runtime, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let mut det = MerlinDetector::new(
+            "MERLIN_ATOI",
+            MpxConnection::new(
+                SyncIOHandle::from_handle(handle, 0, Duration::ZERO),
+                MPX_MAXLINE,
+            ),
+            512,
+            512,
+            DetectorType::MerlinQuad,
+            1 << 20,
+            Arc::new(SharedState::new()),
+        )
+        .unwrap();
+        let counter1 = det.params.enable_counter1;
+        det.ad.port_base.set_int32_param(counter1, 0, 0).unwrap();
+        det.set_mode_commands(counter1).unwrap();
+        assert_eq!(det.ad.port_base.get_int32_param(counter1, 0).unwrap(), 1);
+    }
+
     /// C ignores both `pasynOctetSyncIO->connect` statuses
     /// (merlinDetector.cpp:1398-1401): with neither socket port configured
     /// the detector port still exists.

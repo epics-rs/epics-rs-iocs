@@ -15,6 +15,7 @@ use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::types::c_parse::atoi;
 
 use crate::protocol::{self, MpxError};
 use crate::types::*;
@@ -321,12 +322,9 @@ impl MpxConnection {
         }
     }
 
-    /// `GET <name>` parsed as an integer, or `None` if the device refused.
+    /// `GET <name>` read with C `atoi`, or `None` if the device refused.
     pub fn get_i32(&self, ad: &mut ADDriverBase, name: &str, timeout: Duration) -> Option<i32> {
-        match self.get(ad, name, timeout) {
-            Ok(v) => v.trim().parse().ok(),
-            Err(_) => None,
-        }
+        self.get(ad, name, timeout).ok().map(atoi)
     }
 }
 
