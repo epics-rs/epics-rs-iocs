@@ -7,6 +7,7 @@ use uldaq_sys::*;
 
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::runtime::general_time::EPICS_EPOCH_UNIX_SECS;
 
 use crate::params::*;
 use crate::scaler::print_get_status;
@@ -36,6 +37,8 @@ pub struct McsState {
     pub chan_map: Vec<usize>,
     /// C `MCSPoint0Skip`: the scan's first point is not stored.
     pub point0_skip: bool,
+    /// C `MCSErased_`, which only `report` reads.
+    pub erased: bool,
 }
 
 impl McsState {
@@ -58,6 +61,7 @@ impl McsState {
             counter_enable: 0x1FF, // all 9 enabled by default
             chan_map: Vec::new(),
             point0_skip: false,
+            erased: false,
         }
     }
 }
@@ -73,6 +77,7 @@ impl McsState {
 /// clock, which an acquisition in progress keeps counting from. C
 /// `USBCTR::eraseMCS`; the time bases are left alone.
 pub fn erase_mcs(state: &mut McsState, num_points: usize) {
+    state.erased = true;
     for buf in &mut state.mcs_buffers {
         let n = num_points.min(buf.len());
         buf[..n].fill(0);
@@ -338,13 +343,14 @@ impl McsPass {
 /// Copy the points the scan has transferred and stop it once the hardware
 /// is idle or the preset real time has passed. C `USBCTR::readMCS`.
 pub fn read_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) -> McsPass {
+    // C reads the state and index whatever the call returned
+    // (drvUSBCTR.cpp:743-754): a scan that ended on a transfer error
+    // reports SS_IDLE and its last index beside the error.
     let polled = device.daq_in_scan_status();
+    // C reads uninitialised locals where ulc.cpp fills neither (bad handle, no subsystem, exception); 0 stops as SS_IDLE. C defect, not copied.
     print_get_status(trace, "readMCS", &polled);
-    let (scan_status, current_index) = match &polled {
-        Ok((scan, xfer)) => (*scan, xfer.current_index),
-        Err(_) => (SS_IDLE, -1),
-    };
-    if scan_status == SS_IDLE {
+    let current_index = polled.xfer.current_index;
+    if polled.status == SS_IDLE {
         state.running = false;
     }
 
@@ -401,16 +407,78 @@ pub fn stop_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) -> 
     None
 }
 
+/// Seconds past the EPICS epoch, as C stamps each absolute-time point with
+/// `now.secPastEpoch + now.nsec/1.e9`.
 fn current_time_secs() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+        - EPICS_EPOCH_UNIX_SECS as f64
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// libuldaq's ERR_OVERRUN (uldaq.h:152), a transfer error.
+    const ERR_OVERRUN: UlError = 18;
+
+    thread_local! {
+        /// What the mocked `ulDaqInScanStatus` reports: code, scan state,
+        /// total count and index.
+        static DAQ_IN_STATUS: Cell<Option<(UlError, i32, u64, i64)>> = const { Cell::new(None) };
+    }
+
+    /// The test binary's definition wins over libuldaq's. Unset, it answers
+    /// as libuldaq does for the null handle: ERR_BAD_DEV_HANDLE (2), nothing
+    /// filled.
+    #[unsafe(no_mangle)]
+    extern "C" fn ulDaqInScanStatus(
+        _handle: uldaq_sys::DaqDeviceHandle,
+        status: *mut i32,
+        xfer: *mut TransferStatus,
+    ) -> UlError {
+        let Some((code, scan, count, index)) = DAQ_IN_STATUS.get() else {
+            return 2;
+        };
+        unsafe {
+            *status = scan;
+            (*xfer).current_total_count = count;
+            (*xfer).current_index = index;
+        }
+        code
+    }
+
+    /// C reads a failed status's state and index and copies the last
+    /// points (drvUSBCTR.cpp:743-754).
+    #[test]
+    fn a_scan_that_ended_on_a_transfer_error_keeps_its_last_points() {
+        let mut state = McsState::new(4);
+        state.running = true;
+        state.num_counters_enabled = 2;
+        state.chan_map = vec![0, 1];
+        state.scan_buffer = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        DAQ_IN_STATUS.set(Some((ERR_OVERRUN, SS_IDLE, 6, 5)));
+
+        let pass = read_mcs(&DaqDevice::unconnected(), &mut state, &SelfTrace::default());
+        assert!(pass.stopped);
+        assert_eq!(pass.current_point, 3);
+        assert_eq!(state.mcs_buffers[0][..3], [1, 3, 5]);
+        assert_eq!(state.mcs_buffers[1][..3], [2, 4, 6]);
+    }
+
+    #[test]
+    fn absolute_time_counts_from_the_epics_epoch() {
+        let unix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let offset = unix - current_time_secs();
+        assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
+    }
 
     #[test]
     fn a_completed_scan_counts_every_point() {

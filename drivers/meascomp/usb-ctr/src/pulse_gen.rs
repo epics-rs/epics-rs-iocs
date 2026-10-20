@@ -8,11 +8,19 @@ use epics_rs::asyn::trace::TraceMask;
 
 use crate::trace::SelfTrace;
 
-/// C drvUSBCTR's timer limits.
+/// The clock libuldaq runs the USB-CTR timers from (UsbCtrx.cpp:21).
+const CLOCK_FREQUENCY: f64 = 96e6;
+
+/// C drvUSBCTR's timer limits (drvUSBCTR.cpp:87-90), except the delay.
+/// C's MAX_DELAY 67.11 is 2^32 ticks of a 64 MHz clock; libuldaq sends the
+/// delay as a u32 count of this one (TmrUsb1208hs.cpp:71,95) and refuses a
+/// longer one (TmrDevice.cpp:72-75), so C fails a delay in (44.74, 67.11] s
+/// with ERR_BAD_INITIAL_DELAY instead of clamping it. C defect, not copied
+/// (upstream-c-defects #229).
 const MIN_FREQUENCY: f64 = 0.023;
 const MAX_FREQUENCY: f64 = 48e6;
 const MIN_DELAY: f64 = 0.0;
-const MAX_DELAY: f64 = 67.11;
+const MAX_DELAY: f64 = u32::MAX as f64 / CLOCK_FREQUENCY;
 
 /// One timer's `PULSE_GEN_*` parameters.
 pub struct PulseRequest {
@@ -99,4 +107,17 @@ pub fn stop(trace: &SelfTrace, device: &DaqDevice, timer: i32) -> Result<()> {
             ),
         );
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_longest_delay_fits_the_timer_count() {
+        // libuldaq truncates delay * clock to a tick count and refuses one
+        // above UINT_MAX (TmrDevice.cpp:72-75).
+        assert!((MAX_DELAY * CLOCK_FREQUENCY) as u64 <= u64::from(u32::MAX));
+        assert!(((MAX_DELAY + 1e-6) * CLOCK_FREQUENCY) as u64 > u64::from(u32::MAX));
+    }
 }

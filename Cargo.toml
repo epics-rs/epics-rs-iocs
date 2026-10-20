@@ -19,6 +19,8 @@ members = [
     "drivers/ad/psl",
     "drivers/ad/pixirad",
     "drivers/ad/bruker",
+    "drivers/ad/genicam",
+    "drivers/ad/pylon",
     "drivers/motor/amci",
     "drivers/motor/common",
     "drivers/motor/micronix",
@@ -85,6 +87,7 @@ members = [
     "iocs/ad/psl-ioc",
     "iocs/ad/pixirad-ioc",
     "iocs/ad/bruker-ioc",
+    "iocs/ad/pylon-ioc",
     "iocs/ether-ip/ether-ip-ioc",
     "iocs/ur-robot/ur-robot-ioc",
     "iocs/ip/ip-ioc",
@@ -255,6 +258,77 @@ libraries = [
 # leaving I/O Intr records permanently without updates; a process cycle
 # costs 0.65 us against 0.29.3's 7.7 us; and an `ADDriverBase` detector
 # can load an attributes file at all.
+#
+# 0.30.1 carries the seven fixes filed from this workspace's measComp port.
+# Its one break lands widely: `register_port(name, handle)` takes the trace
+# from the handle the driver was bound to, so the third argument leaves 38
+# calls here, `register_modbus_commands` loses its trace argument too, and
+# the `TraceManager` locals and parameters that only fed them go with them
+# (quadem's configure commands, pmacAsynIPConfigure, microepsilon's
+# `configure`, the ur-robot and ip `register` helpers). Behavioral: a failed
+# async device write alarms, `create_monitor_set` works after iocInit, a
+# plain I/O Intr record rings every callback, and
+# `register_asyn_device_support` registers the asyn shell commands on
+# `PortManager::global()`.
+#
+# 0.30.2 carries five more fixes this port filed. Its one break is
+# `DeviceSupportContext`, which gains a `record_type` the factory gate
+# reads: ten test contexts in yokogawa-gm10/-mw100 name their record
+# ("ai", and "bo" for the two poll triggers). Behavioral: one output write on a non-blocking port reaches the
+# driver once instead of twice, `asynSetTrace*` writes the named port's own
+# trace, `PortServices::new` builds its own trace instead of rebinding the
+# one it is passed, a waveform with DTYP `asyn*ArrayOut` and its link in INP
+# writes (C's `asynXxxArrayWfOut` shape, which `WaveGen<n>UserWF` uses), and
+# the universal factory refuses a (record type, DTYP) pair no `device()`
+# line declares, as a DTYP put does in C. That last one drops records this
+# workspace had bound only because the factory took anything: DTYP
+# `asynOctet` where C declares `asynOctetRead`/`asynOctetWrite`, and an ai
+# reading `asynOctetRead`.
+#
+# 0.31.0 is the widest bump yet -- a toolchain floor plus three break
+# families, 22 files in 18 crates here. The floor comes first: epics-rs
+# pins 1.99.0 (its `9d41250`) because `ad-plugins-rs` asks rust-hdf5 0.7.2
+# for `all_filters`, which pulls rust-zstd 0.4.1, which calls
+# `std::hint::cold_path`. rust-toolchain.toml and both CI pins are set
+# equal to that upstream pin rather than to the floor, so a lint this
+# workspace sees is the lint epics-rs CI saw. 1.99 then adds two warnings
+# that `-D warnings` makes fatal: the two-ordering `Atomic*::fetch_update`
+# is deprecated ("renamed to `try_update` for consistency"), which is what
+# merlin's `images_remaining` call takes, and clippy's `double_must_use`
+# fires on the message-less `#[must_use]` async-trait 0.1.89 generates,
+# which moves drivers/opcua's own pin to 0.1.92.
+#
+# Family one: all twelve array variants of `EpicsValue`, and pva's
+# `NdArrayBuffer` and `TypedScalarArray`, hold a `SharedArray<T>` or
+# `PvArray<T>` rather than a `Vec<T>`. Both deref to `[T]`, so read and
+# slice sites compile unchanged and only construction moves -- and it
+# moves at whatever already owns the conversion, which is why
+# drivers/opcua's `clamp` and drivers/mca's `read_spectrum` changed return
+# type once instead of their ten and one call sites changing each;
+# ether-ip and the opcua/pva-driver tests take `.into()` per literal.
+#
+# Family two: `NDArrayPool::new` returns `Arc<Self>`, built with
+# `Arc::new_cyclic` because an array now holds a `Weak` back-pointer to
+# its pool. Of the ten call sites here, five shed a now-redundant
+# `Arc::new` wrapper and simdetector's test helper retypes its return;
+# the other four infer the change and are untouched.
+#
+# Family three is that back-pointer's consequence: `pool_id` is a method
+# over a `pub(crate)` `pool` field and `NDArray` has a `Drop` that
+# recycles the buffer through it, so from outside ad-core-rs a struct
+# literal cannot be written and a field cannot be moved out. Sixteen
+# literals in bruker, eiger, psl, pixirad, merlin, pilatus, url,
+# photonii, pva-driver and d435i become `NDArray::with_data(dims, data)`
+# plus `update_time_stamps(ts)`, which retires the seventeen `data_size`
+# lines those literals carried (nine `total_bytes()` calls, six hand
+# multiplications, two shorthands) along with the duplicated timestamp
+# pair; three keep that pair field by field, with a comment, because
+# their two halves have different sources. eiger borrows `theirs.data`
+# instead of moving it, and its six `compress_bslz4` calls unwrap the
+# `Result<NDArray, CodecFailure>` the public codec entry points now
+# return. `NDPluginProcess::process_array` taking `&Arc<NDArray>`,
+# `NDGatherConfigure` gaining `maxPorts`, and the kebab-cased example IOC
+# binaries reach no caller here.
 #
 # Cargo.lock pins the exact patch release.
 epics-rs = "0.32.0"

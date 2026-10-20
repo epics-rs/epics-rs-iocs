@@ -3,7 +3,6 @@
 //! Usage:
 //!   cargo run -p delaygen-ioc -- iocs/delaygen-ioc/st.cmd
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::{PortClaim, claim_port};
@@ -69,7 +68,7 @@ async fn main() -> CaResult<()> {
 
     // Standard asyn iocsh commands — provides drvAsynSerialPortConfigure /
     // drvAsynIPPortConfigure / asynOctetSetInputEos / asynOctetSetOutputEos.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // C drvAsynDG645(myport,ioport,ioaddr)

@@ -70,6 +70,11 @@ async fn main() -> CaResult<()> {
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
 
+    // C's app links mcaSupport.dbd (measCompAppInclude.dbd:8) for st.cmd's
+    // optional mca-record form of the MCS spectra.
+    let (mca_name, mca_factory) = mca_rs::mca_record_factory();
+    app = app.register_record_type(mca_name, move || mca_factory());
+
     let (scaler_name, scaler_factory) = epics_rs::scaler::scaler_record_factory();
     app = app.register_record_type(scaler_name, move || scaler_factory());
     // `busy` and `transform` are opt-in in epics-rs (dropped from the default
@@ -84,7 +89,8 @@ async fn main() -> CaResult<()> {
     // Contributing the menu here makes that assignment resolve.
     epics_rs::base::server::record::register_device_menu(scaler_name, SCALER_DEVICES);
 
-    // Universal asyn device support
+    // Universal asyn device support, and with it asyn.dbd's shell commands
+    // (asynReport, asynSetTraceMask, ...) on PortManager::global().
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Autosave

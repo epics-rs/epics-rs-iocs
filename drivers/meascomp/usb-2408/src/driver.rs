@@ -29,6 +29,12 @@ fn device_addr(addr: i32) -> i32 {
     if addr == -1 { 0 } else { addr }
 }
 
+/// C `mapTriggerType` (drvMultiFunction.cpp:1383-1435): the cbw trigger
+/// types 0..19 except the two hysteresis gates have a uldaq trigger.
+fn trigger_mode_maps(value: i32) -> bool {
+    matches!(value, 0 | 1 | 4..=19)
+}
+
 /// The element count of a waveform read: C's `*nIn > (size_t)numPoints` cap
 /// (drvMultiFunction.cpp:2463, :2496), where a negative count casts huge and
 /// caps nothing. The copy still stops at the data, which C reads past.
@@ -479,11 +485,14 @@ impl MultiFunctionDriver {
             } else {
                 &wave_gen_state.int_waveforms[k]
             };
-            // C reads the user scaling at the scan index, not the channel.
+            // C reads the user scaling at the span index i, so a span that
+            // starts past channel 0 takes another channel's Amplitude and
+            // Offset (drvMultiFunction.cpp:1653-1654). C defect, not copied
+            // (upstream-c-defects #227).
             let (amplitude, offset) = if wave_type == wave_gen::WAVE_TYPE_USER {
                 (
-                    self.float(p.wave_gen_amplitude, i as i32),
-                    self.float(p.wave_gen_offset, i as i32),
+                    self.float(p.wave_gen_amplitude, k as i32),
+                    self.float(p.wave_gen_offset, k as i32),
                 )
             } else {
                 (1.0, 0.0)
@@ -518,6 +527,20 @@ impl MultiFunctionDriver {
             .set_float64_param(p.wave_gen_dwell_actual, 0, dwell)?;
         self.base
             .set_float64_param(p.wave_gen_total_time, 0, dwell * num_points as f64)?;
+        // C keeps the axis of the requested dwell after AOutScan returns the
+        // rate it runs (drvMultiFunction.cpp:1738-1757). C defect, not copied
+        // (upstream-c-defects #230).
+        let time_wf = if first_type == wave_gen::WAVE_TYPE_USER {
+            p.wave_gen_user_time_wf
+        } else {
+            p.wave_gen_int_time_wf
+        };
+        let times = wave_dig::time_axis(num_points as i32, dwell);
+        updates.push(ParamSetValue::array(
+            time_wf,
+            0,
+            ParamValue::Float32Array(times.into()),
+        ));
         Ok(0)
     }
 
@@ -597,15 +620,22 @@ impl MultiFunctionDriver {
         let dev = device.lock().unwrap();
         let state = self.state.clone();
         let mut st = state.lock().unwrap();
-        if (0..MAX_ANALOG_OUT as i32).contains(&addr) {
-            self.define_waveform(&mut st.wave_gen, addr, trace, updates)?;
-        }
+        // C drops defineWaveform's -1 (drvMultiFunction.cpp:2178, :2300), so
+        // a refused point count still puts successfully. C defect, not copied
+        // (upstream-c-defects #231).
+        let refused: UlError = if (0..MAX_ANALOG_OUT as i32).contains(&addr)
+            && !self.define_waveform(&mut st.wave_gen, addr, trace, updates)?
+        {
+            -1
+        } else {
+            0
+        };
         if !st.wave_gen.running {
-            return Ok(0);
+            return Ok(refused);
         }
         let restore = self.wave_gen_restore();
         let stopped = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, &restore, trace);
-        Ok(stopped | self.start_wave_gen(&dev, &mut st.wave_gen, trace, updates)?)
+        Ok(refused | stopped | self.start_wave_gen(&dev, &mut st.wave_gen, trace, updates)?)
     }
 
     /// Whether `chan` is configured as a thermocouple input. ulAISetConfig
@@ -898,7 +928,12 @@ impl PortDriver for MultiFunctionDriver {
                     "Set thermocouple type",
                 );
                 let detect = self.int(self.params.thermocouple_open_detect, addr);
-                self.set_open_tc_detect(&dev, addr, detect);
+                // C drops this status (drvMultiFunction.cpp:1981, :2020). C
+                // defect, not copied (upstream-c-defects #231).
+                let otd = self.set_open_tc_detect(&dev, addr, detect);
+                if status == 0 {
+                    status = otd;
+                }
             }
         } else if reason == self.params.analog_in_rate {
             let dev = self.device.lock().unwrap();
@@ -916,7 +951,7 @@ impl PortDriver for MultiFunctionDriver {
             );
         } else if reason == self.params.thermocouple_open_detect && self.is_thermocouple(addr) {
             let dev = self.device.lock().unwrap();
-            self.set_open_tc_detect(&dev, addr, value);
+            status = self.set_open_tc_detect(&dev, addr, value);
         } else if reason == self.params.temperature_sensor {
             let dev = self.device.lock().unwrap();
             status = trace.report(
@@ -935,6 +970,19 @@ impl PortDriver for MultiFunctionDriver {
                 FUNCTION,
                 "Setting temperature wiring",
             );
+        } else if reason == self.params.trigger_mode {
+            // C's Linux build only caches the mapped type, which no scan
+            // reads (drvMultiFunction.cpp:2074-2083).
+            if !trigger_mode_maps(value) {
+                trace.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}::mapTriggerType unsupported cbwTriggerType={value}\n"
+                    ),
+                );
+                status = -1;
+            }
+            trace.report_error(status, FUNCTION, "Setting trigger mode");
         } else if reason == self.params.pulse_gen_run {
             // C starts on any 1, running or not: a counted train ends unseen.
             let device = self.device.clone();
@@ -1335,6 +1383,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trigger_mode_refuses_the_hysteresis_gates_and_out_of_range() {
+        let mapped: Vec<i32> = (-1..=20).filter(|&v| trigger_mode_maps(v)).collect();
+        assert_eq!(
+            mapped,
+            [
+                0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            ]
+        );
+    }
+
+    #[test]
     fn get_bounds_is_the_converter_range_of_an_analog_value() {
         let mut base = PortDriverBase::new(
             "MFBOUNDS",
@@ -1630,6 +1689,59 @@ mod tests {
         let user_wf = AsynUser::new(p.wave_gen_user_wf).with_addr(1);
         assert_eq!(drv.read_float32_array(&user_wf, &mut buf).unwrap(), 3);
         assert_eq!(buf, [0.5, 1.5, 2.5]);
+    }
+
+    /// A user span starting at channel 1 scales by channel 1's Amplitude
+    /// and Offset (upstream-c-defects #227).
+    #[test]
+    fn a_user_waveform_takes_its_own_channels_scaling() {
+        let mut drv =
+            MultiFunctionDriver::new("MFUSERK", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        drv.state.lock().unwrap().wave_gen.user_waveforms[1][..2].copy_from_slice(&[0.5, 1.0]);
+        for (reason, addr, value) in [
+            (p.wave_gen_user_num_points, 0, 2),
+            (p.wave_gen_enable, 1, 1),
+            (p.wave_gen_wave_type, 1, wave_gen::WAVE_TYPE_USER),
+        ] {
+            drv.base.set_int32_param(reason, addr, value).unwrap();
+        }
+        for (reason, addr, value) in [
+            (p.wave_gen_user_dwell, 0, 0.001),
+            (p.wave_gen_amplitude, 0, 1.0),
+            (p.wave_gen_offset, 0, 0.0),
+            (p.wave_gen_amplitude, 1, 2.0),
+            (p.wave_gen_offset, 1, 0.25),
+        ] {
+            drv.base.set_float64_param(reason, addr, value).unwrap();
+        }
+        // ulAOutScan fails on the null handle after the buffer is built.
+        let _ = drv.write_int32(&mut AsynUser::new(p.wave_gen_run), 1);
+        assert_eq!(
+            drv.state.lock().unwrap().wave_gen.scan_buffer,
+            [
+                wave_gen::volts_to_dac(0.5, 2.0, 0.25),
+                wave_gen::volts_to_dac(1.0, 2.0, 0.25)
+            ]
+        );
+    }
+
+    /// A refused point count and a refused open-detect fail the write
+    /// (upstream-c-defects #231).
+    #[test]
+    fn refused_generator_and_open_detect_settings_fail_the_write() {
+        let mut drv =
+            MultiFunctionDriver::new("MFREFUSE", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        let mut points = AsynUser::new(p.wave_gen_user_num_points);
+        assert!(drv.write_int32(&mut points, 16).is_ok());
+        assert!(drv.write_int32(&mut points, 17).is_err());
+        drv.base
+            .set_int32_param(p.analog_in_type, 1, AI_CHAN_TYPE_TC)
+            .unwrap();
+        // ulAISetConfig(OTD_MODE) fails on the null handle.
+        let mut detect = AsynUser::new(p.thermocouple_open_detect).with_addr(1);
+        assert!(drv.write_int32(&mut detect, 1).is_err());
     }
 
     #[test]

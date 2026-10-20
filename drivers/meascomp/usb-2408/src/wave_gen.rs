@@ -307,7 +307,12 @@ pub fn read_wave_gen(
     restore: &[(i32, i32)],
     trace: &SelfTrace,
 ) -> Result<(), UlError> {
-    let (status, xfer) = device.analog_out_scan_status().map_err(|e| e.code)?;
+    let polled = device.analog_out_scan_status();
+    // C `goto error`s on a failed status (drvMultiFunction.cpp:2666-2670).
+    if let Some(e) = polled.error {
+        return Err(e.code);
+    }
+    let (status, xfer) = (polled.status, polled.xfer);
     trace.print(
         TraceMask::IO_DRIVER,
         format_args!(

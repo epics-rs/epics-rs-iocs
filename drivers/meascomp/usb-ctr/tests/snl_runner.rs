@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_rs::base::runtime::task::{Reactor, TaskHandle, sleep};
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::ioc_builder::IocBuilder;
 use epics_rs::base::types::EpicsValue;
@@ -37,10 +38,10 @@ async fn ioc(acquiring: i32) -> Arc<PvDatabase> {
     db
 }
 
-fn start(db: &Arc<PvDatabase>, macros: &str) -> tokio::task::JoinHandle<()> {
+fn start(db: &Arc<PvDatabase>, macros: &str) -> TaskHandle<()> {
     let config = UsbCtrSnlConfig::from_macros(&seq_macros(macros));
     let db = (**db).clone();
-    tokio::spawn(async move {
+    Reactor::current().expect("a runtime").spawn(async move {
         run(config, db).await.unwrap();
     })
 }
@@ -59,7 +60,7 @@ async fn expect(db: &PvDatabase, want: &[(&str, f64)]) {
         if all {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(10)).await;
     }
     let mut got = Vec::new();
     for &(pv, _) in want {

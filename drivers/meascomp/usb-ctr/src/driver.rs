@@ -240,6 +240,37 @@ impl PortDriver for CtrDriver {
         &mut self.base
     }
 
+    /// C `USBCTR::report` (drvUSBCTR.cpp:1545-1570): the timers, scaler and
+    /// MCS state, then `asynPortDriver::report`.
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(out, "  Port: {}", self.base.port_name);
+        if level >= 1 {
+            let _ = writeln!(out, "  Pulse generators:");
+            for (i, running) in self.pulse_running.iter().enumerate() {
+                let _ = writeln!(out, "    {i}: Running:{}", i32::from(*running));
+            }
+            let current_point = self.int(self.params.mcs_current_point, 0);
+            let st = self.state.lock().unwrap();
+            let _ = writeln!(out, "  numCounters: {}", st.num_counters);
+            let _ = writeln!(out, "  Scaler:");
+            let _ = writeln!(out, "    Running: {}", i32::from(st.scaler.running));
+            // C keeps both arrays as epicsInt32.
+            for i in 0..st.num_counters {
+                let _ = writeln!(
+                    out,
+                    "    {i}: preset={}, count={}",
+                    st.scaler.presets[i] as i32, st.scaler.counts[i] as i32
+                );
+            }
+            let _ = writeln!(out, "  MCS:");
+            let _ = writeln!(out, "    Running: {}", i32::from(st.mcs.running));
+            let _ = writeln!(out, "    maxTimePoints: {}", self.max_time_points);
+            let _ = writeln!(out, "    MCSErased: {}", i32::from(st.mcs.erased));
+            let _ = writeln!(out, "    currentPoint: {current_point}");
+        }
+        self.asyn_port_driver_report(out, level);
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let mut status: UlError = 0;
         let trace = self.state.lock().unwrap().trace.clone();
@@ -318,6 +349,7 @@ impl PortDriver for CtrDriver {
                 let num_channels = num_channels.max(0) as usize;
                 let dev = self.device.lock().unwrap();
                 let mut st = self.state.lock().unwrap();
+                st.mcs.erased = false;
                 let dwell = self.float(self.params.mca_dwell_time, 0);
                 let ch_adv = self.int(self.params.mca_ch_advance_source, 0);
                 let prescale = self.int(self.params.mca_prescale, 0);
@@ -343,6 +375,13 @@ impl PortDriver for CtrDriver {
                 );
                 self.base
                     .set_float64_param(self.params.mca_dwell_time, 0, actual_dwell)?;
+                // C writes the dwell the clock runs back without recomputing
+                // its axis (drvUSBCTR.cpp:711, :873-880). C defect, not copied
+                // (upstream-c-defects #230).
+                let times = mcs::compute_times(&mut st.mcs, num_channels, actual_dwell);
+                let times = ParamValue::Float32Array(times.into());
+                self.base
+                    .do_callbacks_array(self.params.mcs_time_wf, 0, times)?;
                 self.base
                     .set_int32_param(self.params.mcs_current_point, 0, 0)?;
             }
@@ -760,6 +799,34 @@ mod tests {
                 .is_empty(),
             "the time base was stored"
         );
+    }
+
+    /// The start writes back the dwell ulDaqInScan runs and posts the axis
+    /// of that dwell (upstream-c-defects #230); on the null handle the scan
+    /// fails and the dwell stays the one asked for.
+    #[test]
+    fn an_mcs_start_posts_the_time_base_of_the_dwell_it_runs() {
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let mut drv = CtrDriver::new("CTRSTART", DaqDevice::unconnected(), 16).unwrap();
+        let p = drv.params;
+        drv.base.set_int32_param(p.mca_num_channels, 0, 4).unwrap();
+        drv.base
+            .set_float64_param(p.mca_dwell_time, 0, 0.25)
+            .unwrap();
+        drv.base.own_interrupts(InterruptGate::opened());
+        drv.base.call_param_callbacks(0).unwrap();
+        let mut rx = drv.base.interrupts.subscribe_async(256, 4096);
+
+        let _ = drv.write_int32(&mut AsynUser::new(p.mca_start_acquire), 1);
+        let axes: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| v.reason == p.mcs_time_wf)
+            .map(|v| match v.value {
+                ParamValue::Float32Array(a) => a.to_vec(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(axes, [vec![0.0f32, 0.25, 0.5, 0.75]]);
     }
 
     #[test]

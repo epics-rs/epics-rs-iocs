@@ -1240,7 +1240,7 @@ mod tests {
         let registry = registry_with("gm10dev", instrument);
         let f = factory(registry);
         let ctx = DeviceSupportContext {
-            record_type: "ai",
+            record_type: "bo",
             dtyp: DTYP,
             inp: "",
             out: "gm10dev CHAN_TRIG",
