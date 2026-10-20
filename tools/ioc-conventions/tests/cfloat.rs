@@ -12,18 +12,6 @@ use std::path::Path;
 /// `(file, placeholder, argument, reason)`, matched exactly; an entry that
 /// matches no site fails the gate.
 const EXEMPT: &[(&str, &str, &str, &str)] = &[
-    (
-        "drivers/twincat-ads/src/driver.rs",
-        "{period:.3}",
-        "period",
-        "poll_info's own summary of a Duration, not C's %g line",
-    ),
-    (
-        "drivers/twincat-ads/src/driver.rs",
-        "{elapsed:.3}",
-        "elapsed",
-        "poll_info's own summary of a Duration, not C's %g line",
-    ),
     // C %f, left to the drvMultiFunction.cpp port in flight; routing them
     // through CFloat turns these entries stale.
     (

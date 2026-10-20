@@ -73,6 +73,7 @@ use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::recgbl::alarm_status;
 
@@ -2143,14 +2144,28 @@ fn register_port(shared: &Arc<AdsShared>) {
         .push((shared.cfg.port_name.clone(), Arc::clone(shared)));
 }
 
+/// `adsPollInfo`'s first line, with C's `%g` seconds (:1309).
+fn bulk_loop_line(port_name: &str, period: Duration, elapsed: Duration) -> String {
+    let (period, elapsed) = (
+        CFloat(period.as_secs_f64()).g(),
+        CFloat(elapsed.as_secs_f64()).g(),
+    );
+    format!("{port_name}: bulk read loop: period {period} s, last cycle {elapsed} s")
+}
+
 /// iocsh `adsPollInfo` — what the bulk reader is polling (C `poll_info`, :1307).
 ///
 /// `filter` is matched against the PLC address; empty prints every variable.
 pub fn poll_info(filter: &str) {
     for (port_name, shared) in PORTS.lock().iter() {
-        let period = shared.cfg.bulk_period().as_secs_f64();
-        let elapsed = shared.bulk_elapsed.lock().as_secs_f64();
-        println!("{port_name}: bulk read loop: period {period:.3} s, last cycle {elapsed:.3} s");
+        println!(
+            "{}",
+            bulk_loop_line(
+                port_name,
+                shared.cfg.bulk_period(),
+                *shared.bulk_elapsed.lock()
+            )
+        );
 
         let params = shared.params.lock();
         for (gi, group) in shared.bulk.lock().iter().enumerate() {
@@ -2217,6 +2232,18 @@ mod tests {
             reason,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn poll_info_prints_bulk_seconds_as_c_g() {
+        assert_eq!(
+            bulk_loop_line(
+                "ADS1",
+                Duration::from_millis(50),
+                Duration::from_micros(1234)
+            ),
+            "ADS1: bulk read loop: period 0.05 s, last cycle 0.001234 s"
+        );
     }
 
     #[test]
