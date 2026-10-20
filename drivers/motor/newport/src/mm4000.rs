@@ -2174,7 +2174,7 @@ mod tests {
                 Model2Axis::new(a.clone(), getter, log)
             })
             .collect();
-        DRIVER.set_card(2, model2, 100, 1000);
+        DRIVER.start_card(2, model2, 100, 1000).unwrap();
         let args = vec![
             ArgValue::String("mm4kForce".into()),
             ArgValue::String("mm4kForceTest".into()),
@@ -2248,7 +2248,7 @@ mod tests {
             })
             .collect();
         // Idle polls an hour apart, so only the test's own calls trace.
-        driver.set_card(2, model2, 3_600_000, 3_600_000);
+        driver.start_card(2, model2, 3_600_000, 3_600_000).unwrap();
         let args = vec![
             ArgValue::String(port.into()),
             ArgValue::String(port.into()),

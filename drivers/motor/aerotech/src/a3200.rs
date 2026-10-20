@@ -893,12 +893,14 @@ mod tests {
         let axis = A3200Axis::new(Arc::new(Mutex::new(controller)), 0, 0, "X".into());
         let (getter, log) = (axis.params(), axis.log());
         let axis = Arc::new(Mutex::new(axis));
-        DRIVER.set_card(
-            0,
-            vec![Model2Axis::new(axis.clone(), getter, log)],
-            100,
-            1000,
-        );
+        DRIVER
+            .start_card(
+                0,
+                vec![Model2Axis::new(axis.clone(), getter, log)],
+                100,
+                1000,
+            )
+            .unwrap();
         let args = vec![
             ArgValue::String("a32Log".into()),
             ArgValue::String("a32LogTest".into()),
@@ -1224,7 +1226,7 @@ mod tests {
         let axis = Arc::new(Mutex::new(axis));
         let log = axis.lock().unwrap().log();
         let axes = vec![Model2Axis::new(axis.clone(), params.clone(), log)];
-        DRIVER.set_card(0, axes, 3_600_000, 3_600_000);
+        DRIVER.start_card(0, axes, 3_600_000, 3_600_000).unwrap();
         let args = vec![
             ArgValue::String("a32Set".into()),
             ArgValue::String("a32SetTest".into()),

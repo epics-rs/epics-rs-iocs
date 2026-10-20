@@ -372,6 +372,12 @@ impl PmacCoordSystem {
         Ok(poll)
     }
 
+    /// [`Self::refresh`] for drvPmacTask and create, which ignore its
+    /// status.
+    pub(crate) fn poll_status(&mut self) {
+        let _ = self.refresh();
+    }
+
     fn poll_system(&mut self) -> AsynResult<CsPoll> {
         match &self.poll {
             Some(poll) if poll.read_at.elapsed() < self.poll_ttl => Ok(poll.clone()),

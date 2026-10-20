@@ -44,10 +44,13 @@ use crate::ethernet::pmac_asyn_ip_configure_command;
 /// C's single poller thread does.
 const POLL_CACHE_TTL: Duration = Duration::from_millis(50);
 
-/// pmacAsynCoord.c's `motorAxisDrvSET_t`, its cards keyed by `reference`.
-/// A woken pass waits the moving period even when done, so one fast poll
-/// is forced (pmacAsynCoord.c:719-728).
-pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord", 1);
+/// pmacAsynCoord.c's `motorAxisDrvSET_t`, its cards keyed by `reference`,
+/// each polled by the drvPmacTask its create started.
+pub static PMAC_ASYN_COORD: Model2 = Model2::new("pmacAsynCoord", 0);
+
+/// drvPmacTask waits the moving period after a woken pass even when done
+/// (pmacAsynCoord.c:719-728).
+const COORD_FORCED_FAST_POLLS: u32 = 1;
 
 /// `defaultMovingPollPeriod` / `defaultIdlePollPeriod` (pmacAsynCoord.c:122).
 const COORD_MOVING_POLL_MS: u64 = 100;
@@ -464,6 +467,8 @@ struct CoordSystem {
     addr: i32,
     cs: i32,
     system: Arc<Mutex<PmacCoordSystem>>,
+    /// Its drvPmacTask.
+    poller: Arc<Controller>,
     /// Each axis's lock, whose address C's report prints as `axisMutex`.
     axes: Vec<Arc<Mutex<dyn AsynMotor>>>,
 }
@@ -499,7 +504,7 @@ fn coord_report(level: i32) -> String {
 }
 
 /// C `pmacAsynCoordCreate(port, addr, cs, ref, program)`: card `ref` of
-/// [`PMAC_ASYN_COORD`], its nine axes polled at C's default periods until a
+/// [`PMAC_ASYN_COORD`], polled from here on at C's default periods until a
 /// `pmacSetCoord*PollPeriod` changes them.
 fn pmac_asyn_coord_create_command() -> CommandDef {
     PMAC_ASYN_COORD.register_report(coord_report);
@@ -622,20 +627,34 @@ fn coord_create(
             log,
         })
         .collect();
-    PMAC_ASYN_COORD.set_card(reference, model2, COORD_MOVING_POLL_MS, COORD_IDLE_POLL_MS);
+    // drvPmacTask's drvPmacGetAxesStatus, before the axes' share of it.
+    let poller = Arc::new(Controller::new().controller_poll({
+        let system = system.clone();
+        move || lock_system(&system).poll_status()
+    }));
+    // The initial poll, then the task (pmacAsynCoord.c:850-860).
+    lock_system(&system).poll_status();
+    poller.start_driver_thread(
+        COORD_MOVING_POLL_MS,
+        COORD_IDLE_POLL_MS,
+        COORD_FORCED_FAST_POLLS,
+    );
+    PMAC_ASYN_COORD.set_card_on(reference, model2, poller.clone());
     systems.push(CoordSystem {
         reference,
         port: port.to_string(),
         addr,
         cs,
         system,
+        poller,
         axes,
     });
     Ok(())
 }
 
 /// C `pmacSetCoordMovingPollPeriod` / `pmacSetCoordIdlePollPeriod(ref,
-/// period)`, silent as C's are.
+/// period)`: the running task's period, then a signal to it
+/// (pmacAsynCoord.c:981-1031).
 fn pmac_set_coord_poll_period_command(name: &'static str, period: &'static str) -> CommandDef {
     let moving = name == "pmacSetCoordMovingPollPeriod";
     CommandDef::new(
@@ -646,7 +665,10 @@ fn pmac_set_coord_poll_period_command(name: &'static str, period: &'static str) 
             let reference = c_int(args, 0);
             let ms = Some(c_int(args, 1).max(0) as u64);
             let (moving_ms, idle_ms) = if moving { (ms, None) } else { (None, ms) };
-            PMAC_ASYN_COORD.set_poll_periods(reference, moving_ms, idle_ms);
+            let systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
+            for system in systems.iter().filter(|c| c.reference == reference) {
+                system.poller.set_poll_periods(moving_ms, idle_ms);
+            }
             Ok(CommandOutcome::Continue)
         },
     )
@@ -816,6 +838,7 @@ mod tests {
             addr: 0,
             cs: 3,
             system: system.clone(),
+            poller: Arc::default(),
             axes: Vec::new(),
         });
         let step = |axis| lock_system(&system).step_size(axis);
@@ -1431,23 +1454,9 @@ mod tests {
         TraceCapture,
         Arc<Mutex<dyn AsynMotor>>,
     ) {
-        use epics_rs::base::server::iocsh::registry::ArgValue;
-        use motor_common::model2::drv_asyn_motor_configure_command;
-        use motor_common::testing::run_command;
-
         let (rt, rig) = publish_scripted(low);
         coord_create(low, 0, 3, reference, 10).unwrap();
-        let args = vec![
-            ArgValue::String(motor.into()),
-            ArgValue::String("pmacAsynCoord".into()),
-            ArgValue::Int(reference.into()),
-            ArgValue::Int(9),
-        ];
-        run_command(
-            drv_asyn_motor_configure_command(vec![&PMAC_ASYN_COORD]),
-            args,
-        )
-        .await;
+        configure_cs(motor, reference).await;
         let own = TraceCapture::on(motor);
         let manager = PortManager::global();
         let trace = manager.trace_manager();
@@ -1462,6 +1471,96 @@ mod tests {
             .axes[0]
             .clone();
         (rt, rig, own, axis)
+    }
+
+    /// CS 3's status queries written from now until there are `n`, or 10 s
+    /// on.
+    async fn polls(rig: &Rig, n: usize) -> usize {
+        use epics_rs::base::runtime::task::sleep;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut polls = 0;
+        loop {
+            polls += rig.written().iter().filter(|c| *c == "&3??").count();
+            if polls >= n || std::time::Instant::now() > deadline {
+                return polls;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// `pmacSetCoord{Moving,Idle}PollPeriod(reference, ms)`.
+    async fn set_coord_poll_period(moving: bool, reference: i32, ms: i32) {
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::testing::run_command;
+        let cmd = if moving {
+            pmac_set_coord_poll_period_command("pmacSetCoordMovingPollPeriod", "Moving poll period")
+        } else {
+            pmac_set_coord_poll_period_command("pmacSetCoordIdlePollPeriod", "Idle poll period")
+        };
+        run_command(
+            cmd,
+            vec![ArgValue::Int(reference.into()), ArgValue::Int(ms.into())],
+        )
+        .await;
+    }
+
+    /// pmacAsynCoord.c:850-860: create reads the CS itself, then starts
+    /// drvPmacTask, which polls with no axis opened.
+    #[epics_rs::base::epics_test]
+    async fn pmac_asyn_coord_create_polls_the_cs_before_any_configure() {
+        let (_rt, rig) = publish_scripted("pmacCsCreatePoll");
+        rig.answer("&3??", b"000000\r020000\r000000\r");
+        rig.answer("&3Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0 0 0 0 0 0 0 0 0\r");
+        coord_create("pmacCsCreatePoll", 0, 3, 9306, 10).unwrap();
+        let initial = rig.written();
+        assert!(initial.iter().any(|c| c == "&3??"), "{initial:?}");
+        // The task's own.
+        assert!(polls(&rig, 1).await >= 1);
+    }
+
+    /// pmacAsynCoord.c:981-1031, after drvAsynMotorConfigure as its example
+    /// st.cmd orders them (:46-53): each set is the running task's and
+    /// signals it.
+    #[epics_rs::base::epics_test]
+    async fn a_poll_period_set_after_configure_is_the_running_task_s() {
+        use epics_rs::base::runtime::task::sleep;
+        let (_rt, rig) = publish_scripted("pmacCsLate");
+        rig.answer("&3??", b"000000\r020000\r000000\r");
+        rig.answer("&3Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0 0 0 0 0 0 0 0 0\r");
+        coord_create("pmacCsLate", 0, 3, 9307, 10).unwrap();
+        configure_cs("pmacCsLateM", 9307).await;
+        rig.written();
+        set_coord_poll_period(false, 9307, 3_600_000).await;
+        // The woken pass and its moving-period one, then an hour's wait.
+        assert!(polls(&rig, 2).await >= 2);
+        sleep(Duration::from_millis(5 * COORD_MOVING_POLL_MS)).await;
+        rig.written();
+        sleep(Duration::from_millis(3 * COORD_IDLE_POLL_MS)).await;
+        assert_eq!(polls(&rig, 0).await, 0);
+        // The woken pass, whose moving-period wait is now an hour too.
+        set_coord_poll_period(true, 9307, 3_600_000).await;
+        assert_eq!(polls(&rig, 1).await, 1);
+        sleep(Duration::from_millis(3 * COORD_MOVING_POLL_MS)).await;
+        assert_eq!(polls(&rig, 0).await, 0);
+    }
+
+    /// `drvAsynMotorConfigure(motor, "pmacAsynCoord", reference, 9)`.
+    async fn configure_cs(motor: &str, reference: i32) {
+        use epics_rs::base::server::iocsh::registry::ArgValue;
+        use motor_common::model2::drv_asyn_motor_configure_command;
+        use motor_common::testing::run_command;
+
+        let args = vec![
+            ArgValue::String(motor.into()),
+            ArgValue::String("pmacAsynCoord".into()),
+            ArgValue::Int(reference.into()),
+            ArgValue::Int(9),
+        ];
+        run_command(
+            drv_asyn_motor_configure_command(vec![&PMAC_ASYN_COORD]),
+            args,
+        )
+        .await;
     }
 
     /// drvMotorAsyn.c:413: before drvAsynMotorConfigure an axis logs through
@@ -1535,26 +1634,34 @@ mod tests {
     }
 
     /// pmacAsynCoord.c:719-728: a woken pass waits the moving period even
-    /// when it read done, so the poll after a move's comes 100 ms on, not
-    /// the idle 500.
+    /// when it read done, so one poll follows a move's, then the idle
+    /// period. The idle period is an hour, so no wait here races the poller.
     #[epics_rs::base::epics_test]
     async fn the_poll_after_a_woken_done_poll_is_at_the_moving_period() {
         use epics_rs::base::runtime::task::sleep;
-        let (_rt, rig, _own, _axis) =
-            configured_cs("pmacCsFast", "pmacCsFastM", 9305, TraceMask::ERROR).await;
+        let (_rt, rig) = publish_scripted("pmacCsFast");
         rig.answer("&3??", b"000000\r020000\r000000\r");
         rig.answer("&3Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0 0 0 0 0 0 0 0 0\r");
-        sleep(Duration::from_millis(600)).await;
+        // In C's st.cmd order (:46-53): a set before configure could start
+        // the hour before the axes join, which then wait it out for a poll.
+        coord_create("pmacCsFast", 0, 3, 9305, 10).unwrap();
+        configure_cs("pmacCsFastM", 9305).await;
+        rig.written();
+        set_coord_poll_period(false, 9305, 3_600_000).await;
+        // The set's woken pass and its moving-period one (:1025). C's count
+        // before them is one per default period the shell took.
+        assert!(polls(&rig, 2).await >= 2);
+        sleep(Duration::from_millis(5 * COORD_MOVING_POLL_MS)).await;
         rig.written();
         let port = PortManager::global()
             .find_port_handle("pmacCsFastM")
             .unwrap();
         // MOTOR_MOVE_ABS (drvMotorAsyn.c:101-106); a failed send still wakes.
         let mover = std::thread::spawn(move || port.write_float64_blocking(104, 0, 1.0));
-        sleep(Duration::from_millis(350)).await;
+        assert_eq!(polls(&rig, 2).await, 2);
         let _ = mover.join().unwrap();
-        let polls = rig.written().iter().filter(|c| *c == "&3??").count();
-        assert_eq!(polls, 2);
+        sleep(Duration::from_millis(5 * COORD_MOVING_POLL_MS)).await;
+        assert_eq!(polls(&rig, 0).await, 0);
     }
 
     /// pmacAsynCoord.c:386-437: every motorAxisSetDouble case prints its FLOW

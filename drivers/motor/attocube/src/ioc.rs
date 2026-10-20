@@ -110,8 +110,43 @@ pub fn anc150_config_command() -> CommandDef {
                     Ok(Model2Axis::new(Arc::new(Mutex::new(ax)), getter, log))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            MOTOR_ANC150.set_card(card, axes, moving_poll_ms, idle_poll_ms);
+            MOTOR_ANC150.start_card(card, axes, moving_poll_ms, idle_poll_ms)?;
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+    use motor_common::testing::{LineRig, run_command};
+
+    /// drvANC150Asyn.cc:784-788: ANC150AsynConfig starts ANC150Poller, whose
+    /// `getm` polls the axes before any drvAsynMotorConfigure.
+    #[epics_rs::base::epics_test]
+    async fn anc150_config_starts_its_poller() {
+        run_command(anc150_setup_command(), vec![ArgValue::Int(1)]).await;
+        let (line, _io) = LineRig::new("ancPollLine", |last| match last {
+            "ver" => "ver\r\nattocube ANC150\r\nOK\r\n".into(),
+            c if c.starts_with("getf") => format!("{c}\r\nfrequency = 1000\r\nOK\r\n"),
+            c => format!("{c}\r\nmode = stp\r\nOK\r\n"),
+        });
+        let args = vec![
+            ArgValue::Int(0),
+            ArgValue::String("ancPollLine".into()),
+            ArgValue::Int(1),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ];
+        run_command(anc150_config_command(), args).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sent = line.sent();
+        while !sent.iter().any(|c| c == "getm 1") && Instant::now() < deadline {
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+            sent.extend(line.sent());
+        }
+        assert!(sent.iter().any(|c| c == "getm 1"), "{sent:?}");
+    }
 }
