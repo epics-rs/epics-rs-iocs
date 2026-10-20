@@ -31,7 +31,7 @@ const FRAMEWORK: &[(&str, &str, &str)] = &[
 const FRAMEWORK_CRATES: &[&str] = &["ad-plugins-rs", "asyn-rs", "epics-base-rs"];
 
 /// Macros an IOC sets from a dependency crate's exported const.
-const EXTERNAL: &[(&str, &str)] = &[("SCALER", "scaler-rs")];
+const EXTERNAL: &[(&str, &str)] = &[("MCA", "mca"), ("SCALER", "scaler-rs")];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
