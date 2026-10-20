@@ -37,9 +37,10 @@
 //!   synthesizes it as an absolute move to `last position + distance`.
 //! - C sets velocity in a separate `SET_VELOCITY` transaction; asyn-rs bundles
 //!   the velocity into the move, so [`move_absolute`](AsynMotor::move_absolute)
-//!   emits `sr` before `set` when a positive velocity is supplied.
+//!   emits `sr` before `set` whatever the rate.
 //! - C `STOP_AXIS`, `HOME_*` and `LOAD_POS` send nothing (unsupported on this
-//!   absolute closed-loop stage); the port mirrors that as no-ops.
+//!   absolute closed-loop stage); stop and set-position are no-ops, and a
+//!   home sends only the record's `sr` and the GO `stat`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
