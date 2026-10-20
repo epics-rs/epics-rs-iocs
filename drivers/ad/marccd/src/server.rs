@@ -9,10 +9,8 @@
 //! cannot interleave with another context's.
 
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::asyn::error::{AsynResult, AsynStatus};
-use epics_rs::asyn::request::{OctetRead, OctetReadOp, RequestOp, RequestResult};
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 
 use crate::driver::MarccdDriver;
 use crate::file_name::format_file_template;
@@ -26,9 +24,6 @@ use crate::types::{
     TASK_STATUS_ERROR, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TASK_WRITE, secs, task_state,
     task_status, test_task_status,
 };
-
-/// asyn subaddress of the single-device marServer octet port.
-const SERVER_ADDR: i32 = 0;
 
 impl MarccdDriver {
     // --- parameter library -------------------------------------------------
@@ -93,27 +88,17 @@ impl MarccdDriver {
             .print(0, TraceMask::ERROR, format_args!("{message}"));
     }
 
-    /// One request on C `pasynUserServer`, which fails when it has no port.
-    fn server_submit(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
-        self.server.port()?.submit_blocking(op, user)
-    }
-
     // --- server ------------------------------------------------------------
 
     /// C `writeServer`: flush stale input, write with `MARCCD_SERVER_TIMEOUT`,
     /// then publish the command on `ADStringToServer`.
     pub fn write_server(&mut self, output: &str) -> AsynStatus {
-        let _ = self.server_submit(RequestOp::Flush, AsynUser::default().with_addr(SERVER_ADDR));
-
-        let user = AsynUser::default()
-            .with_addr(SERVER_ADDR)
-            .with_timeout(secs(MARCCD_SERVER_TIMEOUT));
-        let status = match self.server_submit(
-            RequestOp::OctetWrite {
-                data: output.as_bytes().to_vec(),
-            },
-            user,
-        ) {
+        let _ = self.server.flush(0);
+        let status = match self
+            .server
+            .with_timeout(secs(MARCCD_SERVER_TIMEOUT))
+            .write_octet(0, output.as_bytes())
+        {
             Ok(_) => AsynStatus::Success,
             Err(e) => {
                 self.trace_server_error(&format!(
@@ -132,18 +117,10 @@ impl MarccdDriver {
     /// C `readServer`: a single read with the given timeout, then publish the
     /// reply on `ADStringFromServer`.
     pub fn read_server(&mut self, timeout: f64) -> AsynStatus {
-        let user = AsynUser::default()
-            .with_addr(SERVER_ADDR)
-            .with_timeout(secs(timeout));
-        let read = match self.server.port() {
-            Ok(port) => port.submit_octet_read_blocking(
-                OctetReadOp::Read {
-                    buf_size: MAX_MESSAGE_SIZE,
-                },
-                user,
-            ),
-            Err(e) => OctetRead::failed(e),
-        };
+        let read = self
+            .server
+            .with_timeout(secs(timeout))
+            .read_octet(0, MAX_MESSAGE_SIZE);
         // C's asynOctetSyncIO null-terminates at nbytesTransfered, which
         // counts what a failed read did transfer.
         let (data, status) = read.into_parts();
