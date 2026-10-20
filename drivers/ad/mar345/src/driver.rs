@@ -394,6 +394,32 @@ pub(crate) mod tests {
         }
     }
 
+    /// C `writeServer` is `pasynOctetSyncIO->flush` then `->write`
+    /// (mar345.cpp:235-236), each printing its TRACEIO_DEVICE line
+    /// (asynOctetSyncIO.c:194-200, :291-293).
+    #[test]
+    fn a_server_write_prints_its_sync_io_lines() {
+        use epics_rs::asyn::trace::{TraceFile, TraceIoMask, TraceMask};
+        let name = "MAR345_WRITELINE";
+        let mut det = driver(name, 0);
+        let ip = format!("{name}_IP");
+        let trace = det.server.port().unwrap().trace();
+        let path = std::env::temp_dir().join(format!("{ip}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(&ip),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(&ip), TraceMask::IO_DEVICE);
+        trace.set_trace_io_mask(Some(&ip), TraceIoMask::ASCII);
+        assert_eq!(det.write_server("COMMAND X"), AsynStatus::Success);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("asynOctetSyncIO flush\n"), "{text}");
+        assert!(text.contains("asynOctetSyncIO wrote:\nCOMMAND X"), "{text}");
+    }
+
     /// C `writeServer` returns `pasynOctetSyncIO->write`'s own status
     /// (mar345.cpp:236-248), so a disconnected marServer port is
     /// asynDisconnected, not asynError.
