@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
@@ -577,7 +578,7 @@ impl PortDriver for ControlDriver {
                 inner.jog_speeds[index] = if index >= 3 { value } else { value / 1000.0 };
                 spdlog::debug(format_args!(
                     "Setting jog speed[{index}] to {:.4}",
-                    inner.jog_speeds[index]
+                    CFloat(inner.jog_speeds[index])
                 ));
                 inner.new_jog = true;
             } else if reason == p.tcp_offset {
@@ -587,7 +588,7 @@ impl PortDriver for ControlDriver {
                 let offset = *offset;
                 spdlog::debug(format_args!(
                     "Setting TCP offset to [{}] m,rad",
-                    offset.map(|v| format!("{v:.4}")).join(",")
+                    offset.map(|v| format!("{v:.4}", v = CFloat(v))).join(",")
                 ));
                 if inner.connected() {
                     inner
@@ -602,37 +603,37 @@ impl PortDriver for ControlDriver {
                 inner.joint_speed = deg_to_rad(value);
                 spdlog::debug(format_args!(
                     "Setting joint speed to {:.4}",
-                    inner.joint_speed
+                    CFloat(inner.joint_speed)
                 ));
             } else if reason == p.joint_acceleration {
                 inner.joint_accel = deg_to_rad(value);
                 spdlog::debug(format_args!(
                     "Setting joint acceleration to {:.4}",
-                    inner.joint_accel
+                    CFloat(inner.joint_accel)
                 ));
             } else if reason == p.joint_blend {
                 inner.joint_blend = value / 1000.0;
                 spdlog::debug(format_args!(
                     "Setting joint blend to {:.4}",
-                    inner.joint_blend
+                    CFloat(inner.joint_blend)
                 ));
             } else if reason == p.linear_speed {
                 inner.linear_speed = value / 1000.0;
                 spdlog::debug(format_args!(
                     "Setting linear speed to {:.4}",
-                    inner.linear_speed
+                    CFloat(inner.linear_speed)
                 ));
             } else if reason == p.linear_acceleration {
                 inner.linear_accel = value / 1000.0;
                 spdlog::debug(format_args!(
                     "Setting linear acceleration to {:.4}",
-                    inner.linear_accel
+                    CFloat(inner.linear_accel)
                 ));
             } else if reason == p.linear_blend {
                 inner.linear_blend = value / 1000.0;
                 spdlog::debug(format_args!(
                     "Setting linear blend to {:.4}",
-                    inner.linear_blend
+                    CFloat(inner.linear_blend)
                 ));
             }
             Ok(())
@@ -715,7 +716,7 @@ impl PortDriver for ControlDriver {
                         MotionType::Joint => inner.cmd_joints,
                         MotionType::Cartesian => inner.cmd_pose,
                     };
-                    let joined = target.map(|v| format!("{v:.4}")).join(",");
+                    let joined = target.map(|v| format!("{v:.4}", v = CFloat(v))).join(",");
                     match motion {
                         MotionType::Joint => spdlog::debug(format_args!("moveJ({joined}) rad")),
                         MotionType::Cartesian => {
@@ -801,7 +802,7 @@ impl PortDriver for ControlDriver {
                         inner.iface_mut()?.speed_l(&speeds, accel, 0.01)?;
                         spdlog::debug(format_args!(
                             "Starting jog: accel={accel}, speeds=[{}]",
-                            speeds.map(|v| format!("{v:.2}")).join(",")
+                            speeds.map(|v| format!("{v:.2}", v = CFloat(v))).join(",")
                         ));
                         inner.new_jog = false;
                     }

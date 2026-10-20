@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::InterfaceMask;
@@ -187,7 +188,10 @@ impl PortDriver for IoDriver {
             let result = if reason == p.speed_slider {
                 // C prints only every 0.01, "so we don't print too many values".
                 if ((value * 1000.0) as i32) % 10 == 0 {
-                    spdlog::debug(format_args!("Setting speed slider to {value:.2}"));
+                    spdlog::debug(format_args!(
+                        "Setting speed slider to {value:.2}",
+                        value = CFloat(value)
+                    ));
                 }
                 iface.set_speed_slider(value)
             } else if reason == p.set_voltage_analog_out {
