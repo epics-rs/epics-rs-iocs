@@ -11,7 +11,7 @@ use std::time::Duration;
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, MoveToHomeTask, PollFailure, PortSets,
+    AsynMotor, MotorStatus, MoveToHomeTask, PollFailure, PortSets, StatusWrite,
 };
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
@@ -164,7 +164,8 @@ pub struct Nf874xAxis {
     /// `limitChecking_`: off when both limit inputs read active, which is a
     /// stage with no limit switches (8410 rotary).
     limit_checking: bool,
-    status: MotorStatus,
+    /// The constructor's and `setClosedLoop`'s status sets.
+    status_writes: Vec<StatusWrite>,
     /// The soft limits the last poll read, for [`AsynMotor::take_port_sets`].
     sets: PortSets,
 }
@@ -185,14 +186,16 @@ impl Nf874xAxis {
             encoder_position: 0.0,
             limit_checking: false,
             sets: PortSets::default(),
-            status: MotorStatus::default(),
+            status_writes: Vec::new(),
         };
         if closed_loop {
             // C ignores the PH? status (874xMotorDriver.cpp:246).
             let ((bits, shift), _) = lock(&this.controller).hardware_status(axis, &this.name);
             this.limit_checking = (bits >> shift) & 0x3 != 0x3;
-            this.status.gain_support = true;
-            this.status.has_encoder = true;
+            this.status_writes.extend([
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true),
+            ]);
             let _ = this.closed_loop(true);
         }
         this
@@ -236,19 +239,19 @@ impl Nf874xAxis {
             format!("{n}SN0;{n}ZH3;{n}MM0")
         };
         let result = self.send(&[command]);
-        self.status.powered = enable;
+        self.status_writes.push(StatusWrite::PowerOn(enable));
         result
     }
 
-    /// The reads of `poll` up to the first that fails; the soft limits read
-    /// go to `self.sets`.
-    fn read_status(&mut self) -> AsynResult<()> {
+    /// The reads of `poll` up to the first that fails, each set into
+    /// `status` as C sets its parameter; the soft limits read go to
+    /// `self.sets`.
+    fn read_status(&mut self, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = lock(&self.controller);
         let name = self.name.clone();
         let ask = |q: &str| ctrl.write_read(&format!("{name} {q}"));
 
         self.encoder_position = atof(skip(&ask("TP?")?, &name));
-        let status = &mut self.status;
         status.encoder_position = self.encoder_position;
         status.position = self.encoder_position;
         status.direction = self.last_direction;
@@ -417,9 +420,15 @@ impl AsynMotor for Nf874xAxis {
         }))
     }
 
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
+    }
+
+    /// A failed read returns at `skip` as C returns asynError
+    /// (874xMotorDriver.cpp:547-549).
     fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
-        self.status.problem = self.read_status().is_err();
-        *status = self.status.clone();
+        self.read_status(status)?;
+        status.problem = false;
         Ok(())
     }
 
@@ -675,6 +684,33 @@ mod tests {
         assert!(lock(&ctrl).closed_loop);
         let axis = Nf874xAxis::new(ctrl, 1);
         assert!(!axis.limit_checking);
+    }
+
+    /// 874xMotorDriver.cpp:471-473: a failed `TP?` goes to `skip` before
+    /// `motorStatusDone_` is set, so the Done a move start set stays.
+    #[test]
+    fn a_failed_read_leaves_the_done_a_move_start_set() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let refuse = Arc::new(AtomicBool::new(false));
+        let fails = refuse.clone();
+        let (_rig, io) = motor_common::testing::LineRig::failing(
+            "nf874xSkip",
+            |sent| if sent == "1 MD?" { "1" } else { "0" }.into(),
+            move |sent| sent == "1 TP?" && fails.load(Ordering::Relaxed),
+        );
+        let ctrl = Arc::new(Mutex::new(Nf874xController::new(Some(io))));
+        let mut axis = Nf874xAxis::new(ctrl, 1);
+        let user = AsynUser::default();
+        let mut status = MotorStatus {
+            problem: true,
+            ..MotorStatus::default()
+        };
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && !status.problem);
+        status.done = false;
+        refuse.store(true, Ordering::Relaxed);
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert!(!status.done);
     }
 
     #[test]
