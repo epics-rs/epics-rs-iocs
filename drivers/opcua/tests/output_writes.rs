@@ -10,7 +10,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_opcua::types::Variant;
+use async_opcua::types::{NodeId, Variant};
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::ioc_builder::IocBuilder;
 use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
@@ -43,14 +43,14 @@ static DEVICES: &[(&str, &[DevSup])] = &[
     ),
 ];
 
-/// The value every node holds on the server double.
+/// The value `Sim.Double` holds on the server double.
 const ON_SERVER: f64 = 33.25;
 
 /// An IOC on `db` whose session `S1` is up, with each record holding the
 /// value its initial read brought.
 async fn ioc(db: &str, settled: &[&str]) -> (Arc<Server>, Arc<Registry>, Arc<PvDatabase>) {
     let server = Arc::new(Server {
-        value: Some(ON_SERVER),
+        nodes: vec![(NodeId::new(2, "Sim.Double"), Variant::Double(ON_SERVER))],
         ..Default::default()
     });
     let registry = registry(&server, "autoconnect=y");

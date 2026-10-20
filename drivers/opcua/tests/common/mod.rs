@@ -33,8 +33,9 @@ pub struct Server {
     pub refuse: bool,
     /// How long a connect attempt and a disconnect take.
     pub latency: Duration,
-    /// Every node holds this Double; `None` answers each read empty.
-    pub value: Option<f64>,
+    /// What each node holds; a read of any other node fails
+    /// `BadNodeIdUnknown`.
+    pub nodes: Vec<(NodeId, Variant)>,
     /// The Write service calls, in order.
     pub writes: Mutex<Vec<Vec<WriteValue>>>,
 }
@@ -74,18 +75,22 @@ struct Connection(Arc<Server>);
 #[async_trait]
 impl UaConnection for Connection {
     async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
-        let Some(value) = self.0.value else {
-            return (0, Ok(vec![DataValue::default(); nodes.len()]));
-        };
         let results = nodes
             .iter()
             .map(|node| {
+                let Some((_, value)) = self.0.nodes.iter().find(|(id, _)| *id == node.node_id)
+                else {
+                    return DataValue {
+                        status: Some(StatusCode::BadNodeIdUnknown),
+                        ..Default::default()
+                    };
+                };
                 if node.attribute_id == AttributeId::DataType as u32 {
-                    // Double — i=11.
-                    DataValue::value_only(Variant::NodeId(Box::new(NodeId::new(0, 11u32))))
+                    let scalar = value.scalar_type_id().expect("a scalar node");
+                    DataValue::value_only(Variant::NodeId(Box::new(NodeId::new(0, scalar as u32))))
                 } else {
                     DataValue {
-                        value: Some(Variant::Double(value)),
+                        value: Some(value.clone()),
                         status: Some(StatusCode::Good),
                         ..Default::default()
                     }
