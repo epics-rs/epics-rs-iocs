@@ -153,3 +153,60 @@ async fn the_acquire_time_limit_stops_the_acquisition_by_itself() {
     assert_eq!(handle.read_int32(nd.acquire_busy, 0).await.unwrap(), 0);
     assert_eq!(handle.read_float64(sim.elapsed_time, 0).await.unwrap(), 5.0);
 }
+
+/// C's computeArrays releases pArrays[0] and allocates the next frame into it
+/// under the driver lock, which it keeps through the stamping and callbacks
+/// (ADCSimDetector.cpp:150-151, :305-319), so free-running, a reader never
+/// finds the slot empty once the first frame is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_free_running_acquisition_never_leaves_parrays0_empty() {
+    let rt = create_c_sim_detector(
+        &epics_rs::asyn::registry::claim_port("CSIM_SLOT_FREE").unwrap(),
+        100_000,
+        NDDataType::Float64,
+        0,
+        0,
+    )
+    .unwrap();
+    let handle = rt.port_handle().clone();
+    let sim = rt.sim_params;
+    let nd = rt.nd_params;
+
+    handle.write_float64(sim.time_step, 0, 1e-9).await.unwrap();
+    handle
+        .write_float64(sim.acquire_time, 0, 1e9)
+        .await
+        .unwrap();
+    for addr in 0..MAX_SIGNALS as i32 {
+        handle.write_float64(sim.period, addr, 1.0).await.unwrap();
+    }
+    handle.write_int32(nd.acquire, 0, 1).await.unwrap();
+
+    let owner = rt.pool().owner().clone();
+    let counter = handle.clone();
+    let (samples, empty) = tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while owner.array(0).is_none() {
+            assert!(std::time::Instant::now() < deadline, "no frame");
+            std::thread::yield_now();
+        }
+        let first = counter.read_int32_blocking(nd.array_counter, 0).unwrap();
+        let (mut samples, mut empty) = (0u32, 0u32);
+        while counter.read_int32_blocking(nd.array_counter, 0).unwrap() < first + 3 {
+            assert!(std::time::Instant::now() < deadline, "no third frame");
+            for _ in 0..100 {
+                samples += 1;
+                empty += u32::from(owner.array(0).is_none());
+                std::thread::yield_now();
+            }
+        }
+        (samples, empty)
+    })
+    .await
+    .unwrap();
+    handle.write_int32(nd.acquire, 0, 0).await.unwrap();
+    assert_eq!(
+        empty, 0,
+        "{empty} of {samples} samples found pArrays[0] empty"
+    );
+}
