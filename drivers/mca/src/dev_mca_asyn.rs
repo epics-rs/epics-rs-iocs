@@ -8,8 +8,9 @@
 //! through this same device support unmodified.
 //!
 //! The record drives the device half of its cycle through [`McaDset`]:
-//! `read_begin` runs [`McaRecord::begin_device_cycle`] on every ask, the
-//! ask again after a nested pass included, and `read()` has nothing left.
+//! `read_begin` runs [`McaRecord::device_read_begin`] on every ask, the
+//! ask again after a nested pass or `readValue`'s link reads included, and
+//! `read()` has nothing left.
 //! As in C, every message is queued to the port (`devMcaAsyn.c:262-337`).
 //! Each read is its own request, reused from a free list, whose body is C's
 //! `asynCallback` (`:342-391`): on an `ASYN_CANBLOCK` port the pass ends PACT
@@ -41,9 +42,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
-use mca_rs::record::{
-    McaCommand, McaDset, McaRead, McaRecord, McaStart, McaStatus, Nack, Sent, commands,
-};
+use mca_rs::record::{McaCommand, McaDset, McaRead, McaRecord, McaStatus, Nack, Sent, commands};
 
 use crate::interface::{ASYN_MCA_DTYP, McaReason};
 
@@ -555,7 +554,8 @@ impl DeviceSupport for DevMcaAsyn {
     }
 
     /// C `mcaRecord.c:507-790` up to the first read still out, on every
-    /// pass, the re-entered ones included.
+    /// pass, the re-entered ones included; `readValue`'s SIML and SIOL reads
+    /// are the framework's, as on a soft mca.
     fn read_begin(
         &mut self,
         record: &mut dyn Record,
@@ -571,11 +571,7 @@ impl DeviceSupport for DevMcaAsyn {
             .handle
             .can_block()
             .then(|| (done.device_done(), done.priority()));
-        Ok(match mca.begin_device_cycle(port, done.again()) {
-            McaStart::Synchronous => ReadStart::Synchronous,
-            McaStart::Pending => ReadStart::Pending,
-            McaStart::Reentered => ReadStart::Reentered,
-        })
+        Ok(mca.device_read_begin(port, done))
     }
 
     /// `read_begin` ran the whole device half.
@@ -656,7 +652,9 @@ mod tests {
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
     use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+    use epics_rs::base::server::device_support::SimRead;
     use epics_rs::base::server::record::Record;
+    use mca_rs::record::{Ask, McaStart};
 
     use super::*;
 
@@ -856,14 +854,22 @@ mod tests {
     impl Fixture {
         /// One cycle's device half as the framework runs it on this port,
         /// whose reads all run inline: each `Reentered` runs the nested pass
-        /// and asks again.
+        /// and asks again, and a `ReadValue` asks again unsimulated.
         fn cycle(&mut self) {
             fn pass(rec: &mut McaRecord, port: &mut McaPort) {
                 port.reads.nuse.store(rec.nuse, Ordering::Relaxed);
-                let mut start = rec.begin_device_cycle(port, false);
-                while start == McaStart::Reentered {
-                    pass(rec, port);
-                    start = rec.begin_device_cycle(port, true);
+                let mut start = rec.begin_device_cycle(port, Ask::First);
+                loop {
+                    start = match start {
+                        McaStart::Reentered => {
+                            pass(rec, port);
+                            rec.begin_device_cycle(port, Ask::Again)
+                        }
+                        McaStart::ReadValue => {
+                            rec.begin_device_cycle(port, Ask::ReadValue(&SimRead::Device))
+                        }
+                        McaStart::Synchronous | McaStart::Pending => break,
+                    };
                 }
             }
             pass(&mut self.rec, self.dev.port.as_mut().unwrap());
@@ -1050,6 +1056,91 @@ record(calc, "{prefix}N") {{ field(CALC, "A+1") field(INPA, "{prefix}N") }}
                 (false, spectrum, Some(3.0), 1),
             ]
         );
+    }
+
+    /// `readValue` reads SIML, and on YES SIOL in place of `read_array`
+    /// (`mcaRecord.c:1106-1121`): the callback still reads the driver
+    /// (`devMcaAsyn.c:355-357`), and VAL and NORD are the waveform's. The
+    /// CANBLOCK data pass is the only one to reach `readValue`, so its
+    /// alarm is SIMM_ALARM at SIMS.
+    #[test]
+    fn a_simulated_read_takes_siol_on_both_port_kinds() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use epics_rs::base::runtime::task::{sleep, test_block_on};
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::recgbl::alarm_status;
+        use epics_rs::base::server::record::AlarmSeverity;
+
+        for can_block in [true, false] {
+            let port = format!("MCASIML{}", if can_block { "BLK" } else { "SYNC" });
+            let (runtime, _, array_reads, _) = driver_port(&port, can_block, None, None, None);
+            let db = format!(
+                r#"
+record(waveform, "{port}W") {{ field(FTVL, "LONG") field(NELM, "4") field(INP, "[11, 22, 33]") }}
+record(longin, "{port}S") {{ field(VAL, "1") }}
+record(mca, "{port}") {{
+    field(DTYP, "asynMCA")
+    field(INP, "@asyn({port})")
+    field(NMAX, "4")
+    field(NUSE, "4")
+    field(FTVL, "LONG")
+    field(SIML, "{port}S")
+    field(SIOL, "{port}W")
+    field(SIMS, "MINOR")
+}}
+"#
+            );
+            let (val, nord, simm, alarm) = test_block_on(async {
+                let (name, factory) = mca_rs::mca_record_factory();
+                let (db, _) = IocBuilder::new()
+                    .register_record_type(name, factory)
+                    .register_dynamic_device_support(&[("mca", &MCA_DEVICES)], mca_device_support)
+                    .db_string(&db, &HashMap::new())
+                    .unwrap()
+                    .build()
+                    .await
+                    .unwrap();
+                db.ioc_init().await;
+                db.put_record_field_from_ca(&port, "READ", EpicsValue::Enum(1))
+                    .await
+                    .unwrap();
+                for _ in 0..400 {
+                    if !db.get_record(&port).unwrap().read().is_processing() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+                sleep(Duration::from_millis(100)).await;
+                let get = |f: &str| db.get_pv(format!("{port}.{f}")).unwrap();
+                let alarm = {
+                    let rec = db.get_record(&port).unwrap();
+                    let inner = rec.read();
+                    (inner.common.stat, inner.common.sevr)
+                };
+                (
+                    get("VAL"),
+                    get("NORD").to_f64(),
+                    get("SIMM").to_f64(),
+                    alarm,
+                )
+            });
+            assert_eq!(
+                (val, nord, simm, array_reads.load(Ordering::SeqCst)),
+                (
+                    EpicsValue::LongArray(vec![11, 22, 33].into()),
+                    Some(3.0),
+                    Some(1.0),
+                    1
+                ),
+                "can_block {can_block}"
+            );
+            if can_block {
+                assert_eq!(alarm, (alarm_status::SIMM_ALARM, AlarmSeverity::Minor));
+            }
+            drop(runtime);
+        }
     }
 
     /// On an `ASYN_CANBLOCK` port every request a cycle makes is queued, as
