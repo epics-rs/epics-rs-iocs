@@ -23,7 +23,7 @@ use std::any::Any;
 
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::record::{FieldDesc, ProcessOutcome, Record};
-use epics_rs::base::types::{DbFieldType, DbfCode, EpicsValue};
+use epics_rs::base::types::{DbFieldType, DbfCode, EpicsValue, PvString};
 
 use crate::queue::ProcessReason;
 use crate::registry::Binding;
@@ -43,6 +43,29 @@ const WOC_IMMEDIATE: u16 = 1;
 
 /// The length of a `DBF_STRING` field, minus its terminator.
 const MAX_STRING_SIZE: usize = 40;
+
+/// A `DBF_STRING` field of `size(41)`: the bytes as given, cut at
+/// `MAX_STRING_SIZE` as the C's `strncpy` cuts them (`opcuaItemRecord.cpp:67-70`).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ItemString(PvString);
+
+impl From<&[u8]> for ItemString {
+    fn from(bytes: &[u8]) -> Self {
+        Self(bytes[..bytes.len().min(MAX_STRING_SIZE)].into())
+    }
+}
+
+impl From<&str> for ItemString {
+    fn from(s: &str) -> Self {
+        s.as_bytes().into()
+    }
+}
+
+impl PartialEq<&str> for ItemString {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
 
 // `INP` mirrors `field(INP,DBF_INLINK)` in `opcuaItemRecord.dbd` — INP is
 // not a dbCommon field, so the loader refuses it unless the record declares
@@ -86,13 +109,13 @@ pub struct OpcuaItemRecord {
     /// `field(INP,DBF_INLINK)` — the record owns the field; the loader also
     /// mirrors the text into the common INP, which is where device support
     /// reads it.
-    pub inp: String,
+    pub inp: ItemString,
     /// "Dummy Value" — the record has none. A put to it processes the record,
     /// which is one way to order the default action.
     pub val: u32,
     /// The session and subscription the link named, filled in at init.
-    pub sess: String,
-    pub subs: String,
+    pub sess: ItemString,
+    pub subs: ItemString,
     pub defactn: u16,
     pub bini: u16,
     /// A put to either orders that action on the next process, which the put
@@ -101,7 +124,7 @@ pub struct OpcuaItemRecord {
     pub write: u8,
     pub statcode: u32,
     pub ostatcode: u32,
-    pub stattext: String,
+    pub stattext: ItemString,
     pub woc: u16,
 
     /// The C's `prec->dpvt`: what ties the record to its item.
@@ -169,16 +192,16 @@ impl Record for OpcuaItemRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         Some(match name {
             "VAL" => EpicsValue::ULong(self.val),
-            "INP" => EpicsValue::String(self.inp.clone().into()),
-            "SESS" => EpicsValue::String(self.sess.clone().into()),
-            "SUBS" => EpicsValue::String(self.subs.clone().into()),
+            "INP" => EpicsValue::String(self.inp.0.clone()),
+            "SESS" => EpicsValue::String(self.sess.0.clone()),
+            "SUBS" => EpicsValue::String(self.subs.0.clone()),
             "DEFACTN" => EpicsValue::Enum(self.defactn),
             "BINI" => EpicsValue::Enum(self.bini),
             "READ" => EpicsValue::Char(self.read),
             "WRITE" => EpicsValue::Char(self.write),
             "STATCODE" => EpicsValue::ULong(self.statcode),
             "OSTATCODE" => EpicsValue::ULong(self.ostatcode),
-            "STATTEXT" => EpicsValue::String(self.stattext.clone().into()),
+            "STATTEXT" => EpicsValue::String(self.stattext.0.clone()),
             "WOC" => EpicsValue::Enum(self.woc),
             _ => return None,
         })
@@ -316,13 +339,9 @@ fn byte(value: &EpicsValue) -> Option<u8> {
     }
 }
 
-fn string(value: &EpicsValue) -> Option<String> {
+fn string(value: &EpicsValue) -> Option<ItemString> {
     match value {
-        EpicsValue::String(s) => {
-            let mut s = s.to_string();
-            s.truncate(MAX_STRING_SIZE);
-            Some(s)
-        }
+        EpicsValue::String(s) => Some(s.as_bytes().into()),
         _ => None,
     }
 }

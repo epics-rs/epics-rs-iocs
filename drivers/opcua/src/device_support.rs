@@ -343,8 +343,7 @@ impl OpcuaDevice {
         let rec = item_record(record, &self.record_name)?;
         rec.set_acted(ok);
         rec.statcode = status.bits();
-        rec.stattext =
-            String::from_utf8_lossy(truncate(status.to_string().as_bytes(), 40)).into_owned();
+        rec.stattext = status.to_string().as_str().into();
         // UDF belongs to the record here: `opcua_action_item` never writes it,
         // the record support's `readwrite` wrapper clears it on dset success
         // (`opcuaItemRecord.cpp:159-162`) — which is what `set_acted` ports.
@@ -835,8 +834,8 @@ impl OpcuaDevice {
             // (`opcuaItemRecord.cpp:56-71`).
             let (session, subscription, bini) = names;
             let item_record = item_record(record, &self.record_name)?;
-            item_record.sess = session;
-            item_record.subs = subscription;
+            item_record.sess = session.as_str().into();
+            item_record.subs = subscription.as_str().into();
             if item_record.bini == 0 {
                 item_record.bini = bini_index(bini);
             }

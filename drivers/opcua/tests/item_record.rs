@@ -254,6 +254,46 @@ fn init_shows_the_session_the_link_named() {
     assert!(record.binding().is_some());
 }
 
+/// `strncpy(prec->sess, .., MAX_STRING_SIZE)` (`opcuaItemRecord.cpp:67-70`).
+#[test]
+fn init_cuts_a_long_session_name_at_the_field_size() {
+    let name = format!("S{}", "x".repeat(44));
+    let registry = offline();
+    registry
+        .add_session(SessionConfig::new(&name, "opc.tcp://server:4840"))
+        .unwrap();
+    let mut record = OpcuaItemRecord::default();
+    bind(
+        &registry,
+        "ITEM",
+        &mut record,
+        &format!("{name} ns=2;s=Struct monitor=n"),
+    );
+
+    assert_eq!(
+        record.get_field("SESS"),
+        Some(EpicsValue::String(name.as_bytes()[..40].into()))
+    );
+}
+
+/// A DBF_STRING field holds bytes: a client's put that is not UTF-8 is kept as
+/// it came, as the C's `char[41]` keeps it.
+#[test]
+fn a_string_field_keeps_the_bytes_a_client_put() {
+    let mut record = OpcuaItemRecord::default();
+    let bytes = vec![0xff; 14];
+    for field in ["SESS", "SUBS", "STATTEXT"] {
+        record
+            .put_field(field, EpicsValue::String(bytes.clone().into()))
+            .expect("the field takes it");
+        assert_eq!(
+            record.get_field(field),
+            Some(EpicsValue::String(bytes.clone().into())),
+            "{field}"
+        );
+    }
+}
+
 #[test]
 fn init_takes_the_links_bini_when_the_database_set_none() {
     let registry = offline();
