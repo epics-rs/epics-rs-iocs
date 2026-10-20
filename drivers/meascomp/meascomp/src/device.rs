@@ -1,11 +1,40 @@
 use std::ffi::CStr;
+use std::fmt;
 
 use uldaq_sys::*;
 
-use crate::error::{self, Result};
+use crate::error::{self, MeasCompError, Result};
 
 /// Maximum number of devices returned by discovery.
 const MAX_DEVICES: usize = 64;
+
+/// Why [`DaqDevice::connect`] failed: a uldaq call, or no device to open.
+#[derive(Debug)]
+pub enum ConnectError {
+    Ul(MeasCompError),
+    NoDevices,
+    NotFound(String),
+    NullHandle,
+}
+
+impl From<MeasCompError> for ConnectError {
+    fn from(e: MeasCompError) -> Self {
+        Self::Ul(e)
+    }
+}
+
+impl fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ul(e) => e.fmt(f),
+            Self::NoDevices => f.write_str("no MCC DAQ devices found"),
+            Self::NotFound(id) => write!(f, "device with uniqueID '{id}' not found"),
+            Self::NullHandle => f.write_str("ulCreateDaqDevice returned null handle"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {}
 
 /// RAII wrapper around a connected MCC DAQ device.
 ///
@@ -19,7 +48,7 @@ impl DaqDevice {
     /// Discover all MCC DAQ devices and connect to the one matching `unique_id`.
     ///
     /// If `unique_id` is empty, connects to the first device found.
-    pub fn connect(unique_id: &str) -> Result<Self> {
+    pub fn connect(unique_id: &str) -> std::result::Result<Self, ConnectError> {
         let mut descriptors = vec![DaqDeviceDescriptor::default(); MAX_DEVICES];
         let mut num_devs = MAX_DEVICES as u32;
 
@@ -28,10 +57,7 @@ impl DaqDevice {
         })?;
 
         if num_devs == 0 {
-            return Err(error::MeasCompError {
-                code: ERR_DEV_NOT_FOUND,
-                message: "no MCC DAQ devices found".into(),
-            });
+            return Err(ConnectError::NoDevices);
         }
 
         let descriptor = if unique_id.is_empty() {
@@ -44,18 +70,12 @@ impl DaqDevice {
                     id == unique_id
                 })
                 .cloned()
-                .ok_or_else(|| error::MeasCompError {
-                    code: ERR_DEV_NOT_FOUND,
-                    message: format!("device with uniqueID '{unique_id}' not found"),
-                })?
+                .ok_or_else(|| ConnectError::NotFound(unique_id.to_owned()))?
         };
 
         let handle = unsafe { ulCreateDaqDevice(descriptor.clone()) };
         if handle == 0 {
-            return Err(error::MeasCompError {
-                code: ERR_DEV_NOT_FOUND,
-                message: "ulCreateDaqDevice returned null handle".into(),
-            });
+            return Err(ConnectError::NullHandle);
         }
 
         error::check(unsafe { ulConnectDaqDevice(handle) })?;

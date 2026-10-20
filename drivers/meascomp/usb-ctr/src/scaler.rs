@@ -82,7 +82,7 @@ pub fn start_scaler(
                 TraceMask::ERROR,
                 format_args!(
                     "USBCTR::startScaler error calling ulCConfigScan, counter={i}, mode=0x{mode:x}, status={}, error={}\n",
-                    e.code, e.message
+                    e.code, e.message()
                 ),
             );
         }
@@ -111,7 +111,7 @@ pub fn start_scaler(
                 config.options,
                 config.flags,
                 e.code,
-                e.message
+                e.message()
             ),
         );
     }
@@ -137,7 +137,7 @@ fn set_scaler_presets(
                 TraceMask::ERROR,
                 format_args!(
                     "USBCTR::setScalerPresets error calling cbCLoad32, counter={i}, presetCounts={}, status={}, error={}\n",
-                    preset as i32, e.code, e.message
+                    preset as i32, e.code, e.message()
                 ),
             );
         }
@@ -147,7 +147,7 @@ fn set_scaler_presets(
             TraceMask::ERROR,
             format_args!(
                 "USBCTR::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL0REG0, value=0, status={}, error={}\n",
-                e.code, e.message
+                e.code, e.message()
             ),
         );
     }
@@ -157,7 +157,7 @@ fn set_scaler_presets(
             TraceMask::ERROR,
             format_args!(
                 "USBCTR::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL1REG0, value={}, status={}, error={}\n",
-                preset0 as i32, e.code, e.message
+                preset0 as i32, e.code, e.message()
             ),
         );
     }
@@ -222,7 +222,7 @@ pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrac
                 TraceMask::ERROR,
                 format_args!(
                     "USBCTR::stopScaler ERROR calling cbStopBackground(CTRFUNCTION), status={}, error={}\n",
-                    e.code, e.message
+                    e.code, e.message()
                 ),
             );
         }
