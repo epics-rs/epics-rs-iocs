@@ -48,10 +48,14 @@ async fn main() -> CaResult<()> {
         scaler_dir.to_str().expect("cargo paths are UTF-8"),
     );
 
-    // mca's db, which st.cmd loads SIS38XX_waveform.template from.
+    // mca ships SIS38XX_waveform.template; MCA names its crate dir, as
+    // SCALER does, so st.cmd loads it from $(MCA)/db.
+    let mca_dir = std::path::Path::new(mca::MCA_DB_DIR)
+        .parent()
+        .expect("MCA_DB_DIR is <crate>/db");
     epics_rs::base::runtime::env::set_default(
         "MCA",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../drivers/mca"),
+        mca_dir.to_str().expect("cargo paths are UTF-8"),
     );
 
     // Runtime kept alive by being captured in the startup command closure
