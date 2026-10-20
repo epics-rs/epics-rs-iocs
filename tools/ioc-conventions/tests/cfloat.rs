@@ -13,12 +13,6 @@ use std::path::Path;
 /// matches no site fails the gate.
 const EXEMPT: &[(&str, &str, &str, &str)] = &[
     (
-        "drivers/ad/eiger/src/param.rs",
-        "{value:.1}",
-        "value",
-        "encode_f64's JSON text of a finite integral double, not a C printf",
-    ),
-    (
         "drivers/twincat-ads/src/driver.rs",
         "{period:.3}",
         "period",
