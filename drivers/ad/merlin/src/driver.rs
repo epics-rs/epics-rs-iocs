@@ -1056,8 +1056,7 @@ mod tests {
         let mut body = crate::protocol::tests::quad_header(768, 1);
         body.resize(768 + 256 * 256 * 2, 0);
         epics_rs::ad_core::runtime::run_thread(move || async move {
-            let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, default_timeout());
-            crate::task::handle_frame(&ctx, &sync, &body, &mut String::new()).await;
+            crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
         })
         .join()
         .unwrap();
@@ -1137,6 +1136,59 @@ mod tests {
         assert_eq!(seen, ["acquire 0", "status idle"]);
     }
 
+    /// merlinTask holds the driver lock from the end of its read to the
+    /// next (merlinDetector.cpp:137-305): another thread's callParamCallbacks
+    /// waits for the pass's end and cannot post the counters a half pass
+    /// stored. The pass is stopped in the middle by its "Unknown header" line
+    /// (:250-253), which waits on the trace file.
+    #[test]
+    fn another_callback_cannot_post_a_half_pass() {
+        use epics_rs::asyn::trace::TraceFile;
+        let name = "MERLIN_HALF_PASS";
+        let det = detector_sized(name, 2 << 20);
+        let counter = det.ad.params.base.array_counter;
+        let ctx = quad_frame_context(name, det, NDArrayOutput::new());
+        let handle = ctx.handle.clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        handle
+            .trace()
+            .set_trace_file(Some(name), TraceFile::File(file.clone()));
+        let mut posts = handle.interrupts().subscribe_async(256, 64);
+        let mut counted = move || {
+            let mut n = 0;
+            while let Ok(v) = posts.try_recv() {
+                if v.reason == counter && matches!(v.value, ParamValue::Int32(1)) {
+                    n += 1;
+                }
+            }
+            n
+        };
+
+        let trace_held = file.lock().unwrap();
+        let pass = std::thread::spawn(move || {
+            let body = b"XXX,000001".to_vec();
+            epics_rs::ad_core::runtime::run_thread(move || async move {
+                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+            })
+            .join()
+            .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let other = {
+            let handle = handle.clone();
+            std::thread::spawn(move || handle.call_param_callbacks_blocking(0))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(counted(), 0, "another callback posted the half pass");
+        drop(trace_held);
+        pass.join().unwrap();
+        other.join().unwrap().unwrap();
+        handle.read_int32_blocking(counter, 0).unwrap();
+        assert_eq!(counted(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// copyProfileToNDArray32 posts the profiles at once through
     /// doCallbacksInt32Array, Y then X (merlinDetector.cpp:415-416), on the
     /// asynInt32Array interface; the counters the pass stored go out only at
@@ -1157,8 +1209,7 @@ mod tests {
         body[..3].copy_from_slice(b"PR1");
         body.resize(768 + (256 + 256) * 8, 0);
         epics_rs::ad_core::runtime::run_thread(move || async move {
-            let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, default_timeout());
-            crate::task::handle_frame(&ctx, &sync, &body, &mut String::new()).await;
+            crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
         })
         .join()
         .unwrap();
