@@ -24,7 +24,7 @@ use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
 use crate::connection::{ChannelError, MpxConnection};
-use crate::driver::SharedState;
+use crate::driver::{MerlinDetector, SharedState};
 use crate::image;
 use crate::params::MerlinParams;
 use crate::protocol;
@@ -396,24 +396,15 @@ async fn publish_profiles(
         return false;
     };
 
+    // doCallbacksInt32Array, Y then X (merlinDetector.cpp:415-416).
+    let (x, y) = (ctx.params.profile_x, ctx.params.profile_y);
     let _ = ctx
         .handle
-        .set_params_and_notify(
-            0,
-            vec![
-                ParamSetValue::new(
-                    ctx.params.profile_x,
-                    0,
-                    ParamValue::Int32Array(profiles.x.into()),
-                ),
-                ParamSetValue::new(
-                    ctx.params.profile_y,
-                    0,
-                    ParamValue::Int32Array(profiles.y.into()),
-                ),
-            ],
-        )
-        .await;
+        .with_driver_blocking(move |d: &mut MerlinDetector| {
+            let base = &d.ad.port_base;
+            let _ = base.do_callbacks_array(y, 0, ParamValue::Int32Array(profiles.y.into()));
+            let _ = base.do_callbacks_array(x, 0, ParamValue::Int32Array(profiles.x.into()));
+        });
 
     array.unique_id = array_counter;
     // C never calls updateTimeStamp, so epicsTS stays zero

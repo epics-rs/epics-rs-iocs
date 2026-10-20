@@ -1106,6 +1106,55 @@ mod tests {
         );
     }
 
+    /// copyProfileToNDArray32 posts the profiles at once through
+    /// doCallbacksInt32Array, Y then X (merlinDetector.cpp:415-416), on the
+    /// asynInt32Array interface; the counters the pass stored go out only at
+    /// its end (:305).
+    #[test]
+    fn a_profile_frame_posts_its_profiles_before_the_pass() {
+        // 1 MiB of the limit is the flat-field buffer.
+        let det = detector_sized("MERLIN_PROFILES", 2 << 20);
+        let (counter, x, y) = (
+            det.ad.params.base.array_counter,
+            det.params.profile_x,
+            det.params.profile_y,
+        );
+        let ctx = quad_frame_context("MERLIN_PROFILES", det, NDArrayOutput::new());
+        let handle = ctx.handle.clone();
+        let mut posts = handle.interrupts().subscribe_async(256, 1 << 16);
+        let mut body = crate::protocol::tests::quad_header(768, 1);
+        body[..3].copy_from_slice(b"PR1");
+        body.resize(768 + (256 + 256) * 8, 0);
+        epics_rs::ad_core::runtime::run_thread(move || async move {
+            let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, default_timeout());
+            crate::task::handle_frame(&ctx, &sync, &body, &mut String::new()).await;
+        })
+        .join()
+        .unwrap();
+        handle.read_int32_blocking(counter, 0).unwrap();
+        let mut seen = Vec::new();
+        while let Ok(v) = posts.try_recv() {
+            match v.value {
+                ParamValue::Int32(1) if v.reason == counter => seen.push("counter 1".to_string()),
+                ParamValue::Int32Array(a) if v.reason == x || v.reason == y => seen.push(format!(
+                    "{} {} {:?}",
+                    if v.reason == y { "Y" } else { "X" },
+                    a.len(),
+                    v.iface
+                )),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                "Y 256 Some(Int32Array)",
+                "X 256 Some(Int32Array)",
+                "counter 1"
+            ]
+        );
+    }
+
     /// merlinTask stamps timeStamp and never calls updateTimeStamp
     /// (merlinDetector.cpp:255-258): epicsTS is the zero NDArray starts with.
     #[test]
