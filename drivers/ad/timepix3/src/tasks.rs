@@ -2438,41 +2438,35 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                         ParamValue::Int32(i32::try_from(frames).unwrap_or(i32::MAX)),
                     ),
                     ParamSetValue::new(p.prv_hst_acq_rate, ADDR, ParamValue::Float64(hst_rate)),
-                    ParamSetValue::new(
-                        p.prv_hst_histogram_frame,
-                        ADDR,
-                        ParamValue::Int32Array(
-                            h.counts
-                                .iter()
-                                .map(|&v| v as i32)
-                                .collect::<Vec<i32>>()
-                                .into(),
-                        ),
-                    ),
                 ],
             );
+            // The window sum, the time axis, the running sum and the frame,
+            // in that order (histogram_io.cpp:619-708).
+            if let Some(sum_n) = &update.sum_n {
+                ctx.post_int64_array(p.prv_hst_histogram_sum_n_frames, ADDR, int64_array(sum_n));
+            }
+            let frame: Vec<i32> = h.counts.iter().map(|&v| v as i32).collect();
             ctx.post(
                 ADDR,
-                vec![ParamSetValue::new(
+                vec![ParamSetValue::array(
                     p.prv_hst_histogram_time_ms,
                     ADDR,
                     ParamValue::Float64Array(h.time_axis_ms().into()),
+                )],
+            );
+            ctx.post_int64_array(p.prv_hst_histogram_data, ADDR, int64_array(&update.running));
+            ctx.post(
+                ADDR,
+                vec![ParamSetValue::array(
+                    p.prv_hst_histogram_frame,
+                    ADDR,
+                    ParamValue::Int32Array(frame.into()),
                 )],
             );
             let (total, range) = ctx.shared.hst.lock().public_total();
             post_accum_range(ctx, Accum::PrvHst, range).await;
             ctx.post_int64(p.prv_hst_total_counts, total);
             post_window(ctx, Accum::PrvHst, &update).await;
-
-            publish_accumulation(
-                ctx,
-                &update,
-                p.prv_hst_histogram_data,
-                ADDR,
-                p.prv_hst_histogram_sum_n_frames,
-                ADDR,
-            )
-            .await;
 
             // histogram_io.cpp:720-830: every frame also goes to the plugins on
             // addresses 4-7, the window sum only on the frames it was updated.
@@ -2773,20 +2767,6 @@ fn frame_rate(
         );
     }
     o.due.then_some(o.rate)
-}
-
-async fn publish_accumulation(
-    ctx: &Arc<Ctx>,
-    update: &Update,
-    sum_param: usize,
-    sum_addr: i32,
-    sum_n_param: usize,
-    sum_n_addr: i32,
-) {
-    ctx.post_int64_array(sum_param, sum_addr, int64_array(&update.running));
-    if let Some(sum_n) = &update.sum_n {
-        ctx.post_int64_array(sum_n_param, sum_n_addr, int64_array(sum_n));
-    }
 }
 
 /// An accumulation as the asynInt64Array interface carries it: C's
@@ -3871,6 +3851,42 @@ mod tests {
         // readInt32Array still serves the current frame (mask_io.cpp:54-90).
         let frame = ctx.handle.read_int32_array(p.img_image_frame, 0, 3).await;
         assert_eq!(frame.unwrap()[..], [1, 200, 0]);
+        std::mem::forget(runtime);
+    }
+
+    /// processPrvHstFrame posts the window sum, the time axis, the running
+    /// sum and the current frame with doCallbacksInt64/Float64/Int32Array,
+    /// in that order (histogram_io.cpp:619-708).
+    #[tokio::test]
+    async fn a_prv_hst_frame_posts_its_arrays_as_array_callbacks_in_c_order() {
+        use epics_rs::asyn::interfaces::InterfaceType as I;
+
+        let (ctx, mut rx, runtime) = posting_ctx("TPXHSTARR");
+        let p = ctx.p;
+        ctx.shared.hst.lock().set_update_interval(1);
+        let frame = Frame::Histogram(crate::stream::HistogramFrame {
+            bin_width: 2,
+            bin_offset: 1,
+            frame_number: 1,
+            time_at_frame: 0.0,
+            counts: vec![1, 2],
+        });
+        handle_frame(&ctx, StreamKind::PrvHst, frame).await;
+        let watched = [
+            p.prv_hst_histogram_sum_n_frames,
+            p.prv_hst_histogram_time_ms,
+            p.prv_hst_histogram_data,
+            p.prv_hst_histogram_frame,
+        ];
+        assert_eq!(
+            typed_posts(&ctx, &mut rx, &watched).await,
+            [
+                (p.prv_hst_histogram_sum_n_frames, I::Int64Array),
+                (p.prv_hst_histogram_time_ms, I::Float64Array),
+                (p.prv_hst_histogram_data, I::Int64Array),
+                (p.prv_hst_histogram_frame, I::Int32Array),
+            ]
+        );
         std::mem::forget(runtime);
     }
 
