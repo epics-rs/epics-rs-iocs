@@ -429,8 +429,6 @@ pub struct McsAxis {
     controller: Arc<Mutex<McsController>>,
     /// The axis number, the key of its channel state on the controller.
     axis_no: i32,
-    /// Sensor-present flag probed at construction.
-    has_encoder: bool,
     /// Whether speed-set commands are suppressed (copied from the controller).
     disable_speed: bool,
     /// Cached closed-loop speed (`GCLS`), to skip redundant `SCLS` writes.
@@ -438,7 +436,7 @@ pub struct McsAxis {
     /// What the constructor or the last poll set, for the poller's
     /// callParamCallbacks.
     sets: PortSets,
-    /// The status bits the last failed command raised.
+    /// The status bits the constructor or the last failed command set.
     status_writes: Vec<StatusWrite>,
 }
 
@@ -472,7 +470,6 @@ impl McsAxis {
         let mut axis = Self {
             controller,
             axis_no,
-            has_encoder: false,
             disable_speed,
             vel_cached: 0,
             sets: PortSets::default(),
@@ -507,11 +504,17 @@ impl McsAxis {
         ctrl.get_val("GST", channel)?;
 
         // C reads the position again rather than reusing checkType's `GP`.
-        self.has_encoder = if ctrl.axis(axis_no).is_rot {
+        let has_encoder = if ctrl.axis(axis_no).is_rot {
             ctrl.get_angle(channel).is_ok()
         } else {
             ctrl.get_val("GP", channel).is_ok()
         };
+        if has_encoder {
+            self.status_writes.extend([
+                StatusWrite::HasEncoder(true),
+                StatusWrite::GainSupport(true),
+            ]);
+        }
         Ok(())
     }
 
@@ -722,9 +725,13 @@ impl AsynMotor for McsAxis {
         } else {
             ctrl.get_val("GP", ch)? as i64
         };
+        status.encoder_position = pos as f64;
+        status.position = pos as f64;
 
         let moving = status_is_moving(ctrl.get_val("GS", ch)?);
-        let homed = ctrl.get_val("GPPK", ch)? != 0;
+        status.moving = moving;
+        status.done = !moving;
+        status.homed = ctrl.get_val("GPPK", ch)? != 0;
         // C reads the sensor type, `GST`, into PTYP_RB, then reads it again
         // (smarActMCSMotorDriver.cpp:495-502).
         let sensor = ctrl.get_val("GST", ch)?;
@@ -734,17 +741,8 @@ impl AsynMotor for McsAxis {
         ctrl.get_val("GST", ch)?;
         drop(ctrl);
 
-        *status = MotorStatus {
-            position: pos as f64,
-            encoder_position: pos as f64,
-            velocity: 0.0,
-            done: !moving,
-            moving,
-            has_encoder: self.has_encoder,
-            gain_support: self.has_encoder,
-            homed,
-            ..MotorStatus::default()
-        };
+        status.problem = false;
+        status.comms_error = false;
         Ok(())
     }
 
@@ -945,6 +943,55 @@ mod tests {
         assert_eq!(sets(&mut axis), [(11, 300)]);
     }
 
+    fn mcs_replies(cmd: &str) -> String {
+        match cmd.trim_end() {
+            ":GCLS0" => ":CLS0,0\n",
+            ":GS0" => ":S0,0\n",
+            ":GP0" => ":P0,1234\n",
+            ":GST0" => ":ST0,300\n",
+            ":GPPK0" => ":PPK0,1\n",
+            _ => ":E0,0\n",
+        }
+        .into()
+    }
+
+    /// smarActMCSMotorDriver.cpp:461-485 sets the positions and DONE before
+    /// GPPK can `goto bail`, so a refused GPPK keeps them.
+    #[test]
+    fn a_failed_gppk_keeps_the_position_and_done_read_before_it() {
+        let (_rig, io) =
+            motor_common::testing::LineRig::failing("mcsFailedGppk", mcs_replies, |cmd| {
+                cmd.trim_end() == ":GPPK0"
+            });
+        let controller = Arc::new(Mutex::new(McsController::new(io, false)));
+        let (mut axis, probed) = McsAxis::new(controller, 1, 0);
+        probed.unwrap();
+        let mut status = MotorStatus {
+            done: false,
+            ..MotorStatus::default()
+        };
+        assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
+        assert_eq!((status.position, status.encoder_position), (1234.0, 1234.0));
+        assert!(status.done && !status.moving);
+    }
+
+    /// smarActMCSMotorDriver.cpp:376-383: only the constructor sets
+    /// HAS_ENCODER and GAIN_SUPPORT, from its position probe.
+    #[test]
+    fn the_constructor_sets_has_encoder_and_gain_support() {
+        let (_rig, io) = motor_common::testing::LineRig::new("mcsCtorEncoder", mcs_replies);
+        let controller = Arc::new(Mutex::new(McsController::new(io, false)));
+        let (mut axis, probed) = McsAxis::new(controller, 1, 0);
+        probed.unwrap();
+        assert_eq!(
+            axis.take_status_writes(),
+            [
+                StatusWrite::HasEncoder(true),
+                StatusWrite::GainSupport(true)
+            ]
+        );
+    }
+
     /// smarActMCSMotorDriver.cpp:187-215 and :385-393: a missing link keeps
     /// the controller and a user that refuses every transfer; the axis bails
     /// and stays, its poll failing on the same user.
@@ -958,7 +1005,7 @@ mod tests {
         assert!(probed.is_err());
         let ctrl = controller.lock().unwrap();
         assert_eq!(ctrl.axis(1).channel, 2);
-        assert!(!ctrl.axis(1).is_rot && !axis.has_encoder);
+        assert!(!ctrl.axis(1).is_rot);
         drop(ctrl);
         assert_eq!(axis.vel_cached, 0);
         assert_eq!(
