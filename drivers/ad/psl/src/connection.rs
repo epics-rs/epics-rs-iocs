@@ -26,7 +26,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::types::{GET_IMAGE_TIMEOUT, MAX_MESSAGE_SIZE, SERVER_TIMEOUT};
+use crate::types::{GET_IMAGE_TIMEOUT, IMAGE_BLOCK_TIMEOUT, MAX_MESSAGE_SIZE, SERVER_TIMEOUT};
 
 /// What an exchange with the server can fail with.
 #[derive(Debug)]
@@ -161,7 +161,7 @@ impl Session<'_> {
         // A read that never ran leaves C's `nRead_` at the previous block's
         // count, which its error line prints: not copied.
         self.io
-            .read(max_bytes, GET_IMAGE_TIMEOUT)
+            .read(max_bytes, IMAGE_BLOCK_TIMEOUT)
             .unwrap_or_else(|e| (Vec::new(), Err(e)))
     }
 }
@@ -284,9 +284,11 @@ mod sync_io_tests {
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
     use epics_rs::asyn::trace::{TraceFile, TraceIoMask};
+    use std::sync::Mutex;
 
-    /// A PSLViewer that answers every read with one image header.
-    struct Answers(PortDriverBase);
+    /// A PSLViewer that answers every read with one image header, keeping
+    /// each read's timeout.
+    struct Answers(PortDriverBase, Arc<Mutex<Vec<Option<Duration>>>>);
 
     impl PortDriver for Answers {
         fn base(&self) -> &PortDriverBase {
@@ -302,7 +304,8 @@ mod sync_io_tests {
         ) -> epics_rs::asyn::error::AsynResult<usize> {
             Ok(data.len())
         }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        fn io_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            self.1.lock().unwrap().push(user.timeout);
             let reply = b"L;2;1;2;ab";
             let n = reply.len().min(buf.len());
             buf[..n].copy_from_slice(&reply[..n]);
@@ -310,21 +313,25 @@ mod sync_io_tests {
         }
     }
 
-    /// `getImage` is `pasynOctetSyncIO` writeRead then read (PSL.cpp:306,
-    /// :585), which print their TRACEIO_DEVICE lines
-    /// (asynOctetSyncIO.c:259-266, :219-223).
-    #[test]
-    fn an_image_read_prints_its_sync_io_lines() {
-        let name = "PSL_LINES";
+    /// A server on an `Answers` port, its trace going to the returned file.
+    fn answers(
+        name: &str,
+    ) -> (
+        PslServer,
+        std::path::PathBuf,
+        Arc<Mutex<Vec<Option<Duration>>>>,
+    ) {
+        let timeouts = Arc::new(Mutex::new(Vec::new()));
+        let base = PortDriverBase::new(
+            name,
+            1,
+            Default::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
         let (rt, _) = create_port_runtime(
             &claim_port(name).unwrap(),
-            Answers(PortDriverBase::new(
-                name,
-                1,
-                Default::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
-            )),
+            Answers(base, timeouts.clone()),
             RuntimeConfig::default(),
         )
         .unwrap();
@@ -332,9 +339,7 @@ mod sync_io_tests {
         let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
         trace.set_trace_file(
             Some(name),
-            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
-                std::fs::File::create(&path).unwrap(),
-            ))),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
         );
         trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
         trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
@@ -343,6 +348,16 @@ mod sync_io_tests {
             0,
             Duration::ZERO,
         ));
+        std::mem::forget(rt);
+        (server, path, timeouts)
+    }
+
+    /// `getImage` is `pasynOctetSyncIO` writeRead then read (PSL.cpp:306,
+    /// :585), which print their TRACEIO_DEVICE lines
+    /// (asynOctetSyncIO.c:259-266, :219-223).
+    #[test]
+    fn an_image_read_prints_its_sync_io_lines() {
+        let (server, path, _) = answers("PSL_LINES");
         let mut session = server.session();
         let (first, status) = session.request_image().unwrap();
         assert!(status.is_ok());
@@ -362,7 +377,21 @@ mod sync_io_tests {
             "{text}"
         );
         assert!(text.contains("asynOctetSyncIO read:\nL;\n"), "{text}");
-        std::mem::forget(rt);
+    }
+
+    /// C reads each later image block with a 1 s timeout (PSL.cpp:585-586),
+    /// `GetImage` itself with PSL_GET_IMAGE_TIMEOUT (:534).
+    #[test]
+    fn an_image_block_read_times_out_after_one_second() {
+        let (server, path, timeouts) = answers("PSL_BLOCK_TMO");
+        let _ = std::fs::remove_file(&path);
+        let mut session = server.session();
+        assert!(session.request_image().unwrap().1.is_ok());
+        assert!(session.read_image_block(2).1.is_ok());
+        assert_eq!(
+            *timeouts.lock().unwrap(),
+            [Some(GET_IMAGE_TIMEOUT), Some(Duration::from_secs(1))]
+        );
     }
 }
 
