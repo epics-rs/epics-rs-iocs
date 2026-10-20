@@ -232,6 +232,7 @@ impl MultiFunctionDriver {
         base.set_int32_param(params.wave_gen_user_num_points, 0, 1)?;
         base.set_int32_param(params.wave_gen_int_num_points, 0, 1)?;
         base.set_int32_param(params.wave_dig_num_points, 0, 1)?;
+        base.set_int32_param(params.pulse_gen_run, 0, 0)?;
         base.set_int32_param(params.wave_dig_run, 0, 0)?;
         base.set_int32_param(params.wave_gen_run, 0, 0)?;
         // The first output range of the model (:1284-1287).
@@ -1241,6 +1242,38 @@ mod tests {
         // A 2408 refuses AO_CFG_SYNC_MODE as the null handle does
         // (uldaq AoDevice::setCfg_SyncMode), so the record takes WRITE/INVALID.
         assert!(drv.write_int32(&mut user, 0).is_err());
+    }
+
+    /// The Ao*SyncMaster PINI write that a 2408 refuses at boot prints the
+    /// param's index in C's constructor (drvMultiFunction.cpp:921).
+    #[test]
+    fn a_refused_sync_master_write_prints_cs_function_number() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MFSYNCFN";
+        let mut drv = MultiFunctionDriver::new(port, DaqDevice::unconnected(), 16, 16).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("usb-2408-fn-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let mut user = AsynUser::new(drv.params.analog_out_sync_master).with_addr(1);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        assert!(drv.write_int32(&mut user, 0).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(
+                "MultiFunction:writeInt32, port MFSYNCFN, function=52, ERROR writing 0 to address 1, status="
+            ),
+            "{text}"
+        );
     }
 
     #[test]
