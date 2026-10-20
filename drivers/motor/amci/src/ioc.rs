@@ -91,7 +91,7 @@ pub fn anf2_create_controller_command() -> CommandDef {
 
 /// C `strtoul(hexConfig, NULL, 16)`; `None` where C's `errno` is set
 /// (overflow).
-fn strtoul_hex(text: &str) -> Option<u64> {
+fn strtoul_hex(text: &str) -> Option<std::ffi::c_ulong> {
     epics_rs::base::types::c_parse::strtoul_errno(text, 16).map(|(v, _)| v)
 }
 
@@ -521,9 +521,9 @@ mod tests {
         assert_eq!(strtoul_hex(" 86zz"), Some(0x86));
         assert_eq!(strtoul_hex("zz"), Some(0));
         assert_eq!(strtoul_hex("0x1ffffffffffffffff"), None);
-        // glibc takes a sign and negates modulo 2^64, errno clear.
+        // glibc takes a sign and negates modulo ULONG_MAX + 1, errno clear.
         assert_eq!(strtoul_hex("+86"), Some(0x86));
-        assert_eq!(strtoul_hex("-1"), Some(u64::MAX));
+        assert_eq!(strtoul_hex("-1"), Some(std::ffi::c_ulong::MAX));
     }
 }
 
