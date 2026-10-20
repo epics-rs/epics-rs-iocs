@@ -16,6 +16,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::manager::claim_port_driver;
 use epics_rs::asyn::registry::PortClaim;
@@ -48,7 +49,10 @@ fn poll_arg(args: &[ArgValue], i: usize, default: f64) -> Result<Duration, Strin
         _ => return Err(format!("argument {i} must be a number")),
     };
     if seconds <= 0.0 {
-        return Err(format!("the poll period must be positive, got {seconds}"));
+        return Err(format!(
+            "the poll period must be positive, got {}",
+            CFloat(seconds).g()
+        ));
     }
     Ok(Duration::from_secs_f64(seconds))
 }
@@ -325,4 +329,17 @@ async fn main() -> CaResult<()> {
     }
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_non_positive_poll_period_is_named_as_c_percent_g() {
+        assert_eq!(
+            poll_arg(&[ArgValue::Double(-1e-5)], 0, 0.1).unwrap_err(),
+            "the poll period must be positive, got -1e-05"
+        );
+    }
 }
