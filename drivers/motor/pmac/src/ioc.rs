@@ -752,7 +752,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use epics_rs::asyn::error::{AsynResult, AsynStatus};
-    use epics_rs::asyn::interfaces::motor::{MotorStatus, PortSet};
+    use epics_rs::asyn::interfaces::motor::{MotorStatus, PortSet, StatusWrite};
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::param::ParamValue;
     use epics_rs::asyn::port::InterfaceMask;
@@ -979,7 +979,7 @@ mod tests {
             std::mem::take(&mut *written.lock().unwrap()),
             ["I113 I114 I130 I131 I133"]
         );
-        assert!(!axis.has_encoder);
+        assert_eq!(axis.take_status_writes(), [StatusWrite::GainSupport(true)]);
         controller.lock().unwrap().poll();
         assert_eq!(std::mem::take(&mut *written.lock().unwrap()), ["???"]);
         assert!(axis.polled(&AsynUser::new(0).with_addr(1)).is_ok());
@@ -1009,7 +1009,13 @@ mod tests {
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
         let controller = Arc::new(Mutex::new(controller_on(name)));
-        assert!(PmacAxis::new(controller, 1).has_encoder);
+        assert_eq!(
+            PmacAxis::new(controller, 1).take_status_writes(),
+            [
+                StatusWrite::HasEncoder(true),
+                StatusWrite::GainSupport(true)
+            ]
+        );
         drop(rt);
     }
 
@@ -1284,14 +1290,16 @@ mod tests {
         let controller = Arc::new(Mutex::new(controller_on("pmacAxisSilent")));
         let mut axis = PmacAxis::new(controller, 1);
         let user = AsynUser::new(0).with_addr(1);
-        let read = axis.polled(&user).unwrap();
+        let mut status = MotorStatus::default();
+        axis.poll(&user, &mut status).unwrap();
+        let read = status.clone();
         assert!(read.powered);
         assert_eq!(read.position, 100.0);
 
         rig.silence("#1 ? F P");
-        let failed = axis.polled(&user).unwrap();
+        axis.poll(&user, &mut status).unwrap();
         assert_eq!(
-            failed,
+            status,
             MotorStatus {
                 powered: false,
                 moving: false,
