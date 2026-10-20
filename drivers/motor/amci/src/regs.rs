@@ -21,9 +21,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::DrvUserRequest;
-use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::user::AsynUser;
 
 /// C `MODBUS_DATA_STRING` — the modbus-rs param every register read/write
 /// resolves through.
@@ -79,16 +77,9 @@ impl ModbusRegs {
 
     /// Write an array of registers atomically (C `writeReg32Array` /
     /// `pasynInt32ArraySyncIO->write`); the port must be configured with a
-    /// write-multiple-registers Modbus function. A raw submit: `SyncIOHandle`
-    /// has no Int32Array transfer, so C's trace line is not printed.
+    /// write-multiple-registers Modbus function.
     pub fn write_array(&self, addr: i32, data: Vec<i32>) -> AsynResult<()> {
-        let user = AsynUser::new(self.data_reason)
-            .with_addr(addr)
-            .with_timeout(self.timeout);
-        self.handle
-            .port()?
-            .submit_blocking(RequestOp::Int32ArrayWrite { data }, user)?;
-        Ok(())
+        self.reg(addr)?.write_int32_array(self.data_reason, &data)
     }
 }
 
@@ -286,9 +277,9 @@ mod tests {
         assert_eq!(*taken.lock().unwrap(), [(reason, 0)]);
     }
 
-    /// ANF2Driver.cpp:282, ANG1Driver.cpp:204, :547: register reads and
-    /// writes and the force read are `pasynInt32SyncIO`'s, each printing its
-    /// TRACEIO_DEVICE line.
+    /// ANF2Driver.cpp:271, :282, ANG1Driver.cpp:204, :547: register reads
+    /// and writes and the force read are `pasynInt32SyncIO`'s and the array
+    /// write `pasynInt32ArraySyncIO`'s, each printing its TRACEIO_DEVICE line.
     #[test]
     fn register_transfers_are_asyn_int32_sync_io_s() {
         use epics_rs::asyn::trace::{TraceFile, TraceMask};
@@ -308,6 +299,7 @@ mod tests {
         status.unwrap();
         assert_eq!(regs.read16(7).unwrap(), 7);
         regs.write16(3, 5).unwrap();
+        regs.write_array(4, vec![9, 8]).unwrap();
         ForceRead::connect(name, 10, Duration::from_secs(1))
             .write()
             .unwrap();
@@ -315,9 +307,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let lines: Vec<_> = text
             .lines()
-            .filter_map(|l| l.split_once(" asynInt32SyncIO ").map(|(_, call)| call))
+            .filter_map(|l| l.split_once(" asynInt32").map(|(_, call)| call))
             .collect();
-        assert_eq!(lines, ["read: 7", "wrote: 5", "wrote: 1"], "{text}");
+        let want = [
+            "SyncIO read: 7",
+            "SyncIO wrote: 5",
+            "ArraySyncIO wrote: 9",
+            "SyncIO wrote: 1",
+        ];
+        assert_eq!(lines, want, "{text}");
     }
 
     #[test]
