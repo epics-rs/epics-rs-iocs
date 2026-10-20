@@ -492,42 +492,49 @@ impl Mcs2Axis {
     }
 
     /// C `MCS2Axis::poll`'s queries up to `skip:` (smarActMCS2MotorDriver.cpp:
-    /// 479-555), with the channel parameters it sets on the way in `set`:
-    /// the status word, sensor present, encoder and theoretical position, and
-    /// amplitude reply.
+    /// 479-555), setting `status` as C sets each one, with the channel
+    /// parameters it sets on the way in `set`.
     fn poll_channel(
         &self,
         ctrl: &Mcs2Controller,
         set: &mut Vec<(usize, i32)>,
-    ) -> AsynResult<(i64, bool, f64, f64, String)> {
+        status: &mut MotorStatus,
+    ) -> AsynResult<()> {
         let c = self.channel;
         let r = ctrl.reasons.unwrap_or_default();
         let state = atof(&ctrl.query(&format!(":CHAN{c}:STAT?"))?) as i64;
         set.push((r.pstat, state as i32));
-        let sensor_present = (state & SENSOR_PRESENT) != 0;
-        let mut encoder_position = self.tracked_position;
-        let mut theory_position = self.tracked_position;
-        if sensor_present {
+        let done = (state & ACTIVELY_MOVING) == 0;
+        let end_stop = (state & END_STOP_REACHED) != 0;
+        status.moving = !done;
+        status.done = done;
+        status.has_encoder = (state & SENSOR_PRESENT) != 0;
+        status.gain_support = (state & CLOSED_LOOP_ACTIVE) != 0;
+        status.homed = (state & IS_REFERENCED) != 0;
+        status.high_limit = end_stop;
+        status.low_limit = end_stop;
+        // C's motorStatusFollowingError_, MSTA bit 6.
+        status.slip_stall = (state & FOLLOWING_LIMIT_REACHED) != 0;
+        // C sets PROBLEM from MOVEMENT_FAILED (:508) and then overwrites it
+        // with the comms status at `skip` (:562), so a failed movement never
+        // shows: a C bug, not copied.
+        status.problem = (state & MOVEMENT_FAILED) != 0;
+        status.home = (state & REFERENCE_MARK) != 0;
+        if status.has_encoder {
             let pos = ctrl.query(&format!(":CHAN{c}:POS?"))?;
-            encoder_position = atof(&pos) / PULSES_PER_STEP;
+            status.encoder_position = atof(&pos) / PULSES_PER_STEP;
             let targ = ctrl.query(&format!(":CHAN{c}:POS:TARG?"))?;
-            theory_position = atof(&targ) / PULSES_PER_STEP;
+            status.position = atof(&targ) / PULSES_PER_STEP;
         }
         // Drive power-on status (amplitude non-zero).
-        let ampl = ctrl.query(&format!(":CHAN{c}:AMPL?"))?;
+        status.powered = atof(&ctrl.query(&format!(":CHAN{c}:AMPL?"))?) as i64 != 0;
         set.push((r.ptyp_rb, atoi(&ctrl.query(&format!(":CHAN{c}:PTYP?"))?)));
-        if state & ACTIVELY_MOVING == 0 {
+        if done {
             set.push((r.cal, i32::from(state & IS_CALIBRATED != 0)));
             set.push((r.mclf, atoi(&ctrl.query(&format!(":CHAN{c}:MCLF?"))?)));
             set.push((r.hold, atoi(&ctrl.query(&format!(":CHAN{c}:HOLD?"))?)));
         }
-        Ok((
-            state,
-            sensor_present,
-            encoder_position,
-            theory_position,
-            ampl,
-        ))
+        Ok(())
     }
 
     /// Closed-loop move: set move mode, acceleration and velocity, then move.
@@ -691,9 +698,14 @@ impl AsynMotor for Mcs2Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        // C's open-loop move sets both positions itself (:387-388).
+        if !self.has_encoder {
+            status.position = self.tracked_position;
+            status.encoder_position = self.tracked_position;
+        }
         let ctrl = self.lock();
         let mut set = Vec::new();
-        let polled = self.poll_channel(&ctrl, &mut set);
+        let polled = self.poll_channel(&ctrl, &mut set, status);
         let posts = ctrl.reasons.is_some();
         drop(ctrl);
         // C's `skip:` posts what was set before a failed query.
@@ -702,42 +714,12 @@ impl AsynMotor for Mcs2Axis {
                 self.sets.axis(reason, ParamValue::Int32(value));
             }
         }
-        let (state, sensor_present, encoder_position, theory_position, ampl) = polled?;
-
-        let done = (state & ACTIVELY_MOVING) == 0;
-        let end_stop = (state & END_STOP_REACHED) != 0;
-
-        let powered = atof(&ampl) as i64 != 0;
-
-        self.has_encoder = sensor_present;
+        self.has_encoder = status.has_encoder;
         // Keep the software-tracked position aligned with the sensor when closed.
-        if sensor_present {
-            self.tracked_position = theory_position;
+        if self.has_encoder {
+            self.tracked_position = status.position;
         }
-
-        *status = MotorStatus {
-            position: theory_position,
-            encoder_position,
-            velocity: 0.0,
-            done,
-            moving: !done,
-            has_encoder: sensor_present,
-            gain_support: (state & CLOSED_LOOP_ACTIVE) != 0,
-            homed: (state & IS_REFERENCED) != 0,
-            home: (state & REFERENCE_MARK) != 0,
-            high_limit: end_stop,
-            low_limit: end_stop,
-            // C sets PROBLEM from MOVEMENT_FAILED (smarActMCS2MotorDriver
-            // .cpp:508) and then overwrites it with the comms status at
-            // `skip` (:562), so a failed movement never shows: a C bug, not
-            // copied.
-            problem: (state & MOVEMENT_FAILED) != 0,
-            // C's motorStatusFollowingError_, MSTA bit 6.
-            slip_stall: (state & FOLLOWING_LIMIT_REACHED) != 0,
-            powered,
-            ..MotorStatus::default()
-        };
-        Ok(())
+        polled
     }
 }
 
@@ -996,6 +978,53 @@ mod tests {
         let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2FollowLimit", 0), no_port());
         let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         assert!(axis.polled(&AsynUser::default()).unwrap().slip_stall);
+    }
+
+    /// smarActMCS2MotorDriver.cpp:501-509 sets the status word's bits
+    /// before POS? can `goto skip`, so a refused POS? keeps them.
+    #[test]
+    fn a_failed_pos_keeps_the_bits_stat_set() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing(
+            "mcs2FailedPos",
+            |cmd| match cmd.trim_end() {
+                ":CHAN0:STAT?" => {
+                    format!("{}\r\n", SENSOR_PRESENT | IS_REFERENCED | END_STOP_REACHED)
+                }
+                _ => "0\r\n".to_string(),
+            },
+            |cmd| cmd.trim_end() == ":CHAN0:POS?",
+        );
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2FailedPos", 0), no_port());
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let mut status = MotorStatus {
+            done: false,
+            ..MotorStatus::default()
+        };
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+        assert!(status.done && !status.moving);
+        assert!(status.has_encoder && status.homed);
+        assert!(status.high_limit && status.low_limit);
+        assert!(axis.has_encoder);
+    }
+
+    /// smarActMCS2MotorDriver.cpp:387-388: the open-loop move sets both
+    /// positions itself, so a poll whose STAT? is refused still shows them.
+    #[test]
+    fn a_failed_stat_keeps_the_open_loop_move_s_position() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing(
+            "mcs2FailedStat",
+            |_| "0\r\n".to_string(),
+            |cmd| cmd.trim_end() == ":CHAN0:STAT?",
+        );
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2FailedStat", 0), no_port());
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        axis.move_relative(&user, 2.5, 0.0, 1.0, 1.0).unwrap();
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert_eq!((status.position, status.encoder_position), (2.5, 2.5));
     }
 
     /// smarActMCS2MotorDriver.cpp:479-555: an idle poll sets PSTAT,
