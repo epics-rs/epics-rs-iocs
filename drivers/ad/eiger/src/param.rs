@@ -316,19 +316,11 @@ pub fn encode_int(meta: &Meta, value: i32) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-/// Encode a double for the wire.
-///
-/// C prints with `setprecision(long double digits10 + 2)`; Rust's default
-/// `Display` for f64 is the shortest representation that round-trips exactly,
-/// which is the same number with less noise.
+/// Encode a double for the wire: C `toString(double)`
+/// (eigerParam.cpp:241-246), `setprecision(long double digits10 + 2)` on a
+/// default-format ostream, which is `%.20g`.
 pub fn encode_f64(value: f64) -> String {
-    if value == value.trunc() && value.is_finite() && value.abs() < 1e15 {
-        // Keep integral doubles JSON-numeric ("1" not "1.0" is fine either way,
-        // but a trailing .0 keeps them distinguishable from ints on the wire).
-        format!("{value:.1}")
-    } else {
-        format!("{value}")
-    }
+    format!("{:.20}", CFloat(value).g())
 }
 
 /// Encode a string for the wire: JSON-quoted (C `toString(std::string)`).
@@ -1168,11 +1160,18 @@ mod tests {
         assert_eq!(encode_int(&m, -3).unwrap(), "-3");
     }
 
+    /// C `toString(double)`'s text, from g++ / glibc 2.39.
     #[test]
-    fn encode_doubles_stay_json_numbers() {
-        assert_eq!(encode_f64(0.015), "0.015");
-        assert_eq!(encode_f64(1.0), "1.0");
-        assert_eq!(encode_f64(-2.5e-7), "-0.00000025");
+    fn encode_doubles_as_c_setprecision_20() {
+        assert_eq!(encode_f64(0.015), "0.014999999999999999445");
+        assert_eq!(encode_f64(1.0), "1");
+        assert_eq!(encode_f64(-2.5e-7), "-2.4999999999999998869e-07");
+        assert_eq!(encode_f64(1e15), "1000000000000000");
+        assert_eq!(encode_f64(1e20), "1e+20");
+        assert_eq!(encode_f64(-0.0), "-0");
+        assert_eq!(encode_f64(f64::NAN), "nan");
+        assert_eq!(encode_f64(-f64::NAN), "-nan");
+        assert_eq!(encode_f64(f64::NEG_INFINITY), "-inf");
     }
 
     #[test]
