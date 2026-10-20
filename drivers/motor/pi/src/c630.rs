@@ -314,7 +314,6 @@ impl PIC630Axis {
         };
         self.last_status = MotorStatus {
             position: polled.position as f64,
-            encoder_position: polled.position as f64,
             velocity: 0.0,
             done: polled.done,
             high_limit: polled.high_limit,
@@ -567,6 +566,21 @@ mod tests {
         let mut axis = PIC630Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
         let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.done), (250.0, false));
+    }
+
+    /// drvPIC630.cc set_status sets no encoder_position, so REP keeps
+    /// motor_init's 0 (:550).
+    #[test]
+    fn the_poll_sets_no_encoder_position() {
+        let (_line, io) = LineRig::new("pic630NoRep", |last| match last {
+            "1TS" => format!("1TS:{DONE}"),
+            "1TP" => "1TP:250".into(),
+            c => c.into(),
+        });
+        let ctrl = PIC630Controller::new(io, 1).unwrap();
+        let mut axis = PIC630Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
+        let s = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!((s.position, s.encoder_position), (250.0, 0.0));
     }
 
     /// devPIC630.cc:186-192: INIT as its own message.
