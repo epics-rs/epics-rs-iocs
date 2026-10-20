@@ -292,3 +292,6 @@ mca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "58d3d2bd4cae3cc82a1
 motor-rs = { git = "file:///home/stevek/work/epics-rs", rev = "58d3d2bd4cae3cc82a1971a54bd363a3612ffd8e" }
 scaler-rs = { git = "file:///home/stevek/work/epics-rs", rev = "58d3d2bd4cae3cc82a1971a54bd363a3612ffd8e" }
 stream-rs = { git = "file:///home/stevek/work/epics-rs", rev = "58d3d2bd4cae3cc82a1971a54bd363a3612ffd8e" }
+# Local rust-hdf5 fixes (fix/swmr-unlimited-grid, off v0.7.7),
+# released later as one batch; qa drops or repoints this line at that release.
+rust-hdf5 = { git = "file:///home/stevek/work/rust-hdf5", rev = "eccdf45682156886996306b1904bf157c4eb716d" }
