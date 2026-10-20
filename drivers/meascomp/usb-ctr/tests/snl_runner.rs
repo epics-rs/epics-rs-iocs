@@ -9,7 +9,7 @@ use std::time::Duration;
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::ioc_builder::IocBuilder;
 use epics_rs::base::types::EpicsValue;
-use usb_ctr::snl::{UsbCtrSnlConfig, run};
+use usb_ctr::snl::{UsbCtrSnlConfig, run, seq_macros};
 
 fn counter(name: &str) -> String {
     format!("record(calc, \"{name}\") {{ field(INPA, \"{name} NPP\") field(CALC, \"A+1\") }}\n")
@@ -38,7 +38,7 @@ async fn ioc(acquiring: i32) -> Arc<PvDatabase> {
 }
 
 fn start(db: &Arc<PvDatabase>, macros: &str) -> tokio::task::JoinHandle<()> {
-    let config = UsbCtrSnlConfig::from_macros(macros);
+    let config = UsbCtrSnlConfig::from_macros(&seq_macros(macros));
     let db = (**db).clone();
     tokio::spawn(async move {
         run(config, db).await.unwrap();
@@ -146,7 +146,7 @@ async fn the_end_of_acquisition_reads_and_releases_acquiring() {
 #[epics_rs::base::epics_test]
 async fn an_illegal_num_counters_leaves_the_program_dead() {
     let db = ioc(1).await;
-    let config = UsbCtrSnlConfig::from_macros("P=T:, NUM_COUNTERS=10, FIELD=PROC");
+    let config = UsbCtrSnlConfig::from_macros(&seq_macros("P=T:, NUM_COUNTERS=10, FIELD=PROC"));
     run(config, (*db).clone()).await.unwrap();
     assert_eq!(value(&db, "T:SNL_Connected").await, 0.0);
     assert_eq!(value(&db, "T:Acquiring").await, 1.0);
@@ -155,7 +155,7 @@ async fn an_illegal_num_counters_leaves_the_program_dead() {
 #[epics_rs::base::epics_test]
 async fn a_missing_record_is_named() {
     let db = ioc(1).await;
-    let config = UsbCtrSnlConfig::from_macros("P=T:, NUM_COUNTERS=4, FIELD=PROC");
+    let config = UsbCtrSnlConfig::from_macros(&seq_macros("P=T:, NUM_COUNTERS=4, FIELD=PROC"));
     let err = run(config, (*db).clone()).await.unwrap_err().to_string();
     assert_eq!(err, "USBCTR_SNL: not in the database: T:mca4.PROC");
 }

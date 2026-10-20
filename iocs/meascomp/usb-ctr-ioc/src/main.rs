@@ -212,8 +212,9 @@ async fn main() -> CaResult<()> {
                 Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => String::new(),
             };
+            let macros = usb_ctr::snl::seq_macros(&macros);
             let config = usb_ctr::snl::UsbCtrSnlConfig::from_macros(&macros);
-            spawn_program(ctx.bridge(), ctx.db(), "USBCTR_SNL", move |db| {
+            spawn_program(ctx.bridge(), ctx.db(), "USBCTR_SNL", &macros, move |db| {
                 usb_ctr::snl::run(config, db)
             });
             Ok(CommandOutcome::Continue)
