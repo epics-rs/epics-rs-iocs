@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
@@ -213,7 +214,7 @@ pub fn start_wave_dig(
         TraceMask::FLOW,
         format_args!(
             "{DRIVER_NAME}:{FUNCTION}: called cbAInScan, firstChan={first_chan}, lastChan={last_chan}, numPoints={num_points}, dwell={:.6}, options=0x{options:x}\n",
-            state.dwell_actual
+            CFloat(state.dwell_actual)
         ),
     );
 
@@ -345,7 +346,7 @@ pub fn waveform_updates(
                 TraceMask::FLOW,
                 format_args!(
                     "{DRIVER_NAME}:readWaveDig:, doing callbacks on input {ch}, first value={:.6}\n",
-                    state.channel_buffers[ch][0]
+                    CFloat(state.channel_buffers[ch][0])
                 ),
             );
             updates.push(ParamSetValue::new(
@@ -413,6 +414,41 @@ mod tests {
             })
             .collect();
         assert_eq!(addrs, [14, 15]);
+    }
+
+    /// readWaveDig's trace is C's %f (drvMultiFunction.cpp:1897).
+    #[test]
+    fn a_nan_first_value_prints_as_cs_percent_f() {
+        use crate::driver::MultiFunctionDriver;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::TraceFile;
+        use std::sync::{Arc, Mutex};
+        let port = "MFNANWF";
+        let drv = MultiFunctionDriver::new(port, DaqDevice::unconnected(), 4, 4).unwrap();
+        let params = drv.params;
+        let (rt, _) =
+            create_port_runtime(&claim_port(port).unwrap(), drv, RuntimeConfig::default()).unwrap();
+        let trace = SelfTrace::default();
+        trace.bind(rt.port_handle().clone());
+        let manager = rt.port_handle().trace();
+        let log = std::env::temp_dir().join(format!("usb-2408-nanwf-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(Some(port), TraceFile::File(Arc::new(Mutex::new(file))));
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::FLOW);
+        let mut state = WaveDigState::new(4);
+        state.channel_buffers[0][0] = f64::NAN;
+        state.current_point = 1;
+        waveform_updates(&params, &state, &trace);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(
+                "MultiFunction:readWaveDig:, doing callbacks on input 0, first value=nan\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

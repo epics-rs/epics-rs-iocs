@@ -4991,6 +4991,7 @@ name = "usb-2408"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "epics-libcom-rs",
  "epics-rs",
  "meascomp",
  "parking_lot",

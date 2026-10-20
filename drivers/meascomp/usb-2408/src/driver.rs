@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{EnumEntry, ParamValue};
@@ -913,7 +914,8 @@ impl PortDriver for MultiFunctionDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "{DRIVER_NAME}:writeFloat64, port {port}, wrote {value:.6} to address {addr}\n"
+                    "{DRIVER_NAME}:writeFloat64, port {port}, wrote {value:.6} to address {addr}\n",
+                    value = CFloat(value)
                 ),
             );
         } else {
@@ -922,7 +924,8 @@ impl PortDriver for MultiFunctionDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "{DRIVER_NAME}:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}\n"
+                    "{DRIVER_NAME}:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}\n",
+                    value = CFloat(value)
                 ),
             );
         }
@@ -1272,6 +1275,36 @@ mod tests {
             text.contains(
                 "MultiFunction:writeInt32, port MFSYNCFN, function=52, ERROR writing 0 to address 1, status="
             ),
+            "{text}"
+        );
+    }
+
+    /// writeFloat64's trace is C's %f (drvMultiFunction.cpp:2321).
+    #[test]
+    fn a_written_nan_prints_as_cs_percent_f() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MFNANF";
+        let mut drv = MultiFunctionDriver::new(port, DaqDevice::unconnected(), 16, 16).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("usb-2408-nan-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let mut user = AsynUser::new(drv.params.poll_sleep_ms);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        drv.write_float64(&mut user, f64::NAN).unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains("MultiFunction:writeFloat64, port MFNANF, wrote nan to address 0\n"),
             "{text}"
         );
     }
