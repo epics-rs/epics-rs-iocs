@@ -1106,6 +1106,37 @@ mod tests {
         );
     }
 
+    /// The last frame of an acquisition stores Acquire 0 and Status Idle
+    /// (merlinDetector.cpp:296-300) and the pass's own callParamCallbacks
+    /// (:305) posts them, with no other callback after it.
+    #[test]
+    fn the_last_frame_posts_the_acquisition_complete() {
+        // 1 MiB of the limit is the flat-field buffer.
+        let mut det = detector_sized("MERLIN_DONE_POSTS", 2 << 20);
+        let (acquire, status) = (det.ad.params.acquire, det.ad.params.status);
+        let base = &mut det.ad.port_base;
+        base.set_int32_param(acquire, 0, 1).unwrap();
+        base.set_int32_param(status, 0, ADStatus::Acquire as i32)
+            .unwrap();
+        det.shared.images_remaining.store(1, Ordering::Release);
+        let ctx = quad_frame_context("MERLIN_DONE_POSTS", det, NDArrayOutput::new());
+        let handle = ctx.handle.clone();
+        let mut posts = handle.interrupts().subscribe_async(256, 64);
+        run_quad_frame_in(ctx);
+        handle.read_int32_blocking(acquire, 0).unwrap();
+        let mut seen = Vec::new();
+        while let Ok(v) = posts.try_recv() {
+            match v.value {
+                ParamValue::Int32(0) if v.reason == acquire => seen.push("acquire 0"),
+                ParamValue::Int32(n) if v.reason == status && n == ADStatus::Idle as i32 => {
+                    seen.push("status idle")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(seen, ["acquire 0", "status idle"]);
+    }
+
     /// copyProfileToNDArray32 posts the profiles at once through
     /// doCallbacksInt32Array, Y then X (merlinDetector.cpp:415-416), on the
     /// asynInt32Array interface; the counters the pass stored go out only at
