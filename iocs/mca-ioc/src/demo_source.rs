@@ -66,7 +66,8 @@ fn spawn_producer(handle: PortHandle, data_reason: usize, max_signals: usize, pe
                 thread::sleep(period);
                 let data = synthesize(max_signals, phase);
                 phase = phase.wrapping_add(1);
-                let updates = vec![ParamSetValue::new(
+                // An array callback, as a C asynInt32Array source posts.
+                let updates = vec![ParamSetValue::array(
                     data_reason,
                     0,
                     ParamValue::Int32Array(Arc::from(data)),
@@ -124,6 +125,44 @@ mod tests {
         assert_eq!(data[3], 50);
         assert_eq!(data[0], 35);
         assert!(data.iter().all(|&v| v >= 1));
+    }
+
+    /// DATA reaches an asynInt32Array subscriber as an array callback, the
+    /// way a C source's doCallbacksInt32Array does.
+    #[tokio::test]
+    async fn data_posts_as_an_array_callback() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let claim = epics_rs::asyn::registry::claim_port("DEMO_SRC_ARRAY").unwrap();
+        let mut base = PortDriverBase::new(
+            claim.name(),
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let data = base
+            .create_param(DEMO_SOURCE_DATA, ParamType::Int32Array)
+            .unwrap();
+        base.own_interrupts(InterruptGate::opened());
+        let (runtime, _) =
+            create_port_runtime(&claim, DemoSourceDriver { base }, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        let mut rx = handle.interrupts().subscribe_async(64, 1 << 16);
+        spawn_producer(handle, data, 2, Duration::from_millis(1));
+        let first = loop {
+            let v = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if v.reason == data {
+                break v;
+            }
+        };
+        assert_eq!(first.iface, Some(InterfaceType::Int32Array));
+        std::mem::forget(runtime);
     }
 
     #[test]
