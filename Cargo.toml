@@ -152,6 +152,13 @@ members = [
     "tools/ioc-conventions",
 ]
 
+# cargo dylint --all: raw_float_format, built on its own pinned nightly from
+# the epics-rs revision that carries it.
+[workspace.metadata.dylint]
+libraries = [
+    { git = "file:///home/stevek/work/epics-rs", rev = "90d6c9b3c5c46a93fc98b5681d29cad7d1716c62", pattern = "lints/raw_float_format" },
+]
+
 # Single source of truth for the epics-rs crate versions every driver/IOC
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
