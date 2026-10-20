@@ -11,8 +11,9 @@
 //! This port only ever writes `"\r\n"` to that cell — at construction and at
 //! the top of every setAcquire, as C does — and selects the framing per
 //! operation: [`OctetIo::write_read`] and [`OctetIo::read_line`] are
-//! EOS-terminated, while [`OctetIo::read_binary`] suppresses the EOS for the
-//! duration of the read (`RequestOp::OctetReadBinary`). The bytes on the wire and the bytes
+//! EOS-terminated, while the read thread's [`LockedOctet::read_binary`]
+//! suppresses the EOS for the duration of the read
+//! (`RequestOp::OctetReadBinary`). The bytes on the wire and the bytes
 //! delivered to the parser are identical; only the ownership of the EOS state
 //! changes, from shared mutable to per-call.
 
@@ -60,64 +61,49 @@ impl ReadOutcome {
 
 /// Blocking octet handle at one timeout: the `asynUser` that
 /// `pasynOctetSyncIO->connect` returns.
-#[derive(Clone)]
 pub struct OctetIo {
-    /// `None` is the user a failed connect still hands back, bound to no port:
-    /// C drivers keep it, and every later call on it fails in asynManager.
-    handle: Option<PortHandle>,
-    timeout: Duration,
+    /// A user a failed connect still hands back is bound to no port: C drivers
+    /// keep it, and every later call on it fails in asynManager.
+    io: SyncIOHandle,
+}
+
+impl Clone for OctetIo {
+    fn clone(&self) -> Self {
+        self.with_timeout(self.io.timeout())
+    }
 }
 
 impl OctetIo {
     pub fn new(handle: PortHandle, timeout: Duration) -> Self {
         Self {
-            handle: Some(handle),
-            timeout,
+            io: SyncIOHandle::from_handle(handle, OCTET_ADDR, timeout),
         }
     }
 
-    /// The user [`connect_octet`] leaves when the port does not exist.
+    /// The user a failed connect leaves: `pasynOctetSyncIO->connect` to no
+    /// port.
     pub fn unbound(timeout: Duration) -> Self {
-        Self {
-            handle: None,
-            timeout,
-        }
-    }
-
-    /// The port, or `queueLockPort`'s refusal of an unbound user
-    /// (asynManager.c:1843-1846), which every SyncIO call meets first.
-    fn port(&self) -> AsynResult<&PortHandle> {
-        self.handle.as_ref().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "asynManager::queueLockPort not connected".into(),
-        })
+        let (io, _) = SyncIOHandle::connect_port("", OCTET_ADDR, timeout, InterfaceType::Octet);
+        Self { io }
     }
 
     /// The bound port, for the asynCommon operations (`connect`,
     /// `disconnect`) that have no `asynOctetSyncIO` wrapper.
     pub fn handle(&self) -> Option<&PortHandle> {
-        self.handle.as_ref()
+        self.io.port().ok()
     }
 
     /// The same port at another timeout — `drvNSLS_EM` reads the discovery
     /// datagrams with a shorter one than it uses for commands.
     pub fn with_timeout(&self, timeout: Duration) -> Self {
         Self {
-            handle: self.handle.clone(),
-            timeout,
+            io: self.io.with_timeout(timeout),
         }
     }
 
     /// `asynOctetSyncIO->write` of raw bytes.
     pub fn write_bytes(&self, out: &[u8]) -> AsynResult<usize> {
-        let result = self
-            .port()?
-            .submit_blocking(RequestOp::OctetWrite { data: out.to_vec() }, self.user())?;
-        Ok(result.nbytes)
-    }
-
-    fn user(&self) -> AsynUser {
-        octet_user(self.timeout)
+        self.io.write_octet(OCTET_REASON, out)
     }
 
     /// `pasynManager->lockPort` … `unlockPort` around direct `pasynOctet`
@@ -127,13 +113,13 @@ impl OctetIo {
         &self,
         f: impl FnOnce(&mut LockedOctet<'_>) -> R + Send + 'static,
     ) -> AsynResult<R> {
-        let timeout = self.timeout;
+        let timeout = self.io.timeout();
         // asynManager.c:1783-1786, the unbound user's refusal.
-        let port = self.handle.as_ref().ok_or_else(|| AsynError::Status {
+        let port = self.handle().ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
             message: "asynManager::lockPort not connected\n".into(),
         })?;
-        port.lock_port_blocking(self.user(), move |calls| {
+        port.lock_port_blocking(octet_user(timeout), move |calls| {
             f(&mut LockedOctet { calls, timeout })
         })
     }
@@ -141,41 +127,23 @@ impl OctetIo {
     /// `asynOctetSyncIO->writeRead`: flush stale input, write, read one
     /// EOS-terminated response.
     pub fn write_read(&self, out: &str, buf_size: usize) -> OctetRead {
-        self.read(OctetReadOp::WriteRead {
-            data: out.as_bytes().to_vec(),
-            buf_size,
-        })
-    }
-
-    fn read(&self, op: OctetReadOp) -> OctetRead {
-        match self.port() {
-            Ok(port) => port.submit_octet_read_blocking(op, self.user()),
-            Err(e) => OctetRead::failed(e),
-        }
+        self.io.write_read(OCTET_REASON, out.as_bytes(), buf_size)
     }
 
     /// `asynOctetSyncIO->write`.
     pub fn write(&self, out: &str) -> AsynResult<usize> {
-        let result = self.port()?.submit_blocking(
-            RequestOp::OctetWrite {
-                data: out.as_bytes().to_vec(),
-            },
-            self.user(),
-        )?;
-        Ok(result.nbytes)
+        self.write_bytes(out.as_bytes())
     }
 
     /// `asynOctetSyncIO->read` with the port's input EOS active.
     pub fn read_line(&self, buf_size: usize) -> OctetRead {
-        self.read(OctetReadOp::Read { buf_size })
+        self.io.read_octet(OCTET_REASON, buf_size)
     }
 
-    /// Count-terminated read with the input EOS suppressed — the binary data
-    /// path. Equivalent to C++'s `setInputEos("", 0)` followed by
-    /// `pasynOctet->read(..., nRequested, ...)`, but the suppression is scoped
-    /// to this call.
+    /// `asynOctetSyncIO->read` of a binary frame or datagram. C takes the
+    /// port's input EOS here too, which these ports leave empty.
     pub fn read_binary(&self, buf_size: usize) -> OctetRead {
-        self.read(OctetReadOp::ReadBinary { buf_size })
+        self.read_line(buf_size)
     }
 
     /// One `pasynOctet->read` under [`Self::locked`], EOS-terminated.
@@ -194,21 +162,17 @@ impl OctetIo {
     /// `lockPort`, not `queueLockPort`, so they succeed on a port whose device
     /// is down — the constructor runs before the meter is reachable.
     pub fn set_input_eos(&self, eos: &[u8]) -> AsynResult<()> {
-        let eos = eos.to_vec();
-        self.locked(move |port| port.set_eos(RequestOp::SetInputEos { eos }))?
+        self.io.set_input_eos(OCTET_REASON, eos)
     }
 
     /// `pasynOctetSyncIO->setOutputEos`.
     pub fn set_output_eos(&self, eos: &[u8]) -> AsynResult<()> {
-        let eos = eos.to_vec();
-        self.locked(move |port| port.set_eos(RequestOp::SetOutputEos { eos }))?
+        self.io.set_output_eos(OCTET_REASON, eos)
     }
 
     /// `asynOctetSyncIO->flush`.
     pub fn flush(&self) -> AsynResult<()> {
-        self.port()?
-            .submit_blocking(RequestOp::Flush, self.user())?;
-        Ok(())
+        self.io.flush(OCTET_REASON)
     }
 }
 
@@ -237,8 +201,9 @@ impl LockedOctet<'_> {
             .octet_read(OctetReadOp::Read { buf_size }, octet_user(self.timeout))
     }
 
-    /// `pasynOctet->read` with the input EOS suppressed; see
-    /// [`OctetIo::read_binary`].
+    /// `pasynOctet->read` with the input EOS suppressed: C++'s
+    /// `setInputEos("", 0)` followed by `pasynOctet->read(..., nRequested,
+    /// ...)`, with the suppression scoped to this call.
     pub fn read_binary(&mut self, buf_size: usize) -> OctetRead {
         self.calls.octet_read(
             OctetReadOp::ReadBinary { buf_size },
@@ -251,10 +216,6 @@ impl LockedOctet<'_> {
         self.calls
             .call(&RequestOp::Flush, octet_user(self.timeout))
             .map(drop)
-    }
-
-    fn set_eos(&mut self, op: RequestOp) -> AsynResult<()> {
-        self.calls.call(&op, octet_user(self.timeout)).map(drop)
     }
 }
 
@@ -301,13 +262,9 @@ pub fn create_ip_port(
 /// hands back a user — unbound on a missing port, beside `connectDevice`'s
 /// refusal (asynManager.c:1339-1342).
 pub fn connect_octet(port_name: &str, timeout: Duration) -> (OctetIo, AsynResult<()>) {
-    let (user, status) =
+    let (io, status) =
         SyncIOHandle::connect_port(port_name, OCTET_ADDR, timeout, InterfaceType::Octet);
-    let io = match user.port() {
-        Ok(port) => OctetIo::new(port.clone(), timeout),
-        Err(_) => OctetIo::unbound(timeout),
-    };
-    (io, status)
+    (OctetIo { io }, status)
 }
 
 #[cfg(test)]
@@ -358,6 +315,89 @@ pub(crate) mod tests {
             .unwrap();
         let io = OctetIo::new(runtime.port_handle().clone(), Duration::from_millis(100));
         (io, runtime)
+    }
+
+    /// An octet port that answers every read `pong`.
+    struct Pong(PortDriverBase);
+
+    impl PortDriver for Pong {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            buf[..4].copy_from_slice(b"pong");
+            epics_rs::asyn::interpose::OctetReadResult::ok(4, EomReason::empty())
+        }
+        fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_output_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Every `OctetIo` call is its `pasynOctetSyncIO` namesake, which prints
+    /// its TRACEIO_DEVICE line (asynOctetSyncIO.c:194-200, :219-223,
+    /// :259-266, :291-293, :312, :356).
+    #[test]
+    fn every_call_prints_its_sync_io_line() {
+        use epics_rs::asyn::trace::{TraceFile, TraceIoMask, TraceMask};
+        let name = "QE_SYNCIO_LINES";
+        let (io, runtime) = published_port(
+            name,
+            Pong(PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+        );
+        let trace = runtime.port_handle().trace();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
+        io.set_input_eos(b"\r\n").unwrap();
+        io.set_output_eos(b"\r").unwrap();
+        io.flush().unwrap();
+        io.write("w1").unwrap();
+        io.write_bytes(b"w2").unwrap();
+        assert!(io.write_read("w3", 64).into_parts().1.is_ok());
+        assert!(io.read_line(64).into_parts().1.is_ok());
+        assert!(io.read_binary(64).into_parts().1.is_ok());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for line in [
+            "asynOctetSyncIO setInputEos eoslen 2\n",
+            "asynOctetSyncIO setOutputEos eoslen 1\n",
+            "asynOctetSyncIO flush\n",
+            "asynOctetSyncIO wrote:\nw1\n",
+            "asynOctetSyncIO wrote:\nw2\n",
+            "asynOctetSyncIO wrote:\nw3\n",
+        ] {
+            assert!(text.contains(line), "{line:?} not in\n{text}");
+        }
+        assert_eq!(
+            text.matches("asynOctetSyncIO read:\npong\n").count(),
+            3,
+            "{text}"
+        );
     }
 
     /// The driver constructors set the EOS before the meter is reachable.

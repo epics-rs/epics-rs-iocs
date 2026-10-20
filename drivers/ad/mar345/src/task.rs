@@ -23,10 +23,8 @@ use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::{DriverHold, PortHandle};
-use epics_rs::asyn::request::OctetReadOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 
 use crate::driver::Mar345Driver;
 use crate::params::Mar345Params;
@@ -35,7 +33,6 @@ use crate::protocol::{
     CMD_ERASE, DONE_MODE_CHANGE, DONE_SCAN_DATA, cmd_change, cmd_scan, full_file_name,
     response_done,
 };
-use crate::server::{SERVER_ADDR, server_read};
 use crate::types::{
     EraseMode, Event, IMAGE_SIZES, MAR345_COMMAND_TIMEOUT, MAR345_POLL_DELAY, MAX_FILENAME_LEN,
     MAX_MESSAGE_SIZE, Mode, Status, secs,
@@ -134,17 +131,10 @@ impl Worker {
     /// `ADStringFromServer`, a failed one too (C returns before
     /// `setStringParam` only when `nread == 0`).
     fn read_server(&mut self, l: &mut Held, timeout: f64) -> AsynStatus {
-        let user = AsynUser::default()
-            .with_addr(SERVER_ADDR)
-            .with_timeout(secs(timeout));
         let read = l.unlocked(|| {
-            server_read(
-                &self.server_port,
-                OctetReadOp::Read {
-                    buf_size: MAX_MESSAGE_SIZE,
-                },
-                user,
-            )
+            self.server_port
+                .with_timeout(secs(timeout))
+                .read_octet(0, MAX_MESSAGE_SIZE)
         });
         let (data, status) = read.into_parts();
         let status = status.map_or_else(|e| e.status(), |()| AsynStatus::Success);
@@ -539,6 +529,7 @@ mod tests {
     use epics_rs::ad_core::attributes::NDAttrValue;
     use epics_rs::ad_core::plugin::channel::ndarray_channel;
     use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::user::AsynUser;
 
     /// mar345.cpp:487-503 holds the lock from setShutter(0)'s close delay
     /// through NDFullFileName and writeServer("COMMAND SCAN"), releasing it
@@ -641,10 +632,10 @@ mod tests {
         std::mem::forget(det);
     }
 
-    /// A marServer port whose every read times out after sending `abc`.
-    struct TimesOutAfterAbc(epics_rs::asyn::port::PortDriverBase);
+    /// A marServer port whose every read sends `abc`, then ends with `status`.
+    struct SendsAbc(epics_rs::asyn::port::PortDriverBase, AsynStatus);
 
-    impl epics_rs::asyn::port::PortDriver for TimesOutAfterAbc {
+    impl epics_rs::asyn::port::PortDriver for SendsAbc {
         fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
             &self.0
         }
@@ -658,39 +649,56 @@ mod tests {
         ) -> epics_rs::asyn::interpose::OctetReadResult {
             use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
             buf[..3].copy_from_slice(b"abc");
-            OctetReadResult {
-                status: Err(epics_rs::asyn::error::AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    message: "timeout".into(),
+            let status = match self.1 {
+                AsynStatus::Success => Ok(()),
+                status => Err(epics_rs::asyn::error::AsynError::Status {
+                    status,
+                    message: "refused".into(),
                 }),
+            };
+            OctetReadResult {
+                status,
                 ..OctetReadResult::ok(3, EomReason::empty())
             }
         }
     }
 
-    /// C `readServer` (mar345.cpp:264-269) publishes whatever a timed-out
-    /// read transferred, and returns the timeout.
-    #[test]
-    fn a_timed_out_read_publishes_its_bytes() {
+    /// `readServer` with a 0.1 s timeout on a marServer port answering as
+    /// [`SendsAbc`]: its status, `from`, `ADStringFromServer` and the port's
+    /// TRACEIO_DEVICE output.
+    fn read_server_on(name: &str, status: AsynStatus) -> (AsynStatus, String, Vec<u8>, String) {
         use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use epics_rs::asyn::trace::{TraceFile, TraceIoMask};
         use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
-        let name = "MAR345_PARTIAL";
         let ip = format!("{name}_IP");
         let claim = claim_port(&ip).unwrap();
         let (runtime, _) = create_port_runtime(
             &claim,
-            TimesOutAfterAbc(PortDriverBase::new(
-                &ip,
-                1,
-                PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
-            )),
+            SendsAbc(
+                PortDriverBase::new(
+                    &ip,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                status,
+            ),
             RuntimeConfig::default(),
         )
         .unwrap();
+        let path = std::env::temp_dir().join(format!("{ip}_{}", std::process::id()));
+        let trace = runtime.port_handle().trace();
+        trace.set_trace_file(
+            Some(&ip),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(&ip), TraceMask::IO_DEVICE);
+        trace.set_trace_io_mask(Some(&ip), TraceIoMask::ASCII);
         claim
             .publish(runtime.port_handle().clone(), &InterruptGate::opened())
             .unwrap();
@@ -718,14 +726,35 @@ mod tests {
             let mut l = worker.port.clone().hold_driver_blocking().unwrap();
             worker.read_server(&mut l, 0.1)
         };
-        assert_eq!(status, AsynStatus::Timeout);
-        assert_eq!(worker.from, "abc");
-        assert_eq!(
-            h.get_string_param_blocking(ad.string_from_server, 0, 256)
-                .unwrap(),
-            b"abc"
-        );
+        let from_server = h
+            .get_string_param_blocking(ad.string_from_server, 0, 256)
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
         std::mem::forget(det);
+        (status, worker.from, from_server, text)
+    }
+
+    /// C `readServer` (mar345.cpp:264-269) publishes whatever a timed-out
+    /// read transferred, and returns the timeout; `pasynOctetSyncIO->read`
+    /// prints no read line for it (asynOctetSyncIO.c:219).
+    #[test]
+    fn a_timed_out_read_publishes_its_bytes() {
+        let (status, from, from_server, text) =
+            read_server_on("MAR345_PARTIAL", AsynStatus::Timeout);
+        assert_eq!(status, AsynStatus::Timeout);
+        assert_eq!(from, "abc");
+        assert_eq!(from_server, b"abc");
+        assert!(!text.contains("asynOctetSyncIO read"), "{text}");
+    }
+
+    /// `readServer` is `pasynOctetSyncIO->read` (mar345.cpp:261), whose
+    /// success prints its TRACEIO_DEVICE line (asynOctetSyncIO.c:219-223).
+    #[test]
+    fn a_read_prints_its_sync_io_line() {
+        let (status, _, _, text) = read_server_on("MAR345_READLINE", AsynStatus::Success);
+        assert_eq!(status, AsynStatus::Success);
+        assert!(text.contains("asynOctetSyncIO read:\nabc"), "{text}");
     }
 
     /// mar345.cpp:215-216 reads the driver's attributes into every frame.

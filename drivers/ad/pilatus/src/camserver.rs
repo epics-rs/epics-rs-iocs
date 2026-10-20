@@ -15,21 +15,17 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::{ADStatus, ShutterMode};
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::asyn::error::{AsynResult, AsynStatus};
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{OctetRead, OctetReadOp, ParamSetValue, RequestOp, RequestResult};
+use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 
 use crate::params::PilatusParams;
 use crate::protocol::reply_is_ok;
 use crate::types::{ASYN_POLL_TIME, Event, MAX_FILENAME_LEN, MAX_MESSAGE_SIZE, secs};
-
-/// asyn subaddress of the single-device camserver octet port.
-const CAM_ADDR: i32 = 0;
 
 /// C `readCamserver`: `epicsEventWaitWithTimeout(stopEventId, 0.001)` right
 /// after the socket read.
@@ -89,10 +85,6 @@ impl Camserver {
         &self.to
     }
 
-    fn submit(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
-        self.port.port()?.submit_blocking(op, user)
-    }
-
     /// C `writeCamserver`: flush stale input, write, then publish the command
     /// on `ADStringToServer` regardless of the write status.
     pub(crate) fn write(
@@ -102,17 +94,13 @@ impl Camserver {
         timeout: f64,
     ) -> AsynStatus {
         self.to = cmd.to_string();
-        let _ = self.submit(RequestOp::Flush, AsynUser::default().with_addr(CAM_ADDR));
+        let _ = self.port.flush(0);
 
-        let user = AsynUser::default()
-            .with_addr(CAM_ADDR)
-            .with_timeout(secs(timeout));
-        let status = match self.submit(
-            RequestOp::OctetWrite {
-                data: cmd.as_bytes().to_vec(),
-            },
-            user,
-        ) {
+        let status = match self
+            .port
+            .with_timeout(secs(timeout))
+            .write_octet(0, cmd.as_bytes())
+        {
             Ok(_) => AsynStatus::Success,
             Err(e) => {
                 let status = e.status();
@@ -140,16 +128,10 @@ impl Camserver {
         let mut nread = 0;
 
         while delta_time <= timeout {
-            let user = AsynUser::default()
-                .with_addr(CAM_ADDR)
-                .with_timeout(secs(ASYN_POLL_TIME));
-            let op = OctetReadOp::Read {
-                buf_size: MAX_MESSAGE_SIZE,
-            };
-            let read = match self.port.port() {
-                Ok(port) => port.submit_octet_read_blocking(op, user),
-                Err(e) => OctetRead::failed(e),
-            };
+            let read = self
+                .port
+                .with_timeout(secs(ASYN_POLL_TIME))
+                .read_octet(0, MAX_MESSAGE_SIZE);
             // C's fromCamserver ends at `nbytesTransfered`, which counts what a
             // timed-out read still delivered.
             let (data, result) = read.into_parts();
@@ -440,11 +422,12 @@ mod tests {
     use crate::task::FlatFieldJob;
     use crate::task::Shared;
     use epics_rs::ad_core::runtime as rt;
-    use epics_rs::asyn::error::AsynError;
+    use epics_rs::asyn::error::{AsynError, AsynResult};
     use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
+    use epics_rs::asyn::user::AsynUser;
 
     struct RefusingPort {
         base: PortDriverBase,
@@ -464,6 +447,83 @@ mod tests {
                 message: "refused".into(),
             })
         }
+    }
+
+    /// A camserver that answers every read `15 OK`.
+    struct Answers(PortDriverBase);
+
+    impl PortDriver for Answers {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            buf[..5].copy_from_slice(b"15 OK");
+            OctetReadResult::ok(5, EomReason::empty())
+        }
+    }
+
+    /// `writeCamserver` and `readCamserver` are `pasynOctetSyncIO` flush,
+    /// write and read (pilatusDetector.cpp:922-923, :956), which print their
+    /// TRACEIO_DEVICE lines (asynOctetSyncIO.c:194-200, :219-223, :291-293).
+    #[test]
+    fn a_camserver_exchange_prints_its_sync_io_lines() {
+        use epics_rs::asyn::trace::{TraceFile, TraceIoMask};
+        let name = "PILATUS_LINES";
+        let new_base = |name: &str| {
+            PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )
+        };
+        let (cam, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            Answers(new_base(name)),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let trace = cam.port_handle().trace();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
+        let mut side = new_base("PILATUS_LINES_DET");
+        let (ad, _) = ADBaseParams::create(&mut side).unwrap();
+        let mut camserver = Camserver::new(
+            Arc::new(SyncIOHandle::from_handle(
+                cam.port_handle().clone(),
+                0,
+                std::time::Duration::ZERO,
+            )),
+            ad,
+            Arc::new(Event::new()),
+        );
+        assert_eq!(
+            camserver.write_read(&mut side, "Exposure x", 1.0),
+            AsynStatus::Success
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("asynOctetSyncIO flush\n"), "{text}");
+        assert!(
+            text.contains("asynOctetSyncIO wrote:\nExposure x\n"),
+            "{text}"
+        );
+        assert!(text.contains("asynOctetSyncIO read:\n15 OK\n"), "{text}");
+        std::mem::forget(cam);
     }
 
     /// C `writeCamserver` returns and prints `pasynOctetSyncIO->write`'s own

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
-use epics_rs::asyn::request::{OctetRead, OctetReadOp, RequestOp};
+use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -100,20 +100,14 @@ impl PixiradServer {
     /// Send a command and read the reply (C `writeReadServer`, including its
     /// `GOT:` check).
     pub fn command(&mut self, command: &str) -> Exchange {
-        let user = AsynUser::new(0).with_addr(0).with_timeout(SERVER_TIMEOUT);
-        let op = OctetReadOp::WriteRead {
-            data: command.as_bytes().to_vec(),
-            buf_size: MAX_MESSAGE_SIZE,
-        };
         let Channel {
             handle,
             from_server,
         } = &mut self.channel;
-        let (bytes, status) = match handle.port() {
-            Ok(port) => port.submit_octet_read_blocking(op, user),
-            Err(e) => OctetRead::failed(e),
-        }
-        .into_parts();
+        let (bytes, status) = handle
+            .with_timeout(SERVER_TIMEOUT)
+            .write_read(0, command.as_bytes(), MAX_MESSAGE_SIZE)
+            .into_parts();
         // C prints both lines on `pasynUserCommand_`: the command port's trace
         // mask gates them.
         let trace_error = |message: &str| {
@@ -191,6 +185,80 @@ mod is_timeout_tests {
             message: "read timeout".into(),
         };
         assert!(matches!(ServerError::from(e), ServerError::Timeout));
+    }
+
+    /// A Pixirad box that takes every write and answers every read `GOT:`.
+    struct Answers(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for Answers {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut AsynUser,
+            data: &[u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            buf[..4].copy_from_slice(b"GOT:");
+            OctetReadResult::ok(4, EomReason::empty())
+        }
+    }
+
+    /// `writeReadServer` is `pasynOctetSyncIO->writeRead` (pixirad.cpp:902),
+    /// which prints its TRACEIO_DEVICE lines (asynOctetSyncIO.c:259-266).
+    #[test]
+    fn a_command_prints_its_sync_io_lines() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceIoMask};
+
+        let name = "PIXIRAD_LINES";
+        let (rt, _) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Answers(PortDriverBase::new(
+                name,
+                1,
+                Default::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let trace = rt.port_handle().trace();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
+        let mut server = PixiradServer::new(SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::ZERO,
+        ));
+        assert!(server.command("DAQ:! X").result.is_ok());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("asynOctetSyncIO wrote:\nDAQ:! X"), "{text}");
+        assert!(text.contains("asynOctetSyncIO read:\nGOT:"), "{text}");
+        std::mem::forget(rt);
     }
 
     #[test]

@@ -8,9 +8,7 @@ use std::collections::HashMap;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::request::OctetReadOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::user::AsynUser;
 
 use crate::codec::{
     self, BeginOutcome, ErrorInfo, ResponseAssembler, clean_string, next_counter,
@@ -120,7 +118,6 @@ pub struct OrdinateRange {
 pub struct WireLink<'a> {
     /// C `portUser_`, unconnected when st.cmd named a missing port.
     pub driver_port: &'a SyncIOHandle,
-    pub addr: i32,
     pub base: &'a mut PortDriverBase,
     pub p: &'a SpecsParams,
     /// `ADStatusMessage`.
@@ -128,12 +125,6 @@ pub struct WireLink<'a> {
 }
 
 impl WireLink<'_> {
-    fn user(&self) -> AsynUser {
-        AsynUser::new(0)
-            .with_addr(self.addr)
-            .with_timeout(secs(SOCKET_TIMEOUT))
-    }
-
     /// `SpecsAnalyser::sendSimpleCommand` (`specsAnalyser.cpp:1313-1339`),
     /// the path of every exchange. `asynWriteRead` advances and posts
     /// `SPECSMsgCounter_` before its connected checks (`:2056-2090`).
@@ -150,26 +141,19 @@ impl WireLink<'_> {
             .base
             .set_int32_param(self.p.msg_counter, 0, counter as i32);
         let _ = self.base.call_param_callbacks(0);
-        let port = match self.driver_port.port() {
-            Ok(port) => port,
-            Err(e) => {
-                let _ = self.base.set_int32_param(self.p.connected, 0, 0);
-                return Err(WireError::Io(e));
-            }
-        };
+        if let Err(e) = self.driver_port.port() {
+            let _ = self.base.set_int32_param(self.p.connected, 0, 0);
+            return Err(WireError::Io(e));
+        }
         if self.base.get_int32_param(self.p.connected, 0).unwrap_or(0) != 1 {
             return Err(WireError::NotConnected);
         }
         let request = codec::format_request(counter, command);
 
-        let (reply, status) = port
-            .submit_octet_read_blocking(
-                OctetReadOp::WriteRead {
-                    data: request.into_bytes(),
-                    buf_size: MAX_MESSAGE_SIZE,
-                },
-                self.user(),
-            )
+        let io = self.driver_port.with_timeout(secs(SOCKET_TIMEOUT));
+        let _ = io.flush(0);
+        let (reply, status) = io
+            .write_read(0, request.as_bytes(), MAX_MESSAGE_SIZE)
             .into_parts();
         status.map_err(WireError::Io)?;
         let raw = String::from_utf8_lossy(&reply).into_owned();
@@ -179,14 +163,7 @@ impl WireLink<'_> {
         match assembler.begin(payload) {
             BeginOutcome::Ok => {}
             BeginOutcome::NeedsMore => loop {
-                let (more, status) = port
-                    .submit_octet_read_blocking(
-                        OctetReadOp::Read {
-                            buf_size: MAX_MESSAGE_SIZE,
-                        },
-                        self.user(),
-                    )
-                    .into_parts();
+                let (more, status) = io.read_octet(0, MAX_MESSAGE_SIZE).into_parts();
                 status.map_err(WireError::Io)?;
                 let chunk = String::from_utf8_lossy(&more).into_owned();
                 if !assembler.continue_with(&chunk) {

@@ -3,9 +3,8 @@
 //!
 //! Neither of them touches a parameter or a socket itself: both reach the
 //! detector port through its actor. Each runs on a current-thread runtime of
-//! its own, so every port call here is an `await` on the asynchronous
-//! `PortHandle` API — the blocking API (`SyncIOHandle`, `submit_blocking`) uses
-//! `block_in_place`, which panics outside a multi-threaded runtime.
+//! its own; the status read blocks that thread on the BIS port as C's
+//! `pasynOctetSyncIO->read` does.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,10 +15,9 @@ use std::time::{Duration, Instant, SystemTime};
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{OctetReadOp, ParamSetValue};
+use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
@@ -475,17 +473,12 @@ async fn status_loop(ctx: StatusContext) {
 }
 
 async fn read_status_message(ctx: &StatusContext) -> AsynResult<String> {
-    let user = AsynUser::new(0)
-        .with_addr(0)
-        .with_timeout(STATUS_READ_TIMEOUT);
-    let op = OctetReadOp::Read {
-        buf_size: MAX_MESSAGE_SIZE,
-    };
+    // C `pasynOctetSyncIO->read` (BISDetector.cpp:404): this thread waits on
+    // the port as statusTask does.
     let (bytes, status) = ctx
         .status
-        .port()?
-        .submit_octet_read(op, user)
-        .await
+        .with_timeout(STATUS_READ_TIMEOUT)
+        .read_octet(0, MAX_MESSAGE_SIZE)
         .into_parts();
     status?;
     Ok(crate::connection::reply_text(&bytes))

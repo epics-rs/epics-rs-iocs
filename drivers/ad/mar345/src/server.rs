@@ -6,37 +6,13 @@
 //! parameter access run on [`Mar345Driver`], inline or through the worker's
 //! `task::Held`, and the worker reads with the hold released.
 
-use epics_rs::asyn::error::{AsynResult, AsynStatus};
-use epics_rs::asyn::request::{OctetRead, OctetReadOp, RequestOp, RequestResult};
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 
 use crate::driver::Mar345Driver;
 use crate::file_name::format_file_template;
 use crate::protocol::{CMD_SHUTTER_CLOSE, CMD_SHUTTER_OPEN};
 use crate::types::{MAR345_SOCKET_TIMEOUT, MAX_FILENAME_LEN, secs};
-
-/// asyn subaddress of the single-device marServer octet port.
-pub(crate) const SERVER_ADDR: i32 = 0;
-
-/// One request on C `pasynUserServer`, which has no port when the startup
-/// script named a marServer port that does not exist: then it fails.
-pub(crate) fn server_submit(
-    server: &SyncIOHandle,
-    op: RequestOp,
-    user: AsynUser,
-) -> AsynResult<RequestResult> {
-    server.port()?.submit_blocking(op, user)
-}
-
-/// [`server_submit`] for a read, its bytes beside its status.
-pub(crate) fn server_read(server: &SyncIOHandle, op: OctetReadOp, user: AsynUser) -> OctetRead {
-    match server.port() {
-        Ok(port) => port.submit_octet_read_blocking(op, user),
-        Err(e) => OctetRead::failed(e),
-    }
-}
 
 impl Mar345Driver {
     // --- parameter library -------------------------------------------------
@@ -109,22 +85,12 @@ impl Mar345Driver {
     /// C `writeServer`: flush stale input, write with `MAR345_SOCKET_TIMEOUT`,
     /// then publish the command on `ADStringToServer`.
     pub fn write_server(&mut self, output: &str) -> AsynStatus {
-        let _ = server_submit(
-            &self.server,
-            RequestOp::Flush,
-            AsynUser::default().with_addr(SERVER_ADDR),
-        );
-
-        let user = AsynUser::default()
-            .with_addr(SERVER_ADDR)
-            .with_timeout(secs(MAR345_SOCKET_TIMEOUT));
-        let status = match server_submit(
-            &self.server,
-            RequestOp::OctetWrite {
-                data: output.as_bytes().to_vec(),
-            },
-            user,
-        ) {
+        let _ = self.server.flush(0);
+        let status = match self
+            .server
+            .with_timeout(secs(MAR345_SOCKET_TIMEOUT))
+            .write_octet(0, output.as_bytes())
+        {
             Ok(_) => AsynStatus::Success,
             Err(e) => {
                 // On pasynUserServer, so the server port's trace mask gates it.

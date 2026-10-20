@@ -618,6 +618,75 @@ pub(crate) mod tests {
         std::mem::forget(server);
     }
 
+    /// A server port that takes every write and answers every read `abc`.
+    struct Answers(PortDriverBase);
+
+    impl PortDriver for Answers {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            buf[..3].copy_from_slice(b"abc");
+            OctetReadResult::ok(3, EomReason::empty())
+        }
+    }
+
+    /// `writeServer` and `readServer` are `pasynOctetSyncIO` flush, write and
+    /// read (marCCD.cpp:502-503, :527), each printing its TRACEIO_DEVICE line
+    /// (asynOctetSyncIO.c:194-200, :219-223, :291-293).
+    #[test]
+    fn server_io_prints_its_sync_io_lines() {
+        use epics_rs::asyn::trace::{TraceFile, TraceIoMask, TraceMask};
+        let name = "MARCCD_LINES";
+        let (server, _) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Answers(PortDriverBase::new(
+                name,
+                1,
+                Default::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let trace = server.port_handle().trace();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
+        let links = DriverLinks {
+            server: SyncIOHandle::from_handle(server.port_handle().clone(), 0, Duration::ZERO),
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+        };
+        let mut det = MarccdDriver::new(&format!("{name}_DET"), 0, links).unwrap();
+        assert_eq!(det.write_server("x"), AsynStatus::Success);
+        assert_eq!(det.read_server(0.1), AsynStatus::Success);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("asynOctetSyncIO flush\n"), "{text}");
+        assert!(text.contains("asynOctetSyncIO wrote:\nx"), "{text}");
+        assert!(text.contains("asynOctetSyncIO read:\nabc"), "{text}");
+        std::mem::forget(server);
+    }
+
     /// marCCD.cpp:1467 adds asynEnumMask to ADDriver's interrupt mask, and
     /// the port refuses a client outside it (`getInterruptPvt`,
     /// asynManager.c:2492-2497): the enum callbacks must register.

@@ -12,10 +12,8 @@ use std::time::Duration;
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ADDriverBase;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 
 use crate::protocol::{self, MpxError};
 use crate::types::*;
@@ -96,10 +94,6 @@ impl MpxConnection {
         Self { io, max_frame }
     }
 
-    fn user(&self, timeout: Duration) -> AsynUser {
-        AsynUser::new(0).with_addr(0).with_timeout(timeout)
-    }
-
     /// C prints these on the asynUser of the socket being read or written.
     pub(crate) fn trace(&self, msg: &str) {
         self.io.print(0, TraceMask::ERROR, format_args!("{msg}"));
@@ -115,18 +109,11 @@ impl MpxConnection {
     ) -> Result<(), Option<ChannelError>> {
         let want = out.len() + count;
         while out.len() < want {
-            // OctetReadBinary brackets the read with the input EOS cleared, so
-            // a 0x0A byte inside a pixel payload cannot terminate it early —
-            // MPX frames are length-delimited, never EOS-delimited.
-            let handle = self.io.port().map_err(|e| Some(e.into()))?;
             // C adds `nread` only on asynSuccess (mpxConnection.cpp:647-648).
-            let (chunk, status) = handle
-                .submit_octet_read_blocking(
-                    OctetReadOp::ReadBinary {
-                        buf_size: want - out.len(),
-                    },
-                    self.user(timeout),
-                )
+            let (chunk, status) = self
+                .io
+                .with_timeout(timeout)
+                .read_octet(0, want - out.len())
                 .into_parts();
             status.map_err(|e| Some(e.into()))?;
             if chunk.is_empty() {
@@ -240,14 +227,7 @@ impl MpxConnection {
     ) -> Result<Vec<u8>, ChannelError> {
         let msg = protocol::encode(kind, name, value)?;
         // C `mpxWrite` reports a failed write and still reads the reply.
-        if let Err(e) = self.io.port().and_then(|handle| {
-            handle.submit_blocking(
-                RequestOp::OctetWrite {
-                    data: msg.as_bytes().to_vec(),
-                },
-                self.user(timeout),
-            )
-        }) {
+        if let Err(e) = self.io.with_timeout(timeout).write_octet(0, msg.as_bytes()) {
             self.trace(&format!(
                 "merlinDetector:mpxWrite, status={}, sent\n{msg}\n",
                 ChannelError::from(e).code()
@@ -340,6 +320,7 @@ pub fn default_timeout() -> Duration {
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
+    use epics_rs::asyn::user::AsynUser;
 
     #[test]
     fn a_timeout_maps_to_timeout() {
@@ -348,6 +329,101 @@ mod is_timeout_tests {
             message: "read timeout".into(),
         };
         assert!(matches!(ChannelError::from(e), ChannelError::Timeout));
+    }
+
+    /// A Merlin command socket: each write queues the reply the fake rig
+    /// sends, each read takes what is queued, up to its buffer.
+    struct Mpx {
+        base: epics_rs::asyn::port::PortDriverBase,
+        queued: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Mpx {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut AsynUser,
+            data: &[u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            let body = b"GET,X,1,0";
+            self.queued = format!("MPX,{:010},", body.len() + 1).into_bytes();
+            self.queued.extend_from_slice(body);
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let n = buf.len().min(self.queued.len());
+            buf[..n].copy_from_slice(&self.queued[..n]);
+            self.queued.drain(..n);
+            OctetReadResult::ok(n, EomReason::empty())
+        }
+    }
+
+    /// `mpxWrite` and `mpxRead` are `pasynOctetSyncIO` write and read
+    /// (mpxConnection.cpp:561, :617, :645, :701), which print their
+    /// TRACEIO_DEVICE lines (asynOctetSyncIO.c:194-200, :219-223).
+    #[test]
+    fn a_transaction_prints_its_sync_io_lines() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceIoMask};
+
+        let name = "MERLIN_LINES";
+        let (rt, _) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Mpx {
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    Default::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                queued: Vec::new(),
+            },
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let trace = rt.port_handle().trace();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
+        let conn = MpxConnection::new(
+            SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::ZERO),
+            1 << 20,
+        );
+        let mut ad = ADDriverBase::new(
+            "MERLIN_LINES_DET",
+            1,
+            1 << 20,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_SUBCLASS,
+            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+        )
+        .unwrap();
+        assert_eq!(conn.get(&mut ad, "X", Duration::from_secs(1)).unwrap(), "1");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("asynOctetSyncIO wrote:\nMPX,"), "{text}");
+        assert!(text.contains("asynOctetSyncIO read:\nMPX\n"), "{text}");
+        std::mem::forget(rt);
     }
 
     #[test]
