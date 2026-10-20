@@ -834,6 +834,46 @@ fn a_pass_that_leaves_an_update_queued_wakes_the_record_again() {
     assert!(wake.try_recv().is_err(), "nothing is left to wake for");
 }
 
+/// A pulse's pass that never reaches `read` (DISA, a breakpoint) wakes nothing,
+/// so a record that stays disabled does not spin; the next update wakes the
+/// record for the one still queued, which the C strands
+/// (`DataElementOpen62541Leaf.cpp:129-134`).
+#[test]
+fn a_pulse_pass_that_never_reads_leaves_its_wake_to_the_next_update() {
+    let registry = registry();
+    let mut record = LonginRecord::new(0);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf(&registry);
+    leaf.lock().state = ConnectionStatus::Up;
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    assert!(wake.try_recv().is_ok());
+
+    device.arm_readback_callback();
+    device.reconcile_readback_callback();
+    assert!(wake.try_recv().is_err(), "the pass took nothing");
+
+    leaf.lock().request_processing(ProcessReason::WriteFailure);
+    assert!(
+        wake.try_recv().is_ok(),
+        "the next update wakes for the first"
+    );
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    assert!(wake.try_recv().is_err(), "the owed wake is spent");
+
+    pulse_pass(&mut device, &mut record);
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: "",
+        }),
+        "the first update's read failure"
+    );
+    assert!(wake.try_recv().is_ok(), "two updates are still queued");
+}
+
 // ---------------------------------------------------------------- failure reasons
 
 #[test]
