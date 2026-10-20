@@ -271,6 +271,7 @@ pub fn read_wave_dig(
     trace: &SelfTrace,
 ) -> (UlError, Option<Vec<ParamSetValue>>) {
     let polled = device.analog_in_scan_status();
+    // C reads uninitialised locals where ulc.cpp fills neither (bad handle, no subsystem, exception); 0 stops as SS_IDLE. C defect, not copied.
     let (status, xfer) = (polled.status, &polled.xfer);
     if polled.error.is_some() {
         if prev_status == 0 {

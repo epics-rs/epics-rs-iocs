@@ -347,6 +347,7 @@ pub fn read_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) -> 
     // (drvUSBCTR.cpp:743-754): a scan that ended on a transfer error
     // reports SS_IDLE and its last index beside the error.
     let polled = device.daq_in_scan_status();
+    // C reads uninitialised locals where ulc.cpp fills neither (bad handle, no subsystem, exception); 0 stops as SS_IDLE. C defect, not copied.
     print_get_status(trace, "readMCS", &polled);
     let current_index = polled.xfer.current_index;
     if polled.status == SS_IDLE {
