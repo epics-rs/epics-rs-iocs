@@ -1127,11 +1127,11 @@ pub fn xps_position_compare_command() -> CommandDef {
             }
             println!(
                 "XPSPositionCompare: motorPort={motor_port} positioner={positioner} mode={mode} min={} max={} step={} pw={}us settle={}us",
-                params.min_position,
-                params.max_position,
-                params.position_step,
-                params.pulse_width_us,
-                params.settling_time_us,
+                CFloat(params.min_position).g(),
+                CFloat(params.max_position).g(),
+                CFloat(params.position_step).g(),
+                CFloat(params.pulse_width_us).g(),
+                CFloat(params.settling_time_us).g(),
             );
             Ok(CommandOutcome::Continue)
         },

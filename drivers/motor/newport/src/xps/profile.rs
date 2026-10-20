@@ -220,7 +220,8 @@ impl Profile {
         for (i, &t) in self.times.iter().enumerate() {
             if t <= 0.0 {
                 return Err(ProfileError::Time(format!(
-                    "time[{i}] = {t} is not positive"
+                    "time[{i}] = {} is not positive",
+                    CFloat(t).g()
                 )));
             }
         }
@@ -236,7 +237,9 @@ impl Profile {
             if max_accel <= 0.0 {
                 return Err(ProfileError::Acceleration(format!(
                     "axis {} ({}) max acceleration {} is not positive",
-                    j, axis.positioner, max_acceleration[j]
+                    j,
+                    axis.positioner,
+                    CFloat(max_acceleration[j]).g()
                 )));
             }
             pre_velocity[j] = (axis.positions[1] - axis.positions[0]) / self.times[0];

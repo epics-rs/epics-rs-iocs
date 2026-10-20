@@ -276,7 +276,11 @@ impl Esp300Axis {
         if res == 0.0 || !res.is_finite() {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("ESP300 axis {}: drive resolution is {res}", self.axis),
+                message: format!(
+                    "ESP300 axis {}: drive resolution is {}",
+                    self.axis,
+                    CFloat(res).g()
+                ),
             });
         }
         Ok(res)

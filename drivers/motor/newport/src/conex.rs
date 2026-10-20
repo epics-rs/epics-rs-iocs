@@ -580,7 +580,11 @@ impl ConexAxis {
         if step == 0.0 || !step.is_finite() {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: format!("CONEX {}: step size is {step}", self.controller_id),
+                message: format!(
+                    "CONEX {}: step size is {}",
+                    self.controller_id,
+                    CFloat(step).g()
+                ),
             });
         }
         Ok(step)
