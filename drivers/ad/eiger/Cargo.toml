@@ -36,4 +36,4 @@ libc = "0.2"
 
 [dev-dependencies]
 # Writes the FileWriter-shaped .h5 fixtures parse_h5 is tested on.
-rust-hdf5 = { version = "0.7.5", default-features = false }
+rust-hdf5 = { version = "0.7.8", default-features = false }
