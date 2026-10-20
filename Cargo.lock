@@ -5036,6 +5036,7 @@ name = "usb-ctr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "epics-libcom-rs",
  "epics-rs",
  "meascomp",
  "parking_lot",

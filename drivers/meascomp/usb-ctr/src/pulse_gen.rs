@@ -1,3 +1,4 @@
+use epics_libcom_rs::cfmt::CFloat;
 use meascomp::device::DaqDevice;
 use meascomp::error::Result;
 use meascomp::timer::PulseTiming;
@@ -61,7 +62,11 @@ pub fn start(
             TraceMask::ERROR,
             format_args!(
                 "USBCTR::startPulseGenerator error calling cbPulseOutStart timerNum={timer} frequency={:.6}, dutyCycle={:.6}, count={count}, delay={:.6}, idleState={idle_state}, status={}, error={}\n",
-                timing.frequency, timing.duty_cycle, timing.initial_delay, e.code, e.message
+                CFloat(timing.frequency),
+                CFloat(timing.duty_cycle),
+                CFloat(timing.initial_delay),
+                e.code,
+                e.message
             ),
         );
         return Err(e);
@@ -73,7 +78,10 @@ pub fn start(
         TraceMask::FLOW,
         format_args!(
             "USBCTR:startPulseGenerator: started pulse generator {timer} actual frequency={:.6}, actual period={actual_period:.6}, actual duty cycle={:.6}, actual delay={:.6}\n",
-            timing.frequency, timing.duty_cycle, timing.initial_delay
+            CFloat(timing.frequency),
+            CFloat(timing.duty_cycle),
+            CFloat(timing.initial_delay),
+            actual_period = CFloat(actual_period)
         ),
     );
     Ok((actual_period, timing.duty_cycle, timing.initial_delay))
