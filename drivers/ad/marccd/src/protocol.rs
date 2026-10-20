@@ -9,6 +9,8 @@
 //! every command and splits replies on `\n`. The strings below carry no
 //! terminator.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 // ---------------------------------------------------------------------------
 // scanf-style primitives
 // ---------------------------------------------------------------------------
@@ -65,7 +67,7 @@ fn scan_f64(s: &str) -> Option<(f64, &str)> {
 /// C `epicsSnprintf(toServer, ..., "%f", v)` — the plain `printf` `%f`, six
 /// fractional digits.
 fn f(v: f64) -> String {
-    format!("{v:.6}")
+    format!("{v:.6}", v = CFloat(v))
 }
 
 /// C: `"readout,%d"` / `"readout,%d,%s"`.
@@ -309,6 +311,8 @@ mod tests {
         assert_eq!(cmd_set_readout_mode(4), "set_readout_mode,4");
         assert_eq!(cmd_set_frameshift(7), "set_frameshift,7");
         assert_eq!(cmd_set_stability(0.5), "set_stability,0.500000");
+        assert_eq!(cmd_set_stability(f64::NAN), "set_stability,nan");
+        assert_eq!(cmd_set_stability(-f64::NAN), "set_stability,-nan");
     }
 
     #[test]

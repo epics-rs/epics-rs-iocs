@@ -69,6 +69,7 @@ dependencies = [
 name = "ad-marccd"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
  "tempfile",

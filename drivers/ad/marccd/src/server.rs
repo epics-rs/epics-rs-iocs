@@ -8,6 +8,7 @@
 //! actor on the marServer port, which is a different port, so the round trip
 //! cannot interleave with another context's.
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::request::{OctetRead, OctetReadOp, RequestOp, RequestResult};
@@ -154,7 +155,8 @@ impl MarccdDriver {
                 "marCCD:readServer, timeout={timeout:.6}, status={} received {} bytes\n{}\n",
                 status as i32,
                 data.len(),
-                self.from
+                self.from,
+                timeout = CFloat(timeout)
             ));
         }
 
