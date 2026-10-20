@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
@@ -515,11 +516,11 @@ impl PortDriver for CtrDriver {
             let num_points = self.int(self.params.mca_num_channels, 0);
             let mut st = self.state.lock().unwrap();
             let times = mcs::compute_times(&mut st.mcs, num_points.max(0) as usize, value);
-            self.base
-                .params
-                .set_float32_array(self.params.mcs_time_wf, 0, times)?;
+            // computeMCSTimes' doCallbacksFloat32Array (drvUSBCTR.cpp:883).
+            let times = ParamValue::Float32Array(times.into());
             drop(st);
-            self.base.call_param_callbacks(0)?;
+            self.base
+                .do_callbacks_array(self.params.mcs_time_wf, 0, times)?;
         }
 
         if (reason == self.params.pulse_period
@@ -707,6 +708,54 @@ mod tests {
         assert_eq!(
             drv.base.interface_mask(),
             interrupts | I::DRV_USER | I::COMMON
+        );
+    }
+
+    /// A dwell-time write runs computeMCSTimes, whose
+    /// doCallbacksFloat32Array posts the time base at once, typed and
+    /// unstored, before writeFloat64's callParamCallbacks posts the dwell
+    /// (drvUSBCTR.cpp:873-884, :1302-1304).
+    #[test]
+    fn a_dwell_write_posts_the_time_base_as_an_array_callback() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let mut drv = CtrDriver::new("CTRDWELL", DaqDevice::unconnected(), 16).unwrap();
+        let (dwell, times) = (drv.params.mca_dwell_time, drv.params.mcs_time_wf);
+        drv.base
+            .set_int32_param(drv.params.mca_num_channels, 0, 4)
+            .unwrap();
+        drv.base.own_interrupts(InterruptGate::opened());
+        drv.base.call_param_callbacks(0).unwrap();
+        let mut rx = drv.base.interrupts.subscribe_async(256, 4096);
+
+        drv.write_float64(&mut AsynUser::new(dwell), 0.5).unwrap();
+        let posted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| v.reason == dwell || v.reason == times)
+            .map(|v| match v.value {
+                ParamValue::Float32Array(a) => format!("times {:?} {:?}", &a[..], v.iface),
+                ParamValue::Float64(x) => format!("dwell {x}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            posted,
+            [
+                format!(
+                    "times {:?} {:?}",
+                    [0.0f32, 0.5, 1.0, 1.5],
+                    Some(InterfaceType::Float32Array)
+                ),
+                "dwell 0.5".to_string(),
+            ]
+        );
+        assert!(
+            drv.base
+                .params
+                .get_float32_array(times, 0)
+                .unwrap()
+                .is_empty(),
+            "the time base was stored"
         );
     }
 
