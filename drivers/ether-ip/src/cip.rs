@@ -11,6 +11,7 @@
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::types::c_cast::{f64_to_i32, f64_to_u32};
+use epics_rs::base::types::c_parse;
 use std::fmt;
 
 /// A tag value is transported as an abbreviated type code followed by raw data.
@@ -144,7 +145,9 @@ fn wr_slice(b: &mut [u8], at: usize, src: &[u8]) -> bool {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TagElement {
     Name(String),
-    Index(u32),
+    /// C's `size_t element`: the form is chosen from the whole value, while
+    /// the 32-bit form's bytes and `[%u]` keep only the low half.
+    Index(usize),
 }
 
 /// A tag string compiled into CIP path elements.
@@ -184,13 +187,7 @@ impl ParsedTag {
                 b'[' => {
                     let num_start = i + 1;
                     let close = tag[num_start..].find(']')? + num_start;
-                    // The C uses atol(), which stops at the first non-digit and
-                    // yields 0 for garbage.
-                    let digits: String = tag[num_start..close]
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect();
-                    let idx: u32 = digits.parse().unwrap_or(0);
+                    let idx = c_parse::atol(&tag[num_start..close]) as usize;
                     out.push(TagElement::Index(idx));
                     i = close + 1;
                     // Handle the '.' in "xxxx[3].subelement".
@@ -249,7 +246,7 @@ impl ParsedTag {
                 TagElement::Index(i) => {
                     out.push(0x2A);
                     out.push(0x00);
-                    out.extend_from_slice(&i.to_le_bytes());
+                    out.extend_from_slice(&(*i as u32).to_le_bytes());
                 }
             }
         }
@@ -267,7 +264,7 @@ impl fmt::Display for ParsedTag {
                     }
                     write!(f, "{n}")?;
                 }
-                TagElement::Index(i) => write!(f, "[{i}]")?,
+                TagElement::Index(i) => write!(f, "[{}]", *i as u32)?,
             }
             first = false;
         }

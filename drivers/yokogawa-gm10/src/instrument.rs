@@ -11,6 +11,7 @@ use crate::codec::*;
 use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
 use epics_rs::base::server::driver_support::DriverSupport;
+use epics_rs::base::types::c_parse::strtoul_errno;
 use parking_lot::Mutex;
 use std::io;
 use std::net::TcpStream;
@@ -946,33 +947,21 @@ fn valid_device_name(name: &[u8]) -> bool {
 /// glibc `inet_aton`: one to four `strtoul(.., 0)` parts, the last filling
 /// the remaining bytes, optionally followed by whitespace and anything.
 fn inet_aton(cp: &[u8]) -> Option<Ipv4Addr> {
-    const MAX: [u64; 4] = [0xffff_ffff, 0xff_ffff, 0xffff, 0xff];
-    let mut parts: Vec<u64> = Vec::with_capacity(3);
+    const MAX: [u32; 4] = [0xffff_ffff, 0xff_ffff, 0xffff, 0xff];
+    let mut parts: Vec<u32> = Vec::with_capacity(3);
     let mut i = 0;
     loop {
         if !cp.get(i).is_some_and(u8::is_ascii_digit) {
             return None;
         }
-        let (radix, start) = match (cp[i], cp.get(i + 1)) {
-            (b'0', Some(b'x' | b'X')) if cp.get(i + 2).is_some_and(u8::is_ascii_hexdigit) => {
-                (16, i + 2)
-            }
-            (b'0', _) => (8, i),
-            _ => (10, i),
-        };
-        let end = start
-            + cp[start..]
-                .iter()
-                .take_while(|b| (**b as char).is_digit(radix))
-                .count();
-        let mut val: u64 = 0;
-        for &b in &cp[start..end] {
-            val = val * radix as u64 + (b as char).to_digit(radix)? as u64;
-            if val > 0xffff_ffff {
-                return None;
-            }
+        // glibc's own strtoul predates C23's `0b`: it stops at the `b`,
+        // which no part may be followed by.
+        if cp[i] == b'0' && matches!(cp.get(i + 1), Some(b'b' | b'B')) {
+            return None;
         }
-        i = end;
+        let (val, len) = strtoul_errno(&cp[i..], 0)?;
+        let val = u32::try_from(val).ok()?;
+        i += len;
         if cp.get(i) == Some(&b'.') {
             if parts.len() > 2 || val > 0xff {
                 return None;
@@ -988,9 +977,9 @@ fn inet_aton(cp: &[u8]) -> Option<Ipv4Addr> {
             if val > MAX[parts.len()] {
                 return None;
             }
-            let mut word = val as u32;
+            let mut word = val;
             for (k, p) in parts.iter().enumerate() {
-                word |= (*p as u32) << (24 - 8 * k);
+                word |= p << (24 - 8 * k);
             }
             return Some(Ipv4Addr::from(word));
         }
@@ -1422,6 +1411,8 @@ mod tests {
             "4294967296",
             "1..2",
             "1.2.3.",
+            "0b1",
+            "1.0B1",
         ] {
             assert_eq!(ok(bad), None, "{bad:?}");
         }
