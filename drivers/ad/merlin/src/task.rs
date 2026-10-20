@@ -118,19 +118,7 @@ async fn data_loop(ctx: AcquisitionContext) {
                     "merlinDetector:merlinTask: error in Labview data channel response, status={}\n",
                     e.code()
                 ));
-                let _ = ctx
-                    .handle
-                    .set_params_and_notify(
-                        0,
-                        vec![ParamSetValue::new(
-                            ctx.ad_params.status_message,
-                            0,
-                            ParamValue::Octet(
-                                "Error in Labview data channel response".as_bytes().into(),
-                            ),
-                        )],
-                    )
-                    .await;
+                store_status_message(&ctx, "Error in Labview data channel response");
                 rt::sleep(ERROR_BACKOFF).await;
                 continue;
             }
@@ -142,7 +130,8 @@ async fn data_loop(ctx: AcquisitionContext) {
 
 /// One frame of C `merlinTask` (merlinDetector.cpp:142-305). A data frame
 /// that yields no NDArray ends the pass there, as C's `continue` does, so it
-/// neither clears the software trigger nor completes the acquisition.
+/// neither clears the software trigger nor completes the acquisition, and
+/// posts nothing it stored.
 pub(crate) async fn handle_frame(
     ctx: &AcquisitionContext,
     sync: &SyncIOHandle,
@@ -168,24 +157,21 @@ pub(crate) async fn handle_frame(
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 if n > 0 { Some(n - 1) } else { None }
             });
-        let _ = ctx
-            .handle
-            .set_params_and_notify(
-                0,
-                vec![
-                    ParamSetValue::new(
-                        ctx.ad_params.num_images_counter,
-                        0,
-                        ParamValue::Int32(images),
-                    ),
-                    ParamSetValue::new(
-                        ctx.ad_params.base.array_counter,
-                        0,
-                        ParamValue::Int32(array_counter),
-                    ),
-                ],
-            )
-            .await;
+        store(
+            ctx,
+            vec![
+                ParamSetValue::new(
+                    ctx.ad_params.num_images_counter,
+                    0,
+                    ParamValue::Int32(images),
+                ),
+                ParamSetValue::new(
+                    ctx.ad_params.base.array_counter,
+                    0,
+                    ParamValue::Int32(array_counter),
+                ),
+            ],
+        );
     }
 
     let array_callbacks = sync
@@ -220,35 +206,31 @@ pub(crate) async fn handle_frame(
     // A software trigger is one-shot: clear it once its frame arrives.
     let trigger = sync.read_int32(ctx.ad_params.trigger_mode).unwrap_or(0);
     if trigger == TriggerMode::SoftwareTrigger as i32 {
-        let _ = ctx
-            .handle
-            .set_params_and_notify(
+        store(
+            ctx,
+            vec![ParamSetValue::new(
+                ctx.params.software_trigger,
                 0,
-                vec![ParamSetValue::new(
-                    ctx.params.software_trigger,
-                    0,
-                    ParamValue::Int32(0),
-                )],
-            )
-            .await;
+                ParamValue::Int32(0),
+            )],
+        );
     }
 
     if ctx.shared.images_remaining.load(Ordering::Acquire) == 0 {
-        let _ = ctx
-            .handle
-            .set_params_and_notify(
-                0,
-                vec![
-                    ParamSetValue::new(ctx.ad_params.acquire, 0, ParamValue::Int32(0)),
-                    ParamSetValue::new(
-                        ctx.ad_params.status,
-                        0,
-                        ParamValue::Int32(ADStatus::Idle as i32),
-                    ),
-                ],
-            )
-            .await;
+        store(
+            ctx,
+            vec![
+                ParamSetValue::new(ctx.ad_params.acquire, 0, ParamValue::Int32(0)),
+                ParamSetValue::new(
+                    ctx.ad_params.status,
+                    0,
+                    ParamValue::Int32(ADStatus::Idle as i32),
+                ),
+            ],
+        );
     }
+
+    let _ = ctx.handle.call_param_callbacks(0).await;
 }
 
 /// C prints these on `pasynUserSelf`, the detector port.
@@ -258,18 +240,22 @@ fn trace(handle: &PortHandle, msg: &str) {
         .output_device(handle.port_name(), Some(0), 0, TraceMask::ERROR, msg);
 }
 
-async fn set_status_message(ctx: &AcquisitionContext, msg: &str) {
-    let _ = ctx
-        .handle
-        .set_params_and_notify(
+/// C `setXxxParam` without `callParamCallbacks`: the pass's one post is at
+/// its end (merlinDetector.cpp:305), and a pass that ends early posts
+/// nothing, so its values wait for the next driver callback.
+fn store(ctx: &AcquisitionContext, updates: Vec<ParamSetValue>) {
+    let _ = ctx.handle.set_params_blocking(0, updates);
+}
+
+fn store_status_message(ctx: &AcquisitionContext, msg: &str) {
+    store(
+        ctx,
+        vec![ParamSetValue::new(
+            ctx.ad_params.status_message,
             0,
-            vec![ParamSetValue::new(
-                ctx.ad_params.status_message,
-                0,
-                ParamValue::Octet(msg.as_bytes().into()),
-            )],
-        )
-        .await;
+            ParamValue::Octet(msg.as_bytes().into()),
+        )],
+    );
 }
 
 fn build_attributes(parsed: &[(String, NDAttrValue)], acquisition_header: &str) -> NDAttributeList {
@@ -310,7 +296,7 @@ async fn publish_image(
             &ctx.handle,
             &format!("Unsupported bit depth {}\n", header.pixel_depth),
         );
-        set_status_message(ctx, "Error: Unsupported bit depth").await;
+        store_status_message(ctx, "Error: Unsupported bit depth");
         return false;
     }
     let data = match image::decode_image(
@@ -323,7 +309,7 @@ async fn publish_image(
     ) {
         Ok(d) => d,
         Err(_) => {
-            set_status_message(ctx, "Error: unsupported frame").await;
+            store_status_message(ctx, "Error: unsupported frame");
             return false;
         }
     };
@@ -343,7 +329,7 @@ async fn publish_image(
                 header.pixel_depth
             ),
         );
-        set_status_message(ctx, "Error: run out of buffers in detector driver").await;
+        store_status_message(ctx, "Error: run out of buffers in detector driver");
         return false;
     };
     array.unique_id = array_counter;
@@ -406,7 +392,7 @@ async fn publish_profiles(
     ) else {
         ctx.data
             .trace("merlinDetector:copyProfileToNDArray32: unable to allocate NDArray from pool\n");
-        set_status_message(ctx, "Error: run out of buffers in detector driver").await;
+        store_status_message(ctx, "Error: run out of buffers in detector driver");
         return false;
     };
 

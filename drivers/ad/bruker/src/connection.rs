@@ -7,21 +7,10 @@
 //! to do it; here the acquisition task asks the actor for a scan through a
 //! parameter, so the socket has one owner and needs no lock at all.
 //!
-//! # Why the exchange runs on a thread of its own
+//! # The command thread
 //!
-//! `PortHandle::submit_blocking` blocks with `tokio::task::block_in_place` when
-//! it is called from inside a tokio runtime, and `block_in_place` panics unless
-//! that runtime is multi-threaded. Both runtimes the framework builds for a
-//! driver — the port actor's (`asyn-rs`, `runtime/port.rs`) and
-//! `ad_core::runtime::run_thread_named`'s — are current-thread runtimes, so a
-//! driver that calls `submit_blocking` from its own `write_int32` panics the
-//! actor thread on the first command it sends.
-//!
-//! [`BisServer`] therefore owns a plain thread, with no tokio runtime of its
-//! own, and the actor asks it for each exchange and waits: on a plain thread
-//! `submit_blocking` takes its blocking-channel path and no `block_in_place` is
-//! attempted. Waiting is what the C did too — it held the port lock across the
-//! whole exchange.
+//! [`BisServer`] runs each exchange on a plain thread and the actor waits for
+//! it, as C held the port lock across the whole exchange.
 
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
