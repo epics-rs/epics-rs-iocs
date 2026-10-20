@@ -2483,6 +2483,7 @@ dependencies = [
 name = "mca-rontec"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "mca",
 ]
