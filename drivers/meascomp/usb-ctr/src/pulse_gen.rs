@@ -61,7 +61,7 @@ pub fn start(
             TraceMask::ERROR,
             format_args!(
                 "USBCTR::startPulseGenerator error calling cbPulseOutStart timerNum={timer} frequency={:.6}, dutyCycle={:.6}, count={count}, delay={:.6}, idleState={idle_state}, status={}, error={}\n",
-                timing.frequency, timing.duty_cycle, timing.initial_delay, e.code, e.message
+                timing.frequency, timing.duty_cycle, timing.initial_delay, e.code, e.message()
             ),
         );
         return Err(e);
@@ -87,7 +87,7 @@ pub fn stop(trace: &SelfTrace, device: &DaqDevice, timer: i32) -> Result<()> {
             TraceMask::ERROR,
             format_args!(
                 "USBCTR::stopPulseGenerator error calling cbPulseOutStop timerNum={timer}, status={}, error={}\n",
-                e.code, e.message
+                e.code, e.message()
             ),
         );
     })

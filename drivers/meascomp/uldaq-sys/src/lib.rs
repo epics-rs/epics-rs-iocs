@@ -125,6 +125,7 @@ pub const AI_VOLTAGE: i64 = 1 << 0;
 pub const AI_TC: i64 = 1 << 1;
 pub const AI_RTD: i64 = 1 << 2;
 pub const AI_THERMISTOR: i64 = 1 << 3;
+pub const AI_SEMICONDUCTOR: i64 = 1 << 4;
 pub const AI_DISABLED: i64 = 1 << 30;
 
 // ---------------------------------------------------------------------------
@@ -139,6 +140,15 @@ pub const TC_R: i32 = 5;
 pub const TC_S: i32 = 6;
 pub const TC_B: i32 = 7;
 pub const TC_N: i32 = 8;
+
+// ---------------------------------------------------------------------------
+// SensorConnectionType
+// ---------------------------------------------------------------------------
+
+pub const SCT_2_WIRE_1: i32 = 1;
+pub const SCT_2_WIRE_2: i32 = 2;
+pub const SCT_3_WIRE: i32 = 3;
+pub const SCT_4_WIRE: i32 = 4;
 
 // ---------------------------------------------------------------------------
 // TempScale

@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
@@ -24,7 +25,6 @@ pub struct WaveDigState {
     pub channel_buffers: Vec<Vec<f64>>,
     /// Absolute time per point.
     pub abs_time_buffer: Vec<f64>,
-    pub dwell_actual: f64,
 }
 
 impl WaveDigState {
@@ -42,7 +42,6 @@ impl WaveDigState {
             scan_buffer: Vec::new(),
             channel_buffers,
             abs_time_buffer: vec![0.0; max_points],
-            dwell_actual: 0.001,
         }
     }
 }
@@ -105,6 +104,12 @@ impl WaveDigScan {
         (int(params.wave_dig_auto_restart, 0) != 0)
             .then(|| Self::read(params, input_mode, int, float))
     }
+
+    /// C `rate = 1./dwell` (drvMultiFunction.cpp:1826), unguarded: uldaq
+    /// refuses a dwell <= 0 with ERR_BAD_RATE.
+    pub fn rate(&self) -> f64 {
+        1.0 / self.dwell
+    }
 }
 
 /// Start the waveform digitizer (analog input scan). C `startWaveDig`:
@@ -122,7 +127,7 @@ pub fn start_wave_dig(
         first_chan,
         num_chans,
         num_points,
-        dwell,
+        dwell: _,
         input_mode,
         ref ranges,
         ext_trigger,
@@ -158,7 +163,7 @@ pub fn start_wave_dig(
         return (status, Vec::new());
     }
 
-    let mut rate = if dwell > 0.0 { 1.0 / dwell } else { 1000.0 };
+    let mut rate = scan.rate();
 
     let mut options = SO_DEFAULTIO;
     if ext_trigger {
@@ -193,13 +198,13 @@ pub fn start_wave_dig(
     );
     // C converts the rate back to the dwell whatever the scan returned, and
     // shows a rate the device refused as -9999.
-    state.dwell_actual = 1.0 / rate;
+    let dwell = 1.0 / rate;
     let dwell_actual = ParamSetValue::new(
         params.wave_dig_dwell_actual,
         0,
         ParamValue::Float64(match result {
             Err(ref e) if e.code == ERR_BAD_RATE => -9999.0,
-            _ => state.dwell_actual,
+            _ => dwell,
         }),
     );
     let status = trace.report(&result, FUNCTION, "Calling AInScan");
@@ -213,7 +218,7 @@ pub fn start_wave_dig(
         TraceMask::FLOW,
         format_args!(
             "{DRIVER_NAME}:{FUNCTION}: called cbAInScan, firstChan={first_chan}, lastChan={last_chan}, numPoints={num_points}, dwell={:.6}, options=0x{options:x}\n",
-            state.dwell_actual
+            CFloat(dwell)
         ),
     );
 
@@ -226,7 +231,7 @@ pub fn start_wave_dig(
             ParamSetValue::new(
                 params.wave_dig_total_time,
                 0,
-                ParamValue::Float64(state.dwell_actual * num_points as f64),
+                ParamValue::Float64(dwell * num_points as f64),
             ),
         ],
     )
@@ -345,7 +350,7 @@ pub fn waveform_updates(
                 TraceMask::FLOW,
                 format_args!(
                     "{DRIVER_NAME}:readWaveDig:, doing callbacks on input {ch}, first value={:.6}\n",
-                    state.channel_buffers[ch][0]
+                    CFloat(state.channel_buffers[ch][0])
                 ),
             );
             updates.push(ParamSetValue::array(
@@ -413,6 +418,60 @@ mod tests {
             })
             .collect();
         assert_eq!(addrs, [14, 15]);
+    }
+
+    /// readWaveDig's trace is C's %f (drvMultiFunction.cpp:1897).
+    #[test]
+    fn a_nan_first_value_prints_as_cs_percent_f() {
+        use crate::driver::MultiFunctionDriver;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::TraceFile;
+        use std::sync::{Arc, Mutex};
+        let port = "MFNANWF";
+        let drv = MultiFunctionDriver::new(port, DaqDevice::unconnected(), 4, 4).unwrap();
+        let params = drv.params;
+        let (rt, _) =
+            create_port_runtime(&claim_port(port).unwrap(), drv, RuntimeConfig::default()).unwrap();
+        let trace = SelfTrace::default();
+        trace.bind(rt.port_handle().clone());
+        let manager = rt.port_handle().trace();
+        let log = std::env::temp_dir().join(format!("usb-2408-nanwf-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(Some(port), TraceFile::File(Arc::new(Mutex::new(file))));
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::FLOW);
+        let mut state = WaveDigState::new(4);
+        state.channel_buffers[0][0] = f64::NAN;
+        state.current_point = 1;
+        waveform_updates(&params, &state, &trace);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(
+                "MultiFunction:readWaveDig:, doing callbacks on input 0, first value=nan\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_scan_rate_is_cs_reciprocal_dwell() {
+        let scan = |dwell| WaveDigScan {
+            first_chan: 0,
+            num_chans: 1,
+            num_points: 1,
+            dwell,
+            input_mode: 0,
+            ranges: vec![0],
+            ext_trigger: false,
+            ext_clock: false,
+            continuous: false,
+            retrigger: false,
+            burst_mode: false,
+        };
+        let rates = [1e-3, 0.0, -0.5].map(|dwell| scan(dwell).rate());
+        assert_eq!(rates, [1000.0, f64::INFINITY, -2.0]);
     }
 
     #[test]

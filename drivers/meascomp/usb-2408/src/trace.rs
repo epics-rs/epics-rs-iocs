@@ -59,13 +59,14 @@ impl SelfTrace {
                 TraceMask::ERROR,
                 format_args!("{DRIVER_NAME}::{function} Error: {message}\n"),
             ),
-            _ => self.print(
-                TraceMask::ERROR,
-                format_args!(
-                    "{DRIVER_NAME}::{function} Error: {message}, err={err} {}\n",
-                    MeasCompError::from_code(err).message
-                ),
-            ),
+            _ => {
+                // C reads the library text before asynPrint, mask or not.
+                let text = MeasCompError { code: err }.message().to_string();
+                self.print(
+                    TraceMask::ERROR,
+                    format_args!("{DRIVER_NAME}::{function} Error: {message}, err={err} {text}\n"),
+                )
+            }
         }
         err
     }

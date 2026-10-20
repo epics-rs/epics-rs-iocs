@@ -79,6 +79,24 @@ pub const INPUT_TYPE: &[(&str, i32)] = &[
     ("TC deg.", AI_CHAN_TYPE_TC),
 ];
 
+/// `temperatureSensorUSB_TEMP`, the UL for Linux values
+/// (drvMultiFunction.cpp:504-517).
+pub const TEMPERATURE_SENSOR: &[(&str, i32)] = &[
+    ("RTD", uldaq_sys::AI_RTD as i32),
+    ("Thermistor", uldaq_sys::AI_THERMISTOR as i32),
+    ("Thermocouple", uldaq_sys::AI_TC as i32),
+    ("Semiconductor", uldaq_sys::AI_SEMICONDUCTOR as i32),
+    ("Disabled", uldaq_sys::AI_DISABLED as i32),
+];
+
+/// `temperatureWiringUSB_TEMP`, the UL for Linux values.
+pub const TEMPERATURE_WIRING: &[(&str, i32)] = &[
+    ("2 wire 1 sensor", uldaq_sys::SCT_2_WIRE_1),
+    ("2 wire 2 sensors", uldaq_sys::SCT_2_WIRE_2),
+    ("3 wire", uldaq_sys::SCT_3_WIRE),
+    ("4 wire", uldaq_sys::SCT_4_WIRE),
+];
+
 /// C `readEnum`'s copy of one table, every severity 0.
 pub fn entries(table: &[(&str, i32)]) -> Vec<EnumEntry> {
     table
