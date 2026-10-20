@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::param::{EnumEntry, ParamValue};
 use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
@@ -294,22 +295,35 @@ impl MultiFunctionDriver {
 
 impl MultiFunctionDriver {
     /// Apply array (or scalar) updates built by the wave_dig/wave_gen helpers.
-    ///
-    /// The poller pushes the same list through
-    /// `set_params_and_notify_blocking`; on the actor thread that call would
-    /// be a self-deadlock, so the store is written directly instead.
     fn apply_updates(&mut self, updates: Vec<ParamSetValue>) -> AsynResult<()> {
-        for update in updates {
-            if let ParamSetValue::Value {
+        for update in &updates {
+            self.post(update)?;
+        }
+        Ok(())
+    }
+
+    /// Store one update, except WAVEDIG_VOLT_WF: C declares it Float32Array
+    /// (drvMultiFunction.cpp:916) and fires its double buffers with
+    /// doCallbacksFloat64Array (:1899), so nothing is stored for it.
+    pub(crate) fn post(&mut self, update: &ParamSetValue) -> AsynResult<()> {
+        match update {
+            ParamSetValue::Value {
                 reason,
                 addr,
                 value,
-            } = update
-            {
-                self.base.set_param_value(reason, addr, value)?;
+            } if *reason == self.params.wave_dig_volt_wf => {
+                self.base.notify_interface_value(
+                    *reason,
+                    *addr,
+                    InterfaceType::Float64Array,
+                    value.clone(),
+                    0,
+                    AsynStatus::Success,
+                );
+                Ok(())
             }
+            _ => self.base.set_param(update),
         }
-        Ok(())
     }
 
     /// Common tail of `write_int32`: apply the collected array updates, run
@@ -1418,6 +1432,32 @@ mod tests {
         assert!(drv.read_enum(&AsynUser::new(p.analog_in_mode)).is_err());
         // C's ctor writes the first output range's gain code.
         assert_eq!(drv.base.get_int32_param(p.analog_out_range, 1).unwrap(), 1);
+    }
+
+    /// C declares WAVEDIG_VOLT_WF Float32Array (drvMultiFunction.cpp:916)
+    /// and fires its buffers on asynFloat64Array (:1899).
+    #[test]
+    fn the_volt_waveform_is_float32_and_fired_on_float64_array() {
+        use epics_libcom_rs::runtime::interrupt_accept::InterruptGate;
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::param::ParamType;
+        let mut drv = MultiFunctionDriver::new("MFVOLTWF", DaqDevice::unconnected(), 4, 4).unwrap();
+        let p = drv.params;
+        assert_eq!(
+            drv.base.params.param_type(p.wave_dig_volt_wf),
+            Some(ParamType::Float32Array)
+        );
+        drv.base.own_interrupts(InterruptGate::opened());
+        let mut rx = drv.base.interrupts.subscribe_async(16, 4096);
+        let volts = ParamValue::Float64Array([1.5, 2.5].into());
+        drv.apply_updates(vec![ParamSetValue::new(p.wave_dig_volt_wf, 3, volts)])
+            .unwrap();
+        let v = rx.try_recv().unwrap();
+        assert_eq!(
+            (v.reason, v.addr, v.iface),
+            (p.wave_dig_volt_wf, 3, Some(InterfaceType::Float64Array))
+        );
+        assert!(matches!(&v.value, ParamValue::Float64Array(a) if a[..] == [1.5, 2.5]));
     }
 
     /// C `readFloat64Array` (drvMultiFunction.cpp:2469-2503).

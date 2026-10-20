@@ -189,9 +189,8 @@ impl MultiFunctionParams {
                 .create_param("WAVEDIG_ABS_TIME_WF", ParamType::Float64Array)?,
             wave_dig_read_wf: base.create_param("WAVEDIG_READ_WF", ParamType::Int32)?,
 
-            // C declares it Float32Array (:916) but posts it as Float64Array
-            // (:1899); rs stores the array it posts, so it takes that type.
-            wave_dig_volt_wf: base.create_param("WAVEDIG_VOLT_WF", ParamType::Float64Array)?,
+            // C posts it on asynFloat64Array (:1899); see MultiFunctionDriver::post.
+            wave_dig_volt_wf: base.create_param("WAVEDIG_VOLT_WF", ParamType::Float32Array)?,
 
             analog_out_value: base.create_param("ANALOG_OUT_VALUE", ParamType::Int32)?,
             analog_out_range: base.create_param("ANALOG_OUT_RANGE", ParamType::Int32)?,
