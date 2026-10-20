@@ -304,10 +304,8 @@ pub struct ScuAxis {
     position_offset: f64,
     /// Closed-loop (record `CNEN`) state, updated by `set_closed_loop`.
     closed_loop: bool,
-    /// Sensor-present flag probed at construction.
-    has_encoder: bool,
     io: AxisIo,
-    /// The status bits the last failed command raised.
+    /// The status bits the constructor or the last failed command set.
     status_writes: Vec<StatusWrite>,
 }
 
@@ -332,7 +330,6 @@ impl ScuAxis {
             hold_time: 0,
             position_offset: 0.0,
             closed_loop: false,
-            has_encoder: false,
             io: AxisIo {
                 port: port.to_owned(),
                 addr: axis,
@@ -362,11 +359,17 @@ impl ScuAxis {
         self.is_rot = is_rotary_type(positioner_type);
 
         // A successful position read means the sensor knows the position.
-        self.has_encoder = if self.is_rot {
+        let has_encoder = if self.is_rot {
             ctrl.query_angle(io, channel).is_ok()
         } else {
             ctrl.query_double(io, "GP", channel).is_ok()
         };
+        if has_encoder {
+            self.status_writes.extend([
+                StatusWrite::HasEncoder(true),
+                StatusWrite::GainSupport(true),
+            ]);
+        }
         Ok(())
     }
 
@@ -518,6 +521,8 @@ impl AsynMotor for ScuAxis {
             ctrl.query_double(io, "GP", ch)?
         };
         let position = (raw + self.position_offset) * STEPS_PER_EGU;
+        out.encoder_position = position;
+        out.position = position;
 
         let status = parse_moving_status(ctrl.query_char(io, "M", ch)?);
         let moving = match status {
@@ -528,21 +533,14 @@ impl AsynMotor for ScuAxis {
             | MovingStatus::Referencing => true,
             MovingStatus::Stopped | MovingStatus::AmplSetting | MovingStatus::Unknown => false,
         };
+        out.moving = moving;
+        out.done = !moving;
 
-        let homed = ctrl.query_int(io, "GPPK", ch)? != 0;
+        out.homed = ctrl.query_int(io, "GPPK", ch)? != 0;
         drop(ctrl);
 
-        *out = MotorStatus {
-            position,
-            encoder_position: position,
-            velocity: 0.0,
-            done: !moving,
-            moving,
-            has_encoder: self.has_encoder,
-            gain_support: self.has_encoder,
-            homed,
-            ..MotorStatus::default()
-        };
+        out.problem = false;
+        out.comms_error = false;
         Ok(())
     }
 
@@ -588,13 +586,67 @@ mod tests {
         let (mut axis, probed) = ScuAxis::new(controller, 3, "scu-motor", 1);
         assert!(probed.is_err());
         assert_eq!(axis.channel, 3);
-        assert!(!axis.is_rot && !axis.has_encoder);
+        assert!(!axis.is_rot);
         assert_eq!(axis.hold_time, 0);
         assert_eq!(
             axis.take_status_writes(),
             [StatusWrite::Problem(true), StatusWrite::CommsError(true)]
         );
         assert!(axis.polled(&AsynUser::new(0)).is_err());
+    }
+
+    fn scu_replies(cmd: &str) -> String {
+        match cmd.trim_end() {
+            ":GCLF0" => ":CLF0F1000",
+            ":M0" => ":M0S",
+            ":GST0" => ":ST0T1",
+            ":GP0" => ":P0P12.5",
+            ":GPPK0" => ":PPK0K1",
+            _ => ":E0E0",
+        }
+        .into()
+    }
+
+    /// smarActSCUMotorDriver.cpp:344-380 sets the positions and DONE before
+    /// GPPK can `goto bail`, so a refused GPPK keeps them.
+    #[test]
+    fn a_failed_gppk_keeps_the_position_and_done_read_before_it() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing("scuFailedGppk", scu_replies, |cmd| {
+            cmd.trim_end() == ":GPPK0"
+        });
+        let controller = Arc::new(Mutex::new(ScuController::new(io)));
+        let (mut axis, probed) = ScuAxis::new(controller, 0, "scuFailedGppk", 0);
+        probed.unwrap();
+        let mut status = MotorStatus {
+            done: false,
+            ..MotorStatus::default()
+        };
+        assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
+        let position = 12.5 * STEPS_PER_EGU;
+        assert_eq!(
+            (status.position, status.encoder_position),
+            (position, position)
+        );
+        assert!(status.done && !status.moving);
+    }
+
+    /// smarActSCUMotorDriver.cpp:171-181: only the constructor sets
+    /// HAS_ENCODER and GAIN_SUPPORT, from its position probe.
+    #[test]
+    fn the_constructor_sets_has_encoder_and_gain_support() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("scuCtorEncoder", scu_replies);
+        let controller = Arc::new(Mutex::new(ScuController::new(io)));
+        let (mut axis, probed) = ScuAxis::new(controller, 0, "scuCtorEncoder", 0);
+        probed.unwrap();
+        assert_eq!(
+            axis.take_status_writes(),
+            [
+                StatusWrite::HasEncoder(true),
+                StatusWrite::GainSupport(true)
+            ]
+        );
     }
 
     /// A failed move, home or stop raises Problem and CommsError
