@@ -297,7 +297,6 @@ impl PIC662Axis {
         };
         self.last_status = MotorStatus {
             position: polled.position as f64,
-            encoder_position: polled.position as f64,
             velocity: 0.0,
             done,
             // E-662: no limit/home/encoder/gain feedback; piezo servo powers
@@ -490,6 +489,21 @@ mod tests {
         let axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl)));
         line.sent();
         (line, axis, esr)
+    }
+
+    /// drvPIC662.cc:292 has the encoder_position set commented out, so REP
+    /// keeps motor_init's 0 (:567).
+    #[test]
+    fn the_poll_sets_no_encoder_position() {
+        let (_line, io) = LineRig::new("pic662NoRep", |last| match last {
+            "*IDN?" => "E-662".into(),
+            "*ESR?" => "1".into(),
+            _ => "5.012".into(),
+        });
+        let ctrl = PIC662Controller::new(io).unwrap();
+        let mut axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl)));
+        let s = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!((s.position, s.encoder_position), (5012.0, 0.0));
     }
 
     fn post(text: &[u8]) -> PostMessage {
