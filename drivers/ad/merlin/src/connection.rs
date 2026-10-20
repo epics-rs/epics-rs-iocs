@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ADDriverBase;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::request::{OctetReadOp, RequestOp};
@@ -184,7 +185,7 @@ impl MpxConnection {
                 self.trace(&format!(
                     "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes\n\n",
                     e.code(),
-                    window.len() - MPX_HEADER.len()
+                    window.len() - MPX_HEADER.len(), timeout_s = CFloat(timeout_s)
                 ));
                 return Err(e);
             }
@@ -210,7 +211,7 @@ impl MpxConnection {
             self.trace(&format!(
                 "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes in MPX command body, expected {body_len}\n",
                 e.as_ref().map_or(0, ChannelError::code),
-                body.len()
+                body.len(), timeout_s = CFloat(timeout_s)
             ));
             return Err(e.unwrap_or_else(closed));
         }
