@@ -416,6 +416,16 @@ mod tests {
         ) -> AsynResult<()> {
             Ok(())
         }
+        fn move_relative(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            Ok(())
+        }
         fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
             Ok(())
         }
