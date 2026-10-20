@@ -20,10 +20,9 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
-use epics_rs::ad_core::driver::ndarray_driver::handle_write_int32;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverPool, PersistentArray, PublishedArray};
+use epics_rs::ad_core::ndarray_pool::{DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
@@ -54,8 +53,6 @@ pub struct NdStdArraysDriver {
     pub ad: ADDriverBase,
     pub ndsa: NdsaParams,
     publish_tx: rt::CommandSender<PublishedArray>,
-    /// C `pArrays[0]` — the working buffer that waveform writes append into.
-    current: Option<PersistentArray>,
     /// C `arrayDimensions_` — the requested dimensions, written via the
     /// `NDDimensions` (`ARRAY_DIMENSIONS`) waveform.
     array_dimensions: [usize; ND_ARRAY_MAX_DIMS],
@@ -108,7 +105,6 @@ impl NdStdArraysDriver {
             ad,
             ndsa,
             publish_tx,
-            current: None,
             array_dimensions: [0; ND_ARRAY_MAX_DIMS],
             dim_prod: [0; ND_ARRAY_MAX_DIMS],
         })
@@ -120,7 +116,7 @@ impl NdStdArraysDriver {
     }
 
     /// The allocation half of `writeXXXArray` (NDDriverStdArrays.cpp:153-218):
-    /// release the previous array, allocate a fresh one sized by
+    /// release `pArrays[0]`, allocate its successor there sized by
     /// `arrayDimensions_`, publish its size parameters, recompute `dimProd_`,
     /// and fill it when required.
     fn allocate_array(
@@ -139,24 +135,46 @@ impl NdStdArraysDriver {
         let dims: Vec<NDDimension> = (0..ndims)
             .map(|i| NDDimension::new(self.array_dimensions[i]))
             .collect();
-        // C releases pArrays[0] before allocating its successor
-        // (NDDriverStdArrays.cpp:153).
-        self.current = None;
-        let mut array = self.ad.pool.alloc(dims, data_type).map_err(|e| {
-            self.ad.port_base.trace_print(
-                TraceMask::ERROR,
-                format_args!("NDDriverStdArrays:writeXXXArray: error allocating raw buffer\n"),
-            );
-            pool_err(e)
-        })?;
-        // pArray->pAttributeList->add("ColorMode", ...) (NDDriverStdArrays.cpp:167).
-        array.attributes.add(NDAttribute::new_static(
-            "ColorMode",
-            "Color Mode",
-            NDAttrSource::Driver,
-            NDAttrValue::Int32(color_mode),
-        ));
-        let info = array.info();
+        let fill = self
+            .ad
+            .port_base
+            .get_float64_param(self.ndsa.fill_value, 0)
+            .unwrap_or(0.0);
+        let pool = &self.ad.pool;
+        let mut made = None;
+        pool.owner().replace_persistent(0, || {
+            let mut array = match pool.alloc(dims, data_type) {
+                Ok(array) => array,
+                Err(e) => {
+                    made = Some(Err(e));
+                    return None;
+                }
+            };
+            // pArray->pAttributeList->add("ColorMode", ...) (NDDriverStdArrays.cpp:167).
+            array.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "Color Mode",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(color_mode),
+            ));
+            let info = array.info();
+            // NDDriverStdArrays.cpp:184-214.
+            if append_mode == 1 || (append_mode == 0 && info.num_elements < n_elements) {
+                convert::fill_buffer(&mut array.data, fill);
+            }
+            made = Some(Ok(info));
+            Some(array)
+        });
+        let info = match made.expect("replace_persistent runs make") {
+            Ok(info) => info,
+            Err(e) => {
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!("NDDriverStdArrays:writeXXXArray: error allocating raw buffer\n"),
+                );
+                return Err(pool_err(e));
+            }
+        };
         self.ad.port_base.set_int32_param(
             self.ad.params.base.array_size,
             0,
@@ -187,22 +205,11 @@ impl NdStdArraysDriver {
 
         self.dim_prod = convert::dim_prod(&self.array_dimensions, num_dimensions);
 
-        // NDDriverStdArrays.cpp:184-214.
-        if append_mode == 1 || (append_mode == 0 && info.num_elements < n_elements) {
-            let fill = self
-                .ad
-                .port_base
-                .get_float64_param(self.ndsa.fill_value, 0)
-                .unwrap_or(0.0);
-            convert::fill_buffer(&mut array.data, fill);
-        }
         if append_mode == 0 {
             self.ad
                 .port_base
                 .set_int32_param(self.ndsa.next_element, 0, 0)?;
         }
-
-        self.current = Some(PersistentArray::new(array));
         Ok(())
     }
 
@@ -247,20 +254,25 @@ impl NdStdArraysDriver {
             )?;
         }
 
-        // arrayInfo_.nElements is the current buffer's element count.
-        let total = self.current.as_ref().map(|a| a.data.len()).unwrap_or(0);
         let next_element = self.get_i32(self.ndsa.next_element).max(0) as usize;
-
-        // NDDriverStdArrays.cpp:221-223: clamp the write to the buffer tail.
-        let mut n = n_elements;
-        if next_element + n >= total {
-            n = total.saturating_sub(next_element);
-        }
         let stride = self.get_i32(self.ndsa.stride).max(0) as usize;
-
-        if let Some(array) = self.current.as_mut() {
-            convert::copy_buffer(&mut array.refill().data, next_element, stride, &input[..n]);
-        }
+        // C writes into pArrays[0] in place (NDDriverStdArrays.cpp:220-250).
+        let n = self
+            .ad
+            .pool
+            .owner()
+            .persistent(0, |array| {
+                // arrayInfo_.nElements is the buffer's element count;
+                // NDDriverStdArrays.cpp:221-223 clamp the write to its tail.
+                let total = array.data.len();
+                let mut n = n_elements;
+                if next_element + n >= total {
+                    n = total.saturating_sub(next_element);
+                }
+                convert::copy_buffer(&mut array.refill().data, next_element, stride, &input[..n]);
+                n
+            })
+            .unwrap_or(0);
 
         let new_next = next_element + n;
         self.ad
@@ -329,7 +341,8 @@ impl NdStdArraysDriver {
     /// `doCallbacks` (NDDriverStdArrays.cpp:310-329): bump `NDArrayCounter`,
     /// stamp identity and timestamps, and hand the array to the publisher task.
     fn do_callbacks(&mut self) -> AsynResult<()> {
-        if self.current.is_none() {
+        let owner = self.ad.pool.owner().clone();
+        if owner.persistent(0, |_| ()).is_none() {
             return Ok(());
         }
         let counter = self.get_i32(self.ad.params.base.array_counter) + 1;
@@ -337,19 +350,23 @@ impl NdStdArraysDriver {
             .port_base
             .set_int32_param(self.ad.params.base.array_counter, 0, counter)?;
         let timestamp = self.ad.port_base.update_time_stamp().into();
-        let current = self.current.as_mut().unwrap();
-        let array = current.refill();
-        array.unique_id = counter;
-        array.time_stamp = EpicsTimestamp::now().as_f64();
-        array.timestamp = timestamp;
-        // DEVIATION: C calls getAttributes(pArray->pAttributeList) here; the
-        // NDAttributesFile machinery is not wired for this driver, so only the
-        // ColorMode attribute added at allocation is attached.
+        let published = owner.persistent(0, |current| {
+            let array = current.refill();
+            array.unique_id = counter;
+            array.time_stamp = EpicsTimestamp::now().as_f64();
+            array.timestamp = timestamp;
+            // DEVIATION: C calls getAttributes(pArray->pAttributeList) here;
+            // the NDAttributesFile machinery is not wired for this driver, so
+            // only the ColorMode attribute added at allocation is attached.
 
-        // C hands `pArrays[0]` itself to the plugins; the publish is a copy
-        // that shares its one pool charge, so later writes never reach a
-        // queued frame.
-        let _ = self.publish_tx.try_send(current.published());
+            // C hands `pArrays[0]` itself to the plugins; the publish is a
+            // copy that shares its one pool charge, so later writes never
+            // reach a queued frame.
+            current.published()
+        });
+        if let Some(published) = published {
+            let _ = self.publish_tx.try_send(published);
+        }
         Ok(())
     }
 
@@ -365,18 +382,6 @@ impl ADDriver for NdStdArraysDriver {
 
     fn ad_base_mut(&mut self) -> &mut ADDriverBase {
         &mut self.ad
-    }
-
-    /// `pArrays[0]` is `current`, the working buffer the waveform writes fill.
-    fn ndarray_write_int32(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
-        handle_write_int32(
-            &mut self.ad.port_base,
-            &self.ad.params.base,
-            &self.ad.pool,
-            self.current.as_deref(),
-            user,
-            value,
-        )
     }
 }
 
@@ -649,7 +654,7 @@ mod tests {
         det.write_int32(&mut AsynUser::new(p.acquire), 1).unwrap();
         det.write_float64_array(&AsynUser::new(det.ndsa.array_data), &[1.0])
             .unwrap();
-        assert!(det.current.is_some());
+        assert!(det.ad.pool.owner().array(0).is_some());
 
         let trace = trace_to_file("NDSAPREALLOC");
         det.write_int32(&mut AsynUser::new(p.base.pool_pre_alloc), 1)
@@ -659,6 +664,30 @@ mod tests {
             text.contains("asynNDArrayDriver::preAllocateBuffers: ERROR, "),
             "{text:?}"
         );
+    }
+
+    /// C allocates pArrays[0] and writes into it there (NDDriverStdArrays.cpp:
+    /// 153-158, :220-250), so from the first NewArray the port's slot 0 holds
+    /// the written array, and PreAllocBuffers copies it
+    /// (asynNDArrayDriver.cpp:717-726).
+    #[test]
+    fn the_written_array_is_parrays0_and_the_pre_alloc_template() {
+        let mut f = Fixture::new();
+        let p = f.det.ad.params;
+        f.set_i32(p.base.data_type, NDDataType::Float64 as u8 as i32);
+        f.set_i32(p.base.n_dimensions, 1);
+        f.set_i32(f.det.ndsa.append_mode, 1);
+        f.set_i32(p.image_mode, ImageMode::Continuous as i32);
+        f.write_dims(&[4]);
+        f.write_i32(p.acquire, 1);
+        f.write_f64_array(&[1.0, 2.0]);
+        let slot = f.det.ad.pool.owner().array(0).expect("pArrays[0]");
+        assert_eq!(f64s(&slot), [1.0, 2.0, 0.0, 0.0]);
+        drop(slot);
+
+        f.set_i32(p.base.pool_num_pre_alloc_buffers, 2);
+        f.write_i32(p.base.pool_pre_alloc, 1);
+        assert_eq!(f.det.ad.pool.num_free_buffers(), 2);
     }
 
     #[test]
@@ -749,7 +778,7 @@ mod tests {
         f.write_dims(&[4]);
         // Not acquiring: the write is a no-op and nothing is published.
         f.write_f64_array(&[1.0, 2.0, 3.0, 4.0]);
-        assert!(f.det.current.is_none());
+        assert!(f.det.ad.pool.owner().array(0).is_none());
         assert!(f.drain_publish().is_empty());
     }
 
