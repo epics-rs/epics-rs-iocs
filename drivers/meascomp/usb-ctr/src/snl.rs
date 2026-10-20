@@ -5,11 +5,9 @@
 //! [`Flags::monitor_changes`] is the state `monitor_changes` as a function
 //! of its two event flags; [`run`] binds it to the template's records.
 
-use std::collections::HashMap;
-
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::database::db_access::DbMultiMonitor;
-use epics_rs::base::server::snl::{PutQueue, SeqPv};
+use epics_rs::base::server::snl::{PutQueue, SeqMacros, SeqPv};
 use epics_rs::base::types::EpicsValue;
 
 /// `MAX_COUNTERS` (`USBCTR_SNL.st:22`).
@@ -18,50 +16,10 @@ const MAX_COUNTERS: i32 = 9;
 /// `program USBCTR_SNL(...)`'s macros, which those given to `seq` override.
 const PROGRAM_MACROS: &str = "P=USBCTR:MCS:, R=mca, NUM_COUNTERS=8,  FIELD=READ";
 
-/// `seqMacParse` (seq_mac.c:124-199) into `table`: a name is
-/// `[A-Za-z][A-Za-z0-9_]*`, a value runs to the next blank or comma, and a
-/// name given without a value keeps the value it had.
-fn seq_mac_parse(table: &mut HashMap<String, String>, s: &str) {
-    let mut s = s.as_bytes();
-    let skip_blanks = |s: &mut &[u8]| {
-        while s.first() == Some(&b' ') {
-            *s = &s[1..];
-        }
-    };
-    loop {
-        skip_blanks(&mut s);
-        let n = match s.first() {
-            Some(c) if c.is_ascii_alphabetic() => s
-                .iter()
-                .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
-                .unwrap_or(s.len()),
-            _ => return,
-        };
-        let name = String::from_utf8_lossy(&s[..n]).into_owned();
-        s = &s[n..];
-        skip_blanks(&mut s);
-        match s.first() {
-            Some(b',') => {
-                table.entry(name).or_default();
-                s = &s[1..];
-                continue;
-            }
-            Some(b'=') => s = &s[1..],
-            _ => return,
-        }
-        skip_blanks(&mut s);
-        let n = s
-            .iter()
-            .position(|c| *c == b' ' || *c == b',')
-            .unwrap_or(s.len());
-        table.insert(name, String::from_utf8_lossy(&s[..n]).into_owned());
-        s = &s[n..];
-        skip_blanks(&mut s);
-        match s.first() {
-            Some(b',') => s = &s[1..],
-            _ => return,
-        }
-    }
+/// The macro table `seq` builds for this program from `macro_def`
+/// (seq_main.c:93-96).
+pub fn seq_macros(macro_def: &str) -> SeqMacros {
+    SeqMacros::new(PROGRAM_MACROS, macro_def)
 }
 
 /// glibc `atoi`: `(int) strtol(s, NULL, 10)`, so an out-of-range value
@@ -92,12 +50,9 @@ pub struct UsbCtrSnlConfig {
 }
 
 impl UsbCtrSnlConfig {
-    /// The program's macros, then `seq`'s (seq_main.c:93-96).
-    pub fn from_macros(macros: &str) -> Self {
-        let mut table = HashMap::new();
-        seq_mac_parse(&mut table, PROGRAM_MACROS);
-        seq_mac_parse(&mut table, macros);
-        let get = |name: &str| table.get(name).cloned().unwrap_or_default();
+    /// What `init` reads from `seq`'s macro table ([`seq_macros`]).
+    pub fn from_macros(macros: &SeqMacros) -> Self {
+        let get = |name: &str| macros.value(name).unwrap_or_default().to_owned();
         Self {
             prefix: get("P"),
             record: get("R"),
@@ -285,8 +240,9 @@ mod tests {
 
     #[test]
     fn seq_macros_override_the_programs() {
-        let config =
-            UsbCtrSnlConfig::from_macros("P=USBCTR:MCS:, R=mca, NUM_COUNTERS=9, FIELD=PROC");
+        let config = UsbCtrSnlConfig::from_macros(&seq_macros(
+            "P=USBCTR:MCS:, R=mca, NUM_COUNTERS=9, FIELD=PROC",
+        ));
         assert_eq!(
             config,
             UsbCtrSnlConfig {
@@ -296,7 +252,7 @@ mod tests {
                 field: "PROC".into(),
             }
         );
-        let defaults = UsbCtrSnlConfig::from_macros("R");
+        let defaults = UsbCtrSnlConfig::from_macros(&seq_macros("R"));
         assert_eq!(defaults.prefix, "USBCTR:MCS:");
         assert_eq!(defaults.record, "mca");
         assert_eq!(defaults.num_counters, 8);
