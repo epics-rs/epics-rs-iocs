@@ -342,7 +342,10 @@ fn describe(v: &Variant) -> String {
     let printed = match v {
         // C skips `UA_print` for a variant without a type.
         Variant::Empty => String::new(),
-        _ => ua_print(v).unwrap_or_else(|| format!("{v:?}")),
+        _ => ua_print(v).map_or_else(
+            || format!("{v:?}"),
+            |b| String::from_utf8_lossy(&b).into_owned(),
+        ),
     };
     format!("{} {printed}", type_name(v))
 }
@@ -391,10 +394,11 @@ fn is_choice(choices: &EnumChoices, n: Number) -> bool {
     key.is_some_and(|k| choices.contains_key(&k))
 }
 
-/// Read any variant as text (`readScalar(char*, len)`,
-/// `DataElementOpen62541Leaf.cpp:300-455`) — the stringin/stringout/lsi/lso path.
-/// A kind with no text of its own is printed by `UA_print` (`:422-426`).
-pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<String> {
+/// Read any variant as the bytes the C copies into the record's char buffer
+/// (`readScalar(char*, len)`, `DataElementOpen62541Leaf.cpp:300-455`) — the
+/// stringin/stringout/lsi/lso path. A kind with no text of its own is printed
+/// by `UA_print` (`:422-426`).
+pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<Vec<u8>> {
     let unsupported = || ReadError::UnsupportedKind {
         kind: kind_name(v),
         value: describe(v),
@@ -405,29 +409,35 @@ pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<Str
     if let (Some(choices), Some(n)) = (choices, scalar_number(v))
         && let Some(name) = enum_choice_name(choices, n)
     {
-        return Ok(name.to_string());
+        return Ok(name.as_bytes().to_vec());
     }
 
     Ok(match v {
-        Variant::String(s) => s.as_ref().to_string(),
-        Variant::XmlElement(x) => x.to_string(),
-        Variant::LocalizedText(lt) => lt.text.as_ref().to_string(),
-        Variant::QualifiedName(qn) => qn.name.as_ref().to_string(),
-        Variant::ByteString(bs) => hex_encode(bs.as_ref()),
+        Variant::String(s) => s.as_ref().as_bytes().to_vec(),
+        Variant::XmlElement(x) => x.to_string().into_bytes(),
+        Variant::LocalizedText(lt) => lt.text.as_ref().as_bytes().to_vec(),
+        Variant::QualifiedName(qn) => qn.name.as_ref().as_bytes().to_vec(),
+        Variant::ByteString(bs) => hex_encode(bs.as_ref()).into_bytes(),
         // The C hands the raw byte(s) to the record's char buffer
-        // (`DataElementOpen62541Leaf.cpp:402-409`).
-        Variant::Byte(b) => String::from_utf8_lossy(&[*b]).into_owned(),
-        Variant::SByte(b) => String::from_utf8_lossy(&[*b as u8]).into_owned(),
-        Variant::Array(a) if matches!(a.value_type, VariantScalarTypeId::Byte) => {
-            let bytes: Vec<u8> = a
-                .values
+        // (`DataElementOpen62541Leaf.cpp:402-409`). Its `n++` (`:408`) lets a
+        // byte array fill the whole buffer with no NUL; that C defect is not
+        // copied, so the record cuts these bytes like any other text.
+        Variant::Byte(b) => vec![*b],
+        Variant::SByte(b) => vec![*b as u8],
+        Variant::Array(a)
+            if matches!(
+                a.value_type,
+                VariantScalarTypeId::Byte | VariantScalarTypeId::SByte
+            ) =>
+        {
+            a.values
                 .iter()
                 .filter_map(|e| match e {
                     Variant::Byte(b) => Some(*b),
+                    Variant::SByte(b) => Some(*b as u8),
                     _ => None,
                 })
-                .collect();
-            String::from_utf8_lossy(&bytes).into_owned()
+                .collect()
         }
         // C dereferences the null type of a variant without a value (`:353`).
         Variant::Empty => return Err(unsupported()),

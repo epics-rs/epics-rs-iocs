@@ -343,7 +343,8 @@ impl OpcuaDevice {
         let rec = item_record(record, &self.record_name)?;
         rec.set_acted(ok);
         rec.statcode = status.bits();
-        rec.stattext = truncate(&status.to_string(), 40).to_string();
+        rec.stattext =
+            String::from_utf8_lossy(truncate(status.to_string().as_bytes(), 40)).into_owned();
         // UDF belongs to the record here: `opcua_action_item` never writes it,
         // the record support's `readwrite` wrapper clears it on dset success
         // (`opcuaItemRecord.cpp:159-162`) — which is what `set_acted` ports.
@@ -593,7 +594,7 @@ impl OpcuaDevice {
             // lsi/lso clamp the string to SIZV themselves and set LEN from it.
             Op::LongString => {
                 let v = value::read_string(data, choices)?;
-                put(record, "VAL", EpicsValue::CharArray(v.into_bytes().into()))?;
+                put(record, "VAL", EpicsValue::CharArray(v.into()))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Op::Array => {
@@ -683,7 +684,7 @@ impl OpcuaDevice {
             posts.push((ENUM_VALUE_FIELDS[i].to_string(), EpicsValue::ULong(*value)));
             posts.push((
                 ENUM_STRING_FIELDS[i].to_string(),
-                EpicsValue::String(truncate(name, 25).into()),
+                EpicsValue::String(truncate(name.as_bytes(), 25).into()),
             ));
         }
         // Clear the slots the server does not use, so no stale string shows and
@@ -1112,13 +1113,10 @@ fn no_conversion(record: &dyn Record) -> bool {
     short(record, "LINR").unwrap_or(0) == 0
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    // EPICS field sizes are byte counts; never split a character in half.
-    let mut end = s.len().min(max);
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
+/// EPICS field sizes are byte counts, and the C copies that many bytes even
+/// when the last character is cut in half (`DataElementOpen62541Leaf.cpp:427-431`).
+fn truncate(s: &[u8], max: usize) -> &[u8] {
+    &s[..s.len().min(max)]
 }
 
 // ------------------------------------------------------------------------ arrays
@@ -1136,7 +1134,7 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), Failure> {
         EpicsValue::CharArray(_) | EpicsValue::UCharArray(_) => {
             let bytes = match data {
                 Variant::String(_) | Variant::ByteString(_) | Variant::LocalizedText(_) => {
-                    value::read_string(data, None)?.into_bytes()
+                    value::read_string(data, None)?
                 }
                 _ => value::read_array_u8(data)?,
             };
@@ -1169,7 +1167,7 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), Failure> {
         EpicsValue::StringArray(_) => EpicsValue::StringArray(
             clamp(value::read_string_array(data)?, nelm)
                 .into_iter()
-                .map(|s| truncate(&s, 39).into())
+                .map(|s| truncate(s.as_bytes(), 39).into())
                 .collect(),
         ),
         other => return Err(format!("VAL is not an array ({other:?})").into()),

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use async_opcua::types::{StatusCode, Variant};
+use async_opcua::types::{StatusCode, UAString, Variant};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
@@ -234,6 +234,41 @@ fn stringin_truncates_to_the_epics_string_size() {
         field(&record, "VAL"),
         EpicsValue::String("x".repeat(39).into())
     );
+}
+
+/// EPICS string sizes are byte counts: the C copies 39 bytes even through the
+/// middle of a character (`DataElementOpen62541Leaf.cpp:427-431`).
+#[test]
+fn stringin_cuts_at_the_byte_size_inside_a_character() {
+    let registry = registry();
+    let mut record = StringinRecord::new("");
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    let long = format!("{}\u{e9}", "x".repeat(38));
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::String(long.as_str().into()),
+    );
+
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::String(long.as_bytes()[..39].into())
+    );
+}
+
+#[test]
+fn stringin_takes_a_byte_node_as_its_raw_byte() {
+    let registry = registry();
+    let mut record = StringinRecord::new("");
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    incoming(&mut device, &leaf, &mut record, Variant::Byte(0xff));
+
+    assert_eq!(field(&record, "VAL"), EpicsValue::String(vec![0xff].into()));
 }
 
 #[test]
@@ -466,6 +501,27 @@ fn the_servers_enumeration_fills_a_state_table_the_database_left_empty() {
     assert!(rx.try_recv().is_err());
 }
 
+/// A state string is cut at 25 bytes, as `strncpy` cuts it (`devOpcua.cpp:723`).
+#[test]
+fn a_state_name_from_the_server_is_cut_at_the_byte_size() {
+    let registry = registry();
+    let mut record = MbbiRecord::new(0);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    let name = format!("{}\u{e9}", "x".repeat(24));
+    let mut choices = EnumChoices::new();
+    choices.insert(3, name.clone());
+    leaf.lock().choices = Some(Arc::new(choices));
+
+    incoming(&mut device, &leaf, &mut record, Variant::UInt32(3));
+
+    assert_eq!(
+        field(&record, "ZRST"),
+        EpicsValue::String(name.as_bytes()[..25].into())
+    );
+}
+
 #[test]
 fn a_state_table_the_database_defined_is_not_overwritten_by_the_server() {
     let registry = registry();
@@ -646,6 +702,28 @@ fn an_array_longer_than_nelm_is_clamped() {
     assert_eq!(
         field(&record, "VAL"),
         EpicsValue::LongArray(vec![1, 2].into())
+    );
+}
+
+/// Each element is cut at 39 bytes (`DataElementOpen62541Leaf.cpp:548-551`).
+#[test]
+fn a_string_waveform_cuts_each_element_at_the_byte_size() {
+    let registry = registry();
+    let mut record = WaveformRecord::new(2, DbFieldType::String);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    let long = format!("{}\u{e9}", "x".repeat(38));
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::from(vec![UAString::from(long.as_str()), UAString::from("ok")]),
+    );
+
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::StringArray(vec![long.as_bytes()[..39].into(), "ok".into()].into())
     );
 }
 
