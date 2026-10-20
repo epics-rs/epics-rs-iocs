@@ -272,7 +272,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
             // `writeInt32` already stored ADAcquire=0.
             ctx.pool
                 .owner()
-                .store_array(0, Some(image.share().array().clone()));
+                .store_array(0, image.share().array().clone());
             continue;
         }
 
@@ -310,7 +310,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
         if array_callbacks {
             ctx.publisher.publish(image.clone()).await;
         }
-        ctx.pool.owner().store_array(0, Some(image.array().clone()));
+        ctx.pool.owner().store_array(0, image.array().clone());
 
         // See if acquisition is done.
         if image_mode == ImageMode::Single

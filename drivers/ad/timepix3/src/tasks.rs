@@ -2270,7 +2270,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
             let addr = threshold_addr(f.threshold_id, IMG_ADDR, IMG_THRESHOLD1_ADDR);
             // C releases pArrays[addr] before allocating its replacement
             // (serval_stream.cpp:803-809).
-            ctx.pool.owner().store_array(addr, None);
+            ctx.pool.owner().release_array(addr);
             let Some(mut array) = image_array(
                 ctx,
                 &f,
@@ -2374,9 +2374,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                 }
             }
             let array = array.share();
-            ctx.pool
-                .owner()
-                .store_array(addr, Some(array.array().clone()));
+            ctx.pool.owner().store_array(addr, array.array().clone());
             publish_image(ctx, addr, array).await;
             ctx.trace(
                 TraceMask::IO_DRIVER,
@@ -2504,7 +2502,7 @@ async fn preview_frame(ctx: &Arc<Ctx>, s: Preview, mut f: crate::stream::ImageFr
     log_json_header(ctx, s, &f.header);
     let addr = threshold_addr(f.threshold_id, s.th0, s.th1);
     // C releases pArrays[addr] before allocating its replacement (:165-171).
-    ctx.pool.owner().store_array(addr, None);
+    ctx.pool.owner().release_array(addr);
     let pixels = std::mem::take(&mut f.pixels);
     let Some(mut array) = image_array(
         ctx,
@@ -2562,9 +2560,7 @@ async fn preview_frame(ctx: &Arc<Ctx>, s: Preview, mut f: crate::stream::ImageFr
     }
     attach_attributes(ctx, &mut array, &f).await;
     let array = array.share();
-    ctx.pool
-        .owner()
-        .store_array(addr, Some(array.array().clone()));
+    ctx.pool.owner().store_array(addr, array.array().clone());
     publish_image(ctx, addr, array).await;
 
     let pair_done = {
@@ -2619,7 +2615,7 @@ async fn preview_frame(ctx: &Arc<Ctx>, s: Preview, mut f: crate::stream::ImageFr
 /// C `releasePreviewBandArrays` (serval_stream.cpp:470-481).
 pub(crate) fn release_preview_band_arrays(pool: &DriverPool) {
     for s in [PRV_IMG, PRV_IMG1] {
-        pool.owner().store_array(s.diff, None);
+        pool.owner().release_array(s.diff);
     }
 }
 
@@ -2674,7 +2670,7 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
         );
         return;
     }
-    owner.store_array(s.diff, None);
+    owner.release_array(s.diff);
     let dims = vec![
         NDDimension::new(t0.dims[0].size),
         NDDimension::new(t0.dims[1].size),
@@ -2730,7 +2726,7 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
         NDAttrValue::String(if clip { "max(0,T0-T1)" } else { "T0-T1" }.into()),
     ));
     let diff = diff.share();
-    owner.store_array(s.diff, Some(diff.array().clone()));
+    owner.store_array(s.diff, diff.array().clone());
     ctx.shared.preview[s.index].lock().last_diff_t0 = t0_frame;
     publish_image(ctx, s.diff, diff).await;
     ctx.trace(

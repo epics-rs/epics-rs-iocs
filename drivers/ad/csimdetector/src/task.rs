@@ -123,7 +123,7 @@ async fn sim_task(mut ctx: CSimTaskContext) {
             NDDimension::new(cfg.num_time_points),
         ];
         // C releases pArrays[0] just before the alloc (ADCSimDetector.cpp:150-151).
-        ctx.pool.owner().store_array(0, None);
+        ctx.pool.owner().release_array(0);
         let Ok(mut image) = ctx.pool.alloc(dims, cfg.data_type) else {
             continue;
         };
@@ -152,7 +152,7 @@ async fn sim_task(mut ctx: CSimTaskContext) {
         // attached.
 
         let image = image.share();
-        ctx.pool.owner().store_array(0, Some(image.array().clone()));
+        ctx.pool.owner().store_array(0, image.array().clone());
 
         // `doCallbacksGenericPointer(pImage, NDArrayData, 0)` — unconditional:
         // ADCSimDetector never tests `NDArrayCallbacks`.

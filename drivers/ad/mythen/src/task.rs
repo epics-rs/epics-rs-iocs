@@ -215,6 +215,6 @@ async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> 
             .await;
     }
     // C releases the previous pArrays[0] after the callbacks (mythen.cpp:1010-1011).
-    s.pool.owner().store_array(0, Some(array.array().clone()));
+    s.pool.owner().store_array(0, array.array().clone());
     true
 }

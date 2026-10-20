@@ -199,7 +199,7 @@ fn a_base_class_int32_write_reaches_the_ndarray_pool() {
         .ad
         .pool
         .owner()
-        .store_array(0, Some(image.share().array().clone()));
+        .store_array(0, image.share().array().clone());
     let base = driver.ad.params.base;
     let mut user = AsynUser::new(base.pool_num_pre_alloc_buffers);
     driver.write_int32(&mut user, 2).unwrap();
