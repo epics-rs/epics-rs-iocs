@@ -36,6 +36,7 @@ use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::types::c_parse::strtol;
 
 use crate::util::{atof, atoi};
 
@@ -135,12 +136,9 @@ impl XpsReply {
     /// into a socket the controller closed reads EOF and gets an empty reply,
     /// which C reports as an error (XPS_C8_drivers.cpp:3355,3376).
     pub fn code(&self) -> i32 {
-        let t = self.0.trim_start();
-        let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
-        if digits.starts_with(|c: char| c.is_ascii_digit()) {
-            atoi(t)
-        } else {
-            -1
+        match strtol(&self.0, 0) {
+            (_, 0) => -1,
+            (v, _) => v as i32,
         }
     }
 
@@ -482,6 +480,16 @@ mod tests {
     fn an_overflowing_bitmask_is_strtol_cast_to_int() {
         let r = XpsReply("0,99999999999999999999".to_string());
         assert_eq!(r.bits(1), std::os::raw::c_long::MAX as i32 as u32);
+    }
+
+    /// C `sscanf(ReturnedValue, "%i", &ret)` is base 0: octal, hex and, with
+    /// glibc 2.39 under `_GNU_SOURCE`, binary.
+    #[test]
+    fn reply_error_code_is_percent_i() {
+        assert_eq!(XpsReply("010".to_string()).code(), 8);
+        assert_eq!(XpsReply("-0x1A".to_string()).code(), -26);
+        assert_eq!(XpsReply("0b11".to_string()).code(), 3);
+        assert_eq!(XpsReply("0x".to_string()).code(), 0);
     }
 
     #[test]
