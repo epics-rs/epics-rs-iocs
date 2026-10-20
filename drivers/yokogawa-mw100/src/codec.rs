@@ -5,10 +5,9 @@
 //! consumer's own `ptr += 4`), or on a full raw binary frame (`FD1`/`FO1`,
 //! which indexes from the frame start).
 
-use std::ffi::c_long;
-
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::stdlib::strtod;
+use epics_rs::base::types::c_parse;
 
 // ---------------------------------------------------------------------
 // Command builders
@@ -119,7 +118,7 @@ pub fn format_g(value: f64) -> String {
 /// takes a sign, so only the literal `E1` and one digit are required.
 pub fn parse_error_code(payload: &[u8]) -> Option<i32> {
     let rest = payload.strip_prefix(b"E1")?;
-    match c_strtol(rest) {
+    match c_parse::strtol(rest, 10) {
         (_, 0) => None,
         (code, _) => Some(code as i32),
     }
@@ -1070,44 +1069,6 @@ pub const CH_STATUS_NORMAL: u8 = 1;
 pub const CH_STATUS_DIFF: u8 = 2;
 pub const CH_STATUS_UNKNOWN: u8 = 3;
 
-/// C `strtol(s, &end, 10)`: leading `isspace`, an optional sign, then
-/// decimal digits up to the first non-digit, saturating at `LONG_MIN` /
-/// `LONG_MAX`. Returns the value and the bytes consumed, `(0, 0)` when no
-/// digit follows.
-pub fn c_strtol(s: &[u8]) -> (c_long, usize) {
-    let mut i = 0;
-    while i < s.len() && epics_rs::base::runtime::stdlib::c_isspace(s[i] as char) {
-        i += 1;
-    }
-    let negative = match s.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    let digits = i;
-    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
-    let mut value: c_long = 0;
-    while let Some(d) = s.get(i).filter(|c| c.is_ascii_digit()) {
-        let d = c_long::from(d - b'0');
-        value = if negative {
-            value.saturating_mul(10).saturating_sub(d)
-        } else {
-            value.saturating_mul(10).saturating_add(d)
-        };
-        i += 1;
-    }
-    if i == digits {
-        return (0, 0);
-    }
-    (value, i)
-}
-
 /// glibc `inet_aton`: one to four `.`-separated `strtoul(.., 0)` numbers
 /// (decimal, `0` octal, `0x` hex), the last filling the remaining bytes;
 /// the address may end at a whitespace byte.
@@ -1147,7 +1108,8 @@ pub fn inet_aton(s: &[u8]) -> Option<std::net::Ipv4Addr> {
 }
 
 /// `strtoul(s, &end, 0)` on a string that starts with a digit: the value
-/// and the digits consumed, `None` on `ERANGE`.
+/// and the digits consumed, `None` on `ERANGE`. Not [`c_parse::strtoul`]:
+/// glibc's own `inet_aton` reads without C23's `0b` prefix.
 fn strtoul_base0(s: &[u8]) -> Option<(u64, usize)> {
     let (radix, start) = match s {
         [b'0', b'x' | b'X', c, ..] if c.is_ascii_hexdigit() => (16, 2),
@@ -1165,10 +1127,7 @@ fn strtoul_base0(s: &[u8]) -> Option<(u64, usize)> {
     Some((value, i))
 }
 
-/// C `atoi`, which glibc defines as `(int) strtol(s, NULL, 10)`.
-pub fn c_atoi(s: &[u8]) -> i32 {
-    c_strtol(s).0 as i32
-}
+pub use c_parse::atoi as c_atoi;
 
 /// C `address = atoi(...) - 1` as an array index. `None` where C indexes
 /// out of bounds (undefined behaviour), so that line is dropped.
@@ -1631,6 +1590,7 @@ mod tests {
             ("0xffffffff", Some("255.255.255.255")),
             ("1.0xffffff", Some("1.255.255.255")),
             ("localhost", None),
+            ("0b11.1.1.1", None),
         ];
         for &(input, want) in cases {
             assert_eq!(
@@ -1772,23 +1732,10 @@ mod tests {
     }
 
     #[test]
-    fn c_strtol_matches_c() {
-        assert_eq!(c_strtol(b"0012x"), (12, 4));
-        assert_eq!(c_strtol(b" -3,"), (-3, 3));
-        assert_eq!(c_strtol(b"+7"), (7, 2));
-        assert_eq!(c_strtol(b"x1"), (0, 0));
-        assert_eq!(c_strtol(b"-"), (0, 0));
+    fn c_atoi_is_strtol_truncated_to_int() {
         assert_eq!(c_atoi(b" 12 "), 12);
-    }
-
-    #[test]
-    fn c_strtol_saturates_at_long_min_and_max() {
-        use std::ffi::c_long;
-        assert_eq!(c_strtol(b"-99999999999999999999").0, c_long::MIN);
-        assert_eq!(c_strtol(b"99999999999999999999").0, c_long::MAX);
-        assert_eq!(c_strtol(c_long::MIN.to_string().as_bytes()).0, c_long::MIN);
-        assert_eq!(c_atoi(b"-99999999999999999999"), c_long::MIN as i32);
-        assert_eq!(c_atoi(b"99999999999999999999"), c_long::MAX as i32);
+        assert_eq!(c_atoi(b"-99999999999999999999"), i64::MIN as i32);
+        assert_eq!(c_atoi(b"99999999999999999999"), i64::MAX as i32);
     }
 
     #[test]

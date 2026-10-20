@@ -198,7 +198,7 @@ pub fn analyze_link<P>(
             Some(open) if open > 0 => open,
             _ => return Err(malformed()),
         };
-        let (v, n) = strtol(&tag_text[open + 1..]);
+        let (v, n) = epics_rs::base::types::c_parse::strtol(&tag_text[open + 1..], 0);
         if n == 0 || v == i64::MAX || v == i64::MIN {
             return Err(malformed());
         }
@@ -273,45 +273,6 @@ fn strtod(text: &str) -> (f64, usize) {
         .filter(|&n| t.is_char_boundary(n))
         .find_map(|n| t[..n].parse::<f64>().ok().map(|v| (v, skipped + n)))
         .unwrap_or((0.0, 0))
-}
-
-/// C `strtol(text, &end, 0)`: the value, saturated to `i64::MIN..=MAX` as
-/// `LONG_MIN`/`LONG_MAX`, and how many bytes it took (0 for none).
-fn strtol(text: &str) -> (i64, usize) {
-    let b = text.as_bytes();
-    let mut i = b.iter().take_while(|c| c.is_ascii_whitespace()).count();
-    let negative = match b.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    let (radix, digits_at) = match (b.get(i), b.get(i + 1)) {
-        (Some(b'0'), Some(b'x' | b'X')) if b.get(i + 2).is_some_and(u8::is_ascii_hexdigit) => {
-            (16, i + 2)
-        }
-        (Some(b'0'), _) => (8, i),
-        _ => (10, i),
-    };
-    let n = b[digits_at..]
-        .iter()
-        .take_while(|c| (**c as char).is_digit(radix))
-        .count();
-    if n == 0 {
-        return (0, 0);
-    }
-    let digits = &text[digits_at..digits_at + n];
-    let v = i128::from_str_radix(digits, radix).unwrap_or(i128::MAX);
-    let v = if negative { -v } else { v };
-    (
-        v.clamp(i64::MIN.into(), i64::MAX.into()) as i64,
-        digits_at + n,
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2101,6 +2062,19 @@ mod tests {
         assert_eq!(parse_link("@plc1 A[010]", 1, 0).unwrap().element, 8);
         assert_eq!(parse_link("@plc1 A[3x]", 1, 0).unwrap().element, 3);
         assert_eq!(parse_link("@plc1 Cnt S 0.5", 1, 0).unwrap().period, 0.5);
+    }
+
+    /// devEtherIP.c:1055's strtol is glibc's with `_GNU_SOURCE`: `0b` is
+    /// binary, and a saturated index is malformed.
+    #[test]
+    fn array_index_is_read_as_glibc_strtol() {
+        assert_eq!(parse_link("@plc1 A[0b11]", 1, 0).unwrap().element, 3);
+        for tag in ["A[9223372036854775807]", "A[-9223372036854775809]"] {
+            assert_eq!(
+                parse_link(&format!("@plc1 {tag}"), 1, 0).unwrap_err(),
+                format!("malformed array tag in 'plc1 {tag}'")
+            );
+        }
     }
 
     #[test]

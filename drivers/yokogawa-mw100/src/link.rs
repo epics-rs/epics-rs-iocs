@@ -10,7 +10,7 @@
 //! `constant[60]`), and via every `devMW100_*.c::init_record`'s own
 //! `switch(arg[0])` never having a `'W'` (VarConst) arm.
 
-use crate::codec::c_strtol;
+use epics_rs::base::types::c_parse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelFamily {
@@ -87,7 +87,7 @@ fn parse_channel_address_end(arg: &str) -> Option<(ChannelAddress, usize)> {
         b'K' => (ChannelFamily::Const, 1, 60),
         _ => return None,
     };
-    let (value, len) = c_strtol(&arg.as_bytes()[start..]);
+    let (value, len) = c_parse::strtol(&arg.as_bytes()[start..], 10);
     let index = value as i32;
     if index <= 0 || index > max {
         return None;

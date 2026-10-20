@@ -127,19 +127,7 @@ pub fn read_only(link: &OctetLink) -> AsynResult<String> {
     Ok(String::from_utf8_lossy(&raw).into_owned())
 }
 
-/// Mimic C `atoi`: parse the leading integer prefix, `0` on junk.
-pub fn atoi(s: &str) -> i32 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i32>().ok()).unwrap_or(0)
-}
+pub use epics_rs::base::types::c_parse::atoi;
 
 /// Extract the leading numeric token (sign, digits, optional `.digits`,
 /// optional exponent) that C `atof`/`sscanf("%e", ...)` would consume,
@@ -201,6 +189,13 @@ mod tests {
         assert_eq!(atoi("  -7abc"), -7);
         assert_eq!(atoi("abc"), 0);
         assert_eq!(atoi(""), 0);
+    }
+
+    #[test]
+    fn atoi_wraps_an_overflow_as_glibc_does() {
+        // glibc's atoi is `(int) strtol(s, NULL, 10)`.
+        assert_eq!(atoi("2147483648"), i32::MIN);
+        assert_eq!(atoi("99999999999999999999"), -1);
     }
 
     #[test]
