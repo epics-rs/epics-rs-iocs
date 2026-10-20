@@ -290,7 +290,8 @@ impl PortDriver for CtrDriver {
                     TraceMask::ERROR,
                     format_args!(
                         "USBCTR::writeInt32 error calling cbDaqSetTrigger status={}, error={}\n",
-                        e.code, e.message
+                        e.code,
+                        e.message()
                     ),
                 );
             }

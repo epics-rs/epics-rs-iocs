@@ -320,11 +320,11 @@ fn poller_loop(
             push_analog_in(&mut updates, &params, &snapshot);
         }
         let _ = handle.with_driver_blocking::<MultiFunctionDriver, _>(move |driver| {
-            let base = driver.base_mut();
-            for update in updates {
-                let _ = base.set_param(&update);
+            for update in &updates {
+                let _ = driver.post(update);
             }
             if !goto_error {
+                let base = driver.base_mut();
                 for addr in 0..MAX_SIGNALS as i32 {
                     let _ = base.call_param_callbacks(addr);
                 }

@@ -166,7 +166,7 @@ pub fn start_mcs(
                 TraceMask::ERROR,
                 format_args!(
                     "USBCTR::startMCS error calling cbCConfigScan, counter={i}, mode=0x{mode:x}, status={}, error={}\n",
-                    e.code, e.message
+                    e.code, e.message()
                 ),
             );
         }
@@ -196,7 +196,7 @@ pub fn start_mcs(
             TraceMask::ERROR,
             format_args!(
                 "USBCTR::startMCS error calling cbCLoad32, reg=OUTPUTVALREG, value=0, status={}, error={}\n",
-                e.code, e.message
+                e.code, e.message()
             ),
         );
     }
@@ -225,7 +225,7 @@ pub fn start_mcs(
                 TraceMask::ERROR,
                 format_args!(
                     "USBCTR::startMCS error calling cbCConfigScan, counter={prescale_counter}, mode=0x{mode:x}, status={}, error={}\n",
-                    e.code, e.message
+                    e.code, e.message()
                 ),
             );
         }
@@ -269,7 +269,7 @@ pub fn start_mcs(
                 "USBCTR::startMCS error calling ulDaqInScan, numChans={}, numPoints={num_points}, rate={rate:.6}, options=0x{options:x}, flags=0x{:x}, status={flags}, error={}\n",
                 chan_descs.len(),
                 e.code,
-                e.message, rate = CFloat(rate)
+                e.message(), rate = CFloat(rate)
             ),
         );
     }
@@ -394,7 +394,7 @@ pub fn stop_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) -> 
             TraceMask::ERROR,
             format_args!(
                 "USBCTR::stopMCS ERROR calling cbStopBackground(CTRFUNCTION), status={}, error={}\n",
-                e.code, e.message
+                e.code, e.message()
             ),
         );
     }

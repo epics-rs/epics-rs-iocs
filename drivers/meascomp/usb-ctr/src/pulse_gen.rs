@@ -66,7 +66,7 @@ pub fn start(
                 CFloat(timing.duty_cycle),
                 CFloat(timing.initial_delay),
                 e.code,
-                e.message
+                e.message()
             ),
         );
         return Err(e);
@@ -95,7 +95,7 @@ pub fn stop(trace: &SelfTrace, device: &DaqDevice, timer: i32) -> Result<()> {
             TraceMask::ERROR,
             format_args!(
                 "USBCTR::stopPulseGenerator error calling cbPulseOutStop timerNum={timer}, status={}, error={}\n",
-                e.code, e.message
+                e.code, e.message()
             ),
         );
     })

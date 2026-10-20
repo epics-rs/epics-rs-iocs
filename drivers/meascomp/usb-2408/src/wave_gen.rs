@@ -2,6 +2,7 @@ use meascomp::analog_out::AOutScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::trace::TraceMask;
 
 use crate::board_enums::map_range;
@@ -287,7 +288,7 @@ pub fn start_wave_gen(
         format_args!(
             "{DRIVER_NAME}:{FUNCTION}: called cbAOutScan, firstChan={first_chan}, lastChan={last_chan}, numPoints*numWaveGenChans_={}, dwell={:.6}, options=0x{options:x}\n",
             num_chans * num_points,
-            state.dwell_actual
+            CFloat(state.dwell_actual)
         ),
     );
     Ok(())
