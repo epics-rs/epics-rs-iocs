@@ -7,7 +7,6 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 
@@ -166,30 +165,26 @@ fn unsupported_firmware(controller_type: &str, major: i32, minor: i32) -> String
     )
 }
 
-/// Connect to the octet port, giving it the OMS EOS (input `"\n\r"`, output
-/// `"\n"`) only where st.cmd left that direction empty, as
+/// Connect to the octet port, flush it, and give it the OMS EOS (input
+/// `"\n\r"`, output `"\n"`) only where st.cmd left that direction empty, as
 /// `omsMAXnet`/`omsMXA` do after `getInputEos`/`getOutputEos`. As there, a
 /// refused get skips that direction and a refused set is printed, never fatal
-/// (omsMAXnet.cpp:134-142, omsMXA.cpp:129-137).
+/// (omsMAXnet.cpp:128-142, omsMXA.cpp:123-137).
 fn connect_with_default_eos(port_name: &str, timeout: Duration, who: &str) -> Option<SyncIOHandle> {
     let port = get_port(port_name)?;
-    let user = || AsynUser::new(0).with_addr(0);
-    let handle = &port.handle;
-    if handle
-        .get_input_eos_blocking(user())
-        .is_ok_and(|eos| eos.is_empty())
-        && let Err(e) = handle.set_input_eos_blocking(user(), b"\n\r")
+    let handle = SyncIOHandle::from_handle(port.handle.clone(), 0, timeout);
+    let _ = handle.flush(0);
+    if handle.get_input_eos(0).is_ok_and(|eos| eos.is_empty())
+        && let Err(e) = handle.set_input_eos(0, b"\n\r")
     {
         println!("{who}: unable to set InputEOS {port_name}: {e}");
     }
-    if handle
-        .get_output_eos_blocking(user())
-        .is_ok_and(|eos| eos.is_empty())
-        && let Err(e) = handle.set_output_eos_blocking(user(), b"\n")
+    if handle.get_output_eos(0).is_ok_and(|eos| eos.is_empty())
+        && let Err(e) = handle.set_output_eos(0, b"\n")
     {
         println!("{who}: unable to set OutputEOS {port_name}: {e}");
     }
-    Some(SyncIOHandle::from_handle(handle.clone(), 0, timeout))
+    Some(handle)
 }
 
 #[cfg(test)]
@@ -199,6 +194,7 @@ mod tests {
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::user::AsynUser;
 
     /// A port with no EOS support of its own: both sets are refused.
     struct Bare(PortDriverBase);
@@ -210,6 +206,45 @@ mod tests {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.0
         }
+    }
+
+    /// omsMAXnet.cpp:128-142, omsMXA.cpp:123-137: the connect flushes, then
+    /// gets and sets each EOS through `pasynOctetSyncIO`, each call printing
+    /// its TRACEIO_DEVICE line.
+    #[test]
+    fn the_connect_flushes_and_sets_the_eos_as_asyn_octet_sync_io() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use motor_common::testing::LineRig;
+
+        let name = "omsSyncIoEos";
+        let (_line, io) = LineRig::new(name, |_| String::new());
+        let trace = io.port().unwrap().trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_some());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.split_once(" asynOctetSyncIO ").map(|(_, call)| call))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "flush",
+                "setInputEos eoslen 0",
+                "setInputEos eoslen 2",
+                "setOutputEos eoslen 0",
+                "setOutputEos eoslen 1",
+            ],
+            "{text}"
+        );
     }
 
     #[test]
