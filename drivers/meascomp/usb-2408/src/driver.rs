@@ -504,14 +504,14 @@ impl MultiFunctionDriver {
             }
         }
 
-        if let Err(code) = wave_gen::start_wave_gen(
+        let dwell = match wave_gen::start_wave_gen(
             dev,
             wave_gen_state,
             &WaveGenScan {
                 first_chan,
                 last_chan,
                 num_points,
-                freq: 1.0 / (dwell * num_points as f64),
+                dwell,
                 range: uldaq_sys::BIP10VOLTS,
                 ext_trigger,
                 ext_clock,
@@ -522,15 +522,13 @@ impl MultiFunctionDriver {
             &saved,
             trace,
         ) {
-            return Ok(code);
-        }
+            Ok(dwell) => dwell,
+            Err(code) => return Ok(code),
+        };
         self.base
-            .set_float64_param(p.wave_gen_dwell_actual, 0, wave_gen_state.dwell_actual)?;
-        self.base.set_float64_param(
-            p.wave_gen_total_time,
-            0,
-            wave_gen_state.dwell_actual * num_points as f64,
-        )?;
+            .set_float64_param(p.wave_gen_dwell_actual, 0, dwell)?;
+        self.base
+            .set_float64_param(p.wave_gen_total_time, 0, dwell * num_points as f64)?;
         Ok(0)
     }
 
@@ -1024,14 +1022,6 @@ impl PortDriver for MultiFunctionDriver {
         let reason = user.reason;
         let addr = user.addr;
         self.base.set_float64_param(reason, addr, value)?;
-
-        // Frequency change → update dwell
-        if reason == self.params.wave_gen_freq && value > 0.0 {
-            let num_points = self.int(self.params.wave_gen_num_points, 0) as f64;
-            let dwell = 1.0 / (value * num_points);
-            self.base
-                .set_float64_param(self.params.wave_gen_dwell, 0, dwell)?;
-        }
 
         let mut status: UlError = 0;
         let p = self.params;
@@ -1576,6 +1566,23 @@ mod tests {
         assert!(
             text.contains("MultiFunction:writeFloat64, port MFNANF, wrote nan to address 0\n"),
             "{text}"
+        );
+    }
+
+    /// C writeFloat64 only stores WAVEGEN_FREQ (drvMultiFunction.cpp:2273-2330).
+    #[test]
+    fn a_frequency_write_leaves_the_dwell_alone() {
+        let mut drv = MultiFunctionDriver::new("MFFREQ", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        let dwell = drv.float(p.wave_gen_dwell, 0);
+        drv.write_float64(&mut AsynUser::new(p.wave_gen_freq), 50.0)
+            .unwrap();
+        assert_eq!(
+            (
+                drv.float(p.wave_gen_freq, 0),
+                drv.float(p.wave_gen_dwell, 0)
+            ),
+            (50.0, dwell)
         );
     }
 

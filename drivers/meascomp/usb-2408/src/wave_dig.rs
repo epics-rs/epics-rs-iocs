@@ -25,7 +25,6 @@ pub struct WaveDigState {
     pub channel_buffers: Vec<Vec<f64>>,
     /// Absolute time per point.
     pub abs_time_buffer: Vec<f64>,
-    pub dwell_actual: f64,
 }
 
 impl WaveDigState {
@@ -43,7 +42,6 @@ impl WaveDigState {
             scan_buffer: Vec::new(),
             channel_buffers,
             abs_time_buffer: vec![0.0; max_points],
-            dwell_actual: 0.001,
         }
     }
 }
@@ -106,6 +104,12 @@ impl WaveDigScan {
         (int(params.wave_dig_auto_restart, 0) != 0)
             .then(|| Self::read(params, input_mode, int, float))
     }
+
+    /// C `rate = 1./dwell` (drvMultiFunction.cpp:1826), unguarded: uldaq
+    /// refuses a dwell <= 0 with ERR_BAD_RATE.
+    pub fn rate(&self) -> f64 {
+        1.0 / self.dwell
+    }
 }
 
 /// Start the waveform digitizer (analog input scan). C `startWaveDig`:
@@ -123,7 +127,7 @@ pub fn start_wave_dig(
         first_chan,
         num_chans,
         num_points,
-        dwell,
+        dwell: _,
         input_mode,
         ref ranges,
         ext_trigger,
@@ -159,7 +163,7 @@ pub fn start_wave_dig(
         return (status, Vec::new());
     }
 
-    let mut rate = if dwell > 0.0 { 1.0 / dwell } else { 1000.0 };
+    let mut rate = scan.rate();
 
     let mut options = SO_DEFAULTIO;
     if ext_trigger {
@@ -194,13 +198,13 @@ pub fn start_wave_dig(
     );
     // C converts the rate back to the dwell whatever the scan returned, and
     // shows a rate the device refused as -9999.
-    state.dwell_actual = 1.0 / rate;
+    let dwell = 1.0 / rate;
     let dwell_actual = ParamSetValue::new(
         params.wave_dig_dwell_actual,
         0,
         ParamValue::Float64(match result {
             Err(ref e) if e.code == ERR_BAD_RATE => -9999.0,
-            _ => state.dwell_actual,
+            _ => dwell,
         }),
     );
     let status = trace.report(&result, FUNCTION, "Calling AInScan");
@@ -214,7 +218,7 @@ pub fn start_wave_dig(
         TraceMask::FLOW,
         format_args!(
             "{DRIVER_NAME}:{FUNCTION}: called cbAInScan, firstChan={first_chan}, lastChan={last_chan}, numPoints={num_points}, dwell={:.6}, options=0x{options:x}\n",
-            CFloat(state.dwell_actual)
+            CFloat(dwell)
         ),
     );
 
@@ -227,7 +231,7 @@ pub fn start_wave_dig(
             ParamSetValue::new(
                 params.wave_dig_total_time,
                 0,
-                ParamValue::Float64(state.dwell_actual * num_points as f64),
+                ParamValue::Float64(dwell * num_points as f64),
             ),
         ],
     )
@@ -449,6 +453,25 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_scan_rate_is_cs_reciprocal_dwell() {
+        let scan = |dwell| WaveDigScan {
+            first_chan: 0,
+            num_chans: 1,
+            num_points: 1,
+            dwell,
+            input_mode: 0,
+            ranges: vec![0],
+            ext_trigger: false,
+            ext_clock: false,
+            continuous: false,
+            retrigger: false,
+            burst_mode: false,
+        };
+        let rates = [1e-3, 0.0, -0.5].map(|dwell| scan(dwell).rate());
+        assert_eq!(rates, [1000.0, f64::INFINITY, -2.0]);
     }
 
     #[test]
