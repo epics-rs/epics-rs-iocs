@@ -20,6 +20,7 @@ use async_opcua::types::{
     Array, ByteString, LocalizedText, QualifiedName, UAString, Variant, VariantScalarTypeId,
     VariantTypeId, XmlElement,
 };
+use epics_rs::base::types::c_parse::atoi;
 
 use crate::print::ua_print;
 
@@ -259,21 +260,6 @@ fn parse_int_base0(s: &str) -> Option<i128> {
         digits.parse().ok()?
     };
     Some(if negative { -magnitude } else { magnitude })
-}
-
-/// `atoi`: glibc's `(int) strtol(s, NULL, 10)`.
-fn atoi(s: &str) -> i32 {
-    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let mut n: i128 = 0;
-    for b in digits.bytes().take_while(u8::is_ascii_digit) {
-        n = (n * 10 + i128::from(b - b'0')).min(1 << 64);
-    }
-    let n = if negative { -n } else { n };
-    n.clamp(i64::MIN.into(), i64::MAX.into()) as i64 as i32
 }
 
 /// The namespace of a "namespace|name" value: its `atoi`, kept to the 16 bits

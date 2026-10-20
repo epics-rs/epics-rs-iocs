@@ -837,6 +837,20 @@ fn a_namespace_is_read_as_atoi_reads_it() {
     assert_eq!(namespace("x|n"), 0);
     assert_eq!(namespace("-1|n"), 65535);
     assert_eq!(namespace("70000|n"), 4464);
+    // glibc's `(int) strtol`: `\v` is skipped, and the `long` saturates
+    // before it is truncated.
+    assert_eq!(namespace("\x0b5|n"), 5);
+    use std::ffi::c_long;
+    let wrapped = if c_long::BITS == 64 { 1 } else { u16::MAX };
+    assert_eq!(namespace("4294967297|n"), wrapped);
+    assert_eq!(
+        namespace("99999999999999999999|n"),
+        c_long::MAX as i32 as u16
+    );
+    assert_eq!(
+        namespace("-99999999999999999999|n"),
+        c_long::MIN as i32 as u16
+    );
 }
 
 /// Each element may name its locale or namespace; one that does not takes
