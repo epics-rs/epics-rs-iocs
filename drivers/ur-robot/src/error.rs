@@ -1,5 +1,7 @@
 //! Errors raised by the UR transports.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 /// Failure from any of the UR interfaces (RTDE, dashboard, script, gripper).
 #[derive(Debug, thiserror::Error)]
 pub enum UrError {
@@ -57,8 +59,13 @@ pub enum UrError {
     #[error("timed out after {0:?}: {1}")]
     Timeout(std::time::Duration, String),
 
-    #[error("value {value} is not within [{min}; {max}]")]
-    OutOfRange { value: f64, min: f64, max: f64 },
+    /// `verifyValueIsWithin`'s `range_error`; C++ streams min and max (`%g`).
+    #[error("The value is not within [{};{}]", CFloat(*min).g(), CFloat(*max).g())]
+    OutOfRange { min: f64, max: f64 },
+
+    /// `verifyValueIsWithin`'s `invalid_argument` for a NaN value.
+    #[error("The value is considered NaN")]
+    ValueIsNan,
 
     /// The control script refused a command (C++ returns a bare `false`,
     /// indistinguishable from a query answering "no"; here the refusal is
@@ -93,8 +100,11 @@ pub type UrResult<T> = Result<T, UrError>;
 /// `verifyValueIsWithin` (rtde_control_interface.cpp:22 and
 /// rtde_io_interface.cpp:167).
 pub fn verify_within(value: f64, min: f64, max: f64) -> UrResult<()> {
-    if value.is_nan() || !(value >= min && value <= max) {
-        return Err(UrError::OutOfRange { value, min, max });
+    if value.is_nan() {
+        return Err(UrError::ValueIsNan);
+    }
+    if !(value >= min && value <= max) {
+        return Err(UrError::OutOfRange { min, max });
     }
     Ok(())
 }
@@ -113,5 +123,13 @@ mod tests {
         assert!(verify_within(-0.1, 0.0, HIGH).is_err());
         assert!(verify_within(3.15, 0.0, HIGH).is_err());
         assert!(verify_within(f64::NAN, 0.0, HIGH).is_err());
+    }
+
+    /// `verifyValueIsWithin`'s two texts; min and max go through an ostream.
+    #[test]
+    fn range_check_speaks_ur_rtde() {
+        let text = |v, min, max| verify_within(v, min, max).unwrap_err().to_string();
+        assert_eq!(text(f64::NAN, 0.0, 1.0), "The value is considered NaN");
+        assert_eq!(text(2.0, 1e-5, 1.0), "The value is not within [1e-05;1]");
     }
 }

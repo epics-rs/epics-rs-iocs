@@ -90,7 +90,6 @@ impl IoInterface {
             .position(|&r| r == input_id)
             .map(|i| i as u8)
             .ok_or_else(|| UrError::OutOfRange {
-                value: f64::from(input_id),
                 min: f64::from(ids[0]),
                 max: f64::from(ids[4]),
             })
@@ -253,11 +252,7 @@ enum AnalogKind {
 /// output at all (rtde_io_interface.cpp:186).
 fn digital_mask(output_id: u8) -> UrResult<u8> {
     if output_id > 7 {
-        return Err(UrError::OutOfRange {
-            value: f64::from(output_id),
-            min: 0.0,
-            max: 7.0,
-        });
+        return Err(UrError::OutOfRange { min: 0.0, max: 7.0 });
     }
     Ok(1u8 << output_id)
 }
@@ -280,11 +275,7 @@ fn analog_out(output_id: u8, ratio: f64, kind: AnalogKind) -> UrResult<RobotComm
         0 => (ratio, 0.0),
         1 => (0.0, ratio),
         _ => {
-            return Err(UrError::OutOfRange {
-                value: f64::from(output_id),
-                min: 0.0,
-                max: 1.0,
-            });
+            return Err(UrError::OutOfRange { min: 0.0, max: 1.0 });
         }
     };
     Ok(RobotCommand::new(
