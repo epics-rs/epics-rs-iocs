@@ -6,6 +6,8 @@
 
 use std::str::FromStr;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::types::FrameType;
 
 /// `[Scan ...]` or `[Dark ...]` for this frame type (C `BISTask`'s switch).
@@ -19,18 +21,28 @@ pub fn acquire(
 ) -> String {
     match frame_type {
         FrameType::Normal => {
-            format!("[Scan /Filename={file_name} /scantime={acquire_time:.6} /Rescan=0]")
+            format!(
+                "[Scan /Filename={file_name} /scantime={acquire_time:.6} /Rescan=0]",
+                acquire_time = CFloat(acquire_time)
+            )
         }
         FrameType::Dark => {
-            format!("[Dark /AddTime={acquire_time:.6} /Repetitions={num_darks}]")
+            format!(
+                "[Dark /AddTime={acquire_time:.6} /Repetitions={num_darks}]",
+                acquire_time = CFloat(acquire_time)
+            )
         }
         FrameType::Raw => {
             format!(
-                "[Scan /Filename={file_name} /scantime={acquire_time:.6} /Rescan=0 /DarkFlood=0]"
+                "[Scan /Filename={file_name} /scantime={acquire_time:.6} /Rescan=0 /DarkFlood=0]",
+                acquire_time = CFloat(acquire_time)
             )
         }
         FrameType::DoubleCorrelation => {
-            format!("[Scan /Filename={file_name} /scantime={acquire_time:.6} /Rescan=1]")
+            format!(
+                "[Scan /Filename={file_name} /scantime={acquire_time:.6} /Rescan=1]",
+                acquire_time = CFloat(acquire_time)
+            )
         }
     }
 }
@@ -99,6 +111,14 @@ mod tests {
         assert_eq!(
             acquire(FrameType::Normal, "/data/test_001.sfrm", 2.5, 2),
             "[Scan /Filename=/data/test_001.sfrm /scantime=2.500000 /Rescan=0]"
+        );
+        assert_eq!(
+            acquire(FrameType::Dark, "", f64::NAN, 2),
+            "[Dark /AddTime=nan /Repetitions=2]"
+        );
+        assert_eq!(
+            acquire(FrameType::Dark, "", -f64::NAN, 2),
+            "[Dark /AddTime=-nan /Repetitions=2]"
         );
     }
 
