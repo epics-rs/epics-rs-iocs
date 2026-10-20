@@ -773,6 +773,28 @@ fn the_outgoing_value_takes_the_type_of_the_node() {
     );
 }
 
+/// DataElementOpen62541Leaf.h:1066/:1077 write a STRING or LOCALIZEDTEXT
+/// node from a double with `std::to_string`, which is `%f`.
+#[test]
+fn a_double_written_to_a_text_node_is_std_to_string() {
+    for (value, text) in [(1.5, "1.500000"), (1e-7, "0.000000"), (f64::NAN, "nan")] {
+        assert_eq!(
+            write_scalar(value, &Variant::String(UAString::null()), None),
+            Ok(Variant::String(UAString::from(text)))
+        );
+        assert_eq!(
+            write_scalar(
+                value,
+                &Variant::LocalizedText(Box::new(LocalizedText::new("de", "alt"))),
+                None
+            ),
+            Ok(Variant::LocalizedText(Box::new(LocalizedText::new(
+                "de", text
+            ))))
+        );
+    }
+}
+
 #[test]
 fn an_outgoing_value_that_does_not_fit_the_node_is_out_of_range() {
     assert!(matches!(
