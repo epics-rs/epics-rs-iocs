@@ -76,6 +76,31 @@ fn tag_path_two_indexed_levels() {
     assert_eq!(path_of("arr[2].sub[3]"), "91036172720028029103737562002803");
 }
 
+/// `EIP_parse_tag` reads the element with `atol` into a `size_t`: leading
+/// space and sign are taken, an overflow saturates, and a value past 32 bits
+/// still picks the 32-bit form, whose bytes and `[%u]` keep the low half.
+#[test]
+fn tag_path_element_is_atol_into_size_t() {
+    let cases = [
+        ("x[ 3]", 3, "910178002803", "x[3]"),
+        ("x[+7]", 3, "910178002807", "x[7]"),
+        ("x[0x10]", 3, "910178002800", "x[0]"),
+        ("x[-1]", 5, "910178002A00FFFFFFFF", "x[4294967295]"),
+        ("x[4294967296]", 5, "910178002A0000000000", "x[0]"),
+        (
+            "x[99999999999999999999]",
+            5,
+            "910178002A00FFFFFFFF",
+            "x[4294967295]",
+        ),
+    ];
+    for (s, words, path, shown) in cases {
+        assert_eq!(tag(s).path_words(), words, "{s}");
+        assert_eq!(path_of(s), path, "{s}");
+        assert_eq!(tag(s).to_string(), shown, "{s}");
+    }
+}
+
 #[test]
 fn tag_path_round_trips_through_display() {
     for t in ["FRED", "REALS[3]", "Struct.Member", "arr[2].sub[3]"] {
