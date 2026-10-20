@@ -110,6 +110,9 @@ async fn acquire(s: &Arc<Shared>) {
                 status = read_status(s).await;
             }
             Err(e) => {
+                // C re-reads it for a failed readout too, before the report
+                // (mythen.cpp:908-917).
+                status = read_status(s).await;
                 det.trace_error(&format!(
                     "mythen:acquisitionTask: error using readout command status={}, nRead=0, \
                      eomReason=0\n",
