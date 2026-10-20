@@ -504,14 +504,14 @@ impl MultiFunctionDriver {
             }
         }
 
-        if let Err(code) = wave_gen::start_wave_gen(
+        let dwell = match wave_gen::start_wave_gen(
             dev,
             wave_gen_state,
             &WaveGenScan {
                 first_chan,
                 last_chan,
                 num_points,
-                freq: 1.0 / (dwell * num_points as f64),
+                dwell,
                 range: uldaq_sys::BIP10VOLTS,
                 ext_trigger,
                 ext_clock,
@@ -522,15 +522,13 @@ impl MultiFunctionDriver {
             &saved,
             trace,
         ) {
-            return Ok(code);
-        }
+            Ok(dwell) => dwell,
+            Err(code) => return Ok(code),
+        };
         self.base
-            .set_float64_param(p.wave_gen_dwell_actual, 0, wave_gen_state.dwell_actual)?;
-        self.base.set_float64_param(
-            p.wave_gen_total_time,
-            0,
-            wave_gen_state.dwell_actual * num_points as f64,
-        )?;
+            .set_float64_param(p.wave_gen_dwell_actual, 0, dwell)?;
+        self.base
+            .set_float64_param(p.wave_gen_total_time, 0, dwell * num_points as f64)?;
         Ok(0)
     }
 

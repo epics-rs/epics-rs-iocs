@@ -19,7 +19,6 @@ pub struct WaveGenState {
     pub scan_buffer: Vec<f64>,
     /// Saved output values to restore after stop.
     pub saved_outputs: [f64; MAX_ANALOG_OUT],
-    pub dwell_actual: f64,
     /// C `waveGenUserBuffer_`: per channel, `max_points` volts; a
     /// WAVEGEN_USER_WF write overwrites its first elements and keeps the rest.
     pub user_waveforms: Vec<Vec<f32>>,
@@ -39,7 +38,6 @@ impl WaveGenState {
             current_point: 0,
             scan_buffer: Vec::new(),
             saved_outputs: [0.0; MAX_ANALOG_OUT],
-            dwell_actual: 0.001,
             user_waveforms: vec![vec![0.0; max_points]; MAX_ANALOG_OUT],
             int_waveforms: vec![vec![0.0; max_points]; MAX_ANALOG_OUT],
             max_points,
@@ -196,12 +194,19 @@ pub struct WaveGenScan {
     pub first_chan: i32,
     pub last_chan: i32,
     pub num_points: usize,
-    pub freq: f64,
+    pub dwell: f64,
     pub range: i32,
     pub ext_trigger: bool,
     pub ext_clock: bool,
     pub continuous: bool,
     pub retrigger: bool,
+}
+
+impl WaveGenScan {
+    /// C `rate = 1./dwell` (drvMultiFunction.cpp:1682).
+    pub fn rate(&self) -> f64 {
+        1.0 / self.dwell
+    }
 }
 
 /// Start the waveform generator (analog output scan). C `startWaveGen`
@@ -213,13 +218,13 @@ pub fn start_wave_gen(
     waveform_data: &[f64],
     saved_outputs: &[f64],
     trace: &SelfTrace,
-) -> Result<(), UlError> {
+) -> Result<f64, UlError> {
     const FUNCTION: &str = "startWaveGen";
     let WaveGenScan {
         first_chan,
         last_chan,
         num_points,
-        freq,
+        dwell: _,
         range,
         ext_trigger,
         ext_clock,
@@ -248,7 +253,7 @@ pub fn start_wave_gen(
         buf
     };
 
-    let mut rate = freq * num_points as f64;
+    let mut rate = scan.rate();
 
     let mut options = SO_DEFAULTIO;
     if ext_trigger {
@@ -281,17 +286,17 @@ pub fn start_wave_gen(
         return Err(status);
     }
 
-    state.dwell_actual = if rate > 0.0 { 1.0 / rate } else { 0.001 };
+    let dwell = 1.0 / rate;
     state.running = true;
     trace.print(
         TraceMask::FLOW,
         format_args!(
             "{DRIVER_NAME}:{FUNCTION}: called cbAOutScan, firstChan={first_chan}, lastChan={last_chan}, numPoints*numWaveGenChans_={}, dwell={:.6}, options=0x{options:x}\n",
             num_chans * num_points,
-            CFloat(state.dwell_actual)
+            CFloat(dwell)
         ),
     );
-    Ok(())
+    Ok(dwell)
 }
 
 /// The generator half of C `pollerThread`. `Err` is the failed
@@ -362,6 +367,22 @@ pub fn restore_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scan_rate_is_cs_reciprocal_dwell() {
+        let scan = WaveGenScan {
+            first_chan: 0,
+            last_chan: 0,
+            num_points: 10,
+            dwell: 1e-5,
+            range: BIP10VOLTS,
+            ext_trigger: false,
+            ext_clock: false,
+            continuous: false,
+            retrigger: false,
+        };
+        assert_eq!(scan.rate(), 1.0 / 1e-5);
+    }
 
     fn wave(wave_type: i32, num_points: usize) -> InternalWave {
         InternalWave {
