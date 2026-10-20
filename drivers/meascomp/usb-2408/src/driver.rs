@@ -1117,6 +1117,40 @@ impl PortDriver for MultiFunctionDriver {
         Ok(n)
     }
 
+    /// C `readFloat64Array`: at most WAVEDIG_NUM_POINTS of a digitizer
+    /// buffer.
+    fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
+        const FUNCTION: &str = "readFloat64Array";
+        let p = self.params;
+        let addr = device_addr(user.addr);
+        let error = |msg: std::fmt::Arguments<'_>| {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("{DRIVER_NAME}:{FUNCTION}: ERROR: {msg}\n"),
+            );
+            trace::asyn_status(-1).map(|()| 0)
+        };
+        let reason = user.reason;
+        let num_points = self.int(p.wave_dig_num_points, 0);
+        let st = self.state.lock().unwrap();
+        let data: &[f64] = if reason == p.wave_dig_volt_wf {
+            let max = self.board.num_analog_in;
+            match st.wave_dig.channel_buffers.get(addr as usize) {
+                Some(data) if addr < max => data,
+                _ => return error(format_args!("addr={addr} max={}", max - 1)),
+            }
+        } else if reason == p.wave_dig_abs_time_wf {
+            &st.wave_dig.abs_time_buffer
+        } else {
+            return error(format_args!("unknown function={reason}"));
+        };
+        let n = buf.len().min(num_points.max(0) as usize).min(data.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(n)
+    }
+
     /// Load a user-defined generator waveform (volts) for one channel.
     fn write_float32_array(&mut self, user: &AsynUser, data: &[f32]) -> AsynResult<()> {
         const FUNCTION: &str = "writeFloat32Array";
@@ -1384,6 +1418,33 @@ mod tests {
         assert!(drv.read_enum(&AsynUser::new(p.analog_in_mode)).is_err());
         // C's ctor writes the first output range's gain code.
         assert_eq!(drv.base.get_int32_param(p.analog_out_range, 1).unwrap(), 1);
+    }
+
+    /// C `readFloat64Array` (drvMultiFunction.cpp:2469-2503).
+    #[test]
+    fn read_float64_array_serves_the_digitizer_buffers() {
+        let mut drv = MultiFunctionDriver::new("MFRDF64", DaqDevice::unconnected(), 4, 4).unwrap();
+        let p = drv.params;
+        drv.board.num_analog_in = 8;
+        {
+            let mut st = drv.state.lock().unwrap();
+            st.wave_dig.channel_buffers[7] = vec![1.5, 2.5, 3.5, 4.5];
+            st.wave_dig.abs_time_buffer = vec![0.25, 0.5, 0.75, 1.0];
+        }
+        drv.base
+            .set_int32_param(p.wave_dig_num_points, 0, 3)
+            .unwrap();
+        let mut buf = [0f64; 4];
+        let volt = AsynUser::new(p.wave_dig_volt_wf).with_addr(7);
+        assert_eq!(drv.read_float64_array(&volt, &mut buf).unwrap(), 3);
+        assert_eq!(buf, [1.5, 2.5, 3.5, 0.0]);
+        let abs_time = AsynUser::new(p.wave_dig_abs_time_wf);
+        assert_eq!(drv.read_float64_array(&abs_time, &mut buf[..2]).unwrap(), 2);
+        assert_eq!(buf[..2], [0.25, 0.5]);
+        let past = AsynUser::new(p.wave_dig_volt_wf).with_addr(8);
+        assert!(drv.read_float64_array(&past, &mut buf).is_err());
+        let other = AsynUser::new(p.wave_gen_user_wf);
+        assert!(drv.read_float64_array(&other, &mut buf).is_err());
     }
 
     #[test]
