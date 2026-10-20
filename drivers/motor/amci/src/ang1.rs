@@ -230,10 +230,6 @@ impl AxisReport for Ang1AxisReport {
 pub struct Ang1Axis {
     controller: Arc<Mutex<Ang1Controller>>,
     force_read: ForceRead,
-    /// Last published status. C's poll reuses a single stale `read_val` on a
-    /// failed read and always publishes; this carries forward the last value
-    /// field-by-field for any read that fails in a cycle (see [`Self::poll`]).
-    last: MotorStatus,
 }
 
 impl Ang1Axis {
@@ -263,10 +259,6 @@ impl Ang1Axis {
         let mut ax = Self {
             controller,
             force_read,
-            last: MotorStatus {
-                gain_support: true,
-                ..MotorStatus::default()
-            },
         };
         let _ = ax.set_position(&AsynUser::new(0), 0.0);
         ax
@@ -434,59 +426,49 @@ impl AsynMotor for Ang1Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
-        // C presses on through every read and always publishes: each read's
-        // status is discarded (the base poller ignores poll()'s return) and
-        // callParamCallbacks fires unconditionally. Mirror that — attempt each
-        // read, carry forward the last published value for any field whose read
-        // fails this cycle, and always return Ok so the framework publishes.
-        // (C reuses a single stale `read_val` on failure; last-known is the
-        // defined, safe equivalent.)
-        let last = self.last.clone();
-
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        // C presses on through every read and the base poller ignores poll()'s
+        // return. A failed read sets C's params from a stale `read_val` (the
+        // previous register's value); here the field keeps what it holds. C
+        // defect, not copied.
         let ctrl = self.lock();
         let _ = self.force_read.write();
 
-        let position = ctrl.read32(POS_RD_UPR).map_or(last.position, |v| v as f64);
-
-        // Status word 1 bit 3 set to 1 when the motor is not in motion.
-        let done = ctrl.read16(STATUS_1).map_or(last.done, |v| v & 0x8 != 0);
-
-        let (high_limit, low_limit, powered) = match ctrl.read16(STATUS_2) {
-            Ok(status2) => (
-                status2 & 0x1 != 0,
-                status2 & 0x2 != 0,
-                status2 & 0x8000 != 0,
-            ),
-            Err(_) => (last.high_limit, last.low_limit, last.powered),
-        };
-
-        // A CW limit reached: reset the error and set position so the axis
-        // can move off the limit (errors discarded, matching C).
-        if high_limit {
-            let _ = self.do_set_closed_loop(&ctrl, true);
-            let _ = self.do_set_position(&ctrl, position);
+        if let Ok(v) = ctrl.read32(POS_RD_UPR) {
+            status.position = v as f64;
         }
 
-        // A CCW limit reached: same reset.
-        if low_limit {
+        // Status word 1 bit 3 set to 1 when the motor is not in motion.
+        if let Ok(v) = ctrl.read16(STATUS_1) {
+            status.done = v & 0x8 != 0;
+        }
+        status.moving = !status.done;
+
+        let status2 = ctrl.read16(STATUS_2);
+        if let Ok(v) = status2 {
+            status.high_limit = v & 0x1 != 0;
+        }
+        // A CW limit reached: reset the error and set position so the axis
+        // can move off the limit (errors discarded, matching C).
+        if status.high_limit {
             let _ = self.do_set_closed_loop(&ctrl, true);
-            let _ = self.do_set_position(&ctrl, position);
+            let _ = self.do_set_position(&ctrl, status.position);
+        }
+
+        if let Ok(v) = status2 {
+            status.low_limit = v & 0x2 != 0;
+        }
+        // A CCW limit reached: same reset.
+        if status.low_limit {
+            let _ = self.do_set_closed_loop(&ctrl, true);
+            let _ = self.do_set_position(&ctrl, status.position);
         }
         drop(ctrl);
 
-        let status = MotorStatus {
-            position,
-            done,
-            moving: !done,
-            high_limit,
-            low_limit,
-            powered,
-            gain_support: true,
-            ..MotorStatus::default()
-        };
-        self.last = status.clone();
-        *out = status;
+        status.gain_support = true;
+        if let Ok(v) = status2 {
+            status.powered = v & 0x8000 != 0;
+        }
         Ok(())
     }
 }
@@ -544,6 +526,32 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(ctrl.write16(CMD_MSW, 0).is_err());
         assert!(started.elapsed() >= Duration::from_millis(10));
+    }
+
+    /// The loop clears DONE when a move starts (asynMotorController.cpp:301);
+    /// a failed STATUS_1 read must not put back the done the last poll read.
+    #[test]
+    fn a_failed_status_1_read_keeps_the_done_a_move_cleared() {
+        use crate::regs::fake;
+        fake::publish("ang1KeepDoneIn");
+        fake::publish("ang1KeepDoneOut");
+        fake::set_read("ang1KeepDoneIn", STATUS_1, Some(0x8));
+        fake::set_read("ang1KeepDoneIn", STATUS_2, Some(0x8000));
+        let (ctrl, _) = Ang1Controller::new("ang1KeepDone", "ang1KeepDoneIn", "ang1KeepDoneOut");
+        let mut ax = Ang1Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::new(0);
+        let mut status = MotorStatus::default();
+        ax.poll(&user, &mut status).unwrap();
+        assert!(status.done);
+
+        status.done = false;
+        fake::set_read("ang1KeepDoneIn", STATUS_1, None);
+        ax.poll(&user, &mut status).unwrap();
+        assert!(!status.done);
+        assert!(status.moving);
+        assert!(status.powered);
+        assert!(status.gain_support);
+        assert_eq!(status.position, 2003.0);
     }
 
     #[test]
