@@ -116,23 +116,9 @@ pub fn split_user_param(user_param: &str) -> (&str, i32) {
     (command, supply)
 }
 
-/// C `atoi` / `sscanf("%d")`: an optional sign and the digits that follow,
-/// 0 when there are none.
-pub fn c_atoi(s: &[u8]) -> i32 {
-    let s = s.trim_ascii_start();
-    let (negative, digits) = match s.first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let value = digits
-        .iter()
-        .take_while(|b| b.is_ascii_digit())
-        .fold(0i64, |v, b| {
-            (v * 10 + i64::from(b - b'0')).min(i64::from(u32::MAX))
-        });
-    (if negative { -value } else { value }) as i32
-}
+/// C `atoi`, and `sscanf("%d")` where it converts: glibc reads both as
+/// `(int) strtol`. 0 when there are no digits.
+pub use epics_rs::base::types::c_parse::atoi as c_atoi;
 
 /// C `strtod(s, NULL)`.
 pub fn c_strtod(s: &[u8]) -> f64 {
@@ -200,5 +186,8 @@ mod tests {
         assert_eq!(c_strtod(b"junk"), 0.0);
         assert_eq!(c_atoi(b"1"), 1);
         assert_eq!(c_atoi(b"x"), 0);
+        // glibc: (int) strtol, the same for sscanf("%d").
+        assert_eq!(c_atoi(b"4294967297"), 1);
+        assert_eq!(c_atoi(b"99999999999999999999"), -1);
     }
 }
