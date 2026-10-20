@@ -745,6 +745,10 @@ impl PortDriver for MultiFunctionDriver {
             board_enums::OUTPUT_RANGE
         } else if reason == p.analog_in_type {
             board_enums::INPUT_TYPE
+        } else if reason == p.temperature_sensor {
+            board_enums::TEMPERATURE_SENSOR
+        } else if reason == p.temperature_wiring {
+            board_enums::TEMPERATURE_WIRING
         } else {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
@@ -912,6 +916,24 @@ impl PortDriver for MultiFunctionDriver {
         } else if reason == self.params.thermocouple_open_detect && self.is_thermocouple(addr) {
             let dev = self.device.lock().unwrap();
             self.set_open_tc_detect(&dev, addr, value);
+        } else if reason == self.params.temperature_sensor {
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TYPE, addr as u32, value as i64),
+                FUNCTION,
+                "Setting temperature sensor",
+            );
+        } else if reason == self.params.temperature_wiring {
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ai_set_config(
+                    uldaq_sys::AI_CFG_CHAN_SENSOR_CONNECTION_TYPE,
+                    addr as u32,
+                    value as i64,
+                ),
+                FUNCTION,
+                "Setting temperature wiring",
+            );
         } else if reason == self.params.pulse_gen_run {
             // C starts on any 1, running or not: a counted train ends unseen.
             let device = self.device.clone();
@@ -1340,9 +1362,39 @@ mod tests {
             menu(p.analog_in_type),
             [("Volts".to_owned(), 1), ("TC deg.".to_owned(), 2)]
         );
+        let sensor: Vec<_> = [
+            ("RTD", 4),
+            ("Thermistor", 8),
+            ("Thermocouple", 2),
+            ("Semiconductor", 16),
+            ("Disabled", 1 << 30),
+        ]
+        .map(|(s, v)| (s.to_owned(), v))
+        .into();
+        assert_eq!(menu(p.temperature_sensor), sensor);
+        let wiring: Vec<_> = [
+            ("2 wire 1 sensor", 1),
+            ("2 wire 2 sensors", 2),
+            ("3 wire", 3),
+            ("4 wire", 4),
+        ]
+        .map(|(s, v)| (s.to_owned(), v))
+        .into();
+        assert_eq!(menu(p.temperature_wiring), wiring);
         assert!(drv.read_enum(&AsynUser::new(p.analog_in_mode)).is_err());
         // C's ctor writes the first output range's gain code.
         assert_eq!(drv.base.get_int32_param(p.analog_out_range, 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn temperature_sensor_and_wiring_are_written_to_the_device() {
+        let mut drv = MultiFunctionDriver::new("MFTEMP", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        // Only a write that reaches ulAISetConfig fails on the null handle.
+        for reason in [p.temperature_sensor, p.temperature_wiring] {
+            let mut user = AsynUser::new(reason).with_addr(1);
+            assert!(drv.write_int32(&mut user, 2).is_err());
+        }
     }
 
     #[test]
