@@ -50,8 +50,10 @@ use async_opcua::types::Variant;
 use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
+use epics_rs::base::server::database::AsyncDbHandle;
 use epics_rs::base::server::device_support::{
-    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, IoIntrAction,
+    PropertyPost,
 };
 use epics_rs::base::server::recgbl::alarm_status::{COMM_ALARM, READ_ALARM, WRITE_ALARM};
 use epics_rs::base::server::record::{ProcessContext, Record, ScanType};
@@ -210,11 +212,9 @@ pub struct OpcuaDevice {
     bound: Option<Binding>,
     /// Pulses the record when an update is queued for it.
     notify: Option<mpsc::Receiver<()>>,
-    /// Out-of-band PROPERTY posts — the state table the server's enumeration
-    /// defines (`db_post_events(prec, &prec->val, DBE_PROPERTY)`,
-    /// `devOpcua.cpp:732`).
-    property_tx: Option<mpsc::Sender<PropertyPost>>,
-    property_rx: Option<mpsc::Receiver<PropertyPost>>,
+    /// The database the record is in, for the PROPERTY post its state
+    /// table makes from inside a pass (`devOpcua.cpp:732`).
+    db: Option<AsyncDbHandle>,
     info: HashMap<String, String>,
     enums: EnumState,
     /// The record's UDF at the start of this cycle — the ai smoothing needs it
@@ -239,8 +239,7 @@ impl OpcuaDevice {
             is_output: false,
             bound: None,
             notify: None,
-            property_tx: None,
-            property_rx: None,
+            db: None,
             info: HashMap::new(),
             enums: EnumState::default(),
             udf: true,
@@ -685,9 +684,7 @@ impl OpcuaDevice {
     /// record whose database definition left the table empty.
     ///
     /// The C posts the new table with `db_post_events(..., DBE_PROPERTY)` from
-    /// inside `process`. Here the fields are written inline — the record's own
-    /// RVAL -> VAL conversion runs on this same pass and needs them — and the
-    /// framework does the PROPERTY post, off the channel the device hands it.
+    /// inside `process`, ahead of the record's own posts.
     fn update_enum_infos(
         &mut self,
         choices: Option<&EnumChoices>,
@@ -731,14 +728,15 @@ impl OpcuaDevice {
         record.state_table_written();
         self.enums.from_server = true;
         self.enums.values_defined = true;
-        if let Some(tx) = &self.property_tx {
-            // The state fields are already stored in place above, as the C++
-            // writes them in its callback; what remains is the single
-            // `db_post_events(prec, &prec->val, DBE_PROPERTY)`
-            // (`devOpcua.cpp:717-732`).
-            let _ = tx.try_send(PropertyPost {
-                writes: Vec::new(),
-                post_field: "VAL".to_string(),
+        // This pass holds the record, so the post is owed to the hold and
+        // runs as this dset call returns, before the record body.
+        if let Some(db) = &self.db {
+            db.run_io_intr_callback_with(&self.record_name, |held| {
+                let _ = held.put_property(PropertyPost {
+                    writes: Vec::new(),
+                    post_field: "VAL".to_string(),
+                });
+                IoIntrAction::Skip
             });
         }
         Ok(())
@@ -867,9 +865,6 @@ impl OpcuaDevice {
         init_mask(record).map_err(|e| CaError::LinkError(format!("{}: {e}", self.record_name)))?;
 
         if self.op == Op::Enum {
-            let (tx, rx) = mpsc::channel(4);
-            self.property_tx = Some(tx);
-            self.property_rx = Some(rx);
             let values_defined = ENUM_VALUE_FIELDS
                 .iter()
                 .any(|f| ulong(record, f).is_ok_and(|v| v != 0));
@@ -926,12 +921,12 @@ impl DeviceSupport for OpcuaDevice {
         self.udf = ctx.udf != 0;
     }
 
-    fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
-        self.notify.take()
+    fn bind_database(&mut self, db: AsyncDbHandle) {
+        self.db = Some(db);
     }
 
-    fn property_post_receiver(&mut self) -> Option<mpsc::Receiver<PropertyPost>> {
-        self.property_rx.take()
+    fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
+        self.notify.take()
     }
 
     /// Every update reaches its record whatever the record's SCAN — the C
