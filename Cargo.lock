@@ -2875,6 +2875,7 @@ dependencies = [
 name = "motor-pijena"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
