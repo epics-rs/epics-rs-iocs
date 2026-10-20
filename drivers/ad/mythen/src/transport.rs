@@ -55,13 +55,13 @@ impl Transport {
         timeout: Duration,
     ) -> AsynResult<Vec<u8>> {
         let io = SyncIOHandle::from_handle(self.handle.clone(), ADDR, timeout);
-        io.write_octet(0, command)?;
-
         let deadline = Instant::now() + timeout;
         let mut reply = Vec::with_capacity(expect);
-        while reply.len() < expect {
-            let remaining = expect - reply.len();
-            match io.read_octet(0, remaining).into_parts() {
+        // C's writeRead flushes, writes and reads once; the later reads gather
+        // the rest of a split reply.
+        let mut read = io.write_read(0, command, expect);
+        loop {
+            match read.into_parts() {
                 (bytes, Ok(())) if bytes.is_empty() => break,
                 (bytes, Ok(())) => reply.extend_from_slice(&bytes),
                 // A timeout with something already in hand is a short reply,
@@ -76,9 +76,10 @@ impl Transport {
                 }
                 (_, Err(e)) => return Err(e),
             }
-            if Instant::now() >= deadline {
+            if reply.len() >= expect || Instant::now() >= deadline {
                 break;
             }
+            read = io.read_octet(0, expect - reply.len());
         }
         Ok(reply)
     }
@@ -197,5 +198,57 @@ mod tests {
             .write_read(b"-get version", 7, Duration::from_millis(100))
             .unwrap();
         assert_eq!(reply, b"abc");
+    }
+
+    /// An octet port logging each flush, write and read; reads answer `1234`.
+    struct Logged(PortDriverBase, Arc<parking_lot::Mutex<Vec<&'static str>>>);
+
+    impl PortDriver for Logged {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+            self.1.lock().push("flush");
+            Ok(())
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.1.lock().push("write");
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            self.1.lock().push("read");
+            let n = buf.len().min(4);
+            buf[..n].copy_from_slice(&b"1234"[..n]);
+            OctetReadResult::ok(n, EomReason::empty())
+        }
+    }
+
+    /// `writeReadMeter` is `pasynOctetSyncIO->writeRead` (mythen.cpp:248-259),
+    /// which flushes the stale input before writing (asynOctetSyncIO.c:250).
+    #[test]
+    fn a_command_flushes_before_it_writes() {
+        let name = "MYTHEN_FLUSH";
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (runtime, _actor) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Logged(
+                PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::UNMIGRATED_ALL,
+                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                ),
+                log.clone(),
+            ),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let transport = Transport::new(runtime.port_handle().clone());
+        assert_eq!(transport.send_command("-start").unwrap(), 0x3433_3231);
+        assert_eq!(*log.lock(), ["flush", "write", "read"]);
     }
 }
