@@ -2,10 +2,11 @@
 
 use async_opcua::types::{CreateSubscriptionRequest, RequestHeader};
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::types::c_parse::strtoul_auto;
 
 use crate::defaults;
 use crate::item::stream_double;
-use crate::session::{SessionHandle, strtoul};
+use crate::session::SessionHandle;
 
 /// `opcuaSubscription(NAME, SESSION, INTERVAL, [options])`
 /// (`iocshIntegration.cpp:159-201`).
@@ -99,8 +100,8 @@ impl SubscriptionConfig {
             );
         }
         match name {
-            "debug" => self.debug = strtoul(value) as u32,
-            "priority" => match u8::try_from(strtoul(value)) {
+            "debug" => self.debug = strtoul_auto(value) as u32,
+            "priority" => match u8::try_from(strtoul_auto(value)) {
                 Ok(priority) => self.priority = priority,
                 Err(_) => errlog_vprintf(format_args!(
                     "option '{name}' value out of range - ignored\n"

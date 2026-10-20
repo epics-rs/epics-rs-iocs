@@ -416,7 +416,7 @@ impl AsynMotor for DrvMDriveAxis {
         }
         ctrl.comm = CommState::Normal;
         let position = ask(&ctrl, "PR P");
-        let input = |n: u8| atoi(&ask(&ctrl, &format!("PR I{n}"))) as u8 != 0;
+        let input = |n: u8| atoi(ask(&ctrl, &format!("PR I{n}"))) as u8 != 0;
         let limits = (self.inputs.plus != 0 && self.inputs.minus != 0)
             .then(|| (input(self.inputs.plus), input(self.inputs.minus)));
         let home = self.inputs.home != 0 && input(self.inputs.home);

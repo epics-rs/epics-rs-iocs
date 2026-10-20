@@ -11,6 +11,7 @@
 //! after each reply. The strings below therefore carry no terminator.
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use crate::types::{GAIN_STRINGS, TriggerMode};
 
@@ -29,22 +30,12 @@ pub(crate) fn expect_lit<'a>(s: &'a str, lit: &str) -> Option<&'a str> {
     s.strip_prefix(lit)
 }
 
-/// `%d`: skip leading whitespace, then read an optionally-signed decimal.
+/// `%d`, which glibc stores as `(int) strtol(s, &end, 10)`.
 pub(crate) fn scan_i32(s: &str) -> Option<(i32, &str)> {
-    let s = skip_ws(s);
-    let bytes = s.as_bytes();
-    let mut end = 0;
-    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-        end += 1;
+    match strtol(s, 10) {
+        (_, 0) => None,
+        (v, end) => Some((long_to_int(v), &s[end..])),
     }
-    let digits_start = end;
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end == digits_start {
-        return None;
-    }
-    s[..end].parse::<i32>().ok().map(|v| (v, &s[end..]))
 }
 
 /// `%f`: skip leading whitespace, then read the longest prefix `strtod` would
@@ -656,6 +647,23 @@ mod tests {
         assert_eq!(scan_f32("31.4eC").unwrap().0, 31.4);
         assert_eq!(scan_f32("22.1%").unwrap().1, "%");
         assert!(scan_f32("abc").is_none());
+    }
+
+    /// glibc's `%d` stores `(int) strtol(s, &end, 10)`.
+    #[test]
+    fn an_out_of_range_int_is_glibc_s_cut_to_int() {
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        assert_eq!(
+            parse_energy_setting("15 OK Energy setting: 4294967297 eV"),
+            wrapped
+        );
+        assert_eq!(
+            parse_version("Code release: 99999999999999999999.1.2")
+                .unwrap()
+                .major,
+            Some(long_to_int(c_long::MAX))
+        );
     }
 
     #[test]

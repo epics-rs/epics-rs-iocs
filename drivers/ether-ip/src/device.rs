@@ -199,7 +199,7 @@ pub fn analyze_link<P>(
             _ => return Err(malformed()),
         };
         let (v, n) = epics_rs::base::types::c_parse::strtol(&tag_text[open + 1..], 0);
-        if n == 0 || v == i64::MAX || v == i64::MIN {
+        if n == 0 || v == std::ffi::c_long::MAX || v == std::ffi::c_long::MIN {
             return Err(malformed());
         }
         // A negative index wraps as C's size_t does.

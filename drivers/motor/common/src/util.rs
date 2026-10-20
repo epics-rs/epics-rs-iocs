@@ -6,8 +6,6 @@
 //! "parse the leading numeric prefix, `0` on junk" behaviour of `atof`/`atoi`,
 //! which controller reply parsing relies on.
 
-use std::os::raw::c_long;
-
 /// Mimic C `atof`: parse the leading numeric prefix as `f64`, returning `0.0`
 /// on junk (as C `atof` does).
 pub fn atof(s: &str) -> f64 {
@@ -44,61 +42,9 @@ pub fn atof(s: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// C `strtol(s, &end, radix)` on this platform's `long`, pre-C23 (no `0b`):
-/// `isspace` blanks, a sign and, in base 0 or 16, a `0x` are read, and base
-/// 0 takes a leading `0` as octal. An overflow saturates at `LONG_MIN` /
-/// `LONG_MAX`. The value and the offset `end` stopped at, `0` when no digit
-/// was converted.
-pub fn strtol(s: &[u8], radix: u32) -> (c_long, usize) {
-    let mut at = s
-        .iter()
-        .take_while(|&&c| matches!(c, b' ' | b'\t'..=b'\r'))
-        .count();
-    let negative = s.get(at) == Some(&b'-');
-    if matches!(s.get(at), Some(b'+' | b'-')) {
-        at += 1;
-    }
-    let hex = s.get(at) == Some(&b'0')
-        && matches!(s.get(at + 1), Some(b'x' | b'X'))
-        && s.get(at + 2).is_some_and(u8::is_ascii_hexdigit);
-    let radix = match radix {
-        0 | 16 if hex => {
-            at += 2;
-            16
-        }
-        0 if s.get(at) == Some(&b'0') => 8,
-        0 => 10,
-        radix => radix,
-    };
-    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
-    let (value, digits) = s[at..]
-        .iter()
-        .map_while(|&c| char::from(c).to_digit(radix))
-        .fold((0 as c_long, 0), |(v, n), d| {
-            let v = v.saturating_mul(radix as c_long);
-            let v = if negative {
-                v.saturating_sub(d as c_long)
-            } else {
-                v.saturating_add(d as c_long)
-            };
-            (v, n + 1)
-        });
-    if digits == 0 {
-        return (0, 0);
-    }
-    (value, at + digits)
-}
-
-/// C `atoi`, `(int) strtol(s, NULL, 10)`: an out-of-`int` value wraps, after
-/// an overflow saturates.
-pub fn atoi(s: &str) -> i32 {
-    strtol(s.as_bytes(), 10).0 as i32
-}
-
-/// C `atol`, `strtol(s, NULL, 10)`.
-pub fn atol(s: &str) -> c_long {
-    strtol(s.as_bytes(), 10).0
-}
+/// C `strtol`, `atoi` (`(int) strtol(s, NULL, 10)`) and `atol` at this
+/// platform's `long`, as glibc reads them under `_GNU_SOURCE`.
+pub use epics_rs::base::types::c_parse::{atoi, atol, long_to_int, strtol};
 
 /// Parse leading hex digits as `u32` (C `sscanf` `%x`); `None` if there is no
 /// hex digit (C `sscanf` count `!= 1`).
@@ -138,6 +84,8 @@ pub fn max_digits(step_size: f64) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_long;
+
     use super::*;
 
     #[test]
@@ -158,7 +106,8 @@ mod tests {
 
     #[test]
     fn atol_parses_wide_integers() {
-        assert_eq!(atol("10000000000x"), 10_000_000_000);
+        let wide = c_long::try_from(10_000_000_000_i128).unwrap_or(c_long::MAX);
+        assert_eq!(atol("10000000000x"), wide);
         assert_eq!(atol("-2"), -2);
         assert_eq!(atol("junk"), 0);
     }
@@ -173,8 +122,8 @@ mod tests {
             i32::MAX
         };
         assert_eq!(atoi("3000000000"), wrapped);
-        assert_eq!(atoi("99999999999999999999"), c_long::MAX as i32);
-        assert_eq!(atoi("-99999999999999999999"), c_long::MIN as i32);
+        assert_eq!(atoi("99999999999999999999"), long_to_int(c_long::MAX));
+        assert_eq!(atoi("-99999999999999999999"), long_to_int(c_long::MIN));
         assert_eq!(atoi("\x0b\x0c 12"), 12);
     }
 
@@ -192,7 +141,8 @@ mod tests {
         assert_eq!(strtol(b"017", 0), (15, 3));
         assert_eq!(strtol(b"09", 0), (0, 1));
         assert_eq!(strtol(b" -0xg", 16), (0, 3));
-        assert_eq!(strtol(b"0b101", 0), (0, 1));
+        // g++ defines `_GNU_SOURCE`, so glibc 2.39 reads the C23 `0b` prefix.
+        assert_eq!(strtol(b"0b101", 0), (5, 5));
         assert_eq!(strtol(b"  +", 10), (0, 0));
         assert_eq!(strtol(b"", 10), (0, 0));
         let min = c_long::MIN.to_string();

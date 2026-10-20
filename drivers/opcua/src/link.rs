@@ -18,6 +18,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::c_parse::{
+    NumericField, epics_parse_uint16, parse_auto_base_units_null,
+};
+
 use crate::defaults;
 
 /// Default element-path delimiter (`linkParser.h:24`).
@@ -531,37 +536,17 @@ fn first_char(value: &str, name: &str) -> Result<char, LinkError> {
         .ok_or_else(|| LinkError(format!("no value for option '{name}'")))
 }
 
-/// `epicsParseUInt32`/`epicsParseUInt16` accept a `0x`/`0` base prefix (base 0).
-fn parse_int_base0(value: &str) -> Option<u64> {
-    let (negative, digits) = match value.strip_prefix('-') {
-        Some(rest) => (true, rest.trim()),
-        None => (false, value.strip_prefix('+').unwrap_or(value).trim()),
-    };
-    if negative {
-        return None;
-    }
-    let parsed = if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()?
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        u64::from_str_radix(&digits[1..], 8).ok()?
-    } else {
-        digits.parse().ok()?
-    };
-    Some(parsed)
-}
-
+/// `epicsParseUInt32(value, &v, 0, NULL)`.
 fn parse_u32(value: &str) -> Result<u32, LinkError> {
-    parse_int_base0(value)
-        .and_then(|v| u32::try_from(v).ok())
-        .ok_or_else(|| LinkError(format!("error converting '{value}' to UInt32")))
+    match parse_auto_base_units_null(NumericField::ULong, value) {
+        Some(EpicsValue::ULong(v)) => Ok(v),
+        _ => Err(LinkError(format!("error converting '{value}' to UInt32"))),
+    }
 }
 
+/// `epicsParseUInt16(value, &v, 0, NULL)`.
 fn parse_u16(value: &str) -> Result<u16, LinkError> {
-    parse_int_base0(value)
-        .and_then(|v| u16::try_from(v).ok())
+    epics_parse_uint16(value)
         .ok_or_else(|| LinkError(format!("error converting '{value}' to UInt16")))
 }
 

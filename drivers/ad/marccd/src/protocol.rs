@@ -10,6 +10,7 @@
 //! terminator.
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 // ---------------------------------------------------------------------------
 // scanf-style primitives
@@ -26,22 +27,12 @@ fn expect_lit<'a>(s: &'a str, lit: &str) -> Option<&'a str> {
     s.strip_prefix(lit)
 }
 
-/// `%d`: skip leading whitespace, then read an optionally-signed decimal.
+/// `%d`, which glibc stores as `(int) strtol(s, &end, 10)`.
 fn scan_i32(s: &str) -> Option<(i32, &str)> {
-    let s = skip_ws(s);
-    let bytes = s.as_bytes();
-    let mut end = 0;
-    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-        end += 1;
+    match strtol(s, 10) {
+        (_, 0) => None,
+        (v, end) => Some((long_to_int(v), &s[end..])),
     }
-    let digits_start = end;
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end == digits_start {
-        return None;
-    }
-    s[..end].parse::<i32>().ok().map(|v| (v, &s[end..]))
 }
 
 /// `%lf`: skip leading whitespace, then read the longest prefix `strtod` would
@@ -216,44 +207,9 @@ pub fn cmd_start_series_timed(
 // Reply parsing
 // ---------------------------------------------------------------------------
 
-/// C `getState`: `strtol(fromServer, NULL, 0)`. Base 0 auto-detects a `0x`/`0X`
-/// hex prefix, a leading-`0` octal prefix, or decimal; skips leading whitespace
-/// and an optional sign; stops at the first character not valid for the radix.
-/// Returns `0` when no digits convert, matching `strtol`.
+/// C `getState`: `marState = strtol(fromServer, NULL, 0)` into an `int`.
 pub fn parse_state(reply: &str) -> i32 {
-    let s = skip_ws(reply);
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut negative = false;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        negative = bytes[i] == b'-';
-        i += 1;
-    }
-
-    let (radix, digits_start) = if i < bytes.len()
-        && bytes[i] == b'0'
-        && i + 1 < bytes.len()
-        && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
-    {
-        (16u32, i + 2)
-    } else if i < bytes.len() && bytes[i] == b'0' {
-        // Octal. The leading '0' is itself a valid octal digit, so the run
-        // starts at the '0'.
-        (8u32, i)
-    } else {
-        (10u32, i)
-    };
-
-    let mut end = digits_start;
-    while end < bytes.len() && (bytes[end] as char).is_digit(radix) {
-        end += 1;
-    }
-    if end == digits_start {
-        return 0;
-    }
-    let magnitude = i64::from_str_radix(&s[digits_start..end], radix).unwrap_or(0);
-    let signed = if negative { -magnitude } else { magnitude };
-    signed as i32
+    long_to_int(strtol(reply, 0).0)
 }
 
 /// C `sscanf(fromServer, "%d", &value)`. `None` when no integer converts (C
@@ -399,6 +355,28 @@ mod tests {
         assert_eq!(parse_state("0x1fZ"), 0x1f);
         // '8' and '9' are not octal digits: "089" stops after "0".
         assert_eq!(parse_state("089"), 0);
+    }
+
+    /// glibc's base-0 `strtol` reads C23 `0b` under `_GNU_SOURCE`, and the
+    /// `int marState` keeps the saturated `long`'s low bits.
+    #[test]
+    fn state_is_glibc_strtol_cut_to_int() {
+        assert_eq!(parse_state("0b11"), 3);
+        assert_eq!(
+            parse_state("99999999999999999999"),
+            long_to_int(std::ffi::c_long::MAX)
+        );
+    }
+
+    /// glibc's `%d` stores `(int) strtol(s, &end, 10)`.
+    #[test]
+    fn int_out_of_range_is_glibc_s_cut_to_int() {
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        let saturated = long_to_int(c_long::MAX);
+        assert_eq!(parse_int("4294967297"), Some(wrapped));
+        assert_eq!(parse_int("99999999999999999999"), Some(saturated));
+        assert_eq!(parse_pair("99999999999999999999,2"), Some((saturated, 2)));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use async_opcua::types::{
     Array, ByteString, LocalizedText, QualifiedName, UAString, Variant, VariantScalarTypeId,
     VariantTypeId, XmlElement,
 };
+use epics_rs::base::types::c_parse::{atoi, strtol_errno, strtoll_errno, strtoul_errno};
 
 use crate::print::ua_print;
 
@@ -197,7 +198,7 @@ macro_rules! impl_int_target {
             }
 
             fn from_text(s: &str) -> Option<Self> {
-                parse_int_base0(s).and_then(|v| <$t>::try_from(v).ok())
+                stoll(s).and_then(|v| <$t>::try_from(v).ok())
             }
 
             fn to_number(self) -> Number {
@@ -241,39 +242,14 @@ impl ScalarTarget for f64 {
     }
 }
 
-/// `strtol(s, nullptr, 0)` — decimal, `0x` hex, leading-`0` octal, signed.
-fn parse_int_base0(s: &str) -> Option<i128> {
-    let s = s.trim();
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let magnitude = if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        i128::from_str_radix(hex, 16).ok()?
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        i128::from_str_radix(&digits[1..], 8).ok()?
-    } else {
-        digits.parse().ok()?
-    };
-    Some(if negative { -magnitude } else { magnitude })
-}
-
-/// `atoi`: glibc's `(int) strtol(s, NULL, 10)`.
-fn atoi(s: &str) -> i32 {
-    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let mut n: i128 = 0;
-    for b in digits.bytes().take_while(u8::is_ascii_digit) {
-        n = (n * 10 + i128::from(b - b'0')).min(1 << 64);
+/// `std::stoll(s, 0, 0)`, which throws on no conversion and on `ERANGE`. The
+/// `epicsInt32` overload's `std::stol` reads the same here, since its
+/// silently truncated `long` is range-checked instead.
+fn stoll(s: &str) -> Option<i128> {
+    match strtoll_errno(s, 0) {
+        Some((v, end)) if end != 0 => Some(i128::from(v)),
+        _ => None,
     }
-    let n = if negative { -n } else { n };
-    n.clamp(i64::MIN.into(), i64::MAX.into()) as i64 as i32
 }
 
 /// The namespace of a "namespace|name" value: its `atoi`, kept to the 16 bits
@@ -711,6 +687,16 @@ pub fn write_string(value: &str, incoming: &Variant, choices: Option<&EnumChoice
     let out_of_range = || WriteError::OutOfRange {
         text: Some(value.to_string()),
     };
+    // `strtol`/`strtoul(value, &end, 0)` and `end != value`; C ignores errno,
+    // so an overflow writes the saturated `LONG_MAX`, which is refused here.
+    let long = || match strtol_errno(value, 0) {
+        Some((v, end)) if end != 0 => Ok(i128::from(v)),
+        _ => Err(out_of_range()),
+    };
+    let ulong = || match strtoul_errno(value, 0) {
+        Some((v, end)) if end != 0 => Ok(i128::from(v)),
+        _ => Err(out_of_range()),
+    };
 
     if let Some(choices) = choices {
         // Choice names are tried before numbers, so a choice whose name looks
@@ -720,7 +706,7 @@ pub fn write_string(value: &str, incoming: &Variant, choices: Option<&EnumChoice
                 i32::try_from(*v).map_err(|_| out_of_range())?,
             ));
         }
-        let n = parse_int_base0(value).ok_or_else(out_of_range)?;
+        let n = long()?;
         let v = u32::try_from(n).ok().filter(|v| choices.contains_key(v));
         return match v {
             Some(v) => Ok(Variant::Int32(
@@ -730,7 +716,6 @@ pub fn write_string(value: &str, incoming: &Variant, choices: Option<&EnumChoice
         };
     }
 
-    let int = || parse_int_base0(value).ok_or_else(out_of_range);
     let float = || value.trim().parse::<f64>().map_err(|_| out_of_range());
 
     Ok(match incoming {
@@ -763,14 +748,14 @@ pub fn write_string(value: &str, incoming: &Variant, choices: Option<&EnumChoice
             hex_decode(value).ok_or_else(out_of_range)?,
         )),
         Variant::Boolean(_) => Variant::Boolean(value.starts_with(['Y', 'y', 'T', 't', '1'])),
-        Variant::SByte(_) => Variant::SByte(i8::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::Byte(_) => Variant::Byte(u8::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::Int16(_) => Variant::Int16(i16::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::UInt16(_) => Variant::UInt16(u16::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::Int32(_) => Variant::Int32(i32::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::UInt32(_) => Variant::UInt32(u32::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::Int64(_) => Variant::Int64(i64::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::UInt64(_) => Variant::UInt64(u64::try_from(int()?).map_err(|_| out_of_range())?),
+        Variant::SByte(_) => Variant::SByte(i8::try_from(long()?).map_err(|_| out_of_range())?),
+        Variant::Byte(_) => Variant::Byte(u8::try_from(ulong()?).map_err(|_| out_of_range())?),
+        Variant::Int16(_) => Variant::Int16(i16::try_from(long()?).map_err(|_| out_of_range())?),
+        Variant::UInt16(_) => Variant::UInt16(u16::try_from(ulong()?).map_err(|_| out_of_range())?),
+        Variant::Int32(_) => Variant::Int32(i32::try_from(long()?).map_err(|_| out_of_range())?),
+        Variant::UInt32(_) => Variant::UInt32(u32::try_from(ulong()?).map_err(|_| out_of_range())?),
+        Variant::Int64(_) => Variant::Int64(i64::try_from(long()?).map_err(|_| out_of_range())?),
+        Variant::UInt64(_) => Variant::UInt64(u64::try_from(ulong()?).map_err(|_| out_of_range())?),
         Variant::Float(_) => {
             Variant::Float(f32_from_number(Number::Float(float()?)).ok_or_else(out_of_range)?)
         }

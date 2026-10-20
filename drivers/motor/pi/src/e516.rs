@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(scan_int("-3xyz"), Some(-3));
         assert_eq!(scan_int(""), None);
         assert_eq!(scan_int("abc"), None);
-        let overflow = std::os::raw::c_long::MAX as i32;
+        let overflow = motor_common::util::long_to_int(std::os::raw::c_long::MAX);
         assert_eq!(scan_int("99999999999999999999"), Some(overflow));
     }
 

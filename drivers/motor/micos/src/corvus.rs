@@ -177,7 +177,7 @@ impl CorvusAxis {
             // C ignores each exchange's status and parses what it got.
             let read = |verb: &str| ctrl.exchange(&format!("{} {verb}", axis_no + 1)).0;
             let pitch = atof(&read("getpitch"));
-            let pole_pairs = atoi(&read("getpolepairs"));
+            let pole_pairs = atoi(read("getpolepairs"));
             let cl_period = atof(&read("getclperiod"));
             let state = SmcState {
                 axis_res: pitch / (4.0 * f64::from(pole_pairs)),

@@ -9,6 +9,7 @@ use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::database::db_access::DbMultiMonitor;
 use epics_rs::base::server::snl::{PutQueue, SeqMacros, SeqPv};
 use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::c_parse::atoi;
 
 /// `MAX_COUNTERS` (`USBCTR_SNL.st:22`).
 const MAX_COUNTERS: i32 = 9;
@@ -20,23 +21,6 @@ const PROGRAM_MACROS: &str = "P=USBCTR:MCS:, R=mca, NUM_COUNTERS=8,  FIELD=READ"
 /// (seq_main.c:93-96).
 pub fn seq_macros(macro_def: &str) -> SeqMacros {
     SeqMacros::new(PROGRAM_MACROS, macro_def)
-}
-
-/// glibc `atoi`: `(int) strtol(s, NULL, 10)`, so an out-of-range value
-/// saturates to a `long` before it is truncated to an `int`.
-fn atoi(s: &str) -> i32 {
-    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let (negative, digits) = match s.as_bytes().first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let mut v: i128 = 0;
-    for b in digits.bytes().take_while(u8::is_ascii_digit) {
-        v = (v * 10 + i128::from(b - b'0')).min(1 << 64);
-    }
-    let v = if negative { -v } else { v };
-    v.clamp(i64::MIN.into(), i64::MAX.into()) as i64 as i32
 }
 
 /// The macros `init` reads (`USBCTR_SNL.st:52-55`).
@@ -56,7 +40,7 @@ impl UsbCtrSnlConfig {
         Self {
             prefix: get("P"),
             record: get("R"),
-            num_counters: atoi(&get("NUM_COUNTERS")),
+            num_counters: atoi(get("NUM_COUNTERS")),
             field: get("FIELD"),
         }
     }
@@ -263,11 +247,13 @@ mod tests {
     fn num_counters_is_glibc_atoi() {
         assert_eq!(atoi(" +3x"), 3);
         assert_eq!(atoi("-2"), -2);
-        // strtol saturates at LONG_MIN, whose low 32 bits are 0.
-        assert_eq!(atoi("-99999999999999999999"), 0);
-        assert_eq!(atoi("99999999999999999999"), -1);
-        // 2^32 + 3 fits in a long and truncates to 3.
-        assert_eq!(atoi("4294967299"), 3);
+        use std::ffi::c_long;
+        // strtol saturates at LONG_MIN/LONG_MAX, then truncates to int.
+        assert_eq!(atoi("-99999999999999999999"), c_long::MIN as i32);
+        assert_eq!(atoi("99999999999999999999"), c_long::MAX as i32);
+        // 2^32 + 3 truncates to 3 where it fits a long.
+        let wrapped = if c_long::BITS == 64 { 3 } else { i32::MAX };
+        assert_eq!(atoi("4294967299"), wrapped);
     }
 
     #[test]

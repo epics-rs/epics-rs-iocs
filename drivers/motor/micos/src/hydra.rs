@@ -148,9 +148,9 @@ impl HydraAxis {
         let (motor_form, members) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let read = |verb: &str| ctrl.exchange(&format!("{addr} {verb}")).0;
-            let motor_form = atoi(&read("getmotor"));
+            let motor_form = atoi(read("getmotor"));
             let pitch = atof(&read("getpitch"));
-            let pole_pairs = atoi(&read("getpolepairs"));
+            let pole_pairs = atoi(read("getpolepairs"));
             let cl_period = atof(&read("getclperiod"));
             let state = SmcState {
                 axis_res: axis_res(motor_form, pitch, pole_pairs, cl_period),

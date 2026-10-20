@@ -113,20 +113,12 @@ pub fn parse_error_header(payload: &str) -> Option<(i32, Option<i32>)> {
     Some((code, param))
 }
 
-/// One scanf `%d`: optional whitespace and sign, then at least one digit.
+/// One scanf `%d`, which glibc stores as `(int) strtol(s, &end, 10)`.
 fn scanf_int(s: &str) -> Option<(i32, &str)> {
-    let t = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let digits_from = usize::from(t.starts_with(['+', '-']));
-    let end = digits_from
-        + t[digits_from..]
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(t.len() - digits_from);
-    if end == digits_from {
-        return None;
+    match epics_rs::base::types::c_parse::strtol(s, 10) {
+        (_, 0) => None,
+        (v, end) => Some((epics_rs::base::types::c_parse::long_to_int(v), &s[end..])),
     }
-    // Out-of-range `%d` is undefined in C; wrap.
-    let v = t[..end].parse::<i128>().ok()? as i32;
-    Some((v, &t[end..]))
 }
 
 /// `chopstring40` (`drvGM10.c:330-356`): split off a chunk of at most 39
@@ -952,6 +944,22 @@ mod tests {
         assert_eq!(parse_orec("ORec,1\r\n"), Some(1));
         assert_eq!(parse_omath("OMath,3\r\n"), Some(3));
         assert_eq!(parse_orec("garbage"), None);
+    }
+
+    /// glibc's `%d` stores `(int) strtol(s, &end, 10)`: the saturated `long`
+    /// cut to `int`.
+    #[test]
+    fn an_out_of_range_int_is_glibc_s_cut_to_int() {
+        use std::ffi::c_long;
+        assert_eq!(
+            parse_orec("ORec,99999999999999999999"),
+            Some(epics_rs::base::types::c_parse::long_to_int(c_long::MAX))
+        );
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        assert_eq!(
+            parse_error_header("E1,4294967297:1:2"),
+            Some((wrapped, Some(2)))
+        );
     }
 
     #[test]

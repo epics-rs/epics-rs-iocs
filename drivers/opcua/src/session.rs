@@ -19,6 +19,7 @@ use async_opcua::types::{
     MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, UserTokenType, Variant, WriteValue,
 };
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::types::c_parse::strtoul_auto;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -211,7 +212,7 @@ impl SessionConfig {
             );
         }
         // C reads every count with strtoul and stores it narrowed.
-        let count = || strtoul(value) as u32;
+        let count = || strtoul_auto(value) as u32;
         match name {
             "sec-mode" => match SecurityMode::parse(value) {
                 Some(mode) => self.security_mode = mode,
@@ -1885,37 +1886,6 @@ fn strerror(e: &std::io::Error) -> String {
     match text.find(" (os error") {
         Some(end) => text[..end].to_string(),
         None => text,
-    }
-}
-
-/// C `strtoul(s, nullptr, 0)`: leading whitespace, an optional sign, then the
-/// longest prefix in base 16 (`0x`), 8 (`0`) or 10; nothing parsed is 0 and a
-/// minus sign wraps.
-pub(crate) fn strtoul(s: &str) -> u64 {
-    let s = s.trim_start();
-    let (negative, s) = match s.as_bytes().first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let (radix, digits) = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
-        && hex.starts_with(|c: char| c.is_ascii_hexdigit())
-    {
-        (16, hex)
-    } else if s.starts_with('0') {
-        (8, s)
-    } else {
-        (10, s)
-    };
-    let mut value: u64 = 0;
-    for c in digits.chars() {
-        let Some(d) = c.to_digit(radix) else { break };
-        value = value.saturating_mul(radix as u64).saturating_add(d as u64);
-    }
-    if negative {
-        value.wrapping_neg()
-    } else {
-        value
     }
 }
 

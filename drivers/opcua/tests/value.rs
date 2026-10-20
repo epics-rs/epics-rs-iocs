@@ -160,6 +160,20 @@ fn a_string_node_parses_into_a_numeric_record() {
     assert_eq!(read_scalar::<i32>(&lt, None), Ok(17));
 }
 
+/// `string_to` is `std::stoll(s, 0, 0)` (`DataElementOpen62541Leaf.h:150-177`):
+/// glibc's prefix read, C23 `0b` under g++, C `isspace` only, the tail
+/// ignored; no conversion and `ERANGE` throw.
+#[test]
+fn a_string_node_is_read_as_stoll() {
+    let s = |t: &str| Variant::String(UAString::from(t));
+    assert_eq!(read_scalar::<i32>(&s("12abc"), None), Ok(12));
+    assert_eq!(read_scalar::<u32>(&s("0b101"), None), Ok(5));
+    assert!(read_scalar::<i32>(&s("\u{a0}7"), None).is_err());
+    assert!(read_scalar::<i32>(&s("+-5"), None).is_err());
+    assert!(read_scalar::<u32>(&s("-1"), None).is_err());
+    assert!(read_scalar::<i64>(&s("99999999999999999999"), None).is_err());
+}
+
 #[test]
 fn a_type_with_no_numeric_meaning_is_unsupported() {
     let qn = Variant::QualifiedName(Box::new(QualifiedName::new(2, "Name")));
@@ -892,6 +906,21 @@ fn a_namespace_is_read_as_atoi_reads_it() {
     assert_eq!(namespace("x|n"), 0);
     assert_eq!(namespace("-1|n"), 65535);
     assert_eq!(namespace("70000|n"), 4464);
+    // glibc's `(int) strtol`: `\v` is skipped, and the `long` saturates
+    // before it is truncated.
+    assert_eq!(namespace("\x0b5|n"), 5);
+    use epics_rs::base::types::c_parse::long_to_int;
+    use std::ffi::c_long;
+    let wrapped = if c_long::BITS == 64 { 1 } else { u16::MAX };
+    assert_eq!(namespace("4294967297|n"), wrapped);
+    assert_eq!(
+        namespace("99999999999999999999|n"),
+        long_to_int(c_long::MAX) as u16
+    );
+    assert_eq!(
+        namespace("-99999999999999999999|n"),
+        long_to_int(c_long::MIN) as u16
+    );
 }
 
 /// Each element may name its locale or namespace; one that does not takes
@@ -940,6 +969,43 @@ fn a_string_array_sets_each_elements_locale_and_namespace() {
             vec![qn(5, "x"), qn(5, "y"), qn(65535, "z")]
         ))
     );
+}
+
+/// `strtol`/`strtoul(value, &end, 0)`, then `end != value &&
+/// isWithinRange<T>` (`DataElementOpen62541Leaf.cpp:965-1056`).
+#[test]
+fn a_string_record_writes_an_integer_as_strtol_reads_it() {
+    use std::ffi::c_ulong;
+    assert_eq!(
+        write_string("12abc", &Variant::Int32(0), None),
+        Ok(Variant::Int32(12))
+    );
+    assert_eq!(
+        write_string("0b11", &Variant::Byte(0), None),
+        Ok(Variant::Byte(3))
+    );
+    assert!(write_string("\u{a0}7", &Variant::Int16(0), None).is_err());
+    assert_eq!(
+        write_string("1x", &Variant::Int32(0), Some(&choices())),
+        Ok(Variant::Int32(1))
+    );
+    // strtoul wraps a negative to its own width.
+    let long64 = c_ulong::BITS == 64;
+    let max = if long64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    assert_eq!(
+        write_string("-1", &Variant::UInt64(0), None),
+        Ok(Variant::UInt64(max))
+    );
+    assert_eq!(
+        write_string("-1", &Variant::UInt32(0), None).is_ok(),
+        !long64
+    );
+    // C ignores errno and writes LONG_MAX; an overflow is refused here.
+    assert!(write_string("99999999999999999999", &Variant::Int64(0), None).is_err());
 }
 
 #[test]

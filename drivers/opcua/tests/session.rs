@@ -478,6 +478,29 @@ fn a_bad_session_option_is_passed_over() {
     assert_eq!(config.security_mode, opcua::client::SecurityMode::Best);
 }
 
+/// `std::strtoul(value, nullptr, 0)`, narrowed (`SessionOpen62541.cpp:420-452`,
+/// `SubscriptionOpen62541.cpp:64-67`): g++'s `_GNU_SOURCE` gives glibc's C23
+/// `0b`, only C `isspace` is skipped, and an overflow is `ULONG_MAX` whatever
+/// the sign.
+#[test]
+fn an_option_count_is_glibc_strtoul() {
+    use std::ffi::c_ulong;
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    let mut nodes = |value: &str| {
+        config.set_option("nodes-max", value).unwrap();
+        config.read_nodes_max
+    };
+    assert_eq!(nodes("0b101"), 5);
+    assert_eq!(nodes("\u{a0}7"), 0);
+    assert_eq!(nodes("-99999999999999999999"), u32::MAX);
+    let wrapped = if c_ulong::BITS == 64 { 1 } else { u32::MAX };
+    assert_eq!(nodes("4294967297"), wrapped);
+
+    let mut subscription = SubscriptionConfig::new("subs", "sess");
+    subscription.set_option("priority", "0b11");
+    assert_eq!(subscription.priority, 3);
+}
+
 /// C compares the mode with `==` (`SessionOpen62541.cpp:378-389`).
 #[test]
 fn sec_mode_is_matched_case_exactly() {

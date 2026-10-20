@@ -1444,7 +1444,7 @@ impl PIGCS2Controller {
     /// C `getMoving`: `#5`'s hex word masked by the axis's
     /// `m_movingStateMask`.
     fn get_moving(&self, mask: i64) -> AsynResult<bool> {
-        Ok(strtol(self.query_char(5)?.as_bytes(), 16).0 & mask != 0)
+        Ok(strtol(self.query_char(5)?.as_bytes(), 16).0 as i64 & mask != 0)
     }
 
     /// `PIGCSPiezoController::getStatus`: `SRG? {axis} 1`'s mask, no limits;

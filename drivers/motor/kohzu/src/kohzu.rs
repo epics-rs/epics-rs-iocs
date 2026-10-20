@@ -47,7 +47,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::model1::{MoveStrings, init_poll, init_read};
-use motor_common::util::{nint, strtol};
+use motor_common::util::{long_to_int, nint, strtol};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 160;
@@ -108,7 +108,7 @@ fn identify(reply: &str) -> AsynResult<(i32, i32)> {
         .find_map(
             |model| match strtol(literal(idn?, &model.to_string())?, 10) {
                 (_, 0) => None,
-                (version, _) => Some((model, version as i32)),
+                (version, _) => Some((model, long_to_int(version))),
             },
         )
         .ok_or_else(|| kohzu_err(format!("SC800: unrecognized IDN reply '{reply}'")))

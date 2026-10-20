@@ -75,7 +75,7 @@ pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
 /// there are no digits.
 pub fn strtol(s: &str) -> (i32, &str) {
     let (long, end) = epics_rs::base::types::c_parse::strtol(s, 10);
-    (long as i32, &s[end..])
+    (epics_rs::base::types::c_parse::long_to_int(long), &s[end..])
 }
 
 /// Parse a family-prefixed channel address: bare digits (`Signal`, 1-999),
@@ -255,7 +255,11 @@ mod tests {
     #[test]
     fn address_number_is_strtol_stored_in_an_int() {
         use std::ffi::c_long;
-        let int = |n: i128| n.clamp(c_long::MIN as i128, c_long::MAX as i128) as c_long as i32;
+        let int = |n: i128| {
+            epics_rs::base::types::c_parse::long_to_int(
+                n.clamp(c_long::MIN as i128, c_long::MAX as i128) as c_long,
+            )
+        };
         let huge = 99_999_999_999_999_999_999_i128;
         assert_eq!(strtol("-99999999999999999999").0, int(-huge));
         assert_eq!(strtol("99999999999999999999").0, int(huge));

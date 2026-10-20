@@ -15,7 +15,7 @@ use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::motor::poll_loop::{FirstPollPending, PollCommand};
 
-use motor_common::util::{leading_hex, strtol};
+use motor_common::util::{leading_hex, long_to_int, strtol};
 
 use crate::oms::{AXIS_CHARS, OmsController};
 
@@ -561,7 +561,7 @@ fn parse_axes_array(reply: &str) -> ([i32; OMS_MAX_AXES], usize) {
         if end == 0 {
             break;
         }
-        *value = parsed as i32;
+        *value = long_to_int(parsed);
         count += 1;
         let end = start + end;
         if end >= b.len() {
@@ -1006,15 +1006,16 @@ pub(crate) mod tests {
     }
 
     /// omsBaseController.cpp:1051: `int intVal = strtol(..)` of an
-    /// overflow is `(int)LONG_MIN` 0 and `(int)LONG_MAX` -1.
+    /// overflow is `(int)LONG_MIN` and `(int)LONG_MAX`, 0 and -1 on LP64.
     #[test]
     fn an_overflowing_axis_value_is_strtol_cast_to_int() {
+        use std::ffi::c_long;
+        let (min, max) = (long_to_int(c_long::MIN), long_to_int(c_long::MAX));
         let (values, count) = parse_axes_array("-99999999999999999999,99999999999999999999");
-        assert_eq!((values[..2].to_vec(), count), (vec![0, -1], 2));
-        assert_eq!(
-            parse_axes_array(&std::ffi::c_long::MIN.to_string()),
-            ([0; OMS_MAX_AXES], 1)
-        );
+        assert_eq!((values[..2].to_vec(), count), (vec![min, max], 2));
+        let mut at_min = [0; OMS_MAX_AXES];
+        at_min[0] = min;
+        assert_eq!(parse_axes_array(&c_long::MIN.to_string()), (at_min, 1));
         // strtol skips a `\v` as isspace.
         assert_eq!(parse_axes_array("\x0b5").0[0], 5);
     }

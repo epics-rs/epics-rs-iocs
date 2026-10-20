@@ -88,7 +88,7 @@ fn parse_channel_address_end(arg: &str) -> Option<(ChannelAddress, usize)> {
         _ => return None,
     };
     let (value, len) = c_parse::strtol(&arg.as_bytes()[start..], 10);
-    let index = value as i32;
+    let index = c_parse::long_to_int(value);
     if index <= 0 || index > max {
         return None;
     }
@@ -215,8 +215,10 @@ mod tests {
             })
         );
         assert_eq!(parse_channel_address("A-3"), None);
-        // int truncation of the long: 2^32 + 5 reads back as 5.
-        assert_eq!(parse_channel_address("4294967301"), Some(signal(5)));
+        // int truncation of the long: 2^32 + 5 reads back as 5 where it
+        // fits a long, and saturates past the range where it does not.
+        let wide = std::ffi::c_long::BITS == 64;
+        assert_eq!(parse_channel_address("4294967301"), wide.then(|| signal(5)));
     }
 
     #[test]

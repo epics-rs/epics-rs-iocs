@@ -431,25 +431,25 @@ impl SmartMotorAxis {
 
         let rp = atof(&ctrl.reply(self.axis, "RP"));
 
-        let plus_ls = atoi(&ctrl.reply(self.axis, "RBp")) != 0;
-        let minus_ls = atoi(&ctrl.reply(self.axis, "RBm")) != 0;
+        let plus_ls = atoi(ctrl.reply(self.axis, "RBp")) != 0;
+        let minus_ls = atoi(ctrl.reply(self.axis, "RBm")) != 0;
 
         // Latched right/left travel-limit flags: clear them if set (C Zr/Zl).
-        if atoi(&ctrl.reply(self.axis, "RBr")) != 0 {
+        if atoi(ctrl.reply(self.axis, "RBr")) != 0 {
             ctrl.send(self.axis, "Zr");
         }
-        if atoi(&ctrl.reply(self.axis, "RBl")) != 0 {
+        if atoi(ctrl.reply(self.axis, "RBl")) != 0 {
             ctrl.send(self.axis, "Zl");
         }
 
         // RBo != 0 means "not on commanded position" (C clears EA_POSITION).
-        let on_position = atoi(&ctrl.reply(self.axis, "RBo")) == 0;
+        let on_position = atoi(ctrl.reply(self.axis, "RBo")) == 0;
 
         // C motor_init sets encoder_present, so the encoder is a second RP,
         // truncated by its (epicsInt32) cast.
         let encoder_position = atof(&ctrl.reply(self.axis, "RP")) as i32;
 
-        let velocity_raw = atoi(&ctrl.reply(self.axis, "RV"));
+        let velocity_raw = atoi(ctrl.reply(self.axis, "RV"));
         drop(ctrl);
 
         // drvSmartMotor.cc:271-291: an unchanged RP keeps the direction, a

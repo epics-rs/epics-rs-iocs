@@ -13,13 +13,14 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::block_on_sync;
 use epics_rs::base::server::RecordFactory;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use crate::client::ClientSecurity;
 use crate::defaults;
 use crate::link::split_escaped;
 use crate::record::OpcuaItemRecord;
 use crate::registry::Registry;
-use crate::session::{Control, SessionConfig, strtoul};
+use crate::session::{Control, SessionConfig};
 use crate::subscription::SubscriptionConfig;
 
 /// The `opcuaItem` record-type factory, for
@@ -172,13 +173,13 @@ pub fn parse_options(tokens: &[&str]) -> Vec<(String, String)> {
     options
 }
 
-/// The last `debug=` of an option tail is nonzero (`std::strtol(...)`, tested
-/// as `if (s && debug)`).
+/// The last `debug=` of an option tail is nonzero as C's `int debug =
+/// std::strtol(...)`, tested as `if (s && debug)`.
 fn debug_requested(options: &[(String, String)]) -> bool {
     options
         .iter()
         .rfind(|(key, _)| key == "debug")
-        .is_some_and(|(_, value)| strtoul(value) != 0)
+        .is_some_and(|(_, value)| long_to_int(strtol(value, 0).0) != 0)
 }
 
 /// `opcuaSession(name, URL, [options])` (`iocshIntegration.cpp:124-183`).
@@ -574,6 +575,19 @@ pub type SharedRegistry = Arc<Registry>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C `int debug = std::strtol(value, nullptr, 0)` (`iocshIntegration.cpp:160`,
+    /// `:265`): the `long` narrowed to `int` is what `if (s && debug)` tests.
+    #[test]
+    fn debug_is_strtol_narrowed_to_int() {
+        use std::ffi::c_long;
+        let debug = |v: &str| debug_requested(&[("debug".to_string(), v.to_string())]);
+        assert!(debug("-1"));
+        assert!(!debug("0x"));
+        let past_int = c_long::BITS == 32;
+        assert_eq!(debug("4294967296"), past_int);
+        assert_eq!(debug("0x100000000"), past_int);
+    }
 
     #[test]
     fn an_argument_carries_colon_separated_options() {

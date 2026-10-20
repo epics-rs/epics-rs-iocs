@@ -6,6 +6,8 @@
 //! `NDFileTemplate` needs is reimplemented here together with
 //! `pilatusDetector::makeMultipleFileFormat`.
 
+use epics_rs::base::types::c_parse::atoi;
+
 use crate::types::MAX_FILENAME_LEN;
 
 // ---------------------------------------------------------------------------
@@ -276,14 +278,10 @@ pub fn make_multiple_file_format(base_file_name: &str, num_images: i32) -> Multi
         Some(rel) => {
             let q = p + rel + 1; // q++
             if is_digit(&temp, q) && is_digit(&temp, q + 1) && is_digit(&temp, q + 2) {
-                // atoi(q) stops at the first non-digit.
                 let digits_end = (q..temp.len())
                     .find(|&i| !temp[i].is_ascii_digit())
                     .unwrap_or(temp.len());
-                multiple_file_number = std::str::from_utf8(&temp[q..digits_end])
-                    .ok()
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(0);
+                multiple_file_number = atoi(&temp[q..]);
                 fmt = digits_end - q;
                 // *p = '\0' with p == q: drops the digits *and* anything after.
                 temp.truncate(q);
@@ -411,6 +409,18 @@ mod tests {
         assert_eq!(m.prefix, "/d/i_12_");
         assert_eq!(m.digits, 5);
         assert_eq!(m.file_name(0), "/d/i_12_00000.tif");
+    }
+
+    /// C `multipleFileNumber = atoi(q)`: glibc cuts the saturated long to int.
+    #[test]
+    fn multiple_format_start_number_is_atoi() {
+        let m = make_multiple_file_format("/d/i_4294967297.tif", 10);
+        let wrapped = if std::ffi::c_long::BITS == 64 {
+            1
+        } else {
+            i32::MAX
+        };
+        assert_eq!(m.start_number, wrapped);
     }
 
     #[test]
