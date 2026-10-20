@@ -464,7 +464,8 @@ pub struct Mcs2Axis {
     channel: i32,
     /// Sensor-present flag from the last poll (selects closed/open-loop moves).
     has_encoder: bool,
-    /// Software-tracked position for open-loop step moves (driver units).
+    /// C's `motorEncoderPosition_`, which the open-loop step move starts
+    /// from (smarActMCS2MotorDriver.cpp:379), in driver units.
     tracked_position: f64,
     /// What the last poll or home set on the port, for the poller to post.
     sets: PortSets,
@@ -715,10 +716,7 @@ impl AsynMotor for Mcs2Axis {
             }
         }
         self.has_encoder = status.has_encoder;
-        // Keep the software-tracked position aligned with the sensor when closed.
-        if self.has_encoder {
-            self.tracked_position = status.position;
-        }
+        self.tracked_position = status.encoder_position;
         polled
     }
 }
@@ -1006,6 +1004,39 @@ mod tests {
         assert!(status.has_encoder && status.homed);
         assert!(status.high_limit && status.low_limit);
         assert!(axis.has_encoder);
+    }
+
+    /// smarActMCS2MotorDriver.cpp:379: the open-loop move steps from
+    /// `motorEncoderPosition_`, the last POS?, not the last POS:TARG?.
+    #[test]
+    fn the_open_loop_move_steps_from_the_encoder_position() {
+        use motor_common::testing::LineRig;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sensor = Arc::new(AtomicBool::new(true));
+        let present = sensor.clone();
+        let (rig, io) = LineRig::new("mcs2OpenLoopBase", move |cmd| {
+            match cmd.trim_end() {
+                ":CHAN0:STAT?" if present.load(Ordering::SeqCst) => "32\r\n",
+                ":CHAN0:POS?" => "1000\r\n",
+                ":CHAN0:POS:TARG?" => "2000\r\n",
+                _ => "0\r\n",
+            }
+            .to_string()
+        });
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2OpenLoopBase", 0), no_port());
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        let mut status = MotorStatus::default();
+        axis.poll(&user, &mut status).unwrap();
+        sensor.store(false, Ordering::SeqCst);
+        axis.poll(&user, &mut status).unwrap();
+        rig.sent();
+        axis.move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
+        let sent = rig.sent();
+        assert!(
+            sent.iter().any(|c| c.trim_end() == ":MOVE0 2.000000"),
+            "{sent:?}"
+        );
     }
 
     /// smarActMCS2MotorDriver.cpp:387-388: the open-loop move sets both
