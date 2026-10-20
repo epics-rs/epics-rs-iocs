@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "ad"] }
+epics-libcom-rs = { workspace = true }
 parking_lot = "0.12"
 realsense-rust = "1.3"
 anyhow = "1.0"

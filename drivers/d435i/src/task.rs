@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::port_handle::PortHandle;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
@@ -180,7 +181,10 @@ fn set_sensor_option(
         trace::print(
             port,
             TraceMask::WARNING,
-            &format!("D435i: camera refused {option:?}={value}: {e}\n"),
+            &format!(
+                "D435i: camera refused {option:?}={}: {e}\n",
+                CFloat(f64::from(value)).g()
+            ),
         );
     }
 }

@@ -1023,6 +1023,7 @@ name = "d435i"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
  "realsense-rust",
