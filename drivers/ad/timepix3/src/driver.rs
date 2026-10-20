@@ -7,8 +7,6 @@ use std::sync::Arc;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interrupt::InterruptValue;
 use epics_rs::asyn::param::{EnumEntry, ParamValue};
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -210,33 +208,6 @@ const MPX3_TRIGGER_MSG: &str =
 /// C `kMpx3BothCountersPixelDepthMsg` (ADTimePix.cpp:2132-2133).
 const MPX3_PIXEL_DEPTH_MSG: &str =
     "MPX3: PixelDepth 24 incompatible with BothCounters (use 12-bit)";
-
-/// C `doCallbacksInt64Array` (asynPortDriver.cpp:1829-1866): the array goes
-/// to the asynInt64Array subscribers only, unstored, carrying getTimeStamp and
-/// the param's status and alarm.
-pub(crate) fn do_callbacks_int64_array(
-    base: &PortDriverBase,
-    reason: usize,
-    addr: i32,
-    data: Vec<i64>,
-) {
-    let aux_status = base
-        .get_param_status(reason, addr)
-        .unwrap_or(AsynStatus::Success);
-    let alarm_status = base.get_param_alarm_status(reason, addr).unwrap_or(0);
-    let alarm_severity = base.get_param_alarm_severity(reason, addr).unwrap_or(0);
-    base.interrupts.notify(InterruptValue {
-        reason,
-        addr,
-        value: ParamValue::Int64Array(data.into()),
-        timestamp: base.get_time_stamp(),
-        aux_status,
-        alarm_status,
-        alarm_severity,
-        iface: Some(InterfaceType::Int64Array),
-        ..Default::default()
-    });
-}
 
 pub struct TimePix3Driver {
     pub ad: ADDriverBase,
@@ -714,7 +685,7 @@ impl TimePix3Driver {
         if let Some(sum) = sum {
             // C posts FramesToSum and MemoryUsage before the array (:779-783).
             base.call_param_callbacks(0)?;
-            do_callbacks_int64_array(base, sum_param, 0, sum);
+            base.do_callbacks_array(sum_param, 0, ParamValue::Int64Array(sum.into()))?;
         }
         Ok(())
     }
@@ -3535,7 +3506,8 @@ impl TimePix3Driver {
                     .filter(|&n| n > 0)
                     .unwrap_or(16000);
                 for reason in [p.prv_hst_histogram_data, p.prv_hst_histogram_sum_n_frames] {
-                    do_callbacks_int64_array(&self.ad.port_base, reason, 0, vec![0; bins]);
+                    let zeros = ParamValue::Int64Array(vec![0; bins].into());
+                    self.ad.port_base.do_callbacks_array(reason, 0, zeros)?;
                 }
                 self.ad
                     .port_base

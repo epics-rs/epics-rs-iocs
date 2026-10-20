@@ -343,9 +343,10 @@ impl Ctx {
     /// the stamp is the port's, so it keeps its place after the worker's
     /// `updateTimeStamp` and posts.
     fn post_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
-        self.shared
-            .port_jobs
-            .push(move |base| crate::driver::do_callbacks_int64_array(base, reason, addr, data));
+        self.shared.port_jobs.push(move |base| {
+            // Only a non-array value is refused.
+            let _ = base.do_callbacks_array(reason, addr, ParamValue::Int64Array(data.into()));
+        });
         self.flush_jobs();
     }
 }
