@@ -16,9 +16,10 @@
 //! record's I/O Intr channel whenever an update lands. The pulse is what
 //! processes the record ([`DeviceSupport::io_intr_scan_independent`] is `true`,
 //! so it fires whatever the record's `SCAN`), and the framework runs that pass
-//! as a driver-callback cycle: the *read* stage runs even on an output record,
-//! and the device write is suppressed (`processing.rs:1892-1894`, `:2485-2492` —
-//! the path asyn's `asyn:READBACK` uses). So the two directions split cleanly:
+//! as a driver-callback cycle. On an output record that cycle reads in place of
+//! writing ([`OpcuaDevice::output_callback_readback`]), as the C write dsets pop
+//! the update in place of writing it (`devOpcua.cpp:418-435`). So the two
+//! directions split cleanly:
 //!
 //! * [`OpcuaDevice::read`] — an update is waiting; deliver it. This is the C's
 //!   `pcon->reason != none` branch.
@@ -391,9 +392,9 @@ impl OpcuaDevice {
             leaf.outgoing = Some(outgoing);
             leaf.dirty = true;
         }
-        // An element of an opcuaItem does not write on its own: the item record
-        // decides when the structure goes out (WOC).
-        if !linked_to_item && matches!(state, ConnectionStatus::Up | ConnectionStatus::InitialWrite)
+        // Only a record with an item of its own writes it; an element leaves
+        // that to its opcuaItem record (`devOpcua.cpp:428`).
+        if linked_to_item && matches!(state, ConnectionStatus::Up | ConnectionStatus::InitialWrite)
         {
             bound.item.lock().request(Priority::Low, Action::Write);
         }
@@ -919,6 +920,13 @@ impl DeviceSupport for OpcuaDevice {
         true
     }
 
+    /// The pass an update's pulse runs takes the update into an output record
+    /// and writes nothing: the C write dsets pop it in place of writing
+    /// (`devOpcua.cpp:418-435`).
+    fn output_callback_readback(&self) -> bool {
+        self.is_output
+    }
+
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         self.alarm = None;
         if self.op == Op::Item {
@@ -927,7 +935,7 @@ impl DeviceSupport for OpcuaDevice {
         let popped = { self.bound()?.leaf.lock().queue.pop() };
         match popped {
             Some((update, _)) => self.deliver(update, record),
-            // An output record reaches the read stage only on an I/O Intr pulse,
+            // An output reads only in the readback pass of an I/O Intr pulse,
             // which is only fired for an update — an empty queue means another
             // pass already took it. No pop, so nothing said about UDF (the C
             // leaf returns 1 untouched on an empty queue).
