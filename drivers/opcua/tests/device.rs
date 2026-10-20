@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 
 use epics_rs::base::server::device_support::{DeviceAlarm, DeviceSupport};
-use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType};
+use epics_rs::base::server::record::{AlarmSeverity, Ftype, ProcessContext, Record, ScanType};
 use epics_rs::base::server::records::ai::AiRecord;
 use epics_rs::base::server::records::ao::AoRecord;
 use epics_rs::base::server::records::bi::BiRecord;
@@ -744,6 +744,85 @@ fn a_char_waveform_holds_a_string_node_as_its_bytes() {
     assert_eq!(
         field(&record, "VAL"),
         EpicsValue::CharArray(b"text".to_vec().into())
+    );
+}
+
+/// FTVL = UCHAR is the `epicsUInt8` array overload, never the long-string
+/// path (`DataElementOpen62541Leaf.cpp:652-662`): a ByteString node is its
+/// raw bytes, any other scalar node is not an array.
+#[test]
+fn a_uchar_waveform_reads_a_bytestring_raw_and_refuses_a_string_node() {
+    let registry = registry();
+    let mut record = WaveformRecord::new(8, DbFieldType::UChar);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::ByteString(vec![0x01, 0xff].into()),
+    );
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::UCharArray(vec![0x01, 0xff].into())
+    );
+    assert_eq!(device.last_alarm(), None);
+
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::String("text".into()),
+    );
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: ""
+        })
+    );
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::UCharArray(vec![0x01, 0xff].into())
+    );
+}
+
+/// `writeArray<epicsUInt8>` (`DataElementOpen62541Leaf.cpp:1238-1252`).
+#[test]
+fn a_uchar_aao_writes_a_bytestring_raw_and_refuses_a_string_node() {
+    let registry = registry();
+    let mut record = WaveformRecord::with_kind(ArrayKind::Aao);
+    record.put_field("NELM", EpicsValue::Long(4)).unwrap();
+    record
+        .put_field("FTVL", EpicsValue::Short(Ftype::UChar.index()))
+        .unwrap();
+    record
+        .put_field("VAL", EpicsValue::UCharArray(vec![0x41, 0x42].into()))
+        .unwrap();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    typed(&leaf, Variant::ByteString(vec![0u8].into()));
+    outgoing(&mut device, &mut record);
+    assert_eq!(
+        leaf.lock().outgoing,
+        Some(Variant::ByteString(vec![0x41, 0x42].into()))
+    );
+    assert_eq!(device.last_alarm(), None);
+
+    leaf.lock().outgoing = None;
+    typed(&leaf, Variant::String("".into()));
+    outgoing(&mut device, &mut record);
+    assert_eq!(leaf.lock().outgoing, None);
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 2,
+            sevr: 3,
+            msg: ""
+        })
     );
 }
 

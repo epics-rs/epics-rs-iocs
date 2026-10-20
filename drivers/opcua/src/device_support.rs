@@ -1130,7 +1130,7 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), Failure> {
     let value = match current {
         // FTVL = CHAR doubles as a long string (`devOpcua.cpp:1084-1087`), so a
         // String node lands in it as its bytes.
-        EpicsValue::CharArray(_) | EpicsValue::UCharArray(_) => {
+        EpicsValue::CharArray(_) => {
             let bytes = match data {
                 Variant::String(_) | Variant::ByteString(_) | Variant::LocalizedText(_) => {
                     value::read_string(data, None)?
@@ -1138,6 +1138,11 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), Failure> {
                 _ => value::read_array_u8(data)?,
             };
             EpicsValue::CharArray(clamp(bytes, nelm).into())
+        }
+        // FTVL = UCHAR is the `epicsUInt8` overload: a ByteString's raw bytes
+        // or a Byte/Boolean array (`DataElementOpen62541Leaf.cpp:652-662`).
+        EpicsValue::UCharArray(_) => {
+            EpicsValue::UCharArray(clamp(value::read_array_u8(data)?, nelm).into())
         }
         EpicsValue::ShortArray(_) => {
             EpicsValue::ShortArray(clamp(value::read_array::<i16>(data)?, nelm).into())
@@ -1179,13 +1184,15 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), Failure> {
 fn outgoing_array(record: &mut dyn Record, incoming: &Variant) -> value::WriteResult {
     let current = record.get_field("VAL").unwrap_or(EpicsValue::Long(0));
     match current {
-        EpicsValue::CharArray(v) | EpicsValue::UCharArray(v) => match incoming {
+        EpicsValue::CharArray(v) => match incoming {
             Variant::String(_) | Variant::ByteString(_) | Variant::LocalizedText(_) => {
                 let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
                 value::write_string(&String::from_utf8_lossy(&v[..end]), incoming, None)
             }
             _ => value::write_array_u8(&v, incoming),
         },
+        // `writeArray<epicsUInt8>` (`DataElementOpen62541Leaf.cpp:1238-1252`).
+        EpicsValue::UCharArray(v) => value::write_array_u8(&v, incoming),
         EpicsValue::ShortArray(v) => value::write_array(&v, incoming),
         EpicsValue::UShortArray(v) => value::write_array(&v, incoming),
         EpicsValue::LongArray(v) => value::write_array(&v, incoming),
