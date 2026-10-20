@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::base::types::c_parse::{atoi, strtol};
+use epics_rs::base::types::c_parse::{atoi, long_to_int, strtol};
 
 use crate::drv_quad_em::{QE_MAX_INPUTS, QeTriggerPolarity};
 
@@ -154,7 +154,7 @@ pub fn parse_range(resp: &str) -> Option<i32> {
         .strip_prefix("RANGE:")?
         .trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
     let (value, consumed) = strtol(&rest.as_bytes()[..rest.len().min(1)], 10);
-    (consumed > 0).then_some(value as i32)
+    (consumed > 0).then_some(long_to_int(value))
 }
 
 /// C++ `readStatus`: `sscanf(inString_, "CHANNELS:%d", &numChannels)`.
@@ -170,7 +170,7 @@ pub fn parse_values_per_read(resp: &str) -> Option<i32> {
 /// glibc's `%d` stores `(int) strtol(s, &end, 10)`.
 fn parse_int_after(resp: &str, prefix: &str) -> Option<i32> {
     let (value, consumed) = strtol(resp.strip_prefix(prefix)?, 10);
-    (consumed > 0).then_some(value as i32)
+    (consumed > 0).then_some(long_to_int(value))
 }
 
 /// C++ `readStatus`: `"BIASSTATUS:OFF"` means the bias is off, anything else
@@ -350,7 +350,10 @@ mod tests {
             ("VERSION:PCR4v+3", 3),
             ("VERSION:PCR4vX", 0),
             ("VERSION:PCR4v4294967298 1.0", wrapped),
-            ("VERSION:PCR4v99999999999999999999", c_long::MAX as i32),
+            (
+                "VERSION:PCR4v99999999999999999999",
+                long_to_int(c_long::MAX),
+            ),
         ] {
             assert_eq!(parse_version(resp), Some((resp[8..].to_string(), v)));
         }
@@ -396,7 +399,7 @@ mod tests {
         assert_eq!(parse_num_channels("CHANNELS:4294967297"), Some(wrapped));
         assert_eq!(
             parse_num_channels("CHANNELS:99999999999999999999"),
-            Some(c_long::MAX as i32)
+            Some(long_to_int(c_long::MAX))
         );
         assert_eq!(parse_values_per_read("SPR:-5"), Some(-5));
         assert_eq!(parse_values_per_read("SPR:\x0b7"), Some(7));
