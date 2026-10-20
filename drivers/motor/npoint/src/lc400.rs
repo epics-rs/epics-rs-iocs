@@ -638,6 +638,7 @@ impl AsynMotor for Lc400Axis {
             if let Some(reason) = digital_pos {
                 updates.push((reason, ParamValue::Float64(f64::from(current))));
             }
+            out.position = f64::from(current);
             let busy = ctrl.read_single(address + WAV_ACTIVE)?;
             let done = busy == 0;
             if done {
@@ -647,37 +648,33 @@ impl AsynMotor for Lc400Axis {
             if done {
                 if state.pos_hard != 0 && current >= state.pos_hard {
                     state.high_limit = true;
+                    out.high_limit = true;
                 }
                 if state.neg_hard != 0 && current <= state.neg_hard {
                     state.low_limit = true;
+                    out.low_limit = true;
                 }
             } else {
                 if current < state.pos_hard - state.tol_hard {
                     state.high_limit = false;
+                    out.high_limit = false;
                 }
                 if current > state.neg_hard + state.tol_hard {
                     state.low_limit = false;
+                    out.low_limit = false;
                 }
             }
             state.done = done;
+            out.done = done;
+            out.moving = !done;
             Ok(())
         })();
-        let state = &ctrl.axes[self.axis];
-        let status = MotorStatus {
-            position: state.digital_pos,
-            done: state.done,
-            moving: !state.done,
-            high_limit: state.high_limit,
-            low_limit: state.low_limit,
-            powered: true,
-            problem: result.is_err(),
-            ..MotorStatus::default()
-        };
         drop(ctrl);
+        out.problem = result.is_err();
+        out.powered = true;
         for (reason, value) in updates {
             self.sets.axis(reason, value);
         }
-        *out = status;
         Ok(())
     }
 
@@ -925,6 +922,31 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         text.lines().map(str::to_owned).collect()
+    }
+
+    /// LC400MotorDriver.cpp:882, :913, :922-925: a failed position read
+    /// skips the DONE set, so it keeps the DONE a move start cleared.
+    #[test]
+    fn a_failed_position_read_keeps_the_done_a_move_cleared() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fail = Arc::new(AtomicBool::new(false));
+        let fails = fail.clone();
+        let (_rig, io) = motor_common::testing::LineRig::failing(
+            "lc400FailedPos",
+            |_| "AAAAA\0\0\0\0Z".into(),
+            move |_| fails.load(Ordering::SeqCst),
+        );
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(Some(io), 1)));
+        let mut axis = Lc400Axis::new(controller, 0);
+        let user = AsynUser::new(0);
+        let mut status = MotorStatus::default();
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && !status.problem);
+        // What the poll loop does when a move starts.
+        status.done = false;
+        fail.store(true, Ordering::SeqCst);
+        let _ = axis.poll(&user, &mut status);
+        assert!(!status.done && status.problem && status.powered);
     }
 
     /// LC400MotorDriver.cpp poll / updateAuxParams: the digital position,
