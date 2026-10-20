@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -3669,7 +3670,8 @@ impl PortDriver for TimePix3Driver {
                     adlog::WRITE_FLOAT64,
                     &format!(
                         "ERROR status = {}, function ={reason}, value = {value:.6}",
-                        refusal.c_status_code()
+                        refusal.c_status_code(),
+                        value = CFloat(value)
                     ),
                 ),
             ),
@@ -3678,7 +3680,7 @@ impl PortDriver for TimePix3Driver {
                 TraceMask::IO_DRIVER,
                 &adlog::log(
                     adlog::WRITE_FLOAT64,
-                    &format!("function={reason} value={value:.6}"),
+                    &format!("function={reason} value={value:.6}", value = CFloat(value)),
                 ),
             ),
         }

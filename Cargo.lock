@@ -4582,6 +4582,7 @@ dependencies = [
 name = "timepix3"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "libc",
  "parking_lot",
