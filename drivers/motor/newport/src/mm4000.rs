@@ -681,7 +681,7 @@ impl Mm4000Axis {
                 let reply = ctrl.unchecked_reply(&format!("{axis}{cc}"));
                 reply.get(3..).unwrap_or("").to_owned()
             };
-            let encoder_present = atoi(&query("TC")) != 0;
+            let encoder_present = atoi(query("TC")) != 0;
             let step_size = atof(&query("TU"));
             let home_preset = atof(&query("XH"));
             let low_limit = atof(&query("TL"));

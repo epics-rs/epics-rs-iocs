@@ -238,7 +238,7 @@ impl Esp300Axis {
             let resolution = match feedback & 0x300 {
                 0x200 => {
                     let full_step = atof(&read(format!("{axis:02}FR?")));
-                    let micro_step = atoi(&read(format!("{axis:02}QS?")));
+                    let micro_step = atoi(read(format!("{axis:02}QS?")));
                     full_step / f64::from(micro_step)
                 }
                 0x0 => atof(&read(format!("{axis:02}FR?"))),
@@ -543,7 +543,7 @@ impl Esp300Axis {
         // Kept bug-for-bug: issue ZH? (wire parity), report no switches.
         read(&ctrl, &format!("{a:02}ZH?"));
 
-        let powered = atoi(&read(&ctrl, &format!("{a:02}MO?"))) != 0;
+        let powered = atoi(read(&ctrl, &format!("{a:02}MO?"))) != 0;
 
         let te = read(&ctrl, "TE?");
         let errcode = atoi(&te);

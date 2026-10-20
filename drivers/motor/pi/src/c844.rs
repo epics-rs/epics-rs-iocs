@@ -201,7 +201,7 @@ impl PIC844Controller {
 
         // Motion-condition register (no axis prefix — the AXIS:STAT? above
         // selected the axis, but this query is global anyway).
-        let cond = atoi(&self.query("MOT:COND?")) as u32;
+        let cond = atoi(self.query("MOT:COND?")) as u32;
         let in_motion = cond & (1 << signal) != 0;
         let high_limit = cond & (1 << (8 + signal)) != 0;
         let low_limit = cond & (1 << (12 + signal)) != 0;
