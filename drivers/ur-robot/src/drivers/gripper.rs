@@ -22,7 +22,7 @@ use crate::drivers::{asyn_error, refused};
 use crate::error::UrResult;
 use crate::gripper::{MoveMode, MoveParameter, ObjectStatus, RobotiqGripper, Unit};
 use crate::registry::{self, DashboardHandle};
-use crate::spdlog;
+use crate::spdlog::{self, FmtDouble};
 
 /// The C++ driver hard-codes `RobotiqGripper(ip)`, whose socket timeout is
 /// 2 s in ur_rtde.
@@ -427,10 +427,10 @@ impl PortDriver for GripperDriver {
             // C gates them on the connection and the boot values are lost.
             let mut gripper = self.gripper.lock();
             if reason == p.set_speed {
-                spdlog::debug(format_args!("Setting speed to {value}"));
+                spdlog::debug(format_args!("Setting speed to {}", FmtDouble(value)));
                 gripper.set_speed(value);
             } else if reason == p.set_force {
-                spdlog::debug(format_args!("Setting force to {value}"));
+                spdlog::debug(format_args!("Setting force to {}", FmtDouble(value)));
                 gripper.set_force(value);
             }
             Ok(())
