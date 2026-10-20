@@ -100,9 +100,10 @@ use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
+use epics_rs::base::types::c_parse::strtol;
 
 use motor_common::model1::{MoveStrings, init_poll, init_read};
-use motor_common::util::{nint, parse_int_at, parse_value_at};
+use motor_common::util::{nint, parse_value_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
 const READ_BUF: usize = 100;
@@ -136,20 +137,11 @@ fn parse_status_reg(reply: &str) -> Option<u16> {
     if b.len() <= 2 || b[1] != b'=' {
         return None;
     }
-    // %d skips leading whitespace, then needs an optional sign and >=1 digit.
-    let rest = reply[2..].trim_start();
-    let mut chars = rest.chars();
-    let first = chars.next()?;
-    let has_digit = if first == '+' || first == '-' {
-        chars.next().is_some_and(|c| c.is_ascii_digit())
-    } else {
-        first.is_ascii_digit()
-    };
-    if !has_digit {
-        return None;
+    // glibc's %d is (int) strtol(s, &end, 10).
+    match strtol(&b[2..], 10) {
+        (_, 0) => None,
+        (v, _) => Some(v as i32 as u16),
     }
-    // parse_int_at(rest, 0) mirrors C atoi's leading-integer parse.
-    parse_int_at(rest, 0).map(|v| v as u16)
 }
 
 /// Controller communication state (C `cntrl->status`, per-controller/shared).
@@ -809,6 +801,8 @@ mod tests {
         assert_eq!(parse_status_reg("A="), None); // charcnt <= 2 / no digit
         assert_eq!(parse_status_reg("A=x"), None); // no integer body
         assert_eq!(parse_status_reg(""), None);
+        // %d skips only C isspace, not a UTF-8 no-break space.
+        assert_eq!(parse_status_reg("A=\u{a0}5"), None);
     }
 
     #[test]
