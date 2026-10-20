@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
@@ -695,7 +696,7 @@ impl PortDriver for EigerDriver {
                 line!(),
                 format_args!(
                     "eigerDetector:writeFloat64 error, status={} function={function}, value={value:.6}\n",
-                    e.c_status_code()
+                    e.c_status_code(), value = CFloat(value)
                 ),
             ),
             Ok(()) => {
@@ -703,7 +704,7 @@ impl PortDriver for EigerDriver {
                     TraceMask::IO_DRIVER,
                     file!(),
                     line!(),
-                    format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}\n"),
+                    format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}\n", value = CFloat(value)),
                 );
                 let _ = self.ad.port_base.call_param_callbacks(0);
             }

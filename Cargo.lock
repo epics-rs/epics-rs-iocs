@@ -1223,6 +1223,7 @@ version = "0.1.0"
 dependencies = [
  "ad-plugins-rs",
  "bytes",
+ "epics-libcom-rs",
  "epics-rs",
  "hdf5-reader",
  "libc",
