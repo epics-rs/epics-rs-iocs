@@ -365,7 +365,9 @@ async fn publish_profiles(
         Err(_) => return false,
     };
     // The device echoes the PROFILES mask it acquired with; we can only lay
-    // out a frame that carries both profiles and the sum.
+    // out a frame that carries both profiles and the sum. C never parses the
+    // mask, so it refuses every profile frame as mode 0
+    // (merlinDetector.cpp:217-235); that defect is not copied.
     let expected = MPXPROFILES_XPROFILE | MPXPROFILES_YPROFILE | MPXPROFILES_SUM;
     if header.profile_select != expected {
         trace(
