@@ -141,16 +141,6 @@ pub enum Number {
     Float(f64),
 }
 
-impl std::fmt::Display for Number {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Number::Int(v) => write!(f, "{v}"),
-            Number::Uint(v) => write!(f, "{v}"),
-            Number::Float(v) => write!(f, "{v}"),
-        }
-    }
-}
-
 /// An EPICS scalar the device support can ask a variant to be read into
 /// (`readScalar(epicsInt32|epicsInt64|epicsUInt32|epicsFloat64*)`).
 pub trait ScalarTarget: Copy + Sized + std::fmt::Display {
