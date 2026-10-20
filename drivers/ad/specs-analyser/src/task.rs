@@ -154,8 +154,13 @@ impl Task {
         self.set(reason, ParamValue::Octet(value.into().into()));
     }
 
-    fn set_f64_array(&mut self, reason: usize, value: Vec<f64>) {
-        self.set(reason, ParamValue::Float64Array(value.into()));
+    /// C `doCallbacksFloat64Array(value, n, reason, 0)`: posted at once, not
+    /// stored.
+    fn do_callbacks_f64_array(&mut self, reason: usize, value: Vec<f64>) {
+        let _ = self.driver(move |d| {
+            let value = ParamValue::Float64Array(value.into());
+            let _ = d.ad.port_base.do_callbacks_array(reason, 0, value);
+        });
     }
 
     fn callbacks(&mut self) {
@@ -487,14 +492,14 @@ impl Task {
                     current_data_point = read_end_data_point;
 
                     if iteration == 0 {
-                        self.set_f64_array(
+                        self.do_callbacks_f64_array(
                             self.w.p.acq_spectrum,
                             spectrum[..current_data_point.max(0) as usize].to_vec(),
                         );
                     } else {
-                        self.set_f64_array(self.w.p.acq_spectrum, spectrum.clone());
+                        self.do_callbacks_f64_array(self.w.p.acq_spectrum, spectrum.clone());
                     }
-                    self.set_f64_array(self.w.p.acq_image, image.clone());
+                    self.do_callbacks_f64_array(self.w.p.acq_image, image.clone());
 
                     let pct_iter = if energy_channels > 0 {
                         (current_data_point * 100) / energy_channels
@@ -645,4 +650,84 @@ pub(crate) fn start_task(w: Worker) -> std::thread::JoinHandle<()> {
         .run()
         .await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::plugin::channel::NDArrayOutput;
+    use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+    use epics_rs::asyn::sync_io::SyncIOHandle;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+    use crate::types::SOCKET_TIMEOUT;
+
+    /// The spectrum and the image go out with doCallbacksFloat64Array
+    /// (specsAnalyser.cpp:599-606), typed and in that order.
+    #[test]
+    fn the_spectrum_and_image_post_as_array_callbacks() {
+        let name = "SPECS_ARRAYS";
+        let (driver_port, _) = SyncIOHandle::connect_port(
+            &format!("{name}_NONE"),
+            0,
+            secs(SOCKET_TIMEOUT),
+            InterfaceType::Octet,
+        );
+        let (start, stop) = (Arc::new(Event::new()), Arc::new(Event::new()));
+        let mut driver = SpecsAnalyserDriver::new(
+            name,
+            Arc::new(driver_port),
+            0,
+            1 << 20,
+            start.clone(),
+            stop.clone(),
+        )
+        .unwrap();
+        driver.ad.port_base.own_interrupts(InterruptGate::opened());
+        driver.ad.port_base.call_param_callbacks(0).unwrap();
+        let (p, ad, pool) = (driver.p, driver.ad.params, driver.ad.pool.clone());
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = runtime.port_handle().clone();
+        let mut rx = handle.interrupts().subscribe_async(64, 1 << 20);
+        let mut task = Task {
+            hold: handle.hold_driver_blocking().ok(),
+            w: Worker {
+                self_handle: handle.clone(),
+                p,
+                ad,
+                start,
+                stop,
+                output: ArrayPublisher::new(Arc::new(
+                    parking_lot::Mutex::new(NDArrayOutput::new()),
+                )),
+                pool,
+            },
+            last_status_ok: true,
+            l: Locals::C,
+        };
+        task.do_callbacks_f64_array(p.acq_spectrum, vec![1.0, 2.0]);
+        task.do_callbacks_f64_array(p.acq_image, vec![3.0]);
+        task.callbacks();
+        drop(task);
+
+        let posted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| [p.acq_spectrum, p.acq_image].contains(&v.reason))
+            .map(|v| (v.reason, v.iface))
+            .collect();
+        assert_eq!(
+            posted,
+            [
+                (p.acq_spectrum, Some(InterfaceType::Float64Array)),
+                (p.acq_image, Some(InterfaceType::Float64Array)),
+            ]
+        );
+        std::mem::forget(runtime);
+    }
 }

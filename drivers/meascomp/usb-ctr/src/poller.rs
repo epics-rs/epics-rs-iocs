@@ -97,18 +97,13 @@ fn poller_loop(
             ParamValue::Float64(poll_time.as_secs_f64() * 1000.0),
         )];
         if let Some(data) = snapshot.digital_input {
-            let changed = data ^ prev_digital_input;
-            if force_callback || changed != 0 {
-                prev_digital_input = data;
-                force_callback = false;
-                updates.push(ParamSetValue::uint32_digital(
-                    params.digital_input,
-                    0,
-                    data as u32,
-                    0xFFFF_FFFF,
-                    0,
-                ));
-            }
+            push_digital_in(
+                &mut updates,
+                &params,
+                data,
+                &mut prev_digital_input,
+                &mut force_callback,
+            );
         }
         if let Some(pass) = snapshot.mcs {
             updates.extend(
@@ -131,5 +126,82 @@ fn poller_loop(
             .read_float64_blocking(params.poll_sleep_ms, 0)
             .unwrap_or(50.0);
         std::thread::sleep(Duration::from_secs_f64(poll_ms.max(0.0) / 1000.0));
+    }
+}
+
+/// C's digital-input set of one poll: on the first poll or a changed bit
+/// (drvUSBCTR.cpp:1517-1523).
+fn push_digital_in(
+    updates: &mut Vec<ParamSetValue>,
+    params: &CtrParams,
+    data: u64,
+    prev: &mut u64,
+    force: &mut bool,
+) {
+    if !*force && data == *prev {
+        return;
+    }
+    // C's set carries no interrupt mask, so its first poll fires whatever
+    // paramVal left in the never-initialised uInt32CallbackMask
+    // (paramVal.cpp:34-46). The first poll forces every bit instead, so each
+    // bit record processes once at boot even when its bit reads 0.
+    let interrupt_mask = if *force { 0xFFFF_FFFF } else { 0 };
+    *prev = data;
+    *force = false;
+    updates.push(ParamSetValue::uint32_digital(
+        params.digital_input,
+        0,
+        data as u32,
+        0xFFFF_FFFF,
+        interrupt_mask,
+    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+
+    use super::*;
+
+    #[test]
+    fn the_first_digital_poll_calls_back_every_bit() {
+        let mut base = PortDriverBase::new(
+            "CTRPOLLDI",
+            MAX_MCS_COUNTERS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let params = CtrParams::create(&mut base).unwrap();
+        let (mut prev, mut force) = (0, true);
+        // Every input low: no bit changed, yet each bit record must process.
+        for (poll, want) in [(0, Some(0xFFFF_FFFF)), (1, None)] {
+            let mut updates = Vec::new();
+            push_digital_in(&mut updates, &params, 0, &mut prev, &mut force);
+            assert_eq!(updates.len(), usize::from(want.is_some()), "poll {poll}");
+            for update in &updates {
+                base.set_param(update).unwrap();
+            }
+            if let Some(mask) = want {
+                assert_eq!(
+                    base.params
+                        .take_uint32_interrupt_mask(params.digital_input, 0)
+                        .unwrap(),
+                    mask
+                );
+            }
+        }
+        // A later change calls back the changed bits only.
+        let mut updates = Vec::new();
+        push_digital_in(&mut updates, &params, 0x5, &mut prev, &mut force);
+        for update in &updates {
+            base.set_param(update).unwrap();
+        }
+        assert_eq!(
+            base.params
+                .take_uint32_interrupt_mask(params.digital_input, 0)
+                .unwrap(),
+            0x5
+        );
     }
 }

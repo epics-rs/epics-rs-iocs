@@ -343,9 +343,10 @@ impl Ctx {
     /// the stamp is the port's, so it keeps its place after the worker's
     /// `updateTimeStamp` and posts.
     fn post_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
-        self.shared
-            .port_jobs
-            .push(move |base| crate::driver::do_callbacks_int64_array(base, reason, addr, data));
+        self.shared.port_jobs.push(move |base| {
+            // Only a non-array value is refused.
+            let _ = base.do_callbacks_array(reason, addr, ParamValue::Int64Array(data.into()));
+        });
         self.flush_jobs();
     }
 }
@@ -2339,33 +2340,26 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                 post_window(ctx, Accum::Img, &update).await;
                 let frames = ctx.shared.img.lock().frame_count();
                 post_metrics(ctx, Accum::Img, started).await;
-                ctx.post(
-                    ADDR,
-                    vec![ParamSetValue::new(
-                        p.img_image_frame,
-                        ADDR,
-                        ParamValue::Int32Array(
-                            f.pixels
-                                .iter()
-                                .map(|&v| v as i32)
-                                .collect::<Vec<i32>>()
-                                .into(),
-                        ),
-                    )],
-                );
                 let (total, range) = ctx.shared.img.lock().public_total();
                 post_accum_range(ctx, Accum::Img, range).await;
                 ctx.post_int64(p.img_total_counts, total);
 
-                publish_accumulation(
-                    ctx,
-                    &update,
-                    p.img_image_data,
+                // The running sum, the frame and the window sum, in that
+                // order (serval_stream.cpp:1318-1333). The frame stays stored
+                // as imgCurrentFrame_, which readInt32Array serves.
+                ctx.post_int64_array(p.img_image_data, ADDR, int64_array(&update.running));
+                let frame: Vec<i32> = f.pixels.iter().map(|&v| v as i32).collect();
+                let frame = ParamValue::Int32Array(frame.into());
+                ctx.post(
                     ADDR,
-                    p.img_image_sum_n_frames,
-                    ADDR,
-                )
-                .await;
+                    vec![
+                        ParamSetValue::new(p.img_image_frame, ADDR, frame.clone()),
+                        ParamSetValue::array(p.img_image_frame, ADDR, frame),
+                    ],
+                );
+                if let Some(sum_n) = &update.sum_n {
+                    ctx.post_int64_array(p.img_image_sum_n_frames, ADDR, int64_array(sum_n));
+                }
                 // processImgFrame hands the running sum to the plugins on address 2
                 // and the window sum, when it updates, on 3; C does not check
                 // NDArrayCallbacks here (serval_stream.cpp:1257-1343).
@@ -2445,41 +2439,35 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                         ParamValue::Int32(i32::try_from(frames).unwrap_or(i32::MAX)),
                     ),
                     ParamSetValue::new(p.prv_hst_acq_rate, ADDR, ParamValue::Float64(hst_rate)),
-                    ParamSetValue::new(
-                        p.prv_hst_histogram_frame,
-                        ADDR,
-                        ParamValue::Int32Array(
-                            h.counts
-                                .iter()
-                                .map(|&v| v as i32)
-                                .collect::<Vec<i32>>()
-                                .into(),
-                        ),
-                    ),
                 ],
             );
+            // The window sum, the time axis, the running sum and the frame,
+            // in that order (histogram_io.cpp:619-708).
+            if let Some(sum_n) = &update.sum_n {
+                ctx.post_int64_array(p.prv_hst_histogram_sum_n_frames, ADDR, int64_array(sum_n));
+            }
+            let frame: Vec<i32> = h.counts.iter().map(|&v| v as i32).collect();
             ctx.post(
                 ADDR,
-                vec![ParamSetValue::new(
+                vec![ParamSetValue::array(
                     p.prv_hst_histogram_time_ms,
                     ADDR,
                     ParamValue::Float64Array(h.time_axis_ms().into()),
+                )],
+            );
+            ctx.post_int64_array(p.prv_hst_histogram_data, ADDR, int64_array(&update.running));
+            ctx.post(
+                ADDR,
+                vec![ParamSetValue::array(
+                    p.prv_hst_histogram_frame,
+                    ADDR,
+                    ParamValue::Int32Array(frame.into()),
                 )],
             );
             let (total, range) = ctx.shared.hst.lock().public_total();
             post_accum_range(ctx, Accum::PrvHst, range).await;
             ctx.post_int64(p.prv_hst_total_counts, total);
             post_window(ctx, Accum::PrvHst, &update).await;
-
-            publish_accumulation(
-                ctx,
-                &update,
-                p.prv_hst_histogram_data,
-                ADDR,
-                p.prv_hst_histogram_sum_n_frames,
-                ADDR,
-            )
-            .await;
 
             // histogram_io.cpp:720-830: every frame also goes to the plugins on
             // addresses 4-7, the window sum only on the frames it was updated.
@@ -2780,20 +2768,6 @@ fn frame_rate(
         );
     }
     o.due.then_some(o.rate)
-}
-
-async fn publish_accumulation(
-    ctx: &Arc<Ctx>,
-    update: &Update,
-    sum_param: usize,
-    sum_addr: i32,
-    sum_n_param: usize,
-    sum_n_addr: i32,
-) {
-    ctx.post_int64_array(sum_param, sum_addr, int64_array(&update.running));
-    if let Some(sum_n) = &update.sum_n {
-        ctx.post_int64_array(sum_n_param, sum_n_addr, int64_array(sum_n));
-    }
 }
 
 /// An accumulation as the asynInt64Array interface carries it: C's
@@ -3774,6 +3748,146 @@ mod tests {
         assert_eq!(
             h.read_float64(p.img_memory_usage, 0).await.unwrap(),
             expected
+        );
+        std::mem::forget(runtime);
+    }
+
+    /// A port whose interrupts are open and whose constructor posts are
+    /// made, its stream context, and a subscriber to what follows.
+    fn posting_ctx(
+        name: &str,
+    ) -> (
+        Arc<Ctx>,
+        epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+        epics_rs::asyn::runtime::port::PortRuntimeHandle,
+    ) {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut driver =
+            crate::driver::TimePix3Driver::new(name, http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        let (p, ad) = (driver.p, driver.ad.params);
+        driver.ad.port_base.own_interrupts(InterruptGate::opened());
+        for addr in 0..crate::driver::MAX_ADDR as i32 {
+            driver.ad.port_base.call_param_callbacks(addr).unwrap();
+        }
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let rx = runtime
+            .port_handle()
+            .interrupts()
+            .subscribe_async(4096, 1 << 20);
+        let ctx = Arc::new(Ctx {
+            handle: runtime.port_handle().clone(),
+            http,
+            shared,
+            p,
+            ad,
+            outputs: new_outputs(),
+            pool: DriverPool::standalone(0),
+        });
+        (ctx, rx, runtime)
+    }
+
+    /// The typed posts of `reasons` that reached `rx`, after a round trip
+    /// lets the port's jobs run.
+    /// Every post of `reasons`, with its interface; a flush's is untyped.
+    async fn posts(
+        ctx: &Ctx,
+        rx: &mut epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+        reasons: &[usize],
+    ) -> Vec<(usize, Option<epics_rs::asyn::interfaces::InterfaceType>)> {
+        let _ = ctx.handle.read_int32(ctx.p.img_frames_summed, 0).await;
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| reasons.contains(&v.reason))
+            .map(|v| (v.reason, v.iface))
+            .collect()
+    }
+
+    /// processImgFrame posts the running sum, the current frame and the
+    /// window sum with doCallbacksInt64/Int32Array, in that order
+    /// (serval_stream.cpp:1318-1333).
+    #[tokio::test]
+    async fn an_img_frame_posts_its_arrays_as_array_callbacks_in_c_order() {
+        use crate::stream::PixelFormat;
+        use epics_rs::asyn::interfaces::InterfaceType as I;
+
+        let (ctx, mut rx, runtime) = posting_ctx("TPXIMGARR");
+        let p = ctx.p;
+        set_synced(&ctx, p.img_accumulation_enable, 0, 1).await;
+        ctx.shared.img.lock().set_update_interval(1);
+        let frame = Frame::Image(crate::stream::ImageFrame {
+            width: 2,
+            height: 1,
+            format: PixelFormat::UInt16,
+            frame_number: 1,
+            time_at_frame: 0.0,
+            threshold_id: 0,
+            integration_size: 0,
+            pixels: vec![1, 200],
+            header: serde_json::Value::Null,
+        });
+        handle_frame(&ctx, StreamKind::Img, frame).await;
+        let watched = [
+            p.img_image_data,
+            p.img_image_frame,
+            p.img_image_sum_n_frames,
+        ];
+        assert_eq!(
+            posts(&ctx, &mut rx, &watched).await,
+            [
+                (p.img_image_data, Some(I::Int64Array)),
+                (p.img_image_frame, Some(I::Int32Array)),
+                (p.img_image_sum_n_frames, Some(I::Int64Array)),
+            ]
+        );
+        // readInt32Array still serves the current frame (mask_io.cpp:54-90).
+        let frame = ctx.handle.read_int32_array(p.img_image_frame, 0, 3).await;
+        assert_eq!(frame.unwrap()[..], [1, 200, 0]);
+        std::mem::forget(runtime);
+    }
+
+    /// processPrvHstFrame posts the window sum, the time axis, the running
+    /// sum and the current frame with doCallbacksInt64/Float64/Int32Array,
+    /// in that order (histogram_io.cpp:619-708).
+    #[tokio::test]
+    async fn a_prv_hst_frame_posts_its_arrays_as_array_callbacks_in_c_order() {
+        use epics_rs::asyn::interfaces::InterfaceType as I;
+
+        let (ctx, mut rx, runtime) = posting_ctx("TPXHSTARR");
+        let p = ctx.p;
+        ctx.shared.hst.lock().set_update_interval(1);
+        let frame = Frame::Histogram(crate::stream::HistogramFrame {
+            bin_width: 2,
+            bin_offset: 1,
+            frame_number: 1,
+            time_at_frame: 0.0,
+            counts: vec![1, 2],
+        });
+        handle_frame(&ctx, StreamKind::PrvHst, frame).await;
+        let watched = [
+            p.prv_hst_histogram_sum_n_frames,
+            p.prv_hst_histogram_time_ms,
+            p.prv_hst_histogram_data,
+            p.prv_hst_histogram_frame,
+        ];
+        assert_eq!(
+            posts(&ctx, &mut rx, &watched).await,
+            [
+                (p.prv_hst_histogram_sum_n_frames, Some(I::Int64Array)),
+                (p.prv_hst_histogram_time_ms, Some(I::Float64Array)),
+                (p.prv_hst_histogram_data, Some(I::Int64Array)),
+                (p.prv_hst_histogram_frame, Some(I::Int32Array)),
+            ]
         );
         std::mem::forget(runtime);
     }

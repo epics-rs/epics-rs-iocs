@@ -1,8 +1,7 @@
 //! The BIS areaDetector driver (C `BISDetector.cpp`).
 //!
-//! Ownership: every command to BIS goes through [`BisServer`]; the port actor
-//! owns the parameter library and is the only thing that reacts to a record
-//! write. The two background threads — the acquisition task and the status task
+//! Ownership: the port actor sends every command to BIS and owns the
+//! parameter library; it is the only thing that reacts to a record write. The two background threads — the acquisition task and the status task
 //! — reach the parameter library through the actor and never call into the
 //! driver directly (see the invariant in [`crate::connection`]).
 
@@ -30,7 +29,7 @@ use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
-use crate::connection::{BisServer, Exchange};
+use crate::connection::{Exchange, exchange};
 use crate::filename;
 use crate::params::BrukerParams;
 use crate::protocol;
@@ -66,7 +65,8 @@ pub struct SharedState {
 pub struct BrukerDetector {
     pub ad: ADDriverBase,
     pub params: BrukerParams,
-    server: BisServer,
+    /// C `pasynUserCommand`.
+    command_io: SyncIOHandle,
     shared: Arc<SharedState>,
     commands: rt::CommandSender<TaskCommand>,
     /// C `BISTask`'s `fullFileName` local, kept across frames.
@@ -76,7 +76,7 @@ pub struct BrukerDetector {
 impl BrukerDetector {
     fn new(
         port_name: &str,
-        server: BisServer,
+        command_io: SyncIOHandle,
         max_memory: usize,
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
@@ -113,7 +113,7 @@ impl BrukerDetector {
         let mut det = Self {
             ad,
             params,
-            server,
+            command_io,
             shared,
             commands,
             full_file_name: String::new(),
@@ -126,7 +126,7 @@ impl BrukerDetector {
     /// BISDetector.cpp:309-330). No caller of C's `writeBIS` looks at its
     /// status: a failure is the trace line.
     fn command(&mut self, command: &str, timeout: std::time::Duration) {
-        let (reply, status) = match self.server.command(command, timeout) {
+        let (reply, status) = match exchange(&self.command_io, command, timeout) {
             Exchange::NotSent(e) => (None, Err(e)),
             Exchange::Read { reply, status } => (Some(reply), status),
         };
@@ -378,7 +378,7 @@ pub fn create_bruker_detector(
 
     let det = BrukerDetector::new(
         port_name,
-        BisServer::new(command_handle),
+        command_handle,
         max_memory,
         shared.clone(),
         command_tx,
