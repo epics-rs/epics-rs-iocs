@@ -2339,33 +2339,26 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                 post_window(ctx, Accum::Img, &update).await;
                 let frames = ctx.shared.img.lock().frame_count();
                 post_metrics(ctx, Accum::Img, started).await;
-                ctx.post(
-                    ADDR,
-                    vec![ParamSetValue::new(
-                        p.img_image_frame,
-                        ADDR,
-                        ParamValue::Int32Array(
-                            f.pixels
-                                .iter()
-                                .map(|&v| v as i32)
-                                .collect::<Vec<i32>>()
-                                .into(),
-                        ),
-                    )],
-                );
                 let (total, range) = ctx.shared.img.lock().public_total();
                 post_accum_range(ctx, Accum::Img, range).await;
                 ctx.post_int64(p.img_total_counts, total);
 
-                publish_accumulation(
-                    ctx,
-                    &update,
-                    p.img_image_data,
+                // The running sum, the frame and the window sum, in that
+                // order (serval_stream.cpp:1318-1333). The frame stays stored
+                // as imgCurrentFrame_, which readInt32Array serves.
+                ctx.post_int64_array(p.img_image_data, ADDR, int64_array(&update.running));
+                let frame: Vec<i32> = f.pixels.iter().map(|&v| v as i32).collect();
+                let frame = ParamValue::Int32Array(frame.into());
+                ctx.post(
                     ADDR,
-                    p.img_image_sum_n_frames,
-                    ADDR,
-                )
-                .await;
+                    vec![
+                        ParamSetValue::new(p.img_image_frame, ADDR, frame.clone()),
+                        ParamSetValue::array(p.img_image_frame, ADDR, frame),
+                    ],
+                );
+                if let Some(sum_n) = &update.sum_n {
+                    ctx.post_int64_array(p.img_image_sum_n_frames, ADDR, int64_array(sum_n));
+                }
                 // processImgFrame hands the running sum to the plugins on address 2
                 // and the window sum, when it updates, on 3; C does not check
                 // NDArrayCallbacks here (serval_stream.cpp:1257-1343).
@@ -3775,6 +3768,109 @@ mod tests {
             h.read_float64(p.img_memory_usage, 0).await.unwrap(),
             expected
         );
+        std::mem::forget(runtime);
+    }
+
+    /// A port whose interrupts are open and whose constructor posts are
+    /// made, its stream context, and a subscriber to what follows.
+    fn posting_ctx(
+        name: &str,
+    ) -> (
+        Arc<Ctx>,
+        epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+        epics_rs::asyn::runtime::port::PortRuntimeHandle,
+    ) {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut driver =
+            crate::driver::TimePix3Driver::new(name, http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        let (p, ad) = (driver.p, driver.ad.params);
+        driver.ad.port_base.own_interrupts(InterruptGate::opened());
+        for addr in 0..crate::driver::MAX_ADDR as i32 {
+            driver.ad.port_base.call_param_callbacks(addr).unwrap();
+        }
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let rx = runtime
+            .port_handle()
+            .interrupts()
+            .subscribe_async(4096, 1 << 20);
+        let ctx = Arc::new(Ctx {
+            handle: runtime.port_handle().clone(),
+            http,
+            shared,
+            p,
+            ad,
+            outputs: new_outputs(),
+            pool: DriverPool::standalone(0),
+        });
+        (ctx, rx, runtime)
+    }
+
+    /// The typed posts of `reasons` that reached `rx`, after a round trip
+    /// lets the port's jobs run.
+    async fn typed_posts(
+        ctx: &Ctx,
+        rx: &mut epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+        reasons: &[usize],
+    ) -> Vec<(usize, epics_rs::asyn::interfaces::InterfaceType)> {
+        let _ = ctx.handle.read_int32(ctx.p.img_frames_summed, 0).await;
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| reasons.contains(&v.reason))
+            .filter_map(|v| v.iface.map(|iface| (v.reason, iface)))
+            .collect()
+    }
+
+    /// processImgFrame posts the running sum, the current frame and the
+    /// window sum with doCallbacksInt64/Int32Array, in that order
+    /// (serval_stream.cpp:1318-1333).
+    #[tokio::test]
+    async fn an_img_frame_posts_its_arrays_as_array_callbacks_in_c_order() {
+        use crate::stream::PixelFormat;
+        use epics_rs::asyn::interfaces::InterfaceType as I;
+
+        let (ctx, mut rx, runtime) = posting_ctx("TPXIMGARR");
+        let p = ctx.p;
+        set_synced(&ctx, p.img_accumulation_enable, 0, 1).await;
+        ctx.shared.img.lock().set_update_interval(1);
+        let frame = Frame::Image(crate::stream::ImageFrame {
+            width: 2,
+            height: 1,
+            format: PixelFormat::UInt16,
+            frame_number: 1,
+            time_at_frame: 0.0,
+            threshold_id: 0,
+            integration_size: 0,
+            pixels: vec![1, 200],
+            header: serde_json::Value::Null,
+        });
+        handle_frame(&ctx, StreamKind::Img, frame).await;
+        let watched = [
+            p.img_image_data,
+            p.img_image_frame,
+            p.img_image_sum_n_frames,
+        ];
+        assert_eq!(
+            typed_posts(&ctx, &mut rx, &watched).await,
+            [
+                (p.img_image_data, I::Int64Array),
+                (p.img_image_frame, I::Int32Array),
+                (p.img_image_sum_n_frames, I::Int64Array),
+            ]
+        );
+        // readInt32Array still serves the current frame (mask_io.cpp:54-90).
+        let frame = ctx.handle.read_int32_array(p.img_image_frame, 0, 3).await;
+        assert_eq!(frame.unwrap()[..], [1, 200, 0]);
         std::mem::forget(runtime);
     }
 
