@@ -179,6 +179,34 @@ impl ReceiveParams {
         reason == self.disconnect || reason == self.reconnect
     }
 
+    /// The arrays in C's post order (rtde_receive_driver.cpp:140-206), each
+    /// empty until the first pass reads it.
+    fn empty_arrays(&self) -> Vec<(usize, ParamValue)> {
+        let mut arrays = vec![(self.joint_modes, ParamValue::Int32Array(Vec::new().into()))];
+        for reason in [
+            self.actual_tool_accel,
+            self.actual_joint_pos_arr,
+            self.actual_tcp_pose_arr,
+            self.actual_joint_velocities,
+            self.actual_joint_currents,
+            self.joint_control_currents,
+            self.actual_tcp_speed,
+            self.actual_tcp_force,
+            self.target_joint_positions,
+            self.target_joint_velocities,
+            self.target_joint_accelerations,
+            self.target_joint_currents,
+            self.target_joint_moments,
+            self.target_tcp_pose,
+            self.target_tcp_speed,
+            self.joint_temperatures,
+            self.actual_joint_voltages,
+        ] {
+            arrays.push((reason, ParamValue::Float64Array(Vec::new().into())));
+        }
+        arrays
+    }
+
     /// Every readback `(reason, addr)` the poll thread publishes — the set
     /// that carries the COMM alarm while the stream is down. Excluded: the
     /// two link commands (nothing to alarm on a command), and
@@ -407,6 +435,7 @@ pub fn start_poller(
             // the COMM alarm on its first cycle instead of waiting for a
             // connection that may never come.
             let mut was_healthy = true;
+            let mut last_arrays = params.empty_arrays();
             loop {
                 let healthy = {
                     let slot = iface.lock();
@@ -432,7 +461,7 @@ pub fn start_poller(
                         .map(|i| i.snapshot())
                 };
 
-                let mut updates = match &snapshot {
+                let pass = match &snapshot {
                     Some(snap) if !snap.is_empty() => {
                         // A param keeps its last value through an outage, as
                         // C's does; only a received word replaces it.
@@ -447,13 +476,14 @@ pub fn start_poller(
                         shared.set(state);
                         publish(params, snap)
                     }
-                    _ => {
-                        vec![ParamSetValue::new(
+                    _ => Pass {
+                        scalars: vec![ParamSetValue::new(
                             params.is_connected,
                             0,
                             ParamValue::Int32(0),
-                        )]
-                    }
+                        )],
+                        arrays: Vec::new(),
+                    },
                 };
 
                 // Same predicate as the publish arm above, so the alarm
@@ -462,19 +492,65 @@ pub fn start_poller(
                 // the fresh values.
                 let healthy_now = matches!(&snapshot, Some(s) if !s.is_empty());
                 if ready.is_open() {
-                    updates.extend(crate::drivers::health_transition(
+                    let alarm = crate::drivers::health_transition(
                         &alarm_targets,
                         healthy_now,
                         &mut was_healthy,
-                    ));
-                    for (addr, batch) in by_addr(updates) {
-                        let _ = handle.set_params_and_notify_blocking(addr, batch);
-                    }
+                    );
+                    post_pass(&handle, pass, alarm, &mut last_arrays);
                 }
                 std::thread::sleep(poll_period);
             }
         })
         .expect("failed to spawn the RTDE receive poll thread")
+}
+
+/// One poll's values: the arrays C posts with doCallbacks*Array as its pass
+/// reads them, in its order (rtde_receive_driver.cpp:140-206), and the
+/// scalars it flushes at the end.
+struct Pass {
+    scalars: Vec<ParamSetValue>,
+    arrays: Vec<(usize, ParamValue)>,
+}
+
+/// Post one pass as C does: the arrays first, then `callParamCallbacks` per
+/// address (rtde_receive_driver.cpp:210-212). The COMM alarm (rs only) is
+/// stored before either, since an array post reads its param's status, and
+/// on a health transition each array the pass did not post goes out again
+/// with its last value, so its record carries the alarm too.
+fn post_pass(
+    handle: &PortHandle,
+    pass: Pass,
+    alarm: Vec<ParamSetValue>,
+    last_arrays: &mut [(usize, ParamValue)],
+) {
+    let transition = !alarm.is_empty();
+    let alarm = by_addr(alarm);
+    for (addr, batch) in &alarm {
+        let _ = handle.set_params_blocking(*addr, batch.clone());
+    }
+    let mut posted = Vec::new();
+    for (reason, value) in pass.arrays {
+        if let Some(last) = last_arrays.iter_mut().find(|(r, _)| *r == reason) {
+            last.1 = value.clone();
+        }
+        let _ = handle.do_callbacks_array_blocking(reason, 0, value);
+        posted.push(reason);
+    }
+    if transition {
+        for (reason, value) in last_arrays.iter().filter(|(r, _)| !posted.contains(r)) {
+            let _ = handle.do_callbacks_array_blocking(*reason, 0, value.clone());
+        }
+    }
+    let mut batches = by_addr(pass.scalars);
+    for (addr, _) in alarm {
+        if !batches.iter().any(|(a, _)| *a == addr) {
+            batches.push((addr, Vec::new()));
+        }
+    }
+    for (addr, batch) in batches {
+        let _ = handle.set_params_and_notify_blocking(addr, batch);
+    }
 }
 
 /// Split a poll batch into one flush per address list.
@@ -501,8 +577,8 @@ fn deg(rad: f64) -> f64 {
     rad * 180.0 / std::f64::consts::PI
 }
 
-/// Read one snapshot into the parameter updates the C++ poll loop performs.
-fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
+/// Read one snapshot into the posts the C++ poll loop makes.
+fn publish(p: ReceiveParams, snap: &Snapshot) -> Pass {
     let mut updates = Vec::new();
     let mut int32 = |reason: usize, value: i32| {
         updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(value)))
@@ -555,38 +631,14 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
         }
     }
 
-    // Arrays that go out unconverted.
-    for (reason, name) in [
-        (p.actual_joint_velocities, "actual_qd"),
-        (p.actual_joint_currents, "actual_current"),
-        (p.joint_control_currents, "joint_control_output"),
-        (p.actual_tcp_speed, "actual_TCP_speed"),
-        (p.actual_tcp_force, "actual_TCP_force"),
-        (p.target_joint_positions, "target_q"),
-        (p.target_joint_velocities, "target_qd"),
-        (p.target_joint_accelerations, "target_qdd"),
-        (p.target_joint_currents, "target_current"),
-        (p.target_joint_moments, "target_moment"),
-        (p.target_tcp_pose, "target_TCP_pose"),
-        (p.target_tcp_speed, "target_TCP_speed"),
-        (p.joint_temperatures, "joint_temperatures"),
-        (p.actual_joint_voltages, "actual_joint_voltage"),
-        (p.actual_tool_accel, "actual_tool_accelerometer"),
-    ] {
-        if let Some(v) = snap.doubles(name) {
-            updates.push(ParamSetValue::new(
-                reason,
-                0,
-                ParamValue::Float64Array(v.to_vec().into()),
-            ));
-        }
-    }
-
+    let mut arrays = Vec::new();
     if let Some(v) = snap.ints("joint_mode") {
-        updates.push(ParamSetValue::new(
-            p.joint_modes,
-            0,
-            ParamValue::Int32Array(v.to_vec().into()),
+        arrays.push((p.joint_modes, ParamValue::Int32Array(v.to_vec().into())));
+    }
+    if let Some(v) = snap.doubles("actual_tool_accelerometer") {
+        arrays.push((
+            p.actual_tool_accel,
+            ParamValue::Float64Array(v.to_vec().into()),
         ));
     }
 
@@ -600,9 +652,8 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
                 ParamValue::Float64(*v),
             ));
         }
-        updates.push(ParamSetValue::new(
+        arrays.push((
             p.actual_joint_pos_arr,
-            0,
             ParamValue::Float64Array(degrees.into()),
         ));
     }
@@ -623,14 +674,38 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
                 ParamValue::Float64(*v),
             ));
         }
-        updates.push(ParamSetValue::new(
+        arrays.push((
             p.actual_tcp_pose_arr,
-            0,
             ParamValue::Float64Array(converted.into()),
         ));
     }
 
-    updates
+    // Arrays that go out unconverted.
+    for (reason, name) in [
+        (p.actual_joint_velocities, "actual_qd"),
+        (p.actual_joint_currents, "actual_current"),
+        (p.joint_control_currents, "joint_control_output"),
+        (p.actual_tcp_speed, "actual_TCP_speed"),
+        (p.actual_tcp_force, "actual_TCP_force"),
+        (p.target_joint_positions, "target_q"),
+        (p.target_joint_velocities, "target_qd"),
+        (p.target_joint_accelerations, "target_qdd"),
+        (p.target_joint_currents, "target_current"),
+        (p.target_joint_moments, "target_moment"),
+        (p.target_tcp_pose, "target_TCP_pose"),
+        (p.target_tcp_speed, "target_TCP_speed"),
+        (p.joint_temperatures, "joint_temperatures"),
+        (p.actual_joint_voltages, "actual_joint_voltage"),
+    ] {
+        if let Some(v) = snap.doubles(name) {
+            arrays.push((reason, ParamValue::Float64Array(v.to_vec().into())));
+        }
+    }
+
+    Pass {
+        scalars: updates,
+        arrays,
+    }
 }
 
 #[cfg(test)]
@@ -736,9 +811,10 @@ mod tests {
                 0.0,
             ]),
         );
-        let updates = publish(p, &Snapshot::new(values));
+        let pass = publish(p, &Snapshot::new(values));
 
-        let per_addr: Vec<(i32, f64)> = updates
+        let per_addr: Vec<(i32, f64)> = pass
+            .scalars
             .iter()
             .filter_map(|u| match u {
                 ParamSetValue::Value {
@@ -753,14 +829,13 @@ mod tests {
         assert!((per_addr[1].1 - 90.0).abs() < 1e-9);
         assert!((per_addr[2].1 + 180.0).abs() < 1e-9);
 
-        let arr = updates
+        let arr = pass
+            .arrays
             .iter()
-            .find_map(|u| match u {
-                ParamSetValue::Value {
-                    reason,
-                    value: ParamValue::Float64Array(value),
-                    ..
-                } if *reason == p.actual_joint_pos_arr => Some(value.clone()),
+            .find_map(|(reason, value)| match value {
+                ParamValue::Float64Array(value) if *reason == p.actual_joint_pos_arr => {
+                    Some(value.clone())
+                }
                 _ => None,
             })
             .expect("joint position array");
@@ -776,15 +851,14 @@ mod tests {
             "actual_TCP_pose".to_string(),
             Value::Doubles(vec![0.1, -0.2, 0.35, std::f64::consts::PI, 0.0, 0.0]),
         );
-        let updates = publish(p, &Snapshot::new(values));
-        let arr = updates
+        let pass = publish(p, &Snapshot::new(values));
+        let arr = pass
+            .arrays
             .iter()
-            .find_map(|u| match u {
-                ParamSetValue::Value {
-                    reason,
-                    value: ParamValue::Float64Array(value),
-                    ..
-                } if *reason == p.actual_tcp_pose_arr => Some(value.clone()),
+            .find_map(|(reason, value)| match value {
+                ParamValue::Float64Array(value) if *reason == p.actual_tcp_pose_arr => {
+                    Some(value.clone())
+                }
                 _ => None,
             })
             .expect("TCP pose array");
@@ -802,7 +876,7 @@ mod tests {
             "safety_status_bits".to_string(),
             Value::Uint32(0xffff_f801), // high bits set, plus NORMAL
         );
-        let updates = publish(p, &Snapshot::new(values));
+        let updates = publish(p, &Snapshot::new(values)).scalars;
         let bits = updates
             .iter()
             .find_map(|u| match u {
@@ -822,7 +896,7 @@ mod tests {
         let p = params();
         let mut values = HashMap::new();
         values.insert("timestamp".to_string(), Value::Double(3.5));
-        let updates = publish(p, &Snapshot::new(values));
+        let updates = publish(p, &Snapshot::new(values)).scalars;
         assert!(updates.iter().any(|u| matches!(
             u,
             ParamSetValue::Value { reason, value: ParamValue::Float64(value), .. }
@@ -852,7 +926,7 @@ mod tests {
             "actual_TCP_pose".to_string(),
             Value::Doubles(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
         );
-        let updates = publish(p, &Snapshot::new(values));
+        let updates = publish(p, &Snapshot::new(values)).scalars;
         let total = updates.len();
 
         let batches = by_addr(updates);
@@ -872,9 +946,161 @@ mod tests {
         let p = params();
         let mut values = HashMap::new();
         values.insert("timestamp".to_string(), Value::Double(3.5));
-        let batches = by_addr(publish(p, &Snapshot::new(values)));
+        let batches = by_addr(publish(p, &Snapshot::new(values)).scalars);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].0, 0);
+    }
+
+    /// A receive port on its actor with interrupts open and the
+    /// constructor's posts already made, and a subscriber to everything.
+    fn posting_port(
+        name: &str,
+    ) -> (
+        PortHandle,
+        ReceiveParams,
+        epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+        epics_rs::asyn::runtime::port::PortRuntimeHandle,
+    ) {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let mut base = PortDriverBase::new(
+            name,
+            NUM_JOINTS,
+            PortFlags {
+                multi_device: true,
+                can_block: true,
+                destructible: true,
+            },
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let params = ReceiveParams::create(&mut base).expect("params create");
+        base.own_interrupts(InterruptGate::opened());
+        for addr in 0..NUM_JOINTS as i32 {
+            base.call_param_callbacks(addr).unwrap();
+        }
+        let driver = ReceiveDriver {
+            base,
+            params,
+            iface: Arc::new(Mutex::new(None)),
+            robot_ip: String::new(),
+            shared: ReceiveHandle::new(),
+        };
+        let (rt, _actor) =
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = rt.port_handle().clone();
+        let rx = handle.interrupts().subscribe_async(256, 1024);
+        (handle, params, rx, rt)
+    }
+
+    /// What reached the subscriber, after a round trip lets it land.
+    fn drained(
+        handle: &PortHandle,
+        rx: &mut epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+    ) -> Vec<epics_rs::asyn::interrupt::InterruptValue> {
+        handle.call_param_callbacks_blocking(0).unwrap();
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// C's pass posts each array with doCallbacks*Array as it reads it, on
+    /// its array interface, and flushes the scalars at the end
+    /// (rtde_receive_driver.cpp:140-212).
+    #[test]
+    fn a_pass_posts_its_arrays_typed_before_its_scalars() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        let (handle, p, mut rx, _rt) = posting_port("RECV_ARRAY_ORDER");
+        let pass = Pass {
+            scalars: vec![ParamSetValue::new(p.robot_mode, 0, ParamValue::Int32(7))],
+            arrays: vec![
+                (p.joint_modes, ParamValue::Int32Array(vec![1; 6].into())),
+                (
+                    p.actual_tool_accel,
+                    ParamValue::Float64Array(vec![0.5; 3].into()),
+                ),
+            ],
+        };
+        post_pass(&handle, pass, Vec::new(), &mut p.empty_arrays());
+        let posted: Vec<_> = drained(&handle, &mut rx)
+            .into_iter()
+            .map(|v| (v.reason, v.iface))
+            .collect();
+        assert_eq!(
+            posted,
+            [
+                (p.joint_modes, Some(InterfaceType::Int32Array)),
+                (p.actual_tool_accel, Some(InterfaceType::Float64Array)),
+                (p.robot_mode, None),
+            ]
+        );
+    }
+
+    /// The rs COMM alarm: a raise posts every array again with its last
+    /// value under the alarm, and the recovery pass posts each array once,
+    /// fresh where it read one. Only the typed posts, which are the ones
+    /// post_pass makes, are counted.
+    #[test]
+    fn a_health_transition_posts_every_array_once_under_the_new_status() {
+        use crate::drivers::health_transition;
+        use epics_rs::asyn::error::AsynStatus;
+        let (handle, p, mut rx, _rt) = posting_port("RECV_ARRAY_ALARM");
+        let targets = p.alarm_targets();
+        let mut last = p.empty_arrays();
+        let mut was = true;
+        let modes = |n: i32| (p.joint_modes, ParamValue::Int32Array(vec![n; 6].into()));
+        post_pass(
+            &handle,
+            Pass {
+                scalars: Vec::new(),
+                arrays: vec![modes(1)],
+            },
+            health_transition(&targets, true, &mut was),
+            &mut last,
+        );
+        drained(&handle, &mut rx);
+
+        let lost = Pass {
+            scalars: vec![ParamSetValue::new(p.is_connected, 0, ParamValue::Int32(0))],
+            arrays: Vec::new(),
+        };
+        post_pass(
+            &handle,
+            lost,
+            health_transition(&targets, false, &mut was),
+            &mut last,
+        );
+        let arrays: Vec<_> = drained(&handle, &mut rx)
+            .into_iter()
+            .filter(|v| v.iface.is_some())
+            .collect();
+        assert_eq!(arrays.len(), last.len());
+        assert!(
+            arrays
+                .iter()
+                .all(|v| v.aux_status == AsynStatus::Disconnected)
+        );
+        assert!(matches!(&arrays[0].value, ParamValue::Int32Array(a) if a[..] == [1; 6]));
+
+        let back = Pass {
+            scalars: Vec::new(),
+            arrays: vec![modes(2)],
+        };
+        post_pass(
+            &handle,
+            back,
+            health_transition(&targets, true, &mut was),
+            &mut last,
+        );
+        let arrays: Vec<_> = drained(&handle, &mut rx)
+            .into_iter()
+            .filter(|v| v.iface.is_some())
+            .collect();
+        assert_eq!(arrays.len(), last.len(), "an array went out twice");
+        assert!(arrays.iter().all(|v| v.aux_status == AsynStatus::Success));
+        assert!(matches!(&arrays[0].value, ParamValue::Int32Array(a) if a[..] == [2; 6]));
     }
 
     /// The gate's own boundary, on the one command whose action is reachable
