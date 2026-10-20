@@ -13,8 +13,6 @@
 //! `MAX_CALC_CHAN` = 200 (`drvGM10.c:238`), the same over-wide-bound defect
 //! family as K/W, just via a bare literal instead of a stale macro.
 
-use std::ffi::c_long;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelFamily {
     Signal,
@@ -73,31 +71,11 @@ pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
 }
 
 /// C `int i = strtol(s, &end, 10)`, which every devGM10 `atoi`/`strtol`
-/// caller writes: optional leading whitespace and sign, then decimal
-/// digits, stopping at the first non-digit and saturating at `LONG_MIN` /
-/// `LONG_MAX` before the `int` conversion. Returns that `int` and the
-/// unparsed tail, which is `s` itself when there are no digits.
+/// caller writes: that `int` and the unparsed tail, which is `s` itself when
+/// there are no digits.
 pub fn strtol(s: &str) -> (i32, &str) {
-    let body = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let (neg, unsigned) = match body.as_bytes().first() {
-        Some(b'-') => (true, &body[1..]),
-        Some(b'+') => (false, &body[1..]),
-        _ => (false, body),
-    };
-    let n = unsigned.bytes().take_while(u8::is_ascii_digit).count();
-    if n == 0 {
-        return (0, s);
-    }
-    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
-    let long = unsigned[..n].bytes().fold(0 as c_long, |acc, d| {
-        let d = c_long::from(d - b'0');
-        if neg {
-            acc.saturating_mul(10).saturating_sub(d)
-        } else {
-            acc.saturating_mul(10).saturating_add(d)
-        }
-    });
-    (long as i32, &unsigned[n..])
+    let (long, end) = epics_rs::base::types::c_parse::strtol(s, 10);
+    (long as i32, &s[end..])
 }
 
 /// Parse a family-prefixed channel address: bare digits (`Signal`, 1-999),
