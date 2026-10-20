@@ -37,7 +37,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
+};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{
@@ -707,11 +709,10 @@ pub struct SpiiPlusAxis {
     /// True only for a config-listed virtual axis (home / set-position error, as
     /// in C, independent of the dummy path).
     is_virtual: bool,
-    /// Last non-zero feedback-velocity direction (C updates direction only while
-    /// the axis is moving); 0 until then, as asynMotorAxis's status starts.
-    last_direction: bool,
     /// The readbacks the last poll set, for the poller's callParamCallbacks.
     sets: PortSets,
+    /// What the constructor set, for the loop to apply.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl SpiiPlusAxis {
@@ -726,8 +727,12 @@ impl SpiiPlusAxis {
             dummy: setup.dummy,
             resolution: setup.resolution,
             is_virtual: setup.is_virtual,
-            last_direction: false,
             sets: PortSets::default(),
+            // SPiiPlusDriver.cpp:746-748.
+            status_writes: vec![
+                StatusWrite::HasEncoder(true),
+                StatusWrite::GainSupport(true),
+            ],
         }
     }
 
@@ -901,25 +906,25 @@ impl AsynMotor for SpiiPlusAxis {
         let fvel = at(&polled.feedback_velocity);
         let ast = bits(&polled.axis_status);
 
-        let (moving, powered, high_limit, low_limit, encoder) = if self.reduced {
+        status.position = apos;
+        let (moving, powered) = if self.reduced {
             // Dummy/virtual: motion from AST, no faults; the encoder is the
             // commanded position, or VPOS for a virtual axis that has it.
-            let encoder = if !self.dummy && ctrl.vpos_supported {
+            status.encoder_position = if !self.dummy && ctrl.vpos_supported {
                 at(&polled.virtual_feedback_position) / ctrl.encoder_factor[a]
             } else {
                 apos
             };
-            ((ast & AST_MOTION) != 0, false, false, false, encoder)
+            status.low_limit = false;
+            status.high_limit = false;
+            ((ast & AST_MOTION) != 0, false)
         } else {
-            let mst = bits(&polled.motor_status);
+            status.encoder_position = at(&polled.feedback_position) / ctrl.encoder_factor[a];
             let fault = bits(&polled.fault_status);
-            (
-                (mst & MST_MOTION) != 0,
-                (mst & MST_ENABLED) != 0,
-                (fault & FAULT_HARD_RIGHT_LIMIT) != 0,
-                (fault & FAULT_HARD_LEFT_LIMIT) != 0,
-                at(&polled.feedback_position) / ctrl.encoder_factor[a],
-            )
+            status.low_limit = (fault & FAULT_HARD_LEFT_LIMIT) != 0;
+            status.high_limit = (fault & FAULT_HARD_RIGHT_LIMIT) != 0;
+            let mst = bits(&polled.motor_status);
+            ((mst & MST_MOTION) != 0, (mst & MST_ENABLED) != 0)
         };
         let readbacks = self.readbacks(&ctrl);
         // C stores the poller's `moving` from before this axis's poll, the
@@ -933,36 +938,29 @@ impl AsynMotor for SpiiPlusAxis {
             self.sets.axis(reason, value);
         }
 
+        // C sets no motorVelocity_, so RVEL stays 0.
+        status.done = !moving;
+        status.msta_moving = moving;
+        status.powered = powered;
         // C updates the direction bit only while moving and only on a non-zero
         // feedback velocity; otherwise it keeps the previous direction.
         if moving {
             if fvel > 0.0 {
-                self.last_direction = true;
+                status.direction = true;
             } else if fvel < 0.0 {
-                self.last_direction = false;
+                status.direction = false;
             }
         }
-
-        *status = MotorStatus {
-            position: apos,
-            encoder_position: encoder,
-            // C sets no motorVelocity_, so RVEL stays 0.
-            done: !moving,
-            moving,
-            msta_moving: moving,
-            high_limit,
-            low_limit,
-            direction: self.last_direction,
-            powered,
-            has_encoder: true,
-            gain_support: true,
-            ..MotorStatus::default()
-        };
+        status.moving = moving;
         Ok(())
     }
 
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 }
 
@@ -1998,17 +1996,37 @@ mod tests {
         assert_eq!((status.position, status.encoder_position), (0.5, 4.0));
     }
 
+    /// SPiiPlusDriver.cpp:746-748.
+    #[test]
+    fn the_constructor_sets_has_encoder_and_gain_support() {
+        let (ctrl, _line) = fake("spiiCtor", 1, &[("EFAC", &[1.0])]);
+        let mut axis = SpiiPlusAxis::new(ctrl, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [
+                StatusWrite::HasEncoder(true),
+                StatusWrite::GainSupport(true)
+            ]
+        );
+    }
+
     #[test]
     fn direction_is_zero_until_a_move_runs_forward() {
         let (ctrl, line) = fake("spiiDir", 1, &[("EFAC", &[1.0]), ("FVEL", &[2.0])]);
         let mut axis = SpiiPlusAxis::new(ctrl.clone(), 0);
+        let mut status = MotorStatus::default();
+        let mut pass = || {
+            ctrl.lock().unwrap().poll().unwrap();
+            axis.poll(&AsynUser::default(), &mut status).unwrap();
+            status.direction
+        };
         // Stationary: C leaves motorStatusDirection_ unset.
-        assert!(!pass(&ctrl, &mut axis).direction);
+        assert!(!pass());
         line.lock().unwrap().set("MST", &[f64::from(MST_MOTION)]);
-        assert!(pass(&ctrl, &mut axis).direction);
+        assert!(pass());
         line.lock().unwrap().set("MST", &[0.0]);
         line.lock().unwrap().set("FVEL", &[-2.0]);
-        assert!(pass(&ctrl, &mut axis).direction);
+        assert!(pass());
     }
 
     /// C sets no motorStatusHomed_: MFLAGS HOME goes to
