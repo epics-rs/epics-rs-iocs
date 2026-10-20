@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::{ADStatus, ShutterMode};
 use epics_rs::ad_core::params::ADBaseParams;
@@ -186,7 +187,10 @@ impl Camserver {
         if status != AsynStatus::Success {
             cam_trace(&format!(
                 "pilatusDetector:readCamserver, timeout={timeout:.6}, status={} received {} bytes\n{}\n",
-                status as i32, nread, self.from
+                status as i32,
+                nread,
+                self.from,
+                timeout = CFloat(timeout)
             ));
         } else if !reply_is_ok(&self.from) {
             cam_trace(&format!(
