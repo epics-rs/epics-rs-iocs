@@ -12,13 +12,14 @@ use std::sync::Arc;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::block_on_sync;
 use epics_rs::base::server::RecordFactory;
+use epics_rs::base::types::c_parse::strtoul_auto;
 
 use crate::client::ClientSecurity;
 use crate::defaults;
 use crate::link::split_escaped;
 use crate::record::OpcuaItemRecord;
 use crate::registry::Registry;
-use crate::session::{Control, SessionConfig, strtoul};
+use crate::session::{Control, SessionConfig};
 use crate::subscription::SubscriptionConfig;
 
 /// The `opcuaItem` record-type factory, for
@@ -177,7 +178,7 @@ fn debug_requested(options: &[(String, String)]) -> bool {
     options
         .iter()
         .rfind(|(key, _)| key == "debug")
-        .is_some_and(|(_, value)| strtoul(value) != 0)
+        .is_some_and(|(_, value)| strtoul_auto(value) != 0)
 }
 
 /// `opcuaSession(name, URL, [options])` (`iocshIntegration.cpp:124-183`).
