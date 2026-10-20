@@ -6,6 +6,7 @@
 //! from the frame start).
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::types::c_parse::atoi;
 
 use crate::cache::ModuleType;
 
@@ -272,8 +273,7 @@ pub fn classify_module(set_message: &[u8]) -> Option<(ModuleType, [i32; 2])> {
         // C `continue`s before assigning channel_number for PID/UNKNOWN.
         return Some((module_type, [0, 0]));
     }
-    let digits = &after_dash[..scan_digits(after_dash, 0)];
-    let v: i32 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    let v = atoi(after_dash);
     let channel_number = match module_type {
         ModuleType::InputAnalog | ModuleType::InputDigital | ModuleType::InputPulse => [v, 0],
         ModuleType::OutputAnalog | ModuleType::OutputDigital => [0, v],
@@ -325,20 +325,12 @@ fn scan_digits(payload: &[u8], from: usize) -> usize {
     i
 }
 
-/// `atoi` over `payload[from..to]`, rejecting an empty digit run (an
-/// address of 0 or less would otherwise wrap to a huge `usize` at the
-/// `- 1` cast below; C's `atoi` on empty/garbage input silently returns 0
-/// and indexes `array[-1]`, which is undefined behavior we do not
-/// reproduce — this is a parse-boundary safety net, not a protocol guess).
-fn parse_1based_index(payload: &[u8], from: usize, to: usize) -> Option<usize> {
-    if to <= from {
-        return None;
-    }
-    let n: i64 = std::str::from_utf8(&payload[from..to]).ok()?.parse().ok()?;
-    if n < 1 {
-        return None;
-    }
-    Some((n - 1) as usize)
+/// `atoi(ptr) - 1` from `payload[from..]`. C indexes its arrays with an
+/// address of 0 or less too (`array[-1]`, undefined); that is refused here.
+fn parse_1based_index(payload: &[u8], from: usize) -> Option<usize> {
+    usize::try_from(atoi(payload.get(from..)?))
+        .ok()?
+        .checked_sub(1)
 }
 
 /// Every line, regardless of channel family, is dropped by C when the
@@ -374,8 +366,7 @@ pub fn parse_fchinfo(payload: &[u8]) -> Vec<ChannelInfoLine> {
                 continue;
             }
         };
-        let digits_end = scan_digits(payload, p);
-        let Some(index) = parse_1based_index(payload, p, digits_end) else {
+        let Some(index) = parse_1based_index(payload, p) else {
             break;
         };
         // Fixed 4-byte jump from where `atoi` started reading, independent
@@ -476,8 +467,7 @@ fn parse_range_lines(
             return Err(out);
         }
         p += 1;
-        let digits_end = scan_digits(payload, p);
-        let Some(index) = parse_1based_index(payload, p, digits_end) else {
+        let Some(index) = parse_1based_index(payload, p) else {
             break;
         };
         // Fixed 4-byte jump from where `atoi` started (`drvGM10.c:794`:
@@ -530,8 +520,7 @@ pub fn parse_srangemath(payload: &[u8]) -> Vec<ExprLine> {
     let mut p = 0usize;
     while p < payload.len() && payload[p] != b'E' {
         p += 11;
-        let digits_end = scan_digits(payload, p);
-        let Some(index) = parse_1based_index(payload, p, digits_end) else {
+        let Some(index) = parse_1based_index(payload, p) else {
             break;
         };
         // Fixed 5-byte jump from where `atoi` started (`drvGM10.c:885`:
@@ -653,7 +642,7 @@ pub fn parse_const_lines(payload: &[u8]) -> Vec<ConstLine> {
         let Some(after_prefix) = rest.get(8..) else {
             break;
         };
-        let Some(index) = parse_1based_index(after_prefix, 0, scan_digits(after_prefix, 0)) else {
+        let Some(index) = parse_1based_index(after_prefix, 0) else {
             break;
         };
         let Some(comma) = find_byte(after_prefix, 0, b',') else {
@@ -960,6 +949,41 @@ mod tests {
             parse_error_header("E1,4294967297:1:2"),
             Some((wrapped, Some(2)))
         );
+    }
+
+    /// Every `address = atoi(ptr) - 1` and a module's channel count read
+    /// glibc's `atoi`: blanks and a sign before the digits, an empty run as
+    /// 0, an overflow cut to `int` from the saturated or wrapped `long`.
+    #[test]
+    fn indexes_and_channel_counts_are_glibc_atoi() {
+        use std::ffi::c_long;
+        assert_eq!(
+            classify_module(b"GX90XA-+10-U2"),
+            Some((ModuleType::InputAnalog, [10, 0]))
+        );
+        assert_eq!(
+            classify_module(b"GX90YD-"),
+            Some((ModuleType::OutputDigital, [0, 0]))
+        );
+        let lines =
+            parse_const_lines(b"SKConst, 001,2.5\nSKConst,+002,3.5\nSKConst,99999999999,1\nE");
+        let big = if c_long::BITS == 64 {
+            1_215_752_190
+        } else {
+            i32::MAX as usize - 1
+        };
+        assert_eq!(
+            lines.iter().map(|l| l.index).collect::<Vec<_>>(),
+            [0, 1, big]
+        );
+        let lines = parse_fchinfo(b"N 0+01 DEGC ,3\nE");
+        assert_eq!(
+            (lines[0].index, lines[0].unit.as_slice()),
+            (0, &b"DEGC"[..])
+        );
+        assert_eq!(parse_srangeao(b"xxxxxxxxx0+001T\nE").unwrap()[0].index, 0);
+        // C's `atoi` reads -1 and indexes `array[-2]`; refused here.
+        assert_eq!(parse_srangeao(b"xxxxxxxxx0-001T\nE"), Ok(vec![]));
     }
 
     #[test]
