@@ -680,6 +680,9 @@ impl AsynMotor for Mcs2Axis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let c = self.channel;
+        // C sets only motorPosition_ (asynMotorController.cpp:289, :360), so
+        // the next open-loop move steps from the old motorEncoderPosition_
+        // and undoes the redefinition. C defect, not copied.
         self.tracked_position = position;
         let ctrl = self.lock();
         ctrl.write_only(&format!(
