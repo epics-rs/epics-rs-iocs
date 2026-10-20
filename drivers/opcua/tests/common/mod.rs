@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_opcua::types::{
-    DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
-    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, WriteValue,
+    AttributeId, DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
+    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, Variant, WriteValue,
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use opcua::client::{
@@ -32,6 +33,11 @@ pub struct Server {
     pub refuse: bool,
     /// How long a connect attempt and a disconnect take.
     pub latency: Duration,
+    /// What each node holds; a read of any other node fails
+    /// `BadNodeIdUnknown`.
+    pub nodes: Vec<(NodeId, Variant)>,
+    /// The Write service calls, in order.
+    pub writes: Mutex<Vec<Vec<WriteValue>>>,
 }
 
 struct Connector(Arc<Server>);
@@ -69,9 +75,32 @@ struct Connection(Arc<Server>);
 #[async_trait]
 impl UaConnection for Connection {
     async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
-        (0, Ok(vec![DataValue::default(); nodes.len()]))
+        let results = nodes
+            .iter()
+            .map(|node| {
+                let Some((_, value)) = self.0.nodes.iter().find(|(id, _)| *id == node.node_id)
+                else {
+                    return DataValue {
+                        status: Some(StatusCode::BadNodeIdUnknown),
+                        ..Default::default()
+                    };
+                };
+                if node.attribute_id == AttributeId::DataType as u32 {
+                    let scalar = value.scalar_type_id().expect("a scalar node");
+                    DataValue::value_only(Variant::NodeId(Box::new(NodeId::new(0, scalar as u32))))
+                } else {
+                    DataValue {
+                        value: Some(value.clone()),
+                        status: Some(StatusCode::Good),
+                        ..Default::default()
+                    }
+                }
+            })
+            .collect();
+        (0, Ok(results))
     }
     async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>) {
+        self.0.writes.lock().push(values.to_vec());
         (0, Ok(vec![StatusCode::Good; values.len()]))
     }
     async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode> {

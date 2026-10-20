@@ -12,7 +12,7 @@ use async_opcua::types::{StatusCode, Variant};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use epics_rs::base::server::device_support::{DeviceAlarm, DeviceSupport};
+use epics_rs::base::server::device_support::{DeviceAlarm, DeviceReadOutcome, DeviceSupport};
 use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType};
 use epics_rs::base::server::records::ai::AiRecord;
 use epics_rs::base::server::records::ao::AoRecord;
@@ -85,6 +85,15 @@ fn leaf(registry: &Arc<Registry>) -> Arc<Mutex<Leaf>> {
     leaf
 }
 
+/// The pass an update's pulse brings, as the framework runs it: armed, read,
+/// reconciled (`process_record_readback`).
+fn pulse_pass(device: &mut OpcuaDevice, record: &mut dyn Record) -> DeviceReadOutcome {
+    device.arm_readback_callback();
+    let outcome = device.read(record).expect("the update is delivered");
+    device.reconcile_readback_callback();
+    outcome
+}
+
 /// A value arrives from the server, and the record processes for it.
 fn incoming(
     device: &mut OpcuaDevice,
@@ -96,14 +105,14 @@ fn incoming(
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::Up;
         leaf.incoming = Some(v.clone());
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::IncomingData,
             Some(v),
             StatusCode::Good,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         ));
     }
-    let outcome = device.read(record).expect("the update is delivered");
+    let outcome = pulse_pass(device, record);
     // The framework runs the record's own conversion next when the device did
     // not compute the value itself.
     record.set_device_did_compute(outcome.did_compute());
@@ -782,7 +791,7 @@ fn bini_write_asks_an_output_record_to_send_its_value() {
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::InitialWrite;
         leaf.incoming = Some(Variant::Int32(0));
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::WriteRequest,
             None,
             StatusCode::Good,
@@ -790,10 +799,39 @@ fn bini_write_asks_an_output_record_to_send_its_value() {
         ));
     }
 
-    device.read(&mut record).expect("the request is delivered");
+    pulse_pass(&mut device, &mut record);
 
     assert_eq!(leaf.lock().outgoing, Some(Variant::Int32(5)));
     assert!(leaf.lock().dirty);
+}
+
+// ------------------------------------------------------------ one pass per update
+
+/// A pass that pops an update with another queued behind it wakes the record
+/// again; the pass that pops the last one does not
+/// (`if (nextReason) pcon->requestRecordProcessing(nextReason)`,
+/// `devOpcua.cpp:408`).
+#[test]
+fn a_pass_that_leaves_an_update_queued_wakes_the_record_again() {
+    let registry = registry();
+    let mut record = LonginRecord::new(0);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf(&registry);
+    leaf.lock().state = ConnectionStatus::Up;
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    leaf.lock().request_processing(ProcessReason::WriteFailure);
+    assert!(wake.try_recv().is_ok(), "the first update wakes the record");
+    assert!(
+        wake.try_recv().is_err(),
+        "the second finds it already woken"
+    );
+
+    pulse_pass(&mut device, &mut record);
+    assert!(wake.try_recv().is_ok(), "one update is still queued");
+
+    pulse_pass(&mut device, &mut record);
+    assert!(wake.try_recv().is_err(), "nothing is left to wake for");
 }
 
 // ---------------------------------------------------------------- failure reasons
@@ -832,24 +870,24 @@ fn each_failure_reason_raises_its_own_alarm() {
             },
         ),
     ] {
-        leaf.lock().queue.push(Update::new(
+        leaf.lock().push(Update::new(
             reason,
             None,
             StatusCode::Good,
             SystemTime::UNIX_EPOCH,
         ));
-        device.read(&mut record).expect("the update is delivered");
+        pulse_pass(&mut device, &mut record);
         assert_eq!(device.last_alarm(), Some(alarm), "{reason:?}");
     }
 
     // A completed write leaves the record alone.
-    leaf.lock().queue.push(Update::new(
+    leaf.lock().push(Update::new(
         ProcessReason::WriteComplete,
         None,
         StatusCode::Good,
         SystemTime::UNIX_EPOCH,
     ));
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
     assert_eq!(device.last_alarm(), None);
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(0));
 }
@@ -863,7 +901,7 @@ fn a_bad_status_code_carries_no_value() {
     {
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::Up;
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::IncomingData,
             Some(Variant::Int32(9)),
             StatusCode::BadNodeIdUnknown,
@@ -871,7 +909,7 @@ fn a_bad_status_code_carries_no_value() {
         ));
     }
 
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
 
     assert_eq!(
         device.last_alarm(),
@@ -893,7 +931,7 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
     {
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::Up;
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::IncomingData,
             Some(Variant::Int32(9)),
             StatusCode::UncertainLastUsableValue,
@@ -901,7 +939,7 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
         ));
     }
 
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
 
     assert_eq!(
         device.last_alarm(),

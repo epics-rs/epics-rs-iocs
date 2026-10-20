@@ -201,6 +201,14 @@ fn process(device: &mut OpcuaDevice, record: &mut OpcuaItemRecord) {
     record.process().expect("the record processes");
 }
 
+/// The pass an update's pulse brings: [`process`], armed and reconciled as
+/// `process_record_readback` does.
+fn pulse(device: &mut OpcuaDevice, record: &mut OpcuaItemRecord) {
+    device.arm_readback_callback();
+    process(device, record);
+    device.reconcile_readback_callback();
+}
+
 /// A put from a client: the field, then the `special()` the framework calls.
 fn put(record: &mut OpcuaItemRecord, field: &str, value: EpicsValue) {
     record.put_field(field, value).expect("the field takes it");
@@ -214,7 +222,7 @@ fn up(leaf: &Arc<Mutex<Leaf>>) {
 }
 
 fn queue(leaf: &Arc<Mutex<Leaf>>, reason: ProcessReason, status: StatusCode) {
-    leaf.lock().queue.push(Update::new(
+    leaf.lock().push(Update::new(
         reason,
         None,
         status,
@@ -233,12 +241,20 @@ async fn until(f: impl Fn() -> bool) {
 }
 
 /// Wait for the session's initial read of the item to reach the record, and take
-/// the update it queued — every test below is about what the record does *next*,
-/// so the queue must start from the state a live IOC reaches right after
-/// `iocInit`: connected, read once, nothing outstanding.
+/// every update queued up to it — the connectionLoss each item takes before its
+/// session connects (`SessionOpen62541.cpp:2701`), then the read's. Every test
+/// below is about what the record does *next*, so the queue must start from the
+/// state a live IOC reaches right after `iocInit`: connected, read once,
+/// nothing outstanding.
 async fn settled(mock: &Arc<Mock>, leaf: &Arc<Mutex<Leaf>>) {
     until(|| !mock.calls.lock().reads.is_empty()).await;
-    until(|| leaf.lock().queue.pop().is_some()).await;
+    until(|| {
+        matches!(
+            leaf.lock().pop(),
+            Some(update) if update.reason == ProcessReason::ReadComplete
+        )
+    })
+    .await;
 }
 
 // ------------------------------------------------------------------------- init
@@ -284,6 +300,51 @@ fn a_bini_the_database_set_is_not_overwritten_by_the_link() {
     assert_eq!(record.bini, 1);
 }
 
+// --------------------------------------------------------- one pass per update
+
+/// The item's pass, like every record's, wakes the record again when it leaves
+/// an update queued, and not when it takes the last one.
+#[test]
+fn an_item_pass_that_leaves_an_update_queued_wakes_the_record_again() {
+    let registry = offline();
+    let mut record = OpcuaItemRecord::default();
+    let mut device = bind(&registry, "ITEM", &mut record, "S ns=2;s=Struct monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf_of(&mut record);
+    up(&leaf);
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    leaf.lock().request_processing(ProcessReason::WriteFailure);
+    assert!(wake.try_recv().is_ok(), "the first update wakes the record");
+    assert!(
+        wake.try_recv().is_err(),
+        "the second finds it already woken"
+    );
+
+    pulse(&mut device, &mut record);
+    assert!(wake.try_recv().is_ok(), "one update is still queued");
+
+    pulse(&mut device, &mut record);
+    assert!(wake.try_recv().is_err(), "nothing is left to wake for");
+}
+
+/// A pass no pulse brought (a put to VAL, a scan, a `.PROC`) is the C's
+/// `reason == none` (`devOpcua.cpp:1313`): DEFACTN acts, and the update stays
+/// queued for its pulse's pass.
+#[test]
+fn a_bare_process_leaves_a_queued_update_to_its_pulse() {
+    let registry = offline();
+    let mut record = OpcuaItemRecord::default();
+    let mut device = bind(&registry, "ITEM", &mut record, "S ns=2;s=Struct monitor=n");
+    let leaf = leaf_of(&mut record);
+    up(&leaf);
+    queue(&leaf, ProcessReason::ReadFailure, StatusCode::BadTimeout);
+
+    process(&mut device, &mut record);
+
+    assert_eq!(device.last_alarm(), None);
+    assert_eq!(leaf.lock().queue().len(), 1);
+}
+
 // ---------------------------------------------------------------------- failures
 
 #[test]
@@ -295,7 +356,7 @@ fn a_connection_loss_is_a_comm_alarm_and_leaves_the_record_undefined() {
     up(&leaf);
     queue(&leaf, ProcessReason::ConnectionLoss, StatusCode::Good);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     // COMM_ALARM, INVALID_ALARM.
     assert_eq!(
@@ -318,7 +379,7 @@ fn a_read_failure_is_a_read_alarm() {
     up(&leaf);
     queue(&leaf, ProcessReason::ReadFailure, StatusCode::BadTimeout);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     // READ_ALARM, INVALID_ALARM.
     assert_eq!(
@@ -341,7 +402,7 @@ fn a_write_failure_is_a_write_alarm() {
     up(&leaf);
     queue(&leaf, ProcessReason::WriteFailure, StatusCode::BadTimeout);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     // WRITE_ALARM, INVALID_ALARM.
     assert_eq!(
@@ -390,7 +451,7 @@ fn the_nodes_status_lands_in_statcode_and_stattext() {
     }
     queue(&leaf, ProcessReason::ReadComplete, StatusCode::Good);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     assert_eq!(record.statcode, StatusCode::BadNodeIdUnknown.bits());
     assert_eq!(record.stattext, "BadNodeIdUnknown");
@@ -608,9 +669,9 @@ async fn woc_immediate_sends_what_the_elements_have_already_written() {
 
     // Switching WOC to immediate sends the dirty element there and then — the
     // item asks its own record to process for a write (`requestWriteIfDirty`),
-    // and that request is the update the record's next process pass pops.
+    // and that request is the update its pulse's pass pops.
     put(&mut item, "WOC", EpicsValue::Enum(1));
-    process(&mut item_device, &mut item);
+    pulse(&mut item_device, &mut item);
 
     until(|| !mock.calls.lock().writes.is_empty()).await;
 }
@@ -629,7 +690,7 @@ async fn woc_immediate_with_nothing_dirty_sends_nothing() {
 
     put(&mut item, "WOC", EpicsValue::Enum(1));
     assert!(
-        leaf.lock().queue.pop().is_none(),
+        leaf.lock().pop().is_none(),
         "no element has written, so the item asks for no write"
     );
 

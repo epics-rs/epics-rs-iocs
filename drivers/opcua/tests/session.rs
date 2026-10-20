@@ -350,17 +350,13 @@ async fn until(f: impl Fn() -> bool) {
 }
 
 fn pop(leaf: &Arc<Mutex<Leaf>>) -> Update {
-    leaf.lock()
-        .queue
-        .pop()
-        .map(|(update, _)| update)
-        .expect("the leaf has an update")
+    leaf.lock().pop().expect("the leaf has an update")
 }
 
 fn drain(leaf: &Arc<Mutex<Leaf>>) -> Vec<Update> {
     let mut leaf = leaf.lock();
     let mut updates = Vec::new();
-    while let Some((update, _)) = leaf.queue.pop() {
+    while let Some(update) = leaf.pop() {
         updates.push(update);
     }
     updates
@@ -748,7 +744,7 @@ async fn bini_write_asks_the_record_to_write_after_the_initial_read() {
         vec![item0],
     );
     until(|| handle.is_connected()).await;
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     let updates = drain(&leaf0);
     assert_eq!(updates.len(), 1);
@@ -952,7 +948,7 @@ async fn a_records_read_request_reaches_the_server() {
         .lock()
         .insert(NodeId::new(2, "Sensor"), Variant::Int32(99));
     handle.request(Priority::Low, Request::Read { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     let update = pop(&leaf0);
     assert_eq!(update.reason, ProcessReason::ReadComplete);
@@ -1006,7 +1002,7 @@ async fn a_failed_write_reaches_the_record_as_a_write_failure() {
         leaf.dirty = true;
     }
     handle.request(Priority::Low, Request::Write { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     let update = pop(&leaf0);
     assert_eq!(update.reason, ProcessReason::WriteFailure);
@@ -1032,7 +1028,7 @@ async fn a_failed_read_reaches_the_record_as_a_read_failure() {
 
     mock.behave(|b| b.read_error = Some(StatusCode::BadNodeIdUnknown));
     handle.request(Priority::Low, Request::Read { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     let update = pop(&leaf0);
     assert_eq!(update.reason, ProcessReason::ReadFailure);
@@ -1058,7 +1054,7 @@ async fn a_refused_value_reaches_the_record_and_the_item_status() {
 
     mock.behave(|b| b.value_status = Some(StatusCode::BadNodeIdUnknown));
     handle.request(Priority::Low, Request::Read { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     assert_eq!(pop(&leaf0).reason, ProcessReason::ReadFailure);
     assert_eq!(item0.lock().last_status, StatusCode::BadNodeIdUnknown);
@@ -1087,7 +1083,7 @@ async fn an_unknown_node_is_reported_on_the_first_answer_after_a_connect() {
 
     // Refused again: the item's status is no longer BadServerNotConnected.
     handle.request(Priority::Low, Request::Read { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     // A data change after a connection loss is the same first answer.
     let mut item = item0.lock();
@@ -1134,7 +1130,7 @@ async fn a_server_that_returns_too_few_results_does_not_read_past_the_end() {
         vec![item0],
     );
     until(|| handle.is_connected()).await;
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     assert_eq!(pop(&leaf0).reason, ProcessReason::ReadFailure);
 }
@@ -1157,7 +1153,7 @@ async fn a_short_read_answer_is_reported() {
         vec![item0],
     );
     until(|| handle.is_connected()).await;
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
     errlog_flush();
     errlog_remove_listener(id);
     let reported: Vec<String> = lines
@@ -1194,7 +1190,7 @@ async fn read_and_write_debug_lines_name_the_transaction() {
     };
     let handle = spawn(config, &mock, vec![item0]);
     until(|| handle.is_connected()).await;
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
     drain(&leaf0);
     let write = || {
         let mut leaf = leaf0.lock();
@@ -1203,7 +1199,7 @@ async fn read_and_write_debug_lines_name_the_transaction() {
     };
     write();
     handle.request(Priority::Low, Request::Write { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
     drain(&leaf0);
 
     mock.behave(|b| {
@@ -1211,11 +1207,11 @@ async fn read_and_write_debug_lines_name_the_transaction() {
         b.write_error = Some(StatusCode::BadNodeIdUnknown);
     });
     handle.request(Priority::Low, Request::Read { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
     drain(&leaf0);
     write();
     handle.request(Priority::Low, Request::Write { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
     // SAFETY: restoring what this test replaced.
     unsafe {
         libc::dup2(saved, 1);
@@ -1839,12 +1835,12 @@ async fn a_value_the_server_pushes_reaches_the_item_its_handle_names() {
         value: DataValue::value_only(Variant::Int32(64)),
     })
     .unwrap();
-    until(|| !leaf1.lock().queue.is_empty()).await;
+    until(|| !leaf1.lock().queue().is_empty()).await;
 
     let update = pop(&leaf1);
     assert_eq!(update.reason, ProcessReason::IncomingData);
     assert_eq!(update.data, Some(Variant::Int32(64)));
-    assert!(leaf0.lock().queue.is_empty());
+    assert!(leaf0.lock().queue().is_empty());
 }
 
 #[test]

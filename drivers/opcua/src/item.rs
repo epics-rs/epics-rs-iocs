@@ -38,8 +38,10 @@ pub struct Leaf {
     /// `RecordConnector::getRecordType`.
     pub record_type: String,
     pub link: LinkInfo,
-    /// Incoming updates, one popped per record process cycle.
-    pub queue: UpdateQueue,
+    /// Incoming updates, one popped per record process cycle. Only
+    /// [`Self::push`] and [`Self::pop`] touch it, so a non-empty queue always
+    /// has a wake-up pending.
+    queue: UpdateQueue,
     /// The value the record last wrote, waiting to go out.
     pub outgoing: Option<Variant>,
     /// Set when `outgoing` has not reached the server yet (`markAsDirty`).
@@ -90,13 +92,34 @@ impl Leaf {
         ));
     }
 
-    /// Queue an update and wake the record if this is the one it will see first.
-    fn push(&mut self, update: Update) {
+    /// Queue an update and wake the record if this is the one it will see first
+    /// (`pushUpdate`'s `wasFirst`, `DataElementOpen62541Leaf.cpp:134`).
+    pub fn push(&mut self, update: Update) {
         if self.queue.push(update) {
-            // A full channel already holds a pulse the record has not consumed,
-            // and one pulse drains the whole queue, so dropping it is correct.
-            let _ = self.notify.try_send(());
+            self.wake();
         }
+    }
+
+    /// Take the update this pass processes for, and wake the record again if
+    /// another is queued behind it (`if (nextReason)
+    /// pcon->requestRecordProcessing(nextReason)` after every pop,
+    /// `devOpcua.cpp:408` and its 17 twins).
+    pub fn pop(&mut self) -> Option<Update> {
+        let (update, next) = self.queue.pop()?;
+        if next != ProcessReason::None {
+            self.wake();
+        }
+        Some(update)
+    }
+
+    pub fn queue(&self) -> &UpdateQueue {
+        &self.queue
+    }
+
+    fn wake(&self) {
+        // A full channel holds a wake-up the record has not taken yet; the pass
+        // it brings pops, and wakes the record again if more is queued.
+        let _ = self.notify.try_send(());
     }
 }
 
