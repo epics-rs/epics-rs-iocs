@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::drv_quad_em::QE_MAX_INPUTS;
 
 /// C++ `MAX_COMMAND_LEN`.
@@ -626,8 +628,8 @@ pub fn parse_calibration(ini: &Ini) -> Option<Calibration> {
                 table.offset[range][channel] = offset;
                 println!(
                     "Calibration Range {range} Channel {channel} Slope {} Offset {}",
-                    c_fixed(slope),
-                    c_fixed(offset)
+                    CFloat(f64::from(slope)),
+                    CFloat(f64::from(offset))
                 );
             }
         }
@@ -638,15 +640,6 @@ pub fn parse_calibration(ini: &Ini) -> Option<Calibration> {
         cw: load(cw_name)?,
         pulsed: load(pulsed_name)?,
     })
-}
-
-/// printf `%f` of a float.
-fn c_fixed(v: f32) -> String {
-    if v.is_nan() {
-        if v.is_sign_negative() { "-nan" } else { "nan" }.to_string()
-    } else {
-        format!("{:.6}", f64::from(v))
-    }
 }
 
 /// C++ `sscanf(curr_val.c_str(), " \" %f , %f \" ")`: the opening quote must
@@ -1151,12 +1144,5 @@ ChannelD=\"0.9527919082805758, 1.4346421308430505e-05\"
             "l.1: ini parsing failed, section not closed"
         );
         assert!(parse_ini("").unwrap().get("config", "selected").is_none());
-    }
-
-    #[test]
-    fn calibration_slopes_print_as_printf_f() {
-        assert_eq!(c_fixed(0.8823025), "0.882303");
-        assert_eq!(c_fixed(1.0223252e-10), "0.000000");
-        assert_eq!(c_fixed(f32::NAN), "nan");
     }
 }

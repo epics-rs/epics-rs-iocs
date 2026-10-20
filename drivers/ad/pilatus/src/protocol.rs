@@ -10,6 +10,8 @@
 //! every command and splits replies on the `0x18` (CAN) byte camserver sends
 //! after each reply. The strings below therefore carry no terminator.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::types::{GAIN_STRINGS, TriggerMode};
 
 // ---------------------------------------------------------------------------
@@ -78,17 +80,17 @@ pub fn cmd_nexpframe(n: i32) -> String {
 
 /// C: `"exptime %11.8f"`
 pub fn cmd_exptime(v: f64) -> String {
-    format!("exptime {v:11.8}")
+    format!("exptime {v:11.8}", v = CFloat(v))
 }
 
 /// C: `"expperiod %11.8f"`
 pub fn cmd_expperiod(v: f64) -> String {
-    format!("expperiod {v:11.8}")
+    format!("expperiod {v:11.8}", v = CFloat(v))
 }
 
 /// C: `"delay %f"`
 pub fn cmd_delay(v: f64) -> String {
-    format!("delay {v:.6}")
+    format!("delay {v:.6}", v = CFloat(v))
 }
 
 /// C: `"gapfill %d"`
@@ -102,9 +104,9 @@ pub fn cmd_set_threshold(energy_kev: f64, gain_index: i32, threshold_kev: f64) -
     let gain = GAIN_STRINGS[gain_index.clamp(0, 3) as usize];
     format!(
         "SetThreshold energy {:.0} {} {:.0}",
-        energy_kev * 1000.0,
+        CFloat(energy_kev * 1000.0),
         gain,
-        threshold_kev * 1000.0
+        CFloat(threshold_kev * 1000.0)
     )
 }
 
@@ -135,12 +137,16 @@ pub fn cmd_imgpath(path: &str) -> String {
 
 /// C: `"mxsettings <Name> %f"`
 pub fn cmd_mx_f64(name: &str, v: f64) -> String {
-    format!("mxsettings {name} {v:.6}")
+    format!("mxsettings {name} {v:.6}", v = CFloat(v))
 }
 
 /// C: `"mxsettings <Name> %f,%f"` (`Energy_range`, `Beam_xy`)
 pub fn cmd_mx_pair(name: &str, a: f64, b: f64) -> String {
-    format!("mxsettings {name} {a:.6},{b:.6}")
+    format!(
+        "mxsettings {name} {a:.6},{b:.6}",
+        a = CFloat(a),
+        b = CFloat(b)
+    )
 }
 
 /// C: `"mxsettings N_oscillations %d"`
@@ -346,6 +352,8 @@ mod tests {
         assert_eq!(cmd_exptime(12.25), "exptime 12.25000000");
         // Width 11 is a minimum, not a truncation.
         assert_eq!(cmd_exptime(1234.5), "exptime 1234.50000000");
+        assert_eq!(cmd_exptime(f64::NAN), "exptime         nan");
+        assert_eq!(cmd_exptime(-f64::NAN), "exptime        -nan");
     }
 
     #[test]
@@ -357,6 +365,12 @@ mod tests {
     fn delay_matches_c_percent_f() {
         assert_eq!(cmd_delay(0.0), "delay 0.000000");
         assert_eq!(cmd_delay(0.001), "delay 0.001000");
+        assert_eq!(cmd_delay(f64::NAN), "delay nan");
+        assert_eq!(cmd_delay(-f64::NAN), "delay -nan");
+        assert_eq!(
+            cmd_mx_pair("Beam_xy", -f64::NAN, 1.0),
+            "mxsettings Beam_xy -nan,1.000000"
+        );
     }
 
     #[test]

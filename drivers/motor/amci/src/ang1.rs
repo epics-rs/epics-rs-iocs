@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
@@ -210,8 +211,8 @@ impl ControllerParams for Ang1Params {
             "ANG1 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll,
-            self.idle_poll,
+            CFloat(self.moving_poll),
+            CFloat(self.idle_poll),
         );
         ctx.report(out, level);
     }

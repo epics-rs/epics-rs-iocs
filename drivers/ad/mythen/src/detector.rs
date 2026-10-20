@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::trace::{TraceManager, TraceMask};
@@ -297,7 +298,7 @@ impl Detector {
     /// constants are legal.
     pub fn set_tau(&self, value: f64) -> AsynResult<bool> {
         if value == -1.0 || value > 0.0 {
-            self.send(&format!("-tau {value:.6}"))?;
+            self.send(&format!("-tau {value:.6}", value = CFloat(value)))?;
             Ok(true)
         } else {
             Ok(false)
@@ -306,7 +307,7 @@ impl Detector {
 
     /// C `setKthresh`, mythen.cpp:374 — set on every module in turn.
     pub fn set_kthresh(&self, value: f64) -> AsynResult<()> {
-        self.for_each_module(&format!("-kthresh {value:.6}"))
+        self.for_each_module(&format!("-kthresh {value:.6}", value = CFloat(value)))
     }
 
     /// C `setEnergy`, mythen.cpp:401 — firmware 3 and later only.
@@ -314,7 +315,7 @@ impl Detector {
         if self.firmware_major() < 3 {
             return Ok(());
         }
-        self.for_each_module(&format!("-energy {value:.6}"))
+        self.for_each_module(&format!("-energy {value:.6}", value = CFloat(value)))
     }
 
     /// C `loadSettings`, mythen.cpp:599.
@@ -516,6 +517,64 @@ impl Detector {
         AsynError::Status {
             status: AsynStatus::Error,
             message: format!("mythen: [{command}] unexpected reply: {got}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+    use epics_rs::asyn::user::AsynUser;
+
+    /// A mythen that answers every command with status 0.
+    struct Ok0(PortDriverBase);
+
+    impl PortDriver for Ok0 {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            buf[..4].fill(0);
+            OctetReadResult::ok(4, EomReason::CNT)
+        }
+    }
+
+    /// mythen.cpp:381/:410 write `-kthresh %f` / `-energy %f`.
+    #[test]
+    fn module_float_commands_print_as_c_percent_f() {
+        let name = "MYTHEN_DET_FLOAT_CMD";
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let (runtime, _) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Ok0(base),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let det = Detector::new(Transport::new(runtime.port_handle().clone()), name);
+        det.state.nmodules.store(1, Ordering::Release);
+        det.state.firmware_major.store(3, Ordering::Release);
+        for (v, text) in [(f64::NAN, "nan"), (-f64::NAN, "-nan")] {
+            det.set_kthresh(v).unwrap();
+            assert_eq!(det.out_string(), format!("-kthresh {text}"));
+            det.set_energy(v).unwrap();
+            assert_eq!(det.out_string(), format!("-energy {text}"));
         }
     }
 }

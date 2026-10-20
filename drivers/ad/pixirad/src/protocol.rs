@@ -5,6 +5,7 @@
 //! Everything here is a pure function of bytes in and bytes out, so it is
 //! tested without a detector.
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::stdlib::{c_isspace, strtod};
 
 use crate::types::{
@@ -19,7 +20,11 @@ pub fn system_reset() -> String {
 
 /// `DAQ:! INIT <cooling> <coolingOn> <HV> <HVOn>` (C `setCoolingAndHV`).
 pub fn init(cooling_value: f64, cooling_state: i32, hv_value: f64, hv_state: i32) -> String {
-    format!("DAQ:! INIT {cooling_value:.1} {cooling_state} {hv_value:.1} {hv_state}")
+    format!(
+        "DAQ:! INIT {cooling_value:.1} {cooling_state} {hv_value:.1} {hv_state}",
+        cooling_value = CFloat(cooling_value),
+        hv_value = CFloat(hv_value)
+    )
 }
 
 /// `DAQ:! SET_SYNC <in> <out> <function>` (C `setSync`).
@@ -256,6 +261,7 @@ mod tests {
     #[test]
     fn init_command_matches_c() {
         assert_eq!(init(15.0, 1, 350.0, 1), "DAQ:! INIT 15.0 1 350.0 1");
+        assert_eq!(init(f64::NAN, 1, -f64::NAN, 0), "DAQ:! INIT nan 1 -nan 0");
     }
 
     #[test]

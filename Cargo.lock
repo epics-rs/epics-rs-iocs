@@ -61,6 +61,7 @@ dependencies = [
 name = "ad-mar345"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]
@@ -69,6 +70,7 @@ dependencies = [
 name = "ad-marccd"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
  "tempfile",
@@ -79,6 +81,7 @@ dependencies = [
 name = "ad-pilatus"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
  "tempfile",
@@ -146,6 +149,7 @@ dependencies = [
 name = "ad-specs-analyser"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]
@@ -653,6 +657,7 @@ dependencies = [
 name = "bruker"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]
@@ -1081,6 +1086,7 @@ dependencies = [
 name = "delaygen"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
 ]
 
@@ -1221,6 +1227,7 @@ version = "0.1.0"
 dependencies = [
  "ad-plugins-rs",
  "bytes",
+ "epics-libcom-rs",
  "epics-rs",
  "hdf5-reader",
  "libc",
@@ -2145,6 +2152,7 @@ version = "0.1.0"
 name = "ip-devices"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
 ]
 
@@ -2438,6 +2446,7 @@ dependencies = [
 name = "mca"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "mca-rs",
  "tokio",
@@ -2448,6 +2457,7 @@ name = "mca-amptek"
 version = "0.1.0"
 dependencies = [
  "asyn-rs",
+ "epics-libcom-rs",
  "epics-rs",
  "mca",
  "nusb",
@@ -2481,6 +2491,7 @@ dependencies = [
 name = "mca-rontec"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "mca",
 ]
@@ -2553,6 +2564,7 @@ dependencies = [
 name = "merlin"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]
@@ -2670,6 +2682,7 @@ dependencies = [
 name = "motor-acs"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2704,6 +2717,7 @@ dependencies = [
 name = "motor-amci"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2811,6 +2825,7 @@ dependencies = [
 name = "motor-npoint"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2873,6 +2888,7 @@ dependencies = [
 name = "motor-pijena"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -3317,6 +3333,7 @@ checksum = "3637c05577168127568a64e9dc5a6887da720efef07b3d9472d45f63ab191166"
 name = "photonii"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]
@@ -3387,6 +3404,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "pixirad"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
  "socket2 0.6.3",
@@ -3544,6 +3562,7 @@ dependencies = [
 name = "psl"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]
@@ -4570,6 +4589,7 @@ dependencies = [
 name = "timepix3"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "libc",
  "parking_lot",
@@ -4847,6 +4867,7 @@ name = "twincat-ads"
 version = "0.1.0"
 dependencies = [
  "asyn-rs",
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]
@@ -4915,6 +4936,7 @@ name = "ur-robot"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
  "thiserror 2.0.18",
@@ -5018,6 +5040,7 @@ name = "usb-ctr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "epics-libcom-rs",
  "epics-rs",
  "meascomp",
  "parking_lot",
@@ -5069,6 +5092,7 @@ dependencies = [
 name = "vac"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
 ]
 

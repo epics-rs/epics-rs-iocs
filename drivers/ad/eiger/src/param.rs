@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use serde_json::Value;
 
 use crate::rest::{DEFAULT_TIMEOUT, RestApi, RestError, RestResult, Sys};
@@ -669,7 +670,7 @@ impl ParamOps {
             }
             ParamUpdate::Float64(_, v) => {
                 self.trace
-                    .param_flow(name, "fetch<double>", format_args!("{v:.6}"))
+                    .param_flow(name, "fetch<double>", format_args!("{v:.6}", v = CFloat(v)))
             }
             ParamUpdate::Octet(..) => {}
         }
@@ -851,7 +852,11 @@ impl ParamOps {
     /// `current` is the parameter's present value, used for the epsilon check
     /// that suppresses no-op writes to the detector.
     pub fn put_f64(&self, index: usize, value: f64, current: f64) -> RestResult<Vec<ParamUpdate>> {
-        self.put_flow(index, "put<double>", format_args!("{value:.6}"));
+        self.put_flow(
+            index,
+            "put<double>",
+            format_args!("{value:.6}", value = CFloat(value)),
+        );
         let def = self.ensure_meta(index)?;
         if def.epsilon != 0.0 && (current - value).abs() < def.epsilon {
             return Ok(Vec::new());
@@ -872,7 +877,7 @@ impl ParamOps {
                 self.trace.param_err(
                     &def.asyn_name,
                     "put<double>",
-                    &format!("clamped to {bound} {clamped:.6}"),
+                    &format!("clamped to {bound} {clamped:.6}", clamped = CFloat(clamped)),
                 );
             }
             value = clamped;

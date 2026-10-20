@@ -11,6 +11,7 @@ pub mod protocol;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
@@ -339,7 +340,7 @@ impl DevTpg261 {
         use Command::*;
         let a = live.address;
         let setpoint = |stpt: i32| {
-            let p = format!("{:>8}", crate::fmt::exp_c(double(record, "VAL"), 4));
+            let p = format!("{:8.4E}", CFloat(double(record, "VAL")));
             format!("SP{stpt},{},{p},{p}", a - 1)
         };
         let built = match (self.kind, live.job.command) {
@@ -791,6 +792,10 @@ mod tests {
         let mut ao = AoRecord::default();
         ao.val = 1e-6;
         assert_eq!(command(&dev, &ao), "SP2,0,1.0000E-06,1.0000E-06\r");
+        ao.val = -f64::NAN;
+        assert_eq!(command(&dev, &ao), "SP2,0,    -NAN,    -NAN\r");
+        ao.val = f64::NAN;
+        assert_eq!(command(&dev, &ao), "SP2,0,     NAN,     NAN\r");
         let (dev, _h) = live_dev(Kind::Bo, Command::SetSensor, 2, "TPG_CMD_SEN");
         let mut bo = BoRecord::default();
         bo.put_field("VAL", EpicsValue::Enum(1)).unwrap();

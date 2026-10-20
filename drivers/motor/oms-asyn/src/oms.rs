@@ -163,7 +163,7 @@ fn closing_trace(
 ) {
     let (method, value) = match value {
         WriteValue::Int32(v) => ("writeInt32", v.to_string()),
-        WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}")),
+        WriteValue::Float64(v) => ("writeFloat64", format!("{v:.6}", v = CFloat(v))),
     };
     match status {
         Err(e) => print(
@@ -435,14 +435,14 @@ impl ControllerParams for OmsParams {
                 let _ = writeln!(
                     out,
                     "    Current position = {:.6}, velocity = {:.6}",
-                    float(index::POSITION),
-                    float(index::VELOCITY),
+                    CFloat(float(index::POSITION)),
+                    CFloat(float(index::VELOCITY)),
                 );
                 if ctx.int32_param(addr, HAS_ENCODER).unwrap_or(0) != 0 {
                     let _ = writeln!(
                         out,
                         "    Encoder position {:.6}",
-                        float(index::ENCODER_POSITION)
+                        CFloat(float(index::ENCODER_POSITION))
                     );
                 }
                 if axes.is_some_and(|a| a.homing(axis)) {
@@ -1085,6 +1085,24 @@ impl AsynMotor for OmsAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::port_handle::PortHandle;
+
+    /// omsBaseController.cpp:409-416 prints the value with `%f`.
+    #[test]
+    fn closing_trace_prints_a_float64_as_c_percent_f() {
+        for (v, want) in [(f64::NAN, "nan"), (-f64::NAN, "-nan")] {
+            let line = std::cell::RefCell::new(String::new());
+            closing_trace(
+                |_, args| *line.borrow_mut() = args.to_string(),
+                3,
+                WriteValue::Float64(v),
+                &Ok(()),
+            );
+            assert_eq!(
+                line.into_inner(),
+                format!("omsBaseDriver:writeFloat64: function=3, value={want}\n")
+            );
+        }
+    }
 
     /// A read the test expects to succeed, as its bytes.
     trait BytesOk {

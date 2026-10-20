@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::InterfaceMask;
@@ -479,14 +480,18 @@ impl PortDriver for PixiradDetector {
                 line!(),
                 format_args!(
                     "pixirad:writeFloat64 error, status={} function={reason}, value={value:.6}\n",
-                    e.status() as i32
+                    e.status() as i32,
+                    value = CFloat(value)
                 ),
             ),
             Ok(()) => user.print(
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("pixirad:writeFloat64: function={reason}, value={value:.6}\n"),
+                format_args!(
+                    "pixirad:writeFloat64: function={reason}, value={value:.6}\n",
+                    value = CFloat(value)
+                ),
             ),
         }
         let _ = self.ad.port_base.call_param_callbacks(0);

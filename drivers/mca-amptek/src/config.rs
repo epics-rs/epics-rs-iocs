@@ -7,6 +7,7 @@
 
 use std::fmt::Write as _;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::drivers::option_parse::sscanf_int;
 use epics_rs::base::runtime::stdlib::strtod;
 
@@ -73,30 +74,30 @@ pub fn format_configuration(f: &ConfigFields) -> String {
     let mut s = String::new();
     let _ = write!(s, "CLCK={};", CLOCK_STRINGS[f.clock as usize]);
     let _ = write!(s, "AINP={};", POLARITY_STRINGS[f.input_polarity as usize]);
-    let _ = write!(s, "TPEA={:.6};", f.peaking_time);
+    let _ = write!(s, "TPEA={:.6};", CFloat(f.peaking_time));
     let _ = write!(
         s,
         "TPFA={};",
         FAST_PEAKING_TIME_STRINGS[f.fast_peaking_time as usize]
     );
-    let _ = write!(s, "TFLA={:.6};", f.flat_top_time);
-    let _ = write!(s, "GAIN={:.6};", f.gain);
-    let _ = write!(s, "THSL={:.6};", f.slow_threshold);
-    let _ = write!(s, "THFA={:.6};", f.fast_threshold);
+    let _ = write!(s, "TFLA={:.6};", CFloat(f.flat_top_time));
+    let _ = write!(s, "GAIN={:.6};", CFloat(f.gain));
+    let _ = write!(s, "THSL={:.6};", CFloat(f.slow_threshold));
+    let _ = write!(s, "THFA={:.6};", CFloat(f.fast_threshold));
     let _ = write!(s, "MCAC={};", f.num_channels);
     let _ = write!(s, "GATE={};", GATE_STRINGS[f.gate as usize]);
-    let _ = write!(s, "PRER={:.6};", f.preset_real_time);
-    let _ = write!(s, "PRET={:.6};", f.preset_live_time);
+    let _ = write!(s, "PRER={:.6};", CFloat(f.preset_real_time));
+    let _ = write!(s, "PRET={:.6};", CFloat(f.preset_live_time));
     let _ = write!(s, "PREC={};", f.preset_counts as i32); // `(int)dtemp` truncation, drvAmptek.cpp:580
     let _ = write!(s, "PRCL={};", f.preset_low_channel);
     let _ = write!(s, "PRCH={};", f.preset_high_channel);
     let _ = write!(s, "MCAS={};", MCA_SOURCE_STRINGS[f.mca_source as usize]);
     let _ = write!(s, "PURE={};", PUR_ENABLE_STRINGS[f.pur_enable as usize]);
     let _ = write!(s, "HVSE={};", f.set_high_voltage);
-    let _ = write!(s, "TECS={:.6};", f.set_det_temp);
+    let _ = write!(s, "TECS={:.6};", CFloat(f.set_det_temp));
     let _ = write!(s, "MCSL={};", f.mcs_low_channel);
     let _ = write!(s, "MCSH={};", f.mcs_high_channel);
-    let _ = write!(s, "MCST={:.6};", f.dwell_time);
+    let _ = write!(s, "MCST={:.6};", CFloat(f.dwell_time));
     let _ = write!(s, "AUO1={};", AUX_OUTPUT_STRINGS[f.aux_out1 as usize]);
     let _ = write!(s, "AUO2={};", AUX_OUTPUT_STRINGS[f.aux_out2 as usize]);
     let _ = write!(s, "AU34={};", f.aux_out34);
@@ -329,6 +330,12 @@ mod tests {
              MCAS=NORM;PURE=OFF;HVSE=200;TECS=-20.000000;MCSL=0;MCSH=1023;MCST=0.100000;AUO1=MCAEN;\
              AUO2=OFF;AU34=0;CON1=DAC;CON2=AUXOUT2;SCAW=100;"
         );
+        let s = format_configuration(&ConfigFields {
+            peaking_time: f64::NAN,
+            gain: -f64::NAN,
+            ..sample_fields()
+        });
+        assert!(s.contains("TPEA=nan;") && s.contains("GAIN=-nan;"), "{s}");
     }
 
     #[test]

@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::drv_quad_em::{QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat};
 
 /// C++ `AHxxx_TIMEOUT` (0.05 s).
@@ -146,7 +148,7 @@ pub fn cmd_bias_state(on: bool) -> &'static str {
 
 /// C++ `setBiasVoltage`: `"HVS %f"` — C's `%f` is six decimals.
 pub fn cmd_bias_voltage(volts: f64) -> String {
-    format!("HVS {volts:.6}")
+    format!("HVS {volts:.6}", volts = CFloat(volts))
 }
 
 // ===========================================================================
@@ -631,6 +633,8 @@ mod tests {
         assert_eq!(cmd_bias_state(true), "HVS ON");
         assert_eq!(cmd_bias_state(false), "HVS OFF");
         assert_eq!(cmd_bias_voltage(12.5), "HVS 12.500000");
+        assert_eq!(cmd_bias_voltage(f64::NAN), "HVS nan");
+        assert_eq!(cmd_bias_voltage(-f64::NAN), "HVS -nan");
     }
 
     #[test]

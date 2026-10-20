@@ -43,6 +43,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
@@ -276,14 +277,14 @@ impl PiJedsAxis {
             "sr,{},{:.*}",
             self.axis,
             MAX_RES,
-            velocity * DRIVE_RESOLUTION
+            CFloat(velocity * DRIVE_RESOLUTION)
         ));
         let _ = self.send_prem(&ctrl, &prem);
         let _ = ctrl.write_cmd(&format!(
             "set,{},{:.*}",
             self.axis,
             MAX_RES,
-            position * DRIVE_RESOLUTION
+            CFloat(position * DRIVE_RESOLUTION)
         ));
         let status = self.go(&ctrl);
         drop(ctrl);
@@ -352,7 +353,7 @@ impl AsynMotor for PiJedsAxis {
             "sr,{},{:.*}",
             self.axis,
             MAX_RES,
-            (velocity * DRIVE_RESOLUTION).abs()
+            CFloat((velocity * DRIVE_RESOLUTION).abs())
         ))
     }
 
@@ -374,7 +375,7 @@ impl AsynMotor for PiJedsAxis {
             "sr,{},{:.*}",
             self.axis,
             MAX_RES,
-            velocity * DRIVE_RESOLUTION
+            CFloat(velocity * DRIVE_RESOLUTION)
         ));
         let _ = self.send_prem(&ctrl, &prem);
         self.go(&ctrl)
@@ -611,6 +612,11 @@ mod tests {
         assert_eq!(line.sent(), ["sr,0,0.500", "stat,0"]);
         axis.move_velocity(&user, 0.0, 2000.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["sr,0,2.000"]);
+        axis.move_velocity(&user, 0.0, f64::NAN, 0.0).unwrap();
+        assert_eq!(line.sent(), ["sr,0,nan"]);
+        // The jog's rate is a magnitude, so -nan loses its sign there.
+        axis.move_velocity(&user, 0.0, -f64::NAN, 0.0).unwrap();
+        assert_eq!(line.sent(), ["sr,0,nan"]);
     }
 
     /// devPIJEDS.cc:195-213: PREM as its own message ahead of the move's,

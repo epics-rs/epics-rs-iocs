@@ -75,6 +75,7 @@
 //!   observable wire protocol; asyn-rs's `PortManager`/`asyn_record`
 //!   registries already reject a duplicate port *name* on their own.
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::port::InterfaceMask;
@@ -117,7 +118,7 @@ fn is_ns(units: &str) -> bool {
 /// C `sprintf(outBuf,"%s %-.3f %s",pcmd,value,pport->units)` — `%-.3f` with
 /// no field width prints identically to `%.3f`.
 fn format_float_cmd(pcmd: &str, value: f64, units: &str) -> String {
-    format!("{pcmd} {value:.3} {units}")
+    format!("{pcmd} {value:.3} {units}", value = CFloat(value))
 }
 
 /// C `(epicsFloat64)readback/1.0E-9` (ns) or `/1.0E-12` (ps) — `readback` is
@@ -406,6 +407,8 @@ mod tests {
         assert_eq!(format_float_cmd("DEL", 5.0, "ns"), "DEL 5.000 ns");
         assert_eq!(format_float_cmd("STEP", -1.5, "ps"), "STEP -1.500 ps");
         assert_eq!(format_float_cmd("DEL", 0.12345, "ns"), "DEL 0.123 ns");
+        assert_eq!(format_float_cmd("DEL", f64::NAN, "ns"), "DEL nan ns");
+        assert_eq!(format_float_cmd("DEL", -f64::NAN, "ns"), "DEL -nan ns");
     }
 
     #[test]

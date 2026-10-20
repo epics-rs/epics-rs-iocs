@@ -9,6 +9,7 @@
 //!   "Spec" = ControlNet Spec. version 2.0, Errata 1
 //!   "ENET" = AB Publication 1756-RM005A-EN-E
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::types::c_cast::{f64_to_i32, f64_to_u32};
 use std::fmt;
 
@@ -994,10 +995,13 @@ pub fn dump_raw_cip_data(raw: &[u8], elements: usize) -> String {
             });
         }
         CipType::Real => put("REAL", 4, &|b| {
-            format!("{:.6}", f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            format!(
+                "{:.6}",
+                CFloat(f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            )
         }),
         CipType::Lreal => put("LREAL", 8, &|b| {
-            format!("{:.6}", f64::from_le_bytes(b.try_into().unwrap()))
+            format!("{:.6}", CFloat(f64::from_le_bytes(b.try_into().unwrap())))
         }),
         CipType::Bits => put("BITS", 4, &|b| {
             format!("0x{:08X}", u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -1055,6 +1059,14 @@ mod tests {
             dump_raw_cip_data(&[0xCA, 0, 0, 0, 0xC0, 0x3F], 1),
             "REAL 1.500000\n"
         );
+        // ether_ip.c:1207/:1215 print REAL/LREAL with %f.
+        assert_eq!(
+            dump_raw_cip_data(&[0xCA, 0, 0, 0, 0xC0, 0x7F], 1),
+            "REAL nan\n"
+        );
+        let mut lreal = vec![0xCB, 0];
+        lreal.extend((-f64::NAN).to_le_bytes());
+        assert_eq!(dump_raw_cip_data(&lreal, 1), "LREAL -nan\n");
         let mut s = vec![0xA0, 0x02, 0xCE, 0x0F, 2, 0, 0, 0, b'h', b'i'];
         s.resize(4 + STRUCT_STRING_STRIDE, 0);
         assert_eq!(dump_raw_cip_data(&s, 1), "STRING 'hi'\n");

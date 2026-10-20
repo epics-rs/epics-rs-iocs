@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::{ADDriver, ADStatus};
@@ -525,7 +526,10 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
     let armed = s.rest().arm();
     s.trace().flow(
         "controlTask",
-        format_args!("arming time {:.6}", arm_start.elapsed().as_secs_f64()),
+        format_args!(
+            "arming time {:.6}",
+            CFloat(arm_start.elapsed().as_secs_f64())
+        ),
     );
     let sequence_id = match armed {
         Ok(id) => id,
@@ -615,7 +619,7 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
                     "controlTask",
                     format_args!(
                         "sending trigger {}/{num_triggers}. timeout={trigger_timeout:.6}, exposure={acquire_time:.6}",
-                        triggers + 1
+                        triggers + 1, trigger_timeout = CFloat(trigger_timeout), acquire_time = CFloat(acquire_time)
                     ),
                 );
                 set_shutter(s, true).await;

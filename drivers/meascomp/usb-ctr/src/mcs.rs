@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use epics_libcom_rs::cfmt::CFloat;
 use meascomp::counter::CounterScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
@@ -268,7 +269,7 @@ pub fn start_mcs(
                 "USBCTR::startMCS error calling ulDaqInScan, numChans={}, numPoints={num_points}, rate={rate:.6}, options=0x{options:x}, flags=0x{:x}, status={flags}, error={}\n",
                 chan_descs.len(),
                 e.code,
-                e.message
+                e.message, rate = CFloat(rate)
             ),
         );
     }

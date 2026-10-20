@@ -1,23 +1,8 @@
-//! C `printf`-compatible float formatting.
-//!
-//! The vacuum controllers are fed exponent-form numbers built with `%7.1E`
-//! (`devMPC.c:626`) and `%8.4E` (`devTPG261.c:517`). Rust's `{:E}` writes the
-//! exponent without the C two-digit zero padding (`1.0E-6` vs `1.0E-06`), which
-//! would change the bytes on the wire, so format the exponent explicitly.
+//! C `printf` of a format string that is data, not a literal: the record
+//! link's `FMT=`. [`CFloat`] owns the conversion; this module parses the
+//! format and applies its flags.
 
-/// Format `value` as C's `%.<precision>E` does: one leading digit, `precision`
-/// decimals, `E`, an explicit sign and at least two exponent digits.
-pub fn exp_c(value: f64, precision: usize) -> String {
-    let text = format!("{value:.precision$E}");
-    let (mantissa, exponent) = text
-        .split_once('E')
-        .expect("Rust's {:E} always emits an exponent");
-    let exponent: i32 = exponent
-        .parse()
-        .expect("Rust's {:E} always emits an integer exponent");
-    let sign = if exponent < 0 { '-' } else { '+' };
-    format!("{mantissa}E{sign}{:02}", exponent.abs())
-}
+use epics_libcom_rs::cfmt::CFloat;
 
 /// One `printf` conversion, as parsed out of a C format string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,45 +113,6 @@ fn parse_format(format: &str, conversions: &str) -> Result<(String, Spec, String
     Ok((prefix, spec, suffix))
 }
 
-/// C `%g`: the shorter of `%e` and `%f`, with the trailing zeros removed unless
-/// `#` was given.
-fn g_format(magnitude: f64, precision: usize, alt: bool) -> String {
-    let precision = precision.max(1);
-    let exponent: i32 = if magnitude == 0.0 {
-        0
-    } else {
-        exp_c(magnitude, precision - 1)
-            .split_once('E')
-            .and_then(|(_, e)| e.parse().ok())
-            .unwrap_or(0)
-    };
-
-    let mut text = if exponent < -4 || exponent >= precision as i32 {
-        exp_c(magnitude, precision - 1)
-    } else {
-        let decimals = (precision as i32 - 1 - exponent).max(0) as usize;
-        format!("{magnitude:.decimals$}")
-    };
-    if !alt {
-        let (mantissa, exponent) = match text.split_once('E') {
-            Some((mantissa, exponent)) => (mantissa.to_string(), Some(exponent.to_string())),
-            None => (text, None),
-        };
-        let mut mantissa = mantissa;
-        if mantissa.contains('.') {
-            mantissa = mantissa
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string();
-        }
-        text = match exponent {
-            Some(exponent) => format!("{mantissa}E{exponent}"),
-            None => mantissa,
-        };
-    }
-    text
-}
-
 /// Format `value` with the C format string `format`, which must carry exactly
 /// one `double` conversion (`%f`, `%e`, `%E`, `%g`, `%G`, with the usual flags,
 /// width, precision and `l` modifier).
@@ -179,23 +125,20 @@ pub fn format_c_double(format: &str, value: f64) -> Result<String, String> {
     let (prefix, spec, suffix) = parse_format(format, DOUBLE_CONVERSIONS)?;
 
     let magnitude = value.abs();
-    let mut body = if !value.is_finite() {
-        if value.is_nan() { "nan" } else { "inf" }.to_string()
-    } else {
-        let precision = spec.precision.unwrap_or(6);
-        match spec.conversion {
-            'f' | 'F' => format!("{magnitude:.precision$}"),
-            'e' | 'E' => exp_c(magnitude, precision),
-            _ => g_format(magnitude, precision, spec.alt),
-        }
+    let p = spec.precision.unwrap_or(6);
+    let mut body = match (spec.conversion, spec.alt) {
+        ('f' | 'F', false) => format!("{:.p$}", CFloat(magnitude)),
+        ('f' | 'F', true) => format!("{:#.p$}", CFloat(magnitude)),
+        ('e' | 'E', false) => format!("{:.p$e}", CFloat(magnitude)),
+        ('e' | 'E', true) => format!("{:#.p$e}", CFloat(magnitude)),
+        (_, false) => format!("{:.p$}", CFloat(magnitude).g()),
+        (_, true) => format!("{:#.p$}", CFloat(magnitude).g()),
     };
-    if spec.conversion.is_lowercase() {
-        body = body.to_lowercase();
-    } else {
+    if spec.conversion.is_uppercase() {
         body = body.to_uppercase();
     }
 
-    let sign = if value.is_sign_negative() && !value.is_nan() {
+    let sign = if value.is_sign_negative() {
         "-"
     } else if spec.plus {
         "+"
@@ -313,6 +256,15 @@ mod tests {
         assert_eq!(format_c_double("%.3g", 1234.0).unwrap(), "1.23e+03");
         assert_eq!(format_c_double("%#g", 100.0).unwrap(), "100.000");
         assert_eq!(format_c_double("%G", 0.00001).unwrap(), "1E-05");
+        assert_eq!(format_c_double("%#.0f", 1.0).unwrap(), "1.");
+        assert_eq!(format_c_double("%#.0e", 1.0).unwrap(), "1.e+00");
+        assert_eq!(format_c_double("%f", f64::NAN).unwrap(), "nan");
+        assert_eq!(format_c_double("%f", -f64::NAN).unwrap(), "-nan");
+        assert_eq!(format_c_double("%8.2E", -f64::NAN).unwrap(), "    -NAN");
+        assert_eq!(
+            format_c_double("%08.2f", -f64::INFINITY).unwrap(),
+            "    -inf"
+        );
     }
 
     #[test]
@@ -366,15 +318,13 @@ mod tests {
 
     #[test]
     fn matches_c_percent_e() {
-        // printf("%7.1E", 1.0e-6) -> "1.0E-06"
-        assert_eq!(exp_c(1.0e-6, 1), "1.0E-06");
-        assert_eq!(exp_c(5.5e-8, 1), "5.5E-08");
-        assert_eq!(exp_c(0.0, 1), "0.0E+00");
-        assert_eq!(exp_c(760.0, 1), "7.6E+02");
-        // printf("%8.4E", 1.0e-6) -> "1.0000E-06"
-        assert_eq!(exp_c(1.0e-6, 4), "1.0000E-06");
-        assert_eq!(exp_c(1.2345e-9, 4), "1.2345E-09");
+        assert_eq!(format_c_double("%7.1E", 1.0e-6).unwrap(), "1.0E-06");
+        assert_eq!(format_c_double("%7.1E", 5.5e-8).unwrap(), "5.5E-08");
+        assert_eq!(format_c_double("%7.1E", 0.0).unwrap(), "0.0E+00");
+        assert_eq!(format_c_double("%7.1E", 760.0).unwrap(), "7.6E+02");
+        assert_eq!(format_c_double("%8.4E", 1.0e-6).unwrap(), "1.0000E-06");
+        assert_eq!(format_c_double("%8.4E", 1.2345e-9).unwrap(), "1.2345E-09");
         // Three-digit exponents keep all their digits, as in C.
-        assert_eq!(exp_c(1.0e-120, 1), "1.0E-120");
+        assert_eq!(format_c_double("%7.1E", 1.0e-120).unwrap(), "1.0E-120");
     }
 }

@@ -8,6 +8,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
@@ -449,7 +450,7 @@ impl DevStrParm {
                 if let Some(StackValue::Double(v)) = found {
                     record.put_field("VAL", EpicsValue::Double(v))?;
                 }
-                flow(n, &format_args!("{:.6}", field_f64(record, "VAL")));
+                flow(n, &format_args!("{:.6}", CFloat(field_f64(record, "VAL"))));
                 n == 1
             }
             (Kind::Bi, Some(source)) => {
@@ -488,7 +489,7 @@ impl DevStrParm {
                 if let Some(StackValue::Double(v)) = found {
                     record.put_field("VAL", EpicsValue::Long(v as i64 as i32))?;
                 }
-                flow(n, &format_args!("{:.6}", field_f64(record, "VAL")));
+                flow(n, &format_args!("{:.6}", CFloat(field_f64(record, "VAL"))));
                 n == 1
             }
             (Kind::Si, Some(source)) => {
@@ -578,7 +579,7 @@ impl DeviceSupport for DevStrParm {
         let term: String = print_escaped(&parm.term).chars().take(19).collect();
         trace(format_args!("   term = {term}\n"));
         trace(format_args!("   bufferStartIndex = {}\n", parm.index));
-        trace(format_args!("   timeout = {:.6}\n", parm.timeout));
+        trace(format_args!("   timeout = {:.6}\n", CFloat(parm.timeout)));
         trace(format_args!("   format = {}\n", parm.format));
         trace(format_args!("   nchar = {}\n", parm.nchar));
         let job = Arc::new(Job {

@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
@@ -539,7 +540,8 @@ impl PortDriver for CtrDriver {
                 file!(),
                 line!(),
                 format_args!(
-                    "USBCTR:writeFloat64, port {port}, wrote {value:.6} to address {addr}\n"
+                    "USBCTR:writeFloat64, port {port}, wrote {value:.6} to address {addr}\n",
+                    value = CFloat(value)
                 ),
             );
         } else {
@@ -547,7 +549,7 @@ impl PortDriver for CtrDriver {
                 TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("USBCTR:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}\n"),
+                format_args!("USBCTR:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}\n", value = CFloat(value)),
             );
         }
         trace::asyn_status(status)

@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
@@ -563,7 +564,7 @@ fn get_period(name: &str, scan: ScanType) -> Option<f64> {
     crate::eip_printf!(
         8,
         "EIP record '{name}' scans at {:.1} secs\n",
-        period.unwrap_or(-1.0)
+        CFloat(period.unwrap_or(-1.0))
     );
     period
 }

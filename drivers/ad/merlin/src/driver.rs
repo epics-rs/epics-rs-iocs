@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::port::InterfaceMask;
@@ -249,11 +250,11 @@ impl MerlinDetector {
         // The device takes milliseconds.
         self.try_set(
             MPXVAR_ACQUISITIONTIME,
-            &format!("{:.6}", acquire_time * 1000.0),
+            &format!("{:.6}", CFloat(acquire_time * 1000.0)),
         );
         self.try_set(
             MPXVAR_ACQUISITIONPERIOD,
-            &format!("{:.6}", acquire_period * 1000.0),
+            &format!("{:.6}", CFloat(acquire_period * 1000.0)),
         );
 
         let trigger = TriggerMode::from_i32(self.get_i32(self.ad.params.trigger_mode))
@@ -366,9 +367,12 @@ impl MerlinDetector {
         let step = self.get_f64(self.params.step_threshold_scan);
         let scan = self.get_i32(self.params.threshold_scan);
 
-        self.try_set(MPXVAR_THSTART, &format!("{start:.6}"));
-        self.try_set(MPXVAR_THSTOP, &format!("{stop:.6}"));
-        self.try_set(MPXVAR_THSTEP, &format!("{step:.6}"));
+        self.try_set(
+            MPXVAR_THSTART,
+            &format!("{start:.6}", start = CFloat(start)),
+        );
+        self.try_set(MPXVAR_THSTOP, &format!("{stop:.6}", stop = CFloat(stop)));
+        self.try_set(MPXVAR_THSTEP, &format!("{step:.6}", step = CFloat(step)));
         self.try_set(MPXVAR_THSSCAN, &scan.to_string());
 
         for (name, reason) in [
@@ -652,7 +656,7 @@ impl PortDriver for MerlinDetector {
                 .set(
                     &mut self.ad,
                     name,
-                    &format!("{value:.6}"),
+                    &format!("{value:.6}", value = CFloat(value)),
                     default_timeout(),
                 )
                 .map_err(AsynError::from);
@@ -684,7 +688,7 @@ impl PortDriver for MerlinDetector {
                     line!(),
                     format_args!(
                         "merlinDetector:writeFloat64 error, status={} function={reason}, value={value:.6}\n",
-                        e.status() as i32
+                        e.status() as i32, value = CFloat(value)
                     ),
                 );
             }
@@ -692,7 +696,10 @@ impl PortDriver for MerlinDetector {
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}\n"),
+                format_args!(
+                    "merlinDetector:writeFloat64: function={reason}, value={value:.6}\n",
+                    value = CFloat(value)
+                ),
             ),
         }
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -1171,6 +1178,7 @@ mod tests {
     struct MpxServer {
         base: PortDriverBase,
         pending: std::collections::VecDeque<u8>,
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl PortDriver for MpxServer {
@@ -1182,7 +1190,8 @@ mod tests {
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let request = String::from_utf8_lossy(data);
-            let mut fields = request.splitn(4, ',').skip(2);
+            self.sent.lock().unwrap().push(request.to_string());
+            let mut fields = request.split(',').skip(2);
             let (kind, name) = (fields.next().unwrap(), fields.next().unwrap());
             let echo = match kind {
                 "GET" => format!("GET,{name},2.2,0"),
@@ -1208,6 +1217,7 @@ mod tests {
     #[test]
     fn a_command_exchange_lands_on_string_to_and_from_server() {
         let ip = "MERLIN_WIRE_CMD";
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server = MpxServer {
             base: PortDriverBase::new(
                 ip,
@@ -1217,6 +1227,7 @@ mod tests {
                 InterfaceMask::UNMIGRATED_INTERRUPTS,
             ),
             pending: Default::default(),
+            sent: sent.clone(),
         };
         let (runtime, _) =
             create_port_runtime(&claim_port(ip).unwrap(), server, RuntimeConfig::default())
@@ -1258,5 +1269,17 @@ mod tests {
         let get = crate::protocol::encode(MpxKind::Get, MPXVAR_GETSOFTWAREVERSION, None).unwrap();
         let reply = frame(&format!("GET,{MPXVAR_GETSOFTWAREVERSION},2.2,0"));
         assert_eq!(wire(&det), (get.into_bytes(), reply));
+
+        // mpxSet's value is `%f` (merlinDetector.cpp writeFloat64).
+        let threshold = det.params.thresholds[0];
+        for (v, text) in [(f64::NAN, "nan"), (-f64::NAN, "-nan")] {
+            det.write_float64(&mut AsynUser::new(threshold), v).unwrap();
+            let want = format!(",SET,{},{text}", MPXVAR_THRESHOLD[0]);
+            assert!(
+                sent.lock().unwrap().iter().any(|r| r.ends_with(&want)),
+                "{want} not in {:?}",
+                sent.lock().unwrap()
+            );
+        }
     }
 }

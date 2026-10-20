@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 mca = { path = "../mca" }
 epics-rs = { workspace = true, features = ["asyn"] }
+epics-libcom-rs = { workspace = true }
 asyn-rs = { workspace = true, features = ["epics"] }
 
 # nusb's platform backends; C builds its libusb transport on Linux and Windows.

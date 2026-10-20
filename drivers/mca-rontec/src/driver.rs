@@ -91,6 +91,7 @@ use std::ffi::c_long;
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::OctetStep;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -180,22 +181,6 @@ impl std::fmt::Display for CStr<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let end = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
         f.write_str(&String::from_utf8_lossy(&self.0[..end]))
-    }
-}
-
-/// C `%f`: glibc spells the non-finite values `nan`, `-nan`, `inf`, `-inf`.
-struct CFloat(f64);
-
-impl std::fmt::Display for CFloat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let sign = if self.0.is_sign_negative() { "-" } else { "" };
-        if self.0.is_nan() {
-            write!(f, "{sign}nan")
-        } else if self.0.is_infinite() {
-            write!(f, "{sign}inf")
-        } else {
-            write!(f, "{:.6}", self.0)
-        }
     }
 }
 

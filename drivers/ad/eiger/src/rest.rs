@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use serde_json::Value;
 
 /// Default request timeout (C `DEFAULT_TIMEOUT`, restApi.h:8).
@@ -546,7 +547,12 @@ impl RestApi {
         };
 
         let start = std::time::Instant::now();
-        self.put(Sys::Command, "trigger", &format!("{exposure:.6}"), timeout)?;
+        self.put(
+            Sys::Command,
+            "trigger",
+            &format!("{exposure:.6}", exposure = CFloat(exposure)),
+            timeout,
+        )?;
         let elapsed = start.elapsed().as_secs_f64();
         if elapsed < exposure {
             std::thread::sleep(Duration::from_secs_f64(exposure - elapsed));
@@ -792,6 +798,46 @@ mod tests {
         assert_eq!(put_body("42"), r#"{"value": 42}"#);
         assert_eq!(put_body("\"enabled\""), r#"{"value": "enabled"}"#);
         assert_eq!(put_body("0.015"), r#"{"value": 0.015}"#);
+    }
+
+    /// One PUT's body, from a listener that answers it 200.
+    fn put_body_sent(send: impl FnOnce(RestApi)) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            reader.get_mut().write_all(reply.as_bytes()).unwrap();
+            String::from_utf8(body).unwrap()
+        });
+        send(RestApi::new("127.0.0.1", port));
+        server.join().unwrap()
+    }
+
+    /// restApi.cpp:342 formats the INTE exposure with `%lf`.
+    #[test]
+    fn trigger_sends_the_exposure_as_c_percent_lf() {
+        for (v, text) in [(f64::NAN, "nan"), (-f64::NAN, "-nan")] {
+            let body = put_body_sent(|api| {
+                let _ = api.trigger(Duration::from_secs(5), Some(v));
+            });
+            assert_eq!(body, format!(r#"{{"value": {text}}}"#));
+        }
     }
 
     #[test]

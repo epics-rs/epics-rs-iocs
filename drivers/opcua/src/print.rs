@@ -9,6 +9,7 @@ use async_opcua::types::{
     ExtensionObject, UAString, UaNullable, Variant, VariantScalarTypeId, XmlBody,
 };
 use chrono::{Datelike, Timelike};
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::session::status_name;
 use crate::value::type_name;
@@ -81,8 +82,8 @@ impl Printer {
             Variant::UInt32(x) => self.push(&x.to_string()),
             Variant::Int64(x) => self.push(&x.to_string()),
             Variant::UInt64(x) => self.push(&x.to_string()),
-            Variant::Float(x) => self.push(&fixed(f64::from(*x))),
-            Variant::Double(x) => self.push(&fixed(*x)),
+            Variant::Float(x) => self.push(&CFloat(f64::from(*x)).to_string()),
+            Variant::Double(x) => self.push(&CFloat(*x).to_string()),
             Variant::String(s) => self.string(s),
             Variant::XmlElement(x) if x.is_ua_null() => self.push("NullString"),
             Variant::XmlElement(x) => self.quoted(&x.to_string()),
@@ -275,15 +276,6 @@ impl Printer {
         } else {
             self.close();
         }
-    }
-}
-
-/// `%f`, which glibc prints as "nan" or "-nan" by the sign bit.
-fn fixed(x: f64) -> String {
-    match x {
-        x if x.is_nan() && x.is_sign_negative() => "-nan".to_string(),
-        x if x.is_nan() => "nan".to_string(),
-        x => format!("{x:.6}"),
     }
 }
 

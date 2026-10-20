@@ -124,21 +124,31 @@ impl MotorSimAxis {
         let _ = writeln!(
             out,
             "  Current position = {:.6}, velocity = {:.6} at current time: {:.6}",
-            next.p, next.v, next.t
+            CFloat(next.p),
+            CFloat(next.v),
+            CFloat(next.t)
         );
         let _ = writeln!(
             out,
             "  Destination posn = {:.6}, velocity = {:.6} at desination time:  {:.6}",
-            end.p, end.v, end.t
+            CFloat(end.p),
+            CFloat(end.v),
+            CFloat(end.t)
         );
         let _ = writeln!(
             out,
             "    Hard limits: {:.6}, {:.6}",
-            self.low_hard_limit, self.hi_hard_limit
+            CFloat(self.low_hard_limit),
+            CFloat(self.hi_hard_limit)
         );
-        let _ = writeln!(out, "           Home: {:.6}", self.home);
-        let _ = writeln!(out, "    Enc. offset: {:.6}", self.enc_offset);
-        let _ = writeln!(out, "    Soft limits: {low_soft:.6}, {hi_soft:.6}");
+        let _ = writeln!(out, "           Home: {:.6}", CFloat(self.home));
+        let _ = writeln!(out, "    Enc. offset: {:.6}", CFloat(self.enc_offset));
+        let _ = writeln!(
+            out,
+            "    Soft limits: {low_soft:.6}, {hi_soft:.6}",
+            low_soft = CFloat(low_soft),
+            hi_soft = CFloat(hi_soft)
+        );
         if self.homing {
             let _ = writeln!(out, "    Currently homing axis");
         }
@@ -494,22 +504,32 @@ impl DrvMotorSimAxis {
         let _ = writeln!(
             out,
             "Current position = {:.6}, velocity = {:.6} at current time: {:.6}",
-            next.p, next.v, next.t
+            CFloat(next.p),
+            CFloat(next.v),
+            CFloat(next.t)
         );
         let _ = writeln!(
             out,
             "Destination posn = {:.6}, velocity = {:.6} at desination time:  {:.6}",
-            end.p, end.v, end.t
+            CFloat(end.p),
+            CFloat(end.v),
+            CFloat(end.t)
         );
         let _ = writeln!(
             out,
             "Hard limits: {:.6}, {:.6}",
-            axis.low_hard_limit, axis.hi_hard_limit
+            CFloat(axis.low_hard_limit),
+            CFloat(axis.hi_hard_limit)
         );
         // C's locals stay 0.0 when getDouble finds no value.
         let soft = |f| self.params().get_double(f).ok().flatten().unwrap_or(0.0);
         let (low_soft, hi_soft) = (soft(function::LOW_LIMIT), soft(function::HIGH_LIMIT));
-        let _ = writeln!(out, "Soft limits: {low_soft:.6}, {hi_soft:.6}");
+        let _ = writeln!(
+            out,
+            "Soft limits: {low_soft:.6}, {hi_soft:.6}",
+            low_soft = CFloat(low_soft),
+            hi_soft = CFloat(hi_soft)
+        );
         if axis.homing {
             let _ = writeln!(out, "Currently homing axis");
         }
@@ -894,6 +914,16 @@ mod tests {
             }
         }
         (axis.last_status.position, done)
+    }
+
+    /// motorSimDriver.cpp:122-141 prints these with `%f`.
+    #[test]
+    fn report_prints_limits_as_c_percent_f() {
+        let axis = MotorSimAxis::new(-f64::NAN, f64::NAN, 0.0, 0.0);
+        let mut out = String::new();
+        axis.report(&mut out, (-f64::NAN, f64::NAN));
+        assert!(out.contains("    Hard limits: -nan, nan\n"), "{out}");
+        assert!(out.contains("    Soft limits: -nan, nan\n"), "{out}");
     }
 
     #[test]

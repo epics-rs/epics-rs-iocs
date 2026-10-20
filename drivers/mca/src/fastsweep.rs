@@ -83,6 +83,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
@@ -521,7 +522,7 @@ impl PortDriver for FastSweepDriver {
                 state.num_average,
                 state.num_points,
                 state.num_acquired,
-                state.elapsed_time,
+                CFloat(state.elapsed_time),
                 i32::from(state.acquiring)
             );
         }

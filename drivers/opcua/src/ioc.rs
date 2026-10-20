@@ -9,6 +9,7 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::block_on_sync;
 use epics_rs::base::server::RecordFactory;
@@ -271,7 +272,8 @@ pub fn subscription_command(
     }
     let interval = if interval < 0.0 {
         errlog_vprintf(format_args!(
-            "invalid argument #3 (publishing interval) '{interval:.6}' - ignored\n"
+            "invalid argument #3 (publishing interval) '{interval:.6}' - ignored\n",
+            interval = CFloat(interval)
         ));
         defaults::DEFAULT_PUBLISH_INTERVAL.get()
     } else if interval == 0.0 {

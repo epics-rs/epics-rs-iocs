@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::asyn_print;
 use crate::trace::AsynPrint;
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ndarray_driver::{
     ArrayOwner, NDArrayDriverBase, handle_write_int32,
 };
@@ -1007,7 +1008,7 @@ pub trait QuadEmDevice {
             status,
             "writeFloat64",
             reason,
-            &format!("{value:.6}"),
+            &format!("{value:.6}", value = CFloat(value)),
         )
     }
 

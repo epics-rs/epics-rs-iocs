@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
@@ -176,7 +177,10 @@ impl Anf2Controller {
             "{RULE}\nANF2 motor driver:\n    asyn port: {port}\n    num axes: {}\n    \
              axes created: {}\n    moving poll period: {moving:.6}\n    \
              idle poll period: {idle:.6}\n\nInput registers:\n\n",
-            self.num_axes, self.axes_created,
+            self.num_axes,
+            self.axes_created,
+            moving = CFloat(moving),
+            idle = CFloat(idle),
         );
         let created: Vec<i32> = (0..self.num_axes as i32)
             .filter(|j| self.axes.contains_key(j))

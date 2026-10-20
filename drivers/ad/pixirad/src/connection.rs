@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
 use epics_rs::asyn::request::{OctetRead, OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -134,7 +135,7 @@ impl PixiradServer {
                 trace_error(&format!(
                     "pixirad:writeReadServer, timeout={:.6}, status={} wrote {wrote} bytes, \
                      received {read} bytes\n{}\n",
-                    SERVER_TIMEOUT.as_secs_f64(),
+                    CFloat(SERVER_TIMEOUT.as_secs_f64()),
                     e.status() as i32,
                     String::from_utf8_lossy(from_server)
                 ));

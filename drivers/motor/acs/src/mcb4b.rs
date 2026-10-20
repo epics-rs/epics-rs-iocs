@@ -49,6 +49,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -295,8 +296,8 @@ impl ControllerParams for Mcb4bParams {
             "MCB-4B motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
             ctx.port_name(),
             ctx.num_axes(),
-            self.moving_poll,
-            self.idle_poll,
+            CFloat(self.moving_poll),
+            CFloat(self.idle_poll),
         );
         ctx.report(out, level);
     }

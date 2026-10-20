@@ -11,6 +11,7 @@ pub mod protocol;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port::QueuePriority;
@@ -390,7 +391,7 @@ impl DevMpc {
             (Kind::Ao, SetSize) => Some((0x12, format!("{param},{}", val() as i32))),
             (Kind::Ao, SetSp12 | SetSp34 | SetSp56 | SetSp78) => {
                 let stpt = (cmd.number() - SetSp12.number()) * 2 + param;
-                let p = format!("{:>7}", crate::fmt::exp_c(val(), 1));
+                let p = format!("{:7.1E}", CFloat(val()));
                 Some((0x3d, format!("{stpt},{param},{p},{p}")))
             }
             (Kind::Bo, SetStart | SetStop) => {
@@ -895,6 +896,16 @@ mod tests {
         assert_eq!(
             dev.command(live, &rec),
             Some((0x3d, "3,1,1.0E-06,1.0E-06".into()))
+        );
+        rec.val = -f64::NAN;
+        assert_eq!(
+            dev.command(live, &rec),
+            Some((0x3d, "3,1,   -NAN,   -NAN".into()))
+        );
+        rec.val = f64::NAN;
+        assert_eq!(
+            dev.command(live, &rec),
+            Some((0x3d, "3,1,    NAN,    NAN".into()))
         );
         let (dev, _h) = live_dev(Kind::Ai, Command::GetSpVal56, "MPC_AI_CMD");
         let live = dev.live.as_ref().unwrap();

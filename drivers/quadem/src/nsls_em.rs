@@ -368,7 +368,7 @@ impl NslsEmDriver {
                     s.mode,
                     s.values_per_read,
                     s.range,
-                    s.period_us
+                    CFloat(s.period_us)
                 );
                 return Err(read
                     .err()

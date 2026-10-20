@@ -722,7 +722,8 @@ impl ControllerParams for PhytronParams {
             TraceMask::IO_DRIVER,
             format_args!(
                 "asynMotorController:writeFloat64:: axis={addr}, function={}, value={value:.6}\n",
-                user.reason
+                user.reason,
+                value = CFloat(value)
             ),
         );
         ParamWrite::Handled(Ok(()))

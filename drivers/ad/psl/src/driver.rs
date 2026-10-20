@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::param::EnumEntry;
@@ -603,14 +604,18 @@ impl PortDriver for PslDetector {
                 line!(),
                 format_args!(
                     "PSL:writeFloat64: error, status={} function={reason}, value={value:.6}\n",
-                    e.status() as i32
+                    e.status() as i32,
+                    value = CFloat(value)
                 ),
             ),
             Ok(()) => user.print(
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("PSL:writeFloat64: function={reason}, value={value:.6}\n"),
+                format_args!(
+                    "PSL:writeFloat64: function={reason}, value={value:.6}\n",
+                    value = CFloat(value)
+                ),
             ),
         }
         status
