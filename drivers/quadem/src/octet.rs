@@ -133,7 +133,9 @@ impl OctetIo {
             status: AsynStatus::Error,
             message: "asynManager::lockPort not connected\n".into(),
         })?;
-        port.lock_port_blocking(move |calls| f(&mut LockedOctet { calls, timeout }))
+        port.lock_port_blocking(self.user(), move |calls| {
+            f(&mut LockedOctet { calls, timeout })
+        })
     }
 
     /// `asynOctetSyncIO->writeRead`: flush stale input, write, read one
