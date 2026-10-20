@@ -207,18 +207,11 @@ fn model_from_ident(ident: &str) -> Result<(PmncModel, bool), String> {
     Ok((model, change_eos))
 }
 
-fn eos_user(addr: i32) -> AsynUser {
-    AsynUser::new(0).with_addr(addr)
-}
-
 /// Shared controller endpoint: owns the octet handle and the cross-axis
 /// communication state. The caller holds the `Arc<Mutex<..>>` lock.
 pub struct PmncController {
+    /// C `cntrl->pasynUser`, at `PMNC87xxConfig`'s address (drvPMNC87xx.cc:853).
     handle: SyncIOHandle,
-    /// The same port, for the per-read input-EOS switch.
-    port: PortHandle,
-    /// `PMNC87xxConfig`'s address, which C connects at (drvPMNC87xx.cc:853).
-    addr: i32,
     /// Firmware 1.5.3/1.5.4: `STA` replies end in `\n` (C `changeEOS`).
     change_eos: bool,
     ident: String,
@@ -236,12 +229,11 @@ impl PmncController {
     pub fn new(port: PortHandle, addr: i32, timeout: Duration) -> AsynResult<Self> {
         // C ignores every setInputEos/setOutputEos status
         // (drvPMNC87xx.cc:586, 595, 720, 727, 873-874).
-        let _ = port.set_input_eos_blocking(eos_user(addr), PROMPT_EOS);
-        let _ = port.set_output_eos_blocking(eos_user(addr), CMND_EOS);
+        let handle = SyncIOHandle::from_handle(port, addr, timeout);
+        let _ = handle.set_input_eos(0, PROMPT_EOS);
+        let _ = handle.set_output_eos(0, CMND_EOS);
         let mut ctrl = Self {
-            handle: SyncIOHandle::from_handle(port.clone(), addr, timeout),
-            port,
-            addr,
+            handle,
             change_eos: false,
             ident: String::new(),
             model: PmncModel::Pmnc8750,
@@ -357,16 +349,12 @@ impl PmncController {
         if !self.change_eos {
             return self.command(&cmd);
         }
-        let _ = self
-            .port
-            .set_input_eos_blocking(eos_user(self.addr), NL_EOS);
+        let _ = self.handle.set_input_eos(0, NL_EOS);
         let (raw, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
-        let _ = self
-            .port
-            .set_input_eos_blocking(eos_user(self.addr), PROMPT_EOS);
+        let _ = self.handle.set_input_eos(0, PROMPT_EOS);
         status?;
         Self::trimmed(raw)
     }
@@ -1252,11 +1240,49 @@ mod tests {
         )
         .unwrap();
         let port = rt.port_handle().clone();
-        assert!(port.set_input_eos_blocking(eos_user(0), NL_EOS).is_err());
+        assert!(
+            port.set_input_eos_blocking(AsynUser::new(0), NL_EOS)
+                .is_err()
+        );
         let ctrl = PmncController::new(port, 0, Duration::from_secs(1)).unwrap();
         assert!(ctrl.change_eos);
         assert_eq!(ctrl.num_axes(), 3);
         assert_eq!(ctrl.status(0).unwrap(), "A0=0x05");
+    }
+
+    /// drvPMNC87xx.cc:586, :595, :873-874: every EOS set is
+    /// `pasynOctetSyncIO`'s, which prints its TRACEIO_DEVICE line.
+    #[test]
+    fn the_eos_is_set_as_asyn_octet_sync_io() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+
+        let name = "pmncSyncIoEos";
+        let (_line, io) = LineRig::new(name, |last| match last {
+            "VER" => "Version 1.5.3".into(),
+            "DRT" => "A0=2>".into(),
+            "STA 0" => "A0=0x05\n".into(),
+            _ => ">".into(),
+        });
+        let trace = io.port().unwrap().trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let ctrl = ctrl.unwrap();
+        assert!(ctrl.change_eos);
+        ctrl.status(0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // The connect's, then STA's switch to `\n` and back.
+        let set_input = "asynOctetSyncIO setInputEos eoslen 1\n";
+        assert_eq!(text.matches(set_input).count(), 3, "{text}");
+        assert!(
+            text.contains("asynOctetSyncIO setOutputEos eoslen 1\n"),
+            "{text}"
+        );
     }
 
     /// drvPMNC87xx.cc:277-294: a first missed `STA` is RETRY (nothing
