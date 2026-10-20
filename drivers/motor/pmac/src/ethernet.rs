@@ -503,11 +503,14 @@ mod tests {
         for layer in port_layers() {
             stack.install(PORT_CHAIN, layer);
         }
-        assert!(matches!(stack.set_input_eos(0, b"\x06"), EosSet::Stored));
-        assert!(matches!(stack.set_output_eos(0, b"\r"), EosSet::Stored));
+        let mut user = AsynUser::default();
+        assert!(matches!(
+            stack.set_input_eos(&user, b"\x06"),
+            EosSet::Stored
+        ));
+        assert!(matches!(stack.set_output_eos(&user, b"\r"), EosSet::Stored));
 
         let mut base = MockBase::new(&[b"5\r\x06"]);
-        let mut user = AsynUser::default();
         stack.dispatch_write(&mut user, b"#1 P", &mut base).unwrap();
         // The CR is inside the framed payload and counted in wLength.
         assert_eq!(&base.written[0][6..8], &[0x00, 0x05]);
