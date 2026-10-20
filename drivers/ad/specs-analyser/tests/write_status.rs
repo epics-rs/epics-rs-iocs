@@ -591,3 +591,31 @@ fn an_image_mode_written_mid_image_ends_the_run() {
     let starts = heard.iter().filter(|c| c.starts_with("Start")).count();
     assert_eq!(starts, 1, "{heard:?}");
 }
+
+/// `asynWriteRead` is `pasynOctetSyncIO` flush then writeRead
+/// (specsAnalyser.cpp:2083-2084), each printing its TRACEIO_DEVICE lines
+/// (asynOctetSyncIO.c:259-266, :291-293).
+#[test]
+fn a_command_prints_its_sync_io_lines() {
+    use epics_rs::asyn::trace::{TraceFile, TraceIoMask, TraceMask};
+    let fake = Fake::start("SPECS_WS_LINES");
+    let ip = "SPECS_WS_LINES_IP";
+    let port = epics_rs::asyn::registry::get_port(ip).unwrap();
+    let trace = port.handle.trace();
+    let path = std::env::temp_dir().join(format!("{ip}_{}", std::process::id()));
+    trace.set_trace_file(
+        Some(ip),
+        TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
+            std::fs::File::create(&path).unwrap(),
+        ))),
+    );
+    trace.set_trace_mask(Some(ip), TraceMask::IO_DEVICE);
+    trace.set_trace_io_mask(Some(ip), TraceIoMask::ASCII);
+    let define = fake.runtime.specs_params.define;
+    assert_eq!(fake.write_int32(define, 1), Ok(()));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(text.contains("asynOctetSyncIO flush\n"), "{text}");
+    assert!(text.contains(" DefineSpectrum"), "{text}");
+    assert!(text.contains("asynOctetSyncIO read:\n!"), "{text}");
+}

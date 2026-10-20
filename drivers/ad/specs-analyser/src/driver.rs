@@ -61,7 +61,6 @@ pub struct SpecsAnalyserDriver {
     /// C `runModes_`.
     run_modes: Vec<String>,
     driver_port: Arc<SyncIOHandle>,
-    driver_addr: i32,
     /// C `firstConnect_`.
     first_connect: bool,
     start: Arc<Event>,
@@ -72,7 +71,6 @@ impl SpecsAnalyserDriver {
     fn new(
         port_name: &str,
         driver_port: Arc<SyncIOHandle>,
-        driver_addr: i32,
         max_buffers: i32,
         max_memory: usize,
         start: Arc<Event>,
@@ -114,7 +112,6 @@ impl SpecsAnalyserDriver {
             scan_ranges: Vec::new(),
             run_modes: Vec::new(),
             driver_port,
-            driver_addr,
             first_connect: true,
             start,
             stop,
@@ -125,7 +122,6 @@ impl SpecsAnalyserDriver {
     pub(crate) fn with_wire<R>(&mut self, f: impl FnOnce(&mut WireLink) -> R) -> R {
         f(&mut WireLink {
             driver_port: &self.driver_port,
-            addr: self.driver_addr,
             base: &mut self.ad.port_base,
             p: &self.p,
             status_message: self.ad.params.status_message,
@@ -447,7 +443,6 @@ impl SpecsAnalyserDriver {
     ) -> Result<wire::ValidateResult, wire::WireError> {
         let mut link = WireLink {
             driver_port: &self.driver_port,
-            addr: self.driver_addr,
             base: &mut self.ad.port_base,
             p: &self.p,
             status_message: self.ad.params.status_message,
@@ -743,7 +738,6 @@ pub fn create_specs_analyser_detector(
     let mut driver = SpecsAnalyserDriver::new(
         port_name,
         driver_port.clone(),
-        0,
         max_buffers,
         max_memory,
         start.clone(),
@@ -813,7 +807,6 @@ mod tests {
         SpecsAnalyserDriver::new(
             name,
             Arc::new(driver_port),
-            0,
             0,
             1 << 20,
             Arc::new(Event::new()),
