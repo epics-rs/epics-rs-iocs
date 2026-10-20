@@ -10,8 +10,20 @@
 use std::path::Path;
 
 /// `(file, placeholder, argument, reason)`, matched exactly; an entry that
-/// matches no site fails the gate.
-const EXEMPT: &[(&str, &str, &str, &str)] = &[];
+/// matches no site fails the gate. An entry is one of two kinds:
+/// (a) a non-float argument;
+/// (b) a C-formatter implementation, the one place a raw float format
+///     belongs: its reason names the C formatter it reproduces and the
+///     evidence that it does, and without that evidence it does not go in.
+const EXEMPT: &[(&str, &str, &str, &str)] = &[
+    // (b)
+    (
+        "drivers/ur-robot/src/spdlog.rs",
+        "{:e}",
+        "v.abs()",
+        "fmt 9.1 shortest round-trip {} for double; digits from Rust {:e}; 0/503k diffs (records-b, 65113bd6d)",
+    ),
+];
 
 /// The root manifest's `[workspace] members` that have a `src`.
 fn members(root: &Path) -> Vec<String> {
