@@ -615,9 +615,9 @@ mod tests {
         assert_eq!(line.sent(), ["sr,0,2.000"]);
         axis.move_velocity(&user, 0.0, f64::NAN, 0.0).unwrap();
         assert_eq!(line.sent(), ["sr,0,nan"]);
-        // The jog's rate is a magnitude, so -nan loses its sign there.
+        // The jog's rate is signed, so -nan keeps its sign there.
         axis.move_velocity(&user, 0.0, -f64::NAN, 0.0).unwrap();
-        assert_eq!(line.sent(), ["sr,0,nan"]);
+        assert_eq!(line.sent(), ["sr,0,-nan"]);
     }
 
     /// devPIJEDS.cc:195-213: PREM as its own message ahead of the move's,
