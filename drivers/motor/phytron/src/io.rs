@@ -16,8 +16,10 @@ use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::c_parse::{NumericField, parse_auto_base_units_null, strtol_errno};
 
-use crate::phytron::{CtrlType, PhytronController, c_isspace, parse_int64};
+use crate::phytron::{CtrlType, PhytronController};
 
 /// C `phytronIO::IOTYPE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,12 +165,12 @@ fn parse(
 fn read_value(reply: &str, binary: bool, to: &mut i32) -> bool {
     let text = &reply[1..];
     if !binary {
-        return match parse_int64(text).and_then(|v| i32::try_from(v).ok()) {
-            Some(v) => {
+        return match parse_auto_base_units_null(NumericField::Long, text) {
+            Some(EpicsValue::Long(v)) => {
                 *to = v;
                 true
             }
-            None => false,
+            _ => false,
         };
     }
     *to = 0;
@@ -187,28 +189,8 @@ fn read_value(reply: &str, binary: bool, to: &mut i32) -> bool {
 /// C `epicsParseInt32(s, &v, 0, &units)`: the base-0 integer `s` starts
 /// with, whatever follows it.
 fn parse_int32_prefix(s: &str) -> Option<i32> {
-    let t = s.trim_start_matches(c_isspace);
-    let b = t.as_bytes();
-    let sign = usize::from(matches!(b.first(), Some(b'+' | b'-')));
-    let rest = &b[sign..];
-    let digits = |radix: u32, from: usize| {
-        from + rest[from..]
-            .iter()
-            .take_while(|&&c| char::from(c).is_digit(radix))
-            .count()
-    };
-    let hex = rest.len() > 2
-        && rest[0] == b'0'
-        && (rest[1] | 0x20) == b'x'
-        && rest[2].is_ascii_hexdigit();
-    let end = if hex {
-        digits(16, 2)
-    } else if rest.first() == Some(&b'0') {
-        digits(8, 1)
-    } else {
-        digits(10, 0)
-    };
-    parse_int64(&t[..sign + end]).and_then(|v| i32::try_from(v).ok())
+    let (v, end) = strtol_errno(s, 0)?;
+    i32::try_from(v).ok().filter(|_| end > 0)
 }
 
 /// C `iIn_`/`iOut_`: written under the controller lock by its poll and an
@@ -601,5 +583,10 @@ mod tests {
         assert_eq!(parse_int32_prefix("-3"), Some(-3));
         assert_eq!(parse_int32_prefix("MCC"), None);
         assert_eq!(parse_int32_prefix("4294967296"), None);
+        // libCom epicsParseInt32(s, &v, 0, &units), as the compiled base answers.
+        assert_eq!(parse_int32_prefix("0b11 modules"), Some(3));
+        assert_eq!(parse_int32_prefix(" -2147483648 IO"), Some(i32::MIN));
+        assert_eq!(parse_int32_prefix("07z"), Some(7));
+        assert_eq!(parse_int32_prefix("2147483648x"), None);
     }
 }
