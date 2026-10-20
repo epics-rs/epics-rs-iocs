@@ -23,7 +23,7 @@ dependencies = [
 [[package]]
 name = "ad-core-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -91,7 +91,7 @@ dependencies = [
 [[package]]
 name = "ad-plugins-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "ad-core-rs",
  "asyn-rs",
@@ -410,7 +410,7 @@ dependencies = [
 [[package]]
 name = "asyn-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "bitflags 2.11.1",
  "chrono",
@@ -1288,7 +1288,7 @@ dependencies = [
 [[package]]
 name = "epics-base-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1313,7 +1313,7 @@ dependencies = [
 [[package]]
 name = "epics-bridge-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1337,7 +1337,7 @@ dependencies = [
 [[package]]
 name = "epics-ca-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1361,7 +1361,7 @@ dependencies = [
 [[package]]
 name = "epics-libcom-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "chrono",
  "epics-rtems-boot",
@@ -1378,7 +1378,7 @@ dependencies = [
 [[package]]
 name = "epics-macros-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1389,7 +1389,7 @@ dependencies = [
 [[package]]
 name = "epics-modbus-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -1401,7 +1401,7 @@ dependencies = [
 [[package]]
 name = "epics-pva-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "bytes",
  "chrono",
@@ -1439,7 +1439,7 @@ dependencies = [
 [[package]]
 name = "epics-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -1455,7 +1455,7 @@ dependencies = [
 [[package]]
 name = "epics-rtems-boot"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "cc",
  "libc",
@@ -2511,7 +2511,7 @@ dependencies = [
 [[package]]
 name = "mca-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "chrono",
  "epics-base-rs",
@@ -2905,7 +2905,7 @@ dependencies = [
 [[package]]
 name = "motor-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "asyn-rs",
  "bitflags 2.11.1",
@@ -4024,7 +4024,7 @@ dependencies = [
 [[package]]
 name = "scaler-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "epics-base-rs",
  "tokio",
@@ -4357,7 +4357,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stream-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=3f977f92535c4447e88bc420ef5746f84a57e288#3f977f92535c4447e88bc420ef5746f84a57e288"
+source = "git+file:///home/stevek/work/epics-rs?rev=70568d2d05c35afe569ae19ee5c404e972487e3a#70568d2d05c35afe569ae19ee5c404e972487e3a"
 dependencies = [
  "asyn-rs",
  "chrono",
