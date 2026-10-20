@@ -106,6 +106,12 @@ impl PollShared {
         self.axes()[axis].status.position = position;
     }
 
+    /// `writeFloat64`'s `setDoubleParam(motorEncoderPosition_, value)`,
+    /// ahead of its encoder check (omsBaseController.cpp:329-333).
+    pub(crate) fn set_encoder_position(&self, axis: usize, position: f64) {
+        self.axes()[axis].status.encoder_position = position;
+    }
+
     fn axes(&self) -> MutexGuard<'_, Vec<AxisState>> {
         self.axes.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -885,6 +891,22 @@ pub(crate) mod tests {
         for axis in &mut rig.axes {
             assert!(axis.polled(&user).unwrap().done);
         }
+    }
+
+    /// writeFloat64 sets REP ahead of its encoder check: it stands on an
+    /// axis with no encoder, and on one with until the loop reads it.
+    #[test]
+    fn an_encoder_position_write_sets_the_encoder_position() {
+        let mut rig = rig("omsSetEncoder", 2, &HEALTHY);
+        let user = AsynUser::default();
+        for axis in &mut rig.axes {
+            axis.set_encoder_position(&user, 42.0).unwrap();
+            assert_eq!(axis.polled(&user).unwrap().encoder_position, 42.0);
+        }
+        assert_eq!(*rig.written.lock().unwrap(), ["AX LPE42;"]);
+        poller(&rig).pass();
+        assert_eq!(rig.axes[0].polled(&user).unwrap().encoder_position, 7.0);
+        assert_eq!(rig.axes[1].polled(&user).unwrap().encoder_position, 42.0);
     }
 
     /// C `homing`: set by home(), cleared by the loop that finds the axis
