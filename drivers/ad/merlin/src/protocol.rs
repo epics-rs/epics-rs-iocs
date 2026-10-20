@@ -5,6 +5,7 @@
 //! Ported from `merlinApp/src/mpxConnection.cpp`.
 
 use epics_rs::ad_core::attributes::NDAttrValue;
+use epics_rs::base::types::c_parse::{atoi, strtoul};
 
 use crate::types::*;
 
@@ -68,10 +69,7 @@ pub fn parse_frame_header(header: &[u8], max_body: usize) -> Result<usize, MpxEr
     if header[3] != b',' || header[MPX_FRAME_HEADER_LEN - 1] != b',' {
         return Err(MpxError::BadHeader);
     }
-    let digits =
-        std::str::from_utf8(&header[4..4 + MPX_MSG_LEN_DIGITS]).map_err(|_| MpxError::BadHeader)?;
-    let declared: i64 = digits.trim().parse().map_err(|_| MpxError::BadHeader)?;
-    let body = declared - 1;
+    let body = i64::from(atoi(&header[4..4 + MPX_MSG_LEN_DIGITS])) - 1;
     if body <= 0 || body as usize >= max_body {
         return Err(MpxError::BadBodySize(body));
     }
@@ -98,12 +96,7 @@ pub fn response_echoes(body: &[u8], kind: MpxKind, name: &str) -> bool {
 /// Decode a `SET` or `CMD` response body: `<KIND>,<name>,<error>`.
 pub fn decode_ack(body: &[u8]) -> Result<(), MpxError> {
     let f = fields(body);
-    let code: i32 = f
-        .get(2)
-        .ok_or(MpxError::Malformed)?
-        .trim()
-        .parse()
-        .unwrap_or(MPX_ERR_UNEXPECTED);
+    let code = atoi(f.get(2).ok_or(MpxError::Malformed)?);
     if code != MPX_OK {
         return Err(MpxError::Device(code));
     }
@@ -114,12 +107,7 @@ pub fn decode_ack(body: &[u8]) -> Result<(), MpxError> {
 pub fn decode_get(body: &[u8]) -> Result<String, MpxError> {
     let f = fields(body);
     let value = f.get(2).ok_or(MpxError::Malformed)?;
-    let code: i32 = f
-        .get(3)
-        .ok_or(MpxError::Malformed)?
-        .trim()
-        .parse()
-        .unwrap_or(MPX_ERR_UNEXPECTED);
+    let code = atoi(f.get(3).ok_or(MpxError::Malformed)?);
     if code != MPX_OK {
         return Err(MpxError::Device(code));
     }
@@ -192,17 +180,6 @@ pub struct MqHeader {
     pub attrs: Vec<(String, NDAttrValue)>,
 }
 
-fn parse_i32(tok: &str) -> i32 {
-    // C uses atoi(): leading spaces skipped, trailing garbage ignored,
-    // unparseable -> 0.
-    let t = tok.trim();
-    let end = t
-        .char_indices()
-        .position(|(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
-        .unwrap_or(t.len());
-    t[..end].parse().unwrap_or(0)
-}
-
 fn parse_f64(tok: &str) -> f64 {
     tok.trim().parse().unwrap_or(0.0)
 }
@@ -217,7 +194,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
     // region can be bounded exactly.
     let probe_len = body.len().min(64);
     let probe = fields(&body[..probe_len]);
-    let declared_offset = probe.get(2).map(|t| parse_i32(t)).unwrap_or(0);
+    let declared_offset = probe.get(2).map(atoi).unwrap_or(0);
     let text_end = if declared_offset > 0 && (declared_offset as usize) <= body.len() {
         declared_offset as usize
     } else {
@@ -232,7 +209,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
 
     let mut attrs: Vec<(String, NDAttrValue)> = Vec::new();
 
-    let frame_number = parse_i32(f[1]);
+    let frame_number = atoi(f[1]);
     attrs.push(("Frame Number".into(), NDAttrValue::Int32(frame_number)));
 
     let offset = declared_offset;
@@ -240,12 +217,12 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
         return Err(MpxError::Malformed);
     }
 
-    let chip_count = parse_i32(f[3]);
+    let chip_count = atoi(f[3]);
     attrs.push(("Chip Count".into(), NDAttrValue::Int8(chip_count as i8)));
 
-    let x_size = parse_i32(f[4]);
+    let x_size = atoi(f[4]);
     attrs.push(("X Size".into(), NDAttrValue::Int32(x_size)));
-    let y_size = parse_i32(f[5]);
+    let y_size = atoi(f[5]);
     attrs.push(("Y Size".into(), NDAttrValue::Int32(y_size)));
     if x_size <= 0 || y_size <= 0 {
         return Err(MpxError::Malformed);
@@ -253,7 +230,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
 
     // Depth arrives as e.g. "U16" — strip the type letter.
     let depth_tok = f[6].trim_start_matches(|c: char| !c.is_ascii_digit());
-    let pixel_depth = parse_i32(depth_tok);
+    let pixel_depth = atoi(depth_tok);
     attrs.push(("Pixel Depth".into(), NDAttrValue::Int32(pixel_depth)));
 
     if let Some(t) = f.get(7) {
@@ -265,7 +242,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
     if let Some(t) = f.get(8) {
         // Chip select is a hex mask, one bit per chip. C stored it in an
         // NDAttrInt8, which truncates for detectors above 8 chips.
-        let mask = u32::from_str_radix(t.trim(), 16).unwrap_or(0);
+        let mask = strtoul(t, 16).0;
         attrs.push(("Chip Select".into(), NDAttrValue::UInt16(mask as u16)));
     }
     if let Some(t) = f.get(9) {
@@ -277,13 +254,13 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
         attrs.push(("Shutter Time".into(), NDAttrValue::Float64(parse_f64(t))));
     }
     if let Some(t) = f.get(11) {
-        attrs.push(("Counter".into(), NDAttrValue::Int8(parse_i32(t) as i8)));
+        attrs.push(("Counter".into(), NDAttrValue::Int8(atoi(t) as i8)));
     }
     if let Some(t) = f.get(12) {
-        attrs.push(("Colour Mode".into(), NDAttrValue::Int8(parse_i32(t) as i8)));
+        attrs.push(("Colour Mode".into(), NDAttrValue::Int8(atoi(t) as i8)));
     }
     if let Some(t) = f.get(13) {
-        attrs.push(("Gain Mode".into(), NDAttrValue::Int8(parse_i32(t) as i8)));
+        attrs.push(("Gain Mode".into(), NDAttrValue::Int8(atoi(t) as i8)));
     }
 
     let mut idx = 14;
@@ -305,7 +282,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
             if tok.starts_with("END1") {
                 break;
             }
-            let value = parse_i32(tok);
+            let value = atoi(tok);
             attrs.push((
                 OPT_FIELDS[count].to_string(),
                 NDAttrValue::Int16(value as i16),
@@ -337,7 +314,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
                 let Some(t) = f.get(idx) else { break };
                 attrs.push((
                     format!("Chip {chip} Threshold bits {i}"),
-                    NDAttrValue::UInt16(parse_i32(t) as u16),
+                    NDAttrValue::UInt16(atoi(t) as u16),
                 ));
                 idx += 1;
             }
@@ -345,7 +322,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
                 let Some(t) = f.get(idx) else { break };
                 attrs.push((
                     format!("Chip {chip} {name}"),
-                    NDAttrValue::Int16(parse_i32(t) as i16),
+                    NDAttrValue::Int16(atoi(t) as i16),
                 ));
                 idx += 1;
             }
@@ -450,6 +427,12 @@ pub(crate) mod tests {
         );
     }
 
+    /// C `bodySize = atoi(tok) - 1`: atoi stops at the first non-digit.
+    #[test]
+    fn parse_frame_header_reads_the_length_as_atoi() {
+        assert_eq!(parse_frame_header(b"MPX,00000012ab,", 256).unwrap(), 11);
+    }
+
     // --- response decoding ------------------------------------------------
 
     #[test]
@@ -476,6 +459,14 @@ pub(crate) mod tests {
     #[test]
     fn decode_ack_reports_device_error() {
         assert_eq!(decode_ack(b"CMD,THSCAN,4"), Err(MpxError::Device(4)));
+    }
+
+    /// C `fromLabviewError = atoi(tok)`: glibc's atoi cuts the saturated long
+    /// to int, and stops at the first non-digit.
+    #[test]
+    fn the_error_number_is_atoi() {
+        assert!(decode_ack(b"SET,COUNTERDEPTH,4294967296").is_ok());
+        assert_eq!(decode_get(b"GET,THSTART,7,0x").unwrap(), "7");
     }
 
     #[test]
@@ -635,6 +626,20 @@ pub(crate) mod tests {
         assert_eq!(h.chip_count, 1);
         // The trailing junk must not have appended DAC attributes.
         assert!(h.attrs.iter().all(|(k, _)| k != "DAC 1 Format"));
+    }
+
+    /// C reads the header fields with `atoi` and the chip select with
+    /// `strtoul(tok, NULL, 16)`.
+    #[test]
+    fn parse_mq_header_reads_fields_as_atoi_and_strtoul() {
+        let text = String::from_utf8(quad_header(768, 1)).unwrap();
+        let text =
+            text.replacen("MQ1,000001,", "MQ1,4294967297,", 1)
+                .replacen("R64,1,", "R64,0x1F,", 1);
+        let h = parse_mq_header(text.as_bytes()).unwrap();
+        let get = |n: &str| h.attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+        assert_eq!(get("Frame Number"), Some(NDAttrValue::Int32(1)));
+        assert_eq!(get("Chip Select"), Some(NDAttrValue::UInt16(0x1f)));
     }
 
     #[test]
