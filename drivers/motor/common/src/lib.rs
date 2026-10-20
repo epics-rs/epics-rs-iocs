@@ -256,6 +256,15 @@ impl Controller {
         self.spawn(None, moving_poll_ms, idle_poll_ms, forced_fast_polls);
     }
 
+    /// C `setMovingPollPeriod` / `setIdlePollPeriod` on the running
+    /// [`Self::start_driver_thread`] poller, which then runs a pass.
+    pub fn set_poll_periods(&self, moving_poll_ms: Option<u64>, idle_poll_ms: Option<u64>) {
+        self.axes.set_poll_periods(
+            moving_poll_ms.map(Duration::from_millis),
+            idle_poll_ms.map(Duration::from_millis),
+        );
+    }
+
     fn spawn(
         &self,
         port: Option<&str>,

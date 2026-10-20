@@ -201,30 +201,6 @@ impl Model2 {
         cards.push(card);
     }
 
-    /// Change the poll periods `card`'s axes will be installed with; false
-    /// for a card no `Config` built or one on the driver's own poller.
-    pub fn set_poll_periods(
-        &self,
-        card: i32,
-        moving_ms: Option<u64>,
-        idle_ms: Option<u64>,
-    ) -> bool {
-        let mut cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(Poller::Configured {
-            moving_poll_ms,
-            idle_poll_ms,
-        }) = cards
-            .iter_mut()
-            .find(|c| c.card == card)
-            .map(|c| &mut c.poller)
-        else {
-            return false;
-        };
-        *moving_poll_ms = moving_ms.unwrap_or(*moving_poll_ms);
-        *idle_poll_ms = idle_ms.unwrap_or(*idle_poll_ms);
-        true
-    }
-
     /// The poller of `card`, or `None` for an unconfigured card.
     fn poller(&self, card: i32) -> Option<Poller> {
         let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
@@ -403,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn open_finds_only_built_axes_and_takes_later_poll_periods() {
+    fn open_finds_only_built_axes() {
         DRIVER.set_card(
             3,
             vec![sim_axis(Arc::default()), sim_axis(Arc::default())],
@@ -415,15 +391,6 @@ mod tests {
         assert!(DRIVER.open(3, -1).is_none());
         assert!(DRIVER.open(0, 0).is_none());
         assert!(DRIVER.poller(0).is_none());
-        assert!(DRIVER.set_poll_periods(3, Some(50), None));
-        assert!(!DRIVER.set_poll_periods(0, Some(50), None));
-        assert!(matches!(
-            DRIVER.poller(3),
-            Some(Poller::Configured {
-                moving_poll_ms: 50,
-                idle_poll_ms: 500
-            })
-        ));
     }
 }
 
@@ -476,7 +443,6 @@ mod one_task {
         ];
         let cmd = drv_asyn_motor_configure_command(vec![&OWN]);
         assert_eq!(pollers_after(cmd, args).await, 1);
-        assert!(!OWN.set_poll_periods(0, Some(50), None));
     }
 }
 
