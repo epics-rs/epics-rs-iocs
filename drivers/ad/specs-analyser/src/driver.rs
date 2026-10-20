@@ -740,7 +740,7 @@ pub fn create_specs_analyser_detector(
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
 
-    let mut driver = SpecsAnalyserDriver::new(
+    let driver = SpecsAnalyserDriver::new(
         port_name,
         driver_port.clone(),
         0,
@@ -750,23 +750,6 @@ pub fn create_specs_analyser_detector(
         stop.clone(),
     )
     .map_err(|e| format!("failed to create specs-analyser driver: {e}"))?;
-
-    // C constructor: attempt the initial connection synchronously before
-    // the acquisition task and the actor are even created
-    // (specsAnalyser.cpp:153-169). Failure is not terminal (upstream's own
-    // commented-out early-return, specsAnalyser.cpp:156-162).
-    if driver.reconnect().is_err() {
-        let _ =
-            driver
-                .ad
-                .port_base
-                .set_int32_param(driver.ad.params.status, 0, ADStatus::Error as i32);
-        let _ = driver.ad.port_base.set_string_param(
-            driver.ad.params.status_message,
-            0,
-            "Failed to initialise - check connection",
-        );
-    }
 
     let ad_params = driver.ad.params;
     let specs_params = driver.p;
@@ -787,6 +770,23 @@ pub fn create_specs_analyser_detector(
         pool: pool.clone(),
     };
     let tasks = vec![start_task(worker)];
+
+    // C attempts the connection after epicsThreadCreate
+    // (specsAnalyser.cpp:140-177), so its message outlasts the task's first
+    // "Waiting for the acquire command". Failure is not terminal
+    // (specsAnalyser.cpp:156-162).
+    let _ = handle.with_driver_blocking::<SpecsAnalyserDriver, _>(|driver| {
+        if driver.reconnect().is_err() {
+            let base = &mut driver.ad.port_base;
+            let _ = base.set_int32_param(driver.ad.params.status, 0, ADStatus::Error as i32);
+            let _ = base.set_string_param(
+                driver.ad.params.status_message,
+                0,
+                "Failed to initialise - check connection",
+            );
+            let _ = base.call_param_callbacks(0);
+        }
+    });
 
     Ok(SpecsAnalyserRuntime {
         runtime_handle,

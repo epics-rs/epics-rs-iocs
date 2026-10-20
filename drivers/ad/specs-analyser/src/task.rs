@@ -632,10 +632,13 @@ impl Task {
 }
 
 /// Spawn the acquisition worker thread (C `epicsThreadCreate(...,
-/// specsAnalyserTaskC, ...)`).
+/// specsAnalyserTaskC, ...)`). Returns once the task holds the driver, so a
+/// driver call made next lands after its first pass.
 pub(crate) fn start_task(w: Worker) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("specsAnalyserTask", move || async move {
+    let (held, holding) = std::sync::mpsc::sync_channel(1);
+    let task = rt::run_thread_named("specsAnalyserTask", move || async move {
         let hold = w.self_handle.hold_driver_blocking().ok();
+        let _ = held.send(());
         Task {
             w,
             hold,
@@ -644,5 +647,7 @@ pub(crate) fn start_task(w: Worker) -> std::thread::JoinHandle<()> {
         }
         .run()
         .await
-    })
+    });
+    let _ = holding.recv();
+    task
 }

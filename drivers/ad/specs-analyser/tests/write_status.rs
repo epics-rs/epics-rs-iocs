@@ -69,21 +69,6 @@ impl Fake {
 
     /// Refusing from the constructor's first command on.
     fn start_refusing(name: &str, code: u32, refuse: &[&'static str]) -> Fake {
-        let fake = Self::launch(name, code, refuse);
-        // The task's first post would overwrite a test's ADStatusMessage.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while fake.status_message() != "Waiting for the acquire command" {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the task never waited"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        fake
-    }
-
-    /// The detector as the constructor returns it, its task not yet waiting.
-    fn launch(name: &str, code: u32, refuse: &[&'static str]) -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let (arm, armed) = mpsc::channel::<Rules>();
@@ -142,6 +127,12 @@ impl Fake {
         // Open, as after iocInit, so the posts reach a subscriber.
         claim
             .publish(runtime.port_handle().clone(), &open_owner())
+            .unwrap();
+        // The open's flush runs on its own thread; flushing here leaves it
+        // nothing to post to a test's subscriber.
+        runtime
+            .port_handle()
+            .call_param_callbacks_blocking(0)
             .unwrap();
         Fake {
             runtime,
@@ -488,11 +479,21 @@ fn a_write_waits_for_the_task_sequence() {
     assert!(status < set, "{heard:?}");
 }
 
-/// An Acquire the task reads before its first start wait runs the body with
-/// C's function-scope locals (specsAnalyser.cpp:270-294, 300-303).
+/// The constructor's connect follows the task's first pass
+/// (specsAnalyser.cpp:140-177), so a boot ends on its message.
 #[test]
-fn an_acquire_before_the_first_wait_starts_the_acquisition() {
-    let fake = Fake::launch("SPECS_WS_EARLY", 0, &[]);
+fn a_boot_ends_on_the_connect_message() {
+    let fake = Fake::start("SPECS_WS_BOOTMSG");
+    // Room for a first pass that ran after the constructor to land.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(fake.status_message(), "Connected to SPECS");
+}
+
+/// An Acquire written as the constructor returns starts the acquisition
+/// with C's function-scope locals (specsAnalyser.cpp:270-294, 300-303).
+#[test]
+fn an_acquire_after_the_constructor_starts_the_acquisition() {
+    let fake = Fake::start("SPECS_WS_EARLY");
     fake.write_int32(fake.runtime.ad_params.acquire, 1).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
