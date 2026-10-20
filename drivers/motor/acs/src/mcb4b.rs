@@ -45,8 +45,7 @@
 //! exactly: `motorPosition_`, `motorStatusDone_`, `motorStatusHighLimit_`,
 //! `motorStatusLowLimit_`, `motorStatusAtHome_`, `motorStatusPowerOn_`, and
 //! `motorStatusProblem_`. It never sets direction, encoder position, gain
-//! support, or the moving-velocity readback, so those are left at their
-//! [`MotorStatus`] defaults here (documented deviations, matching C).
+//! support, or the moving-velocity readback, so the poll never writes them.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -257,37 +256,26 @@ impl AsynMotor for Mcb4bAxis {
 
         // Position — reply "#01P=+1000"; C parses atof(&inString_[5]).
         let reply = ctrl.command(&format!("#{:02}P", self.axis))?;
-        let position = reply.get(5..).map(atof).unwrap_or(0.0);
+        status.position = reply.get(5..).map(atof).unwrap_or(0.0);
 
         // Moving status — reply "#01X=1"; C: done = (inString_[5]=='0').
         let reply = ctrl.command(&format!("#{:02}X", self.axis))?;
-        let done = byte_at(&reply, 5) == b'0';
+        status.done = byte_at(&reply, 5) == b'0';
+        status.moving = !status.done;
 
         // Limit / home status — reply "#01E=..."; C reads indices 5/6/7.
         let reply = ctrl.command(&format!("#{:02}E", self.axis))?;
-        let high_limit = byte_at(&reply, 5) == b'1';
-        let low_limit = byte_at(&reply, 6) == b'1';
-        let at_home = byte_at(&reply, 7) == b'1';
+        status.high_limit = byte_at(&reply, 5) == b'1';
+        status.low_limit = byte_at(&reply, 6) == b'1';
+        // C sets motorStatusAtHome_ (RA_HOME) from the E reply's index 7.
+        status.home = byte_at(&reply, 7) == b'1';
 
         // Drive power-on status — reply "#01W=1"; C: driveOn = (inString_[5]=='1').
         let reply = ctrl.command(&format!("#{:02}W", self.axis))?;
-        let powered = byte_at(&reply, 5) == b'1';
+        status.powered = byte_at(&reply, 5) == b'1';
         drop(ctrl);
 
-        *status = MotorStatus {
-            position,
-            done,
-            moving: !done,
-            high_limit,
-            low_limit,
-            // C sets motorStatusAtHome_ (RA_HOME) from the E reply's index 7.
-            home: at_home,
-            powered,
-            // All reads succeeded here; C sets motorStatusProblem_ = 0 and only
-            // flips it to 1 when a read fails (which is the `?` early return).
-            problem: false,
-            ..MotorStatus::default()
-        };
+        status.problem = false;
         Ok(())
     }
 }
@@ -417,6 +405,29 @@ mod tests {
                 "#00H+",
             ]
         );
+    }
+
+    /// MCB4BDriver.cpp:269-301: each read's param is set before the next
+    /// read, so a refused X keeps the position P read and the DONE a move
+    /// start cleared.
+    #[test]
+    fn a_failed_x_read_keeps_the_position_p_read() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing(
+            "mcb4bFailedX",
+            |cmd| match cmd {
+                "#00P" => "#00P=+1000".into(),
+                _ => "#00X=0".into(),
+            },
+            |cmd| cmd == "#00X",
+        );
+        let ctrl = Arc::new(Mutex::new(Mcb4bController::new(io, 1)));
+        let mut axis = Mcb4bAxis::new(ctrl, 0);
+        let user = AsynUser::default();
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert_eq!(status.position, 1000.0);
+        assert!(!status.done);
     }
 
     #[test]
