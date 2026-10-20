@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 # `async-opcua` names its lib `opcua`, which collides with this crate's own
 # lib name in the integration-test targets (E0464). Bind it to a distinct
 # extern name.
