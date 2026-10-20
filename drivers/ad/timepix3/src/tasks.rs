@@ -2267,6 +2267,10 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
         (StreamKind::PrvImg, Frame::Image(f)) => return preview_frame(ctx, PRV_IMG, f).await,
         (StreamKind::PrvImg1, Frame::Image(f)) => return preview_frame(ctx, PRV_IMG1, f).await,
         (StreamKind::Img, Frame::Image(f)) => {
+            let addr = threshold_addr(f.threshold_id, IMG_ADDR, IMG_THRESHOLD1_ADDR);
+            // C releases pArrays[addr] before allocating its replacement
+            // (serval_stream.cpp:803-809).
+            ctx.pool.owner().store_array(addr, None);
             let Some(mut array) = image_array(
                 ctx,
                 &f,
@@ -2369,7 +2373,10 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                     publish_img_sum(ctx, 3, f.width, f.height, sum_n, uid).await;
                 }
             }
-            let addr = threshold_addr(f.threshold_id, IMG_ADDR, IMG_THRESHOLD1_ADDR);
+            let array = array.share();
+            ctx.pool
+                .owner()
+                .store_array(addr, Some(array.array().clone()));
             publish_image(ctx, addr, array).await;
             ctx.trace(
                 TraceMask::IO_DRIVER,
@@ -5187,6 +5194,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after - before, 2);
+    }
+
+    /// C keeps each Img frame in pArrays[1] or [13] until the next one at
+    /// that address (serval_stream.cpp:803-809), so it stays a used buffer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_img_frame_stays_in_its_slot() {
+        let ctx = Arc::new(idle_ctx_at(
+            "TPX_IMG_SLOT",
+            "http://127.0.0.1:1",
+            Some(b"<Attributes></Attributes>"),
+        ));
+        set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
+        for threshold_id in [0, 1, 0] {
+            let frame = Frame::Image(crate::stream::ImageFrame {
+                width: 2,
+                height: 1,
+                format: crate::stream::PixelFormat::UInt16,
+                frame_number: 4,
+                time_at_frame: 0.0,
+                threshold_id,
+                integration_size: 0,
+                pixels: vec![2, 4],
+                header: Value::Null,
+            });
+            assert!(handle_frame(&ctx, StreamKind::Img, frame).await);
+        }
+        let base = ctx.ad.base;
+        ctx.handle
+            .write_int32(base.pool_poll_stats, 0, 1)
+            .await
+            .unwrap();
+        let alloc = ctx
+            .handle
+            .read_int32(base.pool_alloc_buffers, 0)
+            .await
+            .unwrap();
+        let free = ctx
+            .handle
+            .read_int32(base.pool_free_buffers, 0)
+            .await
+            .unwrap();
+        assert_eq!(alloc - free, 2);
     }
 
     /// The first PrvImgLogHeaders PrvImg headers are logged as nlohmann
