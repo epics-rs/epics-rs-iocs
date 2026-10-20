@@ -201,6 +201,14 @@ fn process(device: &mut OpcuaDevice, record: &mut OpcuaItemRecord) {
     record.process().expect("the record processes");
 }
 
+/// The pass an update's pulse brings: [`process`], armed and reconciled as
+/// `process_record_readback` does.
+fn pulse(device: &mut OpcuaDevice, record: &mut OpcuaItemRecord) {
+    device.arm_readback_callback();
+    process(device, record);
+    device.reconcile_readback_callback();
+}
+
 /// A put from a client: the field, then the `special()` the framework calls.
 fn put(record: &mut OpcuaItemRecord, field: &str, value: EpicsValue) {
     record.put_field(field, value).expect("the field takes it");
@@ -312,11 +320,29 @@ fn an_item_pass_that_leaves_an_update_queued_wakes_the_record_again() {
         "the second finds it already woken"
     );
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
     assert!(wake.try_recv().is_ok(), "one update is still queued");
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
     assert!(wake.try_recv().is_err(), "nothing is left to wake for");
+}
+
+/// A pass no pulse brought (a put to VAL, a scan, a `.PROC`) is the C's
+/// `reason == none` (`devOpcua.cpp:1313`): DEFACTN acts, and the update stays
+/// queued for its pulse's pass.
+#[test]
+fn a_bare_process_leaves_a_queued_update_to_its_pulse() {
+    let registry = offline();
+    let mut record = OpcuaItemRecord::default();
+    let mut device = bind(&registry, "ITEM", &mut record, "S ns=2;s=Struct monitor=n");
+    let leaf = leaf_of(&mut record);
+    up(&leaf);
+    queue(&leaf, ProcessReason::ReadFailure, StatusCode::BadTimeout);
+
+    process(&mut device, &mut record);
+
+    assert_eq!(device.last_alarm(), None);
+    assert_eq!(leaf.lock().queue().len(), 1);
 }
 
 // ---------------------------------------------------------------------- failures
@@ -330,7 +356,7 @@ fn a_connection_loss_is_a_comm_alarm_and_leaves_the_record_undefined() {
     up(&leaf);
     queue(&leaf, ProcessReason::ConnectionLoss, StatusCode::Good);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     // COMM_ALARM, INVALID_ALARM.
     assert_eq!(
@@ -353,7 +379,7 @@ fn a_read_failure_is_a_read_alarm() {
     up(&leaf);
     queue(&leaf, ProcessReason::ReadFailure, StatusCode::BadTimeout);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     // READ_ALARM, INVALID_ALARM.
     assert_eq!(
@@ -376,7 +402,7 @@ fn a_write_failure_is_a_write_alarm() {
     up(&leaf);
     queue(&leaf, ProcessReason::WriteFailure, StatusCode::BadTimeout);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     // WRITE_ALARM, INVALID_ALARM.
     assert_eq!(
@@ -425,7 +451,7 @@ fn the_nodes_status_lands_in_statcode_and_stattext() {
     }
     queue(&leaf, ProcessReason::ReadComplete, StatusCode::Good);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     assert_eq!(record.statcode, StatusCode::BadNodeIdUnknown.bits());
     assert_eq!(record.stattext, "BadNodeIdUnknown");
@@ -643,9 +669,9 @@ async fn woc_immediate_sends_what_the_elements_have_already_written() {
 
     // Switching WOC to immediate sends the dirty element there and then — the
     // item asks its own record to process for a write (`requestWriteIfDirty`),
-    // and that request is the update the record's next process pass pops.
+    // and that request is the update its pulse's pass pops.
     put(&mut item, "WOC", EpicsValue::Enum(1));
-    process(&mut item_device, &mut item);
+    pulse(&mut item_device, &mut item);
 
     until(|| !mock.calls.lock().writes.is_empty()).await;
 }

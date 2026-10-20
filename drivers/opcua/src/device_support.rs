@@ -23,8 +23,8 @@
 //! the update in place of writing it (`devOpcua.cpp:418-435`). So the two
 //! directions split cleanly:
 //!
-//! * [`OpcuaDevice::read`] — an update is waiting; deliver it. This is the C's
-//!   `pcon->reason != none` branch.
+//! * [`OpcuaDevice::read`] on the pass an update's pulse brought — deliver the
+//!   update. This is the C's `pcon->reason != none` branch.
 //! * [`OpcuaDevice::write`] — the record processed on its own (a put, a scan, a
 //!   `.PROC`); send its value. This is the C's `reason == none` branch.
 //!
@@ -220,6 +220,10 @@ pub struct OpcuaDevice {
     udf: bool,
     alarm: Option<(u16, u16)>,
     timestamp: Option<SystemTime>,
+    /// This pass is the one an update's pulse brought. Only it pops: the C
+    /// sets `reason` around that callback's own `dbProcess`
+    /// (`RecordConnector.cpp:98-110`), so every other pass is `reason == none`.
+    pulse_pass: bool,
 }
 
 impl OpcuaDevice {
@@ -240,6 +244,7 @@ impl OpcuaDevice {
             udf: true,
             alarm: None,
             timestamp: None,
+            pulse_pass: false,
         }
     }
 
@@ -252,6 +257,15 @@ impl OpcuaDevice {
     /// The item and the leaf this record's link bound to — the C's `prec->dpvt`.
     pub fn binding(&self) -> Option<&Binding> {
         self.bound.as_ref()
+    }
+
+    /// The update this pass takes: the next queued one on the pass its pulse
+    /// brought, none on any other.
+    fn take_update(&mut self) -> CaResult<Option<Update>> {
+        if !std::mem::take(&mut self.pulse_pass) {
+            return Ok(None);
+        }
+        Ok(self.bound()?.leaf.lock().pop())
     }
 
     /// The record wants a value it does not have: ask the session to read the
@@ -295,7 +309,7 @@ impl OpcuaDevice {
         let default_reason = rec.default_reason();
         let reason = match ordered {
             Some(reason) => reason,
-            None => match self.bound()?.leaf.lock().pop() {
+            None => match self.take_update()? {
                 Some(update) => update.reason,
                 None => ProcessReason::None,
             },
@@ -936,18 +950,24 @@ impl DeviceSupport for OpcuaDevice {
         self.is_output
     }
 
+    fn arm_readback_callback(&mut self) -> DeviceUdf {
+        self.pulse_pass = true;
+        DeviceUdf::Untouched
+    }
+
+    fn reconcile_readback_callback(&mut self) {
+        self.pulse_pass = false;
+    }
+
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         self.alarm = None;
         if self.op == Op::Item {
             return self.item_action(record);
         }
-        let popped = { self.bound()?.leaf.lock().pop() };
-        match popped {
+        match self.take_update()? {
             Some(update) => self.deliver(update, record),
-            // An output reads only in the readback pass of an I/O Intr pulse,
-            // which is only fired for an update — an empty queue means another
-            // pass already took it. No pop, so nothing said about UDF (the C
-            // leaf returns 1 untouched on an empty queue).
+            // An output reads only on a pulse's pass. No pop, so nothing said
+            // about UDF (the C leaf returns 1 untouched on an empty queue).
             None if self.is_output => Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched)),
             // The C's `reason == none` on an input record: start a read.
             None => self.request_read(),

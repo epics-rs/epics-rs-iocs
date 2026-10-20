@@ -12,7 +12,7 @@ use async_opcua::types::{StatusCode, Variant};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use epics_rs::base::server::device_support::{DeviceAlarm, DeviceSupport};
+use epics_rs::base::server::device_support::{DeviceAlarm, DeviceReadOutcome, DeviceSupport};
 use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType};
 use epics_rs::base::server::records::ai::AiRecord;
 use epics_rs::base::server::records::ao::AoRecord;
@@ -85,6 +85,15 @@ fn leaf(registry: &Arc<Registry>) -> Arc<Mutex<Leaf>> {
     leaf
 }
 
+/// The pass an update's pulse brings, as the framework runs it: armed, read,
+/// reconciled (`process_record_readback`).
+fn pulse_pass(device: &mut OpcuaDevice, record: &mut dyn Record) -> DeviceReadOutcome {
+    device.arm_readback_callback();
+    let outcome = device.read(record).expect("the update is delivered");
+    device.reconcile_readback_callback();
+    outcome
+}
+
 /// A value arrives from the server, and the record processes for it.
 fn incoming(
     device: &mut OpcuaDevice,
@@ -103,7 +112,7 @@ fn incoming(
             SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         ));
     }
-    let outcome = device.read(record).expect("the update is delivered");
+    let outcome = pulse_pass(device, record);
     // The framework runs the record's own conversion next when the device did
     // not compute the value itself.
     record.set_device_did_compute(outcome.did_compute());
@@ -790,7 +799,7 @@ fn bini_write_asks_an_output_record_to_send_its_value() {
         ));
     }
 
-    device.read(&mut record).expect("the request is delivered");
+    pulse_pass(&mut device, &mut record);
 
     assert_eq!(leaf.lock().outgoing, Some(Variant::Int32(5)));
     assert!(leaf.lock().dirty);
@@ -818,10 +827,10 @@ fn a_pass_that_leaves_an_update_queued_wakes_the_record_again() {
         "the second finds it already woken"
     );
 
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
     assert!(wake.try_recv().is_ok(), "one update is still queued");
 
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
     assert!(wake.try_recv().is_err(), "nothing is left to wake for");
 }
 
@@ -867,7 +876,7 @@ fn each_failure_reason_raises_its_own_alarm() {
             StatusCode::Good,
             SystemTime::UNIX_EPOCH,
         ));
-        device.read(&mut record).expect("the update is delivered");
+        pulse_pass(&mut device, &mut record);
         assert_eq!(device.last_alarm(), Some(alarm), "{reason:?}");
     }
 
@@ -878,7 +887,7 @@ fn each_failure_reason_raises_its_own_alarm() {
         StatusCode::Good,
         SystemTime::UNIX_EPOCH,
     ));
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
     assert_eq!(device.last_alarm(), None);
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(0));
 }
@@ -900,7 +909,7 @@ fn a_bad_status_code_carries_no_value() {
         ));
     }
 
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
 
     assert_eq!(
         device.last_alarm(),
@@ -930,7 +939,7 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
         ));
     }
 
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
 
     assert_eq!(
         device.last_alarm(),
