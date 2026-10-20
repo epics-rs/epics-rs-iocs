@@ -68,7 +68,7 @@ pub struct SpecsAnalyserDriver {
 }
 
 impl SpecsAnalyserDriver {
-    fn new(
+    pub(crate) fn new(
         port_name: &str,
         driver_port: Arc<SyncIOHandle>,
         max_buffers: i32,
