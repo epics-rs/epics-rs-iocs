@@ -345,6 +345,31 @@ fn a_bare_process_leaves_a_queued_update_to_its_pulse() {
     assert_eq!(leaf.lock().queue().len(), 1);
 }
 
+/// A pulse's pass that a put to READ took leaves the update it was for queued
+/// with no wake-up; the next update wakes the record for it.
+#[test]
+fn a_pulse_pass_a_read_put_took_leaves_its_wake_to_the_next_update() {
+    let registry = offline();
+    let mut record = OpcuaItemRecord::default();
+    let mut device = bind(&registry, "ITEM", &mut record, "S ns=2;s=Struct monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf_of(&mut record);
+    up(&leaf);
+    queue(&leaf, ProcessReason::ReadFailure, StatusCode::BadTimeout);
+    assert!(wake.try_recv().is_ok());
+
+    put(&mut record, "READ", EpicsValue::Char(1));
+    pulse(&mut device, &mut record);
+    assert_eq!(leaf.lock().queue().len(), 1, "the read took the pass");
+    assert!(wake.try_recv().is_err());
+
+    queue(&leaf, ProcessReason::WriteFailure, StatusCode::BadTimeout);
+    assert!(
+        wake.try_recv().is_ok(),
+        "the next update wakes for the first"
+    );
+}
+
 // ---------------------------------------------------------------------- failures
 
 #[test]

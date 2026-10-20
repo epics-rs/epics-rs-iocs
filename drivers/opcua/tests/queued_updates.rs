@@ -278,6 +278,48 @@ async fn an_update_a_disabled_pass_left_queued_goes_with_the_next() {
     assert_eq!(db.get_pv("LI").ok(), Some(EpicsValue::Long(8)));
 }
 
+/// A pulse's pass in simulation mode reads SVAL, not the device, so its update
+/// stays queued with no wake-up; the next update wakes the record for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_a_simulated_pass_left_queued_goes_with_the_next() {
+    let (db, leaf) = longin_ioc("", "").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while db.get_pv("LI").ok() != Some(EpicsValue::Long(42))
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(drained(&leaf, Duration::from_secs(2)).await);
+
+    db.put_record_field_from_ca("LI", "SIMM", EpicsValue::Enum(1))
+        .await
+        .unwrap();
+    db.put_record_field_from_ca("LI", "SVAL", EpicsValue::Long(5))
+        .await
+        .unwrap();
+    assert_eq!(db.get_pv("LI").ok(), Some(EpicsValue::Long(42)));
+    leaf.lock().push(value(7));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while db.get_pv("LI").ok() != Some(EpicsValue::Long(5))
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(db.lock_record("LI"));
+    assert_eq!(
+        leaf.lock().queue().len(),
+        1,
+        "the simulated pass took nothing"
+    );
+
+    db.put_record_field_from_ca("LI", "SIMM", EpicsValue::Enum(0))
+        .await
+        .unwrap();
+    leaf.lock().push(value(8));
+    assert!(drained(&leaf, Duration::from_secs(2)).await);
+    assert_eq!(db.get_pv("LI").ok(), Some(EpicsValue::Long(8)));
+}
+
 /// A record that stays disabled takes one pass per update and no more. Each
 /// pass of `LI` reads SDIS, which processes `ON` and so counts in `N`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
