@@ -759,3 +759,60 @@ fn the_bis_sockets_print_their_sync_io_lines() {
         "{text}"
     );
 }
+
+/// C has no command thread: `writeBIS` runs its writeRead on whichever thread
+/// called it (BISDetector.cpp:309-330, :654-659), here the BinX writer's own,
+/// as asynInt32SyncIO runs the driver's write on its caller
+/// (asynInt32SyncIO.c:140-144), so the SyncIO line names that thread.
+#[test]
+fn a_bis_command_runs_on_its_callers_thread() {
+    use epics_rs::asyn::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceMask};
+    let command = TcpListener::bind("127.0.0.1:0").expect("command listener");
+    let status = TcpListener::bind("127.0.0.1:0").expect("status listener");
+    let command_addr = format!("127.0.0.1:{}", command.local_addr().unwrap().port());
+    let status_addr = format!("127.0.0.1:{}", status.local_addr().unwrap().port());
+    fake_bis(command, status);
+
+    let name = "BISTHR";
+    let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    let file = Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+    let port = "BISTHR_COMMAND";
+    let handle = ip_port(port, &command_addr, b"]", b"\n");
+    let trace = handle.trace();
+    trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+    trace.set_trace_mask(Some(port), TraceMask::IO_DEVICE);
+    trace.set_trace_info_mask(Some(port), TraceInfoMask::THREAD);
+    trace.set_trace_io_mask(Some(port), TraceIoMask::ASCII);
+    let detector = create_bruker_detector(
+        &claim_port(name).unwrap(),
+        user(handle),
+        user(ip_port("BISTHR_STATUS", &status_addr, b"\n", b"")),
+        0,
+    )
+    .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let bin_x = detector.ad_params.bin_x;
+    std::thread::Builder::new()
+        .name("binx-writer".into())
+        .spawn(move || sync.write_int32(bin_x, 2).expect("binning 2"))
+        .unwrap()
+        .join()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = std::fs::read_to_string(&path).unwrap();
+        if text.contains("asynOctetSyncIO wrote:\n[ChangeFrameSize")
+            || std::time::Instant::now() >= deadline
+        {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let _ = std::fs::remove_file(&path);
+    let wrote = text
+        .lines()
+        .find(|l| l.contains("asynOctetSyncIO wrote:"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(wrote.starts_with("[binx-writer,"), "{wrote}");
+}
