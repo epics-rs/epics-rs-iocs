@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PortSets,
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PortSets, StatusWrite,
 };
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{DrvUserRequest, PortDriverBase};
@@ -469,6 +469,8 @@ pub struct Mcs2Axis {
     tracked_position: f64,
     /// What the last poll or home set on the port, for the poller to post.
     sets: PortSets,
+    /// What an open-loop move or a set position set, for the loop to apply.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl Mcs2Axis {
@@ -485,6 +487,7 @@ impl Mcs2Axis {
             has_encoder: false,
             tracked_position: 0.0,
             sets: PortSets::default(),
+            status_writes: Vec::new(),
         }
     }
 
@@ -562,12 +565,16 @@ impl Mcs2Axis {
         ctrl.write_only(&format!(":MOVE{c} {:.6}", CFloat(target * PULSES_PER_STEP)))
     }
 
-    /// Open-loop step move: track the target in software and send the relative
-    /// delta unscaled (C `MMOD 4`), `MOVE` sent whatever `MMOD` returned
-    /// (:390-394). Locks the controller internally.
+    /// Open-loop step move: set both positions to the target (:387-388) and
+    /// send the relative delta unscaled (C `MMOD 4`), `MOVE` sent whatever
+    /// `MMOD` returned (:390-394). Locks the controller internally.
     fn move_open_loop(&mut self, delta: f64) -> AsynResult<()> {
         let c = self.channel;
         self.tracked_position += delta;
+        self.status_writes.extend([
+            StatusWrite::EncoderPosition(self.tracked_position),
+            StatusWrite::Position(self.tracked_position),
+        ]);
         let ctrl = self.lock();
         let _ = ctrl.write_only(&format!(":CHAN{c}:MMOD 4"));
         ctrl.write_only(&format!(":MOVE{c} {:.6}", CFloat(delta)))
@@ -583,6 +590,10 @@ impl AsynMotor for Mcs2Axis {
 
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     /// C `MCS2Axis::poll`'s `skip` label sets only `motorStatusProblem_`
@@ -684,6 +695,10 @@ impl AsynMotor for Mcs2Axis {
         // the next open-loop move steps from the old motorEncoderPosition_
         // and undoes the redefinition. C defect, not copied.
         self.tracked_position = position;
+        if !self.has_encoder {
+            self.status_writes
+                .push(StatusWrite::EncoderPosition(position));
+        }
         let ctrl = self.lock();
         ctrl.write_only(&format!(
             ":CHAN{c}:POS {:.6}",
@@ -702,11 +717,6 @@ impl AsynMotor for Mcs2Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
-        // C's open-loop move sets both positions itself (:387-388).
-        if !self.has_encoder {
-            status.position = self.tracked_position;
-            status.encoder_position = self.tracked_position;
-        }
         let ctrl = self.lock();
         let mut set = Vec::new();
         let polled = self.poll_channel(&ctrl, &mut set, status);
@@ -1057,8 +1067,55 @@ mod tests {
         let user = AsynUser::default();
         axis.move_relative(&user, 2.5, 0.0, 1.0, 1.0).unwrap();
         let mut status = MotorStatus::default();
+        for write in axis.take_status_writes() {
+            write.apply(&mut status);
+        }
         assert!(axis.poll(&user, &mut status).is_err());
         assert_eq!((status.position, status.encoder_position), (2.5, 2.5));
+    }
+
+    /// smarActMCS2MotorDriver.cpp:387-388: the open-loop move sets both
+    /// positions when it is sent, not at the next poll.
+    #[test]
+    fn the_open_loop_move_sets_both_positions() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("mcs2OpenLoopSets", |_| "0\r\n".to_string());
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2OpenLoopSets", 0), no_port());
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(
+            axis.take_status_writes(),
+            [
+                StatusWrite::EncoderPosition(3.0),
+                StatusWrite::Position(3.0)
+            ]
+        );
+    }
+
+    /// The redefinition C does not carry into `motorEncoderPosition_`
+    /// survives a poll without a sensor: the next open-loop move steps from it.
+    #[test]
+    fn an_open_loop_move_after_a_poll_steps_from_the_set_position() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("mcs2SetPosPoll", |_| "0\r\n".to_string());
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2SetPosPoll", 0), no_port());
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        let mut status = MotorStatus::default();
+        axis.set_position(&user, 1.5).unwrap();
+        status.position = 1.5;
+        for write in axis.take_status_writes() {
+            write.apply(&mut status);
+        }
+        axis.poll(&user, &mut status).unwrap();
+        rig.sent();
+        axis.move_absolute(&user, 3.0, 0.0, 1.0, 1.0).unwrap();
+        let sent = rig.sent();
+        assert!(
+            sent.iter().any(|c| c.trim_end() == ":MOVE0 1.500000"),
+            "{sent:?}"
+        );
     }
 
     /// smarActMCS2MotorDriver.cpp:479-555: an idle poll sets PSTAT,
