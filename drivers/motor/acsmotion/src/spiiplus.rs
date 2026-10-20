@@ -901,7 +901,7 @@ impl AsynMotor for SpiiPlusAxis {
         let fvel = at(&polled.feedback_velocity);
         let ast = bits(&polled.axis_status);
 
-        let (moving, powered, high_limit, low_limit, homed, encoder) = if self.reduced {
+        let (moving, powered, high_limit, low_limit, encoder) = if self.reduced {
             // Dummy/virtual: motion from AST, no faults; the encoder is the
             // commanded position, or VPOS for a virtual axis that has it.
             let encoder = if !self.dummy && ctrl.vpos_supported {
@@ -909,17 +909,15 @@ impl AsynMotor for SpiiPlusAxis {
             } else {
                 apos
             };
-            ((ast & AST_MOTION) != 0, false, false, false, false, encoder)
+            ((ast & AST_MOTION) != 0, false, false, false, encoder)
         } else {
             let mst = bits(&polled.motor_status);
             let fault = bits(&polled.fault_status);
-            let mflags = bits(&polled.motor_flags);
             (
                 (mst & MST_MOTION) != 0,
                 (mst & MST_ENABLED) != 0,
                 (fault & FAULT_HARD_RIGHT_LIMIT) != 0,
                 (fault & FAULT_HARD_LEFT_LIMIT) != 0,
-                (mflags & MFLAGS_HOME) != 0,
                 at(&polled.feedback_position) / ctrl.encoder_factor[a],
             )
         };
@@ -956,7 +954,6 @@ impl AsynMotor for SpiiPlusAxis {
             low_limit,
             direction: self.last_direction,
             powered,
-            homed,
             has_encoder: true,
             gain_support: true,
             ..MotorStatus::default()
@@ -2012,6 +2009,18 @@ mod tests {
         line.lock().unwrap().set("MST", &[0.0]);
         line.lock().unwrap().set("FVEL", &[-2.0]);
         assert!(pass(&ctrl, &mut axis).direction);
+    }
+
+    /// C sets no motorStatusHomed_: MFLAGS HOME goes to
+    /// SPiiPlusHomingProcedureDone_ alone (SPiiPlusDriver.cpp:802-804).
+    #[test]
+    fn mflags_home_leaves_homed_unset() {
+        let (ctrl, line) = fake("spiiHomed", 1, &[("EFAC", &[1.0])]);
+        line.lock()
+            .unwrap()
+            .set("MFLAGS", &[f64::from(MFLAGS_HOME)]);
+        let mut axis = SpiiPlusAxis::new(ctrl.clone(), 0);
+        assert!(!pass(&ctrl, &mut axis).homed);
     }
 
     #[test]
