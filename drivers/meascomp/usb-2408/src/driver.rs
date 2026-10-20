@@ -12,6 +12,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use meascomp::device::DaqDevice;
+use meascomp::timer::PulseTiming;
 use uldaq_sys::UlError;
 
 use crate::board_enums::{self, AI_CHAN_TYPE_TC, AI_CHAN_TYPE_VOLTAGE, map_range};
@@ -30,6 +31,9 @@ fn device_addr(addr: i32) -> i32 {
 
 /// C `MAX_IO_PORTS`.
 const MAX_IO_PORTS: u32 = 8;
+
+/// C `MAX_PULSE_GEN`.
+const MAX_PULSE_GEN: usize = 4;
 
 /// What C's constructor reads of the board (drvMultiFunction.cpp:845-850,
 /// :1033-1077) for `report` and `getBounds`.
@@ -192,6 +196,8 @@ pub struct MultiFunctionDriver {
     pub max_input_points: usize,
     pub max_output_points: usize,
     board: BoardInfo,
+    /// C `pulseGenRunning_`.
+    pulse_gen_running: [bool; MAX_PULSE_GEN],
 }
 
 /// drvMultiFunction.cpp:817-820.
@@ -281,6 +287,7 @@ impl MultiFunctionDriver {
             max_input_points,
             max_output_points,
             board,
+            pulse_gen_running: [false; MAX_PULSE_GEN],
         })
     }
 }
@@ -624,6 +631,94 @@ impl MultiFunctionDriver {
     fn trace(&self) -> SelfTrace {
         self.state.lock().unwrap().trace.clone()
     }
+
+    /// C `startPulseGenerator`. C bounds the frequency and delay by limits
+    /// its constructor sets only for timer models; on the 2408 they are
+    /// uninitialized (drvMultiFunction.cpp:763-766, :1140), so only the duty
+    /// cycle is bounded here.
+    fn start_pulse_generator(
+        &mut self,
+        dev: &DaqDevice,
+        timer: i32,
+        trace: &SelfTrace,
+    ) -> AsynResult<UlError> {
+        const FUNCTION: &str = "startPulseGenerator";
+        let p = self.params;
+        let duty_cycle = self.float(p.pulse_gen_duty_cycle, timer);
+        let mut timing = PulseTiming {
+            frequency: 1. / self.float(p.pulse_gen_period, timer),
+            duty_cycle: if duty_cycle <= 0. {
+                0.0001
+            } else if duty_cycle >= 1. {
+                0.9999
+            } else {
+                duty_cycle
+            },
+            initial_delay: self.float(p.pulse_gen_delay, timer),
+        };
+        let idle = if self.int(p.pulse_gen_idle_state, timer) == 0 {
+            uldaq_sys::TMRIS_LOW
+        } else {
+            uldaq_sys::TMRIS_HIGH
+        };
+        let count = self.int(p.pulse_gen_count, timer) as u64;
+        let status = trace.report(
+            &dev.pulse_out_start(timer, &mut timing, count, idle, uldaq_sys::PO_DEFAULT),
+            FUNCTION,
+            "Calling PulseOutStart",
+        );
+        if status != 0 {
+            return Ok(status);
+        }
+        if let Some(running) = self.pulse_gen_running.get_mut(timer as usize) {
+            *running = true;
+        }
+        let period = 1. / timing.frequency;
+        trace.print(
+            TraceMask::FLOW,
+            format_args!(
+                "{DRIVER_NAME}:{FUNCTION}: started pulse generator {timer} actual frequency={:.6}, actual period={:.6}, actual duty cycle={:.6}, actual delay={:.6}\n",
+                CFloat(timing.frequency),
+                CFloat(period),
+                CFloat(timing.duty_cycle),
+                CFloat(timing.initial_delay)
+            ),
+        );
+        self.base
+            .set_float64_param(p.pulse_gen_period, timer, period)?;
+        self.base
+            .set_float64_param(p.pulse_gen_duty_cycle, timer, timing.duty_cycle)?;
+        self.base
+            .set_float64_param(p.pulse_gen_delay, timer, timing.initial_delay)?;
+        Ok(0)
+    }
+
+    /// C `stopPulseGenerator`, which does not report its status.
+    fn stop_pulse_generator(&mut self, dev: &DaqDevice, timer: i32) -> UlError {
+        if let Some(running) = self.pulse_gen_running.get_mut(timer as usize) {
+            *running = false;
+        }
+        trace::status_of(&dev.pulse_out_stop(timer))
+    }
+
+    fn is_pulse_gen_running(&self, timer: i32) -> bool {
+        self.pulse_gen_running
+            .get(timer as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// A pulse setting write: `stopPulseGenerator(); startPulseGenerator();`
+    /// of a running generator, statuses or-ed.
+    fn pulse_setting_changed(&mut self, timer: i32, trace: &SelfTrace) -> AsynResult<UlError> {
+        if !self.is_pulse_gen_running(timer) {
+            return Ok(0);
+        }
+        let device = self.device.clone();
+        let dev = device.lock().unwrap();
+        let stopped = self.stop_pulse_generator(&dev, timer);
+        Ok(stopped | self.start_pulse_generator(&dev, timer, trace)?)
+    }
 }
 
 impl PortDriver for MultiFunctionDriver {
@@ -817,6 +912,19 @@ impl PortDriver for MultiFunctionDriver {
         } else if reason == self.params.thermocouple_open_detect && self.is_thermocouple(addr) {
             let dev = self.device.lock().unwrap();
             self.set_open_tc_detect(&dev, addr, value);
+        } else if reason == self.params.pulse_gen_run {
+            // C starts on any 1, running or not: a counted train ends unseen.
+            let device = self.device.clone();
+            let dev = device.lock().unwrap();
+            if value != 0 {
+                status = self.start_pulse_generator(&dev, addr, &trace)?;
+            } else if self.is_pulse_gen_running(addr) {
+                status = self.stop_pulse_generator(&dev, addr);
+            }
+        } else if reason == self.params.pulse_gen_count
+            || reason == self.params.pulse_gen_idle_state
+        {
+            status = self.pulse_setting_changed(addr, &trace)?;
         } else if reason == self.params.wave_dig_run {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
@@ -890,7 +998,16 @@ impl PortDriver for MultiFunctionDriver {
         }
 
         let mut status: UlError = 0;
-        if self.wave_gen_settings().contains(&reason) {
+        let p = self.params;
+        if [
+            p.pulse_gen_period,
+            p.pulse_gen_duty_cycle,
+            p.pulse_gen_delay,
+        ]
+        .contains(&reason)
+        {
+            status = self.pulse_setting_changed(device_addr(addr), &self.trace())?;
+        } else if self.wave_gen_settings().contains(&reason) {
             let mut updates = Vec::new();
             status =
                 self.wave_gen_setting_changed(device_addr(addr), &self.trace(), &mut updates)?;
@@ -1307,6 +1424,39 @@ mod tests {
             text.contains("MultiFunction:writeFloat64, port MFNANF, wrote nan to address 0\n"),
             "{text}"
         );
+    }
+
+    /// C writeInt32/writeFloat64 pulse branches (drvMultiFunction.cpp:2044-2059,
+    /// :2286-2293).
+    #[test]
+    fn pulse_writes_start_and_restart_the_pulse_generator() {
+        let mut drv =
+            MultiFunctionDriver::new("MFPULSE", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        // Only a write that reaches ulTmrPulseOut* fails on the null handle.
+        assert!(
+            drv.write_int32(&mut AsynUser::new(p.pulse_gen_run), 1)
+                .is_err()
+        );
+        assert!(
+            drv.write_int32(&mut AsynUser::new(p.pulse_gen_run), 0)
+                .is_ok()
+        );
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.pulse_gen_period), 0.5)
+                .is_ok()
+        );
+        drv.pulse_gen_running[0] = true;
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.pulse_gen_period), 0.5)
+                .is_err()
+        );
+        drv.pulse_gen_running[0] = true;
+        assert!(
+            drv.write_int32(&mut AsynUser::new(p.pulse_gen_count), 3)
+                .is_err()
+        );
+        assert!(!drv.pulse_gen_running[0]);
     }
 
     #[test]
