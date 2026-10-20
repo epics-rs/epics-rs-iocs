@@ -4,6 +4,8 @@
 //! command strings in, byte slices out, no I/O — so every frame layout and
 //! scaling rule is covered by the tests at the bottom of this file.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::drv_quad_em::{
     QE_MAX_INPUTS, QeAcquireMode, QeReadFormat, QeTriggerMode, QeTriggerPolarity,
 };
@@ -260,7 +262,7 @@ pub fn cmd_bias_state(on: bool) -> &'static str {
 /// C++ `epicsSnprintf(outString_, …, "HVS:%f", value)` — C's `%f` is always six
 /// fractional digits.
 pub fn cmd_bias_voltage(volts: f64) -> String {
-    format!("HVS:{volts:.6}")
+    format!("HVS:{volts:.6}", volts = CFloat(volts))
 }
 
 pub fn cmd_bias_interlock(on: bool) -> &'static str {
@@ -532,6 +534,8 @@ mod tests {
         assert_eq!(cmd_bias_state(false), "HVS:OFF");
         assert_eq!(cmd_bias_voltage(12.5), "HVS:12.500000");
         assert_eq!(cmd_bias_voltage(-3.0), "HVS:-3.000000");
+        assert_eq!(cmd_bias_voltage(f64::NAN), "HVS:nan");
+        assert_eq!(cmd_bias_voltage(-f64::NAN), "HVS:-nan");
         assert_eq!(cmd_bias_interlock(true), "INTERLOCK:ON");
         assert_eq!(cmd_bias_interlock(false), "INTERLOCK:OFF");
     }

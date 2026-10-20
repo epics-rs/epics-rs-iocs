@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::{Map, Value, json};
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::drv_quad_em::{QeTriggerMode, QeTriggerPolarity};
 use crate::trace::TraceMask;
 
@@ -263,8 +265,9 @@ impl Fx4Cache {
                     if let Some(last) = self.adc[0].back() {
                         let line = format!(
                             "Gate event, value={:.6}, time={timestamp:.6}, ADC1 last time={:.6}\n",
-                            f64::from(u8::from(level)),
-                            last.time
+                            CFloat(f64::from(u8::from(level))),
+                            CFloat(last.time),
+                            timestamp = CFloat(timestamp)
                         );
                         self.print(TraceMask::IO_DRIVER, line);
                     }
@@ -306,22 +309,22 @@ impl Fx4Cache {
             b.len(),
             c.len(),
             d.len(),
-            edge(a, false).val,
-            edge(b, false).val,
-            edge(c, false).val,
-            edge(d, false).val,
-            edge(a, false).time,
-            edge(b, false).time,
-            edge(c, false).time,
-            edge(d, false).time,
-            edge(a, true).val,
-            edge(b, true).val,
-            edge(c, true).val,
-            edge(d, true).val,
-            edge(a, true).time,
-            edge(b, true).time,
-            edge(c, true).time,
-            edge(d, true).time,
+            CFloat(edge(a, false).val),
+            CFloat(edge(b, false).val),
+            CFloat(edge(c, false).val),
+            CFloat(edge(d, false).val),
+            CFloat(edge(a, false).time),
+            CFloat(edge(b, false).time),
+            CFloat(edge(c, false).time),
+            CFloat(edge(d, false).time),
+            CFloat(edge(a, true).val),
+            CFloat(edge(b, true).val),
+            CFloat(edge(c, true).val),
+            CFloat(edge(d, true).val),
+            CFloat(edge(a, true).time),
+            CFloat(edge(b, true).time),
+            CFloat(edge(c, true).time),
+            CFloat(edge(d, true).time),
         );
         self.print(TraceMask::IO_DRIVER, line);
         let min_size = self.adc.iter().map(|q| q.len()).min().unwrap_or(0);
@@ -367,7 +370,10 @@ impl Fx4Cache {
                 if !self.timestamp_mismatch {
                     let line = format!(
                         "drvFX4::onMessageEvent timestamps are not the same for sample {i} {:.6} {:.6} {:.6} {:.6}\n",
-                        times[0], times[1], times[2], times[3]
+                        CFloat(times[0]),
+                        CFloat(times[1]),
+                        CFloat(times[2]),
+                        CFloat(times[3])
                     );
                     self.print(TraceMask::ERROR, line);
                     self.timestamp_mismatch = true;

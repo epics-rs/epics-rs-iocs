@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
@@ -368,7 +369,7 @@ impl NslsEmDriver {
                     s.mode,
                     s.values_per_read,
                     s.range,
-                    s.period_us
+                    CFloat(s.period_us)
                 );
                 return Err(read
                     .err()

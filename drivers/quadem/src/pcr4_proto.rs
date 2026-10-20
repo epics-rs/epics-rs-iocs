@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::drv_quad_em::{QE_MAX_INPUTS, QeTriggerPolarity};
 
 /// C++ `PCR4_TIMEOUT` (1 s).
@@ -111,7 +113,7 @@ pub fn cmd_bias_state(on: bool) -> &'static str {
 
 /// C++ `setBiasVoltage`: `"SETBIAS:%f"` — C's `%f` is six decimals.
 pub fn cmd_bias_voltage(volts: f64) -> String {
-    format!("SETBIAS:{volts:.6}")
+    format!("SETBIAS:{volts:.6}", volts = CFloat(volts))
 }
 
 /// C++ `setAcquireParams`: `sampleTime = 19e-6 * valuesPerRead`.
@@ -312,6 +314,8 @@ mod tests {
         assert_eq!(cmd_bias_state(true), "BIAS:ON");
         assert_eq!(cmd_bias_state(false), "BIAS:OFF");
         assert_eq!(cmd_bias_voltage(12.5), "SETBIAS:12.500000");
+        assert_eq!(cmd_bias_voltage(f64::NAN), "SETBIAS:nan");
+        assert_eq!(cmd_bias_voltage(-f64::NAN), "SETBIAS:-nan");
     }
 
     #[test]
