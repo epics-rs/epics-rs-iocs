@@ -1023,14 +1023,6 @@ impl PortDriver for MultiFunctionDriver {
         let addr = user.addr;
         self.base.set_float64_param(reason, addr, value)?;
 
-        // Frequency change → update dwell
-        if reason == self.params.wave_gen_freq && value > 0.0 {
-            let num_points = self.int(self.params.wave_gen_num_points, 0) as f64;
-            let dwell = 1.0 / (value * num_points);
-            self.base
-                .set_float64_param(self.params.wave_gen_dwell, 0, dwell)?;
-        }
-
         let mut status: UlError = 0;
         let p = self.params;
         if [
@@ -1574,6 +1566,23 @@ mod tests {
         assert!(
             text.contains("MultiFunction:writeFloat64, port MFNANF, wrote nan to address 0\n"),
             "{text}"
+        );
+    }
+
+    /// C writeFloat64 only stores WAVEGEN_FREQ (drvMultiFunction.cpp:2273-2330).
+    #[test]
+    fn a_frequency_write_leaves_the_dwell_alone() {
+        let mut drv = MultiFunctionDriver::new("MFFREQ", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        let dwell = drv.float(p.wave_gen_dwell, 0);
+        drv.write_float64(&mut AsynUser::new(p.wave_gen_freq), 50.0)
+            .unwrap();
+        assert_eq!(
+            (
+                drv.float(p.wave_gen_freq, 0),
+                drv.float(p.wave_gen_dwell, 0)
+            ),
+            (50.0, dwell)
         );
     }
 
