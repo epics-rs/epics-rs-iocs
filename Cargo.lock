@@ -4861,6 +4861,7 @@ name = "twincat-ads"
 version = "0.1.0"
 dependencies = [
  "asyn-rs",
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]
