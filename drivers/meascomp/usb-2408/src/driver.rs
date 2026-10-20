@@ -284,21 +284,15 @@ impl MultiFunctionDriver {
 }
 
 impl MultiFunctionDriver {
-    /// Apply array (or scalar) updates built by the wave_dig/wave_gen helpers.
+    /// Apply the updates built by the wave_dig/wave_gen helpers in order:
+    /// each array posts as it is reached, each set waits for the flush.
     ///
-    /// The poller pushes the same list through
-    /// `set_params_and_notify_blocking`; on the actor thread that call would
-    /// be a self-deadlock, so the store is written directly instead.
+    /// The poller applies the same list under `with_driver_blocking`; on the
+    /// actor thread that call would be a self-deadlock, so the base takes
+    /// them directly instead.
     fn apply_updates(&mut self, updates: Vec<ParamSetValue>) -> AsynResult<()> {
-        for update in updates {
-            if let ParamSetValue::Value {
-                reason,
-                addr,
-                value,
-            } = update
-            {
-                self.base.set_param_value(reason, addr, value)?;
-            }
+        for update in &updates {
+            self.base.set_param(update)?;
         }
         Ok(())
     }
@@ -392,7 +386,7 @@ impl MultiFunctionDriver {
         }
         let buffer = &mut wave_gen_state.int_waveforms[channel as usize];
         wave_gen::define_internal(buffer, &wave);
-        updates.push(ParamSetValue::new(
+        updates.push(ParamSetValue::array(
             p.wave_gen_int_wf,
             channel,
             ParamValue::Float32Array(buffer[..wave.num_points].into()),
@@ -539,7 +533,7 @@ impl MultiFunctionDriver {
         let p = &self.params;
         let axis = |points, dwell, wf| {
             let times = wave_dig::time_axis(self.int(points, 0), self.float(dwell, 0));
-            ParamSetValue::new(wf, 0, ParamValue::Float32Array(times.into()))
+            ParamSetValue::array(wf, 0, ParamValue::Float32Array(times.into()))
         };
         [
             axis(
@@ -1189,6 +1183,102 @@ mod tests {
         assert!(usb_2408.bounds(&params, params.counter_reset).is_err());
     }
 
+    /// A driver with interrupts open, the constructor's posts made, and a
+    /// subscriber to everything after them.
+    fn posting_driver(
+        name: &str,
+    ) -> (
+        MultiFunctionDriver,
+        epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+    ) {
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        let mut drv = MultiFunctionDriver::new(name, DaqDevice::unconnected(), 16, 16).unwrap();
+        drv.base.own_interrupts(InterruptGate::opened());
+        for addr in 0..MAX_SIGNALS as i32 {
+            drv.base.call_param_callbacks(addr).unwrap();
+        }
+        let rx = drv.base.interrupts.subscribe_async(1024, 1 << 16);
+        (drv, rx)
+    }
+
+    /// Each post of `reasons`, in order: (reason, addr, typed).
+    fn posts(
+        rx: &mut epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+        reasons: &[usize],
+    ) -> Vec<(usize, i32, bool)> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| reasons.contains(&v.reason))
+            .map(|v| (v.reason, v.addr, v.iface.is_some()))
+            .collect()
+    }
+
+    /// defineWaveform's doCallbacksFloat32Array of the internal wave and
+    /// computeWaveGenTimes' two time axes post at once, typed, ahead of
+    /// writeFloat64's callParamCallbacks (drvMultiFunction.cpp:1573,
+    /// 1748, 1755).
+    #[test]
+    fn a_wave_gen_dwell_write_posts_its_arrays_ahead_of_the_flush() {
+        let (mut drv, mut rx) = posting_driver("MFGENARR");
+        let p = drv.params;
+        drv.base
+            .set_int32_param(p.wave_gen_wave_type, 0, wave_gen::WAVE_TYPE_SIN)
+            .unwrap();
+        drv.base
+            .set_int32_param(p.wave_gen_int_num_points, 0, 4)
+            .unwrap();
+        drv.write_float64(&mut AsynUser::new(p.wave_gen_int_dwell), 0.5)
+            .unwrap();
+        let watched = [
+            p.wave_gen_int_wf,
+            p.wave_gen_user_time_wf,
+            p.wave_gen_int_time_wf,
+            p.wave_gen_int_dwell,
+        ];
+        assert_eq!(
+            posts(&mut rx, &watched),
+            [
+                (p.wave_gen_int_wf, 0, true),
+                (p.wave_gen_user_time_wf, 0, true),
+                (p.wave_gen_int_time_wf, 0, true),
+                (p.wave_gen_int_dwell, 0, false),
+            ]
+        );
+    }
+
+    /// computeWaveDigTimes' doCallbacksFloat32Array (drvMultiFunction.cpp:1915).
+    #[test]
+    fn a_wave_dig_dwell_write_posts_the_time_axis_ahead_of_the_flush() {
+        let (mut drv, mut rx) = posting_driver("MFDIGTIME");
+        let p = drv.params;
+        drv.write_float64(&mut AsynUser::new(p.wave_dig_dwell), 0.5)
+            .unwrap();
+        assert_eq!(
+            posts(&mut rx, &[p.wave_dig_time_wf, p.wave_dig_dwell]),
+            [(p.wave_dig_time_wf, 0, true), (p.wave_dig_dwell, 0, false)]
+        );
+    }
+
+    /// readWaveDig's doCallbacksFloat64Array of each channel and of the
+    /// absolute time base (drvMultiFunction.cpp:1897-1901).
+    #[test]
+    fn a_read_wf_write_posts_the_digitizer_arrays_ahead_of_the_flush() {
+        let (mut drv, mut rx) = posting_driver("MFDIGREAD");
+        let p = drv.params;
+        drv.write_int32(&mut AsynUser::new(p.wave_dig_read_wf), 1)
+            .unwrap();
+        let mut want: Vec<_> = (0..MAX_ANALOG_IN as i32)
+            .map(|ch| (p.wave_dig_volt_wf, ch, true))
+            .collect();
+        want.push((p.wave_dig_abs_time_wf, 0, true));
+        want.push((p.wave_dig_read_wf, 0, false));
+        let watched = [
+            p.wave_dig_volt_wf,
+            p.wave_dig_abs_time_wf,
+            p.wave_dig_read_wf,
+        ];
+        assert_eq!(posts(&mut rx, &watched), want);
+    }
+
     #[test]
     fn read_enum_serves_the_usb_2408_tables_c_does() {
         let mut drv = MultiFunctionDriver::new("MFENUM", DaqDevice::unconnected(), 16, 16).unwrap();
@@ -1254,13 +1344,11 @@ mod tests {
 
     #[test]
     fn a_read_request_of_zero_posts_the_waveforms() {
-        let mut drv =
-            MultiFunctionDriver::new("MFREADWF", DaqDevice::unconnected(), 16, 16).unwrap();
+        let (mut drv, mut rx) = posting_driver("MFREADWF");
         let abs_time_wf = drv.params.wave_dig_abs_time_wf;
-        assert!(!drv.base.params.is_param_defined(abs_time_wf, 0).unwrap());
         let mut user = AsynUser::new(drv.params.wave_dig_read_wf);
         drv.write_int32(&mut user, 0).unwrap();
-        assert!(drv.base.params.is_param_defined(abs_time_wf, 0).unwrap());
+        assert_eq!(posts(&mut rx, &[abs_time_wf]), [(abs_time_wf, 0, true)]);
     }
 
     #[test]

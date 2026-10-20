@@ -348,14 +348,14 @@ pub fn waveform_updates(
                     state.channel_buffers[ch][0]
                 ),
             );
-            updates.push(ParamSetValue::new(
+            updates.push(ParamSetValue::array(
                 params.wave_dig_volt_wf,
                 ch as i32,
                 ParamValue::Float64Array(state.channel_buffers[ch][..n].into()),
             ));
         }
     }
-    updates.push(ParamSetValue::new(
+    updates.push(ParamSetValue::array(
         params.wave_dig_abs_time_wf,
         0,
         ParamValue::Float64Array(state.abs_time_buffer[..n].into()),
@@ -370,7 +370,7 @@ pub fn compute_wave_dig_times(
     num_points: i32,
     dwell: f64,
 ) -> ParamSetValue {
-    ParamSetValue::new(
+    ParamSetValue::array(
         params.wave_dig_time_wf,
         0,
         ParamValue::Float32Array(time_axis(num_points, dwell).into()),
@@ -406,7 +406,7 @@ mod tests {
         let addrs: Vec<_> = waveform_updates(&params, &state, &SelfTrace::default())
             .into_iter()
             .filter_map(|u| match u {
-                ParamSetValue::Value { reason, addr, .. } if reason == params.wave_dig_volt_wf => {
+                ParamSetValue::Array { reason, addr, .. } if reason == params.wave_dig_volt_wf => {
                     Some(addr)
                 }
                 _ => None,
