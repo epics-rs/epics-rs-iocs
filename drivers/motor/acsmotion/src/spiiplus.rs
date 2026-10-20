@@ -36,6 +36,7 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
@@ -47,7 +48,6 @@ use epics_rs::asyn::port::{
 };
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::base::calc::engine::cvt::{fmt_e, fmt_f, fmt_g};
 use epics_rs::motor::controller_port::{
     AxisUser, ControllerCtx, ControllerParams, ControllerReport, PROFILE_EXECUTE_DONE, ParamWrite,
     has_motor_axis, index,
@@ -155,7 +155,7 @@ pub(crate) fn spiiplus_err(message: impl Into<String>) -> AsynError {
 /// A double in a command as C's `std::stringstream << double` writes it:
 /// `%g`, six significant digits.
 pub(crate) fn fmt(v: f64) -> String {
-    fmt_g(v, 6, false, false)
+    CFloat(v).g().to_string()
 }
 
 /// One axis's `SPIIPLUS_HOMING_*` parameters (C `home()` reads them at each
@@ -534,8 +534,8 @@ impl SpiiPlusController {
              virtual feedback position support: {}\n\n",
             self.port,
             self.num_axes,
-            fmt_f(self.poll_periods.0, 6),
-            fmt_f(self.poll_periods.1, 6),
+            CFloat(self.poll_periods.0),
+            CFloat(self.poll_periods.1),
             self.ident,
             yes_no(self.vpos_supported),
         );
@@ -547,7 +547,7 @@ impl SpiiPlusController {
     fn axis_report(&self, a: usize, out: &mut dyn std::fmt::Write) {
         let p = &self.polled;
         let setup = self.setup[a];
-        let f = |values: &[f64]| fmt_f(values.get(a).copied().unwrap_or_default(), 6);
+        let f = |values: &[f64]| CFloat(values.get(a).copied().unwrap_or_default());
         let i = |values: &[i32]| values.get(a).copied().unwrap_or_default();
         let _ = writeln!(out, "Configuration for axis {a}:");
         let _ = writeln!(out, "  mflags: {}", i(&p.motor_flags));
@@ -570,7 +570,7 @@ impl SpiiPlusController {
             // C stores the masked bit, not 0/1.
             let _ = writeln!(out, "    {name}{}", setup.flags & mask);
         }
-        let _ = writeln!(out, "  resolution: {}", fmt_e(setup.resolution, 6, false));
+        let _ = writeln!(out, "  resolution: {:e}", CFloat(setup.resolution));
         let _ = writeln!(out, "  reference offset: {}", f(&p.reference_offset));
         let _ = writeln!(out, "  homing method: {}", self.homing[a].method);
         let _ = writeln!(out, "  max velocity: {}", f(&p.max_velocity));
@@ -579,7 +579,8 @@ impl SpiiPlusController {
         let _ = writeln!(out, "  virtual: {virtual_}");
         let _ = writeln!(out, "Encoder info for axis {a}:");
         let _ = writeln!(out, "  encoder type: {}", i(&self.encoder_type));
-        let e = |values: &[f64]| fmt_e(values.get(a).copied().unwrap_or_default(), 6, false);
+        let e =
+            |values: &[f64]| format!("{:e}", CFloat(values.get(a).copied().unwrap_or_default()));
         let _ = writeln!(out, "  encoder resolution: {}", e(&self.encoder_factor));
         let _ = writeln!(out, "  encoder offset: {}", f(&p.encoder_offset));
         let _ = writeln!(out, "  encoder 2 type: {}", i(&self.encoder2_type));
