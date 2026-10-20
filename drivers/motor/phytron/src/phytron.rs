@@ -1569,10 +1569,6 @@ pub struct PhytronAxis {
     sets: PortSets,
     /// What the constructor set on the axis's status.
     status_writes: Vec<StatusWrite>,
-    /// C `motorStatusDone_` as the poll reads it: 0 until a poll parses
-    /// (phytronAxisMotor.cpp:2022), and asynMotorController's move, home
-    /// and jog writes set it 0 (asynMotorController.cpp:301-353).
-    done: bool,
 }
 
 impl PhytronAxis {
@@ -1613,7 +1609,6 @@ impl PhytronAxis {
             sets: PortSets::default(),
             // phytronAxisMotor.cpp:1352: the controller always has an encoder.
             status_writes: vec![StatusWrite::HasEncoder(true)],
-            done: false,
         })
     }
 
@@ -1718,10 +1713,16 @@ impl PhytronAxis {
     }
 
     /// C `parseAnswer` (phytronAxisMotor.cpp:1916-2091) over this axis's
-    /// `answers`, each ACK already stripped.
-    fn parse_answer(&mut self, answers: &[String], method: PollMethod) -> AsynResult<MotorStatus> {
+    /// `answers`, each ACK already stripped: every field it sets is set in
+    /// `status`, and an answer it cannot parse sets none.
+    fn parse_answer(
+        &mut self,
+        answers: &[String],
+        method: PollMethod,
+        status: &mut MotorStatus,
+    ) -> AsynResult<()> {
         let bad = || phytron_err("phytron: invalid poll answer");
-        let (pos, enc, moving, status) = match self.ctrl_type {
+        let (pos, enc, moving, word) = match self.ctrl_type {
             CtrlType::Phymotion if method == PollMethod::Serial => {
                 let [pos, enc, idle, se] = answers else {
                     return Err(bad());
@@ -1733,23 +1734,18 @@ impl PhytronAxis {
                 let [se, pos, enc] = answers else {
                     return Err(bad());
                 };
-                let status = atoi(se);
-                (atof(pos), atof(enc), status & 1 != 0, status)
+                let word = atoi(se);
+                (atof(pos), atof(enc), word & 1 != 0, word)
             }
             CtrlType::Mcc => {
                 let [idle, perr, pos, enc] = answers else {
                     return Err(bad());
                 };
                 let moving = !idle.starts_with('E');
-                let status = self.mcc_status_word(perr, &self.lock().last_sui, moving)?;
-                (atof(pos), atof(enc), moving, status)
+                let word = self.mcc_status_word(perr, &self.lock().last_sui, moving)?;
+                (atof(pos), atof(enc), moving, word)
             }
         };
-        // C engages the brake once the axis stops (:2013-2024).
-        if !self.done && !moving {
-            self.lock().set_brake_output(self.axis_no, None, false);
-        }
-
         // The poll reports `P22R` times the ratio (:2005-2006).
         let (ratio, axis_status) = {
             let ctrl = self.lock();
@@ -1760,11 +1756,19 @@ impl PhytronAxis {
                 .unwrap_or(1.0);
             (ratio, ctrl.axis_status)
         };
+        status.position = pos;
+        status.encoder_position = enc * ratio;
+        // C engages the brake once the axis stops (:2013-2024).
+        let old_done = status.done;
+        status.done = !moving;
+        if !old_done && !moving {
+            self.lock().set_brake_output(self.axis_no, None, false);
+        }
 
         // Limit-home state machine. `problem` is the axis
         // internal/power-stage/SFI/ENDAT error mask, cleared through the state
         // machine while homing onto a limit switch.
-        let step = step_home_state(self.home_state, status, moving, self.ctrl_type);
+        let step = step_home_state(self.home_state, word, moving, self.ctrl_type);
         self.home_state = step.new_home_state;
         let problem = if step.clear_limit_error {
             // End of reference: clear the limit-switch error the phyMOTION sets.
@@ -1775,7 +1779,7 @@ impl PhytronAxis {
         };
 
         // A limit-switch error arms the next motion's `SEC` (:2070-2071).
-        if status & 0x1000 != 0 {
+        if word & 0x1000 != 0 {
             let mut ctrl = self.lock();
             if let Some(a) = ctrl.axis_mut(self.axis_no)
                 && a.status_reset_time < 0.0
@@ -1785,26 +1789,17 @@ impl PhytronAxis {
         }
 
         // phytronAxisMotor.cpp:2084
+        status.high_limit = step.high;
+        status.low_limit = step.low;
+        status.home = (word & 0x40) != 0;
+        status.homed = (word & 0x08) != 0;
+        status.encoder_home = (word & 0x08) != 0;
+        status.slip = (word & 0x4000) != 0;
         if let Some(reason) = axis_status {
-            self.sets.axis(reason, ParamValue::Int32(status));
+            self.sets.axis(reason, ParamValue::Int32(word));
         }
-
-        self.done = !moving;
-        Ok(MotorStatus {
-            position: pos,
-            encoder_position: enc * ratio,
-            done: !moving,
-            moving,
-            high_limit: step.high,
-            low_limit: step.low,
-            home: (status & 0x40) != 0,
-            encoder_home: (status & 0x08) != 0,
-            homed: (status & 0x08) != 0,
-            slip: (status & 0x4000) != 0,
-            problem,
-            has_encoder: true,
-            ..Default::default()
-        })
+        status.problem = problem;
+        Ok(())
     }
 }
 
@@ -1857,9 +1852,7 @@ impl AsynMotor for PhytronAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let moved = self.do_move(position, false, min_velocity, velocity, acceleration);
-        self.done = false;
-        moved
+        self.do_move(position, false, min_velocity, velocity, acceleration)
     }
 
     fn move_relative(
@@ -1870,9 +1863,7 @@ impl AsynMotor for PhytronAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let moved = self.do_move(distance, true, min_velocity, velocity, acceleration);
-        self.done = false;
-        moved
+        self.do_move(distance, true, min_velocity, velocity, acceleration)
     }
 
     /// C `moveVelocity` (phytronAxisMotor.cpp:1712-1736): the direction is
@@ -1884,9 +1875,7 @@ impl AsynMotor for PhytronAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let moved = self.jog(min_velocity, velocity, acceleration);
-        self.done = false;
-        moved
+        self.jog(min_velocity, velocity, acceleration)
     }
 
     /// C `home` (phytronAxisMotor.cpp:1637-1705).
@@ -1898,16 +1887,7 @@ impl AsynMotor for PhytronAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        let homed = self.start_home(min_velocity, velocity, acceleration, forward);
-        self.done = false;
-        homed
-    }
-
-    /// C `phytronAxis::poll` reports `!motorStatusDone_` past a failed
-    /// read (phytronAxisMotor.cpp:1868-1869), so an unreachable controller
-    /// keeps the poller at the moving period.
-    fn failed_poll_moving(&self) -> Option<bool> {
-        Some(!self.done)
+        self.start_home(min_velocity, velocity, acceleration, forward)
     }
 
     /// C `stop` (phytronAxisMotor.cpp:1741-1756): the deceleration on P15.
@@ -1957,8 +1937,11 @@ impl AsynMotor for PhytronAxis {
             }
             (method, answers)
         };
-        *status = self.parse_answer(&answers?, method)?;
-        Ok(())
+        let parsed = answers.and_then(|answers| self.parse_answer(&answers, method, status));
+        // `!motorStatusDone_` whatever the poll read (:1868-1869), so an
+        // unreachable controller keeps the poller at the moving period.
+        status.moving = !status.done;
+        parsed
     }
 }
 
@@ -2281,45 +2264,24 @@ mod tests {
         assert_eq!(fmt6(f64::NAN), "nan");
     }
 
-    // C's poll reports !motorStatusDone_ past a failure: unset until a
-    // poll parses, 0 again after a move (phytronAxisMotor.cpp:1868-1869,
+    // C's poll reports !motorStatusDone_ past a failure: 0 until a poll
+    // parses, 0 again after a move start (phytronAxisMotor.cpp:1868-1869,
     // :2022, asynMotorController.cpp:301).
     #[test]
     fn a_failed_poll_reports_moving_until_a_poll_reads_the_axis_idle() {
         let (mut axis, _) = mcc_axis("phytronFailedMoving");
-        assert_eq!(axis.failed_poll_moving(), Some(true));
-        axis.controller.lock().unwrap().poll();
-        assert!(!axis.polled(&AsynUser::new(0)).unwrap().moving);
-        assert_eq!(axis.failed_poll_moving(), Some(false));
-        let _ = axis.move_absolute(&AsynUser::new(0), 10.0, 1.0, 2.0, 1.0);
-        assert_eq!(axis.failed_poll_moving(), Some(true));
-    }
-
-    // Every start clears Done, not only the absolute move
-    // (asynMotorController.cpp:301-353).
-    #[test]
-    fn each_start_clears_what_a_failed_poll_reads_as_done() {
-        let (mut axis, _) = mcc_axis("phytronStartsClearDone");
         let user = AsynUser::new(0);
-        type Start = fn(&mut PhytronAxis, &AsynUser);
-        let starts: [(&str, Start); 3] = [
-            ("move_relative", |a, u| {
-                let _ = a.move_relative(u, 10.0, 1.0, 2.0, 1.0);
-            }),
-            ("move_velocity", |a, u| {
-                let _ = a.move_velocity(u, 1.0, 2.0, 1.0);
-            }),
-            ("home", |a, u| {
-                let _ = a.home(u, 1.0, 2.0, 1.0, true);
-            }),
-        ];
-        for (name, start) in starts {
-            axis.controller.lock().unwrap().poll();
-            assert!(!axis.polled(&user).unwrap().moving, "{name}");
-            assert_eq!(axis.failed_poll_moving(), Some(false), "{name}");
-            start(&mut axis, &user);
-            assert_eq!(axis.failed_poll_moving(), Some(true), "{name}");
-        }
+        let mut status = axis.constructed();
+        // No SUI read yet, so the parse fails.
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert!(status.moving);
+        axis.controller.lock().unwrap().poll();
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && !status.moving);
+        status.done = false;
+        axis.controller.lock().unwrap().last_sui.clear();
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert!(status.moving);
     }
 
     #[test]
@@ -2808,10 +2770,12 @@ mod tests {
         };
         assert!(release.ends_with(" M1.1MA A1.2S"), "{sent:?}");
         assert_eq!(mv, "M1.1A1");
-        axis.polled(&user).unwrap();
+        // Done is 0 from construction and from the move start.
+        let mut status = axis.constructed();
+        axis.poll(&user, &mut status).unwrap();
         let sent = take();
         assert_eq!(sent[sent.len() - 2..], ["A1.2R", "M1.1MD"], "{sent:?}");
-        axis.polled(&user).unwrap();
+        axis.poll(&user, &mut status).unwrap();
         assert!(!take().iter().any(|l| l.contains("A1.2")));
     }
 
