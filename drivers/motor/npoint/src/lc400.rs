@@ -397,6 +397,13 @@ impl Lc400Axis {
         }
     }
 
+    /// The base's `motorStatusDone_` = 0 after a move start, refused or not
+    /// (asynMotorController.cpp:301-353), on the DONE updateAuxParams reads.
+    fn started(&self, moved: AsynResult<()>) -> AsynResult<()> {
+        lock(&self.controller).axes[self.axis].done = false;
+        moved
+    }
+
     /// `LC400Axis::move`.
     fn move_to(&mut self, target: Target, velocity: f64, acceleration: f64) -> AsynResult<()> {
         let (Some(ch), Some(wav)) = (base_address(self.axis), wavetable_address(self.axis)) else {
@@ -554,7 +561,8 @@ impl AsynMotor for Lc400Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.move_to(Target::Absolute(position), velocity, acceleration)
+        let moved = self.move_to(Target::Absolute(position), velocity, acceleration);
+        self.started(moved)
     }
 
     fn move_relative(
@@ -565,7 +573,8 @@ impl AsynMotor for Lc400Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.move_to(Target::Relative(distance), velocity, acceleration)
+        let moved = self.move_to(Target::Relative(distance), velocity, acceleration);
+        self.started(moved)
     }
 
     /// A move to the hard limit, or half the range when none is set. C
@@ -581,7 +590,8 @@ impl AsynMotor for Lc400Axis {
             let ctrl = lock(&self.controller);
             let state = &ctrl.axes[self.axis];
             if (velocity > 0.0 && state.high_limit) || (velocity < 0.0 && state.low_limit) {
-                return Ok(());
+                drop(ctrl);
+                return self.started(Ok(()));
             }
             let half = f64::from(state.cts(f64::from(state.range / 2)));
             if velocity < 0.0 {
@@ -596,7 +606,8 @@ impl AsynMotor for Lc400Axis {
                 half
             }
         };
-        self.move_to(Target::Absolute(target), velocity.abs(), acceleration)
+        let moved = self.move_to(Target::Absolute(target), velocity.abs(), acceleration);
+        self.started(moved)
     }
 
     /// The LC400 has no home; C keeps `asynMotorAxis::home`.
@@ -608,7 +619,7 @@ impl AsynMotor for Lc400Axis {
         _acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        Ok(())
+        self.started(Ok(()))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -922,6 +933,42 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         text.lines().map(str::to_owned).collect()
+    }
+
+    /// LC400MotorDriver.cpp:480-486 reads every axis's motorStatusDone_,
+    /// which the base clears after every move start, refused or not
+    /// (asynMotorController.cpp:301-353), so another axis's move skips the
+    /// aux params at once.
+    #[test]
+    fn another_axis_s_move_start_skips_the_aux_params() {
+        let (_rig, io) =
+            motor_common::testing::LineRig::new("lc400MoveStart", |_| "AAAAA\0\0\0\0Z".into());
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(Some(io), 2)));
+        let params = Lc400ControllerParams::new(controller.clone(), 0.0, 0.0);
+        let _port =
+            register_controller_port(&open_owner(), "lc400MoveStartPort", 2, params).unwrap();
+        let p = lock(&controller).params.unwrap();
+        let mut axes = [
+            Lc400Axis::new(controller.clone(), 0),
+            Lc400Axis::new(controller, 1),
+        ];
+        let user = AsynUser::new(0);
+        for axis in &mut axes {
+            axis.polled(&user).unwrap();
+        }
+        // Refused: LC400_W_MAXPTS is 0.
+        assert!(axes[1].move_absolute(&user, 0.0, 0.0, 1.0, 1.0).is_err());
+        axes[0].take_port_sets();
+        axes[0].polled(&user).unwrap();
+        let reasons: Vec<usize> = axes[0]
+            .take_port_sets()
+            .into_iter()
+            .map(|set| match set {
+                PortSet::Axis { reason, .. } => reason,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(reasons, [p.digital_pos]);
     }
 
     /// LC400MotorDriver.cpp:882, :913, :922-925: a failed position read
