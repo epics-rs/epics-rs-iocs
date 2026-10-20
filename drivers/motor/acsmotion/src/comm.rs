@@ -457,7 +457,7 @@ fn binary_error_number(reply: &[u8]) -> Option<i32> {
     if *start != REPLY_START || *end != REPLY_END || (*lsb, *msb) != (6, 0) || digits.len() != 4 {
         return None;
     }
-    Some(atoi(&String::from_utf8_lossy(digits)))
+    Some(atoi(digits))
 }
 
 fn user(timeout: Duration) -> AsynUser {

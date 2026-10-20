@@ -404,9 +404,9 @@ impl AsynMotor for DrvSoloistAxis {
             });
         }
         ctrl.comm = CommState::Normal;
-        let axis_status = atoi(&String::from_utf8_lossy(&reply[1..]));
+        let axis_status = atoi(&reply[1..]);
         let fault = ctrl.ask(b"AXISFAULT()");
-        let fault = atoi(&String::from_utf8_lossy(fault.get(1..).unwrap_or_default()));
+        let fault = atoi(fault.get(1..).unwrap_or_default());
         // drvSoloist.cc:294-303: anything but `%` is position 0.
         let pfbk = ctrl.query("PFBKPROG()").map_or(0.0, |v| atof(&v));
         drop(ctrl);
