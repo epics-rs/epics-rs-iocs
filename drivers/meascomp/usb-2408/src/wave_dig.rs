@@ -257,24 +257,34 @@ pub fn points_transferred(current_index: i64, n_chans: usize, num_points: usize)
 
 /// The digitizer half of C `pollerThread`: copy the points transferred
 /// since the last poll and, once the scan is idle, run C `stopWaveDig`.
-/// `Err` is the failed `ulAInScanStatus` status, for the poller's
-/// once-per-outage report; `Ok(Some(..))` the array callbacks of a scan
-/// that just ended.
+/// Returns the `ulAInScanStatus` code, reported once per outage as C does
+/// when `prev_status` is 0, and the array callbacks of a scan that just
+/// ended. Linux C goes on past a failed status (drvMultiFunction.cpp:2695-2711):
+/// a scan that ended on a transfer error reads SS_IDLE beside it, so its
+/// last points are copied and it is stopped.
 pub fn read_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
     params: &MultiFunctionParams,
     restart: Option<&WaveDigScan>,
+    prev_status: UlError,
     trace: &SelfTrace,
-) -> Result<Option<Vec<ParamSetValue>>, UlError> {
-    let (status, xfer) = device.analog_in_scan_status().map_err(|e| e.code)?;
-    trace.print(
-        TraceMask::IO_DRIVER,
-        format_args!(
-            "{DRIVER_NAME}::pollerThread waveform digitizer status, aiStatus={status}, aiCount={}, aiIndex={}\n",
-            xfer.current_total_count, xfer.current_index
-        ),
-    );
+) -> (UlError, Option<Vec<ParamSetValue>>) {
+    let polled = device.analog_in_scan_status();
+    let (status, xfer) = (polled.status, &polled.xfer);
+    if polled.error.is_some() {
+        if prev_status == 0 {
+            trace.report_error(polled.code(), "pollerThread", "Calling AInScanStatus");
+        }
+    } else {
+        trace.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "{DRIVER_NAME}::pollerThread waveform digitizer status, aiStatus={status}, aiCount={}, aiIndex={}\n",
+                xfer.current_total_count, xfer.current_index
+            ),
+        );
+    }
 
     let n_chans = state.num_chans;
     if xfer.current_total_count != 0 && n_chans != 0 && xfer.current_index >= 0 {
@@ -294,10 +304,8 @@ pub fn read_wave_dig(
         }
     }
 
-    if status == SS_IDLE {
-        return Ok(Some(stop_wave_dig(device, state, params, restart, trace)));
-    }
-    Ok(None)
+    let arrays = (status == SS_IDLE).then(|| stop_wave_dig(device, state, params, restart, trace));
+    (polled.code(), arrays)
 }
 
 /// C `stopWaveDig`: clear RUN, hand the acquired points to the records
@@ -399,7 +407,76 @@ pub fn time_axis(num_points: i32, dwell: f64) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// libuldaq's ERR_OVERRUN (uldaq.h:152), a transfer error.
+    const ERR_OVERRUN: UlError = 18;
+
+    thread_local! {
+        /// What the mocked `ulAInScanStatus` reports: code, scan state,
+        /// total count and index.
+        static AIN_STATUS: Cell<Option<(UlError, i32, u64, i64)>> = const { Cell::new(None) };
+    }
+
+    /// The test binary's definition wins over libuldaq's. Unset, it answers
+    /// as libuldaq does for the null handle: ERR_BAD_DEV_HANDLE (2), nothing
+    /// filled.
+    #[unsafe(no_mangle)]
+    extern "C" fn ulAInScanStatus(
+        _handle: uldaq_sys::DaqDeviceHandle,
+        status: *mut i32,
+        xfer: *mut TransferStatus,
+    ) -> UlError {
+        let Some((code, scan, count, index)) = AIN_STATUS.get() else {
+            return 2;
+        };
+        unsafe {
+            *status = scan;
+            (*xfer).current_total_count = count;
+            (*xfer).current_index = index;
+        }
+        code
+    }
+
+    /// Linux C copies a failed status's points and stops on its SS_IDLE
+    /// (drvMultiFunction.cpp:2695-2732).
+    #[test]
+    fn a_scan_that_ended_on_a_transfer_error_is_copied_and_stopped() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "MFDIGERR",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let mut state = WaveDigState::new(4);
+        state.running = true;
+        state.num_chans = 2;
+        state.num_points = 3;
+        state.scan_buffer = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        AIN_STATUS.set(Some((ERR_OVERRUN, SS_IDLE, 6, 5)));
+
+        let (code, arrays) = read_wave_dig(
+            &DaqDevice::unconnected(),
+            &mut state,
+            &params,
+            None,
+            0,
+            &SelfTrace::default(),
+        );
+        assert_eq!(code, ERR_OVERRUN);
+        assert!(
+            arrays.is_some() && !state.running,
+            "the scan was not stopped"
+        );
+        assert_eq!(state.current_point, 3);
+        assert_eq!(state.channel_buffers[0][..3], [1.0, 3.0, 5.0]);
+        assert_eq!(state.channel_buffers[1][..3], [2.0, 4.0, 6.0]);
+    }
 
     #[test]
     fn absolute_time_counts_from_the_epics_epoch() {

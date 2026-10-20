@@ -53,6 +53,37 @@ pub fn check(code: uldaq_sys::UlError) -> Result<()> {
     }
 }
 
+/// What a `ul*ScanStatus` call reported. libuldaq fills the scan state and
+/// transfer position before it returns the transfer error of a scan that
+/// ended (AiUsbBase/DaqIUsbBase::getStatus), and the error stays set until
+/// the next scan (UsbScanTransferIn.cpp:35, :62, :117), so the error travels
+/// beside them instead of replacing them.
+#[derive(Debug, Clone)]
+pub struct ScanStatusReport {
+    pub status: i32,
+    pub xfer: uldaq_sys::TransferStatus,
+    pub error: Option<MeasCompError>,
+}
+
+impl ScanStatusReport {
+    pub(crate) fn new(
+        code: uldaq_sys::UlError,
+        status: i32,
+        xfer: uldaq_sys::TransferStatus,
+    ) -> Self {
+        Self {
+            status,
+            xfer,
+            error: check(code).err(),
+        }
+    }
+
+    /// The libuldaq return code, `ERR_NO_ERROR` on success.
+    pub fn code(&self) -> uldaq_sys::UlError {
+        self.error.map_or(ERR_NO_ERROR, |e| e.code)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;

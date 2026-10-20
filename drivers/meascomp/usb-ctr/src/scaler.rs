@@ -1,5 +1,6 @@
 use meascomp::counter::{CInScanConfig, CounterScanConfig};
 use meascomp::device::DaqDevice;
+use meascomp::error::ScanStatusReport;
 use uldaq_sys::*;
 
 use epics_rs::asyn::trace::TraceMask;
@@ -170,11 +171,10 @@ pub fn read_scaler(
     num_counters: usize,
     trace: &SelfTrace,
 ) {
+    // C reads the index whatever the call returned (drvUSBCTR.cpp:963-972).
     let polled = device.counter_in_scan_status();
     print_get_status(trace, "readScaler", &polled);
-    let Ok((status, xfer)) = polled else {
-        return;
-    };
+    let (status, xfer) = (polled.status, &polled.xfer);
 
     if xfer.current_total_count == 0 {
         return;
@@ -247,24 +247,72 @@ pub fn reset_scaler(
 
 /// C `readScaler`/`readMCS`'s `getStatus returned` line, printed whatever the
 /// status call returned.
-pub fn print_get_status(
-    trace: &SelfTrace,
-    function_name: &str,
-    polled: &meascomp::error::Result<(i32, TransferStatus)>,
-) {
-    let (status, scan, count, index) = match polled {
-        Ok((scan, xfer)) => (
-            0,
-            *scan,
-            xfer.current_total_count as i64,
-            xfer.current_index,
-        ),
-        Err(e) => (e.code, 0, 0, 0),
-    };
+pub fn print_get_status(trace: &SelfTrace, function_name: &str, polled: &ScanStatusReport) {
+    let (status, scan, count, index) = (
+        polled.code(),
+        polled.status,
+        polled.xfer.current_total_count as i64,
+        polled.xfer.current_index,
+    );
     trace.print(
         TraceMask::FLOW,
         format_args!(
             "USBCTR::{function_name} getStatus returned status={status}, ctrStatus={scan}, ctrCount={count}, ctrIndex={index}\n"
         ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// libuldaq's ERR_OVERRUN (uldaq.h:152), a transfer error.
+    const ERR_OVERRUN: UlError = 18;
+
+    thread_local! {
+        /// What the mocked `ulCInScanStatus` reports: code, scan state,
+        /// total count and index.
+        static CIN_STATUS: Cell<Option<(UlError, i32, u64, i64)>> = const { Cell::new(None) };
+    }
+
+    /// The test binary's definition wins over libuldaq's. Unset, it answers
+    /// as libuldaq does for the null handle: ERR_BAD_DEV_HANDLE (2), nothing
+    /// filled.
+    #[unsafe(no_mangle)]
+    extern "C" fn ulCInScanStatus(
+        _handle: uldaq_sys::DaqDeviceHandle,
+        status: *mut i32,
+        xfer: *mut TransferStatus,
+    ) -> UlError {
+        let Some((code, scan, count, index)) = CIN_STATUS.get() else {
+            return 2;
+        };
+        unsafe {
+            *status = scan;
+            (*xfer).current_total_count = count;
+            (*xfer).current_index = index;
+        }
+        code
+    }
+
+    /// C reads a failed status's index and takes the counts
+    /// (drvUSBCTR.cpp:963-978).
+    #[test]
+    fn a_scan_that_ended_on_a_transfer_error_keeps_its_counts() {
+        let mut state = ScalerState::new();
+        state.running = true;
+        state.scan_buffer = vec![0; 8];
+        state.scan_buffer[..4].copy_from_slice(&[1, 2, 3, 4]);
+        CIN_STATUS.set(Some((ERR_OVERRUN, SS_RUNNING, 4, 3)));
+
+        read_scaler(
+            &DaqDevice::unconnected(),
+            &mut state,
+            2,
+            &SelfTrace::default(),
+        );
+        assert_eq!(state.counts[..2], [3, 4]);
+    }
 }

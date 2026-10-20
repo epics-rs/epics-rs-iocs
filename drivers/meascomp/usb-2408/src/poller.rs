@@ -185,25 +185,18 @@ fn poller_loop(
                     snap.wave_gen_just_stopped = wg_was_running && !st.wave_gen.running;
 
                     if st.wave_dig.running {
-                        match wave_dig::read_wave_dig(
+                        let (code, arrays) = wave_dig::read_wave_dig(
                             &dev,
                             &mut st.wave_dig,
                             &params,
                             restart.as_ref(),
+                            prev_status,
                             &trace,
-                        ) {
-                            Ok(arrays) => snap.wave_dig_arrays = arrays,
-                            // Known deviation: Linux C does not `goto error`
-                            // here and goes on with the scanStatus/xferStatus
-                            // ulAInScanStatus left unset (UB); rs skips the
-                            // buffer copy and the stop for this pass.
-                            Err(code) => {
-                                status = code;
-                                if prev_status == 0 {
-                                    trace.report_error(status, FUNCTION, "Calling AInScanStatus");
-                                }
-                            }
+                        );
+                        if code != 0 {
+                            status = code;
                         }
+                        snap.wave_dig_arrays = arrays;
                         snap.wave_dig_current_point = st.wave_dig.current_point;
                         snap.wave_dig_running = true;
                     } else {
