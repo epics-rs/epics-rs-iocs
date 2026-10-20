@@ -291,11 +291,13 @@ mod tests {
     fn num_counters_is_glibc_atoi() {
         assert_eq!(atoi(" +3x"), 3);
         assert_eq!(atoi("-2"), -2);
-        // strtol saturates at LONG_MIN, whose low 32 bits are 0.
-        assert_eq!(atoi("-99999999999999999999"), 0);
-        assert_eq!(atoi("99999999999999999999"), -1);
-        // 2^32 + 3 fits in a long and truncates to 3.
-        assert_eq!(atoi("4294967299"), 3);
+        use std::ffi::c_long;
+        // strtol saturates at LONG_MIN/LONG_MAX, then truncates to int.
+        assert_eq!(atoi("-99999999999999999999"), c_long::MIN as i32);
+        assert_eq!(atoi("99999999999999999999"), c_long::MAX as i32);
+        // 2^32 + 3 truncates to 3 where it fits a long.
+        let wrapped = if c_long::BITS == 64 { 3 } else { i32::MAX };
+        assert_eq!(atoi("4294967299"), wrapped);
     }
 
     #[test]

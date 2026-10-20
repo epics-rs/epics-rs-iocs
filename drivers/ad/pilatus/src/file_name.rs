@@ -415,7 +415,12 @@ mod tests {
     #[test]
     fn multiple_format_start_number_is_atoi() {
         let m = make_multiple_file_format("/d/i_4294967297.tif", 10);
-        assert_eq!(m.start_number, 1);
+        let wrapped = if std::ffi::c_long::BITS == 64 {
+            1
+        } else {
+            i32::MAX
+        };
+        assert_eq!(m.start_number, wrapped);
     }
 
     #[test]

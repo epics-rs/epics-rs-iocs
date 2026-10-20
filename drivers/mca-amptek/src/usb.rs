@@ -578,14 +578,20 @@ mod tests {
     }
 
     /// C passes `atoi(addressInfo)` to the `unsigned int` serial
-    /// (ConsoleHelper.cpp:41-43): glibc cuts 4294967297 to 1 and saturates
-    /// 99999999999999999999 to -1.
+    /// (ConsoleHelper.cpp:41-43): glibc's `(int) strtol` of a 64-bit long
+    /// cuts 4294967297 to 1 and 99999999999999999999 to -1.
     #[test]
     fn the_serial_is_glibc_atoi() {
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 {
+            1
+        } else {
+            i32::MAX as u32
+        };
         for (address, serial) in [
             (" 12ab", 12),
-            ("4294967297", 1),
-            ("99999999999999999999", u32::MAX),
+            ("4294967297", wrapped),
+            ("99999999999999999999", c_long::MAX as i32 as u32),
         ] {
             let (mut usb, _) = usb(vec![FakeDevice::dp5(|_| Ok(vec![1]))]);
             let mut asked = None;

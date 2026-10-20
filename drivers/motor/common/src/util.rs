@@ -106,7 +106,8 @@ mod tests {
 
     #[test]
     fn atol_parses_wide_integers() {
-        assert_eq!(atol("10000000000x"), 10_000_000_000);
+        let wide = c_long::try_from(10_000_000_000_i128).unwrap_or(c_long::MAX);
+        assert_eq!(atol("10000000000x"), wide);
         assert_eq!(atol("-2"), -2);
         assert_eq!(atol("junk"), 0);
     }

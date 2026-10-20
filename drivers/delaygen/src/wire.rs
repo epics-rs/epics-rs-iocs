@@ -194,8 +194,14 @@ mod tests {
     #[test]
     fn atoi_wraps_an_overflow_as_glibc_does() {
         // glibc's atoi is `(int) strtol(s, NULL, 10)`.
-        assert_eq!(atoi("2147483648"), i32::MIN);
-        assert_eq!(atoi("99999999999999999999"), -1);
+        use std::ffi::c_long;
+        let past_int = if c_long::BITS == 64 {
+            i32::MIN
+        } else {
+            i32::MAX
+        };
+        assert_eq!(atoi("2147483648"), past_int);
+        assert_eq!(atoi("99999999999999999999"), c_long::MAX as i32);
     }
 
     #[test]

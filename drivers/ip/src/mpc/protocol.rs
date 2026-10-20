@@ -187,7 +187,9 @@ mod tests {
         assert_eq!(c_atoi(b"1"), 1);
         assert_eq!(c_atoi(b"x"), 0);
         // glibc: (int) strtol, the same for sscanf("%d").
-        assert_eq!(c_atoi(b"4294967297"), 1);
-        assert_eq!(c_atoi(b"99999999999999999999"), -1);
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        assert_eq!(c_atoi(b"4294967297"), wrapped);
+        assert_eq!(c_atoi(b"99999999999999999999"), c_long::MAX as i32);
     }
 }

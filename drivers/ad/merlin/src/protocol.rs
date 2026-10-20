@@ -465,7 +465,11 @@ pub(crate) mod tests {
     /// to int, and stops at the first non-digit.
     #[test]
     fn the_error_number_is_atoi() {
-        assert!(decode_ack(b"SET,COUNTERDEPTH,4294967296").is_ok());
+        // 2^32 cuts to MPX_OK only where it fits a long.
+        assert_eq!(
+            decode_ack(b"SET,COUNTERDEPTH,4294967296").is_ok(),
+            std::ffi::c_long::BITS == 64
+        );
         assert_eq!(decode_get(b"GET,THSTART,7,0x").unwrap(), "7");
     }
 
@@ -638,7 +642,12 @@ pub(crate) mod tests {
                 .replacen("R64,1,", "R64,0x1F,", 1);
         let h = parse_mq_header(text.as_bytes()).unwrap();
         let get = |n: &str| h.attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
-        assert_eq!(get("Frame Number"), Some(NDAttrValue::Int32(1)));
+        let wrapped = if std::ffi::c_long::BITS == 64 {
+            1
+        } else {
+            i32::MAX
+        };
+        assert_eq!(get("Frame Number"), Some(NDAttrValue::Int32(wrapped)));
         assert_eq!(get("Chip Select"), Some(NDAttrValue::UInt16(0x1f)));
     }
 

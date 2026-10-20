@@ -215,8 +215,10 @@ mod tests {
             })
         );
         assert_eq!(parse_channel_address("A-3"), None);
-        // int truncation of the long: 2^32 + 5 reads back as 5.
-        assert_eq!(parse_channel_address("4294967301"), Some(signal(5)));
+        // int truncation of the long: 2^32 + 5 reads back as 5 where it
+        // fits a long, and saturates past the range where it does not.
+        let wide = std::ffi::c_long::BITS == 64;
+        assert_eq!(parse_channel_address("4294967301"), wide.then(|| signal(5)));
     }
 
     #[test]

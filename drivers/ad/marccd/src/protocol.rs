@@ -359,15 +359,21 @@ mod tests {
     #[test]
     fn state_is_glibc_strtol_cut_to_int() {
         assert_eq!(parse_state("0b11"), 3);
-        assert_eq!(parse_state("99999999999999999999"), -1);
+        assert_eq!(
+            parse_state("99999999999999999999"),
+            std::ffi::c_long::MAX as i32
+        );
     }
 
     /// glibc's `%d` stores `(int) strtol(s, &end, 10)`.
     #[test]
     fn int_out_of_range_is_glibc_s_cut_to_int() {
-        assert_eq!(parse_int("4294967297"), Some(1));
-        assert_eq!(parse_int("99999999999999999999"), Some(-1));
-        assert_eq!(parse_pair("99999999999999999999,2"), Some((-1, 2)));
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        let saturated = c_long::MAX as i32;
+        assert_eq!(parse_int("4294967297"), Some(wrapped));
+        assert_eq!(parse_int("99999999999999999999"), Some(saturated));
+        assert_eq!(parse_pair("99999999999999999999,2"), Some((saturated, 2)));
     }
 
     #[test]

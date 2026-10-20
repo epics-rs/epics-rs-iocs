@@ -950,8 +950,16 @@ mod tests {
     /// cut to `int`.
     #[test]
     fn an_out_of_range_int_is_glibc_s_cut_to_int() {
-        assert_eq!(parse_orec("ORec,99999999999999999999"), Some(-1));
-        assert_eq!(parse_error_header("E1,4294967297:1:2"), Some((1, Some(2))));
+        use std::ffi::c_long;
+        assert_eq!(
+            parse_orec("ORec,99999999999999999999"),
+            Some(c_long::MAX as i32)
+        );
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        assert_eq!(
+            parse_error_header("E1,4294967297:1:2"),
+            Some((wrapped, Some(2)))
+        );
     }
 
     #[test]

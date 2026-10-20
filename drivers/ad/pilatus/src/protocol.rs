@@ -639,15 +639,17 @@ mod tests {
     /// glibc's `%d` stores `(int) strtol(s, &end, 10)`.
     #[test]
     fn an_out_of_range_int_is_glibc_s_cut_to_int() {
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
         assert_eq!(
             parse_energy_setting("15 OK Energy setting: 4294967297 eV"),
-            1
+            wrapped
         );
         assert_eq!(
             parse_version("Code release: 99999999999999999999.1.2")
                 .unwrap()
                 .major,
-            Some(-1)
+            Some(c_long::MAX as i32)
         );
     }
 

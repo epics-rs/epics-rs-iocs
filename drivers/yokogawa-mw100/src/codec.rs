@@ -1734,8 +1734,14 @@ mod tests {
     #[test]
     fn c_atoi_is_strtol_truncated_to_int() {
         assert_eq!(c_atoi(b" 12 "), 12);
-        assert_eq!(c_atoi(b"-99999999999999999999"), i64::MIN as i32);
-        assert_eq!(c_atoi(b"99999999999999999999"), i64::MAX as i32);
+        assert_eq!(
+            c_atoi(b"-99999999999999999999"),
+            std::ffi::c_long::MIN as i32
+        );
+        assert_eq!(
+            c_atoi(b"99999999999999999999"),
+            std::ffi::c_long::MAX as i32
+        );
     }
 
     #[test]
