@@ -19,7 +19,7 @@ use chrono::TimeZone;
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::CallbackPriority;
-use epics_rs::base::server::database::DeviceDone;
+use epics_rs::base::server::database::{AsyncDbHandle, DeviceDone};
 use epics_rs::base::server::ioc_app::InitHookState;
 
 /// `EIP_TIMEOUT` -- default connect / response timeout.
@@ -88,11 +88,35 @@ impl TagData {
     }
 }
 
+/// What a transfer does for one bound record: C's `TagCallback`.
+pub enum OnTransfer {
+    /// An input's `scan_callback`: an I/O Intr pulse.
+    Pulse,
+    /// An output's `check_*_callback`, run on the scan thread under the
+    /// record's lock; nothing without a database.
+    Check(Option<(AsyncDbHandle, String)>),
+}
+
 /// A bound record's end of a tag's callbacks.
 pub struct Listener {
+    /// An input's pulse. An output never sends on it: it only keeps the I/O
+    /// Intr list C files every record on (devEtherIP.c:1202), unposted.
     tx: Sender<()>,
+    on_transfer: OnTransfer,
+    /// Set by the transfer that runs the check: one that took the listener
+    /// list before a device-link put removed this listener runs nothing of
+    /// the device bound since. C walks the list under `plc->lock`, which
+    /// the removal takes.
+    fired: AtomicBool,
     /// Set while the record's write is PACT; the next transfer completes it.
     pub write_done: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+}
+
+impl Listener {
+    /// Whether a transfer is running this listener's check, consumed.
+    pub fn take_fired(&self) -> bool {
+        self.fired.swap(false, Ordering::AcqRel)
+    }
 }
 
 pub struct TagInfo {
@@ -116,29 +140,42 @@ impl TagInfo {
         self.list_stats.lock().clone()
     }
 
-    /// C's callback loop after every transfer: a record whose write is
-    /// pending ends that write's cycle (`if (rec->pact) process`), every
-    /// other record gets an I/O Intr pulse.
+    /// C's callback loop after every transfer (drvEtherIP.c:819-823): a
+    /// record whose write is pending ends that write's cycle (`if
+    /// (rec->pact) process`), an output runs its check here, an input gets
+    /// an I/O Intr pulse.
     ///
-    /// Never blocks: a full channel already has a pending pulse, and the record
-    /// reads the *current* value when it processes, so coalescing is correct.
+    /// The list is copied first: a check takes the record's lock, under
+    /// which a device-link put adds and removes listeners.
     pub(crate) fn notify(&self) {
-        let listeners = self.listeners.lock();
-        for l in listeners.iter() {
-            match l.write_done.lock().take() {
-                Some((done, prio)) => {
-                    let _ = done.complete(prio);
+        let listeners = self.listeners.lock().clone();
+        for l in &listeners {
+            let done = l.write_done.lock().take();
+            if let Some((done, prio)) = done {
+                let _ = done.complete(prio);
+                continue;
+            }
+            match &l.on_transfer {
+                OnTransfer::Check(Some((db, record))) => {
+                    l.fired.store(true, Ordering::Release);
+                    db.run_io_intr_callback(record);
                 }
-                None => {
+                OnTransfer::Check(None) => {}
+                // Never blocks: a full channel already has a pending pulse,
+                // and the record reads the *current* value when it
+                // processes, so coalescing is correct.
+                OnTransfer::Pulse => {
                     let _ = l.tx.try_send(());
                 }
             }
         }
     }
 
-    pub fn add_listener(&self, tx: Sender<()>) -> Arc<Listener> {
+    pub fn add_listener(&self, tx: Sender<()>, on_transfer: OnTransfer) -> Arc<Listener> {
         let l = Arc::new(Listener {
             tx,
+            on_transfer,
+            fired: AtomicBool::new(false),
             write_done: Mutex::new(None),
         });
         self.listeners.lock().push(l.clone());
@@ -1268,7 +1305,7 @@ mod registry_tests {
         let tag = plc.add_tag(1.0, "T", 1).unwrap();
         tag.data.lock().valid_data_size = 4;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tag.add_listener(tx);
+        tag.add_listener(tx, OnTransfer::Pulse);
         assert!(scan_pass(&plc, &mut None).is_some());
         assert_eq!(tag.data.lock().valid_data_size, 4);
         assert!(rx.try_recv().is_err(), "no record was processed");
@@ -1338,7 +1375,7 @@ mod registry_tests {
         let plc = Arc::new(Plc::on_port("probe", "127.0.0.1", 0, port));
         let tag = plc.add_tag(1.0, "T", 1).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tag.add_listener(tx);
+        tag.add_listener(tx, OnTransfer::Pulse);
         let mut c = Connection::startup(
             "127.0.0.1",
             port,
