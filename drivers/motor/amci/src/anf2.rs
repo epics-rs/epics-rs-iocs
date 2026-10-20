@@ -20,8 +20,8 @@
 //!
 //! `ANF2_RESET_ERRORS` and `ANF2_GET_INFO` are ported in [`Anf2Params`].
 //! `resetErrors` also runs from `poll` on a command-error bit, exactly as C
-//! does. `has_encoder` is the only bit of `config` with a functional effect
-//! on `AsynMotor`; the rest is decoded for the report alone.
+//! does. The encoder bits are the only part of `config` with a functional
+//! effect on `AsynMotor`; the rest is decoded for the report alone.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -29,7 +29,9 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::user::AsynUser;
@@ -331,17 +333,8 @@ pub struct Anf2Axis {
     base_speed: i32,
     /// C `jogging_` — `stop` skips the hold-move write while a jog is active.
     jogging: bool,
-    /// Decoded once at construction from `config` bits 24/25 (quadrature
-    /// encoder / diagnostic feedback) — the only config bits with a
-    /// functional effect at the `AsynMotor` boundary.
-    has_encoder: bool,
-    /// C `motorStatusDirection_`, persisted across polls (only updated while
-    /// moving) and used to gate the high/low limit bits.
-    direction: bool,
-    /// Last published status. C's poll reuses a single stale `read_val` on a
-    /// failed read and always publishes; this carries forward the last value
-    /// field-by-field for any read that fails in a cycle (see [`Self::poll`]).
-    last: MotorStatus,
+    /// What the constructor set, for the loop to apply.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl Anf2Axis {
@@ -371,12 +364,7 @@ impl Anf2Axis {
             axis_no,
             base_speed,
             jogging: false,
-            has_encoder: false,
-            direction: true,
-            last: MotorStatus {
-                gain_support: true,
-                ..MotorStatus::default()
-            },
+            status_writes: Vec::new(),
         };
 
         sleep(Duration::from_millis(100));
@@ -391,9 +379,11 @@ impl Anf2Axis {
 
         // Only allow UEIP if the axis has a quadrature encoder or diagnostic
         // feedback configured (config bits 24/25).
-        ax.has_encoder = (config & 0x0100_0000) != 0 || (config & 0x0200_0000) != 0;
+        let has_encoder = (config & 0x0100_0000) != 0 || (config & 0x0200_0000) != 0;
+        ax.status_writes.push(StatusWrite::HasEncoder(has_encoder));
 
         let _ = ax.set_position(&AsynUser::new(0), 0.0);
+        ax.status_writes.push(StatusWrite::Direction(true));
 
         let mut ctrl = ax.lock();
         ctrl.axes.insert(
@@ -600,112 +590,95 @@ impl AsynMotor for Anf2Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
+    }
+
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
 
         // Don't poll until every axis on this controller has been created —
         // avoids interpreting still-being-written config values as command
         // values (C `axesCreated_ != numAxes_`).
         if ctrl.axes_created != ctrl.num_axes {
-            return Ok(MotorStatus {
-                moving: false,
-                ..MotorStatus::default()
-            });
+            status.moving = false;
+            return Ok(());
         }
 
-        // C presses on through every read and always publishes: each read's
-        // status is discarded (the base poller ignores poll()'s return) and
-        // callParamCallbacks fires unconditionally. Mirror that — attempt each
-        // read, carry forward the last published value for any field whose read
-        // fails this cycle (defined, safe equivalent of C reusing a stale
-        // `read_val`), and always return Ok so the framework publishes.
-        let last = self.last.clone();
-
+        // C presses on through every read and the base poller ignores poll()'s
+        // return. A failed read sets C's params from a stale `read_val` (the
+        // previous register's value); here the field keeps what it holds. C
+        // defect, not copied.
         if let Some(axis) = ctrl.axes.get(&self.axis_no) {
             let _ = axis.force_read.write();
         }
 
-        let position = ctrl
-            .read32(self.axis_no, POS_RD_UPR)
-            .map_or(last.position, |v| v as f64);
-        let encoder_position = ctrl
-            .read32(self.axis_no, EN_POS_UPR)
-            .map_or(last.encoder_position, |v| v as f64);
+        if let Ok(v) = ctrl.read32(self.axis_no, POS_RD_UPR) {
+            status.position = v as f64;
+        }
+        if let Ok(v) = ctrl.read32(self.axis_no, EN_POS_UPR) {
+            status.encoder_position = v as f64;
+        }
 
-        // Direction is only updated while moving; otherwise keep the last
-        // polled value (it gates the limit bits below either way).
-        let mut direction = self.direction;
-        // STATUS_1: done / direction / command-error / powered. On a read
-        // failure carry forward last-known done/powered and treat command-error
-        // as clear (avoid a spurious reset from a stale read_val).
-        let (done, cmd_error, powered) = match ctrl.read16(self.axis_no, STATUS_1) {
-            Ok(status1) => {
-                // Status word 1 bit 3 set to 1 when the motor is not in motion.
-                let done = (status1 & 0x8) != 0;
-                if !done {
-                    if status1 & 0x1 != 0 {
-                        direction = true;
-                    }
-                    if status1 & 0x2 != 0 {
-                        direction = false;
-                    }
+        // C reads the direction it updates from list 0 (ANF2Driver.cpp:977),
+        // axis 0's for every axis. C defect, not copied: this axis's own.
+        // A failed read leaves the command-error bit clear rather than reset
+        // errors on a stale `read_val`.
+        let mut cmd_error = false;
+        if let Ok(status1) = ctrl.read16(self.axis_no, STATUS_1) {
+            // Status word 1 bit 3 set to 1 when the motor is not in motion.
+            status.done = (status1 & 0x8) != 0;
+            // Direction is only set while moving.
+            if !status.done {
+                if status1 & 0x1 != 0 {
+                    status.direction = true;
                 }
-                // Enable/disable (not actually the torque status) — determined
-                // by the configuration; it isn't obvious why one would disable
-                // an axis.
-                (done, status1 & 0x1000 != 0, status1 & 0x4000 != 0)
+                if status1 & 0x2 != 0 {
+                    status.direction = false;
+                }
             }
-            Err(_) => (last.done, false, last.powered),
-        };
+            cmd_error = status1 & 0x1000 != 0;
+            // Enable/disable (not actually the torque status) — determined
+            // by the configuration; it isn't obvious why one would disable
+            // an axis.
+            status.powered = status1 & 0x4000 != 0;
+        }
+        status.moving = !status.done;
 
         // High limit reported only while moving positively, low limit only
         // while moving negatively.
-        let (high_limit, low_limit) = match ctrl.read16(self.axis_no, STATUS_2) {
-            Ok(status2) => (
-                (status2 & 0x8 != 0) && direction,
-                (status2 & 0x10 != 0) && !direction,
-            ),
-            Err(_) => (last.high_limit, last.low_limit),
-        };
+        if let Ok(status2) = ctrl.read16(self.axis_no, STATUS_2) {
+            status.high_limit = (status2 & 0x8 != 0) && status.direction;
+            status.low_limit = (status2 & 0x10 != 0) && !status.direction;
+        }
 
         // Clear command errors so we can attempt to move again (error
         // discarded, matching C).
         if cmd_error {
             let _ = self.reset_errors(&ctrl);
         }
-
         drop(ctrl);
-        self.direction = direction;
 
-        let status = MotorStatus {
-            position,
-            encoder_position,
-            done,
-            moving: !done,
-            direction,
-            high_limit,
-            low_limit,
-            powered,
-            has_encoder: self.has_encoder,
-            gain_support: true,
-            ..MotorStatus::default()
-        };
-        self.last = status.clone();
-        Ok(status)
+        status.gain_support = true;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn axes_of_missing_ports_are_built_and_counted() {
         let (ctrl, out_status) = Anf2Controller::new("anf2MissingIn", "anf2MissingOut", 1);
         assert!(out_status.is_err());
         let ctrl = Arc::new(Mutex::new(ctrl));
-        let axis = Anf2Axis::new(ctrl.clone(), 0, 0x0100_0000, 1, 0);
-        assert!(axis.has_encoder);
+        let mut axis = Anf2Axis::new(ctrl.clone(), 0, 0x0100_0000, 1, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::HasEncoder(true), StatusWrite::Direction(true)]
+        );
         assert_eq!(ctrl.lock().unwrap().axes_created, 1);
     }
 
@@ -774,13 +747,39 @@ mod tests {
         assert!(!ax.jogging);
     }
 
+    /// The loop clears DONE when a move starts (asynMotorController.cpp:301);
+    /// a failed STATUS_1 read must not put back the done the last poll read.
+    #[test]
+    fn a_failed_status_1_read_keeps_the_done_a_move_cleared() {
+        use crate::regs::fake;
+        fake::publish("anf2KeepDoneIn");
+        fake::publish("anf2KeepDoneOut");
+        fake::set_read("anf2KeepDoneIn", STATUS_1, Some(0x4008));
+        fake::set_read("anf2KeepDoneIn", STATUS_2, Some(0));
+        let ctrl = Anf2Controller::new("anf2KeepDoneIn", "anf2KeepDoneOut", 1).0;
+        let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0, 1, 0);
+        let user = AsynUser::new(0);
+        let mut status = MotorStatus::default();
+        ax.poll(&user, &mut status).unwrap();
+        assert!(status.done);
+
+        status.done = false;
+        fake::set_read("anf2KeepDoneIn", STATUS_1, None);
+        ax.poll(&user, &mut status).unwrap();
+        assert!(!status.done);
+        assert!(status.moving);
+        assert!(status.powered);
+        assert_eq!(status.position, f64::from((2 << 16) | 3));
+        assert_eq!(status.encoder_position, f64::from((4 << 16) | 5));
+    }
+
     #[test]
     fn an_axis_forces_its_read_at_its_register_block() {
         let (reason, taken) = crate::regs::fake::publish("anf2ForceReadIn");
         crate::regs::fake::publish("anf2ForceReadOut");
         let ctrl = Anf2Controller::new("anf2ForceReadIn", "anf2ForceReadOut", 1).0;
         let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 2, 0, 1, 0);
-        ax.poll(&AsynUser::new(0)).unwrap();
+        ax.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(*taken.lock().unwrap(), [(reason, 2 * AXIS_REG_OFFSET)]);
     }
 }

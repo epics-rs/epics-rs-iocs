@@ -39,7 +39,9 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -224,9 +226,8 @@ pub struct Mvp2001Axis {
     max_current_ma: i32,
     sample_period: i32,
     limit_polarity: i32,
-    /// C's status parameters: written field by field as `poll` gets each
-    /// reply, so a failed poll leaves what it had set.
-    status: MotorStatus,
+    /// What the constructor set on the axis's status.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl Mvp2001Axis {
@@ -274,12 +275,11 @@ impl Mvp2001Axis {
             max_current_ma,
             sample_period,
             limit_polarity,
-            // MVP2001Driver.cpp:204-206, once.
-            status: MotorStatus {
-                gain_support: true,
-                has_encoder: true,
-                ..MotorStatus::default()
-            },
+            // MVP2001Driver.cpp:204-206.
+            status_writes: vec![
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true),
+            ],
         }
     }
 
@@ -425,7 +425,11 @@ impl AsynMotor for Mvp2001Axis {
         ctrl.write_only(&cmd)
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
+    }
+
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let n = self.axis_index;
         let controller = Arc::clone(&self.controller);
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -437,30 +441,29 @@ impl AsynMotor for Mvp2001Axis {
         let position = parse_hex_reply(&pos_reply, 8)
             .ok_or_else(|| micromo_err(format!("MVP2001: unparseable POS reply {pos_reply:?}")))?;
 
-        self.status.position = position as f64;
-        self.status.encoder_position = position as f64;
+        status.position = position as f64;
+        // C sets no motorEncoderPosition_ though its constructor sets
+        // HasEncoder (MVP2001Driver.cpp:206, :453), so UEIP reads 0. C
+        // defect, not copied: POS is the encoder count.
+        status.encoder_position = position as f64;
 
         // Status word (4 hex chars).
         let status_reply = ctrl.query(&format!("{n} ST"))?;
         drop(ctrl);
-        let status = parse_hex_reply(&status_reply, 4).ok_or_else(|| {
+        let st = parse_hex_reply(&status_reply, 4).ok_or_else(|| {
             micromo_err(format!("MVP2001: unparseable ST reply {status_reply:?}"))
         })?;
 
         // Bit 0 set = moving; 0x2000 = high limit; 0x8000 = low limit;
         // 0x100 set = power off. No home bit on this controller.
-        let done = (status & 0x1) == 0;
-        self.status.done = done;
-        self.status.moving = !done;
-        self.status.high_limit = (status & 0x2000) != 0;
-        self.status.low_limit = (status & 0x8000) != 0;
-        self.status.powered = (status & 0x100) == 0;
-        self.status.problem = false;
-        Ok(self.status.clone())
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        Some(self.status.clone())
+        let done = (st & 0x1) == 0;
+        status.done = done;
+        status.moving = !done;
+        status.high_limit = (st & 0x2000) != 0;
+        status.low_limit = (st & 0x8000) != 0;
+        status.powered = (st & 0x100) == 0;
+        status.problem = false;
+        Ok(())
     }
 }
 
@@ -468,6 +471,7 @@ impl AsynMotor for Mvp2001Axis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+    use motor_common::testing::Polled;
 
     #[test]
     fn an_axis_of_an_unanswering_controller_is_still_built() {
@@ -514,11 +518,47 @@ mod tests {
             SyncIOHandle::connect_port("MVP2001_DEAD", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(Mvp2001Controller::new(handle, 1)));
         let mut axis = Mvp2001Axis::new(controller, "MVP2001_DEAD", 0, 512, 500, 1);
-        assert!(axis.poll(&AsynUser::default()).is_err());
-        let left = axis.take_failed_poll_status().expect("the status C left");
+        let mut left = axis.constructed();
+        assert!(axis.poll(&AsynUser::default(), &mut left).is_err());
         assert!(left.gain_support && left.has_encoder, "{left:?}");
         // C's status_ starts at 0; only a good poll sets Done (:467).
         assert!(!left.done, "{left:?}");
+    }
+
+    /// MVP2001Driver.cpp:437-485 sets only what it read before a failed
+    /// read's `skip`, over the params as they stood, the Done=0 a move start
+    /// set included (asynMotorController.cpp:301).
+    #[test]
+    fn a_failed_read_leaves_the_done_a_move_start_set() {
+        use motor_common::testing::LineRig;
+        let refused = Arc::new(Mutex::new(String::new()));
+        let pick = refused.clone();
+        let (_rig, io) = LineRig::failing(
+            "mvp2001MoveStartDone",
+            |cmd| {
+                match cmd.trim_end() {
+                    "1 POS" => "0001 000001F4",
+                    "1 ST" => "0001 0000",
+                    _ => "",
+                }
+                .into()
+            },
+            move |cmd| *pick.lock().unwrap() == cmd.trim_end(),
+        );
+        let controller = Arc::new(Mutex::new(Mvp2001Controller::new(io, 1)));
+        let mut axis = Mvp2001Axis::new(controller, "mvp2001MoveStartDone", 0, 512, 500, 1);
+        let user = AsynUser::default();
+        // The PROBLEM the poller raised over an earlier failure; `skip` clears it.
+        let mut status = MotorStatus {
+            problem: true,
+            ..MotorStatus::default()
+        };
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && !status.problem, "{status:?}");
+        status.done = false;
+        *refused.lock().unwrap() = "1 ST".into();
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert!(status.position == 500.0 && !status.done, "{status:?}");
     }
 
     /// C sets `status =` on each write and returns the last

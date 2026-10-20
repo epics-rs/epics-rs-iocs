@@ -128,26 +128,8 @@ pub struct OemAxis {
     encoder_base: f64,
     /// Last reported position (used to resolve relative moves to absolute).
     position: f64,
-    /// Last polled travel direction (persisted while stopped).
-    direction: bool,
-    /// The switch flags as C's parameter library holds them.
-    switches: SwitchFlags,
     /// The poll's `OEM_SWITCH_DETEC`, for [`AsynMotor::take_port_sets`].
     sets: PortSets,
-    /// What a poll whose last step failed had set, for
-    /// [`AsynMotor::take_failed_poll_status`].
-    left: Option<MotorStatus>,
-}
-
-/// The poll's switch-driven status bits. C sets each only where the switch
-/// names it and leaves the rest at their last value (OEMMotorDriver.cpp:
-/// 398-419); nothing clears `homed` (:404).
-#[derive(Clone, Copy, Default)]
-struct SwitchFlags {
-    high_limit: bool,
-    low_limit: bool,
-    home: bool,
-    homed: bool,
 }
 
 impl OemAxis {
@@ -161,10 +143,7 @@ impl OemAxis {
             homed: false,
             encoder_base: 0.0,
             position: 0.0,
-            direction: false,
-            switches: SwitchFlags::default(),
             sets: PortSets::default(),
-            left: None,
         };
         // C ignores configureController's status (OEMMotorDriver.cpp:208).
         let _ = axis.lock().configure(axis.axis_no);
@@ -430,7 +409,9 @@ impl AsynMotor for OemAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    /// A failed read returns at `skip` as C returns asynError, keeping what
+    /// the reads before it set (OEMMotorDriver.cpp:340-425).
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let addr = self.address;
         // The field, not `self`: the poll pushes its params with it held.
         let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -439,36 +420,34 @@ impl AsynMotor for OemAxis {
         // Moving flags: "*B"/"*C" mean in motion.
         let (flags, _) = ctrl.query(&format!("{addr}R"))?;
         let done = flags != "*B" && flags != "*C";
+        status.done = done;
+        status.moving = !done;
 
-        let mut new_base = self.encoder_base;
-        let mut new_direction = self.direction;
-
-        let new_position = if done {
+        if done {
             // Position readback (skip the leading status char); C posts it
             // only from a good read (:357-361).
             let (pr, read) = ctrl.query(&format!("{addr}PR"))?;
             if read.is_ok() {
-                new_base = atof(pr.get(1..).unwrap_or(""));
-                new_base
-            } else {
-                self.position
+                self.encoder_base = atof(pr.get(1..).unwrap_or(""));
+                status.encoder_position = self.encoder_base;
+                status.position = self.encoder_base;
             }
         } else {
             // Live step count in hex (skip the leading char); "*F" flags negative.
             let (w3, _) = ctrl.query(&format!("{addr}W3"))?;
             let mut step = leading_hex(w3.get(1..).unwrap_or("")).unwrap_or(0) as f64;
-            if w3.contains("*F") {
+            status.direction = !w3.contains("*F");
+            if !status.direction {
                 step -= TWO_POW_32;
-                new_direction = false;
-            } else {
-                new_direction = true;
             }
-            new_base + step
-        };
+            status.encoder_position = self.encoder_base + step;
+            status.position = status.encoder_position;
+        }
+        self.position = status.position;
 
         // Switch status (character flags at fixed offsets 6 and 7).
         // C's poll fails on this read's status, or on the PZ's below.
-        let (is, mut status) = ctrl.query(&format!("{addr}IS"))?;
+        let (is, mut read) = ctrl.query(&format!("{addr}IS"))?;
         let switch_detected = switch_from_is(&is);
         let select_switch = ctrl.select_switch[self.axis_no];
         // Set ahead of the PZ that may fail: C's poll posts it either way
@@ -477,55 +456,29 @@ impl AsynMotor for OemAxis {
             self.sets.axis(reason, ParamValue::Int32(switch_detected));
         }
 
-        let mut switches = self.switches;
+        // C sets only the flags the switch names; nothing clears homed
+        // (:398-419). It sets motorStatusAtHome_ and motorStatusHome_
+        // together.
         if switch_detected > 0 {
             if select_switch == switch_detected - 1 {
                 if self.homed {
-                    status = ctrl.command(&format!("{addr}PZ"));
-                    switches.homed = true;
+                    read = ctrl.command(&format!("{addr}PZ"));
+                    status.homed = true;
                 }
-                switches.low_limit = true;
-                switches.home = true;
+                status.low_limit = true;
+                status.home = true;
+                status.encoder_home = true;
             } else {
-                switches.high_limit = true;
+                status.high_limit = true;
             }
         } else {
-            switches.high_limit = false;
-            switches.low_limit = false;
-            switches.home = false;
+            status.high_limit = false;
+            status.low_limit = false;
+            status.home = false;
+            status.encoder_home = false;
         }
-        drop(ctrl);
-
-        self.encoder_base = new_base;
-        self.position = new_position;
-        self.direction = new_direction;
-        self.switches = switches;
-
-        let polled = MotorStatus {
-            position: new_position,
-            encoder_position: new_position,
-            velocity: 0.0,
-            done,
-            moving: !done,
-            direction: new_direction,
-            high_limit: switches.high_limit,
-            low_limit: switches.low_limit,
-            // C sets motorStatusAtHome_ and motorStatusHome_ together.
-            home: switches.home,
-            encoder_home: switches.home,
-            homed: switches.homed,
-            ..MotorStatus::default()
-        };
-        // C sets every parameter before its skip label.
-        if let Err(e) = status {
-            self.left = Some(polled);
-            return Err(e);
-        }
-        Ok(polled)
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        self.left.take()
+        status.problem = read.is_err();
+        read
     }
 }
 
@@ -558,6 +511,7 @@ mod tests {
     use epics_rs::motor::controller_port::index;
     use epics_rs::motor::devices::{register_axis, register_controller_port};
     use epics_rs::motor::trace::TraceUser;
+    use motor_common::testing::Polled as _;
 
     /// C overwrites each command's status with the next one's and sets
     /// `homed` whatever they returned (OEMMotorDriver.cpp:230-280).
@@ -584,6 +538,31 @@ mod tests {
                 "1MC", "1V1.50", "1H-", "1G", "1MN", "1A0.50", "1V1.50", "1D7", "1G"
             ]
         );
+    }
+
+    /// OEMMotorDriver.cpp:345-389: a refused IS skips after the R and PR
+    /// reads set Done and the position.
+    #[test]
+    fn a_failed_read_keeps_what_the_reads_before_it_set() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing(
+            "oemSkip",
+            |cmd| {
+                match cmd {
+                    "1R" => "*R",
+                    "1PR" => "*+40",
+                    _ => "*",
+                }
+                .into()
+            },
+            |cmd| cmd == "1IS",
+        );
+        let controller = Arc::new(Mutex::new(OemController::new(io, 1)));
+        let mut axis = OemAxis::new(controller, 0);
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
+        assert!(status.done);
+        assert_eq!((status.position, status.encoder_position), (40.0, 40.0));
     }
 
     /// A refused `G` is what the move and the home return, and C sets
@@ -788,7 +767,15 @@ mod tests {
             addr: 0,
         };
         register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
-        let poll = || axis.lock().unwrap().poll(&AsynUser::new(0)).unwrap();
+        // The poller's status, which keeps what a poll does not set.
+        let mut last = MotorStatus::default();
+        let mut poll = || {
+            axis.lock()
+                .unwrap()
+                .poll(&AsynUser::new(0), &mut last)
+                .unwrap();
+            last.clone()
+        };
 
         // UPDATE_STATUS: the port's poll sets it, as C's poll does.
         port.write_int32_blocking(index::UPDATE_STATUS, 0, 1)
@@ -882,10 +869,13 @@ mod tests {
         let ctrl = Arc::new(Mutex::new(OemController::new(handle, 1)));
         let mut axis = OemAxis::new(ctrl, 0);
         let user = AsynUser::new(0);
-        assert_eq!(axis.poll(&user).unwrap().position, 40.0);
+        // The poller's status, which keeps what a poll does not set.
+        let mut status = MotorStatus::default();
+        axis.poll(&user, &mut status).unwrap();
+        assert_eq!(status.position, 40.0);
 
         cut.lock().unwrap().insert("R", "*B");
-        let status = axis.poll(&user).unwrap();
+        axis.poll(&user, &mut status).unwrap();
         assert!(!status.done);
         assert_eq!(status.position, 56.0);
 
@@ -895,18 +885,18 @@ mod tests {
             cut.insert(query, partial);
         };
         cut_only("PR", "*+7");
-        let status = axis.poll(&user).unwrap();
+        axis.poll(&user, &mut status).unwrap();
         assert!(status.done);
         assert_eq!(status.position, 56.0);
 
         cut_only("IS", "*ABCD01");
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.low_limit && left.home && !left.homed);
         assert_eq!(left.position, 40.0);
 
         axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
-        assert!(axis.poll(&user).unwrap().homed);
+        assert!(axis.polled(&user).unwrap().homed);
     }
 
     #[test]

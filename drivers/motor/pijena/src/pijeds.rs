@@ -50,7 +50,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -233,7 +233,7 @@ impl PiJedsAxis {
             failure: PollFailure::NONE,
             init_status: None,
         };
-        me.init_status = Some(me.poll(&AsynUser::new(0)));
+        me.init_status = Some(init_poll(&mut me, &AsynUser::new(0)));
         me
     }
 
@@ -414,7 +414,7 @@ impl AsynMotor for PiJedsAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let status_reply = ctrl.query(&format!("stat,{}", self.axis));
@@ -485,7 +485,8 @@ impl AsynMotor for PiJedsAxis {
             has_encoder: true,
             ..MotorStatus::default()
         };
-        Ok(self.last_status.clone())
+        *status = self.last_status.clone();
+        Ok(())
     }
 }
 
@@ -493,6 +494,7 @@ impl AsynMotor for PiJedsAxis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicI32, Ordering};
 
     /// Axis 0 of an E-516 on a [`LineRig`] whose `mess` reads `pos` µm,
@@ -520,7 +522,7 @@ mod tests {
 
     /// What a poll sent besides its queries.
     fn poll_extra(line: &LineRig, axis: &mut PiJedsAxis) -> Vec<String> {
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         line.sent()
             .into_iter()
             .filter(|l| l != "stat,0" && l != "mess,0")
@@ -548,15 +550,15 @@ mod tests {
         let mut axis = PiJedsAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
@@ -767,11 +769,11 @@ mod tests {
         let mut axis = stage_axis("pijeds_stop");
         let user = AsynUser::default();
         axis.move_absolute(&user, 5000.0, 0.0, 0.0, 0.0).unwrap();
-        assert!(!axis.poll(&user).unwrap().done);
+        assert!(!axis.polled(&user).unwrap().done);
         axis.stop(&user, 0.0).unwrap();
-        let done = (0..20).any(|_| axis.poll(&user).unwrap().done);
+        let done = (0..20).any(|_| axis.polled(&user).unwrap().done);
         assert!(done, "the stage settled at 5 but never reported done");
-        assert_eq!(axis.poll(&user).unwrap().position, 5000.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 5000.0);
     }
 
     /// C motor_init sets EA_PRESENT on every axis (drvPIJEDS.cc:666-667), so
@@ -780,7 +782,7 @@ mod tests {
     fn every_axis_reports_an_encoder() {
         let mut axis = stage_axis("pijeds_enc");
         assert!(axis.last_status.has_encoder);
-        assert!(axis.poll(&AsynUser::default()).unwrap().has_encoder);
+        assert!(axis.polled(&AsynUser::default()).unwrap().has_encoder);
     }
 
     #[test]

@@ -198,8 +198,6 @@ pub struct EnsembleAxis {
     /// `pAxis->params`: the poller's sets, kept when a poll bails, and
     /// `motorAxisProblem` cleared by DISABLE after a travel-limit fault.
     params: Arc<Params>,
-    /// The status a failed poll left, for the next post.
-    failed: Option<MotorStatus>,
     status_writes: Vec<StatusWrite>,
     /// `HomeSetup` word; bit 0 is the home direction, updated by [`Self::home`].
     /// C's `int homeDirection`, so its `%d` prints a high bit signed.
@@ -272,7 +270,6 @@ impl EnsembleAxis {
             axis,
             index,
             last_fault: 0,
-            failed: None,
             status_writes: Vec::new(),
             home_direction,
             reverse_direc,
@@ -692,16 +689,10 @@ impl AsynMotor for EnsembleAxis {
         std::mem::take(&mut self.status_writes)
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let polled = self.poll_status();
-        if polled.is_err() {
-            self.failed = Some(self.params.motor_status());
-        }
-        polled.map(|()| self.params.motor_status())
-    }
-
-    fn take_failed_poll_status(&mut self) -> Option<MotorStatus> {
-        self.failed.take()
+        *status = self.params.motor_status();
+        polled
     }
 }
 
@@ -745,6 +736,7 @@ impl DrvSet for EnsembleAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn max_digits_follows_the_step() {
@@ -812,7 +804,7 @@ mod tests {
         assert_eq!(params.get_integer(function::HAS_CLOSED_LOOP), Ok(Some(1)));
         let user = AsynUser::new(0);
         let mut axis = axis.lock().unwrap();
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(params.get_integer(function::HOMED), Ok(Some(1)));
         assert_eq!(params.get_integer(function::POWER_ON), Ok(Some(1)));
         assert_eq!(params.get_double(function::POSITION), Ok(Some(2.5)));
@@ -947,7 +939,7 @@ mod tests {
         let user = AsynUser::new(0);
         let poll = |axis: &mut EnsembleAxis, reply: &str| {
             *fault.lock().unwrap() = reply.into();
-            axis.poll(&user).unwrap().problem
+            axis.polled(&user).unwrap().problem
         };
 
         assert!(!poll(&mut axis, "%0"));
@@ -1252,14 +1244,14 @@ mod tests {
         set_reply(&line, "AXISSTATUS(@0)", "%1");
         set_reply(&line, "PFBKPROG(@0)", "%5");
         set_reply(&line, "PCMDPROG(@0)", "%6");
-        let good = axis.poll(&user).unwrap();
+        let good = axis.polled(&user).unwrap();
         assert!(good.powered && !good.comms_error);
         assert_eq!((good.position, good.encoder_position), (6.0, 5.0));
 
         // AXISSTATUS fails: only the comm error changes.
         fail_write(&line, Some("AXISSTATUS(@0)"));
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.comms_error);
         assert_eq!(
             MotorStatus {
@@ -1272,34 +1264,35 @@ mod tests {
         // A one-char reply is a comm error too.
         fail_write(&line, None);
         set_reply(&line, "AXISSTATUS(@0)", "%");
-        assert!(axis.poll(&user).is_err());
-        assert!(axis.take_failed_poll_status().unwrap().comms_error);
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
+        assert!(left.comms_error);
 
         // PFBKPROG fails after a new AXISSTATUS: its bits are left, positions
         // are not.
         set_reply(&line, "AXISSTATUS(@0)", "%0");
         set_reply(&line, "PFBKPROG(@0)", "%7");
         fail_write(&line, Some("PFBKPROG(@0)"));
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.comms_error && !left.powered);
         assert_eq!((left.position, left.encoder_position), (6.0, 5.0));
 
         // VFBK fails: the positions read before it are left.
         fail_write(&line, Some("VFBK(@0)"));
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.comms_error);
         assert_eq!((left.position, left.encoder_position), (6.0, 7.0));
 
         // AXISFAULT fails: comm error, problem untouched.
         fail_write(&line, Some("AXISFAULT(@0)"));
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.comms_error && !left.problem);
 
         fail_write(&line, None);
-        assert!(!axis.poll(&user).unwrap().comms_error);
+        assert!(!axis.polled(&user).unwrap().comms_error);
     }
 
     /// drvEnsembleAsyn.cc:725-730, :779-784, :807-814: a NAK'd AXISSTATUS
@@ -1310,19 +1303,20 @@ mod tests {
         let user = AsynUser::new(0);
         let (line, mut axis) = poll_axis("ensPollNak");
         set_reply(&line, "PFBKPROG(@0)", "%5");
-        let good = axis.poll(&user).unwrap();
+        let good = axis.polled(&user).unwrap();
 
         set_reply(&line, "AXISSTATUS(@0)", "!1");
-        assert!(axis.poll(&user).is_err());
-        assert_eq!(axis.take_failed_poll_status().unwrap(), good);
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
+        assert_eq!(left, good);
 
         set_reply(&line, "AXISSTATUS(@0)", "%0");
         set_reply(&line, "PFBKPROG(@0)", "!5");
-        assert_eq!(axis.poll(&user).unwrap().encoder_position, 0.0);
+        assert_eq!(axis.polled(&user).unwrap().encoder_position, 0.0);
 
         set_reply(&line, "AXISFAULT(@0)", "!");
-        assert!(axis.poll(&user).is_err());
-        let left = axis.take_failed_poll_status().unwrap();
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.problem && left.comms_error);
     }
 
@@ -1335,13 +1329,13 @@ mod tests {
         set_reply(&line, "PFBKPROG(@0)", "%5");
         set_reply(&line, "PCMDPROG(@0)", "!6");
         // A NAK'd PCMDPROG is still read past its status char.
-        assert_eq!(axis.poll(&user).unwrap().position, 6.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 6.0);
         fail_write(&line, Some("PCMDPROG(@0)"));
-        assert_eq!(axis.poll(&user).unwrap().position, 5.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 5.0);
         // AXISSTATUS's reply, odd, stands in for a failed PLANESTATUS.
         set_reply(&line, "AXISSTATUS(@0)", "%1");
         fail_write(&line, Some("PLANESTATUS(0)"));
-        assert!(!axis.poll(&user).unwrap().done);
+        assert!(!axis.polled(&user).unwrap().done);
     }
 
     /// drvEnsembleAsyn.cc:740-741, :787-789: a PLANESTATUS or PCMDPROG
@@ -1363,7 +1357,7 @@ mod tests {
         let controller = Arc::new(Mutex::new(EnsembleController::new(io, "ensPollCut", "0")));
         let mut axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
         line.sent();
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(status.position, 6.0);
         assert!(!status.done);
     }
@@ -1432,10 +1426,10 @@ mod tests {
         let trace = manager.trace_manager();
         trace.set_trace_mask(None, TraceMask::IO_DRIVER);
         trace.set_trace_file(None, TraceFile::File(file));
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         // A poll that bails before PCMDPROG prints nothing.
         fail_write(&line, Some("PFBKPROG(@0)"));
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let lines: Vec<_> = text

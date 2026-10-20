@@ -54,7 +54,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -324,7 +324,7 @@ impl SpiiPlusAxis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -531,7 +531,7 @@ impl AsynMotor for SpiiPlusAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let a = self.axis;
@@ -604,7 +604,8 @@ impl AsynMotor for SpiiPlusAxis {
             ..MotorStatus::default()
         };
         self.last_status = status.clone();
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
@@ -638,9 +639,9 @@ mod tests {
         let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
         let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
-        assert!(axis.poll(&user).unwrap().msta_moving);
+        assert!(axis.polled(&user).unwrap().msta_moving);
         mst.store(MST_INPOSITION, Ordering::Relaxed);
-        assert!(!axis.poll(&user).unwrap().msta_moving);
+        assert!(!axis.polled(&user).unwrap().msta_moving);
     }
 
     /// C reads `?APOS` and `?FPOS` through `(long)atof`, which truncates
@@ -661,10 +662,10 @@ mod tests {
         });
         let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
         let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.encoder_position), (12.0, -12.0));
         *sign.lock().unwrap() = -1.0;
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.encoder_position), (-12.0, 12.0));
     }
 
@@ -719,9 +720,9 @@ mod tests {
         let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
         let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
-        assert_eq!(axis.poll(&user).unwrap().velocity, -10.0);
+        assert_eq!(axis.polled(&user).unwrap().velocity, -10.0);
         *vel.lock().unwrap() = "-0.5";
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!((status.velocity, status.direction), (0.0, false));
     }
 
@@ -771,6 +772,7 @@ mod tests {
     }
 
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
 
     /// Axis 0 of a controller in `mode` on a [`LineRig`].
     fn rig(name: &str, mode: CommandMode) -> (LineRig, SpiiPlusAxis) {
@@ -808,7 +810,7 @@ mod tests {
         let num_axes = ctrl.num_axes();
         assert_eq!(num_axes, AXIS_LETTERS.len());
         let mut last = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), num_axes - 1);
-        let _ = last.poll(&AsynUser::default());
+        let _ = last.polled(&AsynUser::default());
     }
 
     /// motorRecord.cc:872-884: VEL, ACC, HOME, GO; GO's `start` goes alone.
@@ -940,12 +942,12 @@ mod tests {
                 "start 0, 1"
             ]
         );
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert!(polled(&line).is_empty());
         done.store(true, Ordering::SeqCst);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(polled(&line), ["P=0"]);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert!(polled(&line).is_empty());
     }
 
@@ -967,14 +969,14 @@ mod tests {
         line.sent();
         let user = AsynUser::default();
         refuse.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(line.sent(), ["?D/MST(0)", "?D/FAULT(0)"]);
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         refuse.store(false, Ordering::SeqCst);
         line.sent();
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         assert_eq!(
             line.sent(),
@@ -987,7 +989,7 @@ mod tests {
             ]
         );
         refuse.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 

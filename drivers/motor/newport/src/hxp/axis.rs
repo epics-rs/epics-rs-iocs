@@ -15,7 +15,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
+};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::user::AsynUser;
 
@@ -71,6 +73,8 @@ pub struct HxpAxis {
     axis_no: usize,
     /// The controller-port steps of the last move, for the owner to apply.
     sets: PortSets,
+    /// What the constructor set, for the loop to apply.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl HxpAxis {
@@ -80,6 +84,12 @@ impl HxpAxis {
             line,
             axis_no,
             sets: PortSets::default(),
+            // CNEN enables/disables the hexapod; it reads stage encoders
+            // (HXPDriver.cpp:566-568).
+            status_writes: vec![
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true),
+            ],
         }
     }
 
@@ -120,6 +130,10 @@ impl AsynMotor for HxpAxis {
 
     fn take_port_sets(&mut self) -> PortSets {
         std::mem::take(&mut self.sets)
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     fn move_absolute(
@@ -222,25 +236,21 @@ impl AsynMotor for HxpAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         // C `HXPAxis::poll` reads what the controller poll before it read.
         let data = self.lock_controller().data().clone();
-        Ok(MotorStatus {
-            position: data.setpoint[self.axis_no] / MRES,
-            encoder_position: data.encoder[self.axis_no] / MRES,
-            done: !data.moving,
-            moving: data.moving,
-            problem: data.problem,
-            comms_error: data.comms_error,
-            powered: data.powered,
-            homed: data.homed,
-            // CNEN enables/disables the hexapod; it reads stage encoders.
-            gain_support: true,
-            has_encoder: true,
-            // The hexapod plans its own trajectory; base velocity is ignored.
-            vbas_supported: false,
-            ..Default::default()
-        })
+        // HXPController::poll's `done` label (HXPDriver.cpp:526-531).
+        status.problem = data.problem;
+        status.comms_error = data.comms_error;
+        status.done = !data.moving;
+        status.powered = data.powered;
+        status.homed = data.homed;
+        status.moving = data.moving;
+        status.encoder_position = data.encoder[self.axis_no] / MRES;
+        status.position = data.setpoint[self.axis_no] / MRES;
+        // The hexapod plans its own trajectory; base velocity is ignored.
+        status.vbas_supported = false;
+        Ok(())
     }
 }
 
@@ -249,6 +259,7 @@ mod tests {
     use super::*;
     use crate::xps::fake::FakeLine;
     use crate::xps::rpc::SocketMode;
+    use motor_common::testing::Polled;
 
     /// HXPAxis inherits asynMotorAxis::setPosition, which sends nothing and
     /// returns asynSuccess (asynMotorAxis.cpp:130).
@@ -266,6 +277,27 @@ mod tests {
         line.log.lock().unwrap().clear();
         axis.set_position(&AsynUser::new(0), 5.0).unwrap();
         assert!(line.log.lock().unwrap().is_empty());
+    }
+
+    /// HXPDriver.cpp:566-568.
+    #[test]
+    fn the_constructor_sets_gain_support_and_has_encoder() {
+        let line = FakeLine::new("hxp_ctor", "");
+        let controller = Arc::new(Mutex::new(HxpController::new(
+            line.socket(SocketMode::Query),
+        )));
+        let mut axis = HxpAxis::new(
+            controller,
+            Arc::new(MoveLine::new(line.socket(SocketMode::Fire))),
+            0,
+        );
+        assert_eq!(
+            axis.take_status_writes(),
+            [
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true)
+            ]
+        );
     }
 
     /// setClosedLoop returns the XPS code as its asynStatus
@@ -316,7 +348,7 @@ mod tests {
         );
         // The fake reports 1.5 for the current position.
         axis.lock_controller().poll();
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!(
             (status.position, status.encoder_position),
             (150000.0, 150000.0)

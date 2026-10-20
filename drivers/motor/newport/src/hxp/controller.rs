@@ -54,7 +54,7 @@ pub struct HxpPollData {
 
 /// Motor status bits derived from an HXP group status code
 /// (`HXPController::poll`), with the classic-firmware and HXP-D branches.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct HxpStatusFlags {
     moving: bool,
     problem: bool,
@@ -198,36 +198,34 @@ impl HxpController {
         &self.data
     }
 
-    /// C `HXPController::poll`. On an RPC failure the firmware probe is
-    /// reset and every axis reports problem + comms error until a poll
-    /// succeeds, exactly as C's `done:` path.
+    /// C `HXPController::poll`. A failed read jumps to `done:` keeping what
+    /// the reads before it set; `done:` posts problem, comms error, power-on
+    /// and homed from what GroupStatusGet decoded, none when it failed, and
+    /// clears the firmware so the next poll re-probes it.
     pub fn poll(&mut self) -> PortSets {
-        let mut status = None;
-        let polled = self.poll_once(&mut status);
+        let mut decoded = None;
+        let polled = self.poll_once(&mut decoded);
         // C sets HXP_STATUS once GroupStatusGet answers, and every poll ends
         // in callParamCallbacks() at address 0.
-        let values = match (self.params, status) {
-            (Some(p), Some(status)) => vec![(p.status, ParamValue::Int32(status))],
+        let values = match (self.params, &decoded) {
+            (Some(p), Some(_)) => vec![(p.status, ParamValue::Int32(self.data.group_status))],
             _ => Vec::new(),
         };
         let sets = Self::post(0, values);
-        match polled {
-            Ok(data) => self.data = data,
-            Err(_) => {
-                // C: status error → firmware re-probed next poll; all axes get
-                // problem=1, commsError=1, homed/powerOn=0; positions and the
-                // moving flag keep their last values.
-                self.firmware.clear();
-                self.data.problem = true;
-                self.data.comms_error = true;
-                self.data.powered = false;
-                self.data.homed = false;
-            }
+        let flags = decoded.unwrap_or_default();
+        if polled.is_err() {
+            self.firmware.clear();
         }
+        self.data.problem = polled.is_err() || flags.problem;
+        self.data.comms_error = polled.is_err();
+        self.data.powered = flags.powered;
+        self.data.homed = flags.homed;
         sets
     }
 
-    fn poll_once(&mut self, status: &mut Option<i32>) -> XpsResult<HxpPollData> {
+    /// The reads of C `HXPController::poll` up to `done:`, each setting
+    /// `data` as C sets its members; `decoded` is the polled_* locals.
+    fn poll_once(&mut self, decoded: &mut Option<HxpStatusFlags>) -> XpsResult<()> {
         if self.firmware.is_empty() {
             let fw = self.poll.firmware_version_get()?;
             if fw.contains("HXP") {
@@ -238,24 +236,17 @@ impl HxpController {
             // discarded and re-probed on the next poll; the poll continues.
         }
         let group_status = self.poll.group_status_get(HXP_GROUP)?;
-        *status = Some(group_status);
+        self.data.group_status = group_status;
         let flags = HxpStatusFlags::from_status(group_status, self.is_hxpd);
-        let encoder = self.poll.hexapod_positions_get(HXP_GROUP, self.is_hxpd)?;
+        self.data.moving = flags.moving;
+        *decoded = Some(flags);
+        self.data.encoder = self.poll.hexapod_positions_get(HXP_GROUP, self.is_hxpd)?;
         // Upstream quirk kept for wire parity: C `HXPGroupPositionSetpointGet`
         // sends the *current*-position function name (`str_XPositionCurrentGet`
         // in hxp_drivers.cpp), so the "setpoint" array is really a second
         // current-position sample.
-        let setpoint = self.poll.hexapod_positions_get(HXP_GROUP, self.is_hxpd)?;
-        Ok(HxpPollData {
-            group_status,
-            encoder,
-            setpoint,
-            moving: flags.moving,
-            problem: flags.problem,
-            powered: flags.powered,
-            homed: flags.homed,
-            comms_error: false,
-        })
+        self.data.setpoint = self.poll.hexapod_positions_get(HXP_GROUP, self.is_hxpd)?;
+        Ok(())
     }
 }
 
@@ -330,5 +321,29 @@ mod tests {
         // HXP-D power is on except in the explicit disabled range.
         assert!(HxpStatusFlags::from_status(9, true).powered);
         assert!(HxpStatusFlags::from_status(44, true).powered);
+    }
+
+    /// HXPDriver.cpp `done:`: a refused position read still posts the
+    /// moving and power-on that GroupStatusGet decoded before it.
+    #[test]
+    fn a_failed_position_read_keeps_the_group_status_read_before_it() {
+        use crate::xps::fake::FakeLine;
+        use crate::xps::rpc::SocketMode;
+
+        let line = FakeLine::new("hxp_pos_fail", "GroupPositionCurrentGet");
+        *line.group_status.lock().unwrap() = 44;
+        let mut ctrl = HxpController::new(line.socket(SocketMode::Query));
+        ctrl.poll();
+        let d = ctrl.data();
+        assert_eq!(
+            (
+                d.group_status,
+                d.moving,
+                d.powered,
+                d.problem,
+                d.comms_error
+            ),
+            (44, true, true, true, true)
+        );
     }
 }

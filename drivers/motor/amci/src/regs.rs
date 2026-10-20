@@ -214,6 +214,15 @@ pub(crate) mod fake {
         mine.into_iter().map(|(_, addr)| addr).collect()
     }
 
+    /// `(port, register, value)`: what [`set_read`] makes a register read;
+    /// `None` refuses the read. The latest entry wins.
+    static READS: Mutex<Vec<(String, i32, Option<i32>)>> = Mutex::new(Vec::new());
+
+    /// Make register `addr` of port `name` read `value`, or refuse on `None`.
+    pub fn set_read(name: &str, addr: i32, value: Option<i32>) {
+        READS.lock().unwrap().push((name.to_string(), addr, value));
+    }
+
     struct Modbus {
         base: PortDriverBase,
         read_reason: usize,
@@ -234,9 +243,24 @@ pub(crate) mod fake {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
         }
-        /// Register `addr` reads `addr`.
+        /// Register `addr` reads `addr` unless [`set_read`] says otherwise.
         fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
-            Ok(user.addr)
+            let port = &*self.base.port_name;
+            let set = READS
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(p, addr, _)| p == port && *addr == user.addr)
+                .map(|(.., value)| *value);
+            match set {
+                None => Ok(user.addr),
+                Some(Some(value)) => Ok(value),
+                Some(None) => Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "refused".into(),
+                }),
+            }
         }
         fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
             if user.reason == self.read_reason {

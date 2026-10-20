@@ -921,9 +921,11 @@ impl AsynMotor for OmsAxis {
         Ok(())
     }
 
-    /// C `writeFloat64`'s motorEncoderPosition_, an encoder axis only
-    /// (omsBaseController.cpp:333-343).
+    /// C `writeFloat64`'s motorEncoderPosition_: the parameter on any axis,
+    /// the command to an encoder axis only (omsBaseController.cpp:329-343).
     fn set_encoder_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.poll_shared
+            .set_encoder_position(self.axis_index, position);
         if !self.has_encoder {
             return Ok(());
         }
@@ -1072,9 +1074,10 @@ impl AsynMotor for OmsAxis {
 
     /// C `omsBaseAxis::poll`: wake the poller; the status is the
     /// parameters as it left them.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.poll_shared.wakeup();
-        Ok(self.poll_shared.status(self.axis_index))
+        *status = self.poll_shared.status(self.axis_index);
+        Ok(())
     }
 }
 

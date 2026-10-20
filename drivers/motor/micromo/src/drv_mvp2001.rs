@@ -20,7 +20,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::device_support::{BuildTrans, DialLimitReset, LimitBuild};
 
-use motor_common::model1::init_read;
+use motor_common::model1::{init_poll, init_read};
 use motor_common::util::{atoi, nint};
 
 /// `MVP2001_NUM_CARDS`.
@@ -235,7 +235,7 @@ impl DrvMvp2001Axis {
         // HO too soon after EN reads back within ten counts of zero.
         sleep(Duration::from_millis(200));
         axis.send("HO");
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -428,7 +428,7 @@ impl AsynMotor for DrvMvp2001Axis {
     /// `set_status`: `ST` for motion, limits and power, `POS` for the
     /// position. A first unanswered `ST` fails the poll raising nothing; a
     /// second raises the comms error.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let chain = self.chain.clone();
         let mut ctrl = chain.lock().unwrap_or_else(|e| e.into_inner());
         let st = ctrl.ask(&format!("{} ST", self.addr));
@@ -472,13 +472,15 @@ impl AsynMotor for DrvMvp2001Axis {
             // POST goes as the record holds it, with no address.
             self.lock().send(post);
         }
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn hex_fields_follow_the_address() {
@@ -552,15 +554,15 @@ mod tests {
         let mut axis = DrvMvp2001Axis::new(chain, 0);
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 

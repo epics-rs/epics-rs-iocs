@@ -45,7 +45,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynResult, OctetStep};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -169,9 +171,10 @@ impl C300Controller {
 
     /// Probe axis `index` (0-based) at construction: query the stage range (to
     /// confirm the axis, mark encoder/gain support and set `bitsPerUnit_`)
-    /// and the digital-input scale factor. Returns `(di_scale_factor,
-    /// has_encoder)`.
-    fn probe_axis(&mut self, index: usize) -> (f64, bool) {
+    /// and the digital-input scale factor. Returns the scale factor and what
+    /// the C constructor sets on the axis's status (C300MotorDriver.cpp:
+    /// 226-244).
+    fn probe_axis(&mut self, index: usize) -> (f64, Vec<StatusWrite>) {
         let chan = index + 1;
         let range = self
             .query(&format!("SYST:CHAN{chan}:STAG:RANG?"))
@@ -180,16 +183,26 @@ impl C300Controller {
             // 2^20 bits per total range (C300MotorDriver.cpp:232-233).
             axis.bits_per_unit = 1_048_576.0 / range;
         }
-        let has_encoder = range.is_ok_and(|r| r != 0.0);
+        let mut writes = match range {
+            Err(_) => vec![StatusWrite::Problem(true)],
+            Ok(r) if r != 0.0 => vec![
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true),
+            ],
+            Ok(_) => Vec::new(),
+        };
 
-        let di_scale_factor = self
-            .query(&format!("SYST:CHAN{chan}:DI:FACT?"))
+        let factor = self.query(&format!("SYST:CHAN{chan}:DI:FACT?"));
+        if factor.is_err() {
+            writes.push(StatusWrite::Problem(true));
+        }
+        let di_scale_factor = factor
             .map(|r| atof(&r))
             .ok()
             .filter(|&f| f != 0.0)
             .unwrap_or(1.0);
 
-        (di_scale_factor, has_encoder)
+        (di_scale_factor, writes)
     }
 
     fn axis(&mut self, index: usize) -> &mut AxisState {
@@ -240,13 +253,14 @@ pub struct C300Axis {
     /// Wire channel name, `CHAN<n>` (1-based).
     chan: String,
     di_scale_factor_inv: f64,
-    has_encoder: bool,
+    /// What the constructor set on the axis's status.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl C300Axis {
     /// Construct axis `index` (0-based), probing its stage range and DI factor.
     pub fn new(controller: Arc<Mutex<C300Controller>>, index: usize) -> Self {
-        let (di_scale_factor, has_encoder) = controller
+        let (di_scale_factor, status_writes) = controller
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .probe_axis(index);
@@ -255,7 +269,7 @@ impl C300Axis {
             index,
             chan: format!("CHAN{}", index + 1),
             di_scale_factor_inv: 1.0 / di_scale_factor,
-            has_encoder,
+            status_writes,
         }
     }
 
@@ -269,6 +283,10 @@ impl AsynMotor for C300Axis {
     /// (C300MotorDriver.cpp).
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     /// C300MotorDriver.cpp:250.
@@ -343,7 +361,7 @@ impl AsynMotor for C300Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let mut ctrl = self.lock();
         let data = ctrl.query(&format!("{}:DATA?", self.chan))?;
         // Encoder position from the monitor record (fixed-offset fields).
@@ -351,26 +369,24 @@ impl AsynMotor for C300Axis {
         let analog_in = parse_at(&data, CORR_OFFSET).unwrap_or(0.0);
         let encoder_position = (pos_mon - analog_in) * self.di_scale_factor_inv;
         ctrl.axis(self.index).encoder_position = encoder_position;
+        status.encoder_position = encoder_position;
 
         // Theoretical (set-point) position.
         let pos_query = ctrl.query(&format!("{}:POS?", self.chan))?;
         let theory_position = atof(&pos_query);
         ctrl.axis(self.index).theory_position = theory_position;
+        status.position = theory_position;
         drop(ctrl);
 
         // Simulated done: within tolerance of the encoder position.
         let done = (theory_position - encoder_position).abs() <= TOLERANCE;
-
-        Ok(MotorStatus {
-            position: theory_position,
-            encoder_position,
-            velocity: 0.0,
-            done,
-            moving: !done,
-            has_encoder: self.has_encoder,
-            gain_support: self.has_encoder,
-            ..MotorStatus::default()
-        })
+        status.done = done;
+        status.moving = !done;
+        status.high_limit = false;
+        status.low_limit = false;
+        status.home = false;
+        status.problem = false;
+        Ok(())
     }
 }
 
@@ -400,8 +416,72 @@ mod tests {
             InterfaceType::Octet,
         );
         let controller = Arc::new(Mutex::new(C300Controller::new(handle, 1)));
-        let axis = C300Axis::new(controller, 0);
-        assert!(!axis.has_encoder);
+        let mut axis = C300Axis::new(controller, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::Problem(true), StatusWrite::Problem(true)]
+        );
+    }
+
+    fn c300_replies(cmd: &str) -> String {
+        match cmd.trim_end() {
+            "SYST:CHAN1:STAG:RANG?" => "100".into(),
+            "SYST:CHAN1:DI:FACT?" => "2".into(),
+            // Analog-in 0.5 at CORR_OFFSET, position monitor 100.5 at DATA_OFFSET.
+            "CHAN1:DATA?" => format!("{:28}{:<84}100.5", "", "0.5"),
+            _ => "0".into(),
+        }
+    }
+
+    /// C300MotorDriver.cpp:307-310: the encoder position is set before POS?
+    /// can `goto skip`, so a refused POS? keeps it.
+    #[test]
+    fn a_failed_pos_keeps_the_encoder_position_data_read() {
+        let (_rig, io) =
+            motor_common::testing::LineRig::failing("c300FailedPos", c300_replies, |cmd| {
+                cmd.trim_end() == "CHAN1:POS?"
+            });
+        let controller = Arc::new(Mutex::new(C300Controller::new(io, 1)));
+        let mut axis = C300Axis::new(controller, 0);
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+        assert_eq!(status.encoder_position, 50.0);
+    }
+
+    /// C300MotorDriver.cpp:234-236: only the constructor sets GAIN_SUPPORT
+    /// and HAS_ENCODER, from its range read.
+    #[test]
+    fn the_constructor_sets_gain_support_and_has_encoder() {
+        let (_rig, io) = motor_common::testing::LineRig::new("c300CtorEncoder", c300_replies);
+        let controller = Arc::new(Mutex::new(C300Controller::new(io, 1)));
+        let mut axis = C300Axis::new(controller, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true)
+            ]
+        );
+    }
+
+    /// C300MotorDriver.cpp:228-231, :241-244: a failed range or DI factor
+    /// read sets PROBLEM in the constructor.
+    #[test]
+    fn a_failed_constructor_read_sets_problem() {
+        let (_rig, io) =
+            motor_common::testing::LineRig::failing("c300CtorProblem", c300_replies, |cmd| {
+                cmd.trim_end() == "SYST:CHAN1:DI:FACT?"
+            });
+        let controller = Arc::new(Mutex::new(C300Controller::new(io, 1)));
+        let mut axis = C300Axis::new(controller, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true),
+                StatusWrite::Problem(true)
+            ]
+        );
     }
 
     /// C prints `inString_` after every exchange: what a failed read

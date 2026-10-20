@@ -926,12 +926,13 @@ mod one_poller {
         fn poll_failure(&self) -> PollFailure {
             PollFailure::NONE
         }
-        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
             self.0.lock().unwrap().push(Instant::now());
-            Ok(MotorStatus {
+            *status = MotorStatus {
                 done: true,
                 ..MotorStatus::default()
-            })
+            };
+            Ok(())
         }
     }
 

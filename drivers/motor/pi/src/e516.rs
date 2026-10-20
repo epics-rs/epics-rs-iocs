@@ -118,7 +118,7 @@ use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 use crate::scan_int;
@@ -414,7 +414,7 @@ impl PIE516Axis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        me.init_status = Some(me.poll(&AsynUser::new(0)));
+        me.init_status = Some(init_poll(&mut me, &AsynUser::new(0)));
         me
     }
 
@@ -562,7 +562,7 @@ impl AsynMotor for PIE516Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let reading = ctrl.poll_axis(self.axis);
@@ -588,7 +588,8 @@ impl AsynMotor for PIE516Axis {
             let _ = ctrl.send_bytes(&post);
         }
         drop(ctrl);
-        Ok(self.last_status.clone())
+        *status = self.last_status.clone();
+        Ok(())
     }
 }
 
@@ -596,6 +597,7 @@ impl AsynMotor for PIE516Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
@@ -659,7 +661,7 @@ mod tests {
 
     /// What a poll sent besides its queries.
     fn poll_extra(line: &LineRig, axis: &mut PIE516Axis) -> Vec<String> {
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         line.sent()
             .into_iter()
             .filter(|l| !QUERIES.contains(&l.as_str()))
@@ -896,15 +898,15 @@ mod tests {
         let mut axis = PIE516Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 

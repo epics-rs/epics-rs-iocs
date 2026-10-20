@@ -101,7 +101,7 @@ use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{nint, parse_value_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -337,7 +337,7 @@ impl PIC663Axis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -481,7 +481,7 @@ impl AsynMotor for PIC663Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = ctrl.poll_status();
@@ -506,7 +506,8 @@ impl AsynMotor for PIC663Axis {
             let _ = ctrl.send_bytes(&post);
         }
         drop(ctrl);
-        Ok(self.last_status.clone())
+        *status = self.last_status.clone();
+        Ok(())
     }
 }
 
@@ -514,6 +515,7 @@ impl AsynMotor for PIC663Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
 
     /// `TS` registers: done with no limit, moving, and moving into the
     /// tripped -limit (a limit bit reads 0 when tripped).
@@ -548,7 +550,7 @@ mod tests {
 
     /// What a poll sent besides its queries.
     fn poll_extra(line: &LineRig, axis: &mut PIC663Axis) -> Vec<String> {
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         line.sent()
             .into_iter()
             .filter(|l| l != "TS" && l != "TP")
@@ -734,15 +736,15 @@ mod tests {
         let mut axis = PIC663Axis::new(Arc::new(Mutex::new(ctrl)));
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 

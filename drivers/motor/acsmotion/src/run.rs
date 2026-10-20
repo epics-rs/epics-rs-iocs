@@ -563,12 +563,12 @@ mod tests {
 
     use epics_rs::motor::controller_port::PROFILE_BUILD_DONE;
 
-    use epics_rs::asyn::interfaces::motor::AsynMotor;
     use epics_rs::asyn::user::AsynUser;
 
     use super::*;
     use crate::profile::tests::{Rig, SERVOS, rig};
     use crate::spiiplus::SpiiPlusAxis;
+    use motor_common::testing::Polled;
 
     fn until(what: &str, done: impl Fn() -> bool) {
         let end = Instant::now() + Duration::from_secs(10);
@@ -620,7 +620,7 @@ mod tests {
         rig.line.lock().unwrap().set(var, &[f64::from(value)]);
         rig.ctrl.lock().unwrap().poll().unwrap();
         SpiiPlusAxis::new(rig.ctrl.clone(), 0)
-            .poll(&AsynUser::default())
+            .polled(&AsynUser::default())
             .unwrap();
     }
 

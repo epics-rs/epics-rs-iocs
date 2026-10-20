@@ -41,7 +41,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, nint};
 
 /// Query read timeout (C `recv_mess` 1.0 s); writes use the caller's
@@ -239,7 +239,7 @@ impl FaulhaberAxis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -433,7 +433,7 @@ impl AsynMotor for FaulhaberAxis {
         }
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // C drvMCDC2805.cc:229-251: an empty or failed GST fails the poll
@@ -514,7 +514,8 @@ impl AsynMotor for FaulhaberAxis {
             has_encoder: true,
             ..MotorStatus::default()
         };
-        Ok(self.last_status.clone())
+        *status = self.last_status.clone();
+        Ok(())
     }
 }
 
@@ -523,6 +524,7 @@ mod tests {
     use super::*;
 
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A record's fields with SREV 1000.
@@ -580,7 +582,7 @@ mod tests {
 
         /// What one poll sent besides its queries.
         fn poll_extra(&mut self) -> Vec<String> {
-            self.axis.poll(&self.user).unwrap();
+            self.axis.polled(&self.user).unwrap();
             self.line
                 .sent()
                 .into_iter()
@@ -788,15 +790,15 @@ mod tests {
         let mut axis = FaulhaberAxis::new(controller, 1);
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
@@ -844,15 +846,15 @@ mod tests {
     fn position_rounds_encoder_truncates() {
         let mut r = Rig::new("mcdc_pos");
         *r.pos.lock().unwrap() = "-20";
-        assert!(!r.axis.poll(&r.user).unwrap().direction);
+        assert!(!r.axis.polled(&r.user).unwrap().direction);
         *r.pos.lock().unwrap() = "-20.4";
-        let s = r.axis.poll(&r.user).unwrap();
+        let s = r.axis.polled(&r.user).unwrap();
         assert_eq!((s.position, s.encoder_position), (-20.0, -20.0));
         assert!(s.direction, "-20 >= -20");
         *r.pos.lock().unwrap() = "-20";
-        assert!(r.axis.poll(&r.user).unwrap().direction, "kept");
+        assert!(r.axis.polled(&r.user).unwrap().direction, "kept");
         *r.pos.lock().unwrap() = "7.6";
-        let s = r.axis.poll(&r.user).unwrap();
+        let s = r.axis.polled(&r.user).unwrap();
         assert_eq!((s.position, s.encoder_position), (8.0, 7.0));
     }
 }

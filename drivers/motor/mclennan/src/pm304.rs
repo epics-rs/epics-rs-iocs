@@ -49,7 +49,7 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -276,7 +276,7 @@ impl Pm304Axis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -439,7 +439,7 @@ impl AsynMotor for Pm304Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let model = ctrl.model;
@@ -497,7 +497,8 @@ impl AsynMotor for Pm304Axis {
             // or gain commands and never offers UEIP.
             ..MotorStatus::default()
         };
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
@@ -505,6 +506,7 @@ impl AsynMotor for Pm304Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
 
     #[test]
     fn pm304_status_moving_and_limits() {
@@ -550,7 +552,7 @@ mod tests {
         assert!(ctrl.model == Model::Pm304);
         assert_eq!(ctrl.ident, "Mclennan PM304");
         let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.done), (123.0, true));
     }
 
@@ -631,8 +633,8 @@ mod tests {
             .unwrap();
         axis.move_absolute(&user, 50.0, 0.0, 400.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["1SV400\r", "1RS\r", "1SC\r", "1MA50\r"]);
-        axis.poll(&user).unwrap();
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["1OS\r", "1OA\r", "1AB\r\r", "1OS\r", "1OA\r"]);
     }
 
@@ -691,12 +693,12 @@ mod tests {
         let ctrl = Pm304Controller::new(io, 1).unwrap();
         let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
-        assert!(axis.poll(&user).unwrap().direction);
+        assert!(axis.polled(&user).unwrap().direction);
         *replies.lock().unwrap() = ("00010000", "AP=5");
-        assert!(!axis.poll(&user).unwrap().direction);
-        assert!(!axis.poll(&user).unwrap().direction);
+        assert!(!axis.polled(&user).unwrap().direction);
+        assert!(!axis.polled(&user).unwrap().direction);
         *replies.lock().unwrap() = ("01010000", "AP=5");
-        assert!(axis.poll(&user).unwrap().direction);
+        assert!(axis.polled(&user).unwrap().direction);
 
         let (_line, io) = LineRig::new("pm600Dir", |last| match last {
             "1ID\r" => "1ID\rMclennan PM600".into(),
@@ -705,7 +707,7 @@ mod tests {
         });
         let ctrl = Pm304Controller::new(io, 1).unwrap();
         let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(s.high_limit && !s.direction);
     }
 

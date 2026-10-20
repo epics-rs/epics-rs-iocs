@@ -38,7 +38,9 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -363,6 +365,8 @@ pub struct AcrAxis {
     theory_pos_reg: i32,
     limits_reg: i32,
     flags_reg: i32,
+    /// The constructor's status sets (ACRMotorDriver.cpp:299-306).
+    status_writes: Vec<StatusWrite>,
 }
 
 impl AcrAxis {
@@ -378,6 +382,13 @@ impl AcrAxis {
             .unwrap_or_else(|e| e.into_inner())
             .query(&format!("{name} PPU"));
         let pulses_per_unit = reply.ok().map(|reply| atof(&reply));
+        let status_writes = match pulses_per_unit {
+            Some(_) => vec![
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true),
+            ],
+            None => vec![StatusWrite::Problem(true)],
+        };
         Self {
             controller,
             axis_no,
@@ -388,6 +399,7 @@ impl AcrAxis {
             theory_pos_reg: 12294 + 256 * axis_no,
             limits_reg: 4600 + axis_no,
             flags_reg: 4120 + axis_no,
+            status_writes,
         }
     }
 
@@ -551,43 +563,38 @@ impl AsynMotor for AcrAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
+    }
+
+    /// A failed read returns at `skip` as C returns asynError, keeping what
+    /// the reads before it set (ACRMotorDriver.cpp:430-480).
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
 
         let encoder_position = atof(&ctrl.read_reg(self.encoder_pos_reg)?);
         self.state().encoder_position = encoder_position;
+        status.encoder_position = encoder_position;
         let theory_position = atof(&ctrl.read_reg(self.theory_pos_reg)?);
         self.state().theory_position = theory_position;
+        status.position = theory_position;
 
         let flags = atoi(&ctrl.read_reg(self.flags_reg)?);
         self.state().flags = flags;
         let moving = (flags & FLAG_MOVING) != 0;
+        status.done = !moving;
+        status.moving = moving;
 
         let limits = atoi(&ctrl.read_reg(self.limits_reg)?);
         self.state().limits = limits;
-        let high_limit = (limits & 0x1) != 0;
-        let low_limit = (limits & 0x2) != 0;
-        let at_home = (limits & 0x4) != 0;
+        status.high_limit = (limits & 0x1) != 0;
+        status.low_limit = (limits & 0x2) != 0;
+        status.home = (limits & 0x4) != 0;
 
         let drive = ctrl.query(&format!("DRIVE {}", self.name))?;
-        let powered = drive.contains("ON");
-        drop(ctrl);
-
-        Ok(MotorStatus {
-            position: theory_position,
-            encoder_position,
-            velocity: 0.0,
-            done: !moving,
-            moving,
-            // C sets these only when the constructor read PPU.
-            has_encoder: self.pulses_per_unit.is_some(),
-            gain_support: self.pulses_per_unit.is_some(),
-            high_limit,
-            low_limit,
-            home: at_home,
-            powered,
-            ..MotorStatus::default()
-        })
+        status.powered = drive.contains("ON");
+        status.problem = false;
+        Ok(())
     }
 }
 
@@ -599,6 +606,7 @@ mod tests {
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use motor_common::testing::Polled;
 
     #[test]
     fn the_constructor_calls_back() {
@@ -629,7 +637,63 @@ mod tests {
             .move_absolute(&AsynUser::new(0), 1.0, 0.0, 1.0, 1.0)
             .unwrap_err();
         assert_eq!(e.message(), "AXIS0: PPU was never read");
-        assert!(axis.poll(&AsynUser::new(0)).is_err());
+        assert!(axis.polled(&AsynUser::new(0)).is_err());
+    }
+
+    /// ACRMotorDriver.cpp:436-449: a refused flags read skips after the
+    /// position reads set theirs, and Done keeps what a move start set.
+    #[test]
+    fn a_failed_read_keeps_what_the_reads_before_it_set() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing(
+            "acrSkip",
+            |cmd| {
+                match cmd {
+                    "AXIS0 PPU" => "1",
+                    "?P12290" => "7.5",
+                    "?P12294" => "7.25",
+                    _ => "",
+                }
+                .into()
+            },
+            |cmd| cmd == "?P4120",
+        );
+        let controller = Arc::new(Mutex::new(AcrController::new(io)));
+        let mut axis = AcrAxis::new(controller, 0);
+        let mut status = MotorStatus {
+            done: false,
+            ..Default::default()
+        };
+        assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
+        assert_eq!((status.encoder_position, status.position), (7.5, 7.25));
+        assert!(!status.done);
+    }
+
+    /// ACRMotorDriver.cpp:299-306: the constructor raises PROBLEM on a failed
+    /// PPU read, else sets gain support and an encoder.
+    #[test]
+    fn the_constructor_sets_status_by_its_ppu_read() {
+        use motor_common::testing::LineRig;
+        for (name, refused, writes) in [
+            (
+                "acrPpuOk",
+                false,
+                vec![
+                    StatusWrite::GainSupport(true),
+                    StatusWrite::HasEncoder(true),
+                ],
+            ),
+            ("acrPpuFail", true, vec![StatusWrite::Problem(true)]),
+        ] {
+            let (_rig, io) = LineRig::failing(
+                name,
+                |_| "1".into(),
+                move |cmd| refused && cmd == "AXIS0 PPU",
+            );
+            let controller = Arc::new(Mutex::new(AcrController::new(io)));
+            let mut axis = AcrAxis::new(controller, 0);
+            assert_eq!(axis.take_status_writes(), writes, "{name}");
+        }
     }
 
     /// C overwrites the JOG ACC/VEL and RES statuses with the command's

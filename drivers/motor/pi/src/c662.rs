@@ -84,7 +84,7 @@ use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, nint};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -259,7 +259,7 @@ impl PIC662Axis {
             no_motion_count: 0,
             init_status: None,
         };
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -297,7 +297,6 @@ impl PIC662Axis {
         };
         self.last_status = MotorStatus {
             position: polled.position as f64,
-            encoder_position: polled.position as f64,
             velocity: 0.0,
             done,
             // E-662: no limit/home/encoder/gain feedback; piezo servo powers
@@ -405,12 +404,19 @@ impl AsynMotor for PIC662Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        self.poll_status(false)
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        *status = self.poll_status(false)?;
+        Ok(())
     }
 
-    fn poll_in_motion(&mut self, _user: &AsynUser, _cdir: &mut bool) -> AsynResult<MotorStatus> {
-        self.poll_status(true)
+    fn poll_in_motion(
+        &mut self,
+        _user: &AsynUser,
+        _cdir: &mut bool,
+        status: &mut MotorStatus,
+    ) -> AsynResult<()> {
+        *status = self.poll_status(true)?;
+        Ok(())
     }
 }
 
@@ -446,6 +452,7 @@ impl PIC662Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
@@ -484,6 +491,21 @@ mod tests {
         (line, axis, esr)
     }
 
+    /// drvPIC662.cc:292 has the encoder_position set commented out, so REP
+    /// keeps motor_init's 0 (:567).
+    #[test]
+    fn the_poll_sets_no_encoder_position() {
+        let (_line, io) = LineRig::new("pic662NoRep", |last| match last {
+            "*IDN?" => "E-662".into(),
+            "*ESR?" => "1".into(),
+            _ => "5.012".into(),
+        });
+        let ctrl = PIC662Controller::new(io).unwrap();
+        let mut axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl)));
+        let s = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!((s.position, s.encoder_position), (5012.0, 0.0));
+    }
+
     fn post(text: &[u8]) -> PostMessage {
         let p = PostMessage::default();
         p.set(text);
@@ -492,7 +514,7 @@ mod tests {
 
     /// What a poll sent besides its queries.
     fn poll_extra(line: &LineRig, axis: &mut PIC662Axis) -> Vec<String> {
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         line.sent()
             .into_iter()
             .filter(|l| l != "*ESR?" && l != "POS?")
@@ -580,13 +602,13 @@ mod tests {
         let user = AsynUser::default();
         esr.store(0, Ordering::SeqCst);
         for _ in 0..5 {
-            assert!(!axis.poll(&user).unwrap().done);
+            assert!(!axis.polled(&user).unwrap().done);
         }
         let mut cdir = true;
         for _ in 0..2 {
             axis.move_absolute(&user, 0.0, 0.0, 1.0, 1.0).unwrap();
             let done: Vec<bool> = (0..4)
-                .map(|_| axis.poll_in_motion(&user, &mut cdir).unwrap().done)
+                .map(|_| axis.polled_in_motion(&user, &mut cdir).unwrap().done)
                 .collect();
             assert_eq!(done, [false, false, true, true]);
         }
@@ -641,15 +663,15 @@ mod tests {
         let mut axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl)));
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

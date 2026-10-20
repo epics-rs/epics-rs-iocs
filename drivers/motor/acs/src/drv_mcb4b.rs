@@ -14,7 +14,7 @@ use epics_rs::asyn::interfaces::motor::{
 };
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atoi, nint};
 
 use crate::mcb4b::Mcb4bController;
@@ -56,7 +56,7 @@ impl DrvMcb4bAxis {
             init_status: None,
         };
         let _ = this.lock().command(&format!("#{axis:02}Q"));
-        this.init_status = Some(this.poll(&AsynUser::new(0)));
+        this.init_status = Some(init_poll(&mut this, &AsynUser::new(0)));
         this
     }
 
@@ -211,7 +211,7 @@ impl AsynMotor for DrvMcb4bAxis {
     /// `set_status`: `X` for done, `E` for the limits, `P` for the
     /// position. C parses a read that timed out from a stale buffer; here
     /// it reads as done with no limits, and the position stands.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let ask = |q: char| {
@@ -243,7 +243,7 @@ impl AsynMotor for DrvMcb4bAxis {
             self.direction = data >= self.position;
             self.position = data;
         }
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position: self.position as f64,
             encoder_position: self.position as f64,
             done,
@@ -252,7 +252,8 @@ impl AsynMotor for DrvMcb4bAxis {
             low_limit,
             direction: self.direction,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -267,6 +268,7 @@ mod tests {
     }
 
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Axis 1 of a card on a [`LineRig`]; `X` reports moving while `moving`.
@@ -318,12 +320,12 @@ mod tests {
             .unwrap();
         assert_eq!(line.sent(), ["#01V=115", "#01R=1", "#01W=1", "#01G+100"]);
         moving.store(true, Ordering::SeqCst);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["#01X", "#01E", "#01P"]);
         moving.store(false, Ordering::SeqCst);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["#01X", "#01E", "#01P", "#01W=0"]);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["#01X", "#01E", "#01P"]);
     }
 

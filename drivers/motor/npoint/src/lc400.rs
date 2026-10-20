@@ -399,6 +399,13 @@ impl Lc400Axis {
         }
     }
 
+    /// The base's `motorStatusDone_` = 0 after a move start, refused or not
+    /// (asynMotorController.cpp:301-353), on the DONE updateAuxParams reads.
+    fn started(&self, moved: AsynResult<()>) -> AsynResult<()> {
+        lock(&self.controller).axes[self.axis].done = false;
+        moved
+    }
+
     /// `LC400Axis::move`.
     fn move_to(&mut self, target: Target, velocity: f64, acceleration: f64) -> AsynResult<()> {
         let (Some(ch), Some(wav)) = (base_address(self.axis), wavetable_address(self.axis)) else {
@@ -556,7 +563,8 @@ impl AsynMotor for Lc400Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.move_to(Target::Absolute(position), velocity, acceleration)
+        let moved = self.move_to(Target::Absolute(position), velocity, acceleration);
+        self.started(moved)
     }
 
     fn move_relative(
@@ -567,7 +575,8 @@ impl AsynMotor for Lc400Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.move_to(Target::Relative(distance), velocity, acceleration)
+        let moved = self.move_to(Target::Relative(distance), velocity, acceleration);
+        self.started(moved)
     }
 
     /// A move to the hard limit, or half the range when none is set. C
@@ -583,7 +592,8 @@ impl AsynMotor for Lc400Axis {
             let ctrl = lock(&self.controller);
             let state = &ctrl.axes[self.axis];
             if (velocity > 0.0 && state.high_limit) || (velocity < 0.0 && state.low_limit) {
-                return Ok(());
+                drop(ctrl);
+                return self.started(Ok(()));
             }
             let half = f64::from(state.cts(f64::from(state.range / 2)));
             if velocity < 0.0 {
@@ -598,7 +608,8 @@ impl AsynMotor for Lc400Axis {
                 half
             }
         };
-        self.move_to(Target::Absolute(target), velocity.abs(), acceleration)
+        let moved = self.move_to(Target::Absolute(target), velocity.abs(), acceleration);
+        self.started(moved)
     }
 
     /// The LC400 has no home; C keeps `asynMotorAxis::home`.
@@ -610,7 +621,7 @@ impl AsynMotor for Lc400Axis {
         _acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        Ok(())
+        self.started(Ok(()))
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -627,7 +638,7 @@ impl AsynMotor for Lc400Axis {
 
     /// `LC400Axis::poll`: the position, then WAV_ACTIVE for done; the limit
     /// bits latch at a hard limit once done and clear while moving away.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let Some(address) = base_address(self.axis) else {
             return Err(lc400_err(format!("LC400 has no axis {}", self.axis)));
         };
@@ -640,6 +651,7 @@ impl AsynMotor for Lc400Axis {
             if let Some(reason) = digital_pos {
                 updates.push((reason, ParamValue::Float64(f64::from(current))));
             }
+            out.position = f64::from(current);
             let busy = ctrl.read_single(address + WAV_ACTIVE)?;
             let done = busy == 0;
             if done {
@@ -649,37 +661,34 @@ impl AsynMotor for Lc400Axis {
             if done {
                 if state.pos_hard != 0 && current >= state.pos_hard {
                     state.high_limit = true;
+                    out.high_limit = true;
                 }
                 if state.neg_hard != 0 && current <= state.neg_hard {
                     state.low_limit = true;
+                    out.low_limit = true;
                 }
             } else {
                 if current < state.pos_hard - state.tol_hard {
                     state.high_limit = false;
+                    out.high_limit = false;
                 }
                 if current > state.neg_hard + state.tol_hard {
                     state.low_limit = false;
+                    out.low_limit = false;
                 }
             }
             state.done = done;
+            out.done = done;
+            out.moving = !done;
             Ok(())
         })();
-        let state = &ctrl.axes[self.axis];
-        let status = MotorStatus {
-            position: state.digital_pos,
-            done: state.done,
-            moving: !state.done,
-            high_limit: state.high_limit,
-            low_limit: state.low_limit,
-            powered: true,
-            problem: result.is_err(),
-            ..MotorStatus::default()
-        };
         drop(ctrl);
+        out.problem = result.is_err();
+        out.powered = true;
         for (reason, value) in updates {
             self.sets.axis(reason, value);
         }
-        Ok(status)
+        Ok(())
     }
 
     fn take_port_sets(&mut self) -> PortSets {
@@ -881,6 +890,7 @@ mod tests {
     use epics_rs::motor::trace::TraceUser;
 
     use super::*;
+    use motor_common::testing::Polled;
 
     #[test]
     fn the_constructor_calls_back() {
@@ -927,6 +937,67 @@ mod tests {
         text.lines().map(str::to_owned).collect()
     }
 
+    /// LC400MotorDriver.cpp:480-486 reads every axis's motorStatusDone_,
+    /// which the base clears after every move start, refused or not
+    /// (asynMotorController.cpp:301-353), so another axis's move skips the
+    /// aux params at once.
+    #[test]
+    fn another_axis_s_move_start_skips_the_aux_params() {
+        let (_rig, io) =
+            motor_common::testing::LineRig::new("lc400MoveStart", |_| "AAAAA\0\0\0\0Z".into());
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(Some(io), 2)));
+        let params = Lc400ControllerParams::new(controller.clone(), 0.0, 0.0);
+        let _port =
+            register_controller_port(&open_owner(), "lc400MoveStartPort", 2, params).unwrap();
+        let p = lock(&controller).params.unwrap();
+        let mut axes = [
+            Lc400Axis::new(controller.clone(), 0),
+            Lc400Axis::new(controller, 1),
+        ];
+        let user = AsynUser::new(0);
+        for axis in &mut axes {
+            axis.polled(&user).unwrap();
+        }
+        // Refused: LC400_W_MAXPTS is 0.
+        assert!(axes[1].move_absolute(&user, 0.0, 0.0, 1.0, 1.0).is_err());
+        axes[0].take_port_sets();
+        axes[0].polled(&user).unwrap();
+        let reasons: Vec<usize> = axes[0]
+            .take_port_sets()
+            .into_iter()
+            .map(|set| match set {
+                PortSet::Axis { reason, .. } => reason,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(reasons, [p.digital_pos]);
+    }
+
+    /// LC400MotorDriver.cpp:882, :913, :922-925: a failed position read
+    /// skips the DONE set, so it keeps the DONE a move start cleared.
+    #[test]
+    fn a_failed_position_read_keeps_the_done_a_move_cleared() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fail = Arc::new(AtomicBool::new(false));
+        let fails = fail.clone();
+        let (_rig, io) = motor_common::testing::LineRig::failing(
+            "lc400FailedPos",
+            |_| "AAAAA\0\0\0\0Z".into(),
+            move |_| fails.load(Ordering::SeqCst),
+        );
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(Some(io), 1)));
+        let mut axis = Lc400Axis::new(controller, 0);
+        let user = AsynUser::new(0);
+        let mut status = MotorStatus::default();
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && !status.problem);
+        // What the poll loop does when a move starts.
+        status.done = false;
+        fail.store(true, Ordering::SeqCst);
+        let _ = axis.poll(&user, &mut status);
+        assert!(!status.done && status.problem && status.powered);
+    }
+
     /// LC400MotorDriver.cpp poll / updateAuxParams: the digital position,
     /// then, once every axis is done, the aux params, all on the axis's own
     /// address in the order C sets them.
@@ -952,9 +1023,9 @@ mod tests {
                 .collect()
         };
         // The first poll finds the axis done; the aux params wait for it.
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(reasons(&mut axis), [p.digital_pos]);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(
             reasons(&mut axis),
             [
@@ -988,11 +1059,11 @@ mod tests {
         let p = lock(&controller).params.unwrap();
         let mut axis = Lc400Axis::new(controller, 0);
         let user = AsynUser::new(0);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         axis.take_port_sets();
         // Position, WAV_ACTIVE, range, range type, then SERVO_STATE refused.
         left.store(5, Ordering::SeqCst);
-        assert!(axis.poll(&user).unwrap().problem);
+        assert!(axis.polled(&user).unwrap().problem);
         let reasons: Vec<usize> = axis
             .take_port_sets()
             .into_iter()

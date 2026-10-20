@@ -61,7 +61,7 @@ use epics_rs::motor::flags::MotorCommand;
 
 use epics_libcom_rs::cfmt::CFloat;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, nint};
 
 /// Millimetres per record step (C `EMC18011_RESOLUTION`, drvEMC18011.h).
@@ -370,7 +370,7 @@ impl Emc18011Axis {
             ctrl.wired = None;
             let _ = ctrl.select(index);
         }
-        axis.init_status = Some(axis.poll(&AsynUser::default()));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::default()));
         axis
     }
 
@@ -564,7 +564,7 @@ impl AsynMotor for Emc18011Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -576,7 +576,8 @@ impl AsynMotor for Emc18011Axis {
             ctrl.comm_state = CommState::Normal;
             drop(ctrl);
             sleep(UNSELECTED_DELAY);
-            return Ok(self.status(&decode_z(Z_STOPPED)));
+            *status = self.status(&decode_z(Z_STOPPED));
+            return Ok(());
         }
         let _ = ctrl.select(self.index);
 
@@ -626,7 +627,8 @@ impl AsynMotor for Emc18011Axis {
         drop(ctrl);
 
         self.prev_position = position;
-        Ok(self.status(&z))
+        *status = self.status(&z);
+        Ok(())
     }
 }
 
@@ -634,6 +636,7 @@ impl AsynMotor for Emc18011Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
     use std::sync::Mutex as StdMutex;
 
     /// Motor 1 of a controller on a [`LineRig`] whose `Z` reply is `z`.
@@ -660,7 +663,7 @@ mod tests {
 
     /// What a poll sent besides its queries.
     fn poll_extra(line: &LineRig, axis: &mut Emc18011Axis) -> Vec<String> {
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         line.sent()
             .into_iter()
             .filter(|l| l != "Z" && l != "A")
@@ -682,7 +685,7 @@ mod tests {
         let mut axis = Emc18011Axis::new(ctrl.clone(), 1);
         assert_eq!(line.sent(), ["M2", "Z", "A"]);
         assert_eq!(ctrl.lock().unwrap().selection.holder(), None);
-        assert_eq!(axis.poll(&AsynUser::default()).unwrap().position, 123.0);
+        assert_eq!(axis.polled(&AsynUser::default()).unwrap().position, 123.0);
     }
 
     /// devEMC18011.cc:243-249: INIT as its own message.
@@ -751,7 +754,7 @@ mod tests {
         let user = AsynUser::default();
         axis.move_absolute(&user, 1234.0, 0.0, 50.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["M1", "V0.50", "G12.3", "A"]);
-        assert_eq!(axis.poll(&user).unwrap().position, 100.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 100.0);
         axis.move_velocity(&user, 0.0, -0.3, 0.0).unwrap();
         assert_eq!(line.sent().last().unwrap(), ">");
     }
@@ -820,15 +823,15 @@ mod tests {
         axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
         line.sent();
         *z.lock().unwrap() = 'x';
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         *z.lock().unwrap() = Z_RUNDOWN;
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         *z.lock().unwrap() = 'x';
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
@@ -861,16 +864,16 @@ mod tests {
         let user = AsynUser::default();
         assert!(!b.build_trans().defers(&MotorCommand::Poll));
         *z.lock().unwrap() = Z_LSUP;
-        assert!(b.poll(&user).unwrap().high_limit);
+        assert!(b.polled(&user).unwrap().high_limit);
 
         assert!(!a.build_trans().defers(&MotorCommand::Poll));
         *z.lock().unwrap() = 'x';
-        assert!(a.poll(&user).is_err());
+        assert!(a.polled(&user).is_err());
         assert_eq!(a.poll_failure(), PollFailure::NONE);
-        let s = b.poll(&user).unwrap();
+        let s = b.polled(&user).unwrap();
         assert!(s.done && s.direction && !s.high_limit && !s.low_limit);
         assert_eq!(s.position, 100.0);
-        assert!(a.poll(&user).is_err());
+        assert!(a.polled(&user).is_err());
         assert_eq!(a.poll_failure(), PollFailure::NONE);
     }
 
@@ -897,10 +900,10 @@ mod tests {
 
         let mut a = a;
         *z.lock().unwrap() = Z_RUNUP;
-        a.poll(&AsynUser::default()).unwrap();
+        a.polled(&AsynUser::default()).unwrap();
         assert!(bb.defers(&MotorCommand::Poll));
         *z.lock().unwrap() = Z_STOPPED;
-        a.poll(&AsynUser::default()).unwrap();
+        a.polled(&AsynUser::default()).unwrap();
         assert!(!bb.defers(&MotorCommand::Poll));
         assert!(ba.defers(&velocity));
     }
@@ -912,9 +915,9 @@ mod tests {
         let (line, [mut a, mut b], _) = pair_rig("emcClaim");
         let user = AsynUser::default();
         assert!(!b.build_trans().defers(&MotorCommand::Poll));
-        a.poll(&user).unwrap();
+        a.polled(&user).unwrap();
         assert_eq!(line.sent(), Vec::<String>::new());
-        b.poll(&user).unwrap();
+        b.polled(&user).unwrap();
         assert_eq!(line.sent(), ["M2", "Z", "A"]);
 
         assert!(

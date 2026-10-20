@@ -659,8 +659,9 @@ mod asyn_writes {
         fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
             Ok(())
         }
-        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-            Ok(MotorStatus::default())
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+            *status = MotorStatus::default();
+            Ok(())
         }
         fn poll_failure(&self) -> PollFailure {
             PollFailure::NONE
@@ -825,8 +826,9 @@ mod asyn_reads {
         fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
             Ok(())
         }
-        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-            Ok(MotorStatus::default())
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+            *status = MotorStatus::default();
+            Ok(())
         }
         fn poll_failure(&self) -> PollFailure {
             PollFailure::NONE

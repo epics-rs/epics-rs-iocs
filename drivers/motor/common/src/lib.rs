@@ -399,9 +399,10 @@ mod tests {
         fn poll_failure(&self) -> PollFailure {
             PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
             self.log.lock().unwrap().push(self.addr);
-            Ok(MotorStatus::default())
+            *status = MotorStatus::default();
+            Ok(())
         }
     }
 
@@ -570,8 +571,9 @@ mod poller_count {
         fn poll_failure(&self) -> PollFailure {
             PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
-            Ok(MotorStatus::default())
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+            *status = MotorStatus::default();
+            Ok(())
         }
     }
 

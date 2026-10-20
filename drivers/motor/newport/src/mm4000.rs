@@ -1200,7 +1200,7 @@ impl AsynMotor for Mm4000Axis {
         self.params.force_callback();
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         self.retry_failed = false;
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -1215,7 +1215,8 @@ impl AsynMotor for Mm4000Axis {
             {
                 let _ = ctrl.write(&String::from_utf8_lossy(&post));
             }
-            return Ok(s);
+            *status = s;
+            return Ok(());
         }
         let idx = self.axis - 1;
         let turn = ctrl.axis_turn(idx);
@@ -1228,7 +1229,8 @@ impl AsynMotor for Mm4000Axis {
         else {
             let _ = self.params.set_integer(function::COMM_ERROR, 1);
             self.params.call_callback();
-            return Ok(self.motor_status());
+            *status = self.motor_status();
+            return Ok(());
         };
         let byte = byte.ok_or_else(|| {
             mm_err(format!(
@@ -1246,7 +1248,8 @@ impl AsynMotor for Mm4000Axis {
         })?;
         let step = self.step_size;
         self.set_read_params(byte, steps(position, step), problem || step == 0.0);
-        Ok(self.motor_status())
+        *status = self.motor_status();
+        Ok(())
     }
 }
 
@@ -1358,6 +1361,7 @@ impl Mm4000Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// One MM4000 axis parked at 5 mm whose line goes silent on `dead`.
@@ -1522,8 +1526,8 @@ mod tests {
         let mut axes = axes.unwrap();
         sent.lock().unwrap().clear();
         let user = AsynUser::default();
-        let one = axes[0].poll(&user).unwrap();
-        let two = axes[1].poll(&user).unwrap();
+        let one = axes[0].polled(&user).unwrap();
+        let two = axes[1].polled(&user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TH;", "TE;", "TE;"]);
 
         assert_eq!((one.position, one.encoder_position), (1500.0, 0.0));
@@ -1626,21 +1630,21 @@ mod tests {
             ]
         );
         // The home armed no POST, so axis 1 has none due.
-        axes[0].poll(&user).unwrap();
+        axes[0].polled(&user).unwrap();
         assert!(posts(&sent).is_empty());
         axes[0].set_move_strings(&user, b"", post(b"1YY")).unwrap();
         axes[0]
             .move_absolute(&user, 0.0, 0.0, 1000.0, 500.0)
             .unwrap();
-        axes[0].poll(&user).unwrap();
-        axes[0].poll(&user).unwrap();
+        axes[0].polled(&user).unwrap();
+        axes[0].polled(&user).unwrap();
         assert_eq!(posts(&sent), ["1YY"], "sent once");
         // Axis 2 is moving, but on its plus limit while moving plus.
         axes[1].set_move_strings(&user, b"", post(b"2YY")).unwrap();
         axes[1]
             .move_absolute(&user, 0.0, 0.0, 1000.0, 500.0)
             .unwrap();
-        axes[1].poll(&user).unwrap();
+        axes[1].polled(&user).unwrap();
         assert_eq!(posts(&sent), ["2YY"]);
     }
 
@@ -1713,8 +1717,8 @@ mod tests {
         assert_eq!(init.position, 0.0);
         sent.lock().unwrap().clear();
         let user = AsynUser::default();
-        let one = axes[0].poll(&user).unwrap();
-        let two = axes[1].poll(&user).unwrap();
+        let one = axes[0].polled(&user).unwrap();
+        let two = axes[1].polled(&user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TH;", "TE;", "TE;"]);
         assert!(one.done && one.powered && one.problem && !one.comms_error);
         assert_eq!((one.position, one.encoder_position), (0.0, 0.0));
@@ -1729,19 +1733,19 @@ mod tests {
         let (axes, sent, silent) = model1_card("mm4000_m1_retry", &[], Duration::ZERO);
         let mut axis = axes.unwrap().remove(1);
         let user = AsynUser::default();
-        let before = axis.poll(&user).unwrap();
+        let before = axis.polled(&user).unwrap();
 
         silent.lock().unwrap().push("MS;");
         sent.lock().unwrap().clear();
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), MODEL1_POLL_FAILURE);
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TH;", "MS;", "TH;"]);
 
         silent.lock().unwrap().clear();
         sent.lock().unwrap().clear();
-        let back = axis.poll(&user).unwrap();
+        let back = axis.polled(&user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TH;", "TE;"]);
         assert_eq!(back, before);
     }
@@ -1822,11 +1826,11 @@ mod tests {
             .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
-        assert_eq!(axis.poll(&user).unwrap().position, 50000.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 50000.0);
 
         dead.store(true, Ordering::SeqCst);
         sent.lock().unwrap().clear();
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         // C sends `TP;` only after `MS;` succeeded.
         assert_eq!(*sent.lock().unwrap(), ["MS;"]);
         assert!(status.comms_error);
@@ -1870,7 +1874,7 @@ mod tests {
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         dead.store(true, Ordering::SeqCst);
         sent.lock().unwrap().clear();
-        let status = axis.poll(&AsynUser::default()).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;"]);
         assert!(status.comms_error);
         let params = axis.params();
@@ -1923,8 +1927,8 @@ mod tests {
     fn each_axis_of_the_pass_asks_te() {
         let (mut axes, sent) = scripted_pair("mm4000_te_each", &[], "1TP1.4990,2TP-2.2490");
         let user = AsynUser::default();
-        axes[0].poll(&user).unwrap();
-        axes[1].poll(&user).unwrap();
+        axes[0].polled(&user).unwrap();
+        axes[1].polled(&user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TE;", "TE;"]);
         for axis in &axes {
             let params = axis.params();
@@ -1940,8 +1944,8 @@ mod tests {
     fn a_failed_te_fails_every_later_axis_of_the_pass() {
         let (mut axes, sent) = scripted_pair("mm4000_te", &["TE;"], "1TP3.0000,2TP-2.2490");
         let user = AsynUser::default();
-        let first = axes[0].poll(&user).unwrap();
-        axes[1].poll(&user).unwrap();
+        let first = axes[0].polled(&user).unwrap();
+        axes[1].polled(&user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TE;"]);
         let params = axes[0].params();
         assert_eq!(params.get_integer(function::COMM_ERROR), Ok(Some(0)));
@@ -1963,8 +1967,8 @@ mod tests {
     fn a_zero_tu_reads_the_status_and_holds_the_position() {
         let (mut axes, sent) = scripted_pair("mm4000_tu0", &["1TU"], "1TP3.0000,2TP-2.2490");
         let user = AsynUser::default();
-        let first = axes[0].poll(&user).unwrap();
-        axes[1].poll(&user).unwrap();
+        let first = axes[0].polled(&user).unwrap();
+        axes[1].polled(&user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TE;", "TE;"]);
         let params = axes[0].params();
         assert_eq!(params.get_integer(function::COMM_ERROR), Ok(Some(0)));
@@ -2016,14 +2020,14 @@ mod tests {
             .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
-        assert!(axis.poll(&user).unwrap().done);
+        assert!(axis.polled(&user).unwrap().done);
         sent.lock().unwrap().clear();
-        assert!(axis.poll(&user).unwrap().done);
+        assert!(axis.polled(&user).unwrap().done);
         assert!(sent.lock().unwrap().is_empty(), "inside the TTL");
 
         axis.move_absolute(&user, 1000.0, 0.0, 10.0, 20.0).unwrap();
         assert_eq!(axis.params().get_integer(function::DONE), Ok(Some(0)));
-        let after = axis.poll(&user).unwrap();
+        let after = axis.polled(&user).unwrap();
         assert_eq!(
             *sent.lock().unwrap(),
             ["1AC0.002000;1VA0.001000;1PA0.100000;", "MS;", "TP;", "TE;"]
@@ -2031,7 +2035,7 @@ mod tests {
         assert!(after.done, "the line's MS; reports the axis idle");
 
         sent.lock().unwrap().clear();
-        assert!(axis.poll(&user).unwrap().done);
+        assert!(axis.polled(&user).unwrap().done);
         assert!(sent.lock().unwrap().is_empty());
     }
 
@@ -2295,7 +2299,7 @@ mod tests {
         .unwrap();
         assert_eq!(reads, (true, true, Some(-500.0), Some(0.0)));
         let mut axis = axes[1].lock().unwrap();
-        axis.poll(&AsynUser::default()).unwrap();
+        axis.polled(&AsynUser::default()).unwrap();
         let params = axis.params();
         // `E`: moving, plus direction.
         assert_eq!(params.get_integer(function::DIRECTION), Ok(Some(4)));
@@ -2313,7 +2317,7 @@ mod tests {
         let user = AsynUser::default();
         let mut axis = axes[0].lock().unwrap();
         axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert!(status.done);
         assert_eq!(axis.params().get_integer(function::DONE), Ok(Some(1)));
     }
@@ -2395,7 +2399,11 @@ mod tests {
     #[epics_rs::base::epics_test]
     async fn the_poll_prints_the_c_iodriver_line() {
         let (axes, path) = traced_axes("mm4kPoll", TraceMask::IO_DRIVER, "TE@").await;
-        axes[1].lock().unwrap().poll(&AsynUser::default()).unwrap();
+        axes[1]
+            .lock()
+            .unwrap()
+            .polled(&AsynUser::default())
+            .unwrap();
         // The poller's own startup poll may land in the file too.
         let text = take_trace(&path);
         assert!(!text.is_empty());
@@ -2412,7 +2420,11 @@ mod tests {
     #[epics_rs::base::epics_test]
     async fn the_poller_errors_print_on_the_axis_log() {
         let (axes, path) = traced_axes("mm4kTeErr", TraceMask::ERROR, "TEC").await;
-        axes[0].lock().unwrap().poll(&AsynUser::default()).unwrap();
+        axes[0]
+            .lock()
+            .unwrap()
+            .polled(&AsynUser::default())
+            .unwrap();
         // The poller's own startup pass may land in the file too.
         let text = take_trace(&path);
         assert!(!text.is_empty());

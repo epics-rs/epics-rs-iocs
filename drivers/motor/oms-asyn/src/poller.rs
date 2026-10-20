@@ -62,6 +62,7 @@ impl PollShared {
         debug_assert_eq!(axes.len(), index);
         axes.push(AxisState {
             status: MotorStatus {
+                done: true,
                 has_encoder,
                 ..MotorStatus::default()
             },
@@ -103,6 +104,12 @@ impl PollShared {
     /// `setPosition`.
     pub(crate) fn set_position(&self, axis: usize, position: f64) {
         self.axes()[axis].status.position = position;
+    }
+
+    /// `writeFloat64`'s `setDoubleParam(motorEncoderPosition_, value)`,
+    /// ahead of its encoder check (omsBaseController.cpp:329-333).
+    pub(crate) fn set_encoder_position(&self, axis: usize, position: f64) {
+        self.axes()[axis].status.encoder_position = position;
     }
 
     fn axes(&self) -> MutexGuard<'_, Vec<AxisState>> {
@@ -583,6 +590,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::oms::OmsAxis;
+    use motor_common::testing::Polled;
 
     type Replies = Arc<Mutex<HashMap<String, String>>>;
 
@@ -739,7 +747,7 @@ pub(crate) mod tests {
         );
 
         let user = AsynUser::default();
-        let x = rig.axes[0].poll(&user).unwrap();
+        let x = rig.axes[0].polled(&user).unwrap();
         assert_eq!(
             (x.done, x.moving, x.msta_moving, x.problem),
             (false, true, true, false)
@@ -749,7 +757,7 @@ pub(crate) mod tests {
         assert!(!x.gain_support, "C sets 0 for an `on` field");
         assert!(!x.low_limit && !x.high_limit);
 
-        let y = rig.axes[1].poll(&user).unwrap();
+        let y = rig.axes[1].polled(&user).unwrap();
         assert_eq!((y.done, y.moving, y.msta_moving), (true, false, false));
         assert_eq!((y.position, y.encoder_position), (-5.0, 0.0));
         assert!(!y.direction && y.home && y.gain_support);
@@ -758,9 +766,9 @@ pub(crate) mod tests {
         rig.axes[1]
             .move_absolute(&user, 10.0, 1.0, 100.0, 1000.0)
             .unwrap();
-        assert!(!rig.axes[1].poll(&user).unwrap().done);
+        assert!(!rig.axes[1].polled(&user).unwrap().done);
         assert!(
-            rig.axes[1].poll(&user).unwrap().home,
+            rig.axes[1].polled(&user).unwrap().home,
             "untouched until the next loop"
         );
     }
@@ -778,7 +786,7 @@ pub(crate) mod tests {
             let Ok(PollCommand::Post(status)) = rx.try_recv() else {
                 panic!("axis {i} not posted");
             };
-            assert_eq!(status, rig.axes[i].poll(&AsynUser::default()).unwrap());
+            assert_eq!(status, rig.axes[i].polled(&AsynUser::default()).unwrap());
             assert!(rx.try_recv().is_err());
         }
         assert!(poller.shared.wait(Duration::ZERO));
@@ -867,8 +875,38 @@ pub(crate) mod tests {
         init_positions(&rig.controller);
         assert_eq!(*rig.written.lock().unwrap(), ["AM PP;"]);
         let user = AsynUser::default();
-        assert_eq!(rig.axes[0].poll(&user).unwrap().position, 3000.0);
-        assert_eq!(rig.axes[1].poll(&user).unwrap().position, -5.0);
+        assert_eq!(rig.axes[0].polled(&user).unwrap().position, 3000.0);
+        assert_eq!(rig.axes[1].polled(&user).unwrap().position, -5.0);
+    }
+
+    /// Init's DONE=1 stands through a loop that finds an axis at rest with
+    /// no done flag, as one reads after power-up.
+    #[test]
+    fn an_axis_at_rest_without_a_done_flag_keeps_init_s_done() {
+        let mut idle = HEALTHY.to_vec();
+        idle.extend([("AM;RI;", "PNNN,MNNN"), ("AM;RV;", "0,0")]);
+        let mut rig = rig("omsInitDone", 2, &idle);
+        poller(&rig).pass();
+        let user = AsynUser::default();
+        for axis in &mut rig.axes {
+            assert!(axis.polled(&user).unwrap().done);
+        }
+    }
+
+    /// writeFloat64 sets REP ahead of its encoder check: it stands on an
+    /// axis with no encoder, and on one with until the loop reads it.
+    #[test]
+    fn an_encoder_position_write_sets_the_encoder_position() {
+        let mut rig = rig("omsSetEncoder", 2, &HEALTHY);
+        let user = AsynUser::default();
+        for axis in &mut rig.axes {
+            axis.set_encoder_position(&user, 42.0).unwrap();
+            assert_eq!(axis.polled(&user).unwrap().encoder_position, 42.0);
+        }
+        assert_eq!(*rig.written.lock().unwrap(), ["AX LPE42;"]);
+        poller(&rig).pass();
+        assert_eq!(rig.axes[0].polled(&user).unwrap().encoder_position, 7.0);
+        assert_eq!(rig.axes[1].polled(&user).unwrap().encoder_position, 42.0);
     }
 
     /// C `homing`: set by home(), cleared by the loop that finds the axis
@@ -897,7 +935,7 @@ pub(crate) mod tests {
             .move_absolute(&user, 10.0, 1.0, 100.0, 1000.0)
             .unwrap();
         assert!(!shared.wait(Duration::ZERO));
-        rig.axes[0].poll(&user).unwrap();
+        rig.axes[0].polled(&user).unwrap();
         assert!(shared.wait(Duration::ZERO));
     }
 
@@ -947,7 +985,7 @@ pub(crate) mod tests {
         assert_eq!(poller.pass(), Some(Duration::from_secs(1)));
         assert!(!poller.enabled);
         assert_eq!(
-            rig.axes[0].poll(&AsynUser::default()).unwrap().position,
+            rig.axes[0].polled(&AsynUser::default()).unwrap().position,
             0.0
         );
         rig.written.lock().unwrap().clear();

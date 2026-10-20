@@ -8,7 +8,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
+use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -319,6 +322,13 @@ impl Model1 {
     }
 }
 
+/// C `set_status` as `motor_init` calls it, into a fresh status, for
+/// [`init_read`] to take.
+pub fn init_poll(motor: &mut impl AsynMotor, user: &AsynUser) -> AsynResult<MotorStatus> {
+    let mut status = MotorStatus::default();
+    motor.poll(user, &mut status).map(|()| status)
+}
+
 /// C `set_status` as `motor_init` calls it: the status `read`, or after a
 /// failed read the status `motor_init` prepared, which the failure exit
 /// stores back, with the bits `failure` names.
@@ -418,9 +428,10 @@ mod tests {
         fn poll_failure(&self) -> PollFailure {
             PollFailure::PROBLEM_AND_COMMS_ERROR
         }
-        fn poll(&mut self, _: &AsynUser) -> AsynResult<MotorStatus> {
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
             self.log.lock().unwrap().push(self.card);
-            Ok(MotorStatus::default())
+            *status = MotorStatus::default();
+            Ok(())
         }
     }
 

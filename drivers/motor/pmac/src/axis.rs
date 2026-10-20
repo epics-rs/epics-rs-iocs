@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
+};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -44,10 +46,8 @@ pub struct PmacAxis {
     /// C `amp_enabled_` / `fatal_following_`, read by `stop`.
     amp_enabled: bool,
     fatal_following: bool,
-    /// C `motorStatusHasEncoder_`: the initial status read succeeded.
-    pub(crate) has_encoder: bool,
-    /// The status the last poll posted, which a failed status read keeps.
-    last: MotorStatus,
+    /// What the constructor set on the axis's status (pmacAxis.cpp:144-148).
+    status_writes: Vec<StatusWrite>,
     /// C's per-axis `printErrors` / `printNextError_`.
     throttle: ErrorThrottle,
     /// The controller-port steps not yet handed to the owner.
@@ -122,6 +122,13 @@ impl PmacAxis {
             }
             status.is_some()
         };
+        let mut status_writes = Vec::new();
+        if has_encoder {
+            status_writes.push(StatusWrite::HasEncoder(true));
+        }
+        if axis != 0 {
+            status_writes.push(StatusWrite::GainSupport(true));
+        }
         Self {
             controller,
             axis,
@@ -130,8 +137,7 @@ impl PmacAxis {
             previous_direction: false,
             amp_enabled: false,
             fatal_following: false,
-            has_encoder,
-            last: MotorStatus::default(),
+            status_writes,
             throttle: ErrorThrottle::default(),
             sets,
         }
@@ -302,6 +308,10 @@ impl AsynMotor for PmacAxis {
         std::mem::take(&mut self.sets)
     }
 
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -458,7 +468,7 @@ impl AsynMotor for PmacAxis {
     }
 
     /// C `pmacAxis::getAxisStatus`.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let axis = self.axis;
         let mut controller = lock(&self.controller);
         let config = controller.axis_config(axis);
@@ -494,9 +504,9 @@ impl AsynMotor for PmacAxis {
             // reads from the zeroed status words, and returns success
             // (pmacAxis.cpp:494-498, 606-613).
             self.amp_enabled = false;
-            self.last.powered = false;
-            self.last.moving = false;
-            return Ok(self.last.clone());
+            out.powered = false;
+            out.moving = false;
+            return Ok(());
         };
 
         // Closed-loop axis: the third field is the following error and the
@@ -570,26 +580,22 @@ impl AsynMotor for PmacAxis {
             },
         );
 
-        self.last = MotorStatus {
-            position,
-            encoder_position,
-            done: flags.done,
-            // C paces on `!done` (pmacAxis.cpp:538-542) and sets
-            // motorStatusMoving_ from the velocity/amp bits (548).
-            moving: !flags.done,
-            msta_moving: flags.moving,
-            high_limit: flags.high_limit,
-            low_limit: flags.low_limit,
-            homed: flags.home_complete,
-            powered: flags.amp_enabled,
-            problem,
-            direction,
-            slip_stall: flags.following_error,
-            gain_support: true,
-            has_encoder: self.has_encoder,
-            ..MotorStatus::default()
-        };
-        Ok(self.last.clone())
+        out.position = position;
+        out.encoder_position = encoder_position;
+        out.direction = direction;
+        // C paces on `!done` (pmacAxis.cpp:538-542) and sets
+        // motorStatusMoving_ from the velocity/amp bits (548).
+        out.moving = !flags.done;
+        out.done = flags.done;
+        out.high_limit = flags.high_limit;
+        out.homed = flags.home_complete;
+        out.msta_moving = flags.moving;
+        out.low_limit = flags.low_limit;
+        out.slip_stall = flags.following_error;
+        out.gain_support = true;
+        out.problem = problem;
+        out.powered = flags.amp_enabled;
+        Ok(())
     }
 }
 
@@ -644,6 +650,48 @@ mod tests {
         let controller = PmacController::new("pmacCallback", "pmacCallbackLow", 0, None);
         let axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
         assert!(axis.constructor_calls_param_callbacks());
+    }
+
+    /// pmacAxis.cpp:493-498, :617: a failed status read sets only the
+    /// power-on bit, so it keeps the DONE a move start cleared.
+    #[test]
+    fn a_failed_status_read_keeps_the_done_a_move_cleared() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fail = Arc::new(AtomicBool::new(false));
+        let fails = fail.clone();
+        let (_rig, handle) = motor_common::testing::LineRig::failing(
+            "pmacFailedRead",
+            |cmd| {
+                match cmd.trim_end() {
+                    "#1 ? F P" => "880000000401\r0\r1000\r\x06",
+                    "i124" => "$0\r\x06",
+                    _ => "100\r-100\r2000\r1000\r500\r\x06",
+                }
+                .into()
+            },
+            move |cmd| fails.load(Ordering::SeqCst) && cmd.trim_end() == "#1 ? F P",
+        );
+        let controller =
+            PmacController::new("pmacFailedReadCtl", "pmacFailedRead", 0, Some(handle));
+        let mut axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        let user = AsynUser::new(0).with_addr(1);
+        let mut status = MotorStatus::default();
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && status.powered);
+        // What the poll loop does when a move starts.
+        status.done = false;
+        fail.store(true, Ordering::SeqCst);
+        axis.poll(&user, &mut status).unwrap();
+        assert!(!status.done && !status.powered);
+    }
+
+    /// pmacAxis.cpp:148: the constructor sets GAIN_SUPPORT on a real axis
+    /// whether or not the initial status read succeeded.
+    #[test]
+    fn the_constructor_sets_gain_support_without_an_initial_status() {
+        let controller = PmacController::new("pmacCtorGain", "pmacCtorGainLow", 0, None);
+        let mut axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        assert_eq!(axis.take_status_writes(), [StatusWrite::GainSupport(true)]);
     }
 
     #[test]

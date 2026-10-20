@@ -23,7 +23,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 /// `IM483PL_NUM_CARDS`.
@@ -221,7 +221,7 @@ impl DrvIm483Axis {
 
     /// `motor_init`'s `set_status` of a new axis.
     fn with_status(mut axis: Self) -> Self {
-        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
         axis
     }
 
@@ -379,7 +379,7 @@ impl AsynMotor for DrvIm483Axis {
     /// `set_status`: `^` for moving, `Z 0` for the position, `] 0` for the
     /// limits, `] 1` for home, `z 0` for the encoder. A first unanswered `^`
     /// fails the poll raising nothing; a second raises the comms error.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let ask = |ctrl: &Im483Controller, q: &str| ctrl.ask(self.line(b"", q));
@@ -432,7 +432,8 @@ impl AsynMotor for DrvIm483Axis {
             line.extend_from_slice(&post);
             self.lock().ask(line);
         }
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
@@ -511,6 +512,7 @@ mod tests {
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use motor_common::testing::Polled;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
     /// An IM483 line: records each message and answers the last one, `^`
@@ -618,7 +620,7 @@ mod tests {
 
         /// The messages one poll sent besides its five queries.
         fn poll_extra(&mut self) -> Vec<String> {
-            self.axis.poll(&self.user).unwrap();
+            self.axis.polled(&self.user).unwrap();
             let queries = ["^", "Z 0", "] 0", "] 1", "z 0"];
             self.sent()
                 .into_iter()
@@ -771,15 +773,15 @@ mod tests {
         let mut axis = DrvIm483Axis::im483pl(controller, 0);
         let user = AsynUser::new(0);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        let s = axis.poll(&user).unwrap();
+        let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error && !s.problem);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 }

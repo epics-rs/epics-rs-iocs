@@ -43,7 +43,7 @@ use epics_rs::motor::device_support::{BuildTrans, LimitBuild};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_libcom_rs::runtime::stdlib::strtod;
 
-use motor_common::model1::{MoveStrings, init_read};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::nint;
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -219,7 +219,7 @@ impl Mdt695Axis {
             strings: MoveStrings::default(),
             init_status: None,
         };
-        me.init_status = Some(me.poll(&AsynUser::new(0)));
+        me.init_status = Some(init_poll(&mut me, &AsynUser::new(0)));
         me
     }
 
@@ -360,7 +360,7 @@ impl AsynMotor for Mdt695Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let reading = ctrl
@@ -395,7 +395,7 @@ impl AsynMotor for Mdt695Axis {
         self.prev_position = f64::from(nint(volts / DRIVE_RESOLUTION));
         let position = self.prev_position;
 
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position,
             encoder_position: 0.0,
             velocity: 0.0,
@@ -404,7 +404,8 @@ impl AsynMotor for Mdt695Axis {
             moving: false,
             direction: true,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -445,6 +446,7 @@ mod tests {
     }
 
     use motor_common::testing::LineRig;
+    use motor_common::testing::Polled;
 
     fn rig(name: &str) -> (LineRig, Mdt695Axis) {
         let (line, io) = LineRig::queued(name, |last| match last {
@@ -511,15 +513,15 @@ mod tests {
         line.sent();
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
         assert_eq!(line.sent(), ["YR?", "E"]);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        assert_eq!(axis.poll(&user).unwrap().position, 15.0);
+        assert_eq!(axis.polled(&user).unwrap().position, 15.0);
         quiet.store(true, Ordering::SeqCst);
-        assert!(axis.poll(&user).is_err());
+        assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
     }
 
@@ -552,9 +554,9 @@ mod tests {
             .unwrap();
         axis.move_absolute(&user, 10.0, 0.0, 0.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["YL\rYV1.0"]);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["YR?", "#H"]);
-        axis.poll(&user).unwrap();
+        axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["YR?"]);
     }
 

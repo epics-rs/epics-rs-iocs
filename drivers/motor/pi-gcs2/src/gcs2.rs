@@ -2642,7 +2642,7 @@ impl AsynMotor for PIGCS2Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let old_homing = self.is_homing;
         let released = self.lock().released.remove(&self.axis_no);
         if let Some(counts) = released {
@@ -2698,7 +2698,7 @@ impl AsynMotor for PIGCS2Axis {
         // status-bitmask moving bit directly.
         let done = !(raw_moving || homing);
 
-        Ok(MotorStatus {
+        *status = MotorStatus {
             position,
             encoder_position: position,
             velocity: 0.0,
@@ -2714,7 +2714,8 @@ impl AsynMotor for PIGCS2Axis {
             homed: self.homed,
             gain_support: true,
             ..MotorStatus::default()
-        })
+        };
+        Ok(())
     }
 }
 
@@ -2724,6 +2725,7 @@ mod tests {
     use epics_rs::asyn::interfaces::motor::PortSet;
     use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::request::ParamSetValue;
+    use motor_common::testing::Polled;
 
     /// PIasynAxis.cpp:101, run from PIasynController.cpp:189.
     #[test]
@@ -3041,7 +3043,7 @@ mod tests {
             acceleration: 0.0,
             sets: PortSets::default(),
         };
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         // POS? 2.5 in whole counts.
         assert_eq!(status.position, 3.0);
         assert!(status.moving && status.msta_moving && status.high_limit && status.powered);
@@ -3269,7 +3271,7 @@ mod tests {
         });
         let user = AsynUser::new(0);
         line.sent();
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         let sent = sent_lines(&line);
         assert!(sent.contains(&"SRG? 1 1".to_string()), "{sent:?}");
         assert!(!sent.contains(&"\u{4}".to_string()), "{sent:?}");
@@ -3279,9 +3281,9 @@ mod tests {
         );
 
         srg.store(false, Ordering::Relaxed);
-        let _ = axis.poll(&user);
+        let _ = axis.polled(&user);
         line.sent();
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         let sent = sent_lines(&line);
         assert!(!sent.contains(&"SRG? 1 1".to_string()), "{sent:?}");
         assert!(
@@ -3390,7 +3392,7 @@ mod tests {
         );
         assert!(axis.homed && axis.servo_on && !axis.has_reference);
         let user = AsynUser::new(0);
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         let sent = sent_lines(&line);
         assert_eq!(sent.first().map(String::as_str), Some("\u{5}"));
         assert!(
@@ -3421,7 +3423,7 @@ mod tests {
         );
         assert!(axis.homed && axis.servo_on && !axis.has_reference);
         let user = AsynUser::new(0);
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!(sent_lines(&line)[..2], ["\u{5}", "SVO? 1"]);
         assert!(status.moving && status.powered);
         axis.stop(&user, 0.0).unwrap();
@@ -3494,7 +3496,7 @@ mod tests {
         let (line, mut axis) = c885_axis("gcs2C885Poll", c885_reply);
         axis.is_homing = true;
         line.sent();
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(
             sent_lines(&line),
             [
@@ -3569,7 +3571,7 @@ mod tests {
     fn an_e755_axis_polls_busy_then_moving() {
         let (line, mut axis) = e755_axis("gcs2E755Poll", e755_reply);
         line.sent();
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(
             sent_lines(&line),
             ["\u{7}", "\u{5}", "POS? 1", "POS? 1", "TMN? 1", "TMX? 1"]
@@ -3667,7 +3669,7 @@ mod tests {
             sent_lines(&line),
             ["SVO A 1", "ERR?", "VEL A 2000.000000", "REF A"]
         );
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert!(sent_lines(&line).is_empty());
         assert!(!status.done && status.moving && axis.is_homing && status.powered);
     }
@@ -3710,8 +3712,8 @@ mod tests {
         assert!(first.take_port_sets().is_empty());
         first.last_position = 0.0;
         second.last_position = 0.0;
-        assert!(first.poll(&user).unwrap().direction);
-        assert!(!second.poll(&user).unwrap().direction);
+        assert!(first.polled(&user).unwrap().direction);
+        assert!(!second.polled(&user).unwrap().direction);
         line.sent();
         first.set_deferred_moves(&user, false).unwrap();
         assert!(sent_lines(&line).is_empty());
@@ -3908,7 +3910,7 @@ mod tests {
         let (port, _, _) = controller_port("gcs2ClPoll", &ctrl, "1");
         let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2ClPoll");
         line.sent();
-        axis.poll(&AsynUser::new(0)).unwrap();
+        axis.polled(&AsynUser::new(0)).unwrap();
         let sent = sent_lines(&line);
         let ont = sent.iter().position(|c| c == "ONT? 1");
         let tmn = sent.iter().position(|c| c == "TMN? 1");
@@ -4375,7 +4377,7 @@ mod tests {
         let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2DirUnits");
         let user = AsynUser::new(0);
         axis.cpu = 10000.0;
-        let _ = axis.poll(&user);
+        let _ = axis.polled(&user);
         assert_eq!(axis.last_position, 10000.0);
         axis.high_limit = 1.00002;
         axis.last_direction = true;
@@ -4410,9 +4412,9 @@ mod tests {
             axis.set_position(&user, 7.0).unwrap();
             axis.has_reference = true;
             axis.home(&user, 0.5, 2.0, 1.5, true).unwrap();
-            axis.poll(&user).unwrap();
+            axis.polled(&user).unwrap();
             homing.store(false, Ordering::Relaxed);
-            axis.poll(&user).unwrap();
+            axis.polled(&user).unwrap();
         });
         for line in [
             "PIasynAxis:moveAxis: Set driver gcs2AxFlow, axis 0 move to 2.500000, min vel=0.500000, max_vel=0.000000, accel=0.000000, deffered=0 - status=0\n",
@@ -4793,7 +4795,7 @@ mod tests {
         let printed = traced_mask("gcs2PosCts", TraceMask::FLOW, || {
             for reply in ["1=2.4", "1=-2.4", "1=-2.6"] {
                 *pos.lock().unwrap() = reply;
-                polled.push(axis.poll(&user).unwrap().position);
+                polled.push(axis.polled(&user).unwrap().position);
             }
         });
         assert_eq!(polled, [2.0, -2.0, -3.0]);
@@ -4827,7 +4829,7 @@ mod tests {
         let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2SupPosLine")));
         let (_port, p, _) = controller_port("gcs2SupPos", &ctrl, "1");
         let mut axis = PIGCS2Axis::new(ctrl.clone(), "1".into(), 0, "gcs2SupPos");
-        axis.poll(&AsynUser::new(0)).unwrap();
+        axis.polled(&AsynUser::new(0)).unwrap();
         let params = axis_params(axis.take_port_sets());
         let mut want = vec![
             (p.position, ParamValue::Float64(2.5)),
@@ -5129,14 +5131,14 @@ mod tests {
         line.sent();
         let _ = ctrl.lock().unwrap().poll();
         assert_eq!(sent_lines(&line), ["\u{5}"]);
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         // PIasynAxis::poll reads the position twice (PIasynAxis.cpp:162-164).
         assert_eq!(sent_lines(&line), ["\u{3}", "\u{3}", "\u{3}", "\u{3}"]);
         assert!(status.moving && !status.done && status.powered);
         assert_eq!(status.position, 20000.0);
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = ctrl.lock().unwrap().poll();
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(sent_lines(&line), ["\u{5}", "POS? Y", "POS? Y"]);
         assert!(status.done && !status.moving);
         assert_eq!(status.position, 30000.0);
@@ -5162,12 +5164,12 @@ mod tests {
         ctrl.lock().unwrap().hexapod.homing = true;
         let _ = ctrl.lock().unwrap().poll();
         line.sent();
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert!(sent_lines(&line).is_empty());
         assert!(axis.is_homing && !status.done);
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = ctrl.lock().unwrap().poll();
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(sent_lines(&line), ["\u{5}", "\u{4}", "POS? X", "POS? X"]);
         assert!(!axis.is_homing && status.done && status.homed);
     }
@@ -5494,7 +5496,7 @@ mod tests {
         axis.home(&user, 0.0, 1.0, 0.0, true).unwrap();
         assert_eq!(sent_lines(&line), ["INI X"]);
         let _ = ctrl.lock().unwrap().poll();
-        assert!(!axis.poll(&user).unwrap().done && axis.is_homing);
+        assert!(!axis.polled(&user).unwrap().done && axis.is_homing);
         line.sent();
         axis.stop(&user, 0.0).unwrap();
         assert_eq!(sent_lines(&line), ["\u{18}", "ERR?"]);
@@ -5569,7 +5571,7 @@ mod tests {
             sent_lines(&line),
             ["VLS 1.000000", "MOV Y 2.000000", "\u{5}"]
         );
-        let status = axis.poll(&user).unwrap();
+        let status = axis.polled(&user).unwrap();
         assert_eq!(sent_lines(&line), ["POS? Y", "POS? Y"]);
         assert!(status.moving && status.position == 20000.0);
         axis.move_velocity(&user, 0.0, 10000.0, 0.0).unwrap();
@@ -5649,7 +5651,7 @@ mod tests {
         ctrl.init();
         let mut axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "Y".into(), 1, "gcs2C887Poll");
         line.sent();
-        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(
             sent_lines(&line),
             [
