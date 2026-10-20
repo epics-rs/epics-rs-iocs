@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use async_opcua::types::{Variant, VariantScalarTypeId};
+use async_opcua::types::Variant;
 use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
@@ -94,6 +94,8 @@ const INVALID: u16 = 3;
 /// MINOR — an uncertain status code still carries a value
 /// (`DataElementOpen62541Leaf.h:733-737`).
 const MINOR: u16 = 1;
+
+const MAX_STRING_SIZE: usize = 40;
 
 /// How many state fields an mbbi/mbbo has (`NUMBER_OF_ENUM_CHOICES`,
 /// `devOpcua.cpp:703`).
@@ -585,14 +587,17 @@ impl OpcuaDevice {
             }
             Op::Enum => self.store_enum(data, choices, record),
             Op::Analog => self.store_analog(data, choices, record),
+            // Byte data may fill all MAX_STRING_SIZE bytes in C, leaving VAL
+            // with no NUL (`DataElementOpen62541Leaf.cpp:408`); not copied.
             Op::String => {
-                let v = value::read_string(data, choices)?;
+                let v = value::read_string(data, choices, MAX_STRING_SIZE)?;
                 put(record, "VAL", EpicsValue::String(truncate(&v, 39).into()))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             // lsi/lso clamp the string to SIZV themselves and set LEN from it.
             Op::LongString => {
-                let v = value::read_string(data, choices)?;
+                let sizv = usize::try_from(long(record, "SIZV")?).unwrap_or(0);
+                let v = value::read_string(data, choices, sizv)?;
                 put(record, "VAL", EpicsValue::CharArray(v.into()))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
@@ -1037,6 +1042,7 @@ fn long(record: &dyn Record, name: &str) -> Result<i32, String> {
         EpicsValue::Long(v) => Ok(v),
         EpicsValue::ULong(v) => Ok(v as i32),
         EpicsValue::Short(v) => Ok(i32::from(v)),
+        EpicsValue::UShort(v) => Ok(i32::from(v)),
         EpicsValue::Enum(v) => Ok(i32::from(v)),
         other => Err(format!("{name} is not an integer ({other:?})")),
     }
@@ -1132,17 +1138,9 @@ fn store_array(
     let current = field(record, "VAL")?;
 
     let value = match current {
-        // FTVL = CHAR is always the long-string read (`devOpcua.cpp:1084-1087`):
-        // text keeps a NUL's room (`DataElementOpen62541Leaf.cpp:346`), Byte
-        // data may fill the buffer (`:408`).
+        // FTVL = CHAR is always the long-string read (`devOpcua.cpp:1084-1087`).
         EpicsValue::CharArray(_) => {
-            let bytes = matches!(data, Variant::Byte(_) | Variant::SByte(_))
-                || matches!(data, Variant::Array(a) if matches!(
-                    a.value_type,
-                    VariantScalarTypeId::Byte | VariantScalarTypeId::SByte
-                ));
-            let room = if bytes { nelm } else { nelm.saturating_sub(1) };
-            EpicsValue::CharArray(clamp(value::read_string(data, choices)?, room).into())
+            EpicsValue::CharArray(value::read_string(data, choices, nelm)?.into())
         }
         // FTVL = UCHAR is the `epicsUInt8` overload: a ByteString's raw bytes
         // or a Byte/Boolean array (`DataElementOpen62541Leaf.cpp:652-662`).
@@ -1174,9 +1172,9 @@ fn store_array(
             EpicsValue::DoubleArray(clamp(value::read_array::<f64>(data)?, nelm).into())
         }
         EpicsValue::StringArray(_) => EpicsValue::StringArray(
-            clamp(value::read_string_array(data)?, nelm)
+            clamp(value::read_string_array(data, MAX_STRING_SIZE)?, nelm)
                 .into_iter()
-                .map(|s| truncate(s.as_bytes(), 39).into())
+                .map(Into::into)
                 .collect(),
         ),
         other => return Err(format!("VAL is not an array ({other:?})").into()),
