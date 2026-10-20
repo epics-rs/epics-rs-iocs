@@ -98,9 +98,9 @@ use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
-use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
@@ -310,10 +310,8 @@ impl RontecDriver {
         // C: "Get the input EOS to be able to reset it later"
         // (`drvMcaRontec.c:196-197`), status ignored.
         driver.input_eos = driver
-            .serial
-            .submit_blocking(RequestOp::GetInputEos, driver.eos_user(RONTEC_TIMEOUT))
-            .ok()
-            .and_then(|r| r.data)
+            .sync_io(RONTEC_TIMEOUT)
+            .get_input_eos(OCTET_REASON)
             .unwrap_or_default();
 
         // C: `sendMessage(pPvt, "$SM 4,0", NULL);` -- send 4 bytes/channel,
@@ -325,16 +323,9 @@ impl RontecDriver {
         Ok(driver)
     }
 
-    fn octet_user(&self, timeout: Duration) -> AsynUser {
-        AsynUser::new(OCTET_REASON)
-            .with_addr(self.addr)
-            .with_timeout(timeout)
-    }
-
-    /// C's `pasynOctetSyncIO` EOS calls take `lockPort`, which a down line
-    /// does not refuse (`asynOctetSyncIO.c:306`); `writeRead` queues and does.
-    fn eos_user(&self, timeout: Duration) -> AsynUser {
-        self.octet_user(timeout).queue_even_if_not_connected()
+    /// C `pPvt->pasynUser`, the `pasynOctetSyncIO` user on the serial port.
+    fn sync_io(&self, timeout: Duration) -> SyncIOHandle {
+        SyncIOHandle::from_handle(self.serial.clone(), self.addr, timeout)
     }
 
     /// Which [`McaReason`] (if any) `self.reasons` resolved `idx` to.
@@ -355,14 +346,8 @@ impl RontecDriver {
     /// The bytes read come back with the status, as C's `input` does.
     fn send_message(&self, output: &str) -> (Vec<u8>, AsynResult<()>) {
         let (input, result) = self
-            .serial
-            .submit_octet_read_blocking(
-                OctetReadOp::WriteRead {
-                    data: output.as_bytes().to_vec(),
-                    buf_size: RONTEC_MESSAGE_SIZE,
-                },
-                self.octet_user(RONTEC_TIMEOUT),
-            )
+            .sync_io(RONTEC_TIMEOUT)
+            .write_read(OCTET_REASON, output.as_bytes(), RONTEC_MESSAGE_SIZE)
             .into_parts();
         // A failed read still wrote the whole command; a failed write read
         // nothing. A bare error carries neither count.
@@ -436,26 +421,12 @@ impl RontecDriver {
         // by the ASCII input EOS, ignoring every status but the length. Each
         // is its own port lock in C as here, so another user of the serial
         // port can run between them in both.
-        let _ = self.serial.submit_blocking(
-            RequestOp::SetInputEos { eos: Vec::new() },
-            self.eos_user(SPECTRUM_TIMEOUT),
-        );
-        let (raw, _) = self
-            .serial
-            .submit_octet_read_blocking(
-                OctetReadOp::WriteRead {
-                    data: message.into_bytes(),
-                    buf_size: nread,
-                },
-                self.octet_user(SPECTRUM_TIMEOUT),
-            )
+        let io = self.sync_io(SPECTRUM_TIMEOUT);
+        let _ = io.set_input_eos(OCTET_REASON, &[]);
+        let (raw, _) = io
+            .write_read(OCTET_REASON, message.as_bytes(), nread)
             .into_parts();
-        let _ = self.serial.submit_blocking(
-            RequestOp::SetInputEos {
-                eos: self.input_eos.clone(),
-            },
-            self.eos_user(SPECTRUM_TIMEOUT),
-        );
+        let _ = io.set_input_eos(OCTET_REASON, &self.input_eos);
         let nbytes_in = raw.len().min(nread);
         self.mca_buffer[..nbytes_in].copy_from_slice(&raw[..nbytes_in]);
         if nbytes_in != nread {
@@ -744,7 +715,7 @@ impl PortDriver for RontecDriver {
 
 #[cfg(test)]
 mod tests {
-    use epics_rs::asyn::request::RequestResult;
+    use epics_rs::asyn::request::{RequestOp, RequestResult};
 
     use super::*;
     use epics_rs::asyn::registry::PortRegistry;
@@ -1438,6 +1409,39 @@ mod tests {
                 .to_owned(),
         ] {
             assert!(trace.contains(&line), "{line:?} not in\n{trace}");
+        }
+    }
+
+    /// `sendMessage` and `int32ArrayRead` are `pasynOctetSyncIO` writeRead
+    /// and setInputEos (drvMcaRontec.c:458-462, :590), which print their
+    /// TRACEIO_DEVICE lines (asynOctetSyncIO.c:259-266, :312).
+    #[test]
+    fn serial_io_prints_its_sync_io_lines() {
+        let rig = Rig::new("lines", rontec_reply);
+        rig.trace_on(TraceMask::IO_DEVICE);
+        rig.services.trace().set_trace_io_mask(
+            Some(&rig.names[0]),
+            epics_rs::asyn::trace::TraceIoMask::ASCII,
+        );
+        rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::Erase)
+            .expect("erase");
+        rig.submit(
+            RequestOp::Int32ArrayRead {
+                buf: Default::default(),
+                max_elements: 1,
+            },
+            McaReason::Data,
+        )
+        .expect("read");
+        let trace = rig.trace();
+        for line in [
+            "asynOctetSyncIO wrote:\n$CC",
+            "asynOctetSyncIO read:\n!ERROR 3",
+            "asynOctetSyncIO setInputEos eoslen 0\n",
+            "asynOctetSyncIO wrote:\n$SS 0,1,1,1",
+            "asynOctetSyncIO setInputEos eoslen 1\n",
+        ] {
+            assert!(trace.contains(line), "{line:?} not in\n{trace}");
         }
     }
 
