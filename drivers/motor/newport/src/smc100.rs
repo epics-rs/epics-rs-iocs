@@ -215,32 +215,25 @@ impl AsynMotor for Smc100Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
+    /// A failed read returns at `skip` as C returns asynError, keeping what
+    /// the reads before it set (SMC100Driver.cpp:305-353).
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         // Position (TP): controller units to record steps.
         let position_units =
             protocol::parse_value(&self.write_read(&protocol::cmd_query_position(self.axis))?)
                 .ok_or_else(|| parse_error("TP"))?;
-        let position = position_units / self.step_size;
+        status.position = position_units / self.step_size;
+        status.encoder_position = status.position;
 
         // Status (TS): moving / limits / at-home.
-        let status =
-            protocol::parse_status(&self.write_read(&protocol::cmd_query_status(self.axis))?)
-                .ok_or_else(|| parse_error("TS"))?;
-
-        *out = MotorStatus {
-            position,
-            encoder_position: position,
-            done: !status.moving,
-            moving: status.moving,
-            high_limit: status.high_limit,
-            low_limit: status.low_limit,
-            home: status.at_home,
-            // The SMC100 exposes no separate encoder and ignores VBAS; the
-            // record then treats base velocity as 0 in its acceleration math.
-            has_encoder: false,
-            vbas_supported: false,
-            ..Default::default()
-        };
+        let ts = protocol::parse_status(&self.write_read(&protocol::cmd_query_status(self.axis))?)
+            .ok_or_else(|| parse_error("TS"))?;
+        status.done = !ts.moving;
+        status.moving = ts.moving;
+        status.high_limit = ts.high_limit;
+        status.low_limit = ts.low_limit;
+        status.home = ts.at_home;
+        status.problem = false;
         Ok(())
     }
 }
@@ -401,6 +394,28 @@ mod tests {
         let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("SMC100_T", 0));
         axis.move_velocity(&user, 0.0, 1.0, 0.0).unwrap();
         assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(false)]);
+    }
+
+    /// SMC100Driver.cpp:312-315: a refused TS skips after TP's position is
+    /// set, so the position survives and Done keeps what a move start set.
+    #[test]
+    fn a_failed_ts_keeps_the_position_tp_read() {
+        let (_line, io) = LineRig::failing(
+            "smc100_ts_skip",
+            |last| match last {
+                "1TP" => "1TP2.5".to_string(),
+                _ => String::new(),
+            },
+            |cmd| cmd == "1TS",
+        );
+        let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("SMC100_T", 0));
+        let mut status = MotorStatus {
+            done: false,
+            ..Default::default()
+        };
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+        assert_eq!(status.position, 2.5);
+        assert!(!status.done);
     }
 
     /// SMC100Driver.cpp:218: moveVelocity's FLOW line, on the axis's user
