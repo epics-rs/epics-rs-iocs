@@ -25,7 +25,9 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::trace::TraceMask;
@@ -230,6 +232,8 @@ impl AxisReport for Ang1AxisReport {
 pub struct Ang1Axis {
     controller: Arc<Mutex<Ang1Controller>>,
     force_read: ForceRead,
+    /// What `set_closed_loop` set, for the loop to apply.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl Ang1Axis {
@@ -259,6 +263,7 @@ impl Ang1Axis {
         let mut ax = Self {
             controller,
             force_read,
+            status_writes: Vec::new(),
         };
         let _ = ax.set_position(&AsynUser::new(0), 0.0);
         ax
@@ -417,8 +422,14 @@ impl AsynMotor for Ang1Axis {
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.do_set_closed_loop(&ctrl, enable)
+        let result = self.do_set_closed_loop(&self.lock(), enable);
+        // Whatever the writes returned (ANG1Driver.cpp:518, :523).
+        self.status_writes.push(StatusWrite::PowerOn(enable));
+        result
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     fn set_pid_gain(&mut self, _user: &AsynUser, _kind: PidGainKind, _gain: f64) -> AsynResult<()> {
@@ -552,6 +563,31 @@ mod tests {
         assert!(status.powered);
         assert!(status.gain_support);
         assert_eq!(status.position, 2003.0);
+    }
+
+    /// C `setClosedLoop` sets POWER_ON whatever its writes returned
+    /// (ANG1Driver.cpp:518, :523); a failed STATUS_2 read then keeps it.
+    #[test]
+    fn set_closed_loop_sets_power_on() {
+        use crate::regs::fake;
+        fake::publish("ang1CnenIn");
+        fake::set_read("ang1CnenIn", STATUS_2, Some(0x8000));
+        let (ctrl, _) = Ang1Controller::new("ang1Cnen", "ang1CnenIn", "ang1CnenOut");
+        let mut ax = Ang1Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::new(0);
+        let mut status = MotorStatus::default();
+        ax.poll(&user, &mut status).unwrap();
+        assert!(status.powered);
+
+        assert!(ax.set_closed_loop(&user, false).is_err());
+        let writes = ax.take_status_writes();
+        assert_eq!(writes, [StatusWrite::PowerOn(false)]);
+        for write in writes {
+            write.apply(&mut status);
+        }
+        fake::set_read("ang1CnenIn", STATUS_2, None);
+        ax.poll(&user, &mut status).unwrap();
+        assert!(!status.powered);
     }
 
     #[test]
