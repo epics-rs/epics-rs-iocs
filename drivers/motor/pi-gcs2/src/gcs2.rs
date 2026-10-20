@@ -4934,7 +4934,7 @@ mod tests {
         let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2Rel");
         let user = AsynUser::new(0);
         axis.cpu = 10000.0;
-        let _ = axis.poll(&user);
+        let _ = axis.polled(&user);
         line.sent();
         drifted.store(true, Ordering::Relaxed);
         axis.move_relative(&user, 250.0, 0.0, 0.0, 0.0).unwrap();
