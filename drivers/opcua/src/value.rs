@@ -20,6 +20,7 @@ use async_opcua::types::{
     Array, ByteString, LocalizedText, QualifiedName, UAString, Variant, VariantScalarTypeId,
     VariantTypeId, XmlElement,
 };
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::types::c_parse::{atoi, strtol_errno, strtoll_errno, strtoul_errno};
 
 use crate::print::ua_print;
@@ -142,19 +143,9 @@ pub enum Number {
     Float(f64),
 }
 
-impl std::fmt::Display for Number {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Number::Int(v) => write!(f, "{v}"),
-            Number::Uint(v) => write!(f, "{v}"),
-            Number::Float(v) => write!(f, "{v}"),
-        }
-    }
-}
-
 /// An EPICS scalar the device support can ask a variant to be read into
 /// (`readScalar(epicsInt32|epicsInt64|epicsUInt32|epicsFloat64*)`).
-pub trait ScalarTarget: Copy + Sized + std::fmt::Display {
+pub trait ScalarTarget: Copy + Sized {
     const NAME: &'static str;
     fn from_number(n: Number) -> Option<Self>;
     /// Parse the text of a STRING/LOCALIZEDTEXT node (`string_to`,
@@ -163,6 +154,9 @@ pub trait ScalarTarget: Copy + Sized + std::fmt::Display {
     fn from_text(s: &str) -> Option<Self>;
     /// The record's own value, on the way out to the server.
     fn to_number(self) -> Number;
+    /// C++ `std::to_string(value)`, the text written to a STRING or
+    /// LOCALIZEDTEXT node (`DataElementOpen62541Leaf.h:1066`, `:1077`).
+    fn to_std_string(self) -> String;
 }
 
 /// Range-checked float → integer. The C checks `!(v < lowest || v > max)` and
@@ -209,6 +203,10 @@ macro_rules! impl_int_target {
                     Number::Uint(self as u64)
                 }
             }
+
+            fn to_std_string(self) -> String {
+                self.to_string()
+            }
         }
     };
 }
@@ -239,6 +237,11 @@ impl ScalarTarget for f64 {
 
     fn to_number(self) -> Number {
         Number::Float(self)
+    }
+
+    /// `%f`.
+    fn to_std_string(self) -> String {
+        CFloat(self).to_string()
     }
 }
 
@@ -654,11 +657,11 @@ pub fn write_scalar<T: ScalarTarget>(
         Variant::UInt64(_) => Variant::UInt64(u64::try_from_number(n).ok_or_else(out_of_range)?),
         Variant::Float(_) => Variant::Float(f32_from_number(n).ok_or_else(out_of_range)?),
         Variant::Double(_) => Variant::Double(f64::from_number(n).ok_or_else(out_of_range)?),
-        Variant::String(_) => Variant::String(UAString::from(value.to_string())),
+        Variant::String(_) => Variant::String(UAString::from(value.to_std_string())),
         Variant::LocalizedText(lt) => Variant::LocalizedText(Box::new(LocalizedText {
             // The locale is not the record's to change.
             locale: lt.locale.clone(),
-            text: UAString::from(value.to_string()),
+            text: UAString::from(value.to_std_string()),
         })),
         other => {
             return Err(WriteError::Unsupported {

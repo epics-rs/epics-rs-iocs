@@ -1096,8 +1096,9 @@ impl AsynMotor for Mm4000Axis {
             if position > self.high_limit {
                 self.jog_high = self.high_limit;
                 return Err(mm_err(format!(
-                    "MM4000 axis {a}: high limit {position} beyond the controller's {}",
-                    self.high_limit
+                    "MM4000 axis {a}: high limit {} beyond the controller's {}",
+                    CFloat(position).g(),
+                    CFloat(self.high_limit).g()
                 )));
             }
             self.jog_high = position;
@@ -1114,8 +1115,9 @@ impl AsynMotor for Mm4000Axis {
             if position < self.low_limit {
                 self.jog_low = self.low_limit;
                 return Err(mm_err(format!(
-                    "MM4000 axis {a}: low limit {position} beyond the controller's {}",
-                    self.low_limit
+                    "MM4000 axis {a}: low limit {} beyond the controller's {}",
+                    CFloat(position).g(),
+                    CFloat(self.low_limit).g()
                 )));
             }
             self.jog_low = position;

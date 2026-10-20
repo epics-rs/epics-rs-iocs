@@ -1,0 +1,7 @@
+# raw_float_format (epics-rs lints/raw_float_format): each entry is a float
+# argument, as written in `path`, whose text is not C's, and the C reason it
+# may stay.
+[raw_float_format]
+allow = [
+    { path = "drivers/ur-robot/src/spdlog.rs", arg = "v.abs()", reason = "FmtDouble's own digits: a finite non-negative magnitude, whose Rust shortest digits are fmt 9.1's Dragonbox digits, laid out by FmtDouble as fmt's {} (format.h do_write_float)" },
+]

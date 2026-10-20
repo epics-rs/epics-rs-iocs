@@ -25,7 +25,7 @@ use crate::error::{UrError, UrResult};
 use crate::registry::{self, DashboardHandle, ReceiveHandle};
 use crate::script::{SCRIPT_PORT, ScriptClient, wrap_custom_script};
 use crate::session::DEFAULT_TIMEOUT;
-use crate::spdlog;
+use crate::spdlog::{self, FmtDouble};
 
 pub const NUM_JOINTS: usize = 6;
 
@@ -801,7 +801,8 @@ impl PortDriver for ControlDriver {
                         let accel = inner.jog_acceleration;
                         inner.iface_mut()?.speed_l(&speeds, accel, 0.01)?;
                         spdlog::debug(format_args!(
-                            "Starting jog: accel={accel}, speeds=[{}]",
+                            "Starting jog: accel={}, speeds=[{}]",
+                            FmtDouble(accel),
                             speeds.map(|v| format!("{v:.2}", v = CFloat(v))).join(",")
                         ));
                         inner.new_jog = false;

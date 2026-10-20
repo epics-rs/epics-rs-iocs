@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 
 use crate::drivers::refused;
 use crate::io::IoInterface;
-use crate::spdlog;
+use crate::spdlog::{self, FmtDouble};
 
 /// Digital outputs 0..7 and analog outputs 0..1 are addressed by asyn address.
 pub const NUM_CHANNELS: usize = 8;
@@ -196,12 +196,14 @@ impl PortDriver for IoDriver {
                 iface.set_speed_slider(value)
             } else if reason == p.set_voltage_analog_out {
                 spdlog::debug(format_args!(
-                    "Setting analog output voltage {addr} to {value}"
+                    "Setting analog output voltage {addr} to {}",
+                    FmtDouble(value)
                 ));
                 iface.set_analog_output_voltage(channel, value)
             } else if reason == p.set_current_analog_out {
                 spdlog::debug(format_args!(
-                    "Setting analog output current {addr} to {value}"
+                    "Setting analog output current {addr} to {}",
+                    FmtDouble(value)
                 ));
                 iface.set_analog_output_current(channel, value)
             } else {

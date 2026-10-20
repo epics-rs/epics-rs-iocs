@@ -96,6 +96,42 @@ pub fn log(level: Level, msg: fmt::Arguments<'_>) {
     let _ = out.flush();
 }
 
+/// A double as spdlog's bundled fmt 9.1 writes `{}` (`format.h:3238`):
+/// Dragonbox's shortest round-trip digits, which are the digits Rust's `{:e}`
+/// gives, laid out fixed for a decimal exponent in [-4, 16) and as
+/// `d.ddde±XX` otherwise (`do_write_float`, `:2381`); `nan`/`inf` keep the
+/// sign bit.
+pub struct FmtDouble(pub f64);
+
+impl fmt::Display for FmtDouble {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let v = self.0;
+        let sign = if v.is_sign_negative() { "-" } else { "" };
+        if !v.is_finite() {
+            return write!(f, "{sign}{}", if v.is_nan() { "nan" } else { "inf" });
+        }
+        let shortest = format!("{:e}", v.abs());
+        let (mantissa, exp) = shortest.split_once('e').expect("{:e} has an exponent");
+        let exp: i32 = exp.parse().expect("{:e}'s exponent is an integer");
+        let digits = mantissa.replace('.', "");
+        let last = digits.len() as i32 - 1;
+        f.write_str(sign)?;
+        if !(-4..16).contains(&exp) {
+            let (lead, rest) = digits.split_at(1);
+            let point = if rest.is_empty() { "" } else { "." };
+            let exp_sign = if exp < 0 { '-' } else { '+' };
+            write!(f, "{lead}{point}{rest}e{exp_sign}{:02}", exp.unsigned_abs())
+        } else if exp >= last {
+            write!(f, "{digits}{}", "0".repeat((exp - last) as usize))
+        } else if exp >= 0 {
+            let (int, frac) = digits.split_at(exp as usize + 1);
+            write!(f, "{int}.{frac}")
+        } else {
+            write!(f, "0.{}{digits}", "0".repeat((-exp - 1) as usize))
+        }
+    }
+}
+
 pub fn debug(msg: fmt::Arguments<'_>) {
     log(Level::Debug, msg);
 }
@@ -115,6 +151,42 @@ pub fn error(msg: fmt::Arguments<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each pair is what `fmt::format("{}", x)` prints with the bundled fmt
+    /// 9.1 headers.
+    #[test]
+    fn fmt_double_is_fmt_9_1_braces() {
+        for (x, c) in [
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (1.0, "1"),
+            (0.5, "0.5"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (100.0, "100"),
+            (123.456, "123.456"),
+            (1e15, "1000000000000000"),
+            (1e16, "1e+16"),
+            (1.5e16, "1.5e+16"),
+            (9999999999999998.0, "9999999999999998"),
+            (0.0001, "0.0001"),
+            (0.00012345, "0.00012345"),
+            (1e-5, "1e-05"),
+            (1.5e-7, "1.5e-07"),
+            (1e20, "1e+20"),
+            (1e100, "1e+100"),
+            (1e-100, "1e-100"),
+            (5e-324, "5e-324"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (-2.5, "-2.5"),
+            (1234567.0, "1234567"),
+            (f64::NAN, "nan"),
+            (-f64::NAN, "-nan"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            assert_eq!(FmtDouble(x).to_string(), c, "{:?}", x.to_bits());
+        }
+    }
 
     #[test]
     fn spdlog_level_takes_the_bare_entries() {

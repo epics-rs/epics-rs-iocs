@@ -306,7 +306,7 @@ impl AsynMotor for C300Axis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.write_only(&format!("{}:POS {}", self.chan, position))
+        ctrl.write_only(&format!("{}:POS {}", self.chan, CFloat(position)))
     }
 
     fn move_relative(
@@ -320,7 +320,7 @@ impl AsynMotor for C300Axis {
         // C: relative target = cached theoretical position + distance.
         let mut ctrl = self.lock();
         let target = ctrl.axis(self.index).theory_position + distance;
-        ctrl.write_only(&format!("{}:POS {}", self.chan, target))
+        ctrl.write_only(&format!("{}:POS {}", self.chan, CFloat(target)))
     }
 
     fn move_velocity(
@@ -434,6 +434,20 @@ mod tests {
             "CHAN1:DATA?" => format!("{:28}{:<84}100.5", "", "0.5"),
             _ => "0".into(),
         }
+    }
+
+    /// C300MotorDriver.cpp:260, :264: both moves send `%s:POS %f`.
+    #[test]
+    fn moves_send_the_target_as_c_percent_f() {
+        let (rig, io) = motor_common::testing::LineRig::new("c300MovePos", c300_replies);
+        let controller = Arc::new(Mutex::new(C300Controller::new(io, 1)));
+        let mut axis = C300Axis::new(controller, 0);
+        rig.sent();
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 0.1, 0.0, 0.0, 0.0).unwrap();
+        axis.move_relative(&user, 1e-7, 0.0, 0.0, 0.0).unwrap();
+        let sent: Vec<String> = rig.sent().iter().map(|c| c.trim_end().to_owned()).collect();
+        assert_eq!(sent, ["CHAN1:POS 0.100000", "CHAN1:POS 0.000000"]);
     }
 
     /// C300MotorDriver.cpp:307-310: the encoder position is set before POS?

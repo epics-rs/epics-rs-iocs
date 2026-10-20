@@ -44,7 +44,11 @@ impl std::fmt::Display for ProtocolError {
         match self {
             Self::BadVersion(s) => write!(f, "unexpected version string '{s}'"),
             Self::OldVersion(s) => {
-                write!(f, "server version '{s}' is older than {MIN_SERVER_VERSION}")
+                write!(
+                    f,
+                    "server version '{s}' is older than {}",
+                    CFloat(MIN_SERVER_VERSION).g()
+                )
             }
             Self::UnknownImageMode(s) => write!(f, "unknown image mode '{s}'"),
             Self::BadImageHeader => write!(f, "malformed image header"),
