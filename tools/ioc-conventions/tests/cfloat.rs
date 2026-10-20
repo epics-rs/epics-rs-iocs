@@ -11,34 +11,7 @@ use std::path::Path;
 
 /// `(file, placeholder, argument, reason)`, matched exactly; an entry that
 /// matches no site fails the gate.
-const EXEMPT: &[(&str, &str, &str, &str)] = &[
-    // C %f, left to the drvMultiFunction.cpp port in flight; routing them
-    // through CFloat turns these entries stale.
-    (
-        "drivers/meascomp/usb-2408/src/driver.rs",
-        "{value:.6}",
-        "value",
-        "C %f, pending the usb-2408 port",
-    ),
-    (
-        "drivers/meascomp/usb-2408/src/wave_dig.rs",
-        "{:.6}",
-        "state.dwell_actual",
-        "C %f, pending the usb-2408 port",
-    ),
-    (
-        "drivers/meascomp/usb-2408/src/wave_dig.rs",
-        "{:.6}",
-        "state.channel_buffers[ch][0]",
-        "C %f, pending the usb-2408 port",
-    ),
-    (
-        "drivers/meascomp/usb-2408/src/wave_gen.rs",
-        "{:.6}",
-        "state.dwell_actual",
-        "C %f, pending the usb-2408 port",
-    ),
-];
+const EXEMPT: &[(&str, &str, &str, &str)] = &[];
 
 /// The root manifest's `[workspace] members` that have a `src`.
 fn members(root: &Path) -> Vec<String> {
