@@ -23,7 +23,7 @@ use crate::{Controller, TraceUser, register_drv_motor_asyn_port};
 struct Card {
     card: i32,
     axes: Vec<Model2Axis>,
-    poller: Poller,
+    poller: Arc<Controller>,
 }
 
 /// One axis a driver's `Config` built: C's `AXIS_HDL` with the
@@ -109,30 +109,6 @@ impl AxisLog {
     }
 }
 
-/// drvMotorAsyn has no task of its own; each driver's task polls its axes.
-#[derive(Clone)]
-enum Poller {
-    /// `drvAsynMotorConfigure` starts one over the card's axes at these
-    /// periods, standing in for the driver's task.
-    Configured {
-        moving_poll_ms: u64,
-        idle_poll_ms: u64,
-    },
-    /// The driver's own, started by its `Config` (motorSim's
-    /// `motorSimThread`, drvMotorSim.c:790); the axes join it.
-    Driver(Arc<Controller>),
-}
-
-impl Poller {
-    /// The controller the card's axes are installed into.
-    fn controller(&self) -> Arc<Controller> {
-        match self {
-            Self::Configured { .. } => Arc::new(Controller::new()),
-            Self::Driver(poller) => poller.clone(),
-        }
-    }
-}
-
 /// One model-2 driver: the `motorAxisDrvSET_t` name `drvAsynMotorConfigure`
 /// finds it by, the fast polls its poller forces after a wakeup, and the
 /// axes each card's `Config` built.
@@ -166,25 +142,6 @@ impl Model2 {
         crate::register_driver_report(self.name, report);
     }
 
-    /// What `Config` built for `card`, polled at `moving_poll_ms` and
-    /// `idle_poll_ms`, replacing an earlier `Config` of it.
-    pub fn set_card(
-        &self,
-        card: i32,
-        axes: Vec<Model2Axis>,
-        moving_poll_ms: u64,
-        idle_poll_ms: u64,
-    ) {
-        self.put_card(Card {
-            card,
-            axes,
-            poller: Poller::Configured {
-                moving_poll_ms,
-                idle_poll_ms,
-            },
-        });
-    }
-
     /// What `Config` built for `card`, polled from now on by a task of the
     /// driver's own, as each driver's `Config` starts its poller
     /// (drvEnsembleAsyn.cc:1026), replacing an earlier `Config` of it.
@@ -215,11 +172,7 @@ impl Model2 {
     /// What `Config` built for `card`, polled by the driver's own `poller`,
     /// replacing an earlier `Config` of it.
     pub fn set_card_on(&self, card: i32, axes: Vec<Model2Axis>, poller: Arc<Controller>) {
-        self.put_card(Card {
-            card,
-            axes,
-            poller: Poller::Driver(poller),
-        });
+        self.put_card(Card { card, axes, poller });
     }
 
     fn put_card(&self, card: Card) {
@@ -229,7 +182,7 @@ impl Model2 {
     }
 
     /// The poller of `card`, or `None` for an unconfigured card.
-    fn poller(&self, card: i32) -> Option<Poller> {
+    fn poller(&self, card: i32) -> Option<Arc<Controller>> {
         let cards = self.cards.lock().unwrap_or_else(|e| e.into_inner());
         Some(cards.iter().find(|c| c.card == card)?.poller.clone())
     }
@@ -276,9 +229,9 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                 ));
                 return Ok(CommandOutcome::Continue);
             };
-            // The driver's one task polls the card's axes in turn.
-            let poller = driver.poller(card);
-            let controller = poller.as_ref().map(Poller::controller);
+            // drvMotorAsyn has no task of its own: the driver's, which its
+            // Config started, polls the card's axes in turn.
+            let controller = driver.poller(card);
             let mut axes = Vec::new();
             // A record reaches its axis once the port it writes through
             // exists (devMotorAsyn.c:689-708).
@@ -336,21 +289,6 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                     ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
-            if let (
-                Some(controller),
-                Some(Poller::Configured {
-                    moving_poll_ms,
-                    idle_poll_ms,
-                }),
-            ) = (controller, poller)
-            {
-                controller.start(
-                    &port_name,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                    driver.forced_fast_polls,
-                );
-            }
             Ok(CommandOutcome::Continue)
         },
     )
@@ -407,12 +345,14 @@ mod tests {
 
     #[test]
     fn open_finds_only_built_axes() {
-        DRIVER.set_card(
-            3,
-            vec![sim_axis(Arc::default()), sim_axis(Arc::default())],
-            100,
-            500,
-        );
+        DRIVER
+            .start_card(
+                3,
+                vec![sim_axis(Arc::default()), sim_axis(Arc::default())],
+                100,
+                500,
+            )
+            .unwrap();
         assert!(DRIVER.open(3, 1).is_some());
         assert!(DRIVER.open(3, 2).is_none());
         assert!(DRIVER.open(3, -1).is_none());
@@ -432,7 +372,7 @@ mod one_task {
     #[epics_rs::base::epics_test]
     async fn drv_asyn_motor_configure_polls_the_card_s_axes_on_one_poller() {
         let axes = (0..3).map(|_| sim_axis(Arc::default())).collect();
-        DRIVER.set_card(0, axes, 100, 1000);
+        DRIVER.start_card(0, axes, 100, 1000).unwrap();
         let args = vec![
             ArgValue::String("oneTaskPort".into()),
             ArgValue::String("oneTask".into()),
@@ -487,7 +427,7 @@ mod axis_log {
     async fn configure_hands_each_opened_axis_its_log_user() {
         let logs: Vec<Arc<AxisLog>> = (0..3).map(|_| Arc::default()).collect();
         let axes = logs[..2].iter().map(|log| sim_axis(log.clone())).collect();
-        LOGGED.set_card(0, axes, 100, 1000);
+        LOGGED.start_card(0, axes, 100, 1000).unwrap();
         let args = vec![
             ArgValue::String("loggedPort".into()),
             ArgValue::String("logged".into()),
@@ -525,7 +465,9 @@ mod axis_log {
     async fn configure_replaces_the_driver_s_own_print() {
         let logs: Vec<Arc<AxisLog>> = (0..2).map(|_| Arc::new(AxisLog::with_own(own))).collect();
         let driver_log = Arc::new(AxisLog::with_own(own));
-        OWNED.set_card(0, vec![sim_axis(logs[0].clone())], 100, 1000);
+        OWNED
+            .start_card(0, vec![sim_axis(logs[0].clone())], 100, 1000)
+            .unwrap();
         OWNED.set_driver_log(driver_log.clone());
         for log in [&logs[0], &logs[1], &driver_log] {
             log.print(TraceMask::FLOW, format_args!("before"));
@@ -584,7 +526,9 @@ mod configure_lines {
         PortManager::global()
             .trace_manager()
             .set_trace_file(Some("configureLinesPort"), TraceFile::File(file));
-        LINES.set_card(0, vec![sim_axis(Arc::default())], 100, 1000);
+        LINES
+            .start_card(0, vec![sim_axis(Arc::default())], 100, 1000)
+            .unwrap();
         let cmd = || drv_asyn_motor_configure_command(vec![&LINES]);
         run_command(cmd(), args("configureLinesNone", "noSuchDriver", 1)).await;
         run_command(cmd(), args("configureLinesPort", "configureLines", 2)).await;
@@ -703,7 +647,7 @@ mod asyn_writes {
             getter: Arc::new(crate::param_lib::Params::default()),
             log,
         };
-        WRITTEN.set_card(0, vec![axis], 100, 1000);
+        WRITTEN.start_card(0, vec![axis], 100, 1000).unwrap();
         let args = vec![
             ArgValue::String("writtenPort".into()),
             ArgValue::String("written".into()),
@@ -913,12 +857,13 @@ mod asyn_reads {
     async fn the_port_reads_the_driver_and_calls_back_what_changed() {
         let params = Arc::new(Params::default());
         let axis = Arc::new(Mutex::new(Stored(params.clone())));
-        READ.set_card(
+        READ.start_card(
             0,
             vec![Model2Axis::new(axis, params.clone(), Arc::default())],
             100,
             1000,
-        );
+        )
+        .unwrap();
         let args = vec![
             ArgValue::String("readPort".into()),
             ArgValue::String("read".into()),

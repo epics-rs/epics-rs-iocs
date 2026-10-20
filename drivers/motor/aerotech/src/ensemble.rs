@@ -781,7 +781,7 @@ mod tests {
         let axis = Arc::new(Mutex::new(axis));
         let log = axis.lock().unwrap().log();
         let axes = vec![Model2Axis::new(axis.clone(), params.clone(), log)];
-        DRIVER.set_card(0, axes, 3_600_000, 3_600_000);
+        DRIVER.start_card(0, axes, 3_600_000, 3_600_000).unwrap();
         let args = vec![
             ArgValue::String("ensSet".into()),
             ArgValue::String("ensSetTest".into()),
@@ -854,12 +854,14 @@ mod tests {
         let axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
         let (getter, log) = (axis.params(), axis.log());
         let axis = Arc::new(Mutex::new(axis));
-        DRIVER.set_card(
-            0,
-            vec![Model2Axis::new(axis.clone(), getter, log)],
-            100,
-            1000,
-        );
+        DRIVER
+            .start_card(
+                0,
+                vec![Model2Axis::new(axis.clone(), getter, log)],
+                100,
+                1000,
+            )
+            .unwrap();
         let args = vec![
             ArgValue::String("ensLog".into()),
             ArgValue::String("ensLogTest".into()),
