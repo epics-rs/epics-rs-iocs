@@ -428,6 +428,8 @@ impl AsynMotor for AgapAxis {
         }
     }
 
+    /// A failed read returns at `skip` as C returns asynError, keeping what
+    /// the reads before it set (AGAP_CONEX.cpp:396-431).
     fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
         let id = ctrl.controller_id;
@@ -440,25 +442,23 @@ impl AsynMotor for AgapAxis {
             .current_position
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = position;
+        status.position = position;
 
         // Moving status (controller-wide TS) and power-on (controller-wide MM?)
         // are shared by both axes. AGAP_CONEX.cpp:411 posts PROBLEM 0 on a bad
         // TS reply, a C defect.
         let moving =
             parse_moving(&ctrl.write_read(&format!("{id}TS"))?).ok_or_else(|| parse_error("TS"))?;
+        status.done = !moving;
+        status.moving = moving;
+        // C AGAP always reports both limits clear (:420-421).
+        status.low_limit = false;
+        status.high_limit = false;
+
         let (powered, mm) = ctrl.read_closed_loop();
         mm?;
-        let powered = powered.ok_or_else(|| parse_error("MM?"))?;
-
-        *status = MotorStatus {
-            position,
-            done: !moving,
-            moving,
-            powered,
-            // C AGAP always reports both limits clear and does not advertise
-            // gain support (leaves motorStatusGainSupport unset).
-            ..Default::default()
-        };
+        status.powered = powered.ok_or_else(|| parse_error("MM?"))?;
+        status.problem = false;
         Ok(())
     }
 }
@@ -509,6 +509,35 @@ mod tests {
             .unwrap();
         let sent = line.sent();
         assert_eq!(sent.last().map(String::as_str), Some("1MM1"), "{sent:?}");
+    }
+
+    /// AGAP_CONEX.cpp:398-407: a refused TS skips after TP's position is
+    /// set, so the position survives and Done keeps what a move start set.
+    #[test]
+    fn a_failed_ts_keeps_the_position_tp_read() {
+        use motor_common::testing::LineRig;
+        let (_line, io) = LineRig::failing(
+            "agap_ts_skip",
+            |last| {
+                match last {
+                    "1VE" => "1VE CONEX-AGAP 1.0",
+                    "1TPU" => "1TPU0.25",
+                    _ => "",
+                }
+                .to_string()
+            },
+            |cmd| cmd == "1TS",
+        );
+        let trace = MotorTrace::new("agap_ts_skip", 0);
+        let ctrl = Arc::new(Mutex::new(AgapController::new(io, 1, trace).unwrap()));
+        let mut axis = AgapAxis::new(ctrl, 0);
+        let mut status = MotorStatus {
+            done: false,
+            ..Default::default()
+        };
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+        assert_eq!(status.position, 2500.0);
+        assert!(!status.done);
     }
 
     #[test]
