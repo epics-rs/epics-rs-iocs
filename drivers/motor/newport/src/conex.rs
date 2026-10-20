@@ -747,7 +747,6 @@ impl AsynMotor for ConexAxis {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = position;
         status.position = position;
-        status.encoder_position = position;
 
         // Status (TS): done + limits (model-dependent parse). AG_CONEX.cpp:530,534
         // posts PROBLEM 0 on a bad reply, a C defect.
@@ -880,6 +879,26 @@ mod tests {
         assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
         assert_eq!(status.position, 25000.0);
         assert!(!status.done);
+    }
+
+    /// AG_CONEXAxis::poll sets motorPosition_ only (AG_CONEX.cpp:516): the
+    /// record's REP stays 0.
+    #[test]
+    fn the_poll_sets_no_encoder_position() {
+        let (_line, io) = LineRig::new("conex_no_rep", |last| {
+            match last {
+                "1VE" => "1VE CONEX-CC 2.0",
+                "1SU?" => "1SU0.0001",
+                "1TP" => "1TP2.5",
+                "1TS" => "1TS000033",
+                "1MM?" => "1MM33",
+                _ => "",
+            }
+            .to_string()
+        });
+        let mut axis = ConexAxis::new(io, 1, &MotorTrace::new("conex_no_rep", 0)).unwrap();
+        let status = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!((status.position, status.encoder_position), (25000.0, 0.0));
     }
 
     /// AG_CONEX.cpp:271-274: gain support is the constructor's, CC and AGP
