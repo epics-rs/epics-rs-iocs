@@ -18,11 +18,9 @@
 
 use std::time::Duration;
 
-use epics_rs::asyn::asyn_record::get_port;
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::DrvUserRequest;
-use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -62,41 +60,34 @@ impl ModbusRegs {
         (regs, connected)
     }
 
-    fn user(&self, reason: usize, addr: i32) -> AsynUser {
-        AsynUser::new(reason)
-            .with_addr(addr)
-            .with_timeout(self.timeout)
+    /// C's `pasynInt32SyncIO` user of register `addr`
+    /// (`pasynUserInReg_`/`pasynUserOutReg_`).
+    fn reg(&self, addr: i32) -> AsynResult<SyncIOHandle> {
+        let port = self.handle.port()?.clone();
+        Ok(SyncIOHandle::from_handle(port, addr, self.timeout))
     }
 
     /// Read one register (C `readReg16` / `pasynInt32SyncIO->read`).
     pub fn read16(&self, addr: i32) -> AsynResult<i32> {
-        let result = self
-            .handle
-            .port()?
-            .submit_blocking(RequestOp::Int32Read, self.user(self.data_reason, addr))?;
-        result.int_val.ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "int32 read returned no value".into(),
-        })
+        self.reg(addr)?.read_int32(self.data_reason)
     }
 
     /// Write one register (C `writeReg16` / `pasynInt32SyncIO->write`).
     pub fn write16(&self, addr: i32, value: i32) -> AsynResult<()> {
-        self.handle.port()?.submit_blocking(
-            RequestOp::Int32Write { value },
-            self.user(self.data_reason, addr),
-        )?;
-        Ok(())
+        self.reg(addr)?.write_int32(self.data_reason, value)
     }
 
     /// Write an array of registers atomically (C `writeReg32Array` /
     /// `pasynInt32ArraySyncIO->write`); the port must be configured with a
-    /// write-multiple-registers Modbus function.
+    /// write-multiple-registers Modbus function. A raw submit: `SyncIOHandle`
+    /// has no Int32Array transfer, so C's trace line is not printed.
     pub fn write_array(&self, addr: i32, data: Vec<i32>) -> AsynResult<()> {
-        self.handle.port()?.submit_blocking(
-            RequestOp::Int32ArrayWrite { data },
-            self.user(self.data_reason, addr),
-        )?;
+        let user = AsynUser::new(self.data_reason)
+            .with_addr(addr)
+            .with_timeout(self.timeout);
+        self.handle
+            .port()?
+            .submit_blocking(RequestOp::Int32ArrayWrite { data }, user)?;
         Ok(())
     }
 }
@@ -105,27 +96,20 @@ impl ModbusRegs {
 /// input port with drvInfo `"MODBUS_READ"`. As C's `connect`, a missing port
 /// leaves it unconnected and a refused drvInfo leaves it on reason 0.
 pub struct ForceRead {
-    handle: Option<PortHandle>,
+    handle: SyncIOHandle,
     reason: usize,
-    addr: i32,
-    timeout: Duration,
     connected: bool,
 }
 
 impl ForceRead {
     pub fn connect(port_name: &str, addr: i32, timeout: Duration) -> Self {
-        let handle = get_port(port_name).map(|entry| entry.handle);
-        let reason = handle.as_ref().and_then(|h| {
-            h.drv_user_create_blocking(&DrvUserRequest::new(MODBUS_READ, addr))
-                .ok()
-                .map(|r| r.reason)
-        });
+        let (handle, connected) =
+            SyncIOHandle::connect_port(port_name, addr, timeout, InterfaceType::Int32);
+        let reason = connected.and_then(|()| handle.drv_user_create(MODBUS_READ));
         Self {
-            connected: reason.is_some(),
-            handle,
+            connected: reason.is_ok(),
             reason: reason.unwrap_or(0),
-            addr,
-            timeout,
+            handle,
         }
     }
 
@@ -142,17 +126,7 @@ impl ForceRead {
     /// Force an immediate synchronous poll cycle (C
     /// `pasynInt32SyncIO->write(pasynUserForceRead_, 1, ...)`).
     pub fn write(&self) -> AsynResult<()> {
-        let handle = self.handle.as_ref().ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: "asynManager::queueLockPort not connected".into(),
-        })?;
-        handle.submit_blocking(
-            RequestOp::Int32Write { value: 1 },
-            AsynUser::new(self.reason)
-                .with_addr(self.addr)
-                .with_timeout(self.timeout),
-        )?;
-        Ok(())
+        self.handle.write_int32(self.reason, 1)
     }
 }
 
@@ -300,6 +274,7 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::asyn_record::get_port;
 
     #[test]
     fn a_force_read_writes_modbus_read_at_its_address() {
@@ -309,6 +284,40 @@ mod tests {
         assert_eq!(fr.reason(), reason);
         fr.write().unwrap();
         assert_eq!(*taken.lock().unwrap(), [(reason, 0)]);
+    }
+
+    /// ANF2Driver.cpp:282, ANG1Driver.cpp:204, :547: register reads and
+    /// writes and the force read are `pasynInt32SyncIO`'s, each printing its
+    /// TRACEIO_DEVICE line.
+    #[test]
+    fn register_transfers_are_asyn_int32_sync_io_s() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+
+        let name = "amciSyncIo";
+        fake::publish(name);
+        let trace = get_port(name).unwrap().handle.trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        let (regs, status) = ModbusRegs::connect(name, Duration::from_secs(1));
+        status.unwrap();
+        assert_eq!(regs.read16(7).unwrap(), 7);
+        regs.write16(3, 5).unwrap();
+        ForceRead::connect(name, 10, Duration::from_secs(1))
+            .write()
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.split_once(" asynInt32SyncIO ").map(|(_, call)| call))
+            .collect();
+        assert_eq!(lines, ["read: 7", "wrote: 5", "wrote: 1"], "{text}");
     }
 
     #[test]
