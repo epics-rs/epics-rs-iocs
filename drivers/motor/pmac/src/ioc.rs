@@ -1625,12 +1625,17 @@ mod tests {
         let (_rt, rig) = publish_scripted("pmacCsFast");
         rig.answer("&3??", b"000000\r020000\r000000\r");
         rig.answer("&3Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0 0 0 0 0 0 0 0 0\r");
+        // In C's st.cmd order (:46-53): a set before configure could start
+        // the hour before the axes join, which then wait it out for a poll.
         coord_create("pmacCsFast", 0, 3, 9305, 10).unwrap();
-        set_coord_poll_period(false, 9305, 3_600_000).await;
         configure_cs("pmacCsFastM", 9305).await;
-        // Create's poll, then the task's first, whose wait the set ends,
-        // and the moving-period one the signal adds (:698, :1025).
-        assert_eq!(polls(&rig, 4).await, 4);
+        rig.written();
+        set_coord_poll_period(false, 9305, 3_600_000).await;
+        // The set's woken pass and its moving-period one (:1025). C's count
+        // before them is one per default period the shell took.
+        assert!(polls(&rig, 2).await >= 2);
+        sleep(Duration::from_millis(5 * COORD_MOVING_POLL_MS)).await;
+        rig.written();
         let port = PortManager::global()
             .find_port_handle("pmacCsFastM")
             .unwrap();
