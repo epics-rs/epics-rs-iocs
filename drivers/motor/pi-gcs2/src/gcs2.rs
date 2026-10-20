@@ -2235,7 +2235,8 @@ impl PIGCS2Axis {
         }
         ctrl.trace(
             TraceMask::FLOW,
-            format_args!("PIGCSController::moveCts(, {counts}) \n"),
+            // C's `%d` of its `int` count; `counts` is whole (`target_counts`).
+            format_args!("PIGCSController::moveCts(, {}) \n", counts as i32),
         );
         drop(ctrl);
         self.move_to(counts / self.cpu)
