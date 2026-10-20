@@ -37,9 +37,10 @@
 //!   synthesizes it as an absolute move to `last position + distance`.
 //! - C sets velocity in a separate `SET_VELOCITY` transaction; asyn-rs bundles
 //!   the velocity into the move, so [`move_absolute`](AsynMotor::move_absolute)
-//!   emits `sr` before `set` when a positive velocity is supplied.
+//!   emits `sr` before `set` whatever the rate.
 //! - C `STOP_AXIS`, `HOME_*` and `LOAD_POS` send nothing (unsupported on this
-//!   absolute closed-loop stage); the port mirrors that as no-ops.
+//!   absolute closed-loop stage); stop and set-position are no-ops, and a
+//!   home sends only the record's `sr` and the GO `stat`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -353,7 +354,7 @@ impl AsynMotor for PiJedsAxis {
             "sr,{},{:.*}",
             self.axis,
             MAX_RES,
-            CFloat((velocity * DRIVE_RESOLUTION).abs())
+            CFloat(velocity * DRIVE_RESOLUTION)
         ))
     }
 
@@ -635,7 +636,7 @@ mod tests {
         assert_eq!(line.sent(), ["sr,0,0.000", "set,0,1.500", "stat,0"]);
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
         axis.move_velocity(&user, 0.0, -2000.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["cl,0,1", "sr,0,2.000"]);
+        assert_eq!(line.sent(), ["cl,0,1", "sr,0,-2.000"]);
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
         axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["sr,0,2.000", "cl,0,1", "stat,0"]);
