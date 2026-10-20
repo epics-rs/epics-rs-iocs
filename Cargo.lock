@@ -3327,6 +3327,7 @@ checksum = "3637c05577168127568a64e9dc5a6887da720efef07b3d9472d45f63ab191166"
 name = "photonii"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]

@@ -5,6 +5,8 @@
 //! is the one the C driver puts on the wire, so p2util sees the same
 //! vocabulary.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::types::*;
 
 /// Everything that can go wrong reading a p2util line.
@@ -35,7 +37,10 @@ pub fn set_run_number(run_number: i32) -> String {
 /// `set --exposure-time <t>`.
 pub fn set_exposure_time(seconds: f64) -> String {
     // C used "%f", i.e. six decimals.
-    format!("set --exposure-time {seconds:.6}")
+    format!(
+        "set --exposure-time {seconds:.6}",
+        seconds = CFloat(seconds)
+    )
 }
 
 /// `set --dr-summation <0|1>`.
@@ -124,6 +129,8 @@ mod tests {
     fn set_exposure_time_uses_six_decimals_like_c_printf() {
         assert_eq!(set_exposure_time(0.5), "set --exposure-time 0.500000");
         assert_eq!(set_exposure_time(1.0), "set --exposure-time 1.000000");
+        assert_eq!(set_exposure_time(f64::NAN), "set --exposure-time nan");
+        assert_eq!(set_exposure_time(-f64::NAN), "set --exposure-time -nan");
     }
 
     #[test]
