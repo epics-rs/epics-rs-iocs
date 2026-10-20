@@ -29,6 +29,15 @@ fn device_addr(addr: i32) -> i32 {
     if addr == -1 { 0 } else { addr }
 }
 
+/// The element count of a waveform read: C's `*nIn > (size_t)numPoints` cap
+/// (drvMultiFunction.cpp:2463, :2496), where a negative count casts huge and
+/// caps nothing. The copy still stops at the data, which C reads past.
+fn read_count(requested: usize, num_points: i32, available: usize) -> usize {
+    requested
+        .min(usize::try_from(num_points).unwrap_or(usize::MAX))
+        .min(available)
+}
+
 /// C `MAX_IO_PORTS`.
 const MAX_IO_PORTS: u32 = 8;
 
@@ -1096,7 +1105,7 @@ impl PortDriver for MultiFunctionDriver {
         };
         // C copies past a time axis' last computed point from its zeroed
         // buffer; here the copy stops at the data.
-        let n = buf.len().min(num_points.max(0) as usize).min(data.len());
+        let n = read_count(buf.len(), num_points, data.len());
         buf[..n].copy_from_slice(&data[..n]);
         Ok(n)
     }
@@ -1130,7 +1139,7 @@ impl PortDriver for MultiFunctionDriver {
         } else {
             return error(format_args!("unknown function={reason}"));
         };
-        let n = buf.len().min(num_points.max(0) as usize).min(data.len());
+        let n = read_count(buf.len(), num_points, data.len());
         buf[..n].copy_from_slice(&data[..n]);
         Ok(n)
     }
@@ -1592,6 +1601,35 @@ mod tests {
         assert!(drv.read_float64_array(&past, &mut buf).is_err());
         let other = AsynUser::new(p.wave_gen_user_wf);
         assert!(drv.read_float64_array(&other, &mut buf).is_err());
+    }
+
+    /// C caps a waveform read with `*nIn > (size_t)numPoints`
+    /// (drvMultiFunction.cpp:2463, :2496): a negative count casts huge and
+    /// caps nothing.
+    #[test]
+    fn a_negative_point_count_caps_no_waveform_read() {
+        let mut drv = MultiFunctionDriver::new("MFNEGPTS", DaqDevice::unconnected(), 4, 4).unwrap();
+        let p = drv.params;
+        drv.board.num_analog_in = 8;
+        {
+            let mut st = drv.state.lock().unwrap();
+            st.wave_dig.channel_buffers[7] = vec![1.5, 2.5, 3.5, 4.5];
+            st.wave_gen.user_waveforms[1] = vec![0.5, 1.5, 2.5, 3.5];
+        }
+        drv.base
+            .set_int32_param(p.wave_dig_num_points, 0, -1)
+            .unwrap();
+        drv.base
+            .set_int32_param(p.wave_gen_num_points, 0, -1)
+            .unwrap();
+        let mut buf = [0f64; 3];
+        let volt = AsynUser::new(p.wave_dig_volt_wf).with_addr(7);
+        assert_eq!(drv.read_float64_array(&volt, &mut buf).unwrap(), 3);
+        assert_eq!(buf, [1.5, 2.5, 3.5]);
+        let mut buf = [0f32; 3];
+        let user_wf = AsynUser::new(p.wave_gen_user_wf).with_addr(1);
+        assert_eq!(drv.read_float32_array(&user_wf, &mut buf).unwrap(), 3);
+        assert_eq!(buf, [0.5, 1.5, 2.5]);
     }
 
     #[test]
