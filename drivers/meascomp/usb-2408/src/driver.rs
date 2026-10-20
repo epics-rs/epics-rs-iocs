@@ -620,15 +620,22 @@ impl MultiFunctionDriver {
         let dev = device.lock().unwrap();
         let state = self.state.clone();
         let mut st = state.lock().unwrap();
-        if (0..MAX_ANALOG_OUT as i32).contains(&addr) {
-            self.define_waveform(&mut st.wave_gen, addr, trace, updates)?;
-        }
+        // C drops defineWaveform's -1 (drvMultiFunction.cpp:2178, :2300), so
+        // a refused point count still puts successfully. C defect, not copied
+        // (upstream-c-defects #231).
+        let refused: UlError = if (0..MAX_ANALOG_OUT as i32).contains(&addr)
+            && !self.define_waveform(&mut st.wave_gen, addr, trace, updates)?
+        {
+            -1
+        } else {
+            0
+        };
         if !st.wave_gen.running {
-            return Ok(0);
+            return Ok(refused);
         }
         let restore = self.wave_gen_restore();
         let stopped = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, &restore, trace);
-        Ok(stopped | self.start_wave_gen(&dev, &mut st.wave_gen, trace, updates)?)
+        Ok(refused | stopped | self.start_wave_gen(&dev, &mut st.wave_gen, trace, updates)?)
     }
 
     /// Whether `chan` is configured as a thermocouple input. ulAISetConfig
@@ -921,7 +928,12 @@ impl PortDriver for MultiFunctionDriver {
                     "Set thermocouple type",
                 );
                 let detect = self.int(self.params.thermocouple_open_detect, addr);
-                self.set_open_tc_detect(&dev, addr, detect);
+                // C drops this status (drvMultiFunction.cpp:1981, :2020). C
+                // defect, not copied (upstream-c-defects #231).
+                let otd = self.set_open_tc_detect(&dev, addr, detect);
+                if status == 0 {
+                    status = otd;
+                }
             }
         } else if reason == self.params.analog_in_rate {
             let dev = self.device.lock().unwrap();
@@ -939,7 +951,7 @@ impl PortDriver for MultiFunctionDriver {
             );
         } else if reason == self.params.thermocouple_open_detect && self.is_thermocouple(addr) {
             let dev = self.device.lock().unwrap();
-            self.set_open_tc_detect(&dev, addr, value);
+            status = self.set_open_tc_detect(&dev, addr, value);
         } else if reason == self.params.temperature_sensor {
             let dev = self.device.lock().unwrap();
             status = trace.report(
@@ -1712,6 +1724,24 @@ mod tests {
                 wave_gen::volts_to_dac(1.0, 2.0, 0.25)
             ]
         );
+    }
+
+    /// A refused point count and a refused open-detect fail the write
+    /// (upstream-c-defects #231).
+    #[test]
+    fn refused_generator_and_open_detect_settings_fail_the_write() {
+        let mut drv =
+            MultiFunctionDriver::new("MFREFUSE", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        let mut points = AsynUser::new(p.wave_gen_user_num_points);
+        assert!(drv.write_int32(&mut points, 16).is_ok());
+        assert!(drv.write_int32(&mut points, 17).is_err());
+        drv.base
+            .set_int32_param(p.analog_in_type, 1, AI_CHAN_TYPE_TC)
+            .unwrap();
+        // ulAISetConfig(OTD_MODE) fails on the null handle.
+        let mut detect = AsynUser::new(p.thermocouple_open_detect).with_addr(1);
+        assert!(drv.write_int32(&mut detect, 1).is_err());
     }
 
     #[test]
