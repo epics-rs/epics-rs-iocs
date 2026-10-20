@@ -815,6 +815,10 @@ pub fn create(
 }
 
 impl SessionWorker {
+    pub(crate) fn handle(&self) -> &Arc<SessionHandle> {
+        &self.handle
+    }
+
     /// Spawn the worker; from then on [`SessionHandle::control`] and
     /// [`SessionHandle::autoconnect`] answer. It connects when told to.
     pub fn spawn(self) -> JoinHandle<()> {
@@ -1762,11 +1766,17 @@ impl SessionWorker {
             }
             End::Lost => self.walk(LOSE),
         }
-        // Requests queued for a connection that no longer exists would be
-        // answered against the next one; the C leaves them in `outstandingOps`
-        // and later logs them as unknown transactions
-        // (`SessionOpen62541::markConnectionLoss` clears only the reader and
-        // writer queues).
+        self.mark_connection_loss();
+    }
+
+    /// `SessionOpen62541::markConnectionLoss` (`SessionOpen62541.cpp:1322-1330`):
+    /// every item tells its records the connection is gone.
+    ///
+    /// Requests queued for a connection that no longer exists would be answered
+    /// against the next one, so they go; the C leaves the ones already sent in
+    /// `outstandingOps` and later logs them as unknown transactions (it clears
+    /// only the reader and writer queues).
+    pub(crate) fn mark_connection_loss(&mut self) {
         for queue in self.reads.iter_mut().chain(self.writes.iter_mut()) {
             queue.clear();
         }

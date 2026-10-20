@@ -198,16 +198,19 @@ impl Registry {
             }
         }
 
-        let workers = std::mem::take(&mut inner.workers);
+        let mut unstarted = std::mem::take(&mut inner.workers);
         let sessions = inner.sessions.clone();
         drop(inner);
         errlog_vprintf(format_args!("OPC UA: Autoconnecting sessions\n"));
-        let workers = workers.into_iter().map(SessionWorker::spawn).collect();
-        // C connects them one after another, in name order, before `iocInit`
-        // goes on (`SessionOpen62541.cpp:2697-2703`).
-        let mut by_name = sessions.clone();
-        by_name.sort_by(|a, b| a.name.cmp(&b.name));
-        for session in &by_name {
+        // C takes the sessions one after another, in name order, before
+        // `iocInit` goes on: each loses its connection, then connects if it
+        // autoconnects (`SessionOpen62541.cpp:2697-2703`).
+        unstarted.sort_by(|a, b| a.handle().name.cmp(&b.handle().name));
+        let mut workers = Vec::with_capacity(unstarted.len());
+        for mut worker in unstarted {
+            worker.mark_connection_loss();
+            let session = worker.handle().clone();
+            workers.push(worker.spawn());
             if let Some(done) = session.autoconnect() {
                 let _ = block_on_sync(done);
             }
