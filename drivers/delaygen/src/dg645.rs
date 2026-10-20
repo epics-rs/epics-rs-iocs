@@ -38,6 +38,7 @@
 //!   the next line): STATUS_CODE always reads back `error`, regardless of
 //!   check_errors state. See [`Dg645Driver::error`] usage in `read_int32`.
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::param::ParamType;
@@ -378,23 +379,6 @@ static STATUS_MSG: &[(i32, &str)] = &[
     (170, "Communication Error"), (171, "Over run"), (254, "Too Many Errors"),
 ];
 
-/// Mimic C `printf("%e", value)`: one leading digit, 6-digit mantissa,
-/// signed at-least-2-digit exponent (e.g. `1.234568e+03`, `0.000000e+00`).
-/// Rust's `{:.6e}` gives the correctly-rounded mantissa (`1.234568e3`);
-/// only the exponent needs reformatting to match C's convention.
-fn fmt_e(value: f64) -> String {
-    let s = format!("{value:.6e}");
-    let (mantissa, exp) = s
-        .split_once('e')
-        .expect("format!(\"{:e}\") always emits 'e'");
-    let exp_n: i32 = exp.parse().expect("exponent is always a valid integer");
-    format!(
-        "{mantissa}e{}{:02}",
-        if exp_n < 0 { "-" } else { "+" },
-        exp_n.abs()
-    )
-}
-
 fn format_int_cmd(template: &str, value: i32) -> String {
     template.replacen("%d", &value.to_string(), 1)
 }
@@ -403,7 +387,7 @@ fn format_float_cmd(template: &str, fmt: FloatFmt, value: f64) -> String {
     match fmt {
         FloatFmt::F2 => template.replacen("%-.2f", &format!("{value:.2}"), 1),
         FloatFmt::F6 => template.replacen("%-.6f", &format!("{value:.6}"), 1),
-        FloatFmt::E => template.replacen("%e", &fmt_e(value), 1),
+        FloatFmt::E => template.replacen("%e", &format!("{:e}", CFloat(value)), 1),
     }
 }
 
@@ -414,13 +398,13 @@ fn format_str_cmd(template: &str, value: &str) -> String {
 /// C `writeChannelRef`: `sprintf(writeCommand, new_chan, old_delay)`.
 fn format_channel_ref_cmd(template: &str, new_chan: i32, old_delay: f64) -> String {
     let s = template.replacen("%d", &new_chan.to_string(), 1);
-    s.replacen("%e", &fmt_e(old_delay), 1)
+    s.replacen("%e", &format!("{:e}", CFloat(old_delay)), 1)
 }
 
 /// C `writeChannelDelay`: `sprintf(writeCommand, chan, new_delay)`.
 fn format_channel_delay_cmd(template: &str, chan: i32, new_delay: f64) -> String {
     let s = template.replacen("%d", &chan.to_string(), 1);
-    s.replacen("%e", &fmt_e(new_delay), 1)
+    s.replacen("%e", &format!("{:e}", CFloat(new_delay)), 1)
 }
 
 /// C `sscanf(inpBuf, "%d,%lf", &chan, &delay)`. Falls back to `(atoi, 0.0)`
@@ -877,12 +861,27 @@ mod tests {
     }
 
     #[test]
-    fn fmt_e_matches_c_printf_e() {
-        assert_eq!(fmt_e(0.0), "0.000000e+00");
-        assert_eq!(fmt_e(1234.5678), "1.234568e+03");
-        assert_eq!(fmt_e(-0.0005), "-5.000000e-04");
-        assert_eq!(fmt_e(1.0), "1.000000e+00");
-        assert_eq!(fmt_e(9.9999999e2), "1.000000e+03"); // rounds up a digit
+    fn e_rows_print_as_c_printf_e() {
+        for (v, want) in [
+            (0.0, "0.000000e+00"),
+            (1234.5678, "1.234568e+03"),
+            (-0.0005, "-5.000000e-04"),
+            (1.0, "1.000000e+00"),
+            (9.9999999e2, "1.000000e+03"), // rounds up a digit
+            (f64::NAN, "nan"),
+            (-f64::NAN, "-nan"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            assert_eq!(
+                format_float_cmd("HOLD%e", FloatFmt::E, v),
+                format!("HOLD{want}")
+            );
+            assert_eq!(
+                format_channel_delay_cmd("DLAY 2,%d,%e", 2, v),
+                format!("DLAY 2,2,{want}")
+            );
+        }
     }
 
     #[test]
