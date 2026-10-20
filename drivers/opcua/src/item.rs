@@ -20,7 +20,7 @@ use async_opcua::types::{
     DataValue, DateTime, ExpandedMessageInfo, ExtensionObject, NodeId, StatusCode, StructureType,
     Variant,
 };
-use epics_rs::base::calc::cvt::fmt_g;
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -920,5 +920,5 @@ fn yn(flag: bool) -> &'static str {
 
 /// A double as `std::cout << v` prints it: `%g` at the default precision 6.
 pub(crate) fn stream_double(v: f64) -> String {
-    fmt_g(v, 6, false, false)
+    CFloat(v).g().to_string()
 }

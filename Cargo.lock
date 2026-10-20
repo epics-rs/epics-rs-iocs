@@ -3182,6 +3182,7 @@ dependencies = [
  "async-opcua",
  "async-trait",
  "chrono",
+ "epics-libcom-rs",
  "epics-rs",
  "futures-util",
  "libc",
