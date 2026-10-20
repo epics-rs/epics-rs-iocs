@@ -29,7 +29,7 @@ use epics_rs::base::server::record::{
 use epics_rs::base::types::EpicsValue;
 
 use crate::cip::{self, CipType};
-use crate::driver::{self, Listener, Plc, TagInfo};
+use crate::driver::{self, Listener, OnTransfer, Plc, TagInfo};
 
 pub const DTYP: &str = "EtherIP";
 pub const DTYP_RESET: &str = "EtherIPReset";
@@ -356,7 +356,7 @@ pub struct EtherIpDevice {
     listener: Option<Arc<Listener>>,
     io_intr_rx: Option<mpsc::Receiver<()>>,
     alarm: Option<(u16, u16)>,
-    /// For the `scanOnce` an output's PLC callback ends with.
+    /// The database an output's PLC callback runs in.
     db: Option<AsyncDbHandle>,
     /// C's `rset->process` from an output's PLC callback that finds no data.
     process: Option<ProcessCallback>,
@@ -436,14 +436,20 @@ impl EtherIpDevice {
             ));
         };
 
-        // One I/O Intr pulse per new tag value. Depth 1: a pending pulse
-        // already says "re-read", and the record reads the current value.
-        // Whatever the SCAN: C adds `scan_callback` only to a record that is
-        // I/O Intr when the link binds (`devEtherIP.c:1125-1133`) yet hands
-        // its IOSCANPVT to `get_ioint_info` (`:790-796`), so a record switched
-        // to I/O Intr later joins a list nothing ever posts. Not copied.
+        // An input: one I/O Intr pulse per new tag value. Depth 1: a pending
+        // pulse already says "re-read", and the record reads the current
+        // value. Whatever the SCAN: C adds `scan_callback` only to a record
+        // that is I/O Intr when the link binds (`devEtherIP.c:1125-1133`) yet
+        // hands its IOSCANPVT to `get_ioint_info` (`:790-796`), so a record
+        // switched to I/O Intr later joins a list nothing ever posts. Not
+        // copied. An output: its check, on the scan thread.
         let (tx, rx) = mpsc::channel(1);
-        self.listener = Some(tag.add_listener(tx));
+        let on_transfer = if self.is_output {
+            OnTransfer::Check(self.db.clone().map(|db| (db, self.name.clone())))
+        } else {
+            OnTransfer::Pulse
+        };
+        self.listener = Some(tag.add_listener(tx, on_transfer));
         self.io_intr_rx = Some(rx);
 
         self.link = Some(link);
@@ -588,35 +594,23 @@ impl DeviceSupport for EtherIpDevice {
         self.io_intr_rx.take()
     }
 
-    /// Output records follow the PLC regardless of their SCAN, exactly as the
-    /// C's `check_ao_callback` / `check_bo_callback` / ... do: the driver
-    /// pushes each new tag value into the record without writing it back.
-    fn io_intr_scan_independent(&self) -> bool {
-        self.is_output
-    }
-
-    /// C `check_ao_callback` & friends (devEtherIP.c:326-794): copy a new
-    /// PLC value into the record under its lock, then `scanOnce` it unless it
-    /// is periodic. Its own process converts that value and its write pass
-    /// finds the PLC agreeing. A failed get, or an unchanged value, leaves
-    /// the record alone.
+    /// C `check_ao_callback` & friends (devEtherIP.c:326-794), on the PLC
+    /// scan thread under the record's lock: copy a new PLC value into the
+    /// record, then `scanOnce` it unless it is periodic. Its own process
+    /// converts that value and its write pass finds the PLC agreeing. A
+    /// failed get, or an unchanged value, leaves the record alone.
     fn io_intr_callback(
         &mut self,
         record: &mut dyn Record,
         common: &mut CommonFields,
     ) -> IoIntrAction {
-        // Inputs: C's scan_callback is a bare scanIoRequest.
-        if !self.is_output {
-            return IoIntrAction::Process;
+        if !self.listener.as_ref().is_some_and(|l| l.take_fired()) {
+            return IoIntrAction::Skip;
         }
         match self.check_callback(record, common) {
-            Callback::ScanOnce => {
-                if let Some(db) = &self.db {
-                    db.scan_once(&self.name);
-                }
-            }
+            Callback::ScanOnce => IoIntrAction::ScanOnce,
             // C calls `rset->process` under the record's lock, past every
-            // dbProcess gate (devEtherIP.c:347-354). This pulse holds the
+            // dbProcess gate (devEtherIP.c:347-354). This callback holds the
             // lock, so the record's ProcessCallback runs it on the record's
             // band as an async completion re-enters: past the PACT and TPRO
             // gates, not the DISA one.
@@ -624,10 +618,10 @@ impl DeviceSupport for EtherIpDevice {
                 if let Some(process) = &self.process {
                     let _ = process.request(common.callback_priority());
                 }
+                IoIntrAction::Skip
             }
-            Callback::Leave => {}
+            Callback::Leave => IoIntrAction::Skip,
         }
-        IoIntrAction::Skip
     }
 
     fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
@@ -1234,7 +1228,7 @@ mod tests {
     use epics_rs::base::server::records::bo::BoRecord;
 
     /// devEtherIP.c mbbo_write / check_mbbo_callback: a staged write leaves
-    /// the record PACT, and the next transfer ends it without the readback
+    /// the record PACT, and the next transfer ends it without the check
     /// that would put the PLC's value back into VAL.
     #[test]
     fn a_staged_write_waits_for_the_next_transfer_instead_of_reading_back() {
@@ -1254,9 +1248,13 @@ mod tests {
         let mut record = MbboRecord::default();
         record.put_field("NOBT", EpicsValue::Short(2)).unwrap();
         let mut dev = EtherIpDevice::new("@staged BOOLs[300]", true);
+        dev.set_record_info("STAGED", ScanType::Passive);
+        dev.bind_database(db.async_handle());
         dev.init(&mut record).unwrap();
         let mut rx = dev.io_intr_receiver().unwrap();
         let tag = dev.tag.clone().unwrap();
+        let listener = dev.listener.clone().unwrap();
+        let checked = || listener.take_fired();
         {
             let mut d = tag.data.lock();
             d.buf = bits_buf(&[0; 10]);
@@ -1270,12 +1268,10 @@ mod tests {
         ));
         assert!(tag.data.lock().do_write);
         tag.notify();
-        assert!(
-            rx.try_recv().is_err(),
-            "the write's transfer is not a readback"
-        );
+        assert!(!checked(), "the write's transfer runs no check");
         tag.notify();
-        assert!(rx.try_recv().is_ok(), "later transfers read back again");
+        assert!(checked(), "later transfers check again");
+        assert!(rx.try_recv().is_err(), "an output is never pulsed");
 
         // The 3 just written reads back as 3, so the next pass has nothing
         // to write.
@@ -1457,6 +1453,7 @@ mod tests {
         define_plc(plc, "127.0.0.1", 0);
         let db = PvDatabase::new();
         db.install_device_support_resolver(Arc::new(device_factory));
+        db.scan_control().finish_dev_sup();
         db
     }
 
@@ -1486,23 +1483,14 @@ mod tests {
             .unwrap()
     }
 
-    /// One driver callback as the I/O Intr pump runs it, then whatever it
-    /// queued on scanOnce, whose ring runs in order on one thread.
-    fn pulse(rt: &tokio::runtime::Runtime, db: &PvDatabase, name: &str) {
-        let rec = db.get_record(name).unwrap();
-        let process = {
-            let mut guard = rec.write();
-            let inst = &mut *guard;
-            inst.device
-                .as_mut()
-                .unwrap()
-                .io_intr_callback(&mut *inst.record, &mut inst.common)
-                == IoIntrAction::Process
-        };
-        if process {
-            rt.block_on(db.process_record_readback(name, &mut ProcStack::new()))
-                .unwrap();
-        }
+    /// One transfer's callbacks as the scan thread runs them, then whatever
+    /// they queued on scanOnce, whose ring runs in order on one thread.
+    fn pulse(tag: &TagInfo) {
+        tag.notify();
+        flush_scan_once();
+    }
+
+    fn flush_scan_once() {
         let (tx, rx) = std::sync::mpsc::channel();
         epics_rs::base::runtime::task::background_scan_once(
             "flush",
@@ -1551,8 +1539,8 @@ mod tests {
             "D",
         );
         set_tag(&dint, CipType::Dint, &42i32.to_le_bytes());
-        pulse(&rt, &db, "AOR");
-        pulse(&rt, &db, "AOD");
+        pulse(&real);
+        pulse(&dint);
         for f in ["VAL", "OVAL", "PVAL"] {
             assert_eq!(field(&db, "AOR", f), 3.25, "AOR.{f}");
             assert_eq!(field(&db, "AOD", f), 42.0, "AOD.{f}");
@@ -1627,7 +1615,7 @@ mod tests {
         let mut words = [0; 10];
         words[9] = 1 << 12;
         set_words(&tag, &words);
-        pulse(&rt, &db, "BOM");
+        pulse(&tag);
         assert_eq!(field(&db, "BOM", "VAL"), 1.0);
         assert_eq!(field(&db, "BOM", "RVAL"), 16.0);
     }
@@ -1654,7 +1642,7 @@ mod tests {
         let mut words = [0; 10];
         words[9] = 3 << 12;
         set_words(&tag, &words);
-        pulse(&rt, &db, "MBBO");
+        pulse(&tag);
         assert_eq!(field(&db, "MBBO", "VAL"), 65535.0);
         let rec = db.get_record("MBBO").unwrap();
         let common = &rec.read().common;
@@ -1662,6 +1650,60 @@ mod tests {
             (common.stat, common.sevr),
             (alarm_status::SOFT_ALARM, AlarmSeverity::Invalid)
         );
+    }
+
+    /// drvEtherIP.c:819-823 runs check_mbbo_callback on the scan task, under
+    /// the record's lock, before the transfer is over: a periodic mbbo that
+    /// processes right after it has the PLC's bits already, and its write
+    /// pass finds nothing to write. Before that, a boot whose scan beat the
+    /// follow wrote the record's RVAL 0 over the PLC's 3.
+    #[test]
+    fn a_periodic_output_processed_after_a_transfer_writes_nothing_stale() {
+        use epics_rs::base::server::records::mbbo::MbboRecord;
+        let rt = current_thread();
+        let db = eip_db("stale");
+        let mut record = MbboRecord::default();
+        record.put_field("NOBT", EpicsValue::Short(2)).unwrap();
+        let tag = load_output(&rt, &db, "STALE", Box::new(record), "stale", "BOOLs[300]");
+        db.get_record("STALE").unwrap().write().common.scan = ScanType::from_u16(SCAN_1ST_PERIODIC);
+
+        // The first transfer, as scan_pass lands and announces it.
+        let mut words = [0; 10];
+        words[9] = 3 << 12;
+        set_words(&tag, &words);
+        tag.notify();
+        // The periodic scan, in the gap a follow on another thread left.
+        rt.block_on(db.process_record_with_links("STALE", &mut ProcStack::new()))
+            .unwrap();
+
+        let data = tag.data.lock();
+        assert!(!data.do_write, "the scan wrote the record's stale RVAL");
+        assert_eq!(data.buf, bits_buf(&words));
+    }
+
+    /// A run of the record's callback that no transfer of its own tag
+    /// started, as one from a listener list taken before a device-link put
+    /// bound this device, checks nothing: C walks the list under the
+    /// `plc->lock` the put's `del_record` takes (drvEtherIP.c:1333-1349).
+    #[test]
+    fn only_the_records_own_transfer_runs_its_check() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        let rt = current_thread();
+        let db = eip_db("ownxfer");
+        let tag = load_output(
+            &rt,
+            &db,
+            "OWN",
+            Box::new(AoRecord::default()),
+            "ownxfer",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &3.25f32.to_le_bytes());
+        db.async_handle().run_io_intr_callback("OWN");
+        flush_scan_once();
+        assert_eq!(field(&db, "OWN", "VAL"), 0.0);
+        pulse(&tag);
+        assert_eq!(field(&db, "OWN", "VAL"), 3.25);
     }
 
     /// A tag holding one Logix STRING, `text`.
@@ -1915,7 +1957,7 @@ mod tests {
         epics_rs::base::runtime::task::background_arm();
         let rt = current_thread();
         let db = eip_db("nodatapulse");
-        load_output(
+        let tag = load_output(
             &rt,
             &db,
             "AONODATA",
@@ -1927,7 +1969,7 @@ mod tests {
             .unwrap();
         let stat = || db.get_record("AONODATA").unwrap().read().common.stat;
         assert_ne!(stat(), alarm_status::WRITE_ALARM);
-        pulse(&rt, &db, "AONODATA");
+        pulse(&tag);
         let deadline = Instant::now() + Duration::from_secs(10);
         while stat() != alarm_status::WRITE_ALARM {
             assert!(Instant::now() < deadline, "no WRITE_ALARM");
