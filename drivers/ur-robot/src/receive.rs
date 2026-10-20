@@ -117,12 +117,12 @@ pub fn output_variables(
             vars.push(format!("output_double_register_{}", offset + i));
         }
     } else if use_upper_range_registers {
-        eprintln!(
+        epics_rs::base::stderr_println!(
             "Warning! The upper range of the double output registers are only available \
              on PolyScope versions >3.9 or >5.3"
         );
     } else {
-        eprintln!(
+        epics_rs::base::stderr_println!(
             "Warning! The lower range of the double output registers are only available \
              on PolyScope versions >3.4"
         );

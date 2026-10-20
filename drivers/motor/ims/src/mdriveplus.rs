@@ -52,7 +52,7 @@ use epics_rs::motor::flags::MstaFlags;
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::util::{atof, atoi};
+use motor_common::util::{atof, atoi, strtol};
 
 /// Reply read buffer size (C `MAX_BUFF_LEN`).
 const READ_BUF: usize = 80;
@@ -73,7 +73,10 @@ const RULE: &str = "-------------------------------------------";
 
 /// `(input, function)` per line of a `PR IS` block: C turns every non-digit
 /// into a separator and scans `%d %d %d` (input, function, active level) from
-/// each LF-terminated line; text after the last LF is not scanned.
+/// each LF-terminated line; text after the last LF is not scanned. The
+/// active level is never read, and C's unchecked sscanf hands
+/// set_switch_vars an uninitialised `fn` from a line of one number: a C
+/// defect, not copied.
 fn parse_input_setup(block: &[u8]) -> Vec<(i32, i32)> {
     let mut lines: Vec<&[u8]> = block.split(|&b| b == b'\n').collect();
     lines.pop();
@@ -83,13 +86,24 @@ fn parse_input_setup(block: &[u8]) -> Vec<(i32, i32)> {
             let mut nums = line
                 .split(|b| !b.is_ascii_digit())
                 .filter(|f| !f.is_empty())
-                .map(|f| std::str::from_utf8(f).ok()?.parse::<i32>().ok());
-            match (nums.next(), nums.next(), nums.next()) {
-                (Some(Some(input)), Some(Some(function)), Some(Some(_))) => Some((input, function)),
-                _ => None,
-            }
+                .map(|f| strtol(f, 10).0 as i32);
+            Some((nums.next()?, nums.next()?))
         })
         .collect()
+}
+
+/// C `sscanf(resp, "%4d[^,]", &type)`'s `type`: at most four characters of
+/// an int after the blanks; `None` when none convert.
+fn scan_switch_type(resp: &str) -> Option<i32> {
+    let b = resp.as_bytes();
+    let at = b
+        .iter()
+        .take_while(|&&c| matches!(c, b' ' | b'\t'..=b'\r'))
+        .count();
+    match strtol(&b[at..b.len().min(at + 4)], 10) {
+        (_, 0) => None,
+        (value, _) => Some(value as i32),
+    }
 }
 
 fn ims_err(message: impl Into<String>) -> AsynError {
@@ -259,13 +273,14 @@ impl ImsLine {
         status.map(|()| reply)
     }
 
-    /// [`Self::write_read`]'s reply beside its status. The EOS layer
-    /// NUL-terminates `resp` on every read, so a failed read leaves the bytes
-    /// it delivered, which the callers that ignore the status parse.
+    /// [`Self::write_read`]'s reply beside its status, as C's `resp` string:
+    /// up to its first NUL and untrimmed, which the console lines print. The
+    /// EOS layer NUL-terminates `resp` on every read, so a failed read leaves
+    /// the bytes it delivered, which the callers that ignore the status parse.
     fn exchange_text(&self, cmd: &str) -> (String, AsynResult<()>) {
         let (raw, status) = self.exchange(cmd);
-        let s = String::from_utf8_lossy(&raw);
-        (s.trim_matches(['\r', '\n', '\0', ' ']).to_string(), status)
+        let resp = raw.split(|&b| b == 0).next().unwrap_or_default();
+        (String::from_utf8_lossy(resp).into_owned(), status)
     }
 
     /// C `writeReadController`'s writeRead and its trace line, which
@@ -558,9 +573,10 @@ impl ImsMDrivePlusAxis {
             println!("Controller version {version}");
         }
         println!("Setup config:");
-        let vlow = version.to_lowercase();
-        if vlow.contains("lmm") || vlow.contains("lmd") {
-            if vlow.contains("lmm") {
+        // C's strstr, so a mixed-case name is an MForce (:182-188).
+        let model = |names: [&str; 2]| names.iter().any(|n| version.contains(n));
+        if model(["lmm", "LMM"]) || model(["lmd", "LMD"]) {
+            if model(["lmm", "LMM"]) {
                 println!("Lexium Motor Module detected");
                 println!("{RULE}");
             } else {
@@ -593,7 +609,12 @@ impl ImsMDrivePlusAxis {
                 // C prints and parses `resp` whatever the status (:213-216).
                 let resp = self.line.exchange_text(&format!("PR S{input_no}")).0;
                 println!("{resp}");
-                self.set_switch(atoi(&resp), input_no);
+                // C's unchecked sscanf leaves `type` as the last input's, or
+                // uninitialised at S1, and maps this input to it: a C defect,
+                // not copied.
+                if let Some(type_code) = scan_switch_type(&resp) {
+                    self.set_switch(type_code, input_no);
+                }
             }
         }
         println!(
@@ -831,6 +852,11 @@ impl AsynMotor for ImsMDrivePlusAxis {
         PollFailure::PROBLEM
     }
 
+    /// ImsMDrivePlusMotorAxis.cpp:56.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// COMMS_ERROR is the controller's own param, set by
     /// writeController/writeReadController (ImsMDrivePlusMotorController.cpp:
     /// 371-373, :403-406) and cleared by a good poll.
@@ -1002,6 +1028,17 @@ mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interfaces::motor::PortSet;
+
+    #[test]
+    fn the_constructor_calls_back() {
+        let (handle, _) =
+            SyncIOHandle::connect_port("IMS_CALLBACK", 0, Duration::ZERO, InterfaceType::Octet);
+        let axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(handle, String::new(), "IMS_CALLBACK"),
+            "IMS_CALLBACK",
+        );
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     /// The steps one call left on the controller port, in the order made.
     fn rendered(sets: PortSets) -> Vec<String> {
@@ -1216,6 +1253,60 @@ mod tests {
             (axis.pos_limit_switch, axis.neg_limit_switch),
             (Some(2), Some(3))
         );
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:182-188 match `lmm`/`LMM` and
+    /// `lmd`/`LMD` only, so `Lmm` probes the MForce S1-S4 setup.
+    #[test]
+    fn a_mixed_case_lexium_name_is_an_mforce() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("imsMixedLmm", |last| match last.trim_end() {
+            "PR VR" => "Lmm 3.0".into(),
+            _ => "0".into(),
+        });
+        ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsMixedLmm"),
+            "imsMixedLmm",
+        );
+        let sent = rig.sent();
+        assert!(sent.iter().any(|c| c.trim_end() == "PR S1"), "{sent:?}");
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:175-178 and :214 print the version
+    /// and S1-S4 replies as read, a CR included.
+    #[test]
+    fn config_replies_print_untrimmed() {
+        use motor_common::testing::{LineRig, child_stdout, in_child};
+        if !in_child() {
+            let out = child_stdout(module_path!(), "config_replies_print_untrimmed");
+            assert!(out.contains("Controller version 1.000\r\n"), "{out:?}");
+            assert!(out.contains("\n2,0,0\r\n"), "{out:?}");
+            return;
+        }
+        let (_rig, io) = LineRig::new("imsRawReply", |last| match last.trim_end() {
+            "PR VR" => "1.000\r".into(),
+            "PR S2" => "2,0,0\r".into(),
+            _ => "0".into(),
+        });
+        ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsRawReply"),
+            "imsRawReply",
+        );
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:215 reads `type` with `%4d`, so
+    /// `00001` is type 0 and maps no switch.
+    #[test]
+    fn a_switch_type_reads_four_characters() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("imsWidth4", |last| match last.trim_end() {
+            "PR VR" => "1.000".into(),
+            "PR S1" => "00001,0,0".into(),
+            _ => "0".into(),
+        });
+        let axis =
+            ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsWidth4"), "imsWidth4");
+        assert_eq!(axis.home_switch, None);
     }
 
     #[test]
@@ -1533,5 +1624,28 @@ mod tests {
         let block = b"IS = 1, 1, 0\r\nIS = 2, 2, 1\r\nIS = 3, 0, 0\r\nIS = 4, 3";
         assert_eq!(parse_input_setup(block), vec![(1, 1), (2, 2), (3, 0)]);
         assert_eq!(parse_input_setup(b"junk\n"), vec![]);
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:251-253 read only `inputno` and
+    /// `fn`, each glibc's `(int) strtol`.
+    #[test]
+    fn input_setup_maps_two_numbers_wrapped_as_c() {
+        assert_eq!(parse_input_setup(b"IS = 5, 1\n"), vec![(5, 1)]);
+        let wrapped = if std::os::raw::c_long::BITS == 64 {
+            2
+        } else {
+            i32::MAX
+        };
+        assert_eq!(parse_input_setup(b"3 4294967298 1\n"), vec![(3, wrapped)]);
+        assert_eq!(parse_input_setup(b"7\n"), vec![]);
+    }
+
+    #[test]
+    fn switch_type_scans_as_c_width_4() {
+        assert_eq!(scan_switch_type("3,0,0"), Some(3));
+        assert_eq!(scan_switch_type(" \t12345"), Some(1234));
+        assert_eq!(scan_switch_type("-12345"), Some(-123));
+        assert_eq!(scan_switch_type("+"), None);
+        assert_eq!(scan_switch_type(""), None);
     }
 }

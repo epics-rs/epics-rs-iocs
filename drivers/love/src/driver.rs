@@ -43,9 +43,9 @@
 //!   (see [`wire::ERR_CODES`]) -- it is never wire-observable at an EPICS
 //!   record, since the caller always treats a 7-byte reply as an error
 //!   regardless of the code's value.
-//! - **The write-response check parses only the first 2 payload bytes**
-//!   (`processWriteResponse`, `drvLove.c:772-787`) as a decimal code;
-//!   nonzero is a failure. The protocol guarantees at least 2 payload bytes
+//! - **The write-response check is a `%2d` decimal code at the payload
+//!   start** (`processWriteResponse`, `drvLove.c:772-787`); nonzero is a
+//!   failure. The protocol guarantees at least 2 payload bytes
 //!   whenever `eval_message` succeeds (`payload_len = pcount-6 >= 2` since
 //!   the success branch requires `pcount >= 8`).
 //! - **`getSignedValue`'s sign field is parsed differently per model**
@@ -91,7 +91,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::{AsynUser, UserTrace};
 
 use crate::registry::{K_INSTRMAX, Model, ModelTable};
-use crate::wire::{EvalError, calc_checksum, eval_message, field, parse_dec, parse_hex};
+use crate::wire::{EvalError, calc_checksum, eval_message, scan_dec, scan_hex};
 
 /// C `#define K_TUNE (0.1)` -- sleep before every send attempt, including
 /// the first.
@@ -480,8 +480,8 @@ fn build_frame(addr: i32, body: &str) -> String {
 
 /// C `getValue`.
 fn parse_value(payload: &[u8]) -> i32 {
-    let sign = parse_hex(field(payload, 0, 4));
-    let mut value = parse_dec(field(payload, 4, 4));
+    let sign = scan_hex(payload, 0, 4);
+    let mut value = scan_dec(payload, 4, 4);
     if sign & 0x0001 != 0 {
         value = -value;
     }
@@ -490,16 +490,15 @@ fn parse_value(payload: &[u8]) -> i32 {
 
 /// C `getStatus`.
 fn parse_status(payload: &[u8]) -> i32 {
-    parse_hex(field(payload, 0, 4)) as i32
+    scan_hex(payload, 0, 4) as i32
 }
 
 /// C `getSignedValue`.
 fn parse_signed_value(payload: &[u8], model: Model) -> i32 {
-    let info = field(payload, 0, 2);
-    let mut value = parse_dec(field(payload, 2, 4));
+    let mut value = scan_dec(payload, 2, 4);
     let negate = match model {
-        Model::Model1600 => parse_dec(info) != 0,
-        Model::Model16A => parse_hex(info) & 0x0001 != 0,
+        Model::Model1600 => scan_dec(payload, 0, 2) != 0,
+        Model::Model16A => scan_hex(payload, 0, 2) & 0x0001 != 0,
     };
     if negate {
         value = -value;
@@ -509,7 +508,7 @@ fn parse_signed_value(payload: &[u8], model: Model) -> i32 {
 
 /// C `getData`.
 fn parse_data(payload: &[u8]) -> i32 {
-    parse_hex(field(payload, 0, 2)) as i32
+    scan_hex(payload, 0, 2) as i32
 }
 
 /// C `putData`: sign-magnitude, `%4.4d` decimal + `%2.2X` hex sign byte.
@@ -524,7 +523,7 @@ fn format_put_data(write_cmd: &str, value: i32) -> String {
 
 /// C `processWriteResponse`.
 fn process_write_response(payload: &[u8]) -> AsynResult<()> {
-    if parse_dec(field(payload, 0, 2)) != 0 {
+    if scan_dec(payload, 0, 2) != 0 {
         return Err(protocol_error("write command failed"));
     }
     Ok(())
@@ -980,6 +979,16 @@ mod tests {
         // model 16A: info parsed as HEX, bit0 -> negate.
         assert_eq!(parse_signed_value(b"010042", Model::Model16A), -42);
         assert_eq!(parse_signed_value(b"020042", Model::Model16A), 42);
+    }
+
+    #[test]
+    fn reply_fields_skip_leading_whitespace_like_sscanf() {
+        // C's `%Nx`/`%Nd` skip whitespace without counting it toward N.
+        assert_eq!(parse_value(b"   1  42"), -42);
+        assert_eq!(parse_signed_value(b" 1  42", Model::Model1600), -42);
+        assert_eq!(parse_signed_value(b" 1  42", Model::Model16A), -42);
+        assert_eq!(parse_data(b" F"), 0x0F);
+        assert!(process_write_response(b" 1").is_err());
     }
 
     #[test]
@@ -1440,9 +1449,10 @@ mod tests {
         assert!(!port.contains("readInt32"), "{port:?}");
     }
 
-    /// A reply whose checksum fails.
+    /// A serial port answering every command with `reply`.
     struct BadReplySerial {
         base: PortDriverBase,
+        reply: &'static [u8],
     }
 
     impl PortDriver for BadReplySerial {
@@ -1459,9 +1469,8 @@ mod tests {
         }
 
         fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
-            let reply = b"\x02L01\xff000000";
-            buf[..reply.len()].copy_from_slice(reply);
-            OctetReadResult::ok(reply.len(), EomReason::EOS)
+            buf[..self.reply.len()].copy_from_slice(self.reply);
+            OctetReadResult::ok(self.reply.len(), EomReason::EOS)
         }
     }
 
@@ -1476,7 +1485,11 @@ mod tests {
             InterfaceMask::UNMIGRATED_ALL,
             InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
-        let (user, port_path, dev_path) = traced_love(BadReplySerial { base }, "LOVETESTRAW");
+        let serial = BadReplySerial {
+            base,
+            reply: b"\x02L01\xff000000",
+        };
+        let (user, port_path, dev_path) = traced_love(serial, "LOVETESTRAW");
         assert!(user.read_int32(0).is_err());
         let _ = read_trace(&port_path);
         let dev = read_trace(&dev_path);
@@ -1488,6 +1501,39 @@ mod tests {
         );
         let want: &[u8] = b"drvLove::evalMessage checksum failed\n";
         assert!(dev.windows(want.len()).any(|w| w == want));
+    }
+
+    /// evalMessage leaves a 7-byte error reply's 3 bytes after the header in
+    /// inpMsg, which recvReply and executeCommand then print
+    /// (drvLove.c:585-591, :617-619).
+    #[test]
+    fn a_device_error_reply_is_printed_as_evalmessage_leaves_it() {
+        let base = PortDriverBase::new(
+            "LOVETESTERRSER",
+            1,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let serial = BadReplySerial {
+            base,
+            reply: b"\x02L01X02",
+        };
+        let (user, port_path, dev_path) = traced_love(serial, "LOVETESTERR");
+        assert!(user.read_int32(0).is_err());
+        let _ = read_trace(&port_path);
+        let dev = String::from_utf8(read_trace(&dev_path)).unwrap();
+        let mut at = 0;
+        for line in [
+            "drvLove::evalMessage error message received \"02 - Checksum error on received data from Host.\"\n",
+            "drvLove::recvReply 3 \"X02\"\n",
+            "drvLove::executeCommand read failure - Sent \"\u{2}L0100C1\" Rcvd \"X02\" \n",
+        ] {
+            let Some(i) = dev[at..].find(line) else {
+                panic!("missing {line:?} after {at} in {dev:?}");
+            };
+            at += i + line.len();
+        }
     }
 
     fn report_of(love: &mut LoveDriver) -> String {

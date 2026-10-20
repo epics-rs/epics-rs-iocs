@@ -11,7 +11,7 @@
 //! timestamp merge and the gate/trigger state machine of C++'s
 //! `onMessageEvent`. The socket itself lives in [`crate::fx4`].
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::{Map, Value, json};
 
@@ -52,19 +52,23 @@ pub fn sample_time(values_per_read: i32) -> f64 {
 // Messages
 // ===========================================================================
 
-/// C++ `sendEventData`: `{"event": <event>, "data": <data>}`.
+/// C++ `sendEventData`: `{"data": <data>, "event": <event>}`. nlohmann keeps
+/// an object in a `std::map`, so `dump()` sorts keys; a `serde_json::Map`
+/// keeps insertion order once any crate enables `preserve_order`, so both
+/// levels are built from a `BTreeMap`.
 fn event_message(event: &str, data: Value) -> String {
-    json!({ "event": event, "data": data }).to_string()
+    let msg = BTreeMap::from([("data", data), ("event", Value::from(event))]);
+    serde_json::to_string(&msg).expect("a map of JSON values serializes")
 }
 
 /// C++ `sendSubscribeEvent`: subscribe to the four ADC paths and the gate.
 pub fn subscribe_message() -> String {
-    let mut data = Map::new();
-    for path in ADC_PATHS {
-        data.insert(path.to_string(), Value::Bool(true));
-    }
-    data.insert(GATE_PATH.to_string(), Value::Bool(true));
-    event_message("subscribe", Value::Object(data))
+    let data: BTreeMap<&str, bool> = ADC_PATHS
+        .into_iter()
+        .chain([GATE_PATH])
+        .map(|path| (path, true))
+        .collect();
+    event_message("subscribe", json!(data))
 }
 
 /// C++ `sendUnsubscribeEvent`: subscribing to nothing is how a subscription is
@@ -522,6 +526,18 @@ mod tests {
         let get: Value = serde_json::from_str(&get_message()).unwrap();
         assert_eq!(get["event"], "get");
         assert_eq!(get["data"], Value::Null);
+    }
+
+    /// The bytes C sends, as a mock FX4 logged them: nlohmann's `dump()` writes
+    /// every object's keys in `std::map` order.
+    #[test]
+    fn messages_are_the_bytes_c_sends() {
+        assert_eq!(
+            subscribe_message(),
+            r#"{"data":{"/fx4/adc/channel_1/value":true,"/fx4/adc/channel_2/value":true,"/fx4/adc/channel_3/value":true,"/fx4/adc/channel_4/value":true,"/fx4/gpio_0/22/readback/value":true},"event":"subscribe"}"#
+        );
+        assert_eq!(unsubscribe_message(), r#"{"data":{},"event":"subscribe"}"#);
+        assert_eq!(get_message(), r#"{"data":null,"event":"get"}"#);
     }
 
     #[test]

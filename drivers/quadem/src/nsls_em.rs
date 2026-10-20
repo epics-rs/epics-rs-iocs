@@ -479,6 +479,12 @@ impl QuadEmDevice for NslsEmDriver {
     fn reset(&mut self) -> AsynResult<()> {
         self.base_reset()
     }
+
+    /// C++ `drvNSLS_EM::exitHandler` (drvNSLS_EM.cpp:564-569): the meter
+    /// stops streaming when the IOC goes.
+    fn exit_handler(&mut self) {
+        let _ = self.set_acquire(0);
+    }
 }
 
 // ===========================================================================
@@ -691,7 +697,7 @@ pub fn create_nsls_em(
             .expect("failed to spawn drvNSLS_EMTask")
     });
 
-    let callback_thread = qe::start_callback_task(CallbackContext {
+    let callback_thread = qe::start_callback_task::<NslsEmDriver>(CallbackContext {
         trigger_rx,
         handle,
         params,
@@ -837,6 +843,66 @@ mod tests {
         );
         let p = drv.params();
         assert_eq!(qe::int_param(&drv.base.port_base, p.range, 0), 2);
+    }
+
+    /// C++ `drvNSLS_EM::exitHandler` is `setAcquire(0)` (drvNSLS_EM.cpp:
+    /// 564-569), so the hook drvQuadEM arms at IOC exit sends an acquiring
+    /// meter the stopped mode.
+    #[test]
+    fn the_exit_handler_stops_an_acquiring_meter() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        // A connection per transaction, as C++ makes; every write is `OK>`.
+        thread::spawn(move || {
+            for sock in listener.incoming() {
+                let mut sock = sock.unwrap();
+                let mut buf = [0u8; 256];
+                while let Ok(n) = sock.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    if sock.write_all(b"OK>\r\n").is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let (command, runtime) = ip_port(
+            "QE_NSLS_EXIT_IP",
+            &addr.to_string(),
+            true,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        std::mem::forget(runtime);
+        let _ = command.set_input_eos(b"\r\n");
+        let _ = command.set_output_eos(b"\r");
+        let shared = QuadEmShared::new(16).0;
+        shared.set_acquiring(true);
+        let mut drv = NslsEmDriver {
+            base: QuadEmBase::new("QE_NSLS_EXIT", 0).unwrap(),
+            command: Some(command),
+            shared: shared.clone(),
+            state: Arc::new(parking_lot::Mutex::new(NslsState {
+                scale_factor: 0.0,
+                ping_pong: PingPong::Both,
+            })),
+            ip_address: String::new(),
+            module_id: 0,
+            firmware_version: String::new(),
+            modules: Vec::new(),
+        };
+
+        drv.exit_handler();
+        assert!(!shared.is_acquiring());
+        let sent: String = rx.try_iter().collect();
+        let stopped = proto::cmd_mode(proto::mode_value(false, drv.state.lock().ping_pong));
+        assert!(sent.contains(&format!("{stopped}\r")), "{sent:?}");
     }
 
     /// C++ keeps the port when no module answers: no link, no read thread,

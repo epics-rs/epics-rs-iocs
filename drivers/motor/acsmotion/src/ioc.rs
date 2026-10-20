@@ -63,8 +63,8 @@ pub fn acsmotion_config_command() -> CommandDef {
             let port_name = req_string(args, 0, "ACS port name")?;
             let asyn_port = req_string(args, 1, "asyn port name")?;
             let num_axes = req_int(args, 2, "num axes")?;
-            if num_axes < 1 {
-                return Err("AcsMotionConfig: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("AcsMotionConfig: numAxes must not be negative".into());
             }
             let num_axes = num_axes as usize;
             let moving_poll = opt_double(args, 3, 0.0, "Moving polling rate")?;
@@ -321,5 +321,24 @@ Configuration for axis 1:
             "{text}"
         );
         assert!(!text.contains("Configuration for axis"), "{text}");
+    }
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn an_spiiplus_with_no_axes() {
+        let (_line, _io) = motor_common::testing::LineRig::new("spiiNoAxesLine", |_| "0".into());
+        let args = vec![
+            ArgValue::String("spiiNoAxes".into()),
+            ArgValue::String("spiiNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(acsmotion_config_command(), args, "spiiNoAxes").await);
     }
 }

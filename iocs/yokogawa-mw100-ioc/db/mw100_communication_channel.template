@@ -1,5 +1,5 @@
 # MW100 Comm (communication) channel.
-# Macros: P, DAU, HANDLE, ADDRESS (Comm address, e.g. C1).
+# Macros: P, DAU, HANDLE, ADDRESS (Comm address, e.g. C001).
 # Port of yokogawaDasApp/Db/MW100_communication_channel.db.
 
 record(ai,"$(P)$(DAU):$(ADDRESS)")

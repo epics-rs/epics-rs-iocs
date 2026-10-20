@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynStatus;
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, Model1Motor};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -50,8 +50,8 @@ pub fn oem_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let oem_port = req_string(args, 1, "OEM port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if num_axes < 1 {
-                return Err("OEMCreateController: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("OEMCreateController: numAxes must not be negative".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
@@ -102,8 +102,8 @@ pub fn acr_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "Port name")?;
             let acr_port = req_string(args, 1, "ACR port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
-            if num_axes < 1 {
-                return Err("ACRCreateController: numAxes must be > 0".into());
+            if num_axes < 0 {
+                return Err("ACRCreateController: numAxes must not be negative".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
@@ -188,16 +188,13 @@ pub fn pc6k_config_command() -> CommandDef {
                     return;
                 };
                 let controller = Pc6kCard::new(handle);
-                let Some((ident, axes)) = drv_pc6k::motor_init(&controller) else {
+                let Some((ident, total)) = drv_pc6k::motor_init(&controller) else {
                     return;
                 };
                 let controller = Arc::new(Mutex::new(controller));
-                for (signal, limits) in axes.into_iter().enumerate() {
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvPc6kAxis::new(
-                        controller.clone(),
-                        signal,
-                        limits,
-                    )));
+                for signal in 0..total {
+                    let motor: Arc<Mutex<dyn Model1Motor>> =
+                        Arc::new(Mutex::new(DrvPc6kAxis::new(controller.clone(), signal)));
                     init.axis(signal as i32, motor);
                 }
                 // C prints `cntrl->asyn_address`, which PC6KConfig never sets
@@ -394,5 +391,91 @@ mod report {
             text.contains(&format!("{head}{detail}Port: acrRep\n")),
             "{text}"
         );
+    }
+}
+
+/// C iocsh passes a missing numAxes as 0 (iocsh.cpp:839-840), and C's
+/// controller then has no axes.
+#[cfg(test)]
+mod missing_num_axes {
+    use super::*;
+    use motor_common::testing::port_after;
+
+    #[epics_rs::base::epics_test]
+    async fn an_oem_with_no_axes() {
+        let args = vec![
+            ArgValue::String("oemNoAxes".into()),
+            ArgValue::String("oemNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(oem_create_controller_command(), args, "oemNoAxes").await);
+    }
+
+    #[epics_rs::base::epics_test]
+    async fn an_acr_with_no_axes() {
+        let args = vec![
+            ArgValue::String("acrNoAxes".into()),
+            ArgValue::String("acrNoAxesLine".into()),
+            ArgValue::Missing,
+        ];
+        assert!(port_after(acr_create_controller_command(), args, "acrNoAxes").await);
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvPC6K.cc:880-914: `motor_init` reads each axis's status once,
+    /// right after that axis's limits and before the next axis's, and the
+    /// record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_after_its_own_limits() {
+        let int = ArgValue::Int;
+        run_command(pc6k_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("pc6kInitLine", |cmd| {
+            let cmd = cmd.trim_end();
+            let value = match cmd {
+                "TREV" => return "*TREV92-016740-01-6K4".into(),
+                "3TPC" => return String::new(),
+                "1TPC" | "1TPE" => "14",
+                "2TPC" | "2TPE" => "3",
+                _ if cmd.ends_with("TAS") => "0000000000000000000000000",
+                _ => "0",
+            };
+            format!("*{cmd}{value}")
+        });
+        let config = vec![int(0), ArgValue::String("pc6kInitLine".into())];
+        run_command(pc6k_config_command(), config).await;
+        drvsup_init().await;
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        let mut want: Vec<String> = [
+            "TREV", "ECHO0", "!K", "DRIVE", "COMEXC1", "1TPC", "2TPC", "3TPC",
+        ]
+        .map(String::from)
+        .into();
+        for axis in [1, 2] {
+            for cmd in [
+                "AXSDEF", "DRES", "LSNEG", "LSPOS", "TAS", "TPC", "TPE", "TVELA", "DRIVE",
+            ] {
+                want.push(format!("{axis}{cmd}"));
+            }
+        }
+        assert_eq!(sent, want);
+        let db = record_init(
+            r##"
+record(motor, "pc6k:m1") { field(DTYP, "PC6K") field(OUT, "#C0 S0 @") }
+record(motor, "pc6k:m2") { field(DTYP, "PC6K") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("pc6k:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("pc6k:m2.RMP").unwrap(), EpicsValue::Long(3));
     }
 }

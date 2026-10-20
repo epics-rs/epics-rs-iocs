@@ -2,16 +2,16 @@
 //! uint32Digital and float64 reads and writes a record makes through
 //! `@asyn(port,axis)MOTOR_*`, which reach the driver's move, home and stop
 //! or its `motorAxisGet*`/`motorAxisSet*`, and `intCallback`, which turns
-//! the driver's parameter callbacks into the port's interrupts.
+//! the driver's parameter callbacks into the port's interrupts and the motor
+//! record's status.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::SystemTime;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
 use epics_rs::asyn::interrupt::{InterruptManager, InterruptValue};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::ParamValue;
@@ -21,6 +21,8 @@ use epics_rs::asyn::port::{
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::sync::mpsc;
+use epics_rs::motor::device_support::StatusPoster;
+use epics_rs::motor::flags::MstaFlags;
 use epics_rs::motor::poll_loop::PollCommand;
 
 use crate::param_lib::Params;
@@ -165,8 +167,10 @@ pub(crate) struct Axis {
     max_velocity: f64,
     min_velocity: f64,
     accel: f64,
-    /// `status.status`, the MSTA-ordered bits `intCallback` keeps.
-    status: Arc<AtomicU32>,
+    /// C `pAxis->status`, which `intCallback` keeps.
+    status: Arc<Mutex<MotorStatus>>,
+    /// The motor record's devMotorAsyn, the genericPointer client.
+    poster: StatusPoster,
 }
 
 impl Axis {
@@ -175,6 +179,7 @@ impl Axis {
         setter: Arc<Mutex<dyn DrvSet>>,
         getter: Arc<dyn DrvGet>,
         poller: mpsc::Sender<PollCommand>,
+        poster: StatusPoster,
     ) -> Self {
         Self {
             motor,
@@ -185,6 +190,7 @@ impl Axis {
             min_velocity: 0.0,
             accel: 0.0,
             status: Arc::default(),
+            poster,
         }
     }
 
@@ -213,29 +219,64 @@ impl Axis {
     }
 }
 
+/// The `MotorStatus` bit of status parameter `function`, C's `bit_num`.
+fn status_bit(status: &mut MotorStatus, function: i32) -> Option<&mut bool> {
+    use function::*;
+    Some(match function {
+        DIRECTION => &mut status.direction,
+        DONE => &mut status.done,
+        HIGH_HARD_LIMIT => &mut status.high_limit,
+        HOME_SIGNAL => &mut status.home,
+        SLIP => &mut status.slip,
+        POWER_ON => &mut status.powered,
+        FOLLOWING_ERROR => &mut status.slip_stall,
+        HOME_ENCODER => &mut status.encoder_home,
+        HAS_ENCODER => &mut status.has_encoder,
+        PROBLEM => &mut status.problem,
+        MOVING => &mut status.msta_moving,
+        HAS_CLOSED_LOOP => &mut status.gain_support,
+        COMM_ERROR => &mut status.comms_error,
+        LOW_HARD_LIMIT => &mut status.low_limit,
+        HOMED => &mut status.homed,
+        _ => return None,
+    })
+}
+
 /// C `intCallback` (drvMotorAsyn.c:822-920) for the axis at `addr`: fold
-/// the changed status bits into `status`, then call back the float64
-/// clients of each changed parameter and the int32 clients of each changed
-/// status bit, of `MOTOR_STATUS`, and of every other reason. A value goes
-/// only to the clients of its reason and interface, which is C's walk of
-/// each interface's list. C's genericPointer clients are the motor record's
-/// devMotorAsyn, which here reads the axis itself.
+/// the changed status bits, position, encoder position and velocity into
+/// `status`, then call back the float64 clients of each changed parameter,
+/// the motor record with `status` whatever changed, and the int32 clients
+/// of each changed status bit, of `MOTOR_STATUS`, and of every other
+/// reason. A value goes only to the clients of its reason and interface,
+/// which is C's walk of each interface's list.
 fn int_callback(
     interrupts: &InterruptManager,
     getter: &dyn DrvGet,
     addr: i32,
-    status: &AtomicU32,
+    (status, poster): (&Mutex<MotorStatus>, &StatusPoster),
     changed: &[i32],
 ) {
     let bits = function::DIRECTION..=function::HOMED;
-    for &c in changed.iter().filter(|c| bits.contains(c)) {
-        let bit = 1u32 << (c - function::DIRECTION);
-        if getter.get_integer(c).unwrap_or(0) != 0 {
-            status.fetch_or(bit, Ordering::Relaxed);
-        } else {
-            status.fetch_and(!bit, Ordering::Relaxed);
+    let status = {
+        let mut status = lock(status);
+        for &c in changed {
+            if let Some(bit) = status_bit(&mut status, c) {
+                *bit = getter.get_integer(c).unwrap_or(0) != 0;
+            }
+            let value = match c {
+                function::POSITION => &mut status.position,
+                function::ENCODER_POSN => &mut status.encoder_position,
+                function::ACTUAL_VEL => &mut status.velocity,
+                _ => continue,
+            };
+            // C's getDouble leaves the value of an undefined one.
+            if let Some(v) = getter.get_double(c) {
+                *value = v;
+            }
         }
-    }
+        status.moving = !status.done;
+        status.clone()
+    };
     let fire = |iface, reason: usize, value| {
         interrupts.notify(InterruptValue {
             reason,
@@ -254,11 +295,12 @@ fn int_callback(
             ParamValue::Float64(value),
         );
     }
+    let word = MstaFlags::from_status(&status).bits() as i32;
+    poster.post(status);
     for &c in changed.iter().filter(|c| bits.contains(c)) {
         let value = getter.get_integer(c).unwrap_or(0);
         fire(InterfaceType::Int32, c as usize, ParamValue::Int32(value));
     }
-    let word = status.load(Ordering::Relaxed) as i32;
     fire(InterfaceType::Int32, STATUS, ParamValue::Int32(word));
     // Every other int32 client, changed or not. C sends its uninitialised
     // `ivalue` for a reason past the store (:905-909); here 0.
@@ -301,20 +343,27 @@ impl DrvMotorAsyn {
             InterfaceMask::UNMIGRATED_INTERRUPTS,
         );
         for (addr, axis) in axes.iter().enumerate() {
-            let Some(Axis { getter, status, .. }) = axis else {
+            let Some(Axis {
+                getter,
+                status,
+                poster,
+                ..
+            }) = axis
+            else {
                 continue;
             };
             let interrupts = InterruptManager::from_shared_state(base.interrupts.shared_state());
-            // The store holds its callback, so the callback holds the getter
+            // The store holds its callbacks, so the callback holds the getter
             // weakly.
             let weak: Weak<dyn DrvGet> = Arc::downgrade(getter);
-            let status = status.clone();
+            let (status, poster) = (status.clone(), poster.clone());
             let addr = addr as i32;
             getter
                 .params()
-                .set_callback(Arc::new(move |changed: &[i32]| {
+                .add_callback(Arc::new(move |changed: &[i32]| {
                     if let Some(getter) = weak.upgrade() {
-                        int_callback(&interrupts, &*getter, addr, &status, changed);
+                        let record = (&*status, &poster);
+                        int_callback(&interrupts, &*getter, addr, record, changed);
                     }
                 }));
         }
@@ -392,7 +441,7 @@ impl PortDriver for DrvMotorAsyn {
         let command = user.reason;
         let axis = self.axis(user, "readInt32")?;
         let value = match command {
-            STATUS => axis.status.load(Ordering::Relaxed) as i32,
+            STATUS => MstaFlags::from_status(&lock(&axis.status)).bits() as i32,
             _ => axis.get_integer(command),
         };
         user.print(
@@ -502,7 +551,8 @@ impl PortDriver for DrvMotorAsyn {
                 axis.wake();
                 r
             }
-            // C's forceCallback posts the axis' parameters; the poller posts.
+            // C's forceCallback makes the driver's next callCallback call
+            // back unchanged parameters too; the poller's poll is that one.
             UPDATE_STATUS => {
                 lock(&axis.motor).force_callback(user);
                 let _ = axis.poller.try_send(PollCommand::ForcePoll);

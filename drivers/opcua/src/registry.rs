@@ -9,14 +9,21 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_opcua::types::NodeId;
+use epics_rs::base::runtime::exit::at_exit;
+use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::runtime::task::block_on_sync;
 use parking_lot::Mutex;
+use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 
 use crate::client::UaConnector;
+use crate::ioc::glob_match;
 use crate::item::{Item, Leaf};
 use crate::link::{LinkInfo, LinkTarget, NameResolver, NodeIdentifier};
-use crate::session::{self, Control, SessionConfig, SessionHandle, SessionWorker};
+use crate::session::{self, SessionConfig, SessionHandle, SessionWorker};
 use crate::subscription::SubscriptionConfig;
 
 pub struct Registry {
@@ -26,11 +33,13 @@ pub struct Registry {
 
 #[derive(Default)]
 struct Inner {
-    sessions: HashMap<String, Arc<SessionHandle>>,
+    /// In creation order, which is the order a glob reports them in; the C's
+    /// glob yields a `std::set` of pointers, an order it does not define.
+    sessions: Vec<Arc<SessionHandle>>,
     /// Workers wait here until [`Registry::start`] spawns them.
     workers: Vec<SessionWorker>,
-    /// Subscription name → the session it runs on.
-    subscriptions: HashMap<String, String>,
+    /// (subscription, the session it runs on), in creation order.
+    subscriptions: Vec<(String, String)>,
     /// The item of each `opcuaItem` record, by record name — what an element
     /// record's link resolves to.
     item_records: HashMap<String, Arc<Mutex<Item>>>,
@@ -40,6 +49,17 @@ struct Inner {
     records: HashMap<String, String>,
     /// `opcuaItem` records whose own init failed (C: `dpvt` left NULL).
     failed_item_records: HashSet<String>,
+    /// Every bound record, in bind order: what `RecordConnector::glob` walks.
+    connectors: Vec<Connector>,
+}
+
+/// A bound record's `RecordConnector`, as far as `opcuaShow` reads it.
+struct Connector {
+    record: String,
+    /// The link's node identifier as `RecordConnector::glob` matches it: a
+    /// numeric one in decimal, none as empty.
+    identifier: String,
+    item: Arc<Mutex<Item>>,
 }
 
 /// What a record's device support gets when it binds its link.
@@ -65,108 +85,104 @@ impl Registry {
         })
     }
 
-    /// `opcuaSession` (`iocshIntegration.cpp:88-140`).
-    pub fn add_session(&self, config: SessionConfig) -> Result<(), String> {
+    /// `Session::createSession` (`Session.cpp:66-73`): `None` when the name is
+    /// taken by a session or a subscription.
+    pub fn add_session(&self, config: SessionConfig) -> Option<Arc<SessionHandle>> {
         let mut inner = self.inner.lock();
-        if inner.sessions.contains_key(&config.name) {
-            return Err(format!("session '{}' already exists", config.name));
+        if inner.name_in_use(&config.name) {
+            return None;
         }
-        let name = config.name.clone();
         let (handle, worker) = session::create(config, self.connector.clone());
-        inner.sessions.insert(name, handle);
+        inner.sessions.push(handle.clone());
         inner.workers.push(worker);
-        Ok(())
+        Some(handle)
     }
 
-    /// `opcuaSubscription` (`iocshIntegration.cpp:159-201`).
-    pub fn add_subscription(&self, config: SubscriptionConfig) -> Result<(), String> {
+    /// `Subscription::createSubscription` (`Subscription.cpp:28-36`): false when
+    /// the name is taken by a session or a subscription, or there is no such
+    /// session.
+    pub fn add_subscription(&self, config: SubscriptionConfig) -> bool {
         let mut inner = self.inner.lock();
-        if inner.subscriptions.contains_key(&config.name) {
-            return Err(format!("subscription '{}' already exists", config.name));
+        let Some(session) = inner.session(&config.session).cloned() else {
+            return false;
+        };
+        if inner.name_in_use(&config.name) {
+            return false;
         }
-        let session = inner
-            .sessions
-            .get(&config.session)
-            .ok_or_else(|| format!("unknown session '{}'", config.session))?
-            .clone();
         inner
             .subscriptions
-            .insert(config.name.clone(), config.session.clone());
+            .push((config.name.clone(), config.session.clone()));
         session.subscriptions.lock().push(config);
-        Ok(())
+        true
     }
 
-    /// `opcuaOptions` — the name is a session's or a subscription's
-    /// (`iocshIntegration.cpp:212-260`).
-    pub fn set_option(&self, name: &str, key: &str, value: &str) -> Result<(), String> {
-        let inner = self.inner.lock();
-        if let Some(session) = inner.sessions.get(name) {
-            return session.set_option(key, value);
-        }
-        let Some(session_name) = inner.subscriptions.get(name) else {
-            return Err(format!("unknown session or subscription '{name}'"));
+    /// `RegistryKeyNamespace::global.contains`: sessions and subscriptions
+    /// share one namespace.
+    pub fn name_in_use(&self, name: &str) -> bool {
+        self.inner.lock().name_in_use(name)
+    }
+
+    /// `Subscription::find`.
+    pub fn has_subscription(&self, name: &str) -> bool {
+        self.inner.lock().subscription_session(name).is_some()
+    }
+
+    /// `SubscriptionOpen62541::setOption` on the named subscription.
+    pub fn set_subscription_option(&self, name: &str, key: &str, value: &str) {
+        let Some(session) = self
+            .subscription_session(name)
+            .and_then(|s| self.session(&s).ok())
+        else {
+            return;
         };
-        let session = inner.sessions[session_name].clone();
-        drop(inner);
         let mut subscriptions = session.subscriptions.lock();
-        let subscription = subscriptions
-            .iter_mut()
-            .find(|s| s.name == name)
-            .expect("the subscription is on the session it was added to");
-        subscription.set_option(key, value);
-        Ok(())
-    }
-
-    /// `opcuaMapNamespace` (`iocshIntegration.cpp:452-490`).
-    pub fn map_namespace(&self, session: &str, index: u16, uri: &str) -> Result<(), String> {
-        let session = self.session(session)?;
-        session
-            .config
-            .lock()
-            .namespace_map
-            .insert(index, uri.to_string());
-        Ok(())
-    }
-
-    /// `opcuaConnect` / `opcuaDisconnect`.
-    pub fn control(&self, session: &str, control: Control) -> Result<(), String> {
-        self.session(session)?.control(control);
-        Ok(())
+        if let Some(subscription) = subscriptions.iter_mut().find(|s| s.name == name) {
+            subscription.set_option(key, value);
+        }
     }
 
     pub fn session(&self, name: &str) -> Result<Arc<SessionHandle>, String> {
         self.inner
             .lock()
-            .sessions
-            .get(name)
+            .session(name)
             .cloned()
             .ok_or_else(|| format!("unknown session '{name}'"))
     }
 
     pub fn sessions(&self) -> Vec<Arc<SessionHandle>> {
-        self.inner.lock().sessions.values().cloned().collect()
+        self.inner.lock().sessions.clone()
     }
 
-    /// Every name `opcuaOptions` and `opcuaShow` can match: the sessions and the
-    /// subscriptions (`RegistryKeyNamespace::global`, which the C keeps them
-    /// both in).
-    pub fn names(&self) -> Vec<String> {
+    /// `Session::glob`.
+    pub fn glob_sessions(&self, pattern: &str) -> Vec<Arc<SessionHandle>> {
         let inner = self.inner.lock();
         inner
             .sessions
-            .keys()
-            .chain(inner.subscriptions.keys())
+            .iter()
+            .filter(|s| glob_match(pattern, &s.name))
             .cloned()
             .collect()
     }
 
-    /// Start every session's worker. Called once, after `iocInit`, so that the
-    /// items of every record are in place before the first connection.
+    /// `Subscription::glob`, by name.
+    pub fn glob_subscriptions(&self, pattern: &str) -> Vec<String> {
+        let inner = self.inner.lock();
+        inner
+            .subscriptions
+            .iter()
+            .filter(|(name, _)| glob_match(pattern, name))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Start every session's worker (`SessionOpen62541::initHook`). Called once,
+    /// after `iocInit`, so that the items of every record are in place before
+    /// the first connection.
     ///
     /// An element record whose `opcuaItem` record failed its init *after* the
     /// element bound is reported here: init order is not load order in this
     /// port, so only now is the item known never to be adopted.
-    pub fn start(&self) -> usize {
+    pub fn start(&self) {
         let mut inner = self.inner.lock();
         for (name, item) in &inner.item_records {
             let item = item.lock();
@@ -175,7 +191,7 @@ impl Registry {
             }
             // C's `add_record` refuses each linking record (`devOpcua.cpp:107`).
             for leaf in &item.leaves {
-                eprintln!(
+                epics_rs::base::stderr_println!(
                     "{} Error in add_record : opcuaItemRecord '{name}' was not initialized correctly",
                     leaf.lock().record
                 );
@@ -183,12 +199,25 @@ impl Registry {
         }
 
         let workers = std::mem::take(&mut inner.workers);
-        let started = workers.len();
+        let sessions = inner.sessions.clone();
         drop(inner);
-        for worker in workers {
-            tokio::spawn(worker.run());
+        errlog_vprintf(format_args!("OPC UA: Autoconnecting sessions\n"));
+        let workers = workers.into_iter().map(SessionWorker::spawn).collect();
+        // C connects them one after another, in name order, before `iocInit`
+        // goes on (`SessionOpen62541.cpp:2697-2703`).
+        let mut by_name = sessions.clone();
+        by_name.sort_by(|a, b| a.name.cmp(&b.name));
+        for session in &by_name {
+            if let Some(done) = session.autoconnect() {
+                let _ = block_on_sync(done);
+            }
         }
-        started
+        // C registers it from `initHookAfterIocRunning` too
+        // (`SessionOpen62541.cpp:2705`).
+        let runtime = Handle::current();
+        at_exit("OPC UA sessions", move || {
+            disconnect_at_exit(&runtime, sessions, workers)
+        });
     }
 
     /// Bind one record to its item: a new item on a session or subscription, or
@@ -207,7 +236,7 @@ impl Registry {
     /// So both an element record and the item record itself reach the item
     /// through [`Self::item_of_record`], and whichever of the two binds first
     /// creates it. The item record's binding is the one that [`Item::adopt`]s it:
-    /// gives it its node, its session and its client handle.
+    /// gives it its node, its session and its index.
     /// A record with OPCUA device support attached (`set_record_info`).
     pub fn declare_record(&self, name: &str, record_type: &str) {
         self.inner
@@ -228,11 +257,46 @@ impl Registry {
     pub fn bind(
         &self,
         record: &str,
+        record_type: &str,
+        link: LinkInfo,
+        notify: tokio::sync::mpsc::Sender<()>,
+    ) -> Result<Binding, String> {
+        let identifier = match &link.identifier {
+            Some(NodeIdentifier::Numeric(id)) => id.to_string(),
+            Some(NodeIdentifier::String(id)) => id.clone(),
+            None => String::new(),
+        };
+        let binding = self.bind_item(record, record_type, link, notify)?;
+        self.inner.lock().connectors.push(Connector {
+            record: record.to_string(),
+            identifier,
+            item: binding.item.clone(),
+        });
+        Ok(binding)
+    }
+
+    /// `RecordConnector::glob` (`RecordConnector.cpp:219-262`): the item of
+    /// every bound record whose name, or else whose node identifier, matches.
+    pub fn glob_records(&self, pattern: &str) -> Vec<Arc<Mutex<Item>>> {
+        self.inner
+            .lock()
+            .connectors
+            .iter()
+            .filter(|c| glob_match(pattern, &c.record) || glob_match(pattern, &c.identifier))
+            .map(|c| c.item.clone())
+            .collect()
+    }
+
+    fn bind_item(
+        &self,
+        record: &str,
+        record_type: &str,
         link: LinkInfo,
         notify: tokio::sync::mpsc::Sender<()>,
     ) -> Result<Binding, String> {
         let leaf = Arc::new(Mutex::new(Leaf::new(
             record.to_string(),
+            record_type,
             link.clone(),
             notify,
         )));
@@ -276,9 +340,9 @@ impl Registry {
         };
         {
             let mut items = session.items.lock();
-            let client_handle = items.len() as u32;
+            let index = items.len() as u32;
             let mut locked = item.lock();
-            locked.adopt(link, node_id, client_handle, session.clone());
+            locked.adopt(link, node_id, index, session.clone());
             locked.leaves.push(leaf.clone());
             drop(locked);
             items.push(item.clone());
@@ -310,12 +374,58 @@ fn node_id_of(link: &LinkInfo) -> Result<NodeId, String> {
     }
 }
 
+impl Inner {
+    fn session(&self, name: &str) -> Option<&Arc<SessionHandle>> {
+        self.sessions.iter().find(|s| s.name == name)
+    }
+
+    fn subscription_session(&self, name: &str) -> Option<&str> {
+        self.subscriptions
+            .iter()
+            .find(|(subscription, _)| subscription == name)
+            .map(|(_, session)| session.as_str())
+    }
+
+    fn name_in_use(&self, name: &str) -> bool {
+        self.session(name).is_some() || self.subscription_session(name).is_some()
+    }
+}
+
 impl NameResolver for Registry {
     fn subscription_session(&self, name: &str) -> Option<String> {
-        self.inner.lock().subscriptions.get(name).cloned()
+        self.inner
+            .lock()
+            .subscription_session(name)
+            .map(str::to_string)
     }
 
     fn is_session(&self, name: &str) -> bool {
-        self.inner.lock().sessions.contains_key(name)
+        self.inner.lock().session(name).is_some()
     }
+}
+
+/// `SessionOpen62541::atExit` (`SessionOpen62541.cpp:2713-2723`). The sessions
+/// close side by side rather than one after another, so together they wait at
+/// most what open62541's synchronous CloseSession waits for one (the client's
+/// 5 s `timeout`).
+fn disconnect_at_exit(
+    runtime: &Handle,
+    sessions: Vec<Arc<SessionHandle>>,
+    workers: Vec<JoinHandle<()>>,
+) {
+    errlog_vprintf(format_args!("OPC UA: Disconnecting sessions\n"));
+    for session in &sessions {
+        session.exit();
+    }
+    // The exit callbacks may run on a thread outside the workers' runtime,
+    // whose timer the timeout needs.
+    let _runtime = runtime.enter();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        for worker in workers {
+            let _ = worker.await;
+        }
+    });
+    // A thread that may not block here (a current-thread runtime's) has asked
+    // the sessions to close and cannot see them do it.
+    let _ = block_on_sync(ended);
 }

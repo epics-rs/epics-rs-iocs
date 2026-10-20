@@ -5,6 +5,8 @@
 //! Everything here is a pure function of bytes in and bytes out, so it is
 //! tested without a detector.
 
+use epics_rs::base::runtime::stdlib::{c_isspace, strtod};
+
 use crate::types::{
     CoolingStatus, DEW_POINT_ERROR, DEW_POINT_WARNING, FrameType, HVMode, SyncOutFunction,
     SyncPolarity, TCOLD_ERROR, TCOLD_WARNING, THOT_ERROR, THOT_WARNING, TriggerMode,
@@ -176,44 +178,34 @@ pub fn parse_additional_info(reply: &[u8]) -> Option<&[u8]> {
 
 /// The value the status broadcast carries for `key`, e.g. `READ_TCOLD -21.5`:
 /// C's `sscanf(strstr(buffer, key), "<key> %f", &value)` on the C string in
-/// the datagram, so `%f` takes the longest float prefix into a `float`.
+/// the datagram, into a `float`.
 pub fn status_value(message: &[u8], key: &str) -> Option<f64> {
     let message = c_string(message);
-    let start = find(message, key.as_bytes())?;
-    let rest = message[start + key.len()..].trim_ascii_start();
-    let number = std::str::from_utf8(&rest[..float_prefix(rest)]).ok()?;
-    number.parse::<f32>().ok().map(f64::from)
+    let rest = &message[find(message, key.as_bytes())? + key.len()..];
+    let s = &rest[rest.iter().take_while(|&&b| c_isspace(b as char)).count()..];
+    let parsed = strtod(s);
+    if parsed.len == 0 || scanf_cannot_back_out(s) {
+        return None;
+    }
+    // `strtof` rounds once; a decimal through `f64` could round twice.
+    let value = std::str::from_utf8(&s[..parsed.len])
+        .ok()
+        .and_then(|t| t.parse::<f32>().ok())
+        .unwrap_or(parsed.value as f32);
+    Some(f64::from(value))
 }
 
-/// The length of the `strtof` subject sequence at the start of `s`: a sign,
-/// then `inf`/`infinity`/`nan` or digits with an optional point and exponent.
-fn float_prefix(s: &[u8]) -> usize {
-    let sign = usize::from(matches!(s.first(), Some(b'+' | b'-')));
-    let rest = &s[sign..];
-    for word in [&b"infinity"[..], b"inf", b"nan"] {
-        if rest.len() >= word.len() && rest[..word.len()].eq_ignore_ascii_case(word) {
-            return sign + word.len();
-        }
-    }
-    let digits = |s: &[u8]| s.iter().take_while(|b| b.is_ascii_digit()).count();
-    let int = digits(rest);
-    let mut len = int;
-    let mut frac = 0;
-    if rest.get(len) == Some(&b'.') {
-        frac = digits(&rest[len + 1..]);
-        len += 1 + frac;
-    }
-    if int + frac == 0 {
-        return 0;
-    }
-    if matches!(rest.get(len), Some(b'e' | b'E')) {
-        let exp_sign = usize::from(matches!(rest.get(len + 1), Some(b'+' | b'-')));
-        let exp = digits(&rest[len + 1 + exp_sign..]);
-        if exp > 0 {
-            len += 1 + exp_sign + exp;
-        }
-    }
-    sign + len
+/// Where glibc's `%f` refuses what `strtof` reads: having taken an `i` after
+/// `inf` or the `x` of `0x`, it cannot push them back, so the input must go on
+/// to `infinity`, or to a hex digit or point.
+fn scanf_cannot_back_out(s: &[u8]) -> bool {
+    let s = &s[usize::from(matches!(s.first(), Some(b'+' | b'-')))..];
+    let starts = |w: &[u8]| s.len() >= w.len() && s[..w.len()].eq_ignore_ascii_case(w);
+    (starts(b"infi") && !starts(b"infinity"))
+        || (starts(b"0x")
+            && !s
+                .get(2)
+                .is_some_and(|&b| b.is_ascii_hexdigit() || b == b'.'))
 }
 
 /// The dew point of the box (Magnus formula, C `statusTask`), with C's
@@ -377,6 +369,30 @@ mod tests {
         assert_eq!(status_value(msg, "READ_BOX_HUM"), Some(f64::from(24.7f32)));
         assert_eq!(status_value(msg, "READ_TCOLD"), Some(-0.5));
         assert_eq!(status_value(msg, "READ_BOX_TEMP"), None);
+    }
+
+    /// glibc's `%f`, probed: `strtof` after any C space, hex included, but it
+    /// cannot back out of `inf` going on with an `i` short of `infinity`, nor
+    /// of a `0x` with no hex digit or point after it.
+    #[test]
+    fn status_values_scan_as_glibc_percent_f() {
+        let value = |text: &str| status_value(format!("K{text}").as_bytes(), "K");
+        assert_eq!(value(" 0x10"), Some(16.0));
+        assert_eq!(value(" 0x.8"), Some(0.5));
+        assert_eq!(value(" 0x1p4"), Some(16.0));
+        assert_eq!(value(" \u{b}1.5"), Some(1.5));
+        assert_eq!(value(" \u{c}3"), Some(3.0));
+        assert_eq!(value(" INFINITY"), Some(f64::INFINITY));
+        assert_eq!(value(" -inF"), Some(f64::NEG_INFINITY));
+        assert!(value(" nan(12)").unwrap().is_nan());
+        assert_eq!(value(" infinit"), None);
+        assert_eq!(value(" -infi"), None);
+        assert_eq!(value(" 0x"), None);
+        assert_eq!(value(" 0xg"), None);
+        assert_eq!(value(" 0x.g"), Some(0.0));
+        assert_eq!(value(" 00x1"), Some(0.0));
+        assert_eq!(value(" 1e+"), Some(1.0));
+        assert_eq!(value(" in"), None);
     }
 
     #[test]

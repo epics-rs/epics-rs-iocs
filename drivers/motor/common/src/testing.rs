@@ -44,6 +44,9 @@ enum Answer {
     /// A command queues its lines; a read takes the next one and times out
     /// once none is left, as a real line does.
     Queued(Lines, VecDeque<String>),
+    /// [`Self::Queued`], but a command's lines go behind any still unread,
+    /// and a flush drops them all.
+    Held(Lines, VecDeque<String>),
 }
 
 impl PortDriver for Line {
@@ -58,8 +61,10 @@ impl PortDriver for Line {
         self.addrs.lock().unwrap().push(user.addr);
         if !data.iter().all(|b| matches!(b, b'\r' | b'\n')) {
             self.command.clone_from(&line);
-            if let Answer::Queued(lines, queue) = &mut self.answer {
-                *queue = lines(&self.command).into();
+            match &mut self.answer {
+                Answer::Queued(lines, queue) => *queue = lines(&self.command).into(),
+                Answer::Held(lines, queue) => queue.extend(lines(&self.command)),
+                Answer::Last(_) => {}
             }
         }
         let failed = (self.fails)(&line);
@@ -91,7 +96,7 @@ impl PortDriver for Line {
     fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
         let reply = match &mut self.answer {
             Answer::Last(reply) => reply(&self.command),
-            Answer::Queued(_, queue) => match queue.pop_front() {
+            Answer::Queued(_, queue) | Answer::Held(_, queue) => match queue.pop_front() {
                 Some(reply) => reply,
                 None => {
                     return OctetReadResult::failed(AsynError::Status {
@@ -114,6 +119,12 @@ impl PortDriver for Line {
             };
         }
         read
+    }
+    fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+        if let Answer::Held(_, queue) = &mut self.answer {
+            queue.clear();
+        }
+        Ok(())
     }
 }
 
@@ -170,6 +181,21 @@ impl LineRig {
             name,
             1,
             Answer::Queued(Box::new(lines), VecDeque::new()),
+            no(),
+            no(),
+        )
+    }
+
+    /// [`Self::queued`] for a line that keeps what was not read: each
+    /// command's lines wait behind earlier ones until read or flushed.
+    pub fn held(
+        name: &str,
+        lines: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
+    ) -> (Self, SyncIOHandle) {
+        Self::open(
+            name,
+            1,
+            Answer::Held(Box::new(lines), VecDeque::new()),
             no(),
             no(),
         )
@@ -301,20 +327,14 @@ pub async fn drvsup_init() {
     off_runtime(|| init_hook_announce(InitHookState::AfterInitDrvSup)).await;
 }
 
-/// The errlog lines of iocInit from drvSup init through record init, with
-/// the motor records of `db` loaded: what C's console shows for the cards
-/// and their records.
-pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
-    use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+/// iocInit's record init over the motor records of `db`, past
+/// [`drvsup_init`]: the database, for what init took from the cards.
+pub async fn record_init(db: &str) -> Arc<epics_rs::base::server::database::PvDatabase> {
     use epics_rs::base::server::ioc_builder::IocBuilder;
     use epics_rs::motor::devices::{device_support_factory, devices};
 
-    let lines = Arc::new(Mutex::new(Vec::new()));
-    let sink = lines.clone();
-    let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
-    drvsup_init().await;
     let (name, factory) = epics_rs::motor::motor_record_factory();
-    let _db = IocBuilder::new()
+    let (db, _) = IocBuilder::new()
         .register_record_type(name, factory)
         .register_dynamic_device_support(&devices(), device_support_factory())
         .db_string(db, &std::collections::HashMap::new())
@@ -322,6 +342,19 @@ pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
         .build()
         .await
         .unwrap();
+    db
+}
+
+/// The errlog lines of iocInit from drvSup init through record init over
+/// `db`: what C's console shows for the cards and their records.
+pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
+    use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));
+    drvsup_init().await;
+    let _db = record_init(db).await;
     errlog_flush();
     errlog_remove_listener(id);
     lines.lock().unwrap().clone()
@@ -387,6 +420,18 @@ pub async fn pollers_after(
     }
     sleep(Duration::from_millis(200)).await;
     pollers()
+}
+
+/// [`run_command`], then whether it left asyn port `port` registered.
+pub async fn port_after(
+    cmd: epics_rs::base::server::iocsh::registry::CommandDef,
+    args: Vec<epics_rs::base::server::iocsh::registry::ArgValue>,
+    port: &str,
+) -> bool {
+    run_command(cmd, args).await;
+    epics_rs::asyn::manager::PortManager::global()
+        .find_port_handle(port)
+        .is_ok()
 }
 
 /// C `asynReport(level, port)`'s text for asyn port `port`.

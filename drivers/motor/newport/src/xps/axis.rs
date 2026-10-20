@@ -106,6 +106,8 @@ pub struct XpsAxis {
     moving: bool,
     /// The status the last poll left, C's parameter-library values.
     last_status: MotorStatus,
+    /// What the last write set, for [`AsynMotor::take_status_writes`].
+    status_writes: Vec<StatusWrite>,
     /// C's `pasynUser_`: the motor port and axis number every error line
     /// prints on and names as `[port,axis]`.
     trace: MotorTrace,
@@ -173,6 +175,7 @@ impl XpsAxis {
                 vbas_supported: false,
                 ..Default::default()
             },
+            status_writes: Vec::new(),
             trace,
         };
         // C reads the corrector into `xpsCorrectorInfo_`, which nothing here
@@ -673,6 +676,11 @@ impl StatusFlags {
 }
 
 impl AsynMotor for XpsAxis {
+    /// The C constructor ends in `callParamCallbacks` (XPSAxis.cpp:163).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `XPSAxis::poll`'s `done` label sets only `motorStatusCommsError_`.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::COMMS_ERROR
@@ -791,14 +799,23 @@ impl AsynMotor for XpsAxis {
             ctrl.set_group_referencing(&self.group_name, false);
             let ctrl = &*ctrl;
             let sock = ctrl.poll_socket();
+            // C ignores both GroupStatusGet statuses. C defect, not copied: a
+            // failed first one leaves groupStatus uninitialized
+            // (XPSAxis.cpp:313, :327); here -1, so neither branch runs.
+            let mut status = -1;
+            let mut read_status = || {
+                if let Ok(s) = sock.group_status_get(&self.group_name) {
+                    status = s;
+                }
+                status
+            };
             // A Ready group (10..=18) will refuse home; kill it first.
-            let status = sock.group_status_get(&self.group_name)?;
-            if (10..=18).contains(&status) {
+            if (10..=18).contains(&read_status()) {
                 sock.group_kill(&self.group_name)
                     .inspect_err(|e| home_error(ctrl, "GroupKill", e))?;
             }
             // If not initialized, initialize it.
-            let status = sock.group_status_get(&self.group_name)?;
+            let status = read_status();
             if (0..=9).contains(&status) || status == 50 || status == 63 {
                 sock.group_initialize(&self.group_name)
                     .inspect_err(|e| home_error(ctrl, "GroupInitialize", e))?;
@@ -809,7 +826,14 @@ impl AsynMotor for XpsAxis {
             return Err(e.into());
         }
         self.moving = true;
+        // XPSAxis.cpp:359, posted by the write's callParamCallbacks.
+        self.last_status.problem = false;
+        self.status_writes.push(StatusWrite::Problem(false));
         Ok(())
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
@@ -1235,6 +1259,13 @@ mod tests {
         (axes.remove(0), fail, log)
     }
 
+    /// XPSAxis.cpp:163.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (axis, _, _) = fake_axis("xps_ctor_callback", "");
+        assert!(axis.constructor_calls_param_callbacks());
+    }
+
     /// One axis per positioner, numbered in order, on one controller.
     fn fake_axes(
         port: &str,
@@ -1625,6 +1656,44 @@ mod tests {
                 "{call}: status 12 is not referencing mode"
             );
         }
+    }
+
+    /// C home ignores both GroupStatusGet statuses (XPSAxis.cpp:327, :339):
+    /// with no status read it neither kills nor initializes, and still homes.
+    #[test]
+    fn home_goes_on_past_a_failed_group_status_get() {
+        let (mut axis, _, log) = fake_axis("xps_home_status", "GroupStatusGet");
+        log.lock().unwrap().clear();
+        axis.home(&AsynUser::new(0), 0.0, 1.0, 1.0, true).unwrap();
+        let log = log.lock().unwrap();
+        let sent: Vec<_> = log
+            .iter()
+            .map(|c| c.split(' ').next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            sent,
+            ["GroupStatusGet", "GroupStatusGet", "GroupHomeSearch"],
+            "{log:?}"
+        );
+    }
+
+    /// C home clears PROBLEM once GroupHomeSearch is sent (XPSAxis.cpp:359),
+    /// and the write posts it; a refused one returns before.
+    #[test]
+    fn home_clears_problem_once_the_search_is_sent() {
+        let (mut axes, line) = fake_line_axes("xps_home_problem", "MOTOR_T", "", false, &["G1.P1"]);
+        let mut axis = axes.remove(0);
+        let user = AsynUser::new(0);
+        *line.group_status.lock().unwrap() = 0;
+        assert!(axis.poll(&user).unwrap().problem, "status 0 is NOTINIT");
+        *line.fail.lock().unwrap() = "GroupHomeSearch";
+        assert!(axis.home(&user, 0.0, 1.0, 1.0, true).is_err());
+        assert_eq!(axis.take_status_writes(), []);
+        *line.fail.lock().unwrap() = "";
+        axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
+        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(false)]);
+        *line.fail.lock().unwrap() = "GroupStatusGet";
+        assert!(!axis.poll(&user).unwrap().problem, "a failed poll keeps it");
     }
 
     /// XPSAxis.cpp:566-575 fails the poll on GroupStatusStringGet; :628 ignores

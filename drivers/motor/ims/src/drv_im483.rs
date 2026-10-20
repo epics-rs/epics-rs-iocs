@@ -15,12 +15,15 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
+use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 /// `IM483PL_NUM_CARDS`.
@@ -60,6 +63,9 @@ impl Im483Controller {
 
     /// `send_mess` then `recv_mess`: the reply, empty when none came.
     fn ask(&self, msg: impl AsRef<[u8]>) -> String {
+        // write_read flushes first; C reads with no flush past motor_init
+        // (drvIM483PL.cc:440, drvIM483SM.cc:433), so one late reply shifts
+        // every later answer: a C defect, not copied.
         match self
             .handle
             .write_read(0, msg.as_ref(), BUFF_SIZE)
@@ -67,6 +73,13 @@ impl Im483Controller {
         {
             (raw, Ok(())) => String::from_utf8_lossy(&raw).into_owned(),
             (_, Err(_)) => String::new(),
+        }
+    }
+
+    /// `pasynOctetSyncIO->flush`.
+    fn flush(&self) {
+        if let Ok(port) = self.handle.port() {
+            let _ = port.submit_blocking(RequestOp::Flush, AsynUser::new(0));
         }
     }
 }
@@ -80,23 +93,18 @@ pub fn im483pl_probe(ctrl: &Im483Controller) -> usize {
         .count()
 }
 
-/// `motor_init`'s probe of an IM483SM, three tries: reset with ETX, wait a
-/// second, send a space and read the sign-on. Its identification when it
-/// answered, which C keeps only for `dbior`.
+/// `motor_init`'s probe of an IM483SM, three tries: flush, reset with ETX,
+/// wait a second, send a space and read the sign-on. Its identification
+/// when it answered, which C keeps only for `dbior`.
 pub fn im483sm_probe(ctrl: &Im483Controller) -> Option<String> {
     (0..3).find_map(|_| {
+        ctrl.flush();
         let _ = ctrl.handle.write_octet(0, b"\x03");
         sleep(Duration::from_secs(1));
-        let mut first = Some(ctrl.ask(" "));
-        sign_on_ident(|| {
-            let line = match first.take() {
-                Some(line) => line.into_bytes(),
-                None => match ctrl.handle.read_octet(0, BUFF_SIZE).into_parts() {
-                    (line, Ok(())) => line,
-                    (_, Err(_)) => Vec::new(),
-                },
-            };
-            Some(line).filter(|l| !l.is_empty())
+        let _ = ctrl.handle.write_octet(0, b" ");
+        sign_on_ident(|| match ctrl.handle.read_octet(0, BUFF_SIZE).into_parts() {
+            (line, Ok(())) => Some(line).filter(|l| !l.is_empty()),
+            (_, Err(_)) => None,
         })
     })
 }
@@ -171,12 +179,15 @@ pub struct DrvIm483Axis {
     /// `motor_info->position`.
     position: i32,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvIm483Axis {
-    /// Axis `signal` of an IM483PL, which C takes to carry an encoder.
+    /// Axis `signal` of an IM483PL, which C takes to carry an encoder, and
+    /// its status read (drvIM483PL.cc:601).
     pub fn im483pl(controller: Arc<Mutex<Im483Controller>>, signal: usize) -> Self {
-        Self {
+        Self::with_status(Self {
             controller,
             name: IM483PL_AXIS[signal],
             sep: " ",
@@ -188,12 +199,14 @@ impl DrvIm483Axis {
             },
             position: 0,
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        })
     }
 
-    /// The one axis of an IM483SM, which C takes to have no encoder.
+    /// The one axis of an IM483SM, which C takes to have no encoder, and its
+    /// status read (drvIM483SM.cc:633).
     pub fn im483sm(controller: Arc<Mutex<Im483Controller>>) -> Self {
-        Self {
+        Self::with_status(Self {
             controller,
             name: "",
             sep: "",
@@ -202,7 +215,14 @@ impl DrvIm483Axis {
             status: MotorStatus::default(),
             position: 0,
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        })
+    }
+
+    /// `motor_init`'s `set_status` of a new axis.
+    fn with_status(mut axis: Self) -> Self {
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, Im483Controller> {
@@ -253,6 +273,13 @@ impl DrvIm483Axis {
             format!("V{:.2};", CFloat(velocity)),
             format!("I{:.2};", CFloat(min_velocity)),
         ]
+    }
+}
+
+impl Model1Motor for DrvIm483Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.status.clone(), self.poll_failure())
     }
 }
 
@@ -434,6 +461,52 @@ mod tests {
         let endless = sign_on_ident(|| Some(b"ab".to_vec())).unwrap();
         assert_eq!(endless, vec!["ab"; 17].join(" "));
     }
+
+    /// drvIM483PL.cc:584-601: a failed `motor_init` read stores the
+    /// EA_PRESENT `motor_init` sets on an IM483PL axis, and nothing on an
+    /// IM483SM's (drvIM483SM.cc:617-633), the first raising nothing (RETRY)
+    /// and the next CNTRL_COMM_ERR and RA_PROBLEM (drvIM483PL.cc:252-264).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        let silent = |name| {
+            let (line, io) = motor_common::testing::LineRig::new(name, |_| String::new());
+            (line, Arc::new(Mutex::new(Im483Controller::new(io))))
+        };
+        let (_pl_line, pl) = silent("im483plInitFail");
+        let prepared = MotorStatus {
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        let init = |signal| DrvIm483Axis::im483pl(pl.clone(), signal).take_init_status();
+        assert_eq!(init(0), prepared);
+        assert_eq!(
+            init(1),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
+        let (_sm_line, sm) = silent("im483smInitFail");
+        let sm = DrvIm483Axis::im483sm(sm).take_init_status();
+        assert_eq!(sm, MotorStatus::default());
+    }
+
+    /// drvIM483SM.cc:551-555: the probe flushes ahead of the ETX, not after
+    /// its 1 s wait, so junk already on the line is dropped and what the
+    /// reset sends is read.
+    #[test]
+    fn the_sm_probe_flushes_before_the_reset_not_after_it() {
+        let (_line, io) =
+            motor_common::testing::LineRig::held("im483smProbeLine", |cmd| match cmd {
+                "junk" => vec!["stale".into()],
+                "\u{3}" => vec!["IM483SM".into()],
+                _ => Vec::new(),
+            });
+        let _ = io.write_octet(0, b"junk");
+        let ctrl = Im483Controller::new(io);
+        assert_eq!(im483sm_probe(&ctrl).as_deref(), Some("IM483SM"));
+    }
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
@@ -523,6 +596,7 @@ mod tests {
             } else {
                 DrvIm483Axis::im483sm(controller)
             };
+            sent.lock().unwrap().clear();
             Self {
                 axis,
                 sent,

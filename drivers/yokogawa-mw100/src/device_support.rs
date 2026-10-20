@@ -800,21 +800,25 @@ impl DeviceSupport for MwDevice {
             return Ok(WriteStart::Completed);
         };
         let command = output_command(*op, record)?;
-        // devMW100_bo.c:194-197: REC_TRIG and REC_ERROR drop VAL back to 0
-        // on the completing pass. Completion re-enters no device code, so
-        // it is cleared here, still before the cycle's monitor.
-        if matches!(
-            op,
-            Operation::InputTrig
+        instrument.submit_write(command, done.device_done());
+        Ok(WriteStart::Pending)
+    }
+
+    // devMW100_bo.c:192-197: the completing pass drops a REC_TRIG or
+    // REC_ERROR bo's VAL back to 0.
+    fn async_write_completed(&mut self, record: &mut dyn Record) {
+        if let Some(Resolved {
+            op:
+                Operation::InputTrig
                 | Operation::OutputTrig
                 | Operation::InfoTrig
                 | Operation::StatTrig
-                | Operation::ErrorClearSet
-        ) {
-            record.put_field("VAL", EpicsValue::Enum(0))?;
+                | Operation::ErrorClearSet,
+            ..
+        }) = self.resolved
+        {
+            let _ = record.put_field("VAL", EpicsValue::Enum(0));
         }
-        instrument.submit_write(command, done.device_done());
-        Ok(WriteStart::Pending)
     }
 }
 
@@ -1418,11 +1422,9 @@ mod tests {
         let db = PvDatabase::new();
         db.add_record("TEST", record).await.unwrap();
         let rec = db.get_record("TEST").unwrap();
-        let mut inst = rec.write();
-        inst.common.dtyp = DTYP.into();
+        rec.write().common.dtyp = DTYP.into();
         // The framework's init, so the record's own status-0 arm runs.
-        wire_device_to_record(&mut inst, device);
-        drop(inst);
+        wire_device_to_record(&db, &rec, device);
         db
     }
 
@@ -1515,6 +1517,7 @@ mod tests {
             let mut device = f(&ctx).unwrap();
             let mut record = FakeRecord::new("bo");
             device.init(&mut record).unwrap();
+            record.fields.insert("VAL", EpicsValue::Enum(1));
             let db = PvDatabase::new();
             let cell = DeviceDone::new(
                 &db,
@@ -1527,6 +1530,10 @@ mod tests {
                 .write_begin(&mut record, &DeviceDoneSource::new(&cell))
                 .unwrap();
             assert!(matches!(start, WriteStart::Pending));
+            // VAL drops to 0 on the completing pass, not while PACT holds.
+            assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(1)));
+            device.async_write_completed(&mut record);
+            assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
             assert_eq!(
                 device_thread.join().unwrap().last().unwrap(),
                 "FD1,001,A300\r\n"

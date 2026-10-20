@@ -37,7 +37,7 @@ pub enum ModuleType {
 
 #[derive(Debug, Clone, Default)]
 pub struct Module {
-    pub module_string: String,
+    pub module_string: Vec<u8>,
     pub use_flag: bool,
     pub mod_type: ModuleType,
     /// [input channel count, output channel count] (`channel_number[2]`).
@@ -60,7 +60,7 @@ pub struct ChannelInfo {
     /// depends on the channel's `ModuleType`; `16` is the shared "unknown"
     /// sentinel both C enums use.
     pub ch_mode: i32,
-    pub unit: String,
+    pub unit: Vec<u8>,
     /// 0-6, indexes `scaled_value`'s `scaler` table.
     pub scale: u8,
 }
@@ -120,14 +120,14 @@ pub fn scaled_value(value: i32, scale: u8) -> f64 {
 #[derive(Debug, Clone, Default)]
 pub struct ExprInfo {
     pub on_flag: bool,
-    pub expr: String,
+    pub expr: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ErrorState {
     pub code: i32,
     pub parameter: i32,
-    pub strings: [String; 3],
+    pub strings: [Vec<u8>; 3],
 }
 
 pub struct Cache {

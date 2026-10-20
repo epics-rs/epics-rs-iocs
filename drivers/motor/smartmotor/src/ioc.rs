@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -70,7 +70,7 @@ pub fn smartmotor_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
                 for axis in 0..num_axes {
                     let ax = SmartMotorAxis::new(controller.clone(), axis);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
                     init.axis(axis as i32, motor);
                 }
                 init.describe(asyn_port);
@@ -107,5 +107,44 @@ mod report {
             b"    SmartMotor controller 0 connection failed.\n    \
              SmartMotorSM controller #1, port=smReportLine, id:  \n"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvSmartMotor.cc:606-660: `motor_init` counts the motors, then reads
+    /// the status once, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn smartmotor_motor_init_reads_the_status_once() {
+        run_command(
+            smartmotor_setup_command(),
+            vec![ArgValue::Int(1), ArgValue::Int(10)],
+        )
+        .await;
+        let (line, _io) = LineRig::new("smInitLine", |cmd| {
+            match cmd {
+                "RP" => "14",
+                _ => "0",
+            }
+            .into()
+        });
+        let args = vec![ArgValue::Int(0), ArgValue::String("smInitLine".into())];
+        run_command(smartmotor_config_command(), args).await;
+        drvsup_init().await;
+        assert_eq!(
+            line.sent(),
+            [
+                "RBe", "RBt", "RP", "RBp", "RBm", "RBr", "RBl", "RBo", "RP", "RV"
+            ]
+        );
+        let db = record_init(
+            "record(motor, \"m1\") { field(DTYP, \"SmartMotor\") field(OUT, \"#C0 S0 @\") }\n",
+        )
+        .await;
+        assert_eq!(db.get_pv("m1.RMP").unwrap(), EpicsValue::Long(14));
     }
 }

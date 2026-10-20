@@ -462,6 +462,16 @@ impl AsynMotor for Anc150Axis {
         )))
     }
 
+    /// drvANC150Asyn.cc:328-330: a soft limit breaks out with the status
+    /// still MOTOR_AXIS_ERROR, and no line.
+    fn set_high_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        Err(anc_err("ANC150 does not set the high limit"))
+    }
+
+    fn set_low_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        Err(anc_err("ANC150 does not set the low limit"))
+    }
+
     /// C `motorAxisforceCallback`; the poll that follows is the poller's.
     fn force_callback(&mut self, _user: &AsynUser) {
         self.log.print(
@@ -583,10 +593,8 @@ impl Anc150Axis {
         let kind = match function {
             function::POSITION => return self.set_position(user, value),
             function::ENCODER_RATIO => return self.set_encoder_ratio(user, value),
-            // C breaks out with its status still MOTOR_AXIS_ERROR.
-            function::LOW_LIMIT | function::HIGH_LIMIT => {
-                return Err(anc_err(format!("ANC150 does not set function {function}")));
-            }
+            function::LOW_LIMIT => return self.set_low_limit(user, value),
+            function::HIGH_LIMIT => return self.set_high_limit(user, value),
             function::P_GAIN => PidGainKind::Proportional,
             function::I_GAIN => PidGainKind::Integral,
             function::D_GAIN => PidGainKind::Derivative,
@@ -817,7 +825,7 @@ mod tests {
     }
 
     /// drvANC150Asyn.cc:316-348: the encoder ratio and the gains are refused
-    /// with an ERROR line on the axis's log.
+    /// with an ERROR line on the axis's log, the soft limits with none.
     #[epics_rs::base::epics_test]
     async fn refusals_print_the_c_error_lines() {
         let (axes, path) = traced_axes("ancRefuse", TraceMask::ERROR).await;
@@ -831,6 +839,8 @@ mod tests {
         ] {
             assert!(axis.set_pid_gain(&user, kind, 0.5).is_err());
         }
+        assert!(axis.set_high_limit(&user, 9.0).is_err());
+        assert!(axis.set_low_limit(&user, -9.0).is_err());
         assert_eq!(
             take_trace(&path),
             "motorAxisSetDouble: ANC150 does not support setting encoder ratio\n\

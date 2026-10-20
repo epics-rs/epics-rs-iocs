@@ -13,18 +13,10 @@
 
 epicsEnvSet("dev", "MMS:S27:MMD1")
 
-# ---- L0 config port ----
-# Raw TCP transport, named "L0_RAW" rather than "L0" itself: unlike upstream
-# (StreamDevice attaches directly to the port drvAsynIPPortConfigure
-# creates), this port's db records bind to a distinct ConfigDriver-backed
-# asyn port named "L0" (matching xxCapaNCDT6200.template's Link=L0 macro
-# unchanged from upstream) -- CapaNCDT6200ConfigInit below creates that port
-# wrapping this raw transport.
-drvAsynIPPortConfigure("L0_RAW", "10.6.28.17:23", 0, 0, 0)
+epicsEnvSet("STREAM_PROTOCOL_PATH", "$(MICROEPSILON)/db")
 
-# CapaNCDT6200ConfigInit(cfgPort, ioPort, ioAddr) -- no upstream C
-# equivalent; see main.rs's module doc.
-CapaNCDT6200ConfigInit("L0", "L0_RAW", 0)
+# ---- L0 config port ----
+drvAsynIPPortConfigure("L0", "10.6.28.17:23", 0, 0, 0)
 
 # ---- L1 data port ----
 # capaNCDT6200Configure builds its own internal raw transport port
@@ -36,10 +28,10 @@ capaNCDT6200Configure("L1", "10.6.28.17", "10001")
 
 # Upstream's asynSetTraceIOMask/asynSetTraceMask diagnostic calls for
 # L0/L1 are deliberately omitted: they resolve via PortManager
-# (epics_rs::asyn::manager::PortManager::find_port_handle), which neither
-# CapaNCDT6200ConfigInit nor microepsilon::data_driver::configure populate
-# (both register only into asyn_record, matching every non-diagnostic-
-# command port in this workspace) -- see main.rs's module doc and
+# (epics_rs::asyn::manager::PortManager::find_port_handle), which
+# microepsilon::data_driver::configure does not populate (it registers
+# only into asyn_record, matching every non-diagnostic-command port in
+# this workspace) -- see main.rs's module doc and
 # asynrs-0221-serial-ioc-boilerplate-gap. Adding the dual-registry shim
 # these calls would need is out of scope for this task.
 

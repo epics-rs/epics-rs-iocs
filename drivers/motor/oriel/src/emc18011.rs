@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -61,7 +61,7 @@ use epics_rs::motor::flags::MotorCommand;
 
 use epics_libcom_rs::cfmt::CFloat;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{atof, nint};
 
 /// Millimetres per record step (C `EMC18011_RESOLUTION`, drvEMC18011.h).
@@ -345,6 +345,8 @@ pub struct Emc18011Axis {
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl Emc18011Axis {
@@ -359,6 +361,7 @@ impl Emc18011Axis {
             prev_position: 0.0,
             failure: PollFailure::NONE,
             strings: MoveStrings::default(),
+            init_status: None,
         };
         {
             // C sets motorSelect outright (drvEMC18011.cc:728).
@@ -367,7 +370,7 @@ impl Emc18011Axis {
             ctrl.wired = None;
             let _ = ctrl.select(index);
         }
-        let _ = axis.poll(&AsynUser::default());
+        axis.init_status = Some(axis.poll(&AsynUser::default()));
         axis
     }
 
@@ -415,6 +418,13 @@ impl Emc18011Axis {
 fn send_prem(ctrl: &Emc18011Controller, prem: &[u8]) {
     if !prem.is_empty() {
         ctrl.send(prem);
+    }
+}
+
+impl Model1Motor for Emc18011Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
     }
 }
 

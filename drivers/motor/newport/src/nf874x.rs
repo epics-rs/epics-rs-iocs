@@ -282,6 +282,11 @@ impl AsynMotor for Nf874xAxis {
         PollFailure::PROBLEM
     }
 
+    /// Only the 8743-CL branch calls back (874xMotorDriver.cpp:241-253).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        lock(&self.controller).closed_loop
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -574,6 +579,14 @@ mod tests {
     use epics_rs::motor::trace::TraceUser;
 
     use super::*;
+
+    #[test]
+    fn only_an_8743_cl_axis_constructor_calls_back() {
+        for closed_loop in [false, true] {
+            let axis = Nf874xAxis::new(Arc::new(Mutex::new(controller(closed_loop))), 1);
+            assert_eq!(axis.constructor_calls_param_callbacks(), closed_loop);
+        }
+    }
 
     fn controller(closed_loop: bool) -> Nf874xController {
         Nf874xController {

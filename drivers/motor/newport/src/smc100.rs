@@ -23,7 +23,7 @@
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, StatusWrite};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -46,6 +46,8 @@ pub struct Smc100Axis {
     step_size: f64,
     /// C `pasynUser_`.
     trace: MotorTrace,
+    /// What the last write set, for [`AsynMotor::take_status_writes`].
+    status_writes: Vec<StatusWrite>,
 }
 
 impl Smc100Axis {
@@ -57,6 +59,7 @@ impl Smc100Axis {
             axis,
             step_size,
             trace,
+            status_writes: Vec::new(),
         }
     }
 
@@ -78,17 +81,37 @@ impl Smc100Axis {
     }
 
     /// C `SMC100Axis::sendAccelAndVelocity`: send `VA` then `AC`, in steps
-    /// times `stepSize_`.
+    /// times `stepSize_`; `AC`'s status overwrites `VA`'s
+    /// (SMC100Driver.cpp:161-176).
     fn send_accel_and_velocity(&self, acceleration: f64, velocity: f64) -> AsynResult<()> {
-        self.write(&protocol::cmd_set_velocity(
+        let _ = self.write(&protocol::cmd_set_velocity(
             self.axis,
             velocity * self.step_size,
-        ))?;
+        ));
         self.write(&protocol::cmd_set_acceleration(
             self.axis,
             acceleration * self.step_size,
-        ))?;
-        Ok(())
+        ))
+    }
+
+    /// C SMC100Axis::moveVelocity: the SMC100 has no free jog, so the driver
+    /// queries the configured travel limits (SR?/SL?, already in controller
+    /// EGU) and moves to the limit in the jog direction. C bails on each
+    /// step's status (SMC100Driver.cpp:211-258).
+    fn jog_to_limit(&self, velocity: f64, acceleration: f64) -> AsynResult<()> {
+        self.send_accel_and_velocity(acceleration, velocity)?;
+        // A reply under 3 bytes is refused: C's `atof(&inString_[3])` reads
+        // past it into the previous reply.
+        let high =
+            protocol::parse_value(&self.write_read(&protocol::cmd_query_high_limit(self.axis))?)
+                .ok_or_else(|| parse_error("SR?"))?;
+        let low =
+            protocol::parse_value(&self.write_read(&protocol::cmd_query_low_limit(self.axis))?)
+                .ok_or_else(|| parse_error("SL?"))?;
+        // C: `maxVelocity > 0.`, so a zero jog goes to the low limit.
+        let target = if velocity > 0.0 { high } else { low };
+        // The limits are already controller EGU — sent directly, not scaled.
+        self.write(&protocol::cmd_move_absolute(self.axis, target))
     }
 }
 
@@ -114,7 +137,8 @@ impl AsynMotor for Smc100Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.send_accel_and_velocity(acceleration, velocity)?;
+        // The move's status overwrites the speed's (SMC100Driver.cpp:179-193).
+        let _ = self.send_accel_and_velocity(acceleration, velocity);
         self.write(&protocol::cmd_move_absolute(
             self.axis,
             position * self.step_size,
@@ -131,7 +155,7 @@ impl AsynMotor for Smc100Axis {
     ) -> AsynResult<()> {
         // C SMC100 has a native relative move (PR); override the trait's
         // poll-then-absolute default to match.
-        self.send_accel_and_velocity(acceleration, velocity)?;
+        let _ = self.send_accel_and_velocity(acceleration, velocity);
         self.write(&protocol::cmd_move_relative(
             self.axis,
             distance * self.step_size,
@@ -155,22 +179,15 @@ impl AsynMotor for Smc100Axis {
                 CFloat(acceleration)
             ),
         );
-        // C SMC100Axis::moveVelocity: the SMC100 has no free jog, so the driver
-        // queries the configured travel limits (SR?/SL?, already in controller
-        // EGU) and moves to the limit in the jog direction.
-        self.send_accel_and_velocity(acceleration, velocity)?;
-        // A reply under 3 bytes is refused: C's `atof(&inString_[3])` reads
-        // past it into the previous reply.
-        let high =
-            protocol::parse_value(&self.write_read(&protocol::cmd_query_high_limit(self.axis))?)
-                .ok_or_else(|| parse_error("SR?"))?;
-        let low =
-            protocol::parse_value(&self.write_read(&protocol::cmd_query_low_limit(self.axis))?)
-                .ok_or_else(|| parse_error("SL?"))?;
-        // C: `maxVelocity > 0.`, so a zero jog goes to the low limit.
-        let target = if velocity > 0.0 { high } else { low };
-        // The limits are already controller EGU — sent directly, not scaled.
-        self.write(&protocol::cmd_move_absolute(self.axis, target))
+        let result = self.jog_to_limit(velocity, acceleration);
+        // C's `skip` label: PROBLEM is the command status (SMC100Driver.cpp:254).
+        self.status_writes
+            .push(StatusWrite::Problem(result.is_err()));
+        result
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     fn home(
@@ -191,9 +208,10 @@ impl AsynMotor for Smc100Axis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
-        // C SMC100Axis::setPosition has no functional body — the command
-        // sprintf is commented out and no "redefine position" command is wired
-        // for the SMC100. This is intentionally a no-op.
+        // C SMC100Axis::setPosition (and setClosedLoop) has its sprintf
+        // commented out but still calls writeReadController, which resends
+        // the last command in outString_, a move among them
+        // (SMC100Driver.cpp:270-290). That C defect is not copied: a no-op.
         Ok(())
     }
 
@@ -271,6 +289,78 @@ mod tests {
         assert_eq!(axis.poll(&user).unwrap().position, 50000.0);
     }
 
+    /// C sets `status =` on each write and returns the last
+    /// (SMC100Driver.cpp:161-193); moveVelocity skips on that last status
+    /// only (:222-223).
+    #[test]
+    fn a_refused_velocity_still_sends_the_command_after_it() {
+        let (line, io) = LineRig::failing(
+            "smc100_refused",
+            |last| match last {
+                "1SR?" => "1SR25".to_string(),
+                "1SL?" => "1SL-5".to_string(),
+                _ => String::new(),
+            },
+            |cmd| cmd.starts_with("1VA"),
+        );
+        let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("SMC100_T", 0));
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 2.0, 0.0, 3.0, 4.0).unwrap();
+        axis.move_relative(&user, 2.0, 0.0, 3.0, 4.0).unwrap();
+        axis.move_velocity(&user, 0.0, 3.0, 4.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "1VA3.000000",
+                "1AC4.000000",
+                "1PA2.000000",
+                "1VA3.000000",
+                "1AC4.000000",
+                "1PR2.000000",
+                "1VA3.000000",
+                "1AC4.000000",
+                "1SR?",
+                "1SL?",
+                "1PA25.000000"
+            ]
+        );
+    }
+
+    /// A refused `AC` is sendAccelAndVelocity's status: the move overwrites
+    /// it with PA's or PR's (SMC100Driver.cpp:184-191), and moveVelocity
+    /// skips on it (:222-223).
+    #[test]
+    fn a_refused_acceleration_stops_only_the_jog() {
+        let (line, io) = LineRig::failing(
+            "smc100_refused_ac",
+            |last| match last {
+                "1SR?" => "1SR25".to_string(),
+                "1SL?" => "1SL-5".to_string(),
+                _ => String::new(),
+            },
+            |cmd| cmd.starts_with("1AC"),
+        );
+        let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("SMC100_T", 0));
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 2.0, 0.0, 3.0, 4.0).unwrap();
+        axis.move_relative(&user, 2.0, 0.0, 3.0, 4.0).unwrap();
+        assert!(axis.move_velocity(&user, 0.0, 3.0, 4.0).is_err());
+        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(true)]);
+        assert_eq!(
+            line.sent(),
+            [
+                "1VA3.000000",
+                "1AC4.000000",
+                "1PA2.000000",
+                "1VA3.000000",
+                "1AC4.000000",
+                "1PR2.000000",
+                "1VA3.000000",
+                "1AC4.000000",
+            ]
+        );
+    }
+
     /// SMC100Driver.cpp:243-249: only a positive jog velocity goes to the
     /// high limit.
     #[test]
@@ -287,6 +377,28 @@ mod tests {
         axis.move_velocity(&AsynUser::default(), 0.0, 0.0, 0.0)
             .unwrap();
         assert_eq!(line.sent().last().unwrap(), "1PA-5.000000");
+    }
+
+    /// SMC100Driver.cpp:253-255: moveVelocity's `skip` label posts PROBLEM
+    /// as its command status, raised on a failed one and cleared otherwise.
+    #[test]
+    fn move_velocity_posts_problem_as_its_status() {
+        let (_line, io) = LineRig::failing(
+            "smc100_jog_problem",
+            |last| match last {
+                "1SR?" => "1SR25".to_string(),
+                _ => "1SL-5".to_string(),
+            },
+            |cmd| cmd == "1SL?",
+        );
+        let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("SMC100_T", 0));
+        let user = AsynUser::default();
+        assert!(axis.move_velocity(&user, 0.0, 1.0, 0.0).is_err());
+        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(true)]);
+        let (_line, io) = LineRig::new("smc100_jog_ok", |_| "1SR25".to_string());
+        let mut axis = Smc100Axis::new(io, 1, 1.0, MotorTrace::new("SMC100_T", 0));
+        axis.move_velocity(&user, 0.0, 1.0, 0.0).unwrap();
+        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(false)]);
     }
 
     /// SMC100Driver.cpp:218: moveVelocity's FLOW line, on the axis's user

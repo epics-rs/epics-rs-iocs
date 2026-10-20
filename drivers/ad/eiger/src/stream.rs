@@ -277,6 +277,14 @@ pub fn decode_image(shape_part: &[u8], blob: &[u8], decompress: bool) -> Result<
 /// Classify and decode one multipart stream message.
 ///
 /// `parts` are the frames of a single ZeroMQ multipart message.
+/// The extra parts (config, flatfield, pixelmask, countrate) are the
+/// detector's calibration dump; C reads and discards them.
+fn dheader_series(first: &[u8]) -> Result<u64> {
+    let v: Value = serde_json::from_slice(first)
+        .map_err(|e| StreamError::Decode(format!("failed to parse dheader: {e}")))?;
+    json_u64(&v, "series")
+}
+
 pub fn decode_message(parts: &[&[u8]], decompress: bool) -> Result<StreamMessage> {
     let first = parts
         .first()
@@ -288,11 +296,7 @@ pub fn decode_message(parts: &[&[u8]], decompress: bool) -> Result<StreamMessage
     }
 
     if htype.starts_with("dheader") {
-        let v: Value = serde_json::from_slice(first)
-            .map_err(|e| StreamError::Decode(format!("failed to parse dheader: {e}")))?;
-        // The extra parts (config, flatfield, pixelmask, countrate) are the
-        // detector's calibration dump; C reads and discards them.
-        return Ok(StreamMessage::Header(json_u64(&v, "series")?));
+        return Ok(StreamMessage::Header(dheader_series(first)?));
     }
 
     if htype.starts_with("dimage") {
@@ -326,32 +330,55 @@ pub struct StreamApi {
 
 impl StreamApi {
     pub async fn connect(hostname: &str) -> Result<Self> {
+        Self::connect_to(&format!("tcp://{hostname}:{ZMQ_PORT}")).await
+    }
+
+    pub(crate) async fn connect_to(addr: &str) -> Result<Self> {
         use zeromq::Socket;
         let mut socket = zeromq::PullSocket::new();
-        let addr = format!("tcp://{hostname}:{ZMQ_PORT}");
         socket
-            .connect(&addr)
+            .connect(addr)
             .await
             .map_err(|e| StreamError::Transport(format!("connect {addr}: {e}")))?;
         Ok(Self { socket })
     }
 
-    /// Receive and decode the next message, or `Ok(None)` on timeout
-    /// (C polls the socket with a timeout in seconds).
-    pub async fn recv(
-        &mut self,
-        timeout: std::time::Duration,
-        decompress: bool,
-    ) -> Result<Option<StreamMessage>> {
+    /// Receive the next message, or `Ok(None)` on timeout (C polls the socket
+    /// with a timeout in seconds). It is decoded apart, so the caller can read
+    /// StreamDecompress after the frame arrives, where C's getFrame does.
+    pub async fn recv(&mut self, timeout: std::time::Duration) -> Result<Option<Received>> {
         use zeromq::SocketRecv;
 
-        let msg = match tokio::time::timeout(timeout, self.socket.recv()).await {
-            Err(_) => return Ok(None),
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => return Err(StreamError::Transport(e.to_string())),
-        };
-        let parts: Vec<&[u8]> = msg.iter().map(|f| f.as_ref()).collect();
-        decode_message(&parts, decompress).map(Some)
+        match tokio::time::timeout(timeout, self.socket.recv()).await {
+            Err(_) => Ok(None),
+            Ok(Ok(m)) => Ok(Some(Received(m))),
+            Ok(Err(e)) => Err(StreamError::Transport(e.to_string())),
+        }
+    }
+}
+
+/// One multipart message off the stream socket, not yet decoded.
+pub struct Received(zeromq::ZmqMessage);
+
+impl Received {
+    /// C `StreamAPI::getHeader`: anything but a `dheader`, a series end
+    /// included, is a wrong header type.
+    pub fn header(&self) -> Result<u64> {
+        let first = self
+            .0
+            .iter()
+            .next()
+            .ok_or_else(|| StreamError::Decode("empty zmq message".into()))?;
+        let htype = htype_of(first)?;
+        if !htype.starts_with("dheader") {
+            return Err(StreamError::WrongHtype(htype));
+        }
+        dheader_series(first)
+    }
+
+    pub fn decode(&self, decompress: bool) -> Result<StreamMessage> {
+        let parts: Vec<&[u8]> = self.0.iter().map(|f| f.as_ref()).collect();
+        decode_message(&parts, decompress)
     }
 }
 

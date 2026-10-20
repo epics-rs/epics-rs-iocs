@@ -65,12 +65,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{atof, nint};
 
 use crate::scan_int;
@@ -226,8 +228,8 @@ impl PIE517Controller {
     }
 
     /// Write a query and read its reply as one exchange that first flushes
-    /// stale input, so a stray line cannot shift every later reply by one
-    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    /// stale input. C flushes only at `set_status` (drvPIE517.cc:251), so a late reply
+    /// shifts its answers until the next poll: a C defect, not copied.
     fn exchange(&self, cmd: &str) -> String {
         Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
     }
@@ -298,14 +300,16 @@ pub struct PIE517Axis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIE517Axis {
-    /// Construct one axis, seeding the initial status (C `motor_init`'s
-    /// `set_status` call). `prev_position` starts at 0.
+    /// Construct one axis and read its status, as C `motor_init`'s
+    /// `set_status` does (drvPIE517.cc:660). `prev_position` starts at 0.
     pub fn new(controller: Arc<Mutex<PIE517Controller>>, axis: usize) -> Self {
         let mut me = Self {
-            controller: controller.clone(),
+            controller,
             axis,
             prev_position: 0,
             failure: PollFailure::NONE,
@@ -316,12 +320,9 @@ impl PIE517Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(reading) = ctrl.poll_axis(axis) {
-            drop(ctrl);
-            me.last_status = fold_reading(&mut me.prev_position, false, &reading);
-        }
+        me.init_status = Some(me.poll(&AsynUser::new(0)));
         me
     }
 
@@ -350,11 +351,18 @@ impl PIE517Axis {
     fn move_line(&mut self, command: &str) -> Vec<u8> {
         let prem = self.strings.arm();
         let mut line = self.addressed(&prem);
-        if !line.is_empty() && !command.is_empty() {
+        if !line.is_empty() {
             line.push(b'\n');
         }
         line.extend_from_slice(command.as_bytes());
         line
+    }
+}
+
+impl Model1Motor for PIE517Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -379,7 +387,9 @@ impl AsynMotor for PIE517Axis {
         let label = self.label();
         let line = self.move_line(&mov_cmd(label, position));
         let ctrl = self.lock();
-        ctrl.send(&vel_cmd(label, velocity * POS_RES))?;
+        // motordrvCom sends each message whatever the one before returned
+        // (motordrvCom.cc:397-484).
+        let _ = ctrl.send(&vel_cmd(label, velocity * POS_RES));
         ctrl.send_bytes(&line)
     }
 
@@ -394,7 +404,7 @@ impl AsynMotor for PIE517Axis {
         let label = self.label();
         let line = self.move_line(&mvr_cmd(label, distance));
         let ctrl = self.lock();
-        ctrl.send(&vel_cmd(label, velocity * POS_RES))?;
+        let _ = ctrl.send(&vel_cmd(label, velocity * POS_RES));
         ctrl.send_bytes(&line)
     }
 
@@ -511,19 +521,40 @@ mod tests {
     /// Axis 1 of a one-axis E-517 on a [`LineRig`] whose `ONT? 1` reply
     /// follows `ont`.
     fn strings_rig(name: &str) -> (LineRig, PIE517Axis, Arc<AtomicU8>) {
+        refusing_rig(name, |_| false)
+    }
+
+    /// [`strings_rig`] with each write `refused` picks recorded and refused.
+    fn refusing_rig(name: &str, refused: fn(&str) -> bool) -> (LineRig, PIE517Axis, Arc<AtomicU8>) {
         let ont = Arc::new(AtomicU8::new(1));
         let o = ont.clone();
-        let (line, io) = LineRig::new(name, move |last| match last {
-            "SVO? 1" => "1=1".into(),
-            "POS? 1" => "1=0.000".into(),
-            "ONT? 1" => format!("1={}", o.load(Ordering::SeqCst)),
-            "OVF? 1" => "1=0".into(),
-            _ => String::new(),
-        });
+        let (line, io) = LineRig::failing(
+            name,
+            move |last| match last {
+                "SVO? 1" => "1=1".into(),
+                "POS? 1" => "1=0.000".into(),
+                "ONT? 1" => format!("1={}", o.load(Ordering::SeqCst)),
+                "OVF? 1" => "1=0".into(),
+                _ => String::new(),
+            },
+            refused,
+        );
         let ctrl = PIE517Controller::new(io).unwrap();
         let axis = PIE517Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis, ont)
+    }
+
+    /// The velocity and the move are each a message of their own, whose
+    /// status C's motor task drops.
+    #[test]
+    fn a_refused_velocity_still_sends_the_move() {
+        let (line, mut axis, _) = refusing_rig("e517Refused", |cmd| cmd.starts_with("VEL 1"));
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 1.0, 0.0, 2.0, 0.0).unwrap();
+        axis.move_relative(&user, -1.0, 0.0, 2.0, 0.0).unwrap();
+        let sent: Vec<String> = line.sent().iter().map(|c| c[..3].to_string()).collect();
+        assert_eq!(sent, ["VEL", "MOV", "VEL", "MVR"]);
     }
 
     fn post(text: &[u8]) -> PostMessage {
@@ -565,8 +596,9 @@ mod tests {
         axis.move_velocity(&user, 0.0, -2.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["SVO 1 1\nVEL 1 -2.000"]);
         axis.set_move_strings(&user, b"SVO # 1", None).unwrap();
+        // HOME builds no command, but its PREM keeps the EOL.
         assert!(axis.home(&user, 0.0, 1.0, 0.0, true).is_err());
-        assert_eq!(line.sent(), ["SVO 1 1"]);
+        assert_eq!(line.sent(), ["SVO 1 1\n"]);
     }
 
     /// drvPIE517.cc:372-379: POST, unaddressed, once the move is done, not
@@ -695,5 +727,31 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIE517.cc:283-304 exit stores what motor_init prepared (:647-656,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once past
+    /// RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("e517InitFail", |_| String::new());
+        let ctrl = Arc::new(Mutex::new(PIE517Controller::new(io).unwrap()));
+        let mut first = PIE517Axis::new(ctrl.clone(), 0);
+        let mut second = PIE517Axis::new(ctrl, 1);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }

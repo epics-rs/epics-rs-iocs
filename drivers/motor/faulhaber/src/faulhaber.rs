@@ -36,12 +36,12 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 use motor_common::util::{atof, nint};
 
 /// Query read timeout (C `recv_mess` 1.0 s); writes use the caller's
@@ -151,8 +151,9 @@ impl FaulhaberController {
 
     /// Send a query to `node` and return its reply, trimmed of framing.
     fn query(&self, node: usize, cmd: &str) -> AsynResult<String> {
-        // C send_mess/recv_mess write then read with no flush, so one stray
-        // line shifts every later reply; write_read flushes first.
+        // C send_mess/recv_mess write then read with no flush
+        // (drvMCDC2805.cc:442), so one stray line shifts every later reply;
+        // write_read flushes first: a C defect, not copied.
         let (raw, status) = self
             .reader
             .write_read(0, &Self::framed(node, cmd), READ_BUF)
@@ -199,13 +200,16 @@ pub struct FaulhaberAxis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl FaulhaberAxis {
     /// Construct axis `node` (0-based) and run the C `motor_init` per-axis setup:
     /// RS-232 velocity source (`SOR 0`) and the limit-switch and homing
-    /// configuration. Performs blocking serial I/O; as C's bare `send_mess`
-    /// (drvMCDC2805.cc:600-623), a refused command keeps the axis.
+    /// configuration, then its status read. Performs blocking serial I/O; as
+    /// C's bare `send_mess` (drvMCDC2805.cc:600-623), a refused command keeps
+    /// the axis.
     pub fn new(controller: Arc<Mutex<FaulhaberController>>, node: usize) -> Self {
         {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -217,7 +221,7 @@ impl FaulhaberAxis {
                 let _ = ctrl.write_cmd(node, cmd);
             }
         }
-        Self {
+        let mut axis = Self {
             controller,
             node,
             // Read only by a move, which set_record_fields leads.
@@ -233,7 +237,10 @@ impl FaulhaberAxis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn counts_per_rev(&self) -> f64 {
@@ -250,26 +257,27 @@ impl FaulhaberAxis {
 
     /// The record's SET_VELOCITY, then SET_ACCEL unless the acceleration is
     /// zero (motorRecord.cc:938-942), each `ENCRES` then `SP` / `AC`
-    /// (devMCDC2805.cc:248-270).
-    fn program_motion(&self, velocity: f64, acceleration: f64) -> AsynResult<()> {
+    /// (devMCDC2805.cc:248-270). Like every message of a transaction, each
+    /// goes out whatever the one before it returned: `send_mess` ignores the
+    /// write (drvMCDC2805.cc), and so does motordrvCom (motordrvCom.cc:397-484).
+    fn program_motion(&self, velocity: f64, acceleration: f64) {
         let ctrl = self.lock();
-        ctrl.write_cmd(self.node, &self.encres())?;
-        ctrl.write_cmd(
+        let _ = ctrl.write_cmd(self.node, &self.encres());
+        let _ = ctrl.write_cmd(
             self.node,
             &format!("SP {}", vel_to_rpm(velocity, self.counts_per_rev())),
-        )?;
+        );
         if acceleration > 0.0 {
-            self.set_accel(&ctrl, acceleration)?;
+            self.set_accel(&ctrl, acceleration);
         }
-        Ok(())
     }
 
-    fn set_accel(&self, ctrl: &FaulhaberController, acceleration: f64) -> AsynResult<()> {
-        ctrl.write_cmd(self.node, &self.encres())?;
-        ctrl.write_cmd(
+    fn set_accel(&self, ctrl: &FaulhaberController, acceleration: f64) {
+        let _ = ctrl.write_cmd(self.node, &self.encres());
+        let _ = ctrl.write_cmd(
             self.node,
             &format!("AC {}", accel_to_rev(acceleration, self.counts_per_rev())),
-        )
+        );
     }
 
     /// PREM and a blank lead a move's first message, and its POST waits for
@@ -286,6 +294,13 @@ impl FaulhaberAxis {
     }
 }
 
+impl Model1Motor for FaulhaberAxis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
+    }
+}
+
 impl AsynMotor for FaulhaberAxis {
     fn poll_failure(&self) -> PollFailure {
         self.failure
@@ -299,8 +314,8 @@ impl AsynMotor for FaulhaberAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.program_motion(velocity, acceleration)?;
-        self.lead_move(&format!("LA {}", nint(position)))?;
+        self.program_motion(velocity, acceleration);
+        let _ = self.lead_move(&format!("LA {}", nint(position)));
         self.lock().write_cmd(self.node, "M")
     }
 
@@ -312,8 +327,8 @@ impl AsynMotor for FaulhaberAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.program_motion(velocity, acceleration)?;
-        self.lead_move(&format!("LR {}", nint(distance)))?;
+        self.program_motion(velocity, acceleration);
+        let _ = self.lead_move(&format!("LR {}", nint(distance)));
         self.lock().write_cmd(self.node, "M")
     }
 
@@ -329,11 +344,11 @@ impl AsynMotor for FaulhaberAxis {
         // signed too; a maximum speed is not, so that is not copied.
         // C never sends that SP: its node keeps type UNDEFINED, which
         // motor_send (motordrvCom.cc:563-576) refuses; that defect is not copied.
-        self.set_accel(&self.lock(), acceleration)?;
+        self.set_accel(&self.lock(), acceleration);
         let rpm = vel_to_rpm(velocity, self.counts_per_rev());
-        self.lead_move(&self.encres())?;
+        let _ = self.lead_move(&self.encres());
         let ctrl = self.lock();
-        ctrl.write_cmd(self.node, &format!("SP {}", rpm.abs()))?;
+        let _ = ctrl.write_cmd(self.node, &format!("SP {}", rpm.abs()));
         ctrl.write_cmd(self.node, &format!("V {rpm}"))
     }
 
@@ -350,17 +365,17 @@ impl AsynMotor for FaulhaberAxis {
         // sequence, and GO's `M`.
         // C never sends HOSP: its node keeps type UNDEFINED, which motor_send
         // (motordrvCom.cc:563-576) refuses; that defect is not copied.
-        self.program_motion(velocity, acceleration)?;
+        self.program_motion(velocity, acceleration);
         // HOSP runs at VELO, not HVEL (devMCDC2805.cc:224); C divides VELO's
         // EGU/s by SREV without MRES, a unit mix not copied.
         let mut rpm = vel_to_rpm(self.record.velocity, self.counts_per_rev());
         if !forward {
             rpm = -rpm;
         }
-        self.lead_move(&self.encres())?;
+        let _ = self.lead_move(&self.encres());
         let ctrl = self.lock();
-        ctrl.write_cmd(self.node, &format!("HOSP{rpm}"))?;
-        ctrl.write_cmd(self.node, "GOHOSEQ")?;
+        let _ = ctrl.write_cmd(self.node, &format!("HOSP{rpm}"));
+        let _ = ctrl.write_cmd(self.node, "GOHOSEQ");
         ctrl.write_cmd(self.node, "M")
     }
 
@@ -530,19 +545,24 @@ mod tests {
     impl Rig {
         /// Node 1 at 1000 counts/rev, its setup traffic taken.
         fn new(name: &str) -> Self {
+            Self::refusing(name, |_| false)
+        }
+
+        /// [`Rig::new`], with the writes `refused` picks refused.
+        fn refusing(name: &str, refused: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
             let moving = Arc::new(AtomicBool::new(false));
             let minus = Arc::new(AtomicBool::new(false));
             let pos = Arc::new(Mutex::new("0"));
             let (m, l, p) = (moving.clone(), minus.clone(), pos.clone());
-            let (line, io) =
-                LineRig::new(name, move |last| match last.get(1..).unwrap_or_default() {
-                    "VER" => "MCDC2805".into(),
-                    "GST" => "0000000".into(),
-                    "POS" => (*p.lock().unwrap()).into(),
-                    "GAST" => if l.load(Ordering::SeqCst) { "01" } else { "00" }.into(),
-                    "GV" => if m.load(Ordering::SeqCst) { "-60" } else { "0" }.into(),
-                    _ => String::new(),
-                });
+            let reply = move |last: &str| match last.get(1..).unwrap_or_default() {
+                "VER" => "MCDC2805".into(),
+                "GST" => "0000000".into(),
+                "POS" => (*p.lock().unwrap()).into(),
+                "GAST" => if l.load(Ordering::SeqCst) { "01" } else { "00" }.into(),
+                "GV" => if m.load(Ordering::SeqCst) { "-60" } else { "0" }.into(),
+                _ => String::new(),
+            };
+            let (line, io) = LineRig::failing(name, reply, refused);
             let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
             let mut axis = FaulhaberAxis::new(controller, 1);
             let user = AsynUser::new(0);
@@ -666,6 +686,36 @@ mod tests {
         assert_eq!(r.poll_extra(), ["1LA 0", "1M", "1DI"]);
     }
 
+    /// motordrvCom sends each message of a transaction and ignores what
+    /// send_mess returns (motordrvCom.cc:397-484): a refused ENCRES or
+    /// GOHOSEQ still sends the messages after it.
+    #[test]
+    fn a_refused_message_still_sends_the_ones_after_it() {
+        let mut r = Rig::refusing("mcdc_refused", |cmd| {
+            ["1ENCRES1000", "1GOHOSEQ", "1V -60"].contains(&cmd)
+        });
+        r.axis.set_record_fields(&r.user, &fields(2000.0)).unwrap();
+        r.axis.move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1ENCRES1000", "1SP 0", "1LA 100", "1M"]);
+        r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
+        assert_eq!(
+            r.line.sent(),
+            [
+                "1ENCRES1000",
+                "1SP 60",
+                "1ENCRES1000",
+                "1HOSP-120",
+                "1GOHOSEQ",
+                "1M"
+            ]
+        );
+        assert!(r.axis.move_velocity(&r.user, 0.0, -1000.0, 0.0).is_err());
+        assert_eq!(
+            r.line.sent(),
+            ["1ENCRES1000", "1AC 0", "1ENCRES1000", "1SP 60", "1V -60"]
+        );
+    }
+
     #[test]
     fn framed_prefixes_node() {
         assert_eq!(FaulhaberController::framed(0, "GST"), b"0GST");
@@ -687,6 +737,36 @@ mod tests {
         // 3000 counts/s² at 1000 counts/rev = 3 rev/s².
         assert_eq!(accel_to_rev(3000.0, 1000.0), 3);
         assert_eq!(accel_to_rev(3000.0, 0.0), 0);
+    }
+
+    /// drvMCDC2805.cc:589-623: a failed `motor_init` read stores the
+    /// GAIN_SUPPORT and EA_PRESENT `motor_init` set, the first raising
+    /// nothing (RETRY) and the next CNTRL_COMM_ERR and RA_PROBLEM
+    /// (:238-250).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        let (_line, io) = LineRig::new("faulhaberInitFail", |last| {
+            match last.get(1..).unwrap_or_default() {
+                "VER" => "MCDC2805".into(),
+                _ => String::new(),
+            }
+        });
+        let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
+        let init = |node| FaulhaberAxis::new(controller.clone(), node).take_init_status();
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(0), prepared);
+        assert_eq!(
+            init(1),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// drvMCDC2805.cc:229-251: a first missed `GST` is RETRY (nothing

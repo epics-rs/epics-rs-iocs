@@ -40,6 +40,10 @@ pub struct Update {
     /// Set when this frame's geometry differed from the previous one and the
     /// accumulation was restarted (C's "size mismatch", serval_stream.cpp:735).
     pub reset: bool,
+    /// The range latch this frame moved, for the caller to post: Ok on a
+    /// restart, AccumulatorSaturated on a saturated add. A restarted sum
+    /// starts from one frame and cannot saturate, so at most one moves.
+    pub range: Option<RangeState>,
 }
 
 /// C `ADTimePix3Numeric::RangeState` (numeric_range.h:17), ordered as C
@@ -61,6 +65,13 @@ impl RangeState {
             Self::AccumulatorSaturated => "Accumulator saturated",
         }
     }
+}
+
+/// C `saturatingAdd` (numeric_range.cpp:17): `left + right` capped at
+/// `u64::MAX`, and whether it was capped.
+fn saturating_add(left: u64, right: u64) -> (u64, bool) {
+    left.checked_add(right)
+        .map_or((u64::MAX, true), |sum| (sum, false))
 }
 
 /// C `clampAverageToUInt32` (numeric_range.cpp:38): `sum / divisor`, capped at
@@ -293,6 +304,16 @@ impl Accumulator {
         self.total_counts
     }
 
+    /// The total as the signed TotalCounts param carries it: C
+    /// `clampToInt64`, latching OutputClamped when it clamps
+    /// (serval_stream.cpp:1351-1357, histogram_io.cpp:564-570).
+    pub fn public_total(&mut self) -> (i64, Option<RangeState>) {
+        match i64::try_from(self.total_counts) {
+            Ok(total) => (total, None),
+            Err(_) => (i64::MAX, self.report_range(RangeState::OutputClamped)),
+        }
+    }
+
     pub fn buffered_frames(&self) -> usize {
         self.window.frame_count()
     }
@@ -327,6 +348,7 @@ impl Accumulator {
 
     pub fn add(&mut self, frame: &[u32]) -> Update {
         let mut reset = false;
+        let mut range = None;
         if frame.len() != self.len {
             // A geometry change invalidates every accumulated frame.
             self.running = vec![0; frame.len()];
@@ -336,16 +358,29 @@ impl Accumulator {
             self.total_counts = 0;
             self.since_update = 0;
             reset = true;
+            // serval_stream.cpp:1086, histogram_io.cpp:485.
+            range = self.report_range(RangeState::Ok);
         }
 
         let mut frame_counts: u64 = 0;
+        let mut saturated = false;
         for (acc, &v) in self.running.iter_mut().zip(frame) {
             // C caps the running sum at UINT64_MAX (img_accumulation.cpp:151).
-            *acc = acc.saturating_add(u64::from(v));
+            let (sum, capped) = saturating_add(*acc, u64::from(v));
+            *acc = sum;
+            saturated |= capped;
             frame_counts = frame_counts.saturating_add(u64::from(v));
         }
-        self.total_counts = self.total_counts.saturating_add(frame_counts);
-        self.frame_count += 1;
+        let (total, capped) = saturating_add(self.total_counts, frame_counts);
+        self.total_counts = total;
+        saturated |= capped;
+        let (frames, capped) = saturating_add(self.frame_count, 1);
+        self.frame_count = frames;
+        saturated |= capped;
+        if saturated {
+            // serval_stream.cpp:1091-1130, histogram_io.cpp:509-524.
+            range = self.report_range(RangeState::AccumulatorSaturated);
+        }
         self.current.clear();
         self.current.extend_from_slice(frame);
 
@@ -374,6 +409,7 @@ impl Accumulator {
             frames_summed: self.window.frame_count(),
             frame_counts,
             reset,
+            range,
             window_config,
             window_push,
         }
@@ -406,6 +442,49 @@ mod tests {
         }
         // 8 * (2^32-1) fits; nothing has saturated yet.
         assert_eq!(a.total_counts(), 8 * u64::from(u32::MAX));
+    }
+
+    /// C latches AccumulatorSaturated when the running sum, the total or the
+    /// frame count saturates (serval_stream.cpp:1091-1130,
+    /// histogram_io.cpp:509-524).
+    #[test]
+    fn a_saturated_add_latches_accumulator_saturated() {
+        for which in 0..3 {
+            let mut a = Accumulator::new();
+            a.add(&[1]);
+            match which {
+                0 => a.running[0] = u64::MAX,
+                1 => a.total_counts = u64::MAX,
+                _ => a.frame_count = u64::MAX,
+            }
+            a.add(&[1]);
+            assert_eq!(a.range(), RangeState::AccumulatorSaturated, "{which}");
+        }
+    }
+
+    /// A geometry restart resets the latch (serval_stream.cpp:1086,
+    /// histogram_io.cpp:485).
+    #[test]
+    fn a_geometry_restart_resets_the_range_latch() {
+        let mut a = Accumulator::new();
+        a.add(&[1]);
+        a.report_range(RangeState::OutputClamped);
+        a.add(&[1, 2]);
+        assert_eq!(a.range(), RangeState::Ok);
+    }
+
+    /// C clampToInt64 publishes a total past i64 as its maximum and latches
+    /// OutputClamped once (serval_stream.cpp:1351-1357).
+    #[test]
+    fn a_total_past_i64_is_published_clamped_and_latched() {
+        let mut a = Accumulator::new();
+        a.add(&[1]);
+        a.total_counts = u64::MAX;
+        assert_eq!(
+            a.public_total(),
+            (i64::MAX, Some(RangeState::OutputClamped))
+        );
+        assert_eq!(a.public_total(), (i64::MAX, None));
     }
 
     #[test]

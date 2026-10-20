@@ -131,6 +131,9 @@ impl AsynMotor for HxpAxis {
         _acceleration: f64,
     ) -> AsynResult<()> {
         let end_pos = position * MRES;
+        // C ignores HXPGroupPositionCurrentGet's status and moves from its
+        // uninitialised `cur_pos` (HXPDriver.cpp:626); not copied, a failed
+        // read refuses the move.
         let (coord_sys, current) = {
             let ctrl = self.lock_controller();
             (ctrl.move_coord_sys(), ctrl.current_positions()?)

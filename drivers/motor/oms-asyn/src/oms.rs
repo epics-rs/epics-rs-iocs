@@ -831,15 +831,21 @@ impl OmsAxis {
         max_v: f64,
         accel: f64,
     ) -> AsynResult<()> {
-        // Servo/encoder axes: sync the motor position to the encoder first.
+        // Servo/encoder axes: sync the motor position to the encoder first;
+        // the move's status overwrites LO's (omsBaseAxis.cpp:49-65, :109).
+        // C returns only on asynError and, after a timed-out RE, sends LO0
+        // from its emptied reply buffer (omsBaseController.cpp:987); that C
+        // defect is not copied, any failed RE refuses the move.
         if self.has_encoder {
             let ctrl = self.lock();
             let ch = self.axis_char;
             let enc = atoi(&ctrl.send_receive(&format!("A{ch};RE;"))?);
             let motor_position = (f64::from(enc) / self.encoder_ratio) as i32;
-            ctrl.send_only(&format!("A{ch};LO{motor_position};"))?;
+            let _ = ctrl.send_only(&format!("A{ch};LO{motor_position};"));
         }
 
+        // C returns LO's status here, so success for an out-of-range move on
+        // an encoder axis (omsBaseAxis.cpp:80-85); not copied, it is refused.
         let pos = Self::nint(position);
         if pos.abs() > MAX_POSITION {
             return Err(oms_err(format!("oms: position {pos} out of range")));
@@ -1274,11 +1280,13 @@ mod tests {
         assert!(!is_notification("3F"));
     }
 
-    /// An encoder axis whose `RE` reads 1000; records every command.
+    /// An encoder axis whose `RE` reads 1000; records every command and
+    /// refuses those containing `refused`.
     struct EncoderAxis {
         base: epics_rs::asyn::port::PortDriverBase,
         written: Arc<Mutex<Vec<String>>>,
         reply: Vec<u8>,
+        refused: &'static str,
     }
 
     impl epics_rs::asyn::port::PortDriver for EncoderAxis {
@@ -1301,7 +1309,11 @@ mod tests {
             } else {
                 Vec::new()
             };
+            let refused = !self.refused.is_empty() && cmd.contains(self.refused);
             self.written.lock().unwrap().push(cmd);
+            if refused {
+                return Err(oms_err("refused"));
+            }
             Ok(data.len())
         }
         fn io_read_octet(
@@ -1336,6 +1348,7 @@ mod tests {
             ),
             written: written.clone(),
             reply: Vec::new(),
+            refused: "",
         };
         let (rt, _actor) = create_port_runtime(
             &claim_port("omsEncoderRatio").unwrap(),
@@ -1361,6 +1374,44 @@ mod tests {
         assert!(written.lock().unwrap().iter().any(|c| c == "AX;LO250;"));
     }
 
+    /// C overwrites the encoder sync's `LO` status with the move's
+    /// (omsBaseAxis.cpp:64-109).
+    #[test]
+    fn a_refused_encoder_sync_still_sends_the_move() {
+        use epics_rs::asyn::port::InterfaceMask;
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let name = "omsRefusedSync";
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = EncoderAxis {
+            base: PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            written: written.clone(),
+            reply: Vec::new(),
+            refused: ";LO",
+        };
+        let (rt, _actor) =
+            create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
+                .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = Arc::new(Mutex::new(OmsController::new(io, name, name, "MAXnet")));
+        let mut axis = OmsAxis::new(controller, 0).unwrap();
+        written.lock().unwrap().clear();
+        axis.move_absolute(&AsynUser::new(0), 10.0, 1.0, 100.0, 1000.0)
+            .unwrap();
+        assert_eq!(
+            *written.lock().unwrap(),
+            ["AX;RE;", "AX;LO1000;", "AX;AC1000;VL100;VB1;MA10;GO;ID;"]
+        );
+    }
+
     #[test]
     fn the_axis_count_skips_empty_fields_as_strtok_does() {
         use epics_rs::asyn::port::InterfaceMask;
@@ -1378,6 +1429,7 @@ mod tests {
             ),
             written: Arc::new(Mutex::new(Vec::new())),
             reply: Vec::new(),
+            refused: "",
         };
         let (rt, _actor) = create_port_runtime(
             &claim_port("omsAxisCount").unwrap(),

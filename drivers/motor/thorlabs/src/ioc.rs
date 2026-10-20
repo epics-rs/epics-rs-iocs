@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -76,7 +76,7 @@ pub fn mdt695_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
                 for index in 0..num_axes {
                     let ax = Mdt695Axis::new(controller.clone(), index);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
                     init.axis_with_build_trans(index as i32, motor, Arc::new(Mdt695Build));
                 }
                 init.describe(line);
@@ -143,6 +143,41 @@ mod report {
         assert_eq!(
             driver_report("drvMDT695", 0),
             "    MDT695 controller 0, port=mdtRefusedD, address=0, id:  \n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvMDT695.cc:561-631: `motor_init` identifies the controller, then
+    /// reads each axis's status once, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn mdt695_motor_init_reads_each_status_once() {
+        let int = ArgValue::Int;
+        run_command(mdt695_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::queued("mdtInitLine", |cmd| match cmd.trim_end() {
+            "D" => vec!["MDT695".into()],
+            "XR?" => vec!["X 1.4".into()],
+            "YR?" => vec!["Y 0.3".into()],
+            "ZR?" => vec!["Z 0.0".into()],
+            _ => Vec::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mdtInitLine".into())];
+        run_command(mdt695_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(line.sent(), ["D", "I", "XR?", "YR?", "ZR?"]);
+        let db = record_init(
+            "record(motor, \"m1\") { field(DTYP, \"MDT695\") field(OUT, \"#C0 S0 @\") }\n\
+             record(motor, \"m2\") { field(DTYP, \"MDT695\") field(OUT, \"#C0 S1 @\") }\n",
+        )
+        .await;
+        assert_eq!(
+            [db.get_pv("m1.RMP").unwrap(), db.get_pv("m2.RMP").unwrap()],
+            [EpicsValue::Long(14), EpicsValue::Long(3)]
         );
     }
 }

@@ -411,6 +411,12 @@ impl ScuAxis {
 }
 
 impl AsynMotor for ScuAxis {
+    /// The C constructor calls `callParamCallbacks` past `bail:`, before
+    /// any throw (smarActSCUMotorDriver.cpp:188).
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
     /// C `SCUAxis::poll`'s `bail` label sets `motorStatusProblem_` and
     /// `motorStatusCommsError_`.
     fn poll_failure(&self) -> PollFailure {
@@ -548,6 +554,22 @@ impl AsynMotor for ScuAxis {
 mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::InterfaceType;
+
+    /// smarActSCUMotorDriver.cpp:184-188: past `bail:`, so a failed probe
+    /// calls back too.
+    #[test]
+    fn the_constructor_calls_param_callbacks() {
+        let (handle, _) = SyncIOHandle::connect_port(
+            "scu-ctor-callback",
+            0,
+            std::time::Duration::from_millis(10),
+            InterfaceType::Octet,
+        );
+        let controller = Arc::new(Mutex::new(ScuController::new(handle)));
+        let (axis, probed) = ScuAxis::new(controller, 0, "scu-ctor-callback", 0);
+        assert!(probed.is_err());
+        assert!(axis.constructor_calls_param_callbacks());
+    }
 
     /// smarActSCUMotorDriver.cpp:185-193: a failed probe bails and the axis
     /// stays, its poll then failing on the same user.

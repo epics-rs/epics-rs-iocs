@@ -1310,6 +1310,27 @@ mod tests {
         assert!(status.powered && !status.problem);
     }
 
+    /// pmacAxis.cpp:383-391: `stop` drops the CS abort's status and sends
+    /// the jog-stop.
+    #[test]
+    fn a_refused_cs_abort_still_stops_the_axis() {
+        let (_rt, rig) = publish_scripted("pmacStopAbort");
+        rig.answer("#1 ? F P", b"882000000001\r0\r100.0\r");
+        rig.answer("#1 J/ M140=1", b"\r");
+        rig.refuse("&2A");
+        let mut controller = controller_on("pmacStopAbort");
+        let groups = controller.cs_groups_mut();
+        groups.add_group(1, "test");
+        groups.add_axis(1, 1, "X", 2).unwrap();
+        groups.select(1);
+        let mut axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        let user = AsynUser::new(0).with_addr(1);
+        assert!(axis.poll(&user).unwrap().powered);
+        rig.written();
+        axis.stop(&user, 0.0).unwrap();
+        assert_eq!(rig.written(), ["#1 J/ M140=1"]);
+    }
+
     /// pmacAsynCoord.c:532-543: home and jog print their refusal on the
     /// coordinate system's trace.
     #[test]
@@ -1856,6 +1877,43 @@ mod tests {
              controller pmacScaleCtl.\n"
         );
         assert_eq!(controller.axis_scale(1), 4);
+    }
+
+    /// pmacController.cpp:317, 324, 349: FLOW on the controller, then the
+    /// command and the response on the low-level port whatever the status;
+    /// a cut read prints what it delivered, a failed write no reply.
+    #[test]
+    fn low_level_write_read_prints_command_and_response() {
+        let (_rt, rig) = publish_scripted("pmacIoLow");
+        let controller = PmacController::new(
+            "pmacIoCtl",
+            "pmacIoLow",
+            0,
+            low_level_port_connect("pmacIoCtl", "pmacIoLow", 0),
+        );
+        let own = TraceCapture::on("pmacIoCtl");
+        let low = TraceCapture::on("pmacIoLow");
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("pmacIoCtl"), TraceMask::FLOW);
+        trace.set_trace_mask(Some("pmacIoLow"), TraceMask::IO_DRIVER);
+        trace.set_device_trace_mask("pmacIoLow", 0, TraceMask::IO_DRIVER);
+        rig.answer("I100", b"5\r");
+        rig.cut("I200", b"7");
+        rig.refuse("I300");
+        let _ = controller.reply("I100");
+        let _ = controller.reply("I200");
+        let _ = controller.reply("I300");
+        assert_eq!(own.take(), "pmacController::lowLevelWriteRead\n".repeat(3));
+        assert_eq!(
+            low.take(),
+            "pmacController::lowLevelWriteRead: command: I100\n\
+             pmacController::lowLevelWriteRead: response: 5\r\n\
+             pmacController::lowLevelWriteRead: command: I200\n\
+             pmacController::lowLevelWriteRead: response: 7\n\
+             pmacController::lowLevelWriteRead: command: I300\n\
+             pmacController::lowLevelWriteRead: response: \n"
+        );
     }
 
     /// `port`'s trace, address 0 included, without the prefix, so what it

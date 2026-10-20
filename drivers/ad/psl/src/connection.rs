@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
 use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -107,7 +107,7 @@ impl PslServer {
     }
 
     /// [`Self::command`] with the reply a failed read delivered.
-    pub fn exchange(&self, command: &str) -> (String, ServerResult<()>) {
+    pub fn exchange(&self, command: &str) -> (Option<String>, ServerResult<()>) {
         self.session().exchange(command)
     }
 
@@ -129,19 +129,20 @@ impl Session<'_> {
     /// default `PSL_SERVER_TIMEOUT`).
     pub fn command(&mut self, command: &str) -> ServerResult<String> {
         let (reply, status) = self.exchange(command);
-        status.map(|()| reply)
+        status.map(|()| reply.unwrap_or_default())
     }
 
     /// [`Self::command`] with the bytes a failed read delivered, which C's
-    /// `fromServer_` holds; a failed write reads none.
-    pub fn exchange(&mut self, command: &str) -> (String, ServerResult<()>) {
+    /// `fromServer_` holds; `None` when no read ran and the buffer kept the
+    /// last reply.
+    pub fn exchange(&mut self, command: &str) -> (Option<String>, ServerResult<()>) {
         let (bytes, status) = self
             .io
             .write_read(command, MAX_MESSAGE_SIZE, SERVER_TIMEOUT);
         if let Err(e) = &status {
             self.io.write_read_failed(e, command);
         }
-        let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
+        let reply = bytes.map(|bytes| String::from_utf8_lossy(&bytes).trim_end().to_string());
         (reply, status)
     }
 
@@ -152,18 +153,34 @@ impl Session<'_> {
     /// an input end-of-string; `OctetReadBinary` suppresses one if the IOC has
     /// configured it. C reconnects the socket before every command, so nothing
     /// can be left in the input buffer from the previous exchange.
-    pub fn request_image(&mut self) -> ServerResult<Vec<u8>> {
+    ///
+    /// The block is what the read delivered, with the read's status: C's
+    /// `getImage` parses `fromServer_` whatever `writeReadServer` returned
+    /// (PSL.cpp:523-557). `Err` when no read ran.
+    pub fn request_image(&mut self) -> ServerResult<(Vec<u8>, ServerResult<()>)> {
         self.io.reconnect();
-        self.io
+        let read = self
+            .io
             .write("GetImage", GET_IMAGE_TIMEOUT)
-            .and_then(|()| self.io.read_binary(MAX_MESSAGE_SIZE, GET_IMAGE_TIMEOUT))
-            .inspect_err(|e| self.io.write_read_failed(e, "GetImage"))
+            .and_then(|()| self.io.read_binary(MAX_MESSAGE_SIZE, GET_IMAGE_TIMEOUT));
+        let status = match &read {
+            Ok((_, status)) => status.as_ref(),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = status {
+            self.io.write_read_failed(e, "GetImage");
+        }
+        read
     }
 
     /// Read the next block of an image payload (C `pasynOctetSyncIO->read`
-    /// inside the copy loop).
-    pub fn read_image_block(&mut self, max_bytes: usize) -> ServerResult<Vec<u8>> {
-        self.io.read_binary(max_bytes, GET_IMAGE_TIMEOUT)
+    /// inside the copy loop): what arrived, also when the read failed.
+    pub fn read_image_block(&mut self, max_bytes: usize) -> (Vec<u8>, ServerResult<()>) {
+        // A read that never ran leaves C's `nRead_` at the previous block's
+        // count, which its error line prints: not copied.
+        self.io
+            .read_binary(max_bytes, GET_IMAGE_TIMEOUT)
+            .unwrap_or_else(|e| (Vec::new(), Err(e)))
     }
 }
 
@@ -205,11 +222,11 @@ impl ServerIo {
         command: &str,
         buf_size: usize,
         timeout: Duration,
-    ) -> (Vec<u8>, ServerResult<()>) {
+    ) -> (Option<Vec<u8>>, ServerResult<()>) {
         self.reconnect();
         let port = match self.handle.port() {
             Ok(port) => port,
-            Err(e) => return (Vec::new(), Err(e.into())),
+            Err(e) => return (None, Err(e.into())),
         };
         let (reply, status) = port
             .submit_octet_read_blocking(
@@ -220,7 +237,11 @@ impl ServerIo {
                 self.user(timeout),
             )
             .into_parts();
-        (reply, status.map_err(ServerError::from))
+        let read = match &status {
+            Ok(()) => true,
+            Err(e) => e.octet_step() == Some(OctetStep::Read),
+        };
+        (read.then_some(reply), status.map_err(ServerError::from))
     }
 
     fn write(&mut self, command: &str, timeout: Duration) -> ServerResult<()> {
@@ -233,14 +254,21 @@ impl ServerIo {
         Ok(())
     }
 
-    fn read_binary(&mut self, buf_size: usize, timeout: Duration) -> ServerResult<Vec<u8>> {
+    /// What the read delivered and its status; `Err` when it never ran.
+    fn read_binary(
+        &mut self,
+        buf_size: usize,
+        timeout: Duration,
+    ) -> ServerResult<(Vec<u8>, ServerResult<()>)> {
         let (data, status) = self
             .handle
             .port()?
             .submit_octet_read_blocking(OctetReadOp::ReadBinary { buf_size }, self.user(timeout))
             .into_parts();
-        status?;
-        Ok(data)
+        match status {
+            Err(e) if e.never_ran() => Err(e.into()),
+            status => Ok((data, status.map_err(ServerError::from))),
+        }
     }
 }
 

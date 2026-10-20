@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
+use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::InterfaceMask;
@@ -160,6 +161,7 @@ impl EigerDriver {
         } else {
             let _ = self.ops.rest.disarm();
         }
+        trace.flow("eigerDetector", format_args!("Eiger initialized"));
         Ok(true)
     }
 
@@ -232,14 +234,21 @@ impl EigerDriver {
             Ok(bytes) => (String::from_utf8_lossy(bytes).into_owned(), Ok(())),
             Err(e) => (String::new(), Err(e)),
         };
+        // With no space C's `space + 1` wraps npos to 0: the model is the whole
+        // description too (eigerDetector.cpp:1648-1650).
         let (manufacturer, model) = match description.split_once(' ') {
             Some((m, rest)) => (m.to_string(), rest.to_string()),
-            None => (description.clone(), String::new()),
+            None => (description.clone(), description.clone()),
         };
         base.set_string_param(self.ad.params.base.manufacturer, 0, manufacturer)?;
         base.set_string_param(self.ad.params.base.model, 0, model)?;
 
         base.set_int32_param(self.ad.params.base.array_size, 0, 0)?;
+        base.set_int32_param(
+            self.ad.params.base.data_type,
+            0,
+            NDDataType::UInt32 as u8 as i32,
+        )?;
         base.set_int32_param(self.ad.params.image_mode, 0, ImageMode::Multiple as i32)?;
         base.set_int32_param(self.ad.params.status, 0, ADStatus::Idle as i32)?;
 

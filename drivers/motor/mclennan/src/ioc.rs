@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -80,7 +80,7 @@ pub fn pm304_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
                 for index in 0..num_axes {
                     let ax = Pm304Axis::new(controller.clone(), index);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
                     init.axis(index as i32, motor);
                 }
                 init.describe(ident);
@@ -200,5 +200,51 @@ mod tests {
             driver_report("drvPM304", 0),
             "    PM304 controller 0, id:  \n"
         );
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvPM304.cc:674-700: `motor_init` reads each axis's `ID` and then its
+    /// status once, before the next axis's `ID`; the record starts from that
+    /// read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_after_its_own_id() {
+        let int = ArgValue::Int;
+        run_command(pm304_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("pm304InitLine", |cmd| match cmd.trim_end() {
+            c if c.ends_with("ID") => "Mclennan PM304".into(),
+            c if c.ends_with("OS") => "00010000".into(),
+            "1OA" => "AP=14".into(),
+            "2OA" => "AP=3".into(),
+            _ => "OK".into(),
+        });
+        let config = vec![int(0), ArgValue::String("pm304InitLine".into()), int(2)];
+        run_command(pm304_config_command(), config).await;
+        drvsup_init().await;
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "1OA", "1ST", "1ID", "1ID", "1OS", "1OA", "2ID", "2OS", "2OA"
+            ]
+        );
+        let db = record_init(
+            r##"
+record(motor, "pm304:m1") { field(DTYP, "Mclennan PM304") field(OUT, "#C0 S0 @") }
+record(motor, "pm304:m2") { field(DTYP, "Mclennan PM304") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("pm304:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("pm304:m2.RMP").unwrap(), EpicsValue::Long(3));
     }
 }

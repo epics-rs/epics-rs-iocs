@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::param::{EnumEntry, ParamValue};
 use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -13,6 +13,7 @@ use epics_rs::asyn::user::AsynUser;
 use meascomp::device::DaqDevice;
 use uldaq_sys::UlError;
 
+use crate::board_enums::{self, AI_CHAN_TYPE_TC, AI_CHAN_TYPE_VOLTAGE, map_range};
 use crate::params::*;
 use crate::poller::{self, PollerState};
 use crate::trace::{self, DRIVER_NAME, SelfTrace};
@@ -47,6 +48,13 @@ struct IoPort {
     port_type: i32,
     io_type: i32,
     num_bits: i32,
+}
+
+impl IoPort {
+    /// C `digitalIOBitConfigurable_` (drvMultiFunction.cpp:1071).
+    fn bit_configurable(&self) -> bool {
+        self.io_type == uldaq_sys::DPIOT_BITIO as i32
+    }
 }
 
 impl BoardInfo {
@@ -84,6 +92,13 @@ impl BoardInfo {
         }
     }
 
+    /// C `numAnalogIn_` and `numTemperatureIn_`, the poller's channel
+    /// counts, held to the param arrays.
+    fn poll_channels(&self) -> (usize, usize) {
+        let n = |v: i32| (v.max(0) as usize).min(MAX_ANALOG_IN);
+        (n(self.num_analog_in), n(self.num_temperature_in))
+    }
+
     /// C `MultiFunction::report` after `asynPortDriver::report`
     /// (drvMultiFunction.cpp:2861-2892), for the USB-2408-2AO family: no
     /// timers, `MAX_COUNTERS` counters from 0, and no port C marks
@@ -111,7 +126,7 @@ impl BoardInfo {
             let _ = writeln!(
                 out,
                 "    I/O bit configurable  = {}",
-                i32::from(port.io_type == uldaq_sys::DPIOT_BITIO as i32)
+                i32::from(port.bit_configurable())
             );
             let _ = writeln!(out, "    I/O port configurable = 0");
             let _ = writeln!(
@@ -175,11 +190,20 @@ pub struct MultiFunctionDriver {
     pub state: Arc<Mutex<PollerState>>,
     pub max_input_points: usize,
     pub max_output_points: usize,
-    /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
-    /// `DPIOT_BITIO`). The USB-2408 reports `DPIOT_NONCONFIG`.
-    dio_configurable: bool,
     board: BoardInfo,
 }
+
+/// drvMultiFunction.cpp:817-820.
+const MULTIFUNCTION_INTERRUPTS: InterfaceMask = InterfaceMask::UINT32_DIGITAL
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT32_ARRAY)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::ENUM);
+const MULTIFUNCTION_INTERFACES: InterfaceMask =
+    MULTIFUNCTION_INTERRUPTS.or(InterfaceMask::DRV_USER);
 
 impl MultiFunctionDriver {
     pub fn new(
@@ -191,13 +215,14 @@ impl MultiFunctionDriver {
         let mut base = PortDriverBase::new(
             port_name,
             MAX_SIGNALS,
+            // ASYN_MULTIDEVICE | ASYN_CANBLOCK (drvMultiFunction.cpp:821).
             PortFlags {
                 multi_device: true,
-                can_block: false,
+                can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            MULTIFUNCTION_INTERFACES,
+            MULTIFUNCTION_INTERRUPTS,
         );
         let params = MultiFunctionParams::create(&mut base)?;
 
@@ -209,13 +234,10 @@ impl MultiFunctionDriver {
         base.set_int32_param(params.wave_dig_num_points, 0, 1)?;
         base.set_int32_param(params.wave_dig_run, 0, 0)?;
         base.set_int32_param(params.wave_gen_run, 0, 0)?;
+        // The first output range of the model (:1284-1287).
         for ch in 0..MAX_ANALOG_OUT as i32 {
-            base.set_int32_param(params.analog_out_range, ch, uldaq_sys::BIP10VOLTS)?;
+            base.set_int32_param(params.analog_out_range, ch, board_enums::OUTPUT_RANGE[0].1)?;
         }
-        for ch in 0..MAX_ANALOG_IN {
-            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
-        }
-
         // Device info
         let product_name = device.product_name();
         let product_id = device.product_id();
@@ -231,16 +253,8 @@ impl MultiFunctionDriver {
         base.set_string_param(params.driver_version, 0, "4.4")?;
 
         let board = BoardInfo::read(&device);
-
-        // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
-        // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
-        // the device instead of assuming.
-        let dio_configurable = matches!(
-            device.digital_port_io_type(0),
-            Ok(uldaq_sys::DPIOT_IO) | Ok(uldaq_sys::DPIOT_BITIO)
-        );
-        if dio_configurable {
-            let _ = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT);
+        for ch in 0..board.poll_channels().1 {
+            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
         }
 
         // Seed DIGITAL_INPUT so the bi records have a value to read at init.
@@ -264,7 +278,6 @@ impl MultiFunctionDriver {
             state,
             max_input_points,
             max_output_points,
-            dio_configurable,
             board,
         })
     }
@@ -589,7 +602,7 @@ impl MultiFunctionDriver {
     /// rejects the TC settings with ERR_BAD_AI_CHAN_TYPE otherwise, so C
     /// writes them only then.
     fn is_thermocouple(&self, chan: i32) -> bool {
-        self.int(self.params.analog_in_type, chan) != 0
+        self.int(self.params.analog_in_type, chan) == AI_CHAN_TYPE_TC
     }
 
     /// C `setOpenThermocoupleDetect`.
@@ -622,6 +635,26 @@ impl PortDriver for MultiFunctionDriver {
 
     fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
         self.board.resolution.bounds(&self.params, user.reason)
+    }
+
+    /// C `readEnum` (drvMultiFunction.cpp:2531-2577) for the USB-2408-2AO;
+    /// a parameter without a table is asynError.
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        let p = &self.params;
+        let reason = user.reason;
+        let table = if reason == p.analog_in_range || reason == p.voltage_in_range {
+            board_enums::INPUT_RANGE
+        } else if reason == p.analog_out_range {
+            board_enums::OUTPUT_RANGE
+        } else if reason == p.analog_in_type {
+            board_enums::INPUT_TYPE
+        } else {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            });
+        };
+        Ok((0, board_enums::entries(table).into()))
     }
 
     fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
@@ -693,32 +726,47 @@ impl PortDriver for MultiFunctionDriver {
                     return trace::asyn_status(-1);
                 }
                 let dev = self.device.lock().unwrap();
-                let range = self.int(self.params.analog_out_range, addr);
+                let range = map_range(&trace, self.int(self.params.analog_out_range, addr));
                 status = trace.report(
                     &dev.analog_out(addr, range, uldaq_sys::AOUT_FF_NOSCALEDATA, value as f64),
                     FUNCTION,
                     "calling AOut",
                 );
             }
+        } else if reason == self.params.analog_out_sync_master {
+            // The record's 0 is Master, 1 Slave.
+            let mode = if value != 0 {
+                uldaq_sys::AOSM_SLAVE
+            } else {
+                uldaq_sys::AOSM_MASTER
+            };
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ao_set_config(uldaq_sys::AO_CFG_SYNC_MODE, addr as u32, mode),
+                FUNCTION,
+                "Setting analog out master",
+            );
         } else if reason == self.params.analog_out_sync_write {
-            // Simultaneous write of all analog outputs
-            if value != 0 {
-                let dev = self.device.lock().unwrap();
-                let mut values = vec![0.0f64; MAX_ANALOG_OUT];
-                let mut ranges = vec![uldaq_sys::BIP10VOLTS; MAX_ANALOG_OUT];
-                for ch in 0..MAX_ANALOG_OUT {
-                    values[ch] = self.int(self.params.analog_out_value, ch as i32) as f64;
-                    ranges[ch] = self.int(self.params.analog_out_range, ch as i32);
-                }
-                // C `writeAnalogOutSync` does not print its status.
-                status = trace::status_of(&dev.analog_out_array(
-                    0,
-                    (MAX_ANALOG_OUT - 1) as i32,
-                    &ranges,
-                    uldaq_sys::AOUTARRAY_FF_NOSCALEDATA,
-                    &mut values,
-                ));
+            // C writes the outputs on any value, "Done" (0) included.
+            let dev = self.device.lock().unwrap();
+            let mut values = vec![0.0f64; MAX_ANALOG_OUT];
+            let mut ranges = vec![uldaq_sys::BIP10VOLTS; MAX_ANALOG_OUT];
+            for ch in 0..MAX_ANALOG_OUT {
+                values[ch] = self.int(self.params.analog_out_value, ch as i32) as f64;
+                ranges[ch] = map_range(&trace, self.int(self.params.analog_out_range, ch as i32));
             }
+            // C `writeAnalogOutSync` does not print its status. Its
+            // AOUTARRAY_FF_SIMULTANEOUS (drvMultiFunction.cpp:2259) is a
+            // flag the 2408 refuses with ERR_BAD_FLAG (AoUsb24xx.cpp:18),
+            // so C's sync write never reaches the DACs. Not copied: the
+            // 2408 updates both DACs together without it.
+            status = trace::status_of(&dev.analog_out_array(
+                0,
+                (MAX_ANALOG_OUT - 1) as i32,
+                &ranges,
+                uldaq_sys::AOUTARRAY_FF_NOSCALEDATA,
+                &mut values,
+            ));
         } else if reason == self.params.analog_in_mode {
             // C's DIFFERENTIAL is the record's menu value 0 (:225, :1989).
             self.state.lock().unwrap().ai_input_mode = if value == 0 {
@@ -728,17 +776,17 @@ impl PortDriver for MultiFunctionDriver {
             };
         } else if reason == self.params.analog_in_type {
             let dev = self.device.lock().unwrap();
-            let chan_type = if value != 0 {
-                uldaq_sys::AI_TC
-            } else {
+            let chan_type = if value == AI_CHAN_TYPE_VOLTAGE {
                 uldaq_sys::AI_VOLTAGE
+            } else {
+                uldaq_sys::AI_TC
             };
             status = trace.report(
                 &dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TYPE, addr as u32, chan_type),
                 FUNCTION,
                 "Setting analog input type",
             );
-            if value != 0 {
+            if value == AI_CHAN_TYPE_TC {
                 // The TC type and open-detect settings the records already
                 // hold could not be pushed while the channel read volts.
                 let tc = self.int(self.params.thermocouple_type, addr);
@@ -750,6 +798,13 @@ impl PortDriver for MultiFunctionDriver {
                 let detect = self.int(self.params.thermocouple_open_detect, addr);
                 self.set_open_tc_detect(&dev, addr, detect);
             }
+        } else if reason == self.params.analog_in_rate {
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ai_set_config_dbl(uldaq_sys::AI_CFG_CHAN_DATA_RATE, addr as u32, value as f64),
+                FUNCTION,
+                "Setting data rate",
+            );
         } else if reason == self.params.thermocouple_type && self.is_thermocouple(addr) {
             let dev = self.device.lock().unwrap();
             status = trace.report(
@@ -791,10 +846,10 @@ impl PortDriver for MultiFunctionDriver {
                 );
             }
         } else if reason == self.params.wave_dig_read_wf {
-            if value != 0 {
-                let st = self.state.lock().unwrap();
-                wave_arrays = wave_dig::waveform_updates(&self.params, &st.wave_dig, &trace);
-            }
+            // On any value: the ReadWF busy record writes 0 every second
+            // while a scan runs.
+            let st = self.state.lock().unwrap();
+            wave_arrays = wave_dig::waveform_updates(&self.params, &st.wave_dig, &trace);
         } else if reason == self.params.wave_gen_run {
             let device = self.device.clone();
             let dev = device.lock().unwrap();
@@ -992,10 +1047,19 @@ impl PortDriver for MultiFunctionDriver {
                     }
                 }
             }
-        } else if reason == self.params.digital_direction && self.dio_configurable {
+        } else if reason == self.params.digital_direction {
+            // C's digitalIOPortConfigurable_ is 0 on Linux: no ConfigPort path.
+            let bit_configurable = self
+                .board
+                .io_ports
+                .first()
+                .is_some_and(IoPort::bit_configurable);
             let dev = self.device.lock().unwrap();
             for bit in 0..NUM_IO_BITS {
-                if mask & (1 << bit) != 0 {
+                if mask & (1 << bit) == 0 {
+                    continue;
+                }
+                if bit_configurable {
                     let dir = if (value >> bit) & 1 != 0 {
                         uldaq_sys::DD_OUTPUT
                     } else {
@@ -1005,6 +1069,14 @@ impl PortDriver for MultiFunctionDriver {
                         &dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir),
                         FUNCTION,
                         "Calling ConfigBit",
+                    );
+                } else {
+                    // C: the direction cannot be programmed, so the
+                    // open-collector output is set to 0.
+                    status = trace.report(
+                        &dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, false),
+                        FUNCTION,
+                        "Calling BitOut",
                     );
                 }
             }
@@ -1061,6 +1133,7 @@ pub fn create_usb_2408(
     let params = driver.params;
     let device = driver.device.clone();
     let state = driver.state.clone();
+    let (ai_chans, tc_chans) = driver.board.poll_channels();
 
     let (runtime_handle, _actor_jh) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the USB-2408 port runtime: {e}"))?;
@@ -1075,6 +1148,8 @@ pub fn create_usb_2408(
         params,
         device.clone(),
         state,
+        ai_chans,
+        tc_chans,
     );
 
     Ok(MultiFunctionRuntime {
@@ -1112,6 +1187,126 @@ mod tests {
             (0, 16_777_215)
         );
         assert!(usb_2408.bounds(&params, params.counter_reset).is_err());
+    }
+
+    #[test]
+    fn read_enum_serves_the_usb_2408_tables_c_does() {
+        let mut drv = MultiFunctionDriver::new("MFENUM", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        let mut menu = |reason| -> Vec<(String, i32)> {
+            let (_, entries) = drv.read_enum(&AsynUser::new(reason)).unwrap();
+            entries
+                .iter()
+                .map(|e| (e.string.clone(), e.value))
+                .collect()
+        };
+        let input_range: Vec<_> = [
+            ("+= 10V", 1),
+            ("+= 5V", 0),
+            ("+= 2.5V", 2),
+            ("+= 1.25V", 3),
+            ("+= 0.625V", 5),
+            ("+= 0.312V", 17),
+            ("+= 0.156V", 18),
+            ("+= 0.078V", 19),
+        ]
+        .map(|(s, v)| (s.to_owned(), v))
+        .into();
+        assert_eq!(menu(p.analog_in_range), input_range);
+        assert_eq!(menu(p.voltage_in_range), input_range);
+        assert_eq!(menu(p.analog_out_range), [("+= 10V".to_owned(), 1)]);
+        assert_eq!(
+            menu(p.analog_in_type),
+            [("Volts".to_owned(), 1), ("TC deg.".to_owned(), 2)]
+        );
+        assert!(drv.read_enum(&AsynUser::new(p.analog_in_mode)).is_err());
+        // C's ctor writes the first output range's gain code.
+        assert_eq!(drv.base.get_int32_param(p.analog_out_range, 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn analog_in_rate_is_written_to_the_device() {
+        let mut drv = MultiFunctionDriver::new("MFRATE", DaqDevice::unconnected(), 16, 16).unwrap();
+        let mut user = AsynUser::new(drv.params.analog_in_rate).with_addr(2);
+        // uldaq refuses every call on the null handle, so only a write that
+        // reaches ulAISetConfigDbl fails.
+        assert!(drv.write_int32(&mut user, 60).is_err());
+    }
+
+    #[test]
+    fn analog_out_sync_master_is_written_to_the_device() {
+        let mut drv =
+            MultiFunctionDriver::new("MFSYNCM", DaqDevice::unconnected(), 16, 16).unwrap();
+        let mut user = AsynUser::new(drv.params.analog_out_sync_master).with_addr(1);
+        // A 2408 refuses AO_CFG_SYNC_MODE as the null handle does
+        // (uldaq AoDevice::setCfg_SyncMode), so the record takes WRITE/INVALID.
+        assert!(drv.write_int32(&mut user, 0).is_err());
+    }
+
+    #[test]
+    fn a_sync_write_of_done_still_writes_the_outputs() {
+        let mut drv =
+            MultiFunctionDriver::new("MFSYNCW", DaqDevice::unconnected(), 16, 16).unwrap();
+        let mut user = AsynUser::new(drv.params.analog_out_sync_write);
+        // Only a write that reaches ulAOutArray fails on the null handle.
+        assert!(drv.write_int32(&mut user, 0).is_err());
+    }
+
+    #[test]
+    fn a_read_request_of_zero_posts_the_waveforms() {
+        let mut drv =
+            MultiFunctionDriver::new("MFREADWF", DaqDevice::unconnected(), 16, 16).unwrap();
+        let abs_time_wf = drv.params.wave_dig_abs_time_wf;
+        assert!(!drv.base.params.is_param_defined(abs_time_wf, 0).unwrap());
+        let mut user = AsynUser::new(drv.params.wave_dig_read_wf);
+        drv.write_int32(&mut user, 0).unwrap();
+        assert!(drv.base.params.is_param_defined(abs_time_wf, 0).unwrap());
+    }
+
+    #[test]
+    fn a_direction_write_on_a_fixed_port_zeroes_the_output_bit() {
+        let mut drv = MultiFunctionDriver::new("MFDIR", DaqDevice::unconnected(), 16, 16).unwrap();
+        assert!(drv.board.io_ports.is_empty());
+        let mut user = AsynUser::new(drv.params.digital_direction);
+        // Only a write that reaches ulDBitOut fails on the null handle.
+        assert!(drv.write_uint32_digital(&mut user, 0, 0x01).is_err());
+    }
+
+    #[test]
+    fn only_a_bitio_port_is_bit_configurable() {
+        let port = |io_type: i64| IoPort {
+            port_type: 1,
+            io_type: io_type as i32,
+            num_bits: 8,
+        };
+        assert!(port(uldaq_sys::DPIOT_BITIO).bit_configurable());
+        assert!(!port(uldaq_sys::DPIOT_NONCONFIG).bit_configurable());
+    }
+
+    #[test]
+    fn the_port_can_block_as_cs_does() {
+        let drv = MultiFunctionDriver::new("MFFLAGS", DaqDevice::unconnected(), 16, 16).unwrap();
+        assert!(drv.base.flags.multi_device);
+        assert!(drv.base.flags.can_block);
+    }
+
+    #[test]
+    fn the_port_carries_cs_interface_and_interrupt_masks() {
+        use InterfaceMask as I;
+        let drv = MultiFunctionDriver::new("MFMASKS", DaqDevice::unconnected(), 16, 16).unwrap();
+        let interrupts = I::UINT32_DIGITAL
+            | I::INT32
+            | I::INT32_ARRAY
+            | I::FLOAT32_ARRAY
+            | I::FLOAT64
+            | I::FLOAT64_ARRAY
+            | I::OCTET
+            | I::ENUM;
+        assert_eq!(drv.base.interrupt_mask(), interrupts);
+        assert_eq!(
+            drv.base.interface_mask(),
+            interrupts | I::DRV_USER | I::COMMON
+        );
     }
 
     #[test]

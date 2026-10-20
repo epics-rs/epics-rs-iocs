@@ -7,7 +7,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::interfaces::motor::{AsynMotor, PostMessage};
+use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -87,7 +88,11 @@ impl Model1Cards<'_> {
 
 /// One axis a card's `motor_init` found: signal, motor, and the device's own
 /// `build_trans` when it has one.
-type FoundAxis = (i32, Arc<Mutex<dyn AsynMotor>>, Option<Arc<dyn BuildTrans>>);
+type FoundAxis = (
+    i32,
+    Arc<Mutex<dyn Model1Motor>>,
+    Option<Arc<dyn BuildTrans>>,
+);
 
 /// What one card's `motor_init` pass found on its controller: the axes it
 /// gives the records, and its report line. A card left with neither is the
@@ -107,7 +112,7 @@ impl CardInit {
     }
 
     /// Make `motor` signal `signal` of the card.
-    pub fn axis(&mut self, signal: i32, motor: Arc<Mutex<dyn AsynMotor>>) {
+    pub fn axis(&mut self, signal: i32, motor: Arc<Mutex<dyn Model1Motor>>) {
         self.axes.push((signal, motor, None));
     }
 
@@ -116,7 +121,7 @@ impl CardInit {
     pub fn axis_with_build_trans(
         &mut self,
         signal: i32,
-        motor: Arc<Mutex<dyn AsynMotor>>,
+        motor: Arc<Mutex<dyn Model1Motor>>,
         build_trans: Arc<dyn BuildTrans>,
     ) {
         self.axes.push((signal, motor, Some(build_trans)));
@@ -314,6 +319,21 @@ impl Model1 {
     }
 }
 
+/// C `set_status` as `motor_init` calls it: the status `read`, or after a
+/// failed read the status `motor_init` prepared, which the failure exit
+/// stores back, with the bits `failure` names.
+pub fn init_read(
+    read: AsynResult<MotorStatus>,
+    prepared: MotorStatus,
+    failure: PollFailure,
+) -> MotorStatus {
+    read.unwrap_or(MotorStatus {
+        problem: prepared.problem | failure.problem,
+        comms_error: prepared.comms_error | failure.comms_error,
+        ..prepared
+    })
+}
+
 /// The record's PREM and POST as a model-1 device holds them: `build_trans`
 /// reads PREM into the move it builds, and points `postmsgptr` at the POST
 /// field when POST is set, for `set_status` to send once that move ends
@@ -351,7 +371,7 @@ impl MoveStrings {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::error::AsynResult;
-    use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
+    use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
     use epics_rs::asyn::user::AsynUser;
     use epics_rs::base::server::ioc_app::{InitHookState, init_hook_announce};
 
@@ -366,6 +386,13 @@ mod tests {
     struct Card {
         card: i32,
         log: Log,
+    }
+
+    /// At rest at 0 when its `motor_init` read it.
+    impl Model1Motor for Card {
+        fn take_init_status(&mut self) -> MotorStatus {
+            MotorStatus::default()
+        }
     }
 
     impl AsynMotor for Card {
@@ -421,10 +448,9 @@ mod tests {
         assert!(inits.lock().unwrap().is_empty(), "Config talks to no card");
         init_hook_announce(InitHookState::AfterInitDrvSup);
         assert_eq!(*inits.lock().unwrap(), [0, 1], "motor_init, in card order");
-        assert_eq!(
-            *log.lock().unwrap(),
-            [0, 1],
-            "drvSup init's startup pass over the axes motor_init found"
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "motor_task has no startup pass; each driver's motor_init reads"
         );
         assert!(TASK.config(2, |_| {}).is_err());
     }

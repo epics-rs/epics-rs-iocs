@@ -7,6 +7,7 @@ use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
+use crate::board_enums::map_range;
 use crate::params::*;
 use crate::trace::{DRIVER_NAME, SelfTrace};
 
@@ -140,11 +141,11 @@ pub fn start_wave_dig(
 
     // Load input queue for multi-channel scanning (required by uldaq)
     let mut queue = Vec::with_capacity(num_chans);
-    for (i, &range) in ranges.iter().enumerate() {
+    for (i, &gain) in ranges.iter().enumerate() {
         queue.push(AiQueueElement {
             channel: (first_chan + i) as i32,
             input_mode,
-            range,
+            range: map_range(trace, gain),
             ..AiQueueElement::default()
         });
     }
@@ -386,6 +387,33 @@ pub fn time_axis(num_points: i32, dwell: f64) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inputs_9_to_16_get_their_waveforms() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "MFWAVEDIG",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UNMIGRATED_ALL,
+            InterfaceMask::UNMIGRATED_INTERRUPTS,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let mut state = WaveDigState::new(4);
+        state.first_chan = 14;
+        state.num_chans = 2;
+        state.current_point = 3;
+        let addrs: Vec<_> = waveform_updates(&params, &state, &SelfTrace::default())
+            .into_iter()
+            .filter_map(|u| match u {
+                ParamSetValue::Value { reason, addr, .. } if reason == params.wave_dig_volt_wf => {
+                    Some(addr)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs, [14, 15]);
+    }
 
     #[test]
     fn a_completed_scan_counts_every_point() {

@@ -171,12 +171,11 @@ impl XpsReply {
         self.field(n).map(atoi).unwrap_or(0)
     }
 
-    /// Out-param `n` as a raw 32-bit bitmask. Parses the field as a (possibly
-    /// `> i32::MAX` or negative) decimal and truncates to the low 32 bits,
-    /// matching C reading an unsigned XPS error code into a signed `int`
-    /// (`PositionerErrorGet`; the end-of-run masks set bit 31).
+    /// Out-param `n` as a raw 32-bit bitmask: C's `sscanf("%d")` of an
+    /// unsigned XPS error code into a signed `int` (`PositionerErrorGet`; the
+    /// end-of-run masks set bit 31).
     pub fn bits(&self, n: usize) -> u32 {
-        self.field(n).map(atoi64).unwrap_or(0) as u32
+        self.field(n).map(atoi).unwrap_or(0) as u32
     }
 
     /// Out-param `n` as a string slice (C `strcpy` up to the next comma).
@@ -429,21 +428,6 @@ pub(crate) fn g13(value: f64) -> String {
     format!("{:.13}", CFloat(value).g())
 }
 
-/// C `atoi` widened to `i64`: parse the leading (optionally signed) integer
-/// prefix, `0` on junk. Used for 32-bit bitmasks that exceed `i32::MAX`.
-fn atoi64(s: &str) -> i64 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i64>().ok()).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     /// asynOctetSocket.cpp:137-141: socket -1 answers every call with -22.
@@ -490,6 +474,14 @@ mod tests {
         assert_eq!(XpsError::Api(-17).into_c_status().c_status_code(), -17);
         assert_eq!(AsynError::from(transport()).c_status_code(), 3);
         assert_eq!(AsynError::from(XpsError::Api(-17)).c_status_code(), 3);
+    }
+
+    /// glibc's `%d` is `(int) strtol`: an overflowing out-param saturates
+    /// before the cast, `0xFFFFFFFF` on LP64.
+    #[test]
+    fn an_overflowing_bitmask_is_strtol_cast_to_int() {
+        let r = XpsReply("0,99999999999999999999".to_string());
+        assert_eq!(r.bits(1), std::os::raw::c_long::MAX as i32 as u32);
     }
 
     #[test]

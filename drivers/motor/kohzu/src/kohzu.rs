@@ -40,12 +40,14 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::model1::MoveStrings;
-use motor_common::util::nint;
+use motor_common::model1::{MoveStrings, init_read};
+use motor_common::util::{nint, strtol};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 160;
@@ -86,17 +88,30 @@ enum CommState {
     CommErr,
 }
 
-/// The model and version an IDN reply `C\tIDN0\t<model>\t<version>` names.
-fn identify(reply: &str) -> AsynResult<(i32, String)> {
-    let fields: Vec<&str> = reply.split('\t').collect();
-    match fields.get(2).and_then(|s| s.trim().parse::<i32>().ok()) {
-        Some(model @ (800 | 400 | 200)) => {
-            Ok((model, fields.get(3).map_or("", |s| s.trim()).to_owned()))
-        }
-        _ => Err(kohzu_err(format!(
-            "SC800: unrecognized IDN reply '{reply}'"
-        ))),
+/// The model and version an IDN reply names: C's `sscanf(buff,
+/// "C\tIDN0\t<model>\t%d", &version) == 1` for 800, 400 and 200
+/// (drvSC800.cc:565-567), each `\t` taking any run of blanks, none included.
+fn identify(reply: &str) -> AsynResult<(i32, i32)> {
+    fn literal<'a>(s: &'a [u8], lit: &str) -> Option<&'a [u8]> {
+        let blanks = s
+            .iter()
+            .take_while(|&&c| matches!(c, b' ' | b'\t'..=b'\r'))
+            .count();
+        s[blanks..].strip_prefix(lit.as_bytes())
     }
+    let idn = reply
+        .as_bytes()
+        .strip_prefix(b"C")
+        .and_then(|s| literal(s, "IDN0"));
+    [800, 400, 200]
+        .into_iter()
+        .find_map(
+            |model| match strtol(literal(idn?, &model.to_string())?, 10) {
+                (_, 0) => None,
+                (version, _) => Some((model, version as i32)),
+            },
+        )
+        .ok_or_else(|| kohzu_err(format!("SC800: unrecognized IDN reply '{reply}'")))
 }
 
 impl KohzuController {
@@ -231,12 +246,15 @@ pub struct KohzuAxis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl KohzuAxis {
-    /// Construct axis `index` (0-based; wire axis = `index + 1`).
+    /// Construct axis `index` (0-based; wire axis = `index + 1`) and read
+    /// its status (drvSC800.cc:621).
     pub fn new(controller: Arc<Mutex<KohzuController>>, index: usize) -> Self {
-        Self {
+        let mut axis = Self {
             controller,
             axis: index as u32 + 1,
             speeds: Speeds {
@@ -251,7 +269,10 @@ impl KohzuAxis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
-        }
+            init_status: None,
+        };
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, KohzuController> {
@@ -268,25 +289,35 @@ impl KohzuAxis {
     /// PREM ahead of `ASI` in one message that `write_parms` strcpy's `ASI`
     /// over, and the move's message replaces the motion node holding POST,
     /// so C sends neither (devSC800.cc:198-217, write_parms); not copied.
+    /// Each message goes out whatever the one before it returned, as
+    /// motordrvCom ignores `send_mess` (motordrvCom.cc:397-484).
     fn write_move(&mut self, command: &str) -> AsynResult<()> {
         let prem = self.strings.arm();
         let ctrl = self.lock();
         if !prem.is_empty() {
-            ctrl.command_bytes(&prem)?;
+            let _ = ctrl.command_bytes(&prem);
         }
-        self.program_speeds(&ctrl)?;
+        self.program_speeds(&ctrl);
         ctrl.command(command)?;
         Ok(())
     }
 
     /// Program the axis speeds (C `write_parms` → `ASI`).
-    fn program_speeds(&self, ctrl: &KohzuController) -> AsynResult<()> {
+    fn program_speeds(&self, ctrl: &KohzuController) {
         let s = self.speeds;
-        ctrl.command(&format!(
+        let _ = ctrl.command(&format!(
             "ASI{}/{}/{}/{}/{}/0/0/0/0/0/0/0/0/0",
             self.axis, s.base, s.slew, s.accel, s.accel
-        ))?;
-        Ok(())
+        ));
+    }
+}
+
+impl Model1Motor for KohzuAxis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        // The GAIN_SUPPORT motor_init set (drvSC800.cc:619), which a failed
+        // read stores back.
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -334,7 +365,9 @@ impl AsynMotor for KohzuAxis {
         if self.speeds.base > self.speeds.slew {
             self.speeds.base = self.speeds.slew;
         }
-        // C `NINT((jvel - vbas) / jar * 100)`, with no VBAS guard.
+        // C `NINT((jvel - vbas) / jar * 100)`, with no VBAS guard. A JAR of
+        // 0 divides by zero into an undefined int conversion
+        // (devSC800.cc:301), a C defect not copied: the last rate is kept.
         if acceleration > 0.0 {
             self.speeds.accel = nint((velocity.abs() - min_velocity) / acceleration * 100.0);
         }
@@ -498,9 +531,19 @@ mod tests {
     /// An SC-200's axis 1 on a [`LineRig`] whose `STR` reply follows
     /// `state`.
     fn strings_rig(name: &str) -> (LineRig, KohzuAxis, Arc<AtomicU8>) {
+        refusing_rig(name, |_| false)
+    }
+
+    /// [`strings_rig`], with the commands `refused` picks, less their STX,
+    /// refused.
+    fn refusing_rig(
+        name: &str,
+        refused: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (LineRig, KohzuAxis, Arc<AtomicU8>) {
         let state = Arc::new(AtomicU8::new(0));
         let st = state.clone();
-        let (line, io) = LineRig::new(name, move |last| {
+        let refused = move |cmd: &str| refused(cmd.trim_start_matches('\u{2}').trim_end());
+        let reply = move |last: &str| {
             let bit = |b: u8| u8::from(st.load(Ordering::SeqCst) & b != 0);
             if bit(QUIET) == 1 {
                 return String::new();
@@ -517,11 +560,40 @@ mod tests {
                 "RSY1/21" => "C\tRSY1\t21\t0".into(),
                 c => format!("C\t{c}"),
             }
-        });
+        };
+        let (line, io) = LineRig::failing(name, reply, refused);
         let ctrl = KohzuController::new(io).unwrap();
         let axis = KohzuAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         (line, axis, state)
+    }
+
+    /// drvSC800.cc:565-567 scan `C\tIDN0\t<model>\t%d`: a scanf `\t` takes
+    /// any blank run, none included, and `1.0` is Ver1.
+    #[test]
+    fn idn_is_scanned_as_c_sscanf() {
+        let ident = |name: &str, reply: &'static str| {
+            let (_line, io) =
+                LineRig::new(name, move |last| match last.trim_start_matches('\u{2}') {
+                    "IDN" => reply.into(),
+                    c => format!("C\t{c}"),
+                });
+            KohzuController::new(io).map(|c| c.ident().to_owned())
+        };
+        assert_eq!(
+            ident("kohzuIdnDot", "C\tIDN0\t200\t1.0").unwrap(),
+            "SC-200 Ver1"
+        );
+        assert_eq!(
+            ident("kohzuIdnBlank", "C IDN0 400 7").unwrap(),
+            "SC-400 Ver7"
+        );
+        assert_eq!(
+            ident("kohzuIdnRun", "C\tIDN0\t8000\t1").unwrap(),
+            "SC-800 Ver0"
+        );
+        assert!(ident("kohzuIdnText", "C\tIDN0\t200\tVer1").is_err());
+        assert!(ident("kohzuIdnLead", " C\tIDN0\t200\t1").is_err());
     }
 
     fn post(text: &[u8]) -> PostMessage {
@@ -553,6 +625,23 @@ mod tests {
         let (line, mut axis, _) = strings_rig("sc800Init");
         axis.primitive(&AsynUser::default(), b"COF1/0").unwrap();
         assert_eq!(sent(&line), ["COF1/0"]);
+    }
+
+    /// write_parms ends ASI's transaction and motordrvCom ignores what
+    /// send_mess returns (devSC800.cc:347-363, motordrvCom.cc:397-484): a
+    /// refused PREM or ASI still sends the move.
+    #[test]
+    fn a_refused_prem_or_asi_still_sends_the_move() {
+        let (line, mut axis, _) = refusing_rig("sc800Refused", |cmd| {
+            cmd == "COF1/0" || cmd.starts_with("ASI") || cmd == "ORG1/2/0/0/3/1"
+        });
+        let user = AsynUser::default();
+        let asi = "ASI1/10/100/9/9/0/0/0/0/0/0/0/0/0";
+        axis.set_move_strings(&user, b"COF1/0", None).unwrap();
+        axis.move_absolute(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
+        assert_eq!(sent(&line), ["COF1/0", asi, "APS1/2/0/0/5/0/0/1"]);
+        assert!(axis.home(&user, 10.0, 100.0, 1000.0, true).is_err());
+        assert_eq!(sent(&line), [asi, "ORG1/2/0/0/3/1"]);
     }
 
     /// devSC800.cc:198-217: PREM as its own command ahead of each move,
@@ -653,6 +742,34 @@ mod tests {
     /// drvSC800.cc:229-249: a first bad `STR` is RETRY (nothing raised,
     /// nothing posted, nothing more sent), the next COMM_ERR, and a reply
     /// clears it.
+    /// drvSC800.cc:609-621: a failed `motor_init` read stores the
+    /// GAIN_SUPPORT `motor_init` set, the first raising nothing (RETRY) and
+    /// the next CNTRL_COMM_ERR and RA_PROBLEM (:236-250).
+    #[test]
+    fn a_failed_init_read_keeps_gain_support() {
+        let (_line, io) = LineRig::new("sc800InitFail", |last| {
+            match last.trim_start_matches('\u{2}') {
+                "IDN" => "C\tIDN0\t200\t1".into(),
+                _ => String::new(),
+            }
+        });
+        let ctrl = Arc::new(Mutex::new(KohzuController::new(io).unwrap()));
+        let init = |index| KohzuAxis::new(ctrl.clone(), index).take_init_status();
+        let prepared = MotorStatus {
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(0), prepared);
+        assert_eq!(
+            init(1),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
+    }
+
     #[test]
     fn a_missed_str_is_retry_then_comm_error() {
         let (line, mut axis, state) = strings_rig("sc800Retry");

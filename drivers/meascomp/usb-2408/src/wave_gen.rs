@@ -4,6 +4,7 @@ use uldaq_sys::*;
 
 use epics_rs::asyn::trace::TraceMask;
 
+use crate::board_enums::map_range;
 use crate::params::*;
 use crate::trace::{DRIVER_NAME, SelfTrace};
 
@@ -330,11 +331,11 @@ pub fn stop_wave_gen(
 ) -> UlError {
     state.running = false;
     let err = device.analog_out_scan_stop().err().map_or(0, |e| e.code);
-    for &(ch, range) in restore {
+    for &(ch, gain) in restore {
         trace.report(
             &device.analog_out(
                 ch,
-                range,
+                map_range(trace, gain),
                 AOUT_FF_NOSCALEDATA,
                 state.saved_outputs[ch as usize],
             ),

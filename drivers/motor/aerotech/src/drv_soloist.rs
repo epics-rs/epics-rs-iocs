@@ -11,13 +11,14 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
+use motor_common::model1::init_read;
 use motor_common::util::{atof, atoi, nint};
 
 /// `Soloist_NUM_CARDS`.
@@ -178,10 +179,13 @@ pub struct DrvSoloistAxis {
     /// reading its reply, which every later status read then takes for its
     /// own; its reply is read away here.
     post: Option<PostMessage>,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvSoloistAxis {
-    /// The axis [`motor_init`] set up, its status read as `motor_init` ends.
+    /// The axis [`motor_init`] set up, its status read as `motor_init` ends
+    /// (drvSoloist.cc:734).
     pub fn new(card: Arc<Mutex<SoloistCard>>, setup: AxisSetup) -> Self {
         let mut axis = Self {
             card,
@@ -194,8 +198,9 @@ impl DrvSoloistAxis {
             },
             strings: None,
             post: None,
+            init_status: None,
         };
-        let _ = axis.poll(&AsynUser::new(0));
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -225,10 +230,16 @@ impl DrvSoloistAxis {
         self.send(format!("SETPARM 107, {v}"));
     }
 
-    /// `SET_ACCEL`, unless zero.
+    /// `SET_ACCEL`.
     fn accel(&self, acceleration: f64) {
+        self.send(format!("SETPARM 103, {}", self.units(acceleration)));
+    }
+
+    /// A move's or home's SET_ACCEL, which the record sends only at a
+    /// positive rate (motorRecord.cc:874); a jog's goes at any (:2141).
+    fn move_accel(&self, acceleration: f64) {
         if acceleration > 0.0 {
-            self.send(format!("SETPARM 103, {}", self.units(acceleration)));
+            self.accel(acceleration);
         }
     }
 
@@ -246,9 +257,16 @@ impl DrvSoloistAxis {
 
     fn move_to(&mut self, command: &str, target: f64, velocity: f64, acceleration: f64) {
         self.velocity(velocity);
-        self.accel(acceleration);
+        self.move_accel(acceleration);
         let motion = format!("{command} D{}", self.units(target));
         self.motion(&motion);
+    }
+}
+
+impl Model1Motor for DrvSoloistAxis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.status.clone(), self.poll_failure())
     }
 }
 
@@ -307,7 +325,7 @@ impl AsynMotor for DrvSoloistAxis {
         forward: bool,
     ) -> AsynResult<()> {
         self.velocity(velocity);
-        self.accel(acceleration);
+        self.move_accel(acceleration);
         let hparam = if forward {
             self.setup.home_dparam | 1
         } else {
@@ -439,6 +457,67 @@ mod tests {
         assert_eq!(decimals(1.0), 2);
         assert_eq!(decimals(1.0 / 3.0), 2);
         assert_eq!(decimals(1000.0), 1);
+    }
+
+    /// drvSoloist.cc:640-734: a failed `motor_init` read stores the
+    /// EA_PRESENT and GAIN_SUPPORT GETPARM(58) and GETPARM(33) gave, a
+    /// missed reply raising nothing (RETRY) and a refused one
+    /// CNTRL_COMM_ERR and RA_PROBLEM (:228-250).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        use motor_common::testing::LineRig;
+        let init = |name, reply: &'static str, encoder| {
+            let (_line, io) = LineRig::new(name, move |_| reply.into());
+            let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+            let setup = AxisSetup {
+                encoder,
+                gain: true,
+                resolution: 1.0,
+                digits: 0,
+                home_dparam: 0,
+            };
+            DrvSoloistAxis::new(card, setup).take_init_status()
+        };
+        let prepared = |encoder| MotorStatus {
+            gain_support: true,
+            has_encoder: encoder,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init("soloistInitMissed", "", true), prepared(true));
+        assert_eq!(
+            init("soloistInitRefused", "!", false),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared(false)
+            }
+        );
+    }
+
+    /// motorRecord.cc:2141, :3068: a jog's SET_ACCEL goes out at any rate,
+    /// a move's only at a positive one (:874).
+    #[test]
+    fn a_jog_sends_set_accel_at_a_zero_rate() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("soloistJogAccel", |_| "%0".into());
+        let card = Arc::new(Mutex::new(SoloistCard::new(io, 0)));
+        let setup = AxisSetup {
+            encoder: false,
+            gain: false,
+            resolution: 1.0,
+            digits: 0,
+            home_dparam: 0,
+        };
+        let mut axis = DrvSoloistAxis::new(card, setup);
+        let user = AsynUser::new(0);
+        line.sent();
+        axis.move_velocity(&user, 0.0, 3.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["SETPARM 103, 0", "FREERUN F 3"]);
+        axis.move_absolute(&user, 5.0, 0.0, 3.0, 0.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["SETPARM 102, 3", "SETPARM 107, 3", "MOVEABS D5"]
+        );
     }
 
     /// drvSoloist.cc's `%.*f` of a non-finite step value.

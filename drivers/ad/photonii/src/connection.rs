@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynStatus, OctetStep};
 use epics_rs::asyn::request::OctetReadOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -62,15 +62,16 @@ impl P2Util {
 
     /// Send one command line and return p2util's reply (C `writePhotonII`,
     /// which is `asynOctetSyncIO::writeRead`: flush, write, read one line).
-    /// The reply is what C's `fromPhotonII_` holds, also after a failed read.
+    /// The reply is what the read left in C's `fromPhotonII_`, also when it
+    /// failed; `None` when no read ran and the buffer kept the last reply.
     pub fn write_read(
         &self,
         command: &str,
         timeout: Duration,
-    ) -> (String, Result<(), ChannelError>) {
+    ) -> (Option<String>, Result<(), ChannelError>) {
         let port = match self.handle.port() {
             Ok(port) => port,
-            Err(e) => return (String::new(), Err(e.into())),
+            Err(e) => return (None, Err(e.into())),
         };
         let (reply, status) = port
             .submit_octet_read_blocking(
@@ -81,15 +82,25 @@ impl P2Util {
                 self.user(timeout),
             )
             .into_parts();
-        (decode(reply), status.map_err(ChannelError::from))
+        let read = match &status {
+            Ok(()) => true,
+            Err(e) => e.octet_step() == Some(OctetStep::Read),
+        };
+        (
+            read.then(|| decode(reply)),
+            status.map_err(ChannelError::from),
+        )
     }
 
     /// Read one line p2util sent unprompted (C `readPhotonII`), e.g. the
-    /// "wrote N bytes to ..." message that follows every frame.
-    pub fn read(&self, timeout: Duration) -> Result<String, ChannelError> {
-        let (line, status) = self
-            .handle
-            .port()?
+    /// "wrote N bytes to ..." message that follows every frame, a timeout's
+    /// bytes included; `None` when the request never ran.
+    pub fn read(&self, timeout: Duration) -> (Option<String>, Result<(), ChannelError>) {
+        let port = match self.handle.port() {
+            Ok(port) => port,
+            Err(e) => return (None, Err(e.into())),
+        };
+        let (line, status) = port
             .submit_octet_read_blocking(
                 OctetReadOp::Read {
                     buf_size: MAX_MESSAGE_SIZE,
@@ -97,18 +108,31 @@ impl P2Util {
                 self.user(timeout),
             )
             .into_parts();
-        status?;
-        Ok(decode(line))
+        let read = status.as_ref().map_or_else(|e| !e.never_ran(), |()| true);
+        (
+            read.then(|| decode(line)),
+            status.map_err(ChannelError::from),
+        )
     }
 }
 
+/// `fromPhotonII_` as C posts it: up to the NUL the read appended.
 fn decode(data: Vec<u8>) -> String {
-    String::from_utf8_lossy(&data).trim_end().to_string()
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    String::from_utf8_lossy(&data[..end]).into_owned()
 }
 
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
+
+    /// Trailing blanks and the `\r` of an EOS a timeout split stay in the
+    /// line C posts (asynInterposeEos.c:89, PhotonII.cpp:260).
+    #[test]
+    fn a_line_keeps_its_trailing_bytes() {
+        assert_eq!(decode(b"wrote 3 \r".to_vec()), "wrote 3 \r");
+        assert_eq!(decode(b"ok\0junk".to_vec()), "ok");
+    }
 
     #[test]
     fn a_timeout_maps_to_timeout() {

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::snl::spawn_program;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
 use usb_ctr::{CtrRuntime, CtrScalerDriver, create_usb_ctr};
@@ -27,7 +28,7 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: usb-ctr-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: usb-ctr-ioc <st.cmd>");
         std::process::exit(1);
     };
 
@@ -45,6 +46,16 @@ async fn main() -> CaResult<()> {
     epics_rs::base::runtime::env::set_default(
         "SCALER",
         scaler_dir.to_str().expect("cargo paths are UTF-8"),
+    );
+
+    // mca ships SIS38XX_waveform.template; MCA names its crate dir, as
+    // SCALER does, so st.cmd loads it from $(MCA)/db.
+    let mca_dir = std::path::Path::new(mca::MCA_DB_DIR)
+        .parent()
+        .expect("MCA_DB_DIR is <crate>/db");
+    epics_rs::base::runtime::env::set_default(
+        "MCA",
+        mca_dir.to_str().expect("cargo paths are UTF-8"),
     );
 
     // Runtime kept alive by being captured in the startup command closure
@@ -166,6 +177,48 @@ async fn main() -> CaResult<()> {
             },
         );
     }
+
+    // seq's iocsh command (seq_cmd.c:134-164), for the one program this IOC
+    // links.
+    app = app.register_startup_command(CommandDef::new(
+        "seq",
+        vec![
+            ArgDesc {
+                name: "sequencer",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "macro definitions",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "stack size",
+                arg_type: ArgType::Int,
+            },
+        ],
+        "seq sequencer [macro definitions] [stack size]",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let Some(ArgValue::String(table)) = args.first() else {
+                println!("No sequencer specified.");
+                return Ok(CommandOutcome::Continue);
+            };
+            let table = table.to_str()?;
+            let table = table.strip_prefix('&').unwrap_or(table);
+            if table != "USBCTR_SNL" {
+                println!("Can't find sequencer `{table}'.");
+                return Ok(CommandOutcome::Continue);
+            }
+            let macros = match args.get(1) {
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
+                _ => String::new(),
+            };
+            let config = usb_ctr::snl::UsbCtrSnlConfig::from_macros(&macros);
+            spawn_program(ctx.bridge(), ctx.db(), "USBCTR_SNL", move |db| {
+                usb_ctr::snl::run(config, db)
+            });
+            Ok(CommandOutcome::Continue)
+        },
+    ));
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

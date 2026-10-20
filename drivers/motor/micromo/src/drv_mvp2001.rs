@@ -14,12 +14,13 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::device_support::{BuildTrans, DialLimitReset, LimitBuild};
 
+use motor_common::model1::init_read;
 use motor_common::util::{atoi, nint};
 
 /// `MVP2001_NUM_CARDS`.
@@ -161,11 +162,11 @@ impl Mvp2001Build {
 
 impl BuildTrans for Mvp2001Build {
     /// A raw limit past the controller's is ERROR and resets the record's
-    /// dial limit to it. C writes DHLM for SET_HIGH_LIMIT and DLLM for
-    /// SET_LOW_LIMIT at |MRES|, but under MRES < 0 the record sends DHLM as
-    /// SET_LOW_LIMIT (motorRecord.cc:4246), so C leaves the refused DHLM
-    /// past the controller and rewrites DLLM: here the dial limit the raw
-    /// one maps to is reset, which is C's for MRES > 0.
+    /// dial limit to it. devMVP2001.cc:436/447 write DHLM for
+    /// SET_HIGH_LIMIT and DLLM for SET_LOW_LIMIT, but under MRES < 0 the
+    /// record sends DHLM as SET_LOW_LIMIT (motorRecord.cc:4246), so C resets
+    /// the other dial limit. That C defect is not copied: the dial limit
+    /// the raw one maps to is reset.
     fn limit(&self, high: bool, raw: f64, mres: f64) -> LimitBuild {
         let (low, high_limit) = self.limits;
         let (limit, past) = if high {
@@ -208,11 +209,13 @@ pub struct DrvMvp2001Axis {
     /// every `build_trans` restarts the transaction, which clears the
     /// pointer before the move is queued.
     post: Option<PostMessage>,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl DrvMvp2001Axis {
     /// Controller `signal + 1` of `chain`: zeroed once more and its status
-    /// read, as `motor_init` ends.
+    /// read, as `motor_init` ends (drvMVP2001.cc:711-720).
     pub fn new(chain: Arc<Mutex<Mvp2001Chain>>, signal: usize) -> Self {
         let mut axis = Self {
             chain,
@@ -227,11 +230,12 @@ impl DrvMvp2001Axis {
             position: 0,
             strings: None,
             post: None,
+            init_status: None,
         };
         // HO too soon after EN reads back within ten counts of zero.
         sleep(Duration::from_millis(200));
         axis.send("HO");
-        let _ = axis.poll(&AsynUser::new(0));
+        axis.init_status = Some(axis.poll(&AsynUser::new(0)));
         axis
     }
 
@@ -294,6 +298,13 @@ fn refused(message: &str) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message: message.into(),
+    }
+}
+
+impl Model1Motor for DrvMvp2001Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.status.clone(), self.poll_failure())
     }
 }
 
@@ -475,6 +486,30 @@ mod tests {
         assert_eq!(hex_at("0001 FFFFFFF6", 8) as i32, -10);
         assert_eq!(hex_at("0001 00000010junk", 8), 16);
         assert_eq!(hex_at("", 8), 0);
+    }
+
+    /// drvMVP2001.cc:675-720: a failed `motor_init` read stores the
+    /// GAIN_SUPPORT `motor_init` set, with EA_PRESENT off, the first raising
+    /// nothing (RETRY) and the next CNTRL_COMM_ERR and RA_PROBLEM
+    /// (:316-330).
+    #[test]
+    fn a_failed_init_read_keeps_gain_support() {
+        let (_line, io) = motor_common::testing::LineRig::new("mvpInitFail", |_| String::new());
+        let chain = Arc::new(Mutex::new(Mvp2001Chain::new(io)));
+        let init = |signal| DrvMvp2001Axis::new(chain.clone(), signal).take_init_status();
+        let prepared = MotorStatus {
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(0), prepared);
+        assert_eq!(
+            init(1),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// devMVP2001.cc:430-448: a raw limit at the controller's is built, one

@@ -87,6 +87,7 @@
 //!   request to `RONTEC_MAXCHANS`. A short reply is not an error, as in C:
 //!   it is logged and the persistent buffer is parsed anyway.
 
+use std::ffi::c_long;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,6 +105,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::runtime::log::errlog_printf;
+use epics_rs::base::runtime::stdlib::c_isspace;
 
 use mca::interface::McaReason;
 
@@ -120,6 +122,12 @@ const RONTEC_TIMEOUT: Duration = Duration::from_secs(2);
 /// -- distinct from [`RONTEC_TIMEOUT`], used only for the binary spectrum
 /// transfer.
 const SPECTRUM_TIMEOUT: Duration = Duration::from_secs(10);
+/// The interfaces `RontecConfig` registers (`drvMcaRontec.c:228-251`); it
+/// registers no interrupt source.
+const RONTEC_INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::DRV_USER);
 
 /// The `pasynUser->reason` used for octet transactions against the
 /// underlying serial port (mirrors `love::driver::OCTET_REASON`).
@@ -132,14 +140,12 @@ fn protocol_error(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// C `atoi`, applied to a byte slice: skip leading ASCII whitespace, an
-/// optional sign, then decimal digits, stopping at the first non-digit (or
-/// the end of the slice); `0` if no digits are found. C's `atoi` has
-/// implementation-defined overflow behavior; this saturates instead, which
-/// cannot diverge for any realistic Rontec time/count reply.
+/// glibc `atoi`, applied to a byte slice: `(int) strtol(s, NULL, 10)`, so
+/// leading `isspace`, an optional sign and decimal digits saturating at
+/// `LONG_MIN` / `LONG_MAX`, then truncated to `int`; `0` if no digits.
 fn c_atoi(bytes: &[u8]) -> i32 {
     let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+    while i < bytes.len() && c_isspace(bytes[i] as char) {
         i += 1;
     }
     let negative = match bytes.get(i) {
@@ -153,14 +159,18 @@ fn c_atoi(bytes: &[u8]) -> i32 {
         }
         _ => false,
     };
-    let mut value: i32 = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value
-            .saturating_mul(10)
-            .saturating_add(i32::from(bytes[i] - b'0'));
+    // Accumulated toward the sign, so LONG_MIN's magnitude fits.
+    let mut value: c_long = 0;
+    while let Some(d) = bytes.get(i).filter(|c| c.is_ascii_digit()) {
+        let d = c_long::from(d - b'0');
+        value = if negative {
+            value.saturating_mul(10).saturating_sub(d)
+        } else {
+            value.saturating_mul(10).saturating_add(d)
+        };
         i += 1;
     }
-    if negative { -value } else { value }
+    value as i32
 }
 
 /// C `%s` of a reply buffer: the bytes up to its first NUL.
@@ -275,8 +285,8 @@ impl RontecDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            RONTEC_INTERFACES,
+            InterfaceMask::NONE,
         );
         let reasons = McaReason::create_params(&mut base)?;
 
@@ -748,6 +758,16 @@ mod tests {
         assert_eq!(c_atoi(b""), 0);
     }
 
+    #[test]
+    fn c_atoi_is_int_of_strtol() {
+        use std::ffi::c_long;
+        assert_eq!(c_atoi(b"-2147483648"), i32::MIN);
+        assert_eq!(c_atoi(b"4294967297"), 1);
+        assert_eq!(c_atoi(b"-99999999999999999999"), c_long::MIN as i32);
+        assert_eq!(c_atoi(b"99999999999999999999"), c_long::MAX as i32);
+        assert_eq!(c_atoi(b"\x0b12"), 12);
+    }
+
     fn dummy_reasons() -> [usize; McaReason::COUNT] {
         let mut r = [0usize; McaReason::COUNT];
         for (i, slot) in r.iter_mut().enumerate() {
@@ -1042,6 +1062,51 @@ mod tests {
     impl Drop for Rig {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.trace_path);
+        }
+    }
+
+    /// C registers asynCommon, asynInt32, asynFloat64, asynInt32Array and
+    /// asynDrvUser and no interrupt source (`drvMcaRontec.c:204-251`).
+    #[test]
+    fn the_port_has_cs_interfaces_and_no_interrupts() {
+        use epics_rs::asyn::interfaces::InterfaceType as I;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        let rig = Rig::new("ifaces", rontec_reply);
+        let handle = rig.rontec.port_handle();
+        let all = [
+            I::Common,
+            I::DrvUser,
+            I::Int32,
+            I::Int64,
+            I::Float64,
+            I::Octet,
+            I::Option,
+            I::UInt32Digital,
+            I::Enum,
+            I::GenericPointer,
+            I::Int32Array,
+            I::Float64Array,
+        ];
+        let present: Vec<_> = all
+            .into_iter()
+            .filter(|&i| handle.has_interface(i))
+            .collect();
+        assert_eq!(
+            present,
+            [I::Common, I::DrvUser, I::Int32, I::Float64, I::Int32Array]
+        );
+        for iface in [I::Int32, I::Float64, I::Int32Array] {
+            let filter = InterruptFilter {
+                iface: Some(iface),
+                ..InterruptFilter::default()
+            };
+            assert!(
+                handle
+                    .interrupts()
+                    .register_interrupt_user(filter, 0)
+                    .is_err(),
+                "{iface:?}"
+            );
         }
     }
 

@@ -296,6 +296,10 @@ impl Plc {
             for info in tags {
                 {
                     let mut d = info.data.lock();
+                    // C defect, not copied: "Reset all write flags ... skip
+                    // all writes" resets is_writing alone
+                    // (drvEtherIP.c:463-466), so a write still in do_write
+                    // goes out after the reconnect.
                     d.is_writing = false;
                     d.do_write = false;
                     d.valid_data_size = 0;
@@ -667,10 +671,14 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
                     d.r_response = 4 + data.len();
                     // Estimate the write sizes from the read, as the C does:
                     // a write request is the read request plus the type+data
-                    // block, and its response is a bare MR header.
-                    let type_and_data = d.r_response - 4;
-                    d.w_request = d.r_request + type_and_data;
-                    d.w_response = 4;
+                    // block, and its response is a bare MR header. A reply
+                    // with no type and data gives none, and no scan reads
+                    // the tag.
+                    (d.w_request, d.w_response) = if data.is_empty() {
+                        (0, 0)
+                    } else {
+                        (d.r_request + data.len(), 4)
+                    };
                     crate::eip_printf!(
                         5,
                         "  tag '{}': req {}, resp {} bytes\n",
@@ -678,14 +686,6 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
                         d.r_request,
                         d.r_response
                     );
-
-                    if data.len() < encap::BUFFER_SIZE {
-                        d.buf = data;
-                        d.valid_data_size = d.buf.len();
-                    } else {
-                        print_rejected(&info.string_tag, data.len());
-                        d.valid_data_size = 0;
-                    }
                 }
                 Err(_) => {
                     crate::eip_printf!(3, "tag '{}': Cannot read!\n", info.string_tag);
@@ -694,10 +694,8 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
                     d.r_response = 0;
                     d.w_request = 0;
                     d.w_response = 0;
-                    d.valid_data_size = 0;
                 }
             }
-            info.notify();
         }
     }
 
@@ -1023,11 +1021,20 @@ fn dump_tag_info(info: &TagInfo, list: &ScanList, level: i32) {
             if d.do_write { "yes" } else { "no" },
             if d.is_writing { "yes" } else { "no" }
         );
-        crate::eip_printf!(0, "  data                : ");
     }
-    if d.valid_data_size > 0 {
-        crate::eip_printf!(0, "{}", cip::dump_raw_cip_data(&d.buf, elements));
+    // C writes the label and the value in two `EIP_printf`s
+    // (drvEtherIP.c:119-124); one write is a deliberate deviation. With no
+    // data the label stays on stderr and `-no data-` on stdout, as C.
+    let label = if level > 3 {
+        "  data                : "
     } else {
+        ""
+    };
+    if d.valid_data_size > 0 {
+        let value = cip::dump_raw_cip_data(&d.buf, elements);
+        crate::eip_printf!(0, "{label}{value}");
+    } else {
+        crate::eip_printf!(0, "{label}");
         println!("-no data-");
     }
     if level > 3 {
@@ -1148,15 +1155,14 @@ pub fn dump() {
         println!("PLC {}", plc.name);
         for list in plc.scanlists.lock().iter() {
             for info in list.tags.lock().iter() {
-                crate::eip_printf!(0, "{} ", info.string_tag);
+                // C writes the tag and its value in two calls
+                // (drvEtherIP.c:1163-1168); one write is a deliberate deviation.
                 let d = info.data.lock();
                 if d.valid_data_size > 0 {
-                    crate::eip_printf!(
-                        0,
-                        "{}",
-                        cip::dump_raw_cip_data(&d.buf, *info.elements.lock())
-                    );
+                    let value = cip::dump_raw_cip_data(&d.buf, *info.elements.lock());
+                    crate::eip_printf!(0, "{} {value}", info.string_tag);
                 } else {
+                    crate::eip_printf!(0, "{} ", info.string_tag);
                     println!(" - no data -");
                 }
             }
@@ -1272,6 +1278,12 @@ mod registry_tests {
     /// session and then fails every request, so the scan-list completion
     /// reads no tag.
     fn plc_that_reads_nothing() -> (u16, std::thread::JoinHandle<()>) {
+        plc_answering(None)
+    }
+
+    /// As [`plc_that_reads_nothing`], but every SendRRData gets `read`, the
+    /// CIP response, when there is one.
+    fn plc_answering(read: Option<Vec<u8>>) -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1294,6 +1306,13 @@ mod registry_tests {
                     }
                     encap::EC_REGISTER_SESSION => (0, vec![1, 0, 0, 0]),
                     encap::EC_UNREGISTER_SESSION => break,
+                    encap::EC_SEND_RR_DATA if read.is_some() => {
+                        let reply = encap::encode_send_rr_data(1, tid, read.as_ref().unwrap());
+                        if s.write_all(&reply).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     _ => (1, Vec::new()),
                 };
                 let mut reply = Vec::new();
@@ -1306,6 +1325,61 @@ mod registry_tests {
             }
         });
         (port, server)
+    }
+
+    /// drvEtherIP.c:396-436: the completion's probe read takes the tag's
+    /// sizes and nothing else; the data and the records' callbacks wait for
+    /// the first scan.
+    #[test]
+    fn a_completion_probe_stores_no_data_and_calls_no_record() {
+        // A DINT 7: CIP_ReadData reply, status 0, no extended status.
+        let read = vec![0xCC, 0, 0, 0, 0xC4, 0, 7, 0, 0, 0];
+        let (port, server) = plc_answering(Some(read));
+        let plc = Arc::new(Plc::on_port("probe", "127.0.0.1", 0, port));
+        let tag = plc.add_tag(1.0, "T", 1).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tag.add_listener(tx);
+        let mut c = Connection::startup(
+            "127.0.0.1",
+            port,
+            0,
+            Duration::from_secs(5),
+            encap::DEFAULT_BUFFER_LIMIT,
+        )
+        .unwrap();
+        assert!(complete_tag_infos(&plc, &mut c));
+        {
+            let d = tag.data.lock();
+            assert_eq!(d.r_response, 10);
+            assert_eq!(d.valid_data_size, 0);
+            assert!(d.buf.is_empty());
+        }
+        assert!(rx.try_recv().is_err(), "no record was processed");
+        drop(c);
+        server.join().unwrap();
+    }
+
+    /// drvEtherIP.c:417-421: a probe reply without type and data gives the
+    /// tag no write sizes, which keeps it out of every scan.
+    #[test]
+    fn a_probe_reply_without_data_takes_the_tag_out_of_the_scan() {
+        let (port, server) = plc_answering(Some(vec![0xCC, 0, 0, 0]));
+        let plc = Arc::new(Plc::on_port("probeempty", "127.0.0.1", 0, port));
+        let tag = plc.add_tag(1.0, "T", 1).unwrap();
+        let mut c = Connection::startup(
+            "127.0.0.1",
+            port,
+            0,
+            Duration::from_secs(5),
+            encap::DEFAULT_BUFFER_LIMIT,
+        )
+        .unwrap();
+        assert!(complete_tag_infos(&plc, &mut c));
+        let d = tag.data.lock();
+        assert_eq!((d.r_response, d.w_request, d.w_response), (4, 0, 0));
+        drop(d);
+        drop(c);
+        server.join().unwrap();
     }
 
     /// drvEtherIP.c:503-510: a scan-list completion failure runs
@@ -1339,6 +1413,31 @@ mod registry_tests {
             .filter(|n| n.starts_with("regorder_"))
             .collect();
         assert_eq!(names, ["regorder_b", "regorder_a"]);
+    }
+
+    /// drvEtherIP.c:119-124 and :1163-1168 write a label and the value in
+    /// two `EIP_printf`s; each is one line here.
+    #[cfg(unix)]
+    #[test]
+    fn a_tag_label_and_its_value_are_one_write() {
+        use crate::tests::stderr_writes;
+        let plc = define_plc("oneline_plc", "10.0.0.8", 0);
+        let tag = plc.add_tag(1.0, "ONELINE", 1).unwrap();
+        {
+            let mut d = tag.data.lock();
+            d.buf = vec![0xC4, 0, 7, 0, 0, 0];
+            d.valid_data_size = 6;
+        }
+        let list = plc.scanlists.lock()[0].clone();
+        let writes = stderr_writes(|| dump_tag_info(&tag, &list, 4));
+        let line = "  data                : DINT 7\n".to_string();
+        assert!(writes.contains(&line), "{writes:?}");
+
+        let writes = stderr_writes(dump);
+        assert!(
+            writes.contains(&"ONELINE DINT 7\n".to_string()),
+            "{writes:?}"
+        );
     }
 
     /// drvEtherIP.c:1278: a tag registered again at a shorter period moves

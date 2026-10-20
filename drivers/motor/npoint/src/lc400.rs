@@ -148,7 +148,7 @@ impl Lc400Controller {
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 controller.firmware = bytes[..end].to_vec();
             }
-            Err(_) => eprintln!(
+            Err(_) => epics_rs::base::stderr_println!(
                 "LC400MotorDriver:LC400Controller: cannot read LC400 controller firmware version"
             ),
         }
@@ -276,41 +276,33 @@ impl Lc400Controller {
         );
     }
 
-    /// `updateAuxParams`: the static parameters of `axis`, read only while
-    /// every axis is done.
-    fn aux_params(&self, address: u32) -> AsynResult<Vec<(usize, ParamValue)>> {
+    /// `updateAuxParams`: the static parameters of `axis` into `set` as
+    /// each is read, only while every axis is done; a failed read ends it
+    /// with those before it kept (LC400MotorDriver.cpp:500-517).
+    fn aux_params(&self, address: u32, set: &mut Vec<(usize, ParamValue)>) -> AsynResult<()> {
         let Some(p) = self.params else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         if self.axes.iter().any(|a| !a.done) {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        Ok(vec![
-            (
-                p.range,
-                ParamValue::Int32(self.read_single(address + ST_RANGE_CMD)?),
-            ),
-            (
-                p.range_type,
-                ParamValue::Int32(self.read_single(address + ST_RANGE_TYPE)?),
-            ),
-            (
-                p.servo_state,
-                ParamValue::Int32(self.read_single(address + SERVO_STATE)?),
-            ),
-            (
-                p.p_gain,
-                ParamValue::Float64(self.read_double(address + P_GAIN)?),
-            ),
-            (
-                p.i_gain,
-                ParamValue::Float64(self.read_double(address + I_GAIN)?),
-            ),
-            (
-                p.d_gain,
-                ParamValue::Float64(self.read_double(address + D_GAIN)?),
-            ),
-        ])
+        for (reason, offset) in [
+            (p.range, ST_RANGE_CMD),
+            (p.range_type, ST_RANGE_TYPE),
+            (p.servo_state, SERVO_STATE),
+        ] {
+            set.push((
+                reason,
+                ParamValue::Int32(self.read_single(address + offset)?),
+            ));
+        }
+        for (reason, offset) in [(p.p_gain, P_GAIN), (p.i_gain, I_GAIN), (p.d_gain, D_GAIN)] {
+            set.push((
+                reason,
+                ParamValue::Float64(self.read_double(address + offset)?),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -371,7 +363,9 @@ fn gen_trapezoid(ipos: f64, fpos: f64, mut vel: f64, acc: f64, max_pts: usize) -
         }
     }
     if cycle_count == 0 {
-        eprintln!("Cycle Count was calculated to be 0, which shouldn't happen. Setting it to 1");
+        epics_rs::base::stderr_println!(
+            "Cycle Count was calculated to be 0, which shouldn't happen. Setting it to 1"
+        );
         cycle_count = 1;
     }
     data.truncate(npts);
@@ -440,6 +434,9 @@ impl Lc400Axis {
 /// last, C ignoring the others.
 fn halt(ctrl: &Lc400Controller, ch: u32, wav: u32) -> AsynResult<()> {
     let _ = ctrl.write_single(ch + WAV_ACTIVE, 0);
+    // C writes its uninitialised `currentPos` when the read fails
+    // (LC400MotorDriver.cpp:679-680, :703-704); not copied, the write is
+    // skipped.
     if let Ok(current) = ctrl.read_single(ch + ST_DIGITAL_POS) {
         let _ = ctrl.write_single(wav, current);
     }
@@ -530,8 +527,9 @@ impl Lc400Controller {
         }
 
         self.write_single(ch + WAV_ACTIVE, 1)?;
-        // C spins until the table starts, forever when the read fails; a failed
-        // read ends the wait here.
+        // C spins until the table starts, forever when the start write or a
+        // read fails (LC400MotorDriver.cpp:797-805); either failure ends the
+        // wait here.
         while self.read_single(ch + WAV_INDEX)? == 0 {
             sleep(Duration::from_millis(10));
         }
@@ -543,6 +541,11 @@ impl AsynMotor for Lc400Axis {
     /// C `LC400Axis::poll`'s `skip` label sets only `motorStatusProblem_`.
     fn poll_failure(&self) -> PollFailure {
         PollFailure::PROBLEM
+    }
+
+    /// LC400MotorDriver.cpp:666.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
     }
 
     fn move_absolute(
@@ -640,7 +643,7 @@ impl AsynMotor for Lc400Axis {
             let busy = ctrl.read_single(address + WAV_ACTIVE)?;
             let done = busy == 0;
             if done {
-                updates.extend(ctrl.aux_params(address)?);
+                ctrl.aux_params(address, &mut updates)?;
             }
             let state = &mut ctrl.axes[self.axis];
             if done {
@@ -879,6 +882,12 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn the_constructor_calls_back() {
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(None, 1)));
+        assert!(Lc400Axis::new(controller, 0).constructor_calls_param_callbacks());
+    }
+
     /// A four-axis LC400 port with no line: axis 3 has no controller
     /// address, and the controller's own registers fail to write.
     fn port(name: &str) -> (PortHandle, Lc400Params) {
@@ -958,6 +967,41 @@ mod tests {
                 p.d_gain
             ]
         );
+    }
+
+    /// LC400MotorDriver.cpp:500-517: a failed aux read ends updateAuxParams
+    /// at `goto skip`, and the params set before it go out with the poll.
+    #[test]
+    fn a_failed_aux_read_keeps_the_params_read_before_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Writes until the one refused; unarmed at usize::MAX.
+        let left = Arc::new(AtomicUsize::new(usize::MAX));
+        let countdown = left.clone();
+        let (_rig, io) = motor_common::testing::LineRig::failing(
+            "lc400AuxFail",
+            |_| "AAAAA\0\0\0\0Z".into(),
+            move |_| countdown.fetch_sub(1, Ordering::SeqCst) == 1,
+        );
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(Some(io), 1)));
+        let params = Lc400ControllerParams::new(controller.clone(), 0.0, 0.0);
+        let _port = register_controller_port(&open_owner(), "lc400AuxFailPort", 1, params).unwrap();
+        let p = lock(&controller).params.unwrap();
+        let mut axis = Lc400Axis::new(controller, 0);
+        let user = AsynUser::new(0);
+        axis.poll(&user).unwrap();
+        axis.take_port_sets();
+        // Position, WAV_ACTIVE, range, range type, then SERVO_STATE refused.
+        left.store(5, Ordering::SeqCst);
+        assert!(axis.poll(&user).unwrap().problem);
+        let reasons: Vec<usize> = axis
+            .take_port_sets()
+            .into_iter()
+            .map(|set| match set {
+                PortSet::Axis { reason, .. } => reason,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(reasons, [p.digital_pos, p.range, p.range_type]);
     }
 
     /// An LC400 register map: words written by `A2`/`A3` read back by

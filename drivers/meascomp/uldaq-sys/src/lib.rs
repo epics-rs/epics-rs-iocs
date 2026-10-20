@@ -181,6 +181,18 @@ pub const BIPPT156VOLTS: i32 = 24;
 
 pub const UNI10VOLTS: i32 = 1005;
 pub const UNI5VOLTS: i32 = 1006;
+pub const UNI4VOLTS: i32 = 1007;
+pub const UNI2PT5VOLTS: i32 = 1008;
+pub const UNI2VOLTS: i32 = 1009;
+pub const UNI1PT25VOLTS: i32 = 1010;
+pub const UNI1VOLTS: i32 = 1011;
+pub const UNIPT5VOLTS: i32 = 1013;
+pub const UNIPT25VOLTS: i32 = 1014;
+pub const UNIPT2VOLTS: i32 = 1016;
+pub const UNIPT1VOLTS: i32 = 1017;
+pub const UNIPT05VOLTS: i32 = 1019;
+pub const UNIPT01VOLTS: i32 = 1020;
+pub const MA0TO20: i32 = 2000;
 
 // ---------------------------------------------------------------------------
 // DigitalPortType

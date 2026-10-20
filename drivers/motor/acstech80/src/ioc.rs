@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
@@ -75,7 +75,7 @@ pub fn spiiplus_config_command() -> CommandDef {
                 let controller = Arc::new(Mutex::new(controller));
                 for index in 0..num_axes {
                     let ax = SpiiPlusAxis::new(controller.clone(), index);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
                     init.axis(index as i32, motor);
                 }
                 init.describe(line);
@@ -204,5 +204,58 @@ mod tests {
             driver_report("drvSPiiPlus", 0),
             "    SPiiPlus controller 0, port=spNoApos, address=0, id: SPiiPlus 6.50 \n"
         );
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvSPiiPlus.cc:723-749: once the axes are counted, `motor_init`
+    /// reads each axis's status once, in turn, and the record starts from
+    /// that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_once_in_axis_order() {
+        let int = ArgValue::Int;
+        run_command(spiiplus_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("spInitLine", |cmd| match cmd.trim_end() {
+            "?VR" => "SPiiPlus 6.50".into(),
+            "?APOS(0)" => "14".into(),
+            "?APOS(1)" => "3".into(),
+            "?APOS(2)" => "?1033".into(),
+            _ => "0".into(),
+        });
+        let config = vec![
+            int(0),
+            ArgValue::String("spInitLine".into()),
+            ArgValue::String("DIR".into()),
+        ];
+        run_command(spiiplus_config_command(), config).await;
+        drvsup_init().await;
+        let mut want: Vec<String> = ["?VR", "halt all", "?VR", "?APOS(0)", "?APOS(1)", "?APOS(2)"]
+            .map(String::from)
+            .into();
+        for axis in 0..2 {
+            for query in ["?D/MST", "?D/FAULT", "?APOS", "?FPOS", "?FVEL"] {
+                want.push(format!("{query}({axis})"));
+            }
+        }
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        assert_eq!(sent, want);
+        let db = record_init(
+            r##"
+record(motor, "sp:m1") { field(DTYP, "SPiiPlus") field(OUT, "#C0 S0 @") }
+record(motor, "sp:m2") { field(DTYP, "SPiiPlus") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("sp:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("sp:m2.RMP").unwrap(), EpicsValue::Long(3));
     }
 }

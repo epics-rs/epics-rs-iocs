@@ -35,7 +35,7 @@ const ITEM: RecordKind = RecordKind {
 };
 
 fn parse(link: &str, kind: RecordKind) -> Result<LinkInfo, LinkError> {
-    parse_link(link, kind, &InfoDefaults::default(), &Names)
+    parse_link("rec", link, kind, &InfoDefaults::default(), &Names)
 }
 
 fn ok(link: &str, kind: RecordKind) -> LinkInfo {
@@ -367,7 +367,7 @@ fn info_tags_set_defaults_that_link_options_then_override() {
     info.insert("opcua:ELEMENT".to_string(), "a.b".to_string());
     let info = InfoDefaults::from_info(&info);
 
-    let l = parse_link("sess i=1", INPUT, &info, &Names).expect("parse");
+    let l = parse_link("rec", "sess i=1", INPUT, &info, &Names).expect("parse");
     assert_eq!(l.sampling_interval, 50.0);
     assert_eq!(l.queue_size, 8);
     assert!(!l.discard_oldest);
@@ -376,6 +376,7 @@ fn info_tags_set_defaults_that_link_options_then_override() {
     assert_eq!(l.element_path, ["a", "b"]);
 
     let l = parse_link(
+        "rec",
         "subs i=1 sampling=10 qsize=2 monitor=y",
         INPUT,
         &info,
@@ -385,6 +386,41 @@ fn info_tags_set_defaults_that_link_options_then_override() {
     assert_eq!(l.sampling_interval, 10.0);
     assert_eq!(l.queue_size, 2);
     assert!(l.monitor);
+}
+
+/// Each tag's deprecation line comes just before the tag is parsed, so a bad
+/// tag stops the lines at its own (`linkParser.cpp:104-185`).
+#[test]
+fn a_bad_info_tag_stops_the_deprecation_lines() {
+    let mut info = HashMap::new();
+    info.insert("opcua:SAMPLING".to_string(), "bad".to_string());
+    info.insert("opcua:QSIZE".to_string(), "8".to_string());
+    let info = InfoDefaults::from_info(&info);
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 2 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(2);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 2);
+        saved
+    };
+    let parsed = parse_link("REC", "sess i=1", INPUT, &info, &Names);
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 2);
+        libc::close(saved);
+    }
+
+    assert_eq!(
+        parsed.unwrap_err().to_string(),
+        "error converting 'bad' to Double"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sink.path()).unwrap(),
+        "REC DEPRECATION WARNING: setting parameters through info items is deprecated; \
+         use link parameters instead.\n"
+    );
 }
 
 #[test]

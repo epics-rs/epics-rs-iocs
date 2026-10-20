@@ -9,8 +9,12 @@ chrono = "0.4"
 epics-libcom-rs = { workspace = true }
 epics-rs = { workspace = true }
 parking_lot = "0.12"
+socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "sync"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

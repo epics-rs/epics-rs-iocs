@@ -86,7 +86,8 @@ pub const WRITE_OCTET: &str =
     "virtual asynStatus ADTimePix::writeOctet(asynUser*, const char*, size_t, size_t*)";
 
 /// `epicsSnprintf` into a `char[size]`: at most `size - 1` bytes, cut at a
-/// character boundary.
+/// character boundary. C cuts mid-character and leaves a broken UTF-8 tail;
+/// that is not copied.
 pub fn snprintf(size: usize, mut text: String) -> String {
     let mut end = text.len().min(size.saturating_sub(1));
     while !text.is_char_boundary(end) {

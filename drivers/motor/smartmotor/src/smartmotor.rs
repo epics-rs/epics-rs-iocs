@@ -41,13 +41,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure,
+};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
+use motor_common::model1::init_read;
 use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -243,12 +246,16 @@ pub struct SmartMotorAxis {
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
     last_status: MotorStatus,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl SmartMotorAxis {
-    /// Construct axis `axis` (0-based chain position) of a controller.
+    /// Construct axis `axis` (0-based chain position) of a controller and
+    /// read its status, as `motor_init`'s `set_status` does
+    /// (drvSmartMotor.cc:660).
     pub fn new(controller: Arc<Mutex<SmartMotorController>>, axis: usize) -> Self {
-        Self {
+        let mut me = Self {
             controller,
             axis,
             prev_position: 0,
@@ -258,7 +265,10 @@ impl SmartMotorAxis {
                 has_encoder: true,
                 ..MotorStatus::default()
             },
-        }
+            init_status: None,
+        };
+        me.init_status = Some(me.poll(&AsynUser::new(0)));
+        me
     }
 
     fn lock(&self) -> MutexGuard<'_, SmartMotorController> {
@@ -273,6 +283,13 @@ impl SmartMotorAxis {
         if acceleration > 0.0 {
             ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
         }
+    }
+}
+
+impl Model1Motor for SmartMotorAxis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -651,6 +668,45 @@ mod tests {
         silent.store(true, Ordering::Relaxed);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvSmartMotor.cc:248-262 exit stores what motor_init prepared
+    /// (:648-658, GAIN_SUPPORT and EA_PRESENT), with both COMM_ERR bits once
+    /// past RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use std::sync::atomic::Ordering;
+
+        let chain = chain("smartInitFail");
+        let silent = chain.silent.clone();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("smartInitFail").unwrap(),
+            chain,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        silent.store(true, Ordering::Relaxed);
+        let mut first = SmartMotorAxis::new(ctrl.clone(), 0);
+        let mut second = SmartMotorAxis::new(ctrl, 1);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// devSmartMotor.cc:190-191: V= and A= are counts/s times VCONFAC and

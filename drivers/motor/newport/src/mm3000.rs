@@ -32,14 +32,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, is_unsolicited_limit_error, nint};
-use motor_common::model1::MoveStrings;
+use motor_common::model1::{MoveStrings, init_read};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -213,6 +213,9 @@ impl Mm3000Controller {
 
     /// Write a command and read the reply (C `send_mess` + `recv_mess`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
+        // write_read flushes first; C reads with no flush past motor_init
+        // (drvMM3000.cc:492), so one late reply shifts every later answer: a
+        // C defect, not copied.
         let (raw, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
@@ -280,6 +283,8 @@ pub struct Mm3000Axis {
     /// carries to its next post.
     left: Option<MotorStatus>,
     strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl Mm3000Axis {
@@ -311,9 +316,9 @@ impl Mm3000Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            init_status: None,
         };
-        // C motor_init ignores set_status's verdict.
-        let _ = ax.set_status();
+        ax.init_status = Some(ax.poll(&AsynUser::new(0)));
         ax
     }
 
@@ -337,6 +342,16 @@ impl Mm3000Axis {
         }
         line.extend_from_slice(command.as_bytes());
         self.lock().write_bytes(&line)
+    }
+}
+
+impl Model1Motor for Mm3000Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        // What the exit stored, a RETRY's MS bits included, which the
+        // first post now carries instead of `left`.
+        self.left = None;
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 }
 
@@ -1062,6 +1077,46 @@ mod tests {
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.poll(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvMM3000.cc:685-711: a failed `motor_init` read stores the
+    /// EA_PRESENT and GAIN_SUPPORT `motor_init` set: a missed MS raises
+    /// nothing (RETRY), a TP missed after a good MS keeps its bits, and the
+    /// next miss raises CNTRL_COMM_ERR and RA_PROBLEM (:250-334).
+    #[test]
+    fn a_failed_init_read_keeps_what_motor_init_set() {
+        let (_line, io) = LineRig::new("mm3000InitFail", |last| match last {
+            "VE" => "MM3000".into(),
+            "RC" => "1=dc 2=dc 3=dc".into(),
+            "2MS" => "%".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(Mm3000Controller::new(io).unwrap()));
+        let init = |axis| Mm3000Axis::new(ctrl.clone(), axis).take_init_status();
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(init(1), prepared);
+        assert_eq!(
+            init(2),
+            MotorStatus {
+                moving: true,
+                direction: true,
+                home: true,
+                powered: true,
+                ..prepared.clone()
+            }
+        );
+        assert_eq!(
+            init(3),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 
     /// drvMM3000.cc:311-334,380: a TP missed after a good MS is RETRY, and

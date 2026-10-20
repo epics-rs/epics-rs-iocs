@@ -161,7 +161,7 @@ impl ForceRead {
 pub(crate) mod fake {
     use std::sync::{Arc, Mutex};
 
-    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
     use epics_rs::asyn::param::ParamType;
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -187,6 +187,18 @@ pub(crate) mod fake {
         mine.into_iter()
             .map(|(_, addr, data)| (addr, data))
             .collect()
+    }
+
+    /// `(port, registers)` of each `MODBUS_DATA` array write [`refuse`]
+    /// makes the port refuse once it is recorded.
+    static REFUSED: Mutex<Vec<(String, Vec<i32>)>> = Mutex::new(Vec::new());
+
+    /// Make port `name` refuse an array write of exactly `data`.
+    pub fn refuse(name: &str, data: &[i32]) {
+        REFUSED
+            .lock()
+            .unwrap()
+            .push((name.to_string(), data.to_vec()));
     }
 
     /// `addr` of each `MODBUS_READ` write, by port.
@@ -238,6 +250,18 @@ pub(crate) mod fake {
         }
         fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
             self.record(user.addr, data.to_vec());
+            let port = &*self.base.port_name;
+            if REFUSED
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, d)| p == port && d == data)
+            {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "refused".into(),
+                });
+            }
             Ok(())
         }
     }

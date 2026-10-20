@@ -4,6 +4,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,16 +40,24 @@ async fn on_mcs2<T: Send + 'static>(
     name: &str,
     body: impl FnOnce(PortHandle) -> T + Send + 'static,
 ) -> (T, Vec<String>) {
+    on_mcs2_with(name, [1, 100, 100, 0], |_| false, body).await
+}
+
+/// [`on_mcs2`] with `MCS2CreateController`'s numAxes, poll periods and
+/// unusedMask, `ints`, on a line refusing the writes `refused` picks.
+async fn on_mcs2_with<T: Send + 'static>(
+    name: &str,
+    ints: [i64; 4],
+    refused: impl Fn(&str) -> bool + Send + Sync + 'static,
+    body: impl FnOnce(PortHandle) -> T + Send + 'static,
+) -> (T, Vec<String>) {
     let io_port = format!("{name}_IO");
-    let (line, _io) = LineRig::new(&io_port, mcs2_reply);
-    let args = vec![
+    let (line, _io) = LineRig::failing(&io_port, mcs2_reply, refused);
+    let mut args = vec![
         ArgValue::String(name.into()),
         ArgValue::String(io_port.into()),
-        ArgValue::Int(1),
-        ArgValue::Int(100),
-        ArgValue::Int(100),
-        ArgValue::Int(0),
     ];
+    args.extend(ints.map(ArgValue::Int));
     let cmd = motor_smaract::ioc::mcs2_create_controller_command();
     let bridge = BlockingBridge::capture();
     let port = name.to_owned();
@@ -73,6 +82,42 @@ fn reason(port: &PortHandle, name: &str) -> usize {
     port.drv_user_create_blocking(&DrvUserRequest::new(name, 0))
         .unwrap()
         .reason
+}
+
+/// smarActMCS2MotorDriver.cpp:74, :84, :164-166: the constructor's
+/// clearErrors posts `motorStatusProblem_` on address 0 itself, with no
+/// axis call to carry it.
+#[epics_rs::base::epics_test]
+async fn the_constructor_posts_address_0_with_no_axis() {
+    let refused = |cmd: &str| cmd.trim_end() == ":SYST:ERR:COUN?";
+    let (problem, _) = on_mcs2_with("mcs2NoAxis", [1, 100, 100, 1], refused, |port| {
+        port.read_int32_blocking(reason(&port, "MOTOR_STATUS_PROBLEM"), 0)
+            .ok()
+    })
+    .await;
+    assert_eq!(problem, Some(1));
+}
+
+/// smarActMCS2MotorDriver.cpp:345: the axis report's clearErrors posts
+/// address 0 then and there, not with the next poll.
+#[epics_rs::base::epics_test]
+async fn the_report_posts_address_0_at_once() {
+    let refuse = Arc::new(AtomicBool::new(false));
+    let refusing = refuse.clone();
+    let refused =
+        move |cmd: &str| refusing.load(Ordering::SeqCst) && cmd.trim_end() == ":SYST:ERR:COUN?";
+    // Channel 1 only, so no poll writes address 0, and no poll before the
+    // read.
+    let ints = [2, 100_000, 100_000, 1];
+    let (problem, _) = on_mcs2_with("mcs2ReportPost", ints, refused, move |port| {
+        let problem = reason(&port, "MOTOR_STATUS_PROBLEM");
+        let before = port.read_int32_blocking(problem, 0).unwrap();
+        refuse.store(true, Ordering::SeqCst);
+        port.report_blocking(1).unwrap();
+        (before, port.read_int32_blocking(problem, 0).unwrap())
+    })
+    .await;
+    assert_eq!(problem, (0, 1));
 }
 
 #[epics_rs::base::epics_test]

@@ -12,3 +12,6 @@
 pub mod dev_mca_asyn;
 pub mod fastsweep;
 pub mod interface;
+
+/// Path to the bundled database template directory.
+pub const MCA_DB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db");

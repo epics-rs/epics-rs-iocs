@@ -19,8 +19,10 @@ use crate::bincomm::{ACKNOWLEDGE, FRAME_START, REPLY_END, REPLY_START};
 pub struct Controller {
     /// `var(i)(j)`; an absent element reads 0.
     pub vars: HashMap<String, HashMap<(i32, i32), f64>>,
-    /// Commands answered with an error.
+    /// Commands answered with an error, a binary read as `BIN ??var(..)(..)`.
     pub refused: HashSet<String>,
+    /// Binary reads left unanswered, which the read times out on.
+    pub dropped: HashSet<String>,
     /// Every command, a binary one as `BIN ??var(..)(..)` or
     /// `BIN >>var(..)(..)`.
     pub sent: Vec<String>,
@@ -73,7 +75,17 @@ impl Controller {
         if let Some(at) = text.find("%??") {
             let size = body[at + 3] as usize;
             let name = &text[at + 4..];
-            self.sent.push(format!("BIN ??{name}"));
+            let sent = format!("BIN ??{name}");
+            self.sent.push(sent.clone());
+            if self.dropped.contains(&sent) {
+                return Vec::new();
+            }
+            if self.refused.contains(&sent) {
+                let mut reply = vec![REPLY_START, id, 6, 0];
+                reply.extend_from_slice(b"?1001\r");
+                reply.push(REPLY_END);
+                return reply;
+            }
             let (var, (a, b), (c, d)) = parse_span(name);
             let mut data = Vec::new();
             for i in a..=b {

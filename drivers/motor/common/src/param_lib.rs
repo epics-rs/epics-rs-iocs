@@ -1,5 +1,5 @@
 //! paramLib.c: the per-axis parameter store a model-2 driver keeps its
-//! `motorAxisParam_t` values in, which flags each change for the callback
+//! `motorAxisParam_t` values in, which flags each change for the callbacks
 //! `motorAxisSetCallback` installs (drvMotorAsyn's `intCallback`).
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -22,12 +22,17 @@ enum Val {
     Int(i32),
 }
 
+/// A callback and the changes it has not yet been called with.
+struct Opener {
+    flags: [bool; NUM_PARAMS],
+    callback: Callback,
+}
+
 #[derive(Default)]
 struct Inner {
     vals: [Val; NUM_PARAMS],
-    flags: [bool; NUM_PARAMS],
     force: bool,
-    callback: Option<Callback>,
+    openers: Vec<Opener>,
 }
 
 /// C `paramList` with `startVal` 0: one per axis, as every model-2 driver
@@ -53,10 +58,12 @@ impl Params {
 
     fn set(&self, index: i32, val: Val) -> Result<(), OutOfRange> {
         let i = slot(index)?;
-        let mut inner = self.lock();
+        let inner = &mut *self.lock();
         if inner.vals[i] != val {
-            inner.flags[i] = true;
             inner.vals[i] = val;
+            for opener in &mut inner.openers {
+                opener.flags[i] = true;
+            }
         }
         Ok(())
     }
@@ -92,32 +99,41 @@ impl Params {
 
     /// C `paramSetCallback`: every parameter set so far goes to the new
     /// callback on the next [`Self::call_callback`].
-    pub fn set_callback(&self, callback: Callback) {
+    ///
+    /// C defect not copied: C keeps one callback, so a second opener of the
+    /// axis replaces the first (motor_interface.h:472-475,
+    /// paramLib.c:227-240) and a second drvAsynMotorConfigure on a card
+    /// silently starves the first port's records. Here each opener keeps
+    /// its own.
+    pub fn add_callback(&self, callback: Callback) {
         let mut inner = self.lock();
-        for i in 0..NUM_PARAMS {
-            if inner.vals[i] != Val::Undef {
-                inner.flags[i] = true;
-            }
-        }
-        inner.callback = Some(callback);
+        let flags = inner.vals.map(|v| v != Val::Undef);
+        inner.openers.push(Opener { flags, callback });
     }
 
-    /// C `paramCallCallback`: the changed indexes, in order, to the callback,
-    /// which runs after the store is unlocked so that it can read it back.
+    /// C `paramCallCallback`: to each callback, the indexes changed since
+    /// its last call, in order. They run after the store is unlocked so
+    /// that they can read it back.
     pub fn call_callback(&self) {
-        let (callback, changed) = {
-            let mut inner = self.lock();
-            let changed: Vec<i32> = (0..NUM_PARAMS)
-                .filter(|&i| std::mem::take(&mut inner.flags[i]))
-                .map(|i| i as i32)
-                .collect();
-            if !(inner.force || !changed.is_empty()) || inner.callback.is_none() {
+        let calls: Vec<(Callback, Vec<i32>)> = {
+            let inner = &mut *self.lock();
+            if inner.openers.is_empty() {
                 return;
             }
-            inner.force = false;
-            (inner.callback.clone(), changed)
+            let force = std::mem::take(&mut inner.force);
+            inner
+                .openers
+                .iter_mut()
+                .filter_map(|opener| {
+                    let changed: Vec<i32> = (0..NUM_PARAMS)
+                        .filter(|&i| std::mem::take(&mut opener.flags[i]))
+                        .map(|i| i as i32)
+                        .collect();
+                    (force || !changed.is_empty()).then(|| (opener.callback.clone(), changed))
+                })
+                .collect()
         };
-        if let Some(callback) = callback {
+        for (callback, changed) in calls {
             callback(&changed);
         }
     }
@@ -201,7 +217,7 @@ mod tests {
     fn recorder(params: &Params) -> Arc<Mutex<Vec<Vec<i32>>>> {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let sink = calls.clone();
-        params.set_callback(Arc::new(move |changed: &[i32]| {
+        params.add_callback(Arc::new(move |changed: &[i32]| {
             sink.lock().unwrap().push(changed.to_vec());
         }));
         calls
@@ -241,6 +257,25 @@ mod tests {
         assert_eq!(calls.lock().unwrap().last().unwrap(), &Vec::<i32>::new());
     }
 
+    /// Each opener gets the changes since its own last call, and a later
+    /// opener's re-send of the store goes to it alone.
+    #[test]
+    fn each_callback_sees_what_changed_since_its_last() {
+        let params = Params::default();
+        params.set_double(0, 1.5).unwrap();
+        let first = recorder(&params);
+        params.set_integer(12, 1).unwrap();
+        params.call_callback();
+        let second = recorder(&params);
+        params.set_integer(13, 1).unwrap();
+        params.call_callback();
+        params.call_callback();
+        params.force_callback();
+        params.call_callback();
+        assert_eq!(*first.lock().unwrap(), [vec![0, 12], vec![13], vec![]]);
+        assert_eq!(*second.lock().unwrap(), [vec![0, 12, 13], vec![]]);
+    }
+
     #[test]
     fn reads_convert_and_report_undefined_and_out_of_range() {
         let params = Params::default();
@@ -260,7 +295,7 @@ mod tests {
         let params = Arc::new(Params::default());
         let seen = Arc::new(Mutex::new(None));
         let (back, sink) = (Arc::downgrade(&params), seen.clone());
-        params.set_callback(Arc::new(move |_: &[i32]| {
+        params.add_callback(Arc::new(move |_: &[i32]| {
             *sink.lock().unwrap() = back.upgrade().unwrap().get_double(0).unwrap();
         }));
         params.set_double(0, 4.0).unwrap();

@@ -133,18 +133,20 @@ impl Mcb4bAxis {
     /// A zero `velocity`/`acceleration` yields a non-finite intermediate; the
     /// `as i32` cast saturates and the clamp then pins it into range, matching
     /// the C clamps that guard the same division.
+    ///
+    /// Every caller overwrites the status C returns with its own command's
+    /// (MCB4BDriver.cpp:143-222), so none is returned.
     fn send_accel_and_velocity(
         ctrl: &Mcb4bController,
         axis: u32,
         acceleration: f64,
         velocity: f64,
-    ) -> AsynResult<()> {
+    ) {
         let ival = nint((115200.0 / velocity).abs()).clamp(2, 255);
-        ctrl.command(&format!("#{axis:02}V={ival}"))?;
+        let _ = ctrl.command(&format!("#{axis:02}V={ival}"));
 
         let ival = nint(256.0 - (720000.0 / acceleration)).clamp(1, 255);
-        ctrl.command(&format!("#{axis:02}R={ival}"))?;
-        Ok(())
+        let _ = ctrl.command(&format!("#{axis:02}R={ival}"));
     }
 }
 
@@ -164,7 +166,7 @@ impl AsynMotor for Mcb4bAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        Mcb4bAxis::send_accel_and_velocity(&ctrl, self.axis, acceleration, velocity)?;
+        Mcb4bAxis::send_accel_and_velocity(&ctrl, self.axis, acceleration, velocity);
         // C absolute move: "#%02dG%+d".
         ctrl.command(&format!("#{:02}G{:+}", self.axis, nint(position)))?;
         Ok(())
@@ -179,7 +181,7 @@ impl AsynMotor for Mcb4bAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        Mcb4bAxis::send_accel_and_velocity(&ctrl, self.axis, acceleration, velocity)?;
+        Mcb4bAxis::send_accel_and_velocity(&ctrl, self.axis, acceleration, velocity);
         // C relative move: "#%02dI%+d".
         ctrl.command(&format!("#{:02}I{:+}", self.axis, nint(distance)))?;
         Ok(())
@@ -193,7 +195,7 @@ impl AsynMotor for Mcb4bAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        Mcb4bAxis::send_accel_and_velocity(&ctrl, self.axis, acceleration, velocity)?;
+        Mcb4bAxis::send_accel_and_velocity(&ctrl, self.axis, acceleration, velocity);
         // The MCB-4B has no jog command; C moves a fixed 1,000,000 steps in the
         // requested direction ("#%02dI+1000000" / "#%02dI-1000000").
         let cmd = if velocity > 0.0 {
@@ -214,7 +216,7 @@ impl AsynMotor for Mcb4bAxis {
         forward: bool,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        Mcb4bAxis::send_accel_and_velocity(&ctrl, self.axis, acceleration, velocity)?;
+        Mcb4bAxis::send_accel_and_velocity(&ctrl, self.axis, acceleration, velocity);
         // C home: "#%02dH+" (forward) / "#%02dH-" (reverse).
         let cmd = if forward {
             format!("#{:02}H+", self.axis)
@@ -376,6 +378,44 @@ mod tests {
         assert_eq!(nint((115200.0f64 / 1000.0).abs()).clamp(2, 255), 115); // 115.2 -> 115
         assert_eq!(nint((115200.0f64 / 10.0).abs()).clamp(2, 255), 255); // 11520 -> 255
         assert_eq!(nint((115200.0f64 / 100000.0).abs()).clamp(2, 255), 2); // ~1.15 -> 2 (floor of clamp)
+    }
+
+    /// C sets `status =` on each write and returns the last
+    /// (MCB4BDriver.cpp:143-222): a refused V or R still sends the move.
+    #[test]
+    fn a_refused_setting_still_sends_the_move_after_it() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::failing(
+            "mcb4bRefused",
+            |_| "OK".into(),
+            |cmd| cmd.starts_with("#00V=") || cmd.starts_with("#00R=") || cmd == "#00H+",
+        );
+        let ctrl = Arc::new(Mutex::new(Mcb4bController::new(io, 1)));
+        let mut axis = Mcb4bAxis::new(ctrl, 0);
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 100.0, 0.0, 1000.0, 100000.0)
+            .unwrap();
+        axis.move_relative(&user, -5.0, 0.0, 1000.0, 100000.0)
+            .unwrap();
+        axis.move_velocity(&user, 0.0, -1000.0, 100000.0).unwrap();
+        assert!(axis.home(&user, 0.0, 1000.0, 100000.0, true).is_err());
+        assert_eq!(
+            rig.sent(),
+            [
+                "#00V=115",
+                "#00R=249",
+                "#00G+100",
+                "#00V=115",
+                "#00R=249",
+                "#00I-5",
+                "#00V=115",
+                "#00R=249",
+                "#00I-1000000",
+                "#00V=115",
+                "#00R=249",
+                "#00H+",
+            ]
+        );
     }
 
     #[test]
