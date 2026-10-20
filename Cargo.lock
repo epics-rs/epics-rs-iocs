@@ -751,6 +751,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "cfloat-gate"
+version = "0.0.0"
+source = "git+file:///home/stevek/work/epics-rs?rev=309d984d0cffc403762560be407a698d8368a7f0#309d984d0cffc403762560be407a698d8368a7f0"
+dependencies = [
+ "source-guard",
+]
+
+[[package]]
 name = "chacha20"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2146,6 +2154,9 @@ dependencies = [
 [[package]]
 name = "ioc-conventions"
 version = "0.1.0"
+dependencies = [
+ "cfloat-gate",
+]
 
 [[package]]
 name = "ip-devices"
@@ -4296,6 +4307,11 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "source-guard"
+version = "0.32.0"
+source = "git+file:///home/stevek/work/epics-rs?rev=309d984d0cffc403762560be407a698d8368a7f0#309d984d0cffc403762560be407a698d8368a7f0"
 
 [[package]]
 name = "specs-analyser-ioc"

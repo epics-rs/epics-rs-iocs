@@ -269,12 +269,16 @@ stream-rs = "0.32.0"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 # libssh2, as C's HAVE_LIBSSH2 build links; motor-newport's `sftp` feature.
 ssh2 = { version = "0.9", default-features = false }
+# Dev-only CFloat gate (tools/ioc-conventions/tests/cfloat.rs). Never
+# published; like stream-rs, the patch below supplies it from epics-rs.
+cfloat-gate = "0.0.0"
 
 # epics-rs rt/iocs-base, the single base every iocs panel builds against.
 [patch.crates-io]
 ad-core-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3e1f188dd394a6d822fc642879606c48404f34e9" }
 ad-plugins-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3e1f188dd394a6d822fc642879606c48404f34e9" }
 asyn-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3e1f188dd394a6d822fc642879606c48404f34e9" }
+cfloat-gate = { git = "file:///home/stevek/work/epics-rs", rev = "309d984d0cffc403762560be407a698d8368a7f0" }
 epics-base-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3e1f188dd394a6d822fc642879606c48404f34e9" }
 epics-bridge-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3e1f188dd394a6d822fc642879606c48404f34e9" }
 epics-ca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "3e1f188dd394a6d822fc642879606c48404f34e9" }
