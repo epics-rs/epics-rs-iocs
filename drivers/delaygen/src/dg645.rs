@@ -54,7 +54,10 @@ use crate::wire::{self, atof, atoi};
 /// value returned to device support.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Conv {
-    /// `cvtSink`: no meaningful value; write-only tag.
+    /// `cvtSink`: no meaningful value; write-only tag. C's writes nothing
+    /// (drvAsynDG645.cpp:604-608), so an output record's init read takes the
+    /// caller's uninitialised local (devAsynInt32.c:1176-1187); a C defect,
+    /// not copied: reads return zero.
     Sink,
     /// `cvtIdent`: `*IDN?` reply, chopped after the first comma and
     /// prefixed `"SRS "`.
