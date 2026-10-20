@@ -2498,11 +2498,20 @@ impl AsynMotor for PIGCS2Axis {
         result
     }
 
-    // move_relative: C's own `move(position, relative, ...)` never branches
-    // on `relative` (a `//TODO` stub) — it always issues MOV with `position`
-    // taken as an absolute target regardless of the flag. The trait's default
-    // (poll for the current position, add the distance, delegate to
-    // move_absolute) reaches that same MOV wire command, so no override.
+    /// C defect not copied: `PIasynAxis::move` leaves `relative` a TODO
+    /// (PIasynAxis.cpp:226) and sends the distance as the MOV target. The
+    /// record's distance is from the position this axis last polled.
+    fn move_relative(
+        &mut self,
+        user: &AsynUser,
+        distance: f64,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        let target = self.last_position + distance;
+        self.move_absolute(user, target, min_velocity, velocity, acceleration)
+    }
 
     fn move_velocity(
         &mut self,
@@ -4902,6 +4911,34 @@ mod tests {
             .unwrap();
         first.set_deferred_moves(&user, false).unwrap();
         assert_eq!(sent_lines(&line)[0], "MOV 1 3.000000 2 -3.000000");
+    }
+
+    /// A relative move is one MOV to the last polled position plus the
+    /// distance, with no poll of its own.
+    #[test]
+    fn a_relative_move_targets_the_polled_position_plus_the_distance() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let drifted = Arc::new(AtomicBool::new(false));
+        let state = drifted.clone();
+        let (line, io) = motor_common::testing::LineRig::new("gcs2RelLine", move |last| {
+            match last {
+                "ERR?" => "0",
+                "POS? 1" if state.load(Ordering::Relaxed) => "1=2",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2RelLine")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2Rel");
+        let user = AsynUser::new(0);
+        axis.cpu = 10000.0;
+        let _ = axis.poll(&user);
+        line.sent();
+        drifted.store(true, Ordering::Relaxed);
+        axis.move_relative(&user, 250.0, 0.0, 0.0, 0.0).unwrap();
+        let sent = sent_lines(&line);
+        assert!(!sent.iter().any(|l| l.starts_with("POS?")), "{sent:?}");
+        assert!(sent.iter().any(|l| l == "MOV 1 1.025000"), "{sent:?}");
     }
 
     /// `PIasynController::writeInt32` (PIasynController.cpp:295-298) logs a
