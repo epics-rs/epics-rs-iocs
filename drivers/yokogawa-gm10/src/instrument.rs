@@ -960,7 +960,8 @@ fn inet_aton(cp: &[u8]) -> Option<Ipv4Addr> {
             return None;
         }
         let (val, len) = strtoul_errno(&cp[i..], 0)?;
-        let val = u32::try_from(val).ok()?;
+        // glibc's `ul > 0xfffffffful`, through u128 as `unsigned long` may be u32.
+        let val = u32::try_from(u128::from(val)).ok()?;
         i += len;
         if cp.get(i) == Some(&b'.') {
             if parts.len() > 2 || val > 0xff {

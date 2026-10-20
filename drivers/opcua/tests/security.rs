@@ -2,6 +2,7 @@
 
 use opcua::client::security_policy_string;
 
+#[cfg(unix)]
 mod console;
 
 #[test]
@@ -362,6 +363,7 @@ mod setup_security {
 
     /// The session's own lines from `setupClientSecurityInfo`, the PKI set-up
     /// and `setupSecurity`, at debug 1, after setting it up on `url`.
+    #[cfg(unix)]
     async fn setup_lines(url: &str, options: &[(&str, &str)], tag: &str) -> Vec<String> {
         let pki = std::env::temp_dir().join(format!("opcua-{tag}-{}", std::process::id()));
         let mut config = SessionConfig::new("s", url);
@@ -382,6 +384,7 @@ mod setup_security {
 
     /// `SessionOpen62541.cpp:1029-1040`, after the client security info
     /// (`:1219-1225`) and the PKI provider (`:516-522`).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_session_without_security_prints_its_setup() {
         let lines = setup_lines(
@@ -402,6 +405,7 @@ mod setup_security {
     }
 
     /// `SessionOpen62541.cpp:1043-1059`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_dead_discovery_url_prints_the_failed_get_endpoints() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -427,6 +431,7 @@ mod setup_security {
     }
 
     /// `SessionOpen62541.cpp:1172-1201`: C only checks that each file reads.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_client_certificate_prints_its_files() {
         let files = [(); 2].map(|_| {

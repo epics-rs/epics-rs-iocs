@@ -17,7 +17,9 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::types::EpicsValue;
-use epics_rs::base::types::c_parse::{NumericField, parse_auto_base_units_null, strtol_errno};
+use epics_rs::base::types::c_parse::{
+    NumericField, epics_parse_int32_units, parse_auto_base_units_null,
+};
 
 use crate::phytron::{CtrlType, PhytronController};
 
@@ -184,13 +186,6 @@ fn read_value(reply: &str, binary: bool, to: &mut i32) -> bool {
         bit = bit.wrapping_shl(1);
     }
     true
-}
-
-/// C `epicsParseInt32(s, &v, 0, &units)`: the base-0 integer `s` starts
-/// with, whatever follows it.
-fn parse_int32_prefix(s: &str) -> Option<i32> {
-    let (v, end) = strtol_errno(s, 0)?;
-    i32::try_from(v).ok().filter(|_| end > 0)
 }
 
 /// C `iIn_`/`iOut_`: written under the controller lock by its poll and an
@@ -465,7 +460,7 @@ impl PortDriver for PhytronIo {
         let reply = |cmd: &str| ctrl.send(cmd, true).ok();
         let escaped = |s: &str| print_escaped(s.as_bytes());
         let max = reply(if self.mcc { "IAR" } else { "IV" })
-            .and_then(|r| parse_int32_prefix(&r))
+            .and_then(|r| epics_parse_int32_units(&r))
             .filter(|&m| m >= 1)
             .unwrap_or(if self.mcc { 8 } else { 21 });
         if level == 1 {
@@ -576,17 +571,17 @@ mod tests {
 
     #[test]
     fn the_report_s_module_count_is_the_integer_a_reply_starts_with() {
-        assert_eq!(parse_int32_prefix(" 12 modules"), Some(12));
-        assert_eq!(parse_int32_prefix("0x1fz"), Some(31));
-        assert_eq!(parse_int32_prefix("0xz"), Some(0));
-        assert_eq!(parse_int32_prefix("019"), Some(1));
-        assert_eq!(parse_int32_prefix("-3"), Some(-3));
-        assert_eq!(parse_int32_prefix("MCC"), None);
-        assert_eq!(parse_int32_prefix("4294967296"), None);
+        assert_eq!(epics_parse_int32_units(" 12 modules"), Some(12));
+        assert_eq!(epics_parse_int32_units("0x1fz"), Some(31));
+        assert_eq!(epics_parse_int32_units("0xz"), Some(0));
+        assert_eq!(epics_parse_int32_units("019"), Some(1));
+        assert_eq!(epics_parse_int32_units("-3"), Some(-3));
+        assert_eq!(epics_parse_int32_units("MCC"), None);
+        assert_eq!(epics_parse_int32_units("4294967296"), None);
         // libCom epicsParseInt32(s, &v, 0, &units), as the compiled base answers.
-        assert_eq!(parse_int32_prefix("0b11 modules"), Some(3));
-        assert_eq!(parse_int32_prefix(" -2147483648 IO"), Some(i32::MIN));
-        assert_eq!(parse_int32_prefix("07z"), Some(7));
-        assert_eq!(parse_int32_prefix("2147483648x"), None);
+        assert_eq!(epics_parse_int32_units("0b11 modules"), Some(3));
+        assert_eq!(epics_parse_int32_units(" -2147483648 IO"), Some(i32::MIN));
+        assert_eq!(epics_parse_int32_units("07z"), Some(7));
+        assert_eq!(epics_parse_int32_units("2147483648x"), None);
     }
 }
