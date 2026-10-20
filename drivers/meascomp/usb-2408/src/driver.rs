@@ -485,11 +485,14 @@ impl MultiFunctionDriver {
             } else {
                 &wave_gen_state.int_waveforms[k]
             };
-            // C reads the user scaling at the scan index, not the channel.
+            // C reads the user scaling at the span index i, so a span that
+            // starts past channel 0 takes another channel's Amplitude and
+            // Offset (drvMultiFunction.cpp:1653-1654). C defect, not copied
+            // (upstream-c-defects #227).
             let (amplitude, offset) = if wave_type == wave_gen::WAVE_TYPE_USER {
                 (
-                    self.float(p.wave_gen_amplitude, i as i32),
-                    self.float(p.wave_gen_offset, i as i32),
+                    self.float(p.wave_gen_amplitude, k as i32),
+                    self.float(p.wave_gen_offset, k as i32),
                 )
             } else {
                 (1.0, 0.0)
@@ -1674,6 +1677,41 @@ mod tests {
         let user_wf = AsynUser::new(p.wave_gen_user_wf).with_addr(1);
         assert_eq!(drv.read_float32_array(&user_wf, &mut buf).unwrap(), 3);
         assert_eq!(buf, [0.5, 1.5, 2.5]);
+    }
+
+    /// A user span starting at channel 1 scales by channel 1's Amplitude
+    /// and Offset (upstream-c-defects #227).
+    #[test]
+    fn a_user_waveform_takes_its_own_channels_scaling() {
+        let mut drv =
+            MultiFunctionDriver::new("MFUSERK", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        drv.state.lock().unwrap().wave_gen.user_waveforms[1][..2].copy_from_slice(&[0.5, 1.0]);
+        for (reason, addr, value) in [
+            (p.wave_gen_user_num_points, 0, 2),
+            (p.wave_gen_enable, 1, 1),
+            (p.wave_gen_wave_type, 1, wave_gen::WAVE_TYPE_USER),
+        ] {
+            drv.base.set_int32_param(reason, addr, value).unwrap();
+        }
+        for (reason, addr, value) in [
+            (p.wave_gen_user_dwell, 0, 0.001),
+            (p.wave_gen_amplitude, 0, 1.0),
+            (p.wave_gen_offset, 0, 0.0),
+            (p.wave_gen_amplitude, 1, 2.0),
+            (p.wave_gen_offset, 1, 0.25),
+        ] {
+            drv.base.set_float64_param(reason, addr, value).unwrap();
+        }
+        // ulAOutScan fails on the null handle after the buffer is built.
+        let _ = drv.write_int32(&mut AsynUser::new(p.wave_gen_run), 1);
+        assert_eq!(
+            drv.state.lock().unwrap().wave_gen.scan_buffer,
+            [
+                wave_gen::volts_to_dac(0.5, 2.0, 0.25),
+                wave_gen::volts_to_dac(1.0, 2.0, 0.25)
+            ]
+        );
     }
 
     #[test]
