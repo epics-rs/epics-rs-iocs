@@ -58,6 +58,7 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::port::InterfaceMask;
@@ -236,7 +237,7 @@ fn format_int_write(prefix: &str, width: usize, value: u32) -> String {
 
 /// C `sprintf(outBuf,"...%06.1f",value)` — see [`WriteKind::FloatFmt`].
 fn format_float_write(prefix: &str, value: f64) -> String {
-    format!("{prefix} {value:06.1}")
+    format!("{prefix} {value:06.1}", value = CFloat(value))
 }
 
 /// C `epicsStrCaseCmp(inpBuf,"OK")==0` — the write-success check shared by
@@ -554,6 +555,15 @@ mod tests {
     fn format_float_write_matches_c_06_1f() {
         assert_eq!(format_float_write("set:del:c1", 5.0), "set:del:c1 0005.0");
         assert_eq!(format_float_write("set:del:c1", -1.5), "set:del:c1 -001.5");
+        // glibc pads a NaN with spaces: the 0 flag is for numbers.
+        assert_eq!(
+            format_float_write("set:del:c1", f64::NAN),
+            "set:del:c1    nan"
+        );
+        assert_eq!(
+            format_float_write("set:del:c1", -f64::NAN),
+            "set:del:c1   -nan"
+        );
     }
 
     #[test]

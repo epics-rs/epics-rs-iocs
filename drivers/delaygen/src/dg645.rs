@@ -385,8 +385,12 @@ fn format_int_cmd(template: &str, value: i32) -> String {
 
 fn format_float_cmd(template: &str, fmt: FloatFmt, value: f64) -> String {
     match fmt {
-        FloatFmt::F2 => template.replacen("%-.2f", &format!("{value:.2}"), 1),
-        FloatFmt::F6 => template.replacen("%-.6f", &format!("{value:.6}"), 1),
+        FloatFmt::F2 => {
+            template.replacen("%-.2f", &format!("{value:.2}", value = CFloat(value)), 1)
+        }
+        FloatFmt::F6 => {
+            template.replacen("%-.6f", &format!("{value:.6}", value = CFloat(value)), 1)
+        }
         FloatFmt::E => template.replacen("%e", &format!("{:e}", CFloat(value)), 1),
     }
 }
@@ -430,7 +434,7 @@ fn cvt_ident(reply: &str) -> String {
 fn chan_delay_text(reply: &str) -> String {
     let (chan, delay) = parse_chan_delay_pair(reply);
     let name = CHAN_NAMES.get(chan as usize).copied().unwrap_or("?");
-    format!("{name} + {delay:.12}")
+    format!("{name} + {delay:.12}", delay = CFloat(delay))
 }
 
 /// C `cvtErrorText`. doc/upstream-c-defects.md #34: upstream's
@@ -901,6 +905,14 @@ mod tests {
         assert_eq!(
             format_float_cmd("HOLD%e", FloatFmt::E, 0.001),
             "HOLD1.000000e-03"
+        );
+        assert_eq!(
+            format_float_cmd("TLVL%-.2f", FloatFmt::F2, f64::NAN),
+            "TLVLnan"
+        );
+        assert_eq!(
+            format_float_cmd("TRAT%-.6f", FloatFmt::F6, -f64::NAN),
+            "TRAT-nan"
         );
     }
 
