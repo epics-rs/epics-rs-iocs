@@ -6,6 +6,7 @@
 //! Positions are in controller units: an axis's profile positions are its
 //! steps times `resolution_`, as C's `defineProfile` leaves them.
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::manager::PortManager;
@@ -308,7 +309,8 @@ impl AcsMotionParams {
             TraceMask::FLOW,
             "definePulses",
             format_args!(
-                " pulseAxis={pulse_axis}, numPulses={num_pulses}, profilePulsesUser_[0]={first:.6}"
+                " pulseAxis={pulse_axis}, numPulses={num_pulses}, profilePulsesUser_[0]={first:.6}",
+                first = CFloat(first)
             ),
         );
         let num_pulses = usize::try_from(num_pulses).unwrap_or(usize::MAX);
@@ -337,7 +339,9 @@ impl AcsMotionParams {
             TraceMask::FLOW,
             "definePulses",
             format_args!(
-                " status={status}, offset={offset:.6} direction={direction}, resolution={resolution:.6}"
+                " status={status}, offset={offset:.6} direction={direction}, resolution={resolution:.6}",
+                offset = CFloat(offset),
+                resolution = CFloat(resolution)
             ),
         );
         if status != 0 || resolution == 0.0 {
@@ -368,7 +372,11 @@ impl AcsMotionParams {
             format_args!(
                 " scale={scale:.6}, offset={offset:.6}, resolution_={axis_resolution:.6}, \
                  profilePulsesUser_[0]={first:.6}, profilePulses_[0]={:.6}",
-                profile.pulses.first().copied().unwrap_or_default()
+                CFloat(profile.pulses.first().copied().unwrap_or_default()),
+                scale = CFloat(scale),
+                offset = CFloat(offset),
+                axis_resolution = CFloat(axis_resolution),
+                first = CFloat(first)
             ),
         );
         Ok(())
@@ -489,8 +497,8 @@ impl AcsMotionParams {
             ("\tstartPulses", p.start_pulses.to_string()),
             ("\tendPulses", p.end_pulses.to_string()),
             ("\ttimeMode", p.time_mode.to_string()),
-            ("\ttimePerPoint", format!("{:.6}", p.time_per_point)),
-            ("\taccelerationTime", format!("{:.6}", p.accel_time)),
+            ("\ttimePerPoint", format!("{:.6}", CFloat(p.time_per_point))),
+            ("\taccelerationTime", format!("{:.6}", CFloat(p.accel_time))),
             ("\tmoveMode", p.move_mode.to_string()),
             ("\tpulseMode", p.pulse_mode.to_string()),
             ("\tpulseAxis", p.pulse_axis.to_string()),
@@ -596,7 +604,7 @@ impl AcsMotionParams {
                     ctx,
                     TraceMask::ERROR,
                     "buildProfile",
-                    format_args!("{name} = {value:.6}"),
+                    format_args!("{name} = {value:.6}", value = CFloat(value)),
                 );
             }
         }
@@ -693,7 +701,8 @@ impl AcsMotionParams {
             "buildProfile",
             format_args!(
                 "\tfullProfileSize_ = {size}, maxProfilePoints_ = {}, dataCollectionInterval_ = {interval:.6}",
-                ctx.profile.max_points
+                ctx.profile.max_points,
+                interval = CFloat(interval)
             ),
         );
         Ok(message)
@@ -823,7 +832,8 @@ impl AcsMotionParams {
                 0,
                 TraceMask::FLOW,
                 format_args!(
-                    "SPiiPlusController:readbackProfile: axis={addr}, resolution={resolution:.6}\n"
+                    "SPiiPlusController:readbackProfile: axis={addr}, resolution={resolution:.6}\n",
+                    resolution = CFloat(resolution)
                 ),
             );
             // SPiiPlusAxis::readbackProfile: controller units to steps.
@@ -962,9 +972,12 @@ impl AcsMotionParams {
                     " axis {idx} profilePositions[0]={:.6}, profilePositions[{}]={:.6}, \
                      maxAcceleration={max_acceleration:.6}, preTimeMax={pre_time_max:.6}, \
                      postTimeMax={post_time_max:.6}",
-                    positions[0],
+                    CFloat(positions[0]),
                     n - 1,
-                    positions[n - 1]
+                    CFloat(positions[n - 1]),
+                    max_acceleration = CFloat(max_acceleration),
+                    pre_time_max = CFloat(pre_time_max),
+                    post_time_max = CFloat(post_time_max)
                 ),
             );
         }

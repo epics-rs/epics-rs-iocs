@@ -9,6 +9,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -395,7 +396,7 @@ impl Runner {
                     "runProfile",
                     format_args!(
                         "startPulsePos={:.6}, endPulsePos={:.6}, numElements={}, pulseInterval={:.6}",
-                        plan.pulse_start_pos, plan.pulse_end_pos, plan.num_pulses, plan.pulse_spacing
+                        CFloat(plan.pulse_start_pos), CFloat(plan.pulse_end_pos), plan.num_pulses, CFloat(plan.pulse_spacing)
                     ),
                 );
                 let cmd = format!(

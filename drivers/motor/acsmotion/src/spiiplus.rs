@@ -36,6 +36,7 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
 use epics_rs::asyn::manager::PortManager;
@@ -657,7 +658,11 @@ impl SpiiPlusController {
         ));
         match status {
             Err(_) => error(format_args!("{what} change failed")),
-            Ok(()) => error(format_args!("{what} changed from {old:.6} to {offset:.6}")),
+            Ok(()) => error(format_args!(
+                "{what} changed from {old:.6} to {offset:.6}",
+                old = CFloat(old),
+                offset = CFloat(offset)
+            )),
         }
         status
     }
@@ -860,7 +865,7 @@ impl AsynMotor for SpiiPlusAxis {
                 TraceMask::ERROR,
                 format_args!(
                     "SPiiPlusController:setPosition: Changing the position of axis {} is disabled; Ignoring requested position: {rpos:.6}\n",
-                    self.axis
+                    self.axis, rpos = CFloat(rpos)
                 ),
             );
             return Err(spiiplus_err(format!(
