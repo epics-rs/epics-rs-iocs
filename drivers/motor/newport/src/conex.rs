@@ -41,7 +41,9 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -341,6 +343,8 @@ pub struct ConexAxis {
     shown: Shown,
     /// C `currentPosition_`, which `poll` sets.
     current_position: Arc<Mutex<f64>>,
+    /// The constructor's gain-support set (AG_CONEX.cpp:271-274).
+    status_writes: Vec<StatusWrite>,
 }
 
 /// The constructor's readings that only C's `report` prints.
@@ -467,6 +471,7 @@ impl ConexAxis {
                 version,
                 shown: Shown::default(),
                 current_position: Arc::default(),
+                status_writes: Vec::new(),
             });
         };
 
@@ -525,6 +530,11 @@ impl ConexAxis {
                 micro_steps_per_full_step,
             },
             current_position: Arc::default(),
+            status_writes: if model.is_cc_or_agp() {
+                vec![StatusWrite::GainSupport(true)]
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -720,7 +730,13 @@ impl AsynMotor for ConexAxis {
         status
     }
 
-    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
+    }
+
+    /// A failed read returns at `skip` as C returns asynError, keeping what
+    /// the reads before it set (AG_CONEX.cpp:510-563).
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         // Position (TP): controller units to record steps.
         let step = self.step()?;
         let position = parse_value_at(&self.write_read(&query(self.controller_id, "TP"))?, 3)
@@ -730,31 +746,26 @@ impl AsynMotor for ConexAxis {
             .current_position
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = position;
+        status.position = position;
+        status.encoder_position = position;
 
         // Status (TS): done + limits (model-dependent parse). AG_CONEX.cpp:530,534
         // posts PROBLEM 0 on a bad reply, a C defect.
-        let status = parse_ts(
+        let ts = parse_ts(
             self.model,
             &self.write_read(&query(self.controller_id, "TS"))?,
         )
         .ok_or_else(|| parse_error("TS"))?;
+        status.done = ts.done;
+        status.moving = !ts.done;
+        status.low_limit = ts.low_limit;
+        status.high_limit = ts.high_limit;
 
         // Power-on = closed-loop enabled (MM?).
         let (powered, mm) = self.get_closed_loop();
         mm?;
-        let powered = powered.ok_or_else(|| parse_error("MM?"))?;
-
-        *out = MotorStatus {
-            position,
-            encoder_position: position,
-            done: status.done,
-            moving: !status.done,
-            low_limit: status.low_limit,
-            high_limit: status.high_limit,
-            powered,
-            gain_support: self.model.is_cc_or_agp(),
-            ..Default::default()
-        };
+        status.powered = powered.ok_or_else(|| parse_error("MM?"))?;
+        status.problem = false;
         Ok(())
     }
 }
@@ -842,6 +853,51 @@ mod tests {
             ]
         );
         assert_eq!(axis.polled(&user).unwrap().position, 25000.0);
+    }
+
+    /// AG_CONEX.cpp:516-522: a refused TS skips after TP's position is set,
+    /// so the position survives and Done keeps what a move start set.
+    #[test]
+    fn a_failed_ts_keeps_the_position_tp_read() {
+        let (_line, io) = LineRig::failing(
+            "conex_ts_skip",
+            |last| {
+                match last {
+                    "1VE" => "1VE CONEX-CC 2.0",
+                    "1SU?" => "1SU0.0001",
+                    "1TP" => "1TP2.5",
+                    _ => "",
+                }
+                .to_string()
+            },
+            |cmd| cmd == "1TS",
+        );
+        let mut axis = ConexAxis::new(io, 1, &MotorTrace::new("conex_ts_skip", 0)).unwrap();
+        let mut status = MotorStatus {
+            done: false,
+            ..Default::default()
+        };
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+        assert_eq!(status.position, 25000.0);
+        assert!(!status.done);
+    }
+
+    /// AG_CONEX.cpp:271-274: gain support is the constructor's, CC and AGP
+    /// only.
+    #[test]
+    fn the_constructor_sets_gain_support_for_cc_and_agp() {
+        for (version, writes) in [
+            ("1VE CONEX-CC 2.0", vec![StatusWrite::GainSupport(true)]),
+            ("1VE CONEX-AGP 2.0", vec![StatusWrite::GainSupport(true)]),
+            ("1VE Conex PP 2.0", vec![]),
+        ] {
+            let (_line, io) = LineRig::new(version, move |last| match last {
+                "1VE" => version.to_string(),
+                _ => String::new(),
+            });
+            let mut axis = ConexAxis::new(io, 1, &MotorTrace::new("conex_gain", 0)).unwrap();
+            assert_eq!(axis.take_status_writes(), writes, "{version}");
+        }
     }
 
     /// C sets `status =` on each write and returns the last
