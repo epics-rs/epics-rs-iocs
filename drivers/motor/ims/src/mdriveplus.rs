@@ -532,6 +532,9 @@ impl ImsMDrivePlusAxis {
                         String::from_utf8_lossy(resp)
                     ),
                 );
+                self.status_writes.push(StatusWrite::Problem(true));
+                self.sets
+                    .axis(index::STATUS_COMMS_ERROR, ParamValue::Int32(1));
                 return AsynStatus::Error;
             }
             break;
@@ -1477,6 +1480,23 @@ mod tests {
             "{failed:?}"
         );
         assert!(failed.vbas_supported);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:83-88: a version reply shorter than two
+    /// bytes ends configAxis with PROBLEM and COMMS_ERROR set.
+    #[test]
+    fn a_short_version_reply_sets_problem_and_comms_error() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("imsShortVersion", |_| "1".into());
+        let mut axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsShortVersion"),
+            "imsShortVersion",
+        );
+        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(true)]);
+        assert_eq!(
+            rendered(axis.take_port_sets()),
+            [format!("axis {} 1", index::STATUS_COMMS_ERROR)]
+        );
     }
 
     /// ImsMDrivePlusMotorAxis.cpp:396-503 sets only what it read before a
