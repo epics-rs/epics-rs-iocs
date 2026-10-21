@@ -59,13 +59,13 @@ pub(crate) fn asio_connect_what(e: &io::Error) -> String {
 mod tests {
     use super::*;
 
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
+
     #[test]
     fn a_refused_connect_reads_as_asio_what() {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        };
-        let e = connect_tcp("127.0.0.1", port, None).expect_err("nothing listens");
+        let e = connect_tcp("127.0.0.1", DEAD_PORT, None).expect_err("nothing listens");
         let code = e.raw_os_error().expect("an OS error");
         let what = asio_connect_what(&e);
         assert!(what.starts_with("connect: "), "{what}");

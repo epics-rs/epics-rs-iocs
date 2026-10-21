@@ -716,26 +716,28 @@ pub fn create_fx4(
 mod tests {
     use super::*;
 
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
+
     /// A refused connect is found by poll, so ixwebsocket prefixes
     /// `Connect error: `; drvFX4's onError line carries the whole reason.
     #[cfg(unix)]
     #[test]
     fn a_refused_connect_reads_as_ixwebsocket_reason() {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        let Err(reason) = rt.block_on(connect(&format!("ws://127.0.0.1:{port}"))) else {
+        let Err(reason) = rt.block_on(connect(&format!("ws://127.0.0.1:{DEAD_PORT}"))) else {
             panic!("nothing listens");
         };
         let text = ixwebsocket::strerror(&std::io::Error::from_raw_os_error(libc::ECONNREFUSED));
         assert_eq!(
             reason,
-            format!("Unable to connect to 127.0.0.1 on port {port}, error: Connect error: {text}")
+            format!(
+                "Unable to connect to 127.0.0.1 on port {DEAD_PORT}, error: Connect error: {text}"
+            )
         );
     }
 
@@ -743,10 +745,21 @@ mod tests {
     /// came back is reached by the write itself, not at the next poll.
     #[test]
     fn a_write_reconnects_before_refusing() {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        };
+        // Held from first connect to last: a released number can be taken
+        // before the meter comes back on it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (back_tx, back_rx) = std_mpsc::channel::<()>();
+        thread::spawn(move || {
+            loop {
+                let (sock, _) = listener.accept().expect("accept");
+                if back_rx.try_recv().is_ok() {
+                    let _ws = tungstenite_accept(sock);
+                    thread::sleep(Duration::from_secs(10));
+                    return;
+                }
+            }
+        });
         let (shared, _trigger_rx) = QuadEmShared::new(16);
         let (out_tx, out_rx) = tokio_mpsc::unbounded_channel();
         let (in_tx, _in_rx) = std_mpsc::channel();
@@ -759,16 +772,11 @@ mod tests {
             in_tx,
         };
         thread::spawn(move || socket_thread(ctx));
-        // The constructor's attempt finds nothing listening.
+        // The constructor's attempt is closed before its handshake.
         thread::sleep(Duration::from_millis(300));
         assert!(!link.is_connected());
 
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind");
-        thread::spawn(move || {
-            let (sock, _) = listener.accept().expect("accept");
-            let _ws = tungstenite_accept(sock);
-            thread::sleep(Duration::from_secs(10));
-        });
+        back_tx.send(()).expect("meter back");
         let started = Instant::now();
         link.reconnect();
         assert!(link.is_connected());

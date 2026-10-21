@@ -1230,6 +1230,10 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
+
     #[test]
     fn connect_runs_full_init_sequence_then_error_round_trip() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1434,18 +1438,14 @@ mod tests {
 
     #[test]
     fn gm10_init_registers_before_a_failed_connect() {
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
         let registry = Registry::new();
-        init_on_port(&registry, Some(b"gm_1"), Some(b"127.1"), port);
+        init_on_port(&registry, Some(b"gm_1"), Some(b"127.1"), DEAD_PORT);
         let instrument = registry
             .get("gm_1")
             .expect("registered despite the refused connect");
         assert_eq!(instrument.peer_address, "127.0.0.1");
         assert!(instrument.tx.get().is_none());
-        init_on_port(&registry, Some(b"gm_1"), Some(b"10.0.0.1"), port);
+        init_on_port(&registry, Some(b"gm_1"), Some(b"10.0.0.1"), DEAD_PORT);
         assert_eq!(registry.get("gm_1").unwrap().peer_address, "127.0.0.1");
         // No queue thread: the command is dropped and submit returns.
         instrument.submit(Command::ReadAllData);

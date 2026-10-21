@@ -367,6 +367,10 @@ mod tests {
 
     const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
+    /// Privileged port 1: no test can bind it, so nothing answers there.
+    /// A freed ephemeral port can be taken by a concurrent test's responder.
+    const DEAD_PORT: u16 = 1;
+
     /// Spawn a UDP responder bound to an ephemeral port and hand back
     /// both a transport wired to send to that port (standing in for
     /// [`DP5_COMMAND_PORT`], which parallel test runs can't safely bind)
@@ -417,10 +421,7 @@ mod tests {
 
     #[test]
     fn amptek_net_finder_packet_times_out_with_no_responder() {
-        let unused = UdpSocket::bind((LOOPBACK, 0)).unwrap();
-        let dead_port = unused.local_addr().unwrap().port();
-        drop(unused);
-        let transport = AmptekUdpTransport::bind_on_command_port(dead_port).unwrap();
+        let transport = AmptekUdpTransport::bind_on_command_port(DEAD_PORT).unwrap();
         assert_eq!(transport.amptek_net_finder_packet(LOOPBACK).unwrap(), None);
     }
 
@@ -522,10 +523,7 @@ mod tests {
 
     #[test]
     fn send_packet_inet_returns_empty_when_unreachable() {
-        let unused = UdpSocket::bind((LOOPBACK, 0)).unwrap();
-        let dead_port = unused.local_addr().unwrap().port();
-        drop(unused);
-        let transport = AmptekUdpTransport::bind_on_command_port(dead_port).unwrap();
+        let transport = AmptekUdpTransport::bind_on_command_port(DEAD_PORT).unwrap();
         let packet = protocol::build_command(protocol::TransmitPacketType::SendStatus);
         let result = transport.send_packet_inet(LOOPBACK, &packet, 72).unwrap();
         assert!(result.is_empty());
