@@ -986,12 +986,10 @@ pub trait QuadEmDevice {
             ));
         }
 
-        // drvQuadEM.cpp:517 posts address 0 only, leaving a channel write's
-        // readback to the next data post (:280): a C defect, not copied.
+        // Address 0 only (drvQuadEM.cpp:517): a channel's readback, which
+        // readStatus may have replaced with the device's answer, posts with
+        // the next data (:280), or from the boot sweep for a PINI write.
         status.add(self.qe_base().port_base.call_param_callbacks(0));
-        if channel != 0 {
-            status.add(self.qe_base().port_base.call_param_callbacks(channel));
-        }
         qe_write_result(
             &self.qe_base().port_base,
             status,
@@ -1027,11 +1025,8 @@ pub trait QuadEmDevice {
             status.add(self.read_status());
         }
 
-        // Address 0 only at drvQuadEM.cpp:572 too, the same C defect.
+        // Address 0 only, as drvQuadEM.cpp:572.
         status.add(self.qe_base().port_base.call_param_callbacks(0));
-        if channel != 0 {
-            status.add(self.qe_base().port_base.call_param_callbacks(channel));
-        }
         qe_write_result(
             &self.qe_base().port_base,
             status,
@@ -2048,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn a_channel_write_posts_its_own_address_with_no_data_running() {
+    fn a_channel_write_leaves_its_address_to_the_next_data_post() {
         use epics_rs::asyn::interrupt::InterruptFilter;
         use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
@@ -2071,13 +2066,18 @@ mod tests {
             .unwrap();
         m.qe_write_float64(&AsynUser::new(offset).with_addr(2), 1.5)
             .unwrap();
-        let posted: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|v| match v.value {
-                ParamValue::Int32(n) => format!("{} {n}", v.reason),
-                ParamValue::Float64(x) => format!("{} {x}", v.reason),
-                _ => format!("{} other", v.reason),
-            })
-            .collect();
-        assert_eq!(posted, [format!("{range} 3"), format!("{offset} 1.5")]);
+        let mut posted = || -> Vec<String> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|v| match v.value {
+                    ParamValue::Int32(n) => format!("{} {n}", v.reason),
+                    ParamValue::Float64(x) => format!("{} {x}", v.reason),
+                    _ => format!("{} other", v.reason),
+                })
+                .collect()
+        };
+        assert_eq!(posted(), Vec::<String>::new());
+        // computePositions' per-channel post (drvQuadEM.cpp:280).
+        m.base.port_base.call_param_callbacks(2).unwrap();
+        assert_eq!(posted(), [format!("{range} 3"), format!("{offset} 1.5")]);
     }
 }
