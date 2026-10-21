@@ -1,5 +1,5 @@
 //! SyringePump IOC — Teledyne ISCO D/H-series on StreamDevice (SPApp/Db's
-//! teled_d.proto/teled_h.proto through stream-rs, as C) plus ISCO and
+//! teled_d.proto/teled_h.proto through epics-stream-rs, as C) plus ISCO and
 //! Vindum (Modbus-only upstream, wired directly against `epics-modbus-rs`).
 //!
 //! # dbLoadTemplate (epics-base-rs 0.24.3)

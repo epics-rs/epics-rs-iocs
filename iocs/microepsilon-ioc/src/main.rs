@@ -1,5 +1,5 @@
 //! MicroEpsilon capaNCDT6200 IOC — L0 config port (upstream
-//! `capaNCDT6200.proto` on stream-rs) + L1 native data port
+//! `capaNCDT6200.proto` on epics-stream-rs) + L1 native data port
 //! (`capaNCDT6200Sup.c`, ported byte-for-byte).
 //!
 //! Usage:
