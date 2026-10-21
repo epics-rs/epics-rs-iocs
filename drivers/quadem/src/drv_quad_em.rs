@@ -41,7 +41,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::request::{DriverCall, ParamSetValue, RequestOp};
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::exit::at_exit;
 
@@ -729,14 +729,15 @@ impl QuadEmShared {
     /// callbacks once `numAverage` samples have accumulated, and publish the
     /// per-address `QE_DOUBLE_DATA` / `QE_INT_ARRAY_DATA` parameters.
     ///
-    /// Called from the device read thread, so parameter updates are enqueued on
-    /// the port actor rather than written directly.
+    /// Called from the device read thread, so it reaches the port only through
+    /// [`ReadThreadPort`].
     pub fn compute_positions(
         &self,
         handle: &PortHandle,
         params: &QuadEmParams,
         raw: &[f64; QE_MAX_INPUTS],
     ) {
+        let handle = ReadThreadPort(handle);
         let cfg = *self.pos.lock();
         let sample = compute_positions(raw, &cfg);
 
@@ -747,11 +748,11 @@ impl QuadEmShared {
         };
         if overflowed {
             asyn_print!(
-                *handle,
+                handle,
                 WARNING,
                 "drvQuadEM::computePositions warning ring buffer overflow\n"
             );
-            let _ = handle.set_params_and_notify_blocking(
+            handle.post_params(
                 0,
                 vec![ParamSetValue::new(
                     params.ring_overflows,
@@ -763,14 +764,14 @@ impl QuadEmShared {
 
         let num_average = self.acq.lock().num_average;
         if num_average > 0 && self.ring.lock().raw_count >= num_average {
-            let _ = self.trigger_callbacks(handle);
+            let _ = self.trigger_callbacks(&handle);
         }
 
         // C++ sets QE_DOUBLE_DATA and fires callbacks on each of the 11
         // addresses, then does one doCallbacksInt32Array of the truncated
         // values (drvQuadEM.cpp:277-282).
         for (addr, value) in sample.iter().enumerate() {
-            let _ = handle.set_params_and_notify_blocking(
+            handle.post_params(
                 addr as i32,
                 vec![ParamSetValue::new(
                     params.double_data,
@@ -780,11 +781,41 @@ impl QuadEmShared {
             );
         }
         let int_data: Vec<i32> = sample.iter().map(|v| *v as i32).collect();
-        let _ = handle.do_callbacks_array_blocking(
+        handle.post_array(
             params.int_array_data,
             0,
             ParamValue::Int32Array(int_data.into()),
         );
+    }
+}
+
+/// The port as a device read thread reaches it: posts are enqueued on the
+/// actor and never awaited. The actor can be in `set_acquire(0)` polling for
+/// the thread to clear `reading_active`, which C's setAcquire does with the
+/// port lock released (drvAHxxx.cpp:483-487); an actor cannot release itself,
+/// so a read thread awaiting it would never let it return.
+struct ReadThreadPort<'a>(&'a PortHandle);
+
+impl ReadThreadPort<'_> {
+    /// `setXxxParam` of `updates` and `callParamCallbacks(addr)`.
+    fn post_params(&self, addr: i32, updates: Vec<ParamSetValue>) {
+        let _ = self.0.set_params_and_notify_blocking(addr, updates);
+    }
+
+    /// `doCallbacksXxxArray`: posted to the array interface, not stored.
+    fn post_array(&self, reason: usize, addr: i32, value: ParamValue) {
+        let post = DriverCall::new(move |driver| {
+            let _ = driver.base().do_callbacks_array(reason, addr, value);
+        });
+        let _ = self
+            .0
+            .try_submit(RequestOp::WithDriver(post), AsynUser::default());
+    }
+}
+
+impl AsynPrint for ReadThreadPort<'_> {
+    fn asyn_print(&self, mask: crate::trace::TraceMask, args: std::fmt::Arguments<'_>) {
+        self.0.asyn_print(mask, args);
     }
 }
 
@@ -1956,6 +1987,64 @@ mod tests {
             .map(|v| v.iface)
             .collect();
         assert_eq!(posted, [Some(InterfaceType::Int32Array)]);
+    }
+
+    /// C's setAcquire waits for the read thread with the port lock released
+    /// (drvAHxxx.cpp:483-487); the actor running set_acquire(0) cannot release
+    /// itself, so the read thread's compute_positions must not wait for it.
+    #[test]
+    fn compute_positions_does_not_wait_for_an_actor_waiting_for_the_reader() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct Bare(QuadEmBase);
+        impl PortDriver for Bare {
+            fn base(&self) -> &PortDriverBase {
+                &self.0.port_base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0.port_base
+            }
+        }
+        let name = "QE_READER_ACTOR";
+        let base = QuadEmBase::new(name, 0).unwrap();
+        let params = base.params;
+        let (rt, _actor) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Bare(base),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = rt.port_handle().clone();
+        let (shared, _triggers) = QuadEmShared::new(16);
+
+        // The read thread is mid-sample when set_acquire(0) takes the actor
+        // and polls reading_active.
+        shared.set_reading_active(true);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let (h, sh) = (handle.clone(), shared.clone());
+        std::thread::spawn(move || {
+            let _ = h.with_driver_blocking(move |_: &mut Bare| {
+                entered_tx.send(()).unwrap();
+                while sh.is_reading_active() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            let _ = stopped_tx.send(());
+        });
+        entered_rx.recv().unwrap();
+        std::thread::spawn(move || {
+            shared.compute_positions(&handle, &params, &[1.0, 2.0, 4.0, 8.0]);
+            shared.set_reading_active(false);
+        });
+        assert!(
+            stopped_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the read thread waited on the actor that waits for it"
+        );
     }
 
     #[test]
