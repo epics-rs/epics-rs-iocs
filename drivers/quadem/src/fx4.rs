@@ -743,10 +743,21 @@ mod tests {
     /// came back is reached by the write itself, not at the next poll.
     #[test]
     fn a_write_reconnects_before_refusing() {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        };
+        // Held from first connect to last: a released number can be taken
+        // before the meter comes back on it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (back_tx, back_rx) = std_mpsc::channel::<()>();
+        thread::spawn(move || {
+            loop {
+                let (sock, _) = listener.accept().expect("accept");
+                if back_rx.try_recv().is_ok() {
+                    let _ws = tungstenite_accept(sock);
+                    thread::sleep(Duration::from_secs(10));
+                    return;
+                }
+            }
+        });
         let (shared, _trigger_rx) = QuadEmShared::new(16);
         let (out_tx, out_rx) = tokio_mpsc::unbounded_channel();
         let (in_tx, _in_rx) = std_mpsc::channel();
@@ -759,16 +770,11 @@ mod tests {
             in_tx,
         };
         thread::spawn(move || socket_thread(ctx));
-        // The constructor's attempt finds nothing listening.
+        // The constructor's attempt is closed before its handshake.
         thread::sleep(Duration::from_millis(300));
         assert!(!link.is_connected());
 
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind");
-        thread::spawn(move || {
-            let (sock, _) = listener.accept().expect("accept");
-            let _ws = tungstenite_accept(sock);
-            thread::sleep(Duration::from_secs(10));
-        });
+        back_tx.send(()).expect("meter back");
         let started = Instant::now();
         link.reconnect();
         assert!(link.is_connected());
