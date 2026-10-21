@@ -1111,7 +1111,7 @@ other two device blocks are commented out.
 (ISCO/Vindum are Modbus-only upstream)
 
 The Teledyne ISCO D/H-series pumps run on StreamDevice as in C: SPApp/Db's
-`teled_d.proto`/`teled_h.proto` and templates through `stream-rs`, with
+`teled_d.proto`/`teled_h.proto` and templates through `epics-stream-rs`, with
 only the approved `PressSeq`/`MaxFlowSeq` link repoint in
 `teledynePumpD.template`. The module's other two families, ISCO and
 Vindum, are Modbus-only upstream (`drvModbusAsynConfigure` + generic
@@ -1149,7 +1149,7 @@ protocol for the config port)
 `drivers/microepsilon` ports two independent asyn ports per physical unit:
 **L0**, a config port whose ~30-command ASCII protocol (sample rate,
 averaging, trigger mode, per-channel status/info/linearization, data-port
-number, analog filter) runs the upstream `capaNCDT6200.proto` on stream-rs;
+number, analog filter) runs the upstream `capaNCDT6200.proto` on epics-stream-rs;
 and **L1**, a fully custom native driver with its
 own background reader thread ingesting a raw binary TCP measurement
 stream (fixed-format packets, up to 4 channels), ported byte-for-byte

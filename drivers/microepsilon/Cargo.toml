@@ -1,7 +1,7 @@
 # MicroEpsilon capaNCDT6200 capacitive displacement sensor, ported from
 # epics-modules/microEpsilon: the data port (`capaNCDT6200Sup.c`, a native C
 # asyn driver ingesting a raw binary TCP measurement stream). The config
-# port's `capaNCDT6200.proto` runs on stream-rs in microepsilon-ioc.
+# port's `capaNCDT6200.proto` runs on epics-stream-rs in microepsilon-ioc.
 
 [package]
 name = "microepsilon"

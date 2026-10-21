@@ -1,6 +1,6 @@
 # SyringePump IOC binary. Wires up all three pump families from
 # epics-modules/SyringePump: Teledyne ISCO D/H-series (StreamDevice, via
-# stream-rs) plus ISCO and Vindum (Modbus-only upstream,
+# epics-stream-rs) plus ISCO and Vindum (Modbus-only upstream,
 # wired directly against epics-modbus-rs's drvModbusAsynConfigure + ported
 # db templates -- no driver code of their own).
 

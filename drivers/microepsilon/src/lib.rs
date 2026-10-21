@@ -4,7 +4,7 @@
 //!
 //! - **L0 (config port)** -- `capaNCDT6200Sup/Db/capaNCDT6200.proto`, a
 //!   StreamDevice ASCII command/reply protocol. microepsilon-ioc runs the
-//!   upstream file on stream-rs; nothing of it lives in this crate.
+//!   upstream file on epics-stream-rs; nothing of it lives in this crate.
 //! - **L1 (data port)** -- `capaNCDT6200Sup/src/capaNCDT6200Sup.c`, a fully
 //!   custom native C asyn driver with its own dedicated background reader
 //!   thread ingesting a raw binary TCP measurement stream (fixed-format
