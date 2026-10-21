@@ -1125,6 +1125,10 @@ mod tests {
     use crate::dashboard::PolyScopeVersion;
     use crate::registry::DashboardState;
 
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
+
     fn params() -> ControlParams {
         let mut n = 0usize;
         let mut next = || {
@@ -1369,15 +1373,11 @@ mod tests {
             ..Default::default()
         });
         registry::register_dashboard("CTRL_THROW_DASH1", versioned).expect("fresh port name");
-        let closed = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        };
         let refused = message(ControlDriver::with_script_port(
             "CTRL_THROW1",
             "CTRL_THROW_DASH1",
             "CTRL_THROW_RECV",
-            closed,
+            DEAD_PORT,
         ));
         assert!(refused.starts_with("connect: "), "{refused}");
     }

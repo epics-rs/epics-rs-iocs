@@ -716,26 +716,28 @@ pub fn create_fx4(
 mod tests {
     use super::*;
 
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
+
     /// A refused connect is found by poll, so ixwebsocket prefixes
     /// `Connect error: `; drvFX4's onError line carries the whole reason.
     #[cfg(unix)]
     #[test]
     fn a_refused_connect_reads_as_ixwebsocket_reason() {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr").port()
-        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        let Err(reason) = rt.block_on(connect(&format!("ws://127.0.0.1:{port}"))) else {
+        let Err(reason) = rt.block_on(connect(&format!("ws://127.0.0.1:{DEAD_PORT}"))) else {
             panic!("nothing listens");
         };
         let text = ixwebsocket::strerror(&std::io::Error::from_raw_os_error(libc::ECONNREFUSED));
         assert_eq!(
             reason,
-            format!("Unable to connect to 127.0.0.1 on port {port}, error: Connect error: {text}")
+            format!(
+                "Unable to connect to 127.0.0.1 on port {DEAD_PORT}, error: Connect error: {text}"
+            )
         );
     }
 

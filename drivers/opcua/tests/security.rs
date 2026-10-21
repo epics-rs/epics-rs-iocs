@@ -29,6 +29,10 @@ mod setup_security {
     const NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
     const SHA256: &str = "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256";
 
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
+
     fn endpoint(
         url: &str,
         mode: MessageSecurityMode,
@@ -260,13 +264,8 @@ mod setup_security {
 
     #[tokio::test]
     async fn a_dead_discovery_url_is_cant_connect() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         let pki = std::env::temp_dir().join(format!("opcua-cantconnect-{}", std::process::id()));
-        let mut config = SessionConfig::new("s", format!("opc.tcp://127.0.0.1:{port}"));
+        let mut config = SessionConfig::new("s", format!("opc.tcp://127.0.0.1:{DEAD_PORT}"));
         config.pki_dir = Some(pki.to_string_lossy().into_owned());
         let err = AsyncOpcuaConnector::new()
             .setup(&config)
@@ -343,13 +342,9 @@ mod setup_security {
     /// connect is BadDisconnect (`UA_ClientConnectionTCP_poll`).
     #[tokio::test]
     async fn a_dead_session_url_is_a_connect_failure_with_its_status() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         let err =
-            connect_without_security(&format!("opc.tcp://127.0.0.1:{port}"), "deadsession").await;
+            connect_without_security(&format!("opc.tcp://127.0.0.1:{DEAD_PORT}"), "deadsession")
+                .await;
         assert_eq!(err, StatusCode::BadDisconnect);
     }
 
@@ -408,12 +403,7 @@ mod setup_security {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_dead_discovery_url_prints_the_failed_get_endpoints() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let url = format!("opc.tcp://127.0.0.1:{port}");
+        let url = format!("opc.tcp://127.0.0.1:{DEAD_PORT}");
         let lines = setup_lines(&url, &[], "dbgdead").await;
         assert_eq!(
             lines,
