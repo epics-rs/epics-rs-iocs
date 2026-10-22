@@ -370,6 +370,10 @@ impl AsynMotor for HydraAxis {
             self.members.axis_no,
             axis_status,
         );
+        // C sets problem from 0x200 here, ahead of the getsw and getswst
+        // skips (SMChydraAxis.cpp:302-311); its overwrite with 0 at :357
+        // makes that a dead store on a good poll, not copied.
+        status.problem = (axis_status & STATUS_ESTOP_SWITCH) != 0;
 
         // Switch config: bit 1 (0x2) masks (disables) the switch.
         let sw = ctrl.query(&format!("{addr} getsw"))?;
@@ -390,9 +394,6 @@ impl AsynMotor for HydraAxis {
         status.high_limit = high_limit;
 
         status.powered = (axis_status & STATUS_POWER_OFF) == 0;
-        // C sets problem from 0x200 (SMChydraAxis.cpp:302-311), then
-        // overwrites it at :357 and :360, a dead store; not copied.
-        status.problem = (axis_status & STATUS_ESTOP_SWITCH) != 0;
         Ok(())
     }
 }
@@ -494,6 +495,40 @@ mod tests {
         *refused.lock().unwrap() = "1 np".into();
         assert!(axis.poll(&user, &mut status).is_err());
         assert!(!status.done, "{status:?}");
+    }
+
+    /// C sets Problem from the e-stop switch bit before the `getsw` and
+    /// `getswst` skips (SMChydraAxis.cpp:302-311), so a failure there clears
+    /// the Problem an earlier failure left and `skip` sets it again: a
+    /// change the poller calls back on every failing poll.
+    #[test]
+    fn a_failed_switch_read_clears_the_problem_before_its_skip() {
+        use motor_common::testing::LineRig;
+        for (port, refused) in [
+            ("hydraGetswFails", "1 getsw"),
+            ("hydraGetswstFails", "1 getswst"),
+        ] {
+            let (_line, handle) = LineRig::failing(
+                port,
+                |cmd| match cmd.trim_end() {
+                    "1 getmotor" => "1".into(),
+                    "1 getclperiod" => "0.5".into(),
+                    "1 np" => "2.5".into(),
+                    "1 nst" => "0".into(),
+                    "1 getsw" | "1 getswst" => "0 0".into(),
+                    _ => String::new(),
+                },
+                move |cmd| cmd.trim_end() == refused,
+            );
+            let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+            let mut axis = HydraAxis::new(controller, 0, Arc::default(), "");
+            let mut status = MotorStatus {
+                problem: true,
+                ..MotorStatus::default()
+            };
+            assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+            assert!(!status.problem, "{refused}: {status:?}");
+        }
     }
 
     /// SMChydraAxis.cpp:15-57 parses `inString_` whatever
