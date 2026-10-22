@@ -10,8 +10,8 @@
 //! ## Protocol
 //!
 //! SCPI-style ASCII commands, one per axis, addressed as `CHAN<n>` (1-based).
-//! Commands are terminated by LF (the driver owns output framing; the startup
-//! script sets the input EOS). Set commands (`CHAN<n>:POS <value>`) take no
+//! Commands are terminated by LF (the startup script sets both EOS, as C needs;
+//! the driver sends bare commands). Set commands (`CHAN<n>:POS <value>`) take no
 //! reply; queries (`...?`) are written and their reply read.
 //!
 //! - Startup unlocks the controller with `SYS:PASS:CEN "nPoint"`.
@@ -58,9 +58,6 @@ use motor_common::{ControllerParams, ControllerReport};
 
 /// Response buffer size (C `MAX_C300_STRING_SIZE`).
 const READ_BUF: usize = 300;
-
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\n";
 
 /// Byte offset of the corrected position-monitor value in the `DATA?` record
 /// (C `C300_DATA_OFFSET`).
@@ -123,17 +120,10 @@ impl C300Controller {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected (C `writeController`), and
     /// print it whatever the write returned (C300MotorDriver.cpp:171-172).
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        let status = self.handle.write_octet(0, &Self::framed(cmd)).map(drop);
+        let status = self.handle.write_octet(0, cmd.as_bytes()).map(drop);
         self.handle.print(
             0,
             TraceMask::IO_DRIVER,
@@ -148,7 +138,7 @@ impl C300Controller {
     fn query(&mut self, cmd: &str) -> AsynResult<String> {
         let (raw, status) = self
             .handle
-            .write_read(0, &Self::framed(cmd), READ_BUF)
+            .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
         let read = match &status {
             Err(e) => e.octet_step() == Some(OctetStep::Read),
@@ -448,6 +438,30 @@ mod tests {
         axis.move_relative(&user, 1e-7, 0.0, 0.0, 0.0).unwrap();
         let sent: Vec<String> = rig.sent().iter().map(|c| c.trim_end().to_owned()).collect();
         assert_eq!(sent, ["CHAN1:POS 0.100000", "CHAN1:POS 0.000000"]);
+    }
+
+    /// C300MotorDriver.cpp:168, :199 write `output` bare; the port's
+    /// output EOS terminates it.
+    #[test]
+    fn commands_are_written_bare() {
+        let (rig, io) = motor_common::testing::LineRig::new("c300Bare", c300_replies);
+        let controller = Arc::new(Mutex::new(C300Controller::new(io, 1)));
+        let mut axis = C300Axis::new(controller, 0);
+        axis.move_absolute(&AsynUser::default(), 1.0, 0.0, 0.0, 0.0)
+            .unwrap();
+        axis.poll(&AsynUser::default(), &mut MotorStatus::default())
+            .unwrap();
+        assert_eq!(
+            rig.sent(),
+            [
+                "SYS:PASS:CEN \"nPoint\"",
+                "SYST:CHAN1:STAG:RANG?",
+                "SYST:CHAN1:DI:FACT?",
+                "CHAN1:POS 1.000000",
+                "CHAN1:DATA?",
+                "CHAN1:POS?",
+            ]
+        );
     }
 
     /// C300MotorDriver.cpp:307-310: the encoder position is set before POS?

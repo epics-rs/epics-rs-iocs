@@ -21,10 +21,9 @@ epicsEnvSet("NAXES",  "3")
 # ---- asyn IP octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
-# C300 framing: the driver appends the LF command terminator, so only the input
-# EOS is configured here. Do not set an output EOS — the port would append it a
-# second time.
+# Port EOS as C needs it: C300MotorDriver sets no EOS and sends bare commands.
 asynOctetSetInputEos("$(IPPORT)", 0, "\n")
+asynOctetSetOutputEos("$(IPPORT)", 0, "\n")
 
 # ---- C300 controller ----
 # C300CreateController(portName, C300PortName, numAxes, movingPollPeriod, idlePollPeriod).
