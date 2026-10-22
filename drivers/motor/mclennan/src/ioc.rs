@@ -107,7 +107,7 @@ mod report {
         let int = ArgValue::Int;
         run_command(setup, vec![int(2), int(10)]).await;
         let (_line, _io) = LineRig::new("pm304RepLine", |cmd| match cmd {
-            "1ID\r" => "Mclennan PM304 v1".into(),
+            "1ID" => "Mclennan PM304 v1".into(),
             _ => "OK".into(),
         });
         let config = vec![int(1), ArgValue::String("pm304RepLine".into()), int(1)];

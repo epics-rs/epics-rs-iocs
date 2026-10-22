@@ -3,7 +3,7 @@
 //! Ported from `motorMclennan/mclennanApp/src/drvPM304.cc` + `devPM304.cc` (the
 //! model-1 dev/drv pair). One serial line drives a multi-axis controller; each
 //! command is prefixed with the 1-based axis number and terminated by CR (the
-//! driver owns output framing; the startup script sets only the input EOS). The
+//! startup script sets both EOS, as C needs; the driver sends bare commands). The
 //! controller answers **every** command, so each command is written and its
 //! reply consumed to keep the stream synchronized.
 //!
@@ -54,9 +54,6 @@ use motor_common::util::{atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 200;
-
-/// Command terminator; the driver owns output framing (PM304/PM600 accept CR).
-const TERMINATOR: &[u8] = b"\r";
 
 /// Controller family, selected from the `1ID` reply.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,13 +133,6 @@ impl Pm304Controller {
         self.n_axes
     }
 
-    fn framed(cmd: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd);
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// On the PM600, drop the echoed command (everything up to and including the
     /// first CR); on the PM304 the reply has no echo and is returned unchanged.
     fn strip_echo<'a>(&self, reply: &'a str) -> &'a str {
@@ -166,7 +156,7 @@ impl Pm304Controller {
         // shift every later reply.
         let (raw, status) = self
             .handle
-            .write_read(0, &Self::framed(cmd.as_bytes()), READ_BUF)
+            .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_end_matches(['\r', '\n', '\0']).to_string();
@@ -186,7 +176,7 @@ impl Pm304Controller {
     /// out (drvPM304.cc:367-376).
     fn send_mess(&self, msg: &[u8]) {
         for piece in msg.split(|&b| b == b';').filter(|p| !p.is_empty()) {
-            let _ = self.handle.write_read(0, &Self::framed(piece), READ_BUF);
+            let _ = self.handle.write_read(0, piece, READ_BUF);
         }
     }
 }
@@ -541,9 +531,9 @@ mod tests {
         let (_line, io) = LineRig::cut(
             "pm304_cut",
             |last| match last {
-                "1OA\r" => "AP=123".into(),
-                "1ID\r" => "Mclennan PM304".into(),
-                "1OS\r" => "00010000".into(),
+                "1OA" => "AP=123".into(),
+                "1ID" => "Mclennan PM304".into(),
+                "1OS" => "00010000".into(),
                 _ => "OK".into(),
             },
             |_| true,
@@ -560,8 +550,8 @@ mod tests {
     #[test]
     fn the_ident_keeps_its_blanks() {
         let (_line, io) = LineRig::new("pm304_ident", |last| match last {
-            "1OA\r" => "AP=0".into(),
-            "1ID\r" => " Mclennan PM304 v1 ".into(),
+            "1OA" => "AP=0".into(),
+            "1ID" => " Mclennan PM304 v1 ".into(),
             _ => "OK".into(),
         });
         let ctrl = Pm304Controller::new(io, 1).unwrap();
@@ -570,7 +560,7 @@ mod tests {
 
     fn pm304_line(name: &str) -> (LineRig, Pm304Axis) {
         let (line, io) = LineRig::new(name, |last| match last {
-            "1ID\r" => "Mclennan PM304".into(),
+            "1ID" => "Mclennan PM304".into(),
             _ => "OK".into(),
         });
         let ctrl = Pm304Controller::new(io, 1).unwrap();
@@ -586,12 +576,9 @@ mod tests {
         let (line, mut axis) = pm304_line("pm304_speeds");
         let user = AsynUser::default();
         axis.home(&user, 0.0, 400.0, 800.0, true).unwrap();
-        assert_eq!(line.sent(), ["1SV400\r", "1SA800\r", "1SD800\r", "1IX\r"]);
+        assert_eq!(line.sent(), ["1SV400", "1SA800", "1SD800", "1IX"]);
         axis.move_velocity(&user, 0.0, -300.0, 600.0).unwrap();
-        assert_eq!(
-            line.sent(),
-            ["1SA600\r", "1SD600\r", "1SV-300\r", "1CV-1\r"]
-        );
+        assert_eq!(line.sent(), ["1SA600", "1SD600", "1SV-300", "1CV-1"]);
     }
 
     /// devPM304.cc sends SV%ld whatever its value, signed on a jog, and
@@ -601,14 +588,11 @@ mod tests {
         let (line, mut axis) = pm304_line("pm304_sv");
         let user = AsynUser::default();
         axis.move_absolute(&user, 10.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["1SV0\r", "1MA10\r"]);
+        assert_eq!(line.sent(), ["1SV0", "1MA10"]);
         axis.move_velocity(&user, 0.0, -300.0, 600.0).unwrap();
-        assert_eq!(
-            line.sent(),
-            ["1SA600\r", "1SD600\r", "1SV-300\r", "1CV-1\r"]
-        );
+        assert_eq!(line.sent(), ["1SA600", "1SD600", "1SV-300", "1CV-1"]);
         axis.move_velocity(&user, 0.0, 0.4, 600.0).unwrap();
-        assert_eq!(line.sent(), ["1SA600\r", "1SD600\r", "1SV0\r", "1CV-1\r"]);
+        assert_eq!(line.sent(), ["1SA600", "1SD600", "1SV0", "1CV-1"]);
     }
 
     /// devPM304.cc: INIT and a CR, PREM just ahead of the motion command,
@@ -616,9 +600,9 @@ mod tests {
     #[test]
     fn init_prem_and_post_go_out_piece_by_piece() {
         let (line, io) = LineRig::new("pm304_strings", |last| match last {
-            "1ID\r" => "Mclennan PM304".into(),
-            "1OS\r" => "00010000".into(),
-            "1OA\r" => "AP=10".into(),
+            "1ID" => "Mclennan PM304".into(),
+            "1OS" => "00010000".into(),
+            "1OA" => "AP=10".into(),
             _ => "OK".into(),
         });
         let ctrl = Pm304Controller::new(io, 1).unwrap();
@@ -626,16 +610,16 @@ mod tests {
         line.sent();
         let user = AsynUser::default();
         axis.primitive(&user, b"1RS;1KP5").unwrap();
-        assert_eq!(line.sent(), ["1RS\r", "1KP5\r\r"]);
+        assert_eq!(line.sent(), ["1RS", "1KP5\r"]);
         let post = PostMessage::default();
         post.set(b"1AB");
         axis.set_move_strings(&user, b"1RS;1SC", Some(post))
             .unwrap();
         axis.move_absolute(&user, 50.0, 0.0, 400.0, 0.0).unwrap();
-        assert_eq!(line.sent(), ["1SV400\r", "1RS\r", "1SC\r", "1MA50\r"]);
+        assert_eq!(line.sent(), ["1SV400", "1RS", "1SC", "1MA50"]);
         axis.polled(&user).unwrap();
         axis.polled(&user).unwrap();
-        assert_eq!(line.sent(), ["1OS\r", "1OA\r", "1AB\r\r", "1OS\r", "1OA\r"]);
+        assert_eq!(line.sent(), ["1OS", "1OA", "1AB\r", "1OS", "1OA"]);
     }
 
     /// drvPM304.cc:668-690: `1OA` finds the card, retried while silent;
@@ -645,13 +629,13 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let probes = AtomicUsize::new(0);
         let (line, io) = LineRig::new("pm304Probe", move |last| match last {
-            "1OA\r" if probes.fetch_add(1, Ordering::SeqCst) < 2 => String::new(),
-            "1OA\r" => "AP=0".into(),
+            "1OA" if probes.fetch_add(1, Ordering::SeqCst) < 2 => String::new(),
+            "1OA" => "AP=0".into(),
             _ => String::new(),
         });
         let ctrl = Pm304Controller::new(io, 1).unwrap();
         assert_eq!(ctrl.ident(), "");
-        assert_eq!(line.sent(), ["1OA\r", "1OA\r", "1OA\r", "1ST\r", "1ID\r"]);
+        assert_eq!(line.sent(), ["1OA", "1OA", "1OA", "1ST", "1ID"]);
 
         let (_line, io) = LineRig::new("pm304Absent", |_| String::new());
         assert!(Pm304Controller::new(io, 1).is_err());
@@ -664,17 +648,17 @@ mod tests {
         let (line, io) = LineRig::failing(
             "pm304Refused",
             |last| match last {
-                "1ID\r" => "Mclennan PM304".into(),
+                "1ID" => "Mclennan PM304".into(),
                 _ => "OK".into(),
             },
-            |sent| sent == "1SV400\r",
+            |sent| sent == "1SV400",
         );
         let ctrl = Pm304Controller::new(io, 1).unwrap();
         let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         line.sent();
         axis.move_absolute(&AsynUser::default(), 50.0, 0.0, 400.0, 0.0)
             .unwrap();
-        assert_eq!(line.sent(), ["1SV400\r", "1MA50\r"]);
+        assert_eq!(line.sent(), ["1SV400", "1MA50"]);
     }
 
     /// drvPM304.cc:252-261, 302-311: the direction follows a position
@@ -685,9 +669,9 @@ mod tests {
         let replies = Arc::new(StdMutex::new(("00010000", "AP=10")));
         let r = replies.clone();
         let (_line, io) = LineRig::new("pm304Dir", move |last| match last {
-            "1ID\r" => "Mclennan PM304".into(),
-            "1OS\r" => r.lock().unwrap().0.into(),
-            "1OA\r" => r.lock().unwrap().1.into(),
+            "1ID" => "Mclennan PM304".into(),
+            "1OS" => r.lock().unwrap().0.into(),
+            "1OA" => r.lock().unwrap().1.into(),
             _ => "OK".into(),
         });
         let ctrl = Pm304Controller::new(io, 1).unwrap();
@@ -701,8 +685,8 @@ mod tests {
         assert!(axis.polled(&user).unwrap().direction);
 
         let (_line, io) = LineRig::new("pm600Dir", |last| match last {
-            "1ID\r" => "1ID\rMclennan PM600".into(),
-            "1OS\r" => "1OS\r01:10100000".into(),
+            "1ID" => "1ID\rMclennan PM600".into(),
+            "1OS" => "1OS\r01:10100000".into(),
             _ => "1OA\r01:0".into(),
         });
         let ctrl = Pm304Controller::new(io, 1).unwrap();
