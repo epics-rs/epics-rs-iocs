@@ -742,6 +742,39 @@ mod tests {
         );
     }
 
+    /// C `writeController` writes `outString_` bare as well
+    /// (MMC200Driver.cpp:308-395).
+    #[test]
+    fn the_commands_go_out_bare() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("mmc200BareWrite", |cmd| {
+            match cmd.trim_end() {
+                "1VER?" => "#MMC-200 v4.1",
+                "1REZ?" => "#1000",
+                "1UST?" => "#8",
+                "1VMX?" => "#2.5",
+                _ => "#0",
+            }
+            .into()
+        });
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        let mut axis = Mmc200Axis::new(controller, 0, false);
+        rig.sent();
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 800.0, 0.0, 800.0, 800.0).unwrap();
+        axis.stop(&user, 1.0).unwrap();
+        assert_eq!(
+            rig.sent(),
+            [
+                "1VEL0.001",
+                "1ACC0.001",
+                "1DEC0.001",
+                "1MVA0.001000",
+                "1STP"
+            ]
+        );
+    }
+
     /// A line whose stale reply is still arriving: the port flush finds
     /// nothing to drop, and the next read takes it.
     struct LateReply {
