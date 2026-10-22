@@ -130,7 +130,6 @@ impl MerlinDetector {
         base.set_int32_param(ad.params.image_mode, 0, MerlinImageMode::Continuous as i32)?;
         base.set_int32_param(ad.params.trigger_mode, 0, TriggerMode::Internal as i32)?;
         base.set_int32_param(params.profile_control, 0, MPXPROFILES_IMAGE)?;
-        base.set_int32_param(params.counter_depth, 0, 12)?;
         base.set_int32_param(ad.params.status, 0, ADStatus::Initializing as i32)?;
 
         Ok(Self {
@@ -964,6 +963,18 @@ mod tests {
         assert_eq!(base.get_float64_param(p.pool_used_memory, 0).unwrap(), 1.0);
     }
 
+    /// C's constructor leaves COUNTERDEPTH unset (merlinDetector.cpp:1434);
+    /// only setAcquireParams defaults it to 12, so the output record boots UDF.
+    #[test]
+    fn counter_depth_starts_undefined() {
+        let det = detector("MERLIN_COUNTER_DEPTH");
+        let reason = det.params.counter_depth;
+        assert!(matches!(
+            det.ad.port_base.get_int32_param(reason, 0),
+            Err(AsynError::ParamUndefined(r)) if r == reason
+        ));
+    }
+
     #[test]
     fn a_base_class_write_reaches_addriver() {
         let mut det = detector("MERLIN_BASE_WRITE");
@@ -1048,6 +1059,128 @@ mod tests {
             det.ad.port_base.get_float64_param(threshold, 0).unwrap(),
             0.0
         );
+    }
+
+    /// merlinDetector never writes `pasynUser->errorMessage`, so a refused
+    /// SET reaches the record as its status alone.
+    #[test]
+    fn a_refused_threshold_write_hands_the_record_no_message() {
+        let mut det = detector("MERLIN_WRITE_MESSAGE");
+        let mut user = AsynUser::new(det.params.thresholds[0]);
+        let e = det.write_float64(&mut user, 9.0).unwrap_err();
+        assert_eq!(e.message(), "");
+    }
+
+    /// mpxWrite hands every request to toLabViewStr (mpxConnection.cpp:571),
+    /// the constructor's STOPACQUISITION included, whether or not it went out.
+    #[test]
+    fn the_constructors_stop_is_the_string_to_server() {
+        let (cmd, _) =
+            SyncIOHandle::connect_port("MERLIN_ECHO_CMD", 0, Duration::ZERO, InterfaceType::Octet);
+        let (data, _) =
+            SyncIOHandle::connect_port("MERLIN_ECHO_DATA", 0, Duration::ZERO, InterfaceType::Octet);
+        let rt = create_merlin_detector(
+            &claim_port("MERLIN_ECHO").unwrap(),
+            cmd,
+            data,
+            512,
+            512,
+            DetectorType::MerlinQuad,
+            1 << 20,
+        )
+        .unwrap();
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let (text, status) = sync
+            .read_octet(rt.ad_params.string_to_server, 256)
+            .into_parts();
+        status.unwrap();
+        // NORD 35 in C: the 34 characters and the NUL.
+        assert_eq!(text, b"MPX,0000000020,CMD,STOPACQUISITION\0");
+    }
+
+    /// mpxReadCmd hands every reply it reads to fromLabViewStr
+    /// (mpxConnection.cpp:763), and the write's callbacks carry both strings.
+    #[test]
+    fn a_command_reply_is_the_string_from_server() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut header = [0u8; 15];
+            s.read_exact(&mut header).unwrap();
+            let len: usize = std::str::from_utf8(&header[4..14])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut body = vec![0u8; len - 1];
+            s.read_exact(&mut body).unwrap();
+            let reply = "CMD,SWTRIGGER,0";
+            write!(s, "MPX,{:010},{reply}", reply.len() + 1).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let ip = "MERLIN_REPLY_CMD";
+        let driver = DrvAsynIPPort::new(ip, &addr).unwrap();
+        let (runtime, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let mut det = MerlinDetector::new(
+            "MERLIN_REPLY",
+            MpxConnection::new(
+                SyncIOHandle::from_handle(handle, 0, Duration::from_secs(1)),
+                MPX_MAXLINE,
+            ),
+            512,
+            512,
+            DetectorType::MerlinQuad,
+            1 << 20,
+            Arc::new(SharedState::new()),
+        )
+        .unwrap();
+        let mut user = AsynUser::new(det.params.software_trigger);
+        det.write_int32(&mut user, 1).unwrap();
+        let p = det.ad.params;
+        let base = &det.ad.port_base;
+        assert_eq!(
+            base.get_string_param(p.string_to_server, 0).unwrap(),
+            b"MPX,0000000014,CMD,SWTRIGGER"
+        );
+        assert_eq!(
+            base.get_string_param(p.string_from_server, 0).unwrap(),
+            b"MPX,0000000016,CMD,SWTRIGGER,0"
+        );
+    }
+
+    /// C's writeFloat64 error line for THRESHOLD0 reads `function=99`: the
+    /// ADDriver params, then DELAY_TIME, then the thresholds.
+    #[test]
+    fn a_threshold_error_line_prints_cs_function_number() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "MERLIN_FUNCTION_NO";
+        let det = detector(name);
+        let threshold = det.params.thresholds[0];
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace().set_trace_mask(Some(name), TraceMask::ERROR);
+        assert!(h.write_float64_blocking(threshold, 0, 10.0).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains(
+                "merlinDetector:writeFloat64 error, status=4 function=99, value=10.000000"
+            ),
+            "{text:?}"
+        );
+        std::mem::forget(runtime);
     }
 
     /// The last frame of a Single acquisition under a software trigger;
