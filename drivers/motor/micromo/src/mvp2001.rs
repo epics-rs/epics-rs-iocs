@@ -3,8 +3,8 @@
 //! Ported from `motorMicroMo/microMoApp/src/MVP2001Driver.cpp` (the model-3
 //! `asynMotorController`/`asynMotorAxis` form; the older `drvMVP2001.cc` model-1
 //! pair is [`crate::drv_mvp2001`]). Commands are ASCII `<axis> <CMD> <args>` where `<axis>`
-//! is 1-based; commands are CR-terminated (the driver owns output framing, the
-//! startup script sets the input EOS).
+//! is 1-based; commands are written bare, as C writes them, and the port's
+//! output EOS terminates them.
 //!
 //! ## Prepended-terminator responses
 //!
@@ -52,9 +52,6 @@ use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 32;
-
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
 
 /// Delay between the prepended-terminator read and the real reply (C 0.033 s).
 const REPLY_DELAY: Duration = Duration::from_millis(33);
@@ -124,16 +121,9 @@ impl Mvp2001Controller {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected (C `writeController`).
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
@@ -143,16 +133,17 @@ impl Mvp2001Controller {
         // First read: the prepended terminator (discarded).
         let (_, status) = self
             .handle
-            .write_read(0, &Self::framed(cmd), READ_BUF)
+            .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
         status?;
         sleep(REPLY_DELAY);
-        // Second read: the real reply.
+        // Second read: the real reply, as the C string `parseReply` indexes.
+        // Nothing is trimmed: a terminator the port's input EOS leaves in it
+        // shifts the field for C as well.
         let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
         status?;
-        Ok(String::from_utf8_lossy(&raw)
-            .trim_matches(['\r', '\n', '\0'])
-            .to_string())
+        let reply = raw.split(|&b| b == 0).next().unwrap_or_default();
+        Ok(String::from_utf8_lossy(reply).into_owned())
     }
 }
 
@@ -596,6 +587,56 @@ mod tests {
             ["1 LA 10", "1 M", "1 LR 5", "1 M", &v, "1 AB", "1 EN"]
         );
         assert!(axis.set_closed_loop(&user, false).is_err());
+    }
+
+    /// C `writeController` and `writeRead2xController` write `outString_`
+    /// bare (MVP2001Driver.cpp:129, :183-198); the port's output EOS
+    /// terminates it.
+    #[test]
+    fn the_commands_go_out_bare() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("mvp2001Bare", |cmd| match cmd {
+            "1 SR" => "0001 0190".into(),
+            _ => String::new(),
+        });
+        let controller = Arc::new(Mutex::new(Mvp2001Controller::new(io, 1)));
+        let mut axis = Mvp2001Axis::new(controller, "mvp2001Bare", 0, 512, 1000, 1);
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 10.0, 0.0, 100.0, 250.0).unwrap();
+        axis.stop(&user, 1.0).unwrap();
+        assert_eq!(
+            rig.sent(),
+            [
+                "1 LP 1",
+                "1 HO",
+                "1 SR",
+                "1 ANO 2969",
+                "1 SP 2",
+                "1 AC 1",
+                "1 LA 10",
+                "1 M",
+                "1 AB"
+            ]
+        );
+    }
+
+    /// `parseReply` copies the field with `strncat` (MVP2001Driver.cpp:147), so
+    /// a NUL in the reply ends it there.
+    #[test]
+    fn a_nul_in_a_reply_ends_the_field() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("mvp2001Nul", |cmd| {
+            match cmd {
+                "1 POS" => "0001 000001\0F4",
+                "1 ST" => "0001 0000",
+                _ => "",
+            }
+            .into()
+        });
+        let controller = Arc::new(Mutex::new(Mvp2001Controller::new(io, 1)));
+        let mut axis = Mvp2001Axis::new(controller, "mvp2001Nul", 0, 512, 500, 1);
+        let status = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!(status.position, 1.0);
     }
 
     #[test]
