@@ -1507,6 +1507,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "epics-seq-rs"
+version = "0.32.0"
+source = "git+file:///home/stevek/work/epics-rs?rev=c4a3cb85db0066824769bed02215c280cb4ff729#c4a3cb85db0066824769bed02215c280cb4ff729"
+dependencies = [
+ "epics-base-rs",
+ "epics-libcom-rs",
+ "parking_lot",
+]
+
+[[package]]
+name = "epics-snc-rs"
+version = "0.32.0"
+source = "git+file:///home/stevek/work/epics-rs?rev=c4a3cb85db0066824769bed02215c280cb4ff729#c4a3cb85db0066824769bed02215c280cb4ff729"
+dependencies = [
+ "chrono",
+ "epics-libcom-rs",
+]
+
+[[package]]
 name = "epics-stream-rs"
 version = "0.32.0"
 source = "git+file:///home/stevek/work/epics-rs?rev=c4a3cb85db0066824769bed02215c280cb4ff729#c4a3cb85db0066824769bed02215c280cb4ff729"
@@ -5097,6 +5116,8 @@ dependencies = [
  "anyhow",
  "epics-libcom-rs",
  "epics-rs",
+ "epics-seq-rs",
+ "epics-snc-rs",
  "meascomp",
  "parking_lot",
  "uldaq-sys",

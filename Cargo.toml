@@ -334,6 +334,10 @@ libraries = [
 epics-rs = "0.32.0"
 asyn-rs = "0.32.0"
 epics-libcom-rs = "0.32.0"
+# The sequencer run-time and the snc-rs compiler a crate's build.rs runs
+# on its src/snl/*.st.
+epics-seq-rs = "0.32.0"
+epics-snc-rs = "0.32.0"
 ad-core-rs = "0.32.0"
 ad-plugins-rs = "0.32.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
@@ -369,6 +373,8 @@ epics-modbus-rs = { git = "file:///home/stevek/work/epics-rs", rev = "c4a3cb85db
 epics-pva-rs = { git = "file:///home/stevek/work/epics-rs", rev = "c4a3cb85db0066824769bed02215c280cb4ff729" }
 epics-rs = { git = "file:///home/stevek/work/epics-rs", rev = "c4a3cb85db0066824769bed02215c280cb4ff729" }
 epics-rtems-boot = { git = "file:///home/stevek/work/epics-rs", rev = "c4a3cb85db0066824769bed02215c280cb4ff729" }
+epics-seq-rs = { git = "file:///home/stevek/work/epics-rs", rev = "c4a3cb85db0066824769bed02215c280cb4ff729" }
+epics-snc-rs = { git = "file:///home/stevek/work/epics-rs", rev = "c4a3cb85db0066824769bed02215c280cb4ff729" }
 epics-stream-rs = { git = "file:///home/stevek/work/epics-rs", rev = "c4a3cb85db0066824769bed02215c280cb4ff729" }
 mca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "c4a3cb85db0066824769bed02215c280cb4ff729" }
 motor-rs = { git = "file:///home/stevek/work/epics-rs", rev = "c4a3cb85db0066824769bed02215c280cb4ff729" }
