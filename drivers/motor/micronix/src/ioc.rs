@@ -19,9 +19,10 @@ use motor_common::{Controller, asyn_user, register_port_with};
 
 use crate::mmc200::{Mmc200Axis, Mmc200Controller, Mmc200Params};
 
-/// Serial command timeout. The MMC controllers answer queries promptly; the C
-/// driver uses the default asyn synchronous-I/O timeout.
-const MMC200_TIMEOUT: Duration = Duration::from_secs(1);
+/// Command timeout: asynMotorController's `DEFAULT_CONTROLLER_TIMEOUT`
+/// (asynMotorController.h:16), which every MMC200Driver.cpp read and write
+/// takes.
+const MMC200_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the `MMC200CreateController(portName, MMC200PortName, numAxes,
 /// movingPollPeriod, idlePollPeriod, ignoreLimits)` command, periods in ms.
@@ -161,6 +162,37 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("  axis index"), "{text}");
+    }
+}
+
+/// asynMotorController's `writeController()` and `writeReadController()`
+/// pass `DEFAULT_CONTROLLER_TIMEOUT` (asynMotorController.cpp:750, :798).
+#[cfg(test)]
+mod timeout {
+    use super::*;
+    use motor_common::testing::{LineRig, run_command};
+
+    #[epics_rs::base::epics_test]
+    async fn every_write_waits_the_default_controller_timeout() {
+        let (line, _io) = LineRig::new("mmcTimeoutLine", |cmd| {
+            match cmd {
+                "1VER?" => "#MMC-200 v4.1",
+                _ => "#1",
+            }
+            .into()
+        });
+        let args = vec![
+            ArgValue::String("mmcTimeout".into()),
+            ArgValue::String("mmcTimeoutLine".into()),
+            ArgValue::Int(1),
+        ];
+        run_command(mmc200_create_controller_command(), args).await;
+        let timeouts = line.timeouts();
+        assert!(!timeouts.is_empty());
+        assert!(
+            timeouts.iter().all(|t| *t == Some(Duration::from_secs(2))),
+            "{timeouts:?}"
+        );
     }
 }
 

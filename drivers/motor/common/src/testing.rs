@@ -59,6 +59,8 @@ struct Line {
     sent: Arc<Mutex<Vec<String>>>,
     /// The asyn address of each write in `sent`.
     addrs: Arc<Mutex<Vec<i32>>>,
+    /// The timeout each write in `sent` was handed.
+    timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
     /// The last write that was more than a terminator: GCS2 writes a command
     /// and its `\n` separately, and the reply belongs to the command.
     command: String,
@@ -89,6 +91,7 @@ impl PortDriver for Line {
     fn io_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let line = String::from_utf8_lossy(data).into_owned();
         self.addrs.lock().unwrap().push(user.addr);
+        self.timeouts.lock().unwrap().push(user.timeout);
         if !data.iter().all(|b| matches!(b, b'\r' | b'\n')) {
             self.command.clone_from(&line);
             match &mut self.answer {
@@ -162,6 +165,7 @@ impl PortDriver for Line {
 pub struct LineRig {
     sent: Arc<Mutex<Vec<String>>>,
     addrs: Arc<Mutex<Vec<i32>>>,
+    timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
 }
 
 impl LineRig {
@@ -250,6 +254,7 @@ impl LineRig {
     ) -> (Self, SyncIOHandle) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let addrs = Arc::new(Mutex::new(Vec::new()));
+        let timeouts = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
             base: PortDriverBase::new(
                 name,
@@ -260,6 +265,7 @@ impl LineRig {
             ),
             sent: sent.clone(),
             addrs: addrs.clone(),
+            timeouts: timeouts.clone(),
             command: String::new(),
             answer,
             fails,
@@ -272,7 +278,14 @@ impl LineRig {
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        (Self { sent, addrs }, io)
+        (
+            Self {
+                sent,
+                addrs,
+                timeouts,
+            },
+            io,
+        )
     }
 
     /// The messages written since the last call.
@@ -283,6 +296,11 @@ impl LineRig {
     /// The address of each write since the last call.
     pub fn addresses(&self) -> Vec<i32> {
         std::mem::take(&mut *self.addrs.lock().unwrap())
+    }
+
+    /// The timeout of each write since the last call.
+    pub fn timeouts(&self) -> Vec<Option<Duration>> {
+        std::mem::take(&mut *self.timeouts.lock().unwrap())
     }
 }
 
