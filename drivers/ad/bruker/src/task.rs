@@ -27,7 +27,7 @@ use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::driver::{SharedState, TaskCommand};
+use crate::driver::{BrukerDetector, SharedState, TaskCommand};
 use crate::params::BrukerParams;
 use crate::protocol;
 use crate::sfrm;
@@ -423,52 +423,40 @@ async fn status_loop(ctx: StatusContext) {
             // something to say.
             Err(_) => continue,
         };
-        let report = protocol::parse_status(&message);
-        let mut updates = vec![ParamSetValue::new(
-            ctx.params.status,
-            0,
-            ParamValue::Octet(message.into_bytes().into()),
-        )];
-        if let Some(temperature) = report.temperature {
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.temperature,
-                0,
-                ParamValue::Float64(temperature),
-            ));
-        }
-        if let Some(frame_size) = report.frame_size {
-            // The detector is square.
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.size_x,
-                0,
-                ParamValue::Int32(frame_size),
-            ));
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.size_y,
-                0,
-                ParamValue::Int32(frame_size),
-            ));
-        }
-        if let Some(open) = report.shutter_open {
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.shutter_status,
-                0,
-                ParamValue::Int32(open),
-            ));
-        }
-        let _ = ctx.handle.set_params_and_notify(0, updates).await;
-
-        let acquiring = ctx
-            .handle
-            .read_int32(ctx.ad_params.acquire, 0)
-            .await
-            .unwrap_or(0)
-            != 0;
-        if report.processing_done && acquiring {
+        let Ok(mut held) = ctx.handle.hold_driver_blocking::<BrukerDetector>() else {
+            continue;
+        };
+        let (ad, params) = (ctx.ad_params, ctx.params);
+        let read_out = held
+            .run(move |d| {
+                let report = protocol::parse_status(&message);
+                let base = &mut d.ad.port_base;
+                let _ = base.set_string_param(params.status, 0, message);
+                let acquiring = base.get_int32_param(ad.acquire, 0).unwrap_or(0) != 0;
+                if let Some(temperature) = report.temperature {
+                    let _ = base.set_float64_param(ad.temperature, 0, temperature);
+                }
+                if let Some(frame_size) = report.frame_size {
+                    // The detector is square.
+                    let _ = base.set_int32_param(ad.size_x, 0, frame_size);
+                    let _ = base.set_int32_param(ad.size_y, 0, frame_size);
+                }
+                if let Some(open) = report.shutter_open {
+                    let _ = base.set_int32_param(ad.shutter_status, 0, open);
+                }
+                let _ = base.call_param_callbacks(0);
+                report.processing_done && acquiring
+            })
+            .unwrap_or(false);
+        if read_out {
             // The acquisition task takes this when it is done exposing; if it
             // is not waiting yet, the slot holds it until it is.
             let _ = ctx.readout.try_send(());
         }
+        // C sleeps with the lock held, so its records process before the
+        // driver takes another request.
+        std::thread::sleep(STATUS_POST_DELAY);
+        drop(held);
     }
 }
 

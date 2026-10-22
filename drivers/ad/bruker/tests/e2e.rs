@@ -674,6 +674,45 @@ fn every_status_read_is_posted_as_read() {
     assert_eq!(got.1.as_deref(), Some(&b"\0"[..]));
 }
 
+/// BISDetector.cpp:408-438: statusTask posts under the driver lock and sleeps
+/// 0.01 s before it unlocks, so no request reaches the driver until then.
+#[test]
+fn a_status_post_holds_the_driver_for_ten_milliseconds() {
+    let status = TcpListener::bind("127.0.0.1:0").expect("status listener");
+    let status_addr = format!("127.0.0.1:{}", status.local_addr().unwrap().port());
+    let (sent_tx, sent_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = status.accept().expect("status connection");
+        std::thread::sleep(Duration::from_millis(200));
+        let sent = std::time::Instant::now();
+        stream
+            .write_all(b"[DETECTORSTATUS /FRAMESIZE=2048 /CCDTEMP=-41.5]\n")
+            .expect("status message");
+        sent_tx.send(sent).expect("sent");
+        std::thread::sleep(Duration::from_secs(30));
+    });
+    let detector = create_bruker_detector(
+        &claim_port("BISHOLD").unwrap(),
+        user(closed_port("BISHOLD_COMMAND")),
+        user(ip_port("BISHOLD_STATUS", &status_addr, b"\n", b"")),
+        0,
+    )
+    .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let size_x = detector.ad_params.size_x;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while sync.read_int32(size_x).unwrap() != 2048 {
+        assert!(std::time::Instant::now() < deadline, "no status post");
+    }
+    let seen = std::time::Instant::now();
+    let sent = sent_rx.recv().expect("sent");
+    assert!(
+        seen - sent >= Duration::from_millis(10),
+        "the post reached a request {:?} after BIS sent it",
+        seen - sent
+    );
+}
+
 /// BISDetector.cpp never sets NDDriverVersion, so it keeps the ADCore version
 /// asynNDArrayDriver gave it (asynNDArrayDriver.cpp:966).
 #[test]
