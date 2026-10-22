@@ -161,7 +161,7 @@ pub async fn run(
         // `pvSysFlush` at state entry (seq_task.c:303-304), then the monitors
         // that arrived before this evaluation.
         queue.flush().await;
-        while let Some(event) = monitor.try_change() {
+        for event in monitor.try_changes() {
             vars.take(event);
         }
         let debug = monitor.var(&pv_asyn_debug) != 0.0;
@@ -192,7 +192,11 @@ pub async fn run(
                     let _ = acquiring.put(long(0));
                 }
             }
-            None => vars.take(monitor.wait_change().await),
+            None => {
+                for event in monitor.wait_changes().await {
+                    vars.take(event);
+                }
+            }
         }
     }
 }
