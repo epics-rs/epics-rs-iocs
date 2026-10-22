@@ -39,9 +39,6 @@ use motor_common::{AxisReport, ControllerParams, ControllerReport};
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
 
-/// Command line terminator (st.cmd configures `asynOctetSetOutputEos("\r")`).
-const TERMINATOR: &[u8] = b"\r";
-
 /// C `model_ == 999`: the MMC-ETH ethernet module, not a motor axis.
 const MODEL_ETH: i32 = 999;
 
@@ -51,7 +48,7 @@ const STA_HIGH_LIMIT: i32 = 0x2;
 const STA_DONE: i32 = 0x8;
 const STA_ERROR: i32 = 0x80;
 
-/// Shared controller endpoint: owns the serial handle and command framing.
+/// Shared controller endpoint: owns the serial handle.
 /// The caller holds the `Arc<Mutex<_>>` lock across a write→read exchange.
 pub struct Mmc200Controller {
     handle: SyncIOHandle,
@@ -64,17 +61,10 @@ impl Mmc200Controller {
         Self { handle }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
-    /// Write a command message with no reply (C `writeController`); the
-    /// terminator is appended here.
+    /// Write a command message with no reply (C `writeController`), bare:
+    /// the port's output EOS terminates it, as in C.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
@@ -92,7 +82,7 @@ impl Mmc200Controller {
     fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
         let (raw, status) = self
             .handle
-            .write_read(0, &Self::framed(cmd), READ_BUF)
+            .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
         let reply = String::from_utf8_lossy(&raw);
         (
@@ -712,6 +702,26 @@ mod tests {
                 "1VEL", "1ACC", "1DEC", "1MVA", "1VEL", "1ACC", "1DEC", "1MVR", "1JAC", "1JOG",
                 "1VEL", "1ACC", "1DEC", "1HCG", "1HOM"
             ]
+        );
+    }
+
+    /// C writes `outString_` bare and sets no EOS (MMC200Driver.cpp:143-254),
+    /// so the st.cmd's output EOS is the only terminator.
+    #[test]
+    fn the_axis_probes_go_out_bare() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("mmc200Bare", |cmd| {
+            match cmd.trim_end() {
+                "1VER?" => "#MMC-200 v4.1",
+                _ => "#0",
+            }
+            .into()
+        });
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        Mmc200Axis::new(controller, 0, false);
+        assert_eq!(
+            rig.sent(),
+            ["1VER?", "1FBK?", "1REZ?", "1UST?", "1ENC?", "1VMX?"]
         );
     }
 

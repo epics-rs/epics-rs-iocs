@@ -24,10 +24,10 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# MMC framing: the driver appends the CR terminator to each command, so only
-# the input EOS is configured here (replies are LF+CR terminated). Do not also
-# set an output EOS — the port would append it a second time.
+# Port EOS with the C example's values (motor.cmd.mmc200:6-7, left
+# commented there); the C driver sends bare commands.
 asynOctetSetInputEos("$(SERIAL)", 0, "\n\r")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- MMC-200 controller ----
 # MMC200CreateController(portName, MMC200PortName, numAxes,
