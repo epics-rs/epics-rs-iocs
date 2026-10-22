@@ -137,12 +137,13 @@ impl Mvp2001Controller {
             .into_parts();
         status?;
         sleep(REPLY_DELAY);
-        // Second read: the real reply.
+        // Second read: the real reply, as the C string `parseReply` indexes.
+        // Nothing is trimmed: a terminator the port's input EOS leaves in it
+        // shifts the field for C as well.
         let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
         status?;
-        Ok(String::from_utf8_lossy(&raw)
-            .trim_matches(['\r', '\n', '\0'])
-            .to_string())
+        let reply = raw.split(|&b| b == 0).next().unwrap_or_default();
+        Ok(String::from_utf8_lossy(reply).into_owned())
     }
 }
 

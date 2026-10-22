@@ -24,8 +24,10 @@ asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # The C driver sends bare commands, so the port's output EOS ends them
-# (MVP2001.cmd:4, commented there). Replies end in CR.
-asynOctetSetInputEos("$(SERIAL)", 0, "\r")
+# (MVP2001.cmd:4, commented there). A reply is "\r\n0001 <hex>\r\n", which
+# drvMVP2001.cc:597 reads with "\n"; this driver sets no EOS, and only
+# MVP2001.cmd:5's "\r\n" leaves its second read the bare "0001 <hex>".
+asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
 asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- MVP2001 controller + axes ----
