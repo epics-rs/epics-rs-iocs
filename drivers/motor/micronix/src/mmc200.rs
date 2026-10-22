@@ -52,18 +52,33 @@ const STA_ERROR: i32 = 0x80;
 /// The caller holds the `Arc<Mutex<_>>` lock across a write→read exchange.
 pub struct Mmc200Controller {
     handle: SyncIOHandle,
+    /// C `outString_`: the last command written, empty before the first.
+    out_string: String,
 }
 
 impl Mmc200Controller {
     /// Wrap a connected octet handle. Axes are created separately (the count
     /// is a `MMC200CreateController` argument, not autodiscovered).
     pub fn new(handle: SyncIOHandle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            out_string: String::new(),
+        }
+    }
+
+    /// C's "Flush I/O in case there is lingering garbage": a
+    /// `writeReadController()` of whatever `outString_` holds, reply and
+    /// status dropped (MMC200Driver.cpp:139-140).
+    fn flush(&mut self) {
+        let _ = self
+            .handle
+            .write_read(0, self.out_string.as_bytes(), READ_BUF);
     }
 
     /// Write a command message with no reply (C `writeController`), bare:
     /// the port's output EOS terminates it, as in C.
-    fn write(&self, cmd: &str) -> AsynResult<()> {
+    fn write(&mut self, cmd: &str) -> AsynResult<()> {
+        cmd.clone_into(&mut self.out_string);
         self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
@@ -71,7 +86,7 @@ impl Mmc200Controller {
     /// Write a query and read its reply (C `writeReadController`), trimming the
     /// trailing line terminator. The leading `#` is left intact — callers skip
     /// it with `reply.get(1..)`, matching C's `&inString_[1]`.
-    fn query(&self, cmd: &str) -> AsynResult<String> {
+    fn query(&mut self, cmd: &str) -> AsynResult<String> {
         let (reply, status) = self.exchange(cmd);
         status.map(|()| reply)
     }
@@ -79,7 +94,8 @@ impl Mmc200Controller {
     /// [`Self::query`]'s reply beside its status. The EOS layer NUL-terminates
     /// `inString_` on every read, so a failed read leaves the bytes it
     /// delivered, which the axis constructor parses.
-    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
+    fn exchange(&mut self, cmd: &str) -> (String, AsynResult<()>) {
+        cmd.clone_into(&mut self.out_string);
         let (raw, status) = self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
@@ -230,7 +246,8 @@ impl Mmc200Axis {
         ignore_limits: bool,
     ) -> Self {
         let axis_index = index as i32 + 1;
-        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        ctrl.flush();
 
         // C carries on past a failed query with `errorFlag` set, parses what
         // arrived, and reports the flag as `motorStatusProblem_`
@@ -328,7 +345,7 @@ impl Mmc200Axis {
     /// both), each scaled by `resolution_`. Every caller overwrites the
     /// status C returns with its own command's (MMC200Driver.cpp:300-360),
     /// so none is returned.
-    fn send_accel_vel(&self, ctrl: &Mmc200Controller, acceleration: f64, velocity: f64) {
+    fn send_accel_vel(&self, ctrl: &mut Mmc200Controller, acceleration: f64, velocity: f64) {
         let axis = self.axis_index;
         let res = self.resolution;
         let _ = ctrl.write(&format!("{axis}VEL{:.3}", CFloat(velocity * res)));
@@ -364,8 +381,8 @@ impl AsynMotor for Mmc200Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let n = self.axis_index;
-        let ctrl = self.lock();
-        self.send_accel_vel(&ctrl, acceleration, velocity);
+        let mut ctrl = self.lock();
+        self.send_accel_vel(&mut ctrl, acceleration, velocity);
         ctrl.write(&format!("{n}MVA{:.6}", CFloat(position * self.resolution)))?;
         Ok(())
     }
@@ -379,8 +396,8 @@ impl AsynMotor for Mmc200Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let n = self.axis_index;
-        let ctrl = self.lock();
-        self.send_accel_vel(&ctrl, acceleration, velocity);
+        let mut ctrl = self.lock();
+        self.send_accel_vel(&mut ctrl, acceleration, velocity);
         ctrl.write(&format!("{n}MVR{:.6}", CFloat(distance * self.resolution)))?;
         Ok(())
     }
@@ -397,7 +414,7 @@ impl AsynMotor for Mmc200Axis {
         let n = self.axis_index;
         let jog_percent =
             (velocity * self.resolution / self.max_velocity * 100.0).clamp(-100.0, 100.0);
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         let _ = ctrl.write(&format!(
             "{n}JAC{:.3}",
             CFloat(acceleration * self.resolution)
@@ -415,8 +432,8 @@ impl AsynMotor for Mmc200Axis {
         forward: bool,
     ) -> AsynResult<()> {
         let n = self.axis_index;
-        let ctrl = self.lock();
-        self.send_accel_vel(&ctrl, acceleration, velocity);
+        let mut ctrl = self.lock();
+        self.send_accel_vel(&mut ctrl, acceleration, velocity);
         // C `HCG1` selects the forward home direction, `HCG0` the reverse.
         let _ = ctrl.write(&format!("{n}HCG{}", if forward { 1 } else { 0 }));
         ctrl.write(&format!("{n}HOM"))?;
@@ -425,7 +442,7 @@ impl AsynMotor for Mmc200Axis {
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let n = self.axis_index;
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         ctrl.write(&format!("{n}STP"))?;
         Ok(())
     }
@@ -435,7 +452,7 @@ impl AsynMotor for Mmc200Axis {
         // non-zero request is a quiet success (no command).
         if position == 0.0 {
             let n = self.axis_index;
-            let ctrl = self.lock();
+            let mut ctrl = self.lock();
             ctrl.write(&format!("{n}ZRO"))?;
         }
         Ok(())
@@ -444,7 +461,7 @@ impl AsynMotor for Mmc200Axis {
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
         // C `setClosedLoop` toggles motor power (`MOT1`/`MOT0`).
         let n = self.axis_index;
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         ctrl.write(&format!("{n}MOT{}", if enable { 1 } else { 0 }))?;
         Ok(())
     }
@@ -462,7 +479,7 @@ impl AsynMotor for Mmc200Axis {
 
         let n = self.axis_index;
         let controller = Arc::clone(&self.controller);
-        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // C `poll`: `POS?` (position + encoder), `STA?` (status word, clearing
         // the error buffer with `CER` when the error bit is set), `MOT?`
         // (drive power), each written as it arrives. A read failure is C's
@@ -721,8 +738,106 @@ mod tests {
         Mmc200Axis::new(controller, 0, false);
         assert_eq!(
             rig.sent(),
-            ["1VER?", "1FBK?", "1REZ?", "1UST?", "1ENC?", "1VMX?"]
+            ["", "1VER?", "1FBK?", "1REZ?", "1UST?", "1ENC?", "1VMX?"]
         );
+    }
+
+    /// A line whose stale reply is still arriving: the port flush finds
+    /// nothing to drop, and the next read takes it.
+    struct LateReply {
+        base: epics_rs::asyn::port::PortDriverBase,
+        unread: std::collections::VecDeque<String>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for LateReply {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let reply = match &*String::from_utf8_lossy(data) {
+                "" => return Ok(0),
+                "1VER?" => "#MMC-200 v4.1",
+                "1REZ?" => "#1000",
+                "1UST?" => "#8",
+                "1VMX?" => "#2.5",
+                _ => "#0",
+            };
+            self.unread.push_back(reply.into());
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::error::{AsynError, AsynStatus};
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let Some(reply) = self.unread.pop_front() else {
+                return OctetReadResult::failed(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "nothing to read".into(),
+                });
+            };
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            OctetReadResult::ok(reply.len(), EomReason::empty())
+        }
+    }
+
+    /// C flushes with a `writeReadController()` before `VER?`
+    /// (MMC200Driver.cpp:139-140), so a reply still arriving is dropped there
+    /// rather than read as the version.
+    #[test]
+    fn a_late_stale_reply_is_not_read_as_the_version() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        let port = LateReply {
+            base: PortDriverBase::new(
+                "mmc200LateReply",
+                1,
+                PortFlags::default(),
+                InterfaceMask::UNMIGRATED_ALL,
+                InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ),
+            unread: ["#stale".to_owned()].into(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("mmc200LateReply").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        let axis = Mmc200Axis::new(controller, 0, false);
+        let report = axis.report();
+        assert_eq!(report.version, "#MMC-200 v4.1");
+        assert_eq!(
+            (report.model, report.rez, report.micro_steps),
+            (200, 1000, 8)
+        );
+    }
+
+    /// C's flush sends `outString_` as it stands: nothing before axis 1,
+    /// the previous axis's `VMX?` before the next one's `VER?`.
+    #[test]
+    fn the_flush_resends_the_last_command() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("mmc200Flush", |cmd| {
+            match cmd.trim_end() {
+                "1VER?" | "2VER?" => "#MMC-200 v4.1",
+                _ => "#0",
+            }
+            .into()
+        });
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
+        Mmc200Axis::new(controller.clone(), 0, false);
+        assert_eq!(rig.sent()[..2], ["", "1VER?"]);
+        Mmc200Axis::new(controller, 1, false);
+        assert_eq!(rig.sent()[..2], ["1VMX?", "2VER?"]);
     }
 
     /// C `sprintf("%dVEL%.3f")` / `"%dMVA%.6f"` spell a non-finite value
