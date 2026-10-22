@@ -844,7 +844,8 @@ mod taurus_limit_type {
             .into_iter()
             .filter(|s| s.contains("setsw"))
             .collect();
-        assert_eq!(sent, ["2 0 1 setsw\r\n", "2 1 1 setsw\r\n"]);
+        // C sends bare commands; the port's output EOS frames them.
+        assert_eq!(sent, ["2 0 1 setsw", "2 1 1 setsw"]);
 
         assert_eq!(io.read_int32(low).unwrap(), 3);
         assert_eq!(io.read_int32(high).unwrap(), 1);

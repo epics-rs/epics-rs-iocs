@@ -18,10 +18,10 @@ epicsEnvSet("NAXES",  "1")
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyS1", 0, 0, 0)
 
-# Taurus framing: the driver appends the CR/LF command terminator, so only the
-# input EOS is configured here. Do not set an output EOS — the port would append
-# it a second time.
+# Port EOS as C needs it: SMCTaurusDriver sets no EOS and sends bare
+# commands, as the hydra sibling (motor.cmd.SMChydra:14-15).
 asynOctetSetInputEos("$(IPPORT)", 0, "\r\n")
+asynOctetSetOutputEos("$(IPPORT)", 0, "\r\n")
 
 # ---- Taurus controller ----
 # SMCTaurusCreateController(portName, taurusPort, numAxes, movingPollPeriod, idlePollPeriod).

@@ -3,8 +3,8 @@
 //! Ported from `motorMicos/micosApp/src/SMCTaurusAxis.cpp` +
 //! `SMCTaurusDriver.cpp` (a model-3 `asynMotorController`/`asynMotorAxis` pair).
 //! Connects over a `drvAsynIPPort` or `drvAsynSerialPort`; commands are ASCII,
-//! CR/LF-terminated (the startup script sets the input EOS, the driver owns
-//! output framing).
+//! CR/LF-terminated (the startup script sets both EOS, as C needs; the driver
+//! sends bare commands).
 //!
 //! The Taurus command set is the per-axis SMC dialect shared with the hydra
 //! sibling (`<value> <axis> <verb>` setters, `<axis> <verb>` queries). Compared
@@ -50,9 +50,6 @@ use crate::smc::{SmcMembers, SmcState, trace_axis_status, trace_move_velocity, t
 /// Response buffer size.
 const READ_BUF: usize = 128;
 
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r\n";
-
 /// `nst` status bits.
 const STATUS_MOVING: i32 = 0x1; // axis in motion
 const STATUS_POWER_OFF: i32 = 0x100; // drive power disabled
@@ -72,16 +69,9 @@ impl TaurusController {
         Self { handle }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected.
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
@@ -137,7 +127,7 @@ impl TaurusController {
     fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
         let (raw, status) = self
             .handle
-            .write_read(0, &Self::framed(cmd), READ_BUF)
+            .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
         let reply = String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
