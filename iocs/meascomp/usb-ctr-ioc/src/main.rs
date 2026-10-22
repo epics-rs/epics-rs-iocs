@@ -6,9 +6,9 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::base::error::CaResult;
+use epics_rs::base::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
-use epics_rs::base::server::snl::spawn_program;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
 use usb_ctr::{CtrRuntime, CtrScalerDriver, create_usb_ctr};
@@ -208,6 +208,17 @@ async fn main() -> CaResult<()> {
                 println!("No sequencer specified.");
                 return Ok(CommandOutcome::Continue);
             };
+            let stack_size = match args.get(2) {
+                Some(ArgValue::Int(n)) => *n,
+                _ => 0,
+            };
+            if stack_size < 0 {
+                errlog_sev_vprintf(
+                    ErrlogSevEnum::Fatal,
+                    format_args!("3rd argument of seq must be a positive integer"),
+                );
+                return Ok(CommandOutcome::Continue);
+            }
             let table = table.to_str()?;
             let table = table.strip_prefix('&').unwrap_or(table);
             if table != "USBCTR_SNL" {
@@ -218,11 +229,12 @@ async fn main() -> CaResult<()> {
                 Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => String::new(),
             };
-            let macros = usb_ctr::snl::seq_macros(&macros);
-            let config = usb_ctr::snl::UsbCtrSnlConfig::from_macros(&macros);
-            spawn_program(ctx.bridge(), ctx.db(), "USBCTR_SNL", &macros, move |db| {
-                usb_ctr::snl::run(config, db)
-            });
+            epics_seq_rs::seq(
+                &usb_ctr::snl::USBCTR_SNL,
+                &macros,
+                stack_size as u32,
+                ctx.db(),
+            );
             Ok(CommandOutcome::Continue)
         },
     ));

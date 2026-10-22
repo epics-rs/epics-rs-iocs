@@ -1,16 +1,17 @@
-//! `USBCTR_SNL` against soft stand-ins for the records `measCompMCS.template`
-//! and the spectrum waveforms declare. Each `calc` reading itself plus one
-//! counts how often the program processed it.
+//! `USBCTR_SNL.st`, compiled by snc-rs, against soft stand-ins for the
+//! records `measCompMCS.template` and the spectrum waveforms declare. Each
+//! `calc` reading itself plus one counts how often the program processed it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::base::runtime::task::{Reactor, TaskHandle, sleep};
+use epics_rs::base::runtime::task::sleep;
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::ioc_builder::IocBuilder;
 use epics_rs::base::types::EpicsValue;
-use usb_ctr::snl::{UsbCtrSnlConfig, run, seq_macros};
+use epics_seq_rs::{SeqThreadId, seq, seq_stop};
+use usb_ctr::snl::USBCTR_SNL;
 
 fn counter(name: &str) -> String {
     format!("record(calc, \"{name}\") {{ field(INPA, \"{name} NPP\") field(CALC, \"A+1\") }}\n")
@@ -35,15 +36,13 @@ async fn ioc(acquiring: i32) -> Arc<PvDatabase> {
         .build_served()
         .await
         .unwrap();
+    // seq holds each state set in its first state until PINI is done.
+    db.mark_pini_done();
     db
 }
 
-fn start(db: &Arc<PvDatabase>, macros: &str) -> TaskHandle<()> {
-    let config = UsbCtrSnlConfig::from_macros(&seq_macros(macros));
-    let db = (**db).clone();
-    Reactor::current().expect("a runtime").spawn(async move {
-        run(config, db).await.unwrap();
-    })
+fn start(db: &PvDatabase, macros: &str) -> SeqThreadId {
+    seq(&USBCTR_SNL, macros, 0, db).expect("USBCTR_SNL starts")
 }
 
 async fn value(db: &PvDatabase, pv: &str) -> f64 {
@@ -81,7 +80,7 @@ const MACROS: &str = "P=T:, R=mca, NUM_COUNTERS=2, FIELD=PROC";
 #[epics_rs::base::epics_test]
 async fn the_connect_time_monitor_reads_each_counter_and_releases_acquiring() {
     let db = ioc(1).await;
-    let task = start(&db, MACROS);
+    let tid = start(&db, MACROS);
     expect(
         &db,
         &[
@@ -95,13 +94,13 @@ async fn the_connect_time_monitor_reads_each_counter_and_releases_acquiring() {
     .await;
     // NUM_COUNTERS=2 assigns mca1 and mca2 only.
     assert_eq!(value(&db, "T:mca3").await, 0.0);
-    task.abort();
+    seq_stop(tid);
 }
 
 #[epics_rs::base::epics_test]
 async fn a_read_request_reads_and_is_cleared_without_releasing_acquiring() {
     let db = ioc(0).await;
-    let task = start(&db, MACROS);
+    let tid = start(&db, MACROS);
     expect(&db, &[("T:mca1", 1.0), ("T:AbsTimeWF", 1.0)]).await;
     ca_put(&db, "T:Acquiring", 1).await;
     ca_put(&db, "T:HardwareAcquiring", 1).await;
@@ -120,13 +119,13 @@ async fn a_read_request_reads_and_is_cleared_without_releasing_acquiring() {
     ca_put(&db, "T:DoReadAll", 1).await;
     expect(&db, &[("T:mca1", 3.0), ("T:DoReadAll", 0.0)]).await;
     assert_eq!(value(&db, "T:Acquiring").await, 1.0);
-    task.abort();
+    seq_stop(tid);
 }
 
 #[epics_rs::base::epics_test]
 async fn the_end_of_acquisition_reads_and_releases_acquiring() {
     let db = ioc(0).await;
-    let task = start(&db, MACROS);
+    let tid = start(&db, MACROS);
     expect(&db, &[("T:mca1", 1.0), ("T:Acquiring", 0.0)]).await;
     ca_put(&db, "T:Acquiring", 1).await;
     ca_put(&db, "T:HardwareAcquiring", 1).await;
@@ -141,22 +140,30 @@ async fn the_end_of_acquisition_reads_and_releases_acquiring() {
         ],
     )
     .await;
-    task.abort();
+    seq_stop(tid);
 }
 
+/// `dead` wakes hourly and touches nothing (USBCTR_SNL.st:69-83).
 #[epics_rs::base::epics_test]
 async fn an_illegal_num_counters_leaves_the_program_dead() {
     let db = ioc(1).await;
-    let config = UsbCtrSnlConfig::from_macros(&seq_macros("P=T:, NUM_COUNTERS=10, FIELD=PROC"));
-    run(config, (*db).clone()).await.unwrap();
+    let tid = start(&db, "P=T:, NUM_COUNTERS=10, FIELD=PROC");
+    sleep(Duration::from_millis(500)).await;
     assert_eq!(value(&db, "T:SNL_Connected").await, 0.0);
     assert_eq!(value(&db, "T:Acquiring").await, 1.0);
+    seq_stop(tid);
 }
 
+/// Under `option -c` the program starts unconnected and `waitConnected`
+/// waits for every channel (USBCTR_SNL.st:73-77), so a record the database
+/// lacks holds it there.
 #[epics_rs::base::epics_test]
-async fn a_missing_record_is_named() {
+async fn a_missing_record_leaves_the_program_waiting_to_connect() {
     let db = ioc(1).await;
-    let config = UsbCtrSnlConfig::from_macros(&seq_macros("P=T:, NUM_COUNTERS=4, FIELD=PROC"));
-    let err = run(config, (*db).clone()).await.unwrap_err().to_string();
-    assert_eq!(err, "USBCTR_SNL: not in the database: T:mca4.PROC");
+    let tid = start(&db, "P=T:, NUM_COUNTERS=4, FIELD=PROC");
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(value(&db, "T:SNL_Connected").await, 0.0);
+    assert_eq!(value(&db, "T:mca1").await, 0.0);
+    assert_eq!(value(&db, "T:Acquiring").await, 1.0);
+    seq_stop(tid);
 }
