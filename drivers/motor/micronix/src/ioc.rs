@@ -6,7 +6,6 @@
 //! axis, addressed by records as `@asyn(portName,axis)`.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
@@ -15,14 +14,9 @@ use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, opt_int, poll_intervals, req_int, req_string,
 };
-use motor_common::{Controller, asyn_user, register_port_with};
+use motor_common::{Controller, DEFAULT_CONTROLLER_TIMEOUT, asyn_user, register_port_with};
 
 use crate::mmc200::{Mmc200Axis, Mmc200Controller, Mmc200Params};
-
-/// Command timeout: asynMotorController's `DEFAULT_CONTROLLER_TIMEOUT`
-/// (asynMotorController.h:16), which every MMC200Driver.cpp read and write
-/// takes.
-const MMC200_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the `MMC200CreateController(portName, MMC200PortName, numAxes,
 /// movingPollPeriod, idlePollPeriod, ignoreLimits)` command, periods in ms.
@@ -58,7 +52,7 @@ pub fn mmc200_create_controller_command() -> CommandDef {
 
             let (handle, _) = connect_controller(
                 &serial_port,
-                MMC200_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &motor_port,
                 format_args!(
                     "MMC200Controller::MMC200Controller: cannot connect to MMC-200 controller"
@@ -84,6 +78,7 @@ pub fn mmc200_create_controller_command() -> CommandDef {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
+    use std::time::Duration;
 
     /// `cmd` with `args` on a thread of its own, then the asynReport of
     /// `port` at `level`.
@@ -171,6 +166,7 @@ mod tests {
 mod timeout {
     use super::*;
     use motor_common::testing::{LineRig, run_command};
+    use std::time::Duration;
 
     #[epics_rs::base::epics_test]
     async fn every_write_waits_the_default_controller_timeout() {

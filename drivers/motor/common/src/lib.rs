@@ -55,6 +55,10 @@ pub use epics_rs::motor::devices::{
 use epics_rs::motor::poll_loop::PollCommand;
 pub use epics_rs::motor::trace::TraceUser;
 
+/// asynMotorController's `DEFAULT_CONTROLLER_TIMEOUT` (asynMotorController.h:16):
+/// what `writeController`, `writeReadController` and `readController` pass.
+pub const DEFAULT_CONTROLLER_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Create C `asynMotorController` port `port` with axes `0..num_axes` for a
 /// driver with no parameters of its own, gated on the IOC's interruptAccept.
 pub fn register_port(ctx: &CommandContext, port: &str, num_axes: i32) -> Result<(), String> {

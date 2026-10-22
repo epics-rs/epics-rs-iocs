@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
@@ -22,13 +21,13 @@ use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{AxisReport, Controller, asyn_user, model1_device, register_port_with};
+use motor_common::{
+    AxisReport, Controller, DEFAULT_CONTROLLER_TIMEOUT, asyn_user, model1_device,
+    register_port_with,
+};
 
 use crate::drv_mvp2001::{self, DrvMvp2001Axis, MVP2001_NUM_CARDS, Mvp2001Build, Mvp2001Chain};
 use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller, Mvp2001Params};
-
-/// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT`).
-const MVP2001_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A registered controller and the poller its axes join.
 struct Registered {
@@ -75,7 +74,7 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
 
             let (handle, _) = connect_controller(
                 &asyn_port,
-                MVP2001_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &port_name,
                 format_args!(
                     "MVP2001Controller::MVP2001Controller: cannot connect to MVP 2001 controller"

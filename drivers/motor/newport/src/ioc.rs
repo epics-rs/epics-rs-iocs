@@ -47,8 +47,8 @@ use motor_common::model1::{CardInit, Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::{Model2, Model2Axis};
 use motor_common::{
-    AxisReport, Controller, ControllerParams, ControllerReport, asyn_user, install_with_report,
-    register_controller_port, register_port_with,
+    AxisReport, Controller, ControllerParams, ControllerReport, DEFAULT_CONTROLLER_TIMEOUT,
+    asyn_user, install_with_report, register_controller_port, register_port_with,
 };
 
 use crate::agap::{self, AgapAxis, AgapController};
@@ -67,11 +67,10 @@ use crate::xps::{
     XpsController, XpsError, XpsSocket, ftp, gathering, gpio, pco, profile, sftp,
 };
 
-/// Per-command serial I/O timeout: SMC100 (asynMotorController's
-/// `DEFAULT_CONTROLLER_TIMEOUT`) and CONEX / AGAP (`CONEX_TIMEOUT`).
-const SMC100_TIMEOUT: Duration = Duration::from_secs(2);
+/// `CONEX_TIMEOUT` of AG_CONEX.cpp:30 and AGAP_CONEX.cpp:31.
 const CONEX_TIMEOUT: Duration = Duration::from_secs(2);
 const AGAP_TIMEOUT: Duration = Duration::from_secs(2);
+/// AG_UC.cpp:29 `AGILIS_TIMEOUT`.
 const AG_UC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// XPS poll-socket timeout (C `XPS_POLL_TIMEOUT` = 2 s): waits for the full
@@ -232,7 +231,7 @@ pub fn smc100_create_controller_command() -> CommandDef {
             register_port_with(ctx, &port_name, num_axes, head)?;
             let (handle, _) = connect_controller(
                 &serial_port,
-                SMC100_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &port_name,
                 format_args!(
                     "SMC100Controller::SMC100Controller: cannot connect to SMC100 controller"
@@ -246,7 +245,7 @@ pub fn smc100_create_controller_command() -> CommandDef {
                     SyncIOHandle::connect_port(
                         &serial_port,
                         0,
-                        SMC100_TIMEOUT,
+                        DEFAULT_CONTROLLER_TIMEOUT,
                         InterfaceType::Octet,
                     )
                     .0

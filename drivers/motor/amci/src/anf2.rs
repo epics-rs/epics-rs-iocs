@@ -39,7 +39,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{AxisUser, ParamWrite, has_motor_axis};
 
 use motor_common::util::nint;
-use motor_common::{AxisReport, ControllerParams, ControllerReport};
+use motor_common::{AxisReport, ControllerParams, ControllerReport, DEFAULT_CONTROLLER_TIMEOUT};
 
 use crate::regs::{ForceRead, ModbusRegs};
 
@@ -47,9 +47,6 @@ use crate::regs::{ForceRead, ModbusRegs};
 pub const AXIS_REG_OFFSET: i32 = 10;
 /// C `MAX_AXES`.
 pub const MAX_AXES: i32 = 12;
-
-/// C `DEFAULT_CONTROLLER_TIMEOUT` (`asynMotorController.h`).
-const TIMEOUT: Duration = Duration::from_millis(2000);
 
 // Input registers (16-bit), offset from the axis base.
 const STATUS_1: i32 = 0;
@@ -108,8 +105,8 @@ impl Anf2Controller {
     /// way; the status of the last output connect, the only one C checks, is
     /// returned, and is success when the loop has no axis to run.
     pub fn new(in_port: &str, out_port: &str, num_axes: usize) -> (Self, AsynResult<()>) {
-        let (in_regs, _) = ModbusRegs::connect(in_port, TIMEOUT);
-        let (out_regs, out_status) = ModbusRegs::connect(out_port, TIMEOUT);
+        let (in_regs, _) = ModbusRegs::connect(in_port, DEFAULT_CONTROLLER_TIMEOUT);
+        let (out_regs, out_status) = ModbusRegs::connect(out_port, DEFAULT_CONTROLLER_TIMEOUT);
         let ctrl = Self {
             in_port: in_port.to_string(),
             in_regs,
@@ -357,7 +354,11 @@ impl Anf2Axis {
             .unwrap_or_else(|e| e.into_inner())
             .in_port
             .clone();
-        let force_read = ForceRead::connect(&in_port, axis_no * AXIS_REG_OFFSET, TIMEOUT);
+        let force_read = ForceRead::connect(
+            &in_port,
+            axis_no * AXIS_REG_OFFSET,
+            DEFAULT_CONTROLLER_TIMEOUT,
+        );
         if !force_read.connected() {
             println!(
                 "{in_port}: Error, unable to connect pasynUserForceRead_ to Modbus input driver"

@@ -21,14 +21,12 @@ use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 use motor_common::model1::{Model1, Model1Cards, SCAN_RATE, c_int};
-use motor_common::{Controller, asyn_user, model1_device, register_port_with};
+use motor_common::{
+    Controller, DEFAULT_CONTROLLER_TIMEOUT, asyn_user, model1_device, register_port_with,
+};
 
 use crate::drv_mcb4b::{DrvMcb4bAxis, MCB4B_NUM_AXES, MCB4B_NUM_CARDS, motor_init};
 use crate::mcb4b::{Mcb4bAxis, Mcb4bAxisReport, Mcb4bController, Mcb4bParams};
-
-/// Serial command timeout (C `MCB4BDriver` uses the asyn port default; the other
-/// ACS/motor ports use 2 s, matched here).
-const MCB4B_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the `MCB4BCreateController(portName, MCB4BPortName, numAxes,
 /// movingPollPeriod, idlePollPeriod)` command.
@@ -61,7 +59,7 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
 
             let (handle, _) = connect_controller(
                 &asyn_port,
-                MCB4B_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &port_name,
                 format_args!(
                     "MCB4BController::MCB4BController: cannot connect to MCB-4B controller"

@@ -6,7 +6,6 @@
 //! addressed `c>n`, and their replies carry the same `c>` prefix.
 
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -26,8 +25,6 @@ use epics_rs::motor::controller_port::{
 use motor_common::util::{atof, atoi};
 use motor_common::{AxisReport, ControllerReport};
 
-/// `DEFAULT_CONTROLLER_TIMEOUT` of asynMotorController.
-pub const NF874X_TIMEOUT: Duration = Duration::from_secs(2);
 /// `MAX_CONTROLLER_STRING_SIZE`.
 const MAX_REPLY: usize = 256;
 

@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, Model1Motor};
@@ -20,17 +19,13 @@ use motor_common::iocsh::{
     req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
-use motor_common::{Controller, asyn_user, model1_device, register_controller_port};
+use motor_common::{
+    Controller, DEFAULT_CONTROLLER_TIMEOUT, asyn_user, model1_device, register_controller_port,
+};
 
 use crate::acr::{AcrAxis, AcrController, AcrParams};
 use crate::drv_pc6k::{self, DrvPc6kAxis, PC6K_NUM_CARDS, Pc6kCard};
 use crate::oem::{OemAxis, OemController, OemParams};
-
-/// Command timeout: asynMotorController's `DEFAULT_CONTROLLER_TIMEOUT`.
-const OEM_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// ACR command timeout: asynMotorController's `DEFAULT_CONTROLLER_TIMEOUT`.
-const ACR_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the `OEMCreateController(portName, OEMPortName, numAxes,
 /// movingPollPeriod, idlePollPeriod)` command, periods in ms.
@@ -57,7 +52,7 @@ pub fn oem_create_controller_command() -> CommandDef {
 
             let (handle, _) = connect_controller(
                 &oem_port,
-                OEM_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &port_name,
                 format_args!(
                     "OEMMotorDriver:OEMController: cannot connect to OEM series controller"
@@ -109,7 +104,7 @@ pub fn acr_create_controller_command() -> CommandDef {
 
             let (handle, _) = connect_controller(
                 &acr_port,
-                ACR_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &port_name,
                 format_args!("ACRMotorDriver:ACRController: cannot connect to ACR controller"),
             );

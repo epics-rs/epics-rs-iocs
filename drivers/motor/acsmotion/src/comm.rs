@@ -26,6 +26,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
+use motor_common::DEFAULT_CONTROLLER_TIMEOUT;
 use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::util::{atof, atoi};
 
@@ -41,10 +42,6 @@ const CMD_TIMEOUT: Duration = Duration::from_millis(50);
 const ACK_TIMEOUT: Duration = Duration::from_millis(200);
 /// `SPIIPLUS_ARRAY_TIMEOUT`: an array reply, and the write of an array.
 const ARRAY_TIMEOUT: Duration = Duration::from_secs(10);
-/// An ASCII exchange. C passes -1, which waits forever, so one lost reply
-/// wedges the comm; this is asynMotorController's default, which C's
-/// `writeReadController` was copied from.
-const ASCII_TIMEOUT: Duration = Duration::from_secs(2);
 /// `MAX_CONTROLLER_STRING_SIZE`.
 const READ_BUF: usize = 256;
 
@@ -63,7 +60,10 @@ impl SpiiPlusComm {
         let io = connect_with_eos(
             asyn_port,
             0,
-            ASCII_TIMEOUT,
+            // An ASCII exchange. C passes -1, which waits forever, so one
+            // lost reply wedges the comm; asynMotorController's default is
+            // what C's `writeReadController` was copied from.
+            DEFAULT_CONTROLLER_TIMEOUT,
             INPUT_EOS,
             OUTPUT_EOS,
             EosRefusal::Ignored,

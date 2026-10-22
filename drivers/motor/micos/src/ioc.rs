@@ -29,7 +29,8 @@ use motor_common::iocsh::{
 };
 use motor_common::model1::{Model1, Model1Cards, SCAN_RATE, c_int};
 use motor_common::{
-    Controller, ControllerParams, ControllerReport, asyn_user, model1_device, register_port_with,
+    Controller, ControllerParams, ControllerReport, DEFAULT_CONTROLLER_TIMEOUT, asyn_user,
+    model1_device, register_port_with,
 };
 
 use crate::corvus::{CorvusAxis, CorvusController};
@@ -38,15 +39,6 @@ use crate::drv_micos::{
 };
 use crate::hydra::{HydraAxis, HydraController};
 use crate::taurus::{TaurusAxis, TaurusController};
-
-/// Command timeout.
-const CORVUS_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Hydra command timeout.
-const HYDRA_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Taurus command timeout.
-const TAURUS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The SMC controllers' `report` override: their one line, then
 /// `asynMotorController::report` (SMChydraDriver.cpp:86-93).
@@ -315,7 +307,7 @@ pub fn corvus_create_controller_command() -> CommandDef {
 
             let (handle, _) = connect_controller(
                 &corvus_port,
-                CORVUS_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &port_name,
                 format_args!(
                     "SMCcorvusController::SMCcorvusController: cannot connect to SMC corvus controller"
@@ -383,7 +375,7 @@ pub fn hydra_create_controller_command() -> CommandDef {
 
             let (handle, _) = connect_controller(
                 &hydra_port,
-                HYDRA_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &port_name,
                 format_args!(
                     "SMChydraController::SMChydraController: cannot connect to SMC hydra controller"
@@ -452,7 +444,7 @@ pub fn taurus_create_controller_command() -> CommandDef {
 
             let (handle, _) = connect_controller(
                 &taurus_port,
-                TAURUS_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &port_name,
                 format_args!(
                     "SMCTaurusController::SMCTaurusController: cannot connect to SMC Taurus controller"

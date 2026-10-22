@@ -21,14 +21,13 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
-use motor_common::{Controller, ControllerParams, asyn_user, register_port_with};
+use motor_common::{
+    Controller, ControllerParams, DEFAULT_CONTROLLER_TIMEOUT, asyn_user, register_port_with,
+};
 
 use crate::mcs::{self, McsAxis, McsController, McsParams, McsReasons};
 use crate::mcs2::{self, Mcs2Axis, Mcs2AxisReport, Mcs2Controller, Mcs2Params, Mcs2Reasons};
 use crate::scu::{ScuAxis, ScuController};
-
-/// Command timeout (C `DEFAULT_CONTROLLER_TIMEOUT` = 2.0 s).
-const MCS2_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// SCU command timeout (C `DEFAULT_TIMEOUT` = 2.0 s).
 const SCU_TIMEOUT: Duration = Duration::from_secs(2);
@@ -74,7 +73,7 @@ pub fn mcs2_create_controller_command() -> CommandDef {
             register_port_with(ctx, &port_name, num_axes, params)?;
             let (handle, _) = connect_controller(
                 &mcs2_port,
-                MCS2_TIMEOUT,
+                DEFAULT_CONTROLLER_TIMEOUT,
                 &port_name,
                 format_args!(
                     "SmarActMCS2MotorDriver:MCS2Controller: cannot connect to MCS2 controller"
