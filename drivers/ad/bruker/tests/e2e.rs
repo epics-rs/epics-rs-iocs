@@ -684,10 +684,11 @@ fn a_status_post_holds_the_driver_for_ten_milliseconds() {
     std::thread::spawn(move || {
         let (mut stream, _) = status.accept().expect("status connection");
         std::thread::sleep(Duration::from_millis(200));
+        let sent = std::time::Instant::now();
         stream
             .write_all(b"[DETECTORSTATUS /FRAMESIZE=2048 /CCDTEMP=-41.5]\n")
             .expect("status message");
-        sent_tx.send(std::time::Instant::now()).expect("sent");
+        sent_tx.send(sent).expect("sent");
         std::thread::sleep(Duration::from_secs(30));
     });
     let detector = create_bruker_detector(
