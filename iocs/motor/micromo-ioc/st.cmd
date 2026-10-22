@@ -23,10 +23,10 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# MVP2001 framing: the driver appends the CR command terminator, so only the
-# input EOS is configured here. Do not set an output EOS — the port would append
-# it a second time.
+# The C driver sends bare commands, so the port's output EOS ends them
+# (MVP2001.cmd:4, commented there). Replies end in CR.
 asynOctetSetInputEos("$(SERIAL)", 0, "\r")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- MVP2001 controller + axes ----
 # MVP2001CreateController(portName, MVP2001PortName, numAxes, movingPollPeriod, idlePollPeriod).
