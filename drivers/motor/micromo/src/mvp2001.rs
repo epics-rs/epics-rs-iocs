@@ -620,6 +620,25 @@ mod tests {
         );
     }
 
+    /// `parseReply` copies the field with `strncat` (MVP2001Driver.cpp:147), so
+    /// a NUL in the reply ends it there.
+    #[test]
+    fn a_nul_in_a_reply_ends_the_field() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("mvp2001Nul", |cmd| {
+            match cmd {
+                "1 POS" => "0001 000001\0F4",
+                "1 ST" => "0001 0000",
+                _ => "",
+            }
+            .into()
+        });
+        let controller = Arc::new(Mutex::new(Mvp2001Controller::new(io, 1)));
+        let mut axis = Mvp2001Axis::new(controller, "mvp2001Nul", 0, 512, 500, 1);
+        let status = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!(status.position, 1.0);
+    }
+
     #[test]
     fn parse_hex_reply_offset_and_width() {
         assert_eq!(parse_hex_reply("0001 000001F4", 8), Some(500));
