@@ -385,8 +385,8 @@ impl AsynMotor for TaurusAxis {
             axis_status,
         );
         // C sets problem from 0x200 here, ahead of the getsw and getswst
-        // skips (SMCTaurusAxis.cpp:287-294); its overwrite with 0 at :337
-        // makes that a dead store on a good poll, not copied.
+        // skips (SMCTaurusAxis.cpp:287-294). A good poll then overwrites it with 0
+        // at :337 and at skip :340, a C defect that drops the e-stop; not copied.
         status.problem = (axis_status & STATUS_ESTOP_SWITCH) != 0;
 
         // Switch config: bit 1 (0x2) masks (disables) the switch.
