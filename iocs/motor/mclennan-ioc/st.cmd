@@ -23,11 +23,11 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# PM304/PM600 framing: the driver appends the CR terminator to each command, so
-# only the input EOS is configured here (replies are CR+LF terminated; on the
-# PM600 the command echo ends in a lone CR that the driver strips). Do not set
-# an output EOS — the port would append it a second time.
+# Port EOS as C needs it: drvPM304 sets no EOS and sends bare commands. Replies
+# are CR+LF terminated; on the PM600 the command echo ends in a lone CR that the
+# driver strips.
 asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- PM304 controller ----
 # PM304Setup(num_cards, scan_rate in Hz)
