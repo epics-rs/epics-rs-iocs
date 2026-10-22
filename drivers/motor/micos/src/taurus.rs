@@ -394,6 +394,10 @@ impl AsynMotor for TaurusAxis {
             self.members.axis_no,
             axis_status,
         );
+        // C sets problem from 0x200 here, ahead of the getsw and getswst
+        // skips (SMCTaurusAxis.cpp:287-294); its overwrite with 0 at :337
+        // makes that a dead store on a good poll, not copied.
+        status.problem = (axis_status & STATUS_ESTOP_SWITCH) != 0;
 
         // Switch config: bit 1 (0x2) masks (disables) the switch.
         let sw = ctrl.query(&format!("{addr} getsw"))?;
@@ -414,9 +418,6 @@ impl AsynMotor for TaurusAxis {
         status.high_limit = high_limit;
 
         status.powered = (axis_status & STATUS_POWER_OFF) == 0;
-        // C sets problem from 0x200 (SMCTaurusAxis.cpp:287-294), then
-        // overwrites it at :337 and :340, a dead store; not copied.
-        status.problem = (axis_status & STATUS_ESTOP_SWITCH) != 0;
         Ok(())
     }
 }
@@ -540,6 +541,39 @@ mod tests {
         *refused.lock().unwrap() = "1 np".into();
         assert!(axis.poll(&user, &mut status).is_err());
         assert!(!status.done, "{status:?}");
+    }
+
+    /// C sets Problem from the e-stop switch bit before the `getsw` and
+    /// `getswst` skips (SMCTaurusAxis.cpp:287-294), so a failure there clears
+    /// the Problem an earlier failure left and `skip` sets it again: a
+    /// change the poller calls back on every failing poll.
+    #[test]
+    fn a_failed_switch_read_clears_the_problem_before_its_skip() {
+        use motor_common::testing::LineRig;
+        for (port, refused) in [
+            ("taurusGetswFails", "1 getsw"),
+            ("taurusGetswstFails", "1 getswst"),
+        ] {
+            let (_line, handle) = LineRig::failing(
+                port,
+                |cmd| match cmd.trim_end() {
+                    "1 getclperiod" => "0.5".into(),
+                    "1 np" => "2.5".into(),
+                    "1 nst" => "0".into(),
+                    "1 getsw" | "1 getswst" => "0 0".into(),
+                    _ => String::new(),
+                },
+                move |cmd| cmd.trim_end() == refused,
+            );
+            let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
+            let mut axis = TaurusAxis::new(controller, 0, "");
+            let mut status = MotorStatus {
+                problem: true,
+                ..MotorStatus::default()
+            };
+            assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+            assert!(!status.problem, "{refused}: {status:?}");
+        }
     }
 
     #[test]
