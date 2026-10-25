@@ -1,0 +1,57 @@
+# drvT4UDirect_EM's records over T4U_EM.template. C keeps them in T4U_EM.template,
+# which iocT4U_EM loads on drvT4U_EM, a driver without QE_WSMODE or QE_RPP
+# (drvT4UDirect_EM.cpp:182-183), so all four failed drvUserCreate there.
+# C defect, not copied.
+
+include "T4U_EM.template"
+
+#------------------------------------
+# Wait State Modes and Trigger Modes
+#------------------------------------
+
+record(mbbo, "$(P)$(R)WaitStateMode")
+{
+    field(DESC, "Wait State Mode Selector")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn($(PORT) 0)QE_WSMODE")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+    field(ONST, "Inhibit")
+    field(ONVL, "1")
+    field(TWST, "Triggered")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(PINI, "YES")
+    field(FLNK, "$(P)$(R)Range.PROC")
+}
+
+record(mbbi, "$(P)$(R)WaitStateMode_RBV")
+{
+    field(DESC, "Wait State Mode Selector")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn($(PORT) 0)QE_WSMODE")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+    field(ONST, "Inhibit")
+    field(ONVL, "1")
+    field(TWST, "Triggered")
+    field(TWVL, "2")
+    field(SCAN, "I/O Intr")
+}
+
+record(longout, "$(P)$(R)ReadsPerPacket")
+{
+    field(DRVL, "1")
+    field(DRVH, "50")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn($(PORT) 0)QE_RPP")
+    field(PINI, "YES")
+    field(VAL, "50")
+}
+
+record(longin, "$(P)$(R)ReadsPerPacket_RBV")
+{
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn($(PORT) 0)QE_RPP")
+    field(SCAN, "I/O Intr")
+}
