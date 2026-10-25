@@ -1680,7 +1680,9 @@ static int executeTrajectory(SS_ID ssId, struct UserVar *pVar) {
 	status = writeIntAndCheck(ssId, pVar, iarg3Var, iFirstTrajDGLOBAL);
 
 	/* Set Ensemble's IGLOBAL(iarg4Var) to -1, so we can follow progress of trajectory. */
-	status = writeIntAndCheck(ssId, pVar, iarg3Var, iFirstTrajDGLOBAL);
+	/* Upstream wrote iarg3Var again here, so the progress loop below read the
+	 * last run's final point and skipped its wait. */
+	status = writeIntAndCheck(ssId, pVar, iarg4Var, -1);
 
 	sprintf(stringOut, "DOSTOREDTRAJ");
 	status = sendReceiveCommand(ssId, pVar, stringOut, reply, 0);
