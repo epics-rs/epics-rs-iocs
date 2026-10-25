@@ -1220,6 +1220,8 @@ impl XpsAxis {
         let velocity = sock
             .group_velocity_current_get(&self.positioner_name)
             .inspect_err(|e| poll_error("GroupPositionVelocityGet", e))?;
+        // C omission: XPSAxis::poll never sets motorActVelocity_, so its RVEL
+        // stays 0 (XPSAxis.cpp:742-753). Kept as the velocity read here.
         status.velocity = velocity / self.step_size;
         status.direction = velocity > XPS_VELOCITY_DEADBAND;
         // MSTA RA_MOVING is velocity-derived, C `motorStatusMoving_`
