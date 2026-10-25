@@ -1526,6 +1526,8 @@ static int loadTrajectory(SS_ID ssId, struct UserVar *pVar, int *pstatus) {
 	}
 	/* Upstream went on with j == MAX_AXES, indexing every per-axis array past its end. */
 	if (j == MAX_AXES) goto bad;
+	/* The end-transient points read element npoints-2, before the arrays when npoints is 1. */
+	if (pVar->npoints < 2) goto bad;
 
 	/* Calc accel portion of trajectory.  Note epicsMotorACCL is accel time. */
 	accelTime = pVar->epicsMotorACCL[j];
