@@ -1269,9 +1269,14 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     };
 
     let counter = ctx.shared.array_counter.fetch_add(1, Ordering::SeqCst) + 1;
-    // Only the double timeStamp: C never sets an array's epicsTS, so it stays
-    // the constructor's zero (drvQuadEM.cpp:335-336, NDArray.cpp:31-32).
-    let time_stamp = EpicsTimestamp::now().as_f64();
+    // C sets only the double timeStamp, leaving epicsTS the constructor's zero
+    // (drvQuadEM.cpp:335-336, NDArray.cpp:31-32). C defect, not copied.
+    let epics_ts: EpicsTimestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| std::time::SystemTime::now())
+        .into();
 
     // Address 11: the whole [QE_MAX_DATA, numRead] array, sample-major on disk
     // exactly as the C++ ring layout.
@@ -1295,7 +1300,7 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
             row.copy_from_slice(s);
         }
         frame.set_unique_id(counter);
-        frame.set_time_stamp(time_stamp);
+        frame.update_time_stamps(epics_ts);
         ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
             .publish(all)
             .await;
@@ -1318,7 +1323,7 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
             *v = s[item];
         }
         frame.set_unique_id(counter);
-        frame.set_time_stamp(time_stamp);
+        frame.update_time_stamps(epics_ts);
         ArrayPublisher::new(ctx.outputs[item].clone())
             .publish(single)
             .await;

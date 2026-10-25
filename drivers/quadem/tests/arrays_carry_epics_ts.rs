@@ -1,8 +1,9 @@
 //! drvQuadEM::doDataCallbacks sets each array's uniqueId and double
 //! timeStamp but never its epicsTS (drvQuadEM.cpp:334-336, :352-353), which
-//! the NDArray constructor zeroes (NDArray.cpp:31-32): every plugin
-//! downstream reads EpicsTSSec_RBV and EpicsTSNsec_RBV as 0. Driven through
-//! an FX4 port, whose meter is a local WebSocket server.
+//! the NDArray constructor zeroes (NDArray.cpp:31-32), so plugins read
+//! EpicsTSSec_RBV and EpicsTSNsec_RBV as 0. Here every array carries the
+//! port's timestamp. Driven through an FX4 port, whose meter is a local
+//! WebSocket server.
 
 use std::sync::mpsc;
 use std::thread;
@@ -33,7 +34,7 @@ fn update_frame() -> String {
 }
 
 #[test]
-fn published_arrays_leave_epics_ts_zero() {
+fn published_arrays_carry_epics_ts() {
     let (addr_tx, addr_rx) = mpsc::channel();
 
     // The meter: answer the get that follows the subscribe with one sample.
@@ -102,8 +103,8 @@ fn published_arrays_leave_epics_ts_zero() {
         if seen.contains(&addr) {
             continue;
         }
-        assert_eq!(array.timestamp, EpicsTimestamp::default(), "address {addr}");
-        assert_ne!(array.time_stamp, 0.0, "address {addr}");
+        assert_ne!(array.timestamp, EpicsTimestamp::default(), "address {addr}");
+        assert_eq!(array.time_stamp, array.timestamp.as_f64(), "address {addr}");
         seen.push(addr);
     }
 }
