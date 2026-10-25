@@ -185,6 +185,7 @@ ss EnsembleTrajectoryScan {
 			if (debugLevel) printf("EnsembleTrajectoryScan:init: entry\n");
 			initStatus = STATUS_UNDEFINED;
 			/* Force numAxes to be <= MAX_AXES */
+			pvGet(numAxes);
 			if (numAxes > MAX_AXES) numAxes = MAX_AXES;
 			for (i=0; i<numAxes; i++) {
 				sprintf(macroBuf, "M%d", i+1);

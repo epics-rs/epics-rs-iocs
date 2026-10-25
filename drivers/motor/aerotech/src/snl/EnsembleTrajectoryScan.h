@@ -42,7 +42,8 @@
 int     debugLevel;  assign debugLevel   to "{P}{R}DebugLevel.VAL"; 
 monitor debugLevel;
 int     numAxes;     assign numAxes      to "{P}{R}NumAxes.VAL"; 
-monitor numAxes;
+/* Not monitored: init assigns the motors and their pvIndex()es for numAxes once,
+ * and upstream's live value indexed every per-axis array past MAX_AXES. */
 int     nelements;   assign nelements    to "{P}{R}Nelements.VAL"; 
 monitor nelements;
 int     npulses;     assign npulses      to "{P}{R}Npulses.VAL"; 
