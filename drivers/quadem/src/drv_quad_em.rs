@@ -604,6 +604,16 @@ impl StatusOr {
     }
 }
 
+/// Posts what a write changed on every address. C posts address 0 only
+/// (drvQuadEM.cpp:517, :572), though the record's channel and readStatus's
+/// per-input ranges (drvTetrAMM.cpp:802) live on others, so with no data
+/// running their readbacks never update. C defect, not copied.
+fn post_every_address(base: &mut PortDriverBase, status: &mut StatusOr) {
+    for addr in 0..=QE_ADDR_ALL as i32 {
+        status.add(base.call_param_callbacks(addr));
+    }
+}
+
 /// The tail C's `writeInt32`/`writeFloat64` share: the errorMessage on a
 /// failure, the `ASYN_TRACEIO_DRIVER` line otherwise.
 fn qe_write_result(
@@ -1011,10 +1021,7 @@ pub trait QuadEmDevice {
             ));
         }
 
-        // Address 0 only (drvQuadEM.cpp:517): a channel's readback, which
-        // readStatus may have replaced with the device's answer, posts with
-        // the next data (:280), or from the boot sweep for a PINI write.
-        status.add(self.qe_base().port_base.call_param_callbacks(0));
+        post_every_address(&mut self.qe_base().port_base, &mut status);
         qe_write_result(
             &self.qe_base().port_base,
             status,
@@ -1050,8 +1057,7 @@ pub trait QuadEmDevice {
             status.add(self.read_status());
         }
 
-        // Address 0 only, as drvQuadEM.cpp:572.
-        status.add(self.qe_base().port_base.call_param_callbacks(0));
+        post_every_address(&mut self.qe_base().port_base, &mut status);
         qe_write_result(
             &self.qe_base().port_base,
             status,
@@ -1606,6 +1612,9 @@ mod tests {
         calls: Vec<&'static str>,
         failing: &'static [(&'static str, AsynStatus)],
         bias_interlocks: Vec<i32>,
+        /// The range `read_status` reads back for every input, as
+        /// drvTetrAMM::readStatus sets them (drvTetrAMM.cpp:802).
+        input_range: Option<i32>,
     }
 
     impl FakeMeter {
@@ -1616,6 +1625,7 @@ mod tests {
                 calls: Vec::new(),
                 failing,
                 bias_interlocks: Vec::new(),
+                input_range: None,
             }
         }
 
@@ -1658,6 +1668,12 @@ mod tests {
             Ok(())
         }
         fn read_status(&mut self) -> AsynResult<()> {
+            if let Some(range) = self.input_range {
+                let idx = self.base.params.range;
+                for addr in 1..=QE_MAX_INPUTS as i32 {
+                    self.base.port_base.set_int32_param(idx, addr, range)?;
+                }
+            }
             self.step("read_status")
         }
         fn reset(&mut self) -> AsynResult<()> {
@@ -2084,30 +2100,11 @@ mod tests {
     }
 
     #[test]
-    fn a_channel_write_leaves_its_address_to_the_next_data_post() {
-        use epics_rs::asyn::interrupt::InterruptFilter;
+    fn a_write_posts_every_address_it_changed_with_no_data_running() {
+        use epics_rs::asyn::interrupt::{AsyncInterruptReceiver, InterruptFilter};
         use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
-        let mut m = FakeMeter::new(&[]);
-        let (range, offset) = (m.base.params.range, m.base.params.current_offset);
-        m.base.port_base.own_interrupts(InterruptGate::opened());
-        // The boot sweep's post of what the constructor set.
-        m.base.port_base.call_param_callbacks(2).unwrap();
-        let filter = InterruptFilter {
-            addr: Some(2),
-            ..Default::default()
-        };
-        let mut rx = m
-            .base
-            .port_base
-            .interrupts
-            .subscribe_async_filtered(filter, 16, 0)
-            .unwrap();
-        m.qe_write_int32(&AsynUser::new(range).with_addr(2), 3)
-            .unwrap();
-        m.qe_write_float64(&AsynUser::new(offset).with_addr(2), 1.5)
-            .unwrap();
-        let mut posted = || -> Vec<String> {
+        fn posted(rx: &mut AsyncInterruptReceiver) -> Vec<String> {
             std::iter::from_fn(|| rx.try_recv().ok())
                 .map(|v| match v.value {
                     ParamValue::Int32(n) => format!("{} {n}", v.reason),
@@ -2115,10 +2112,41 @@ mod tests {
                     _ => format!("{} other", v.reason),
                 })
                 .collect()
+        }
+
+        let mut m = FakeMeter::new(&[]);
+        let (range, offset) = (m.base.params.range, m.base.params.current_offset);
+        let bias_voltage = m.base.params.bias_voltage;
+        m.base.port_base.own_interrupts(InterruptGate::opened());
+        let mut subscribe = |addr: i32| {
+            // The boot sweep's post of what the constructor set.
+            m.base.port_base.call_param_callbacks(addr).unwrap();
+            let filter = InterruptFilter {
+                addr: Some(addr),
+                ..Default::default()
+            };
+            m.base
+                .port_base
+                .interrupts
+                .subscribe_async_filtered(filter, 16, 0)
+                .unwrap()
         };
-        assert_eq!(posted(), Vec::<String>::new());
-        // computePositions' per-channel post (drvQuadEM.cpp:280).
-        m.base.port_base.call_param_callbacks(2).unwrap();
-        assert_eq!(posted(), [format!("{range} 3"), format!("{offset} 1.5")]);
+        let (mut rx2, mut rx3) = (subscribe(2), subscribe(3));
+
+        // The record's own channel.
+        m.qe_write_int32(&AsynUser::new(range).with_addr(2), 3)
+            .unwrap();
+        m.qe_write_float64(&AsynUser::new(offset).with_addr(2), 1.5)
+            .unwrap();
+        assert_eq!(
+            posted(&mut rx2),
+            [format!("{range} 3"), format!("{offset} 1.5")]
+        );
+
+        // An address-0 write whose status read sets every input's range.
+        m.input_range = Some(5);
+        m.qe_write_float64(&AsynUser::new(bias_voltage).with_addr(0), 50.0)
+            .unwrap();
+        assert_eq!(posted(&mut rx3), [format!("{range} 5")]);
     }
 }
