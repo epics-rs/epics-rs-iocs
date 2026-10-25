@@ -13,6 +13,11 @@ epicsEnvSet("PREFIX",     "TPX3-TEST:")
 epicsEnvSet("PORT",       "TPX3")
 epicsEnvSet("SERVER_URL", "http://localhost:8081")
 epicsEnvSet("EPICS_CA_MAX_ARRAY_BYTES", "6000000")
+epicsEnvSet("QSIZE",      "30")
+epicsEnvSet("NCHANS",     "2048")
+epicsEnvSet("XSIZE",      "256")
+epicsEnvSet("YSIZE",      "256")
+epicsEnvSet("CBUFFS",     "500")
 
 # The mask/BPC waveforms must be at least as long as the detector's PixCount:
 #   1 chip  256x256   ->    65536
@@ -61,7 +66,15 @@ dbLoadRecords("$(ADTIMEPIX)/db/OperatingVoltage.template", "P=$(PREFIX),R=cam1:,
 NDStdArraysConfigure("Image1", 3, 0, "$(PORT)", 0, 0)
 dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),NDARRAY_ADDR=0,TYPE=Int16,FTVL=SHORT,NELEMENTS=$(MASK_BPC_NELEMENTS)")
 
+# Load all other plugins using commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd
+
+set_requestfile_path("$(ADTIMEPIX)/db")
+
 iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
 
 # The detector-side initialisation the C IOC does from init_detector*.cmd is
 # site-specific (TCP stream paths, BPC/DACS files, masks). Set it from iocsh or
