@@ -56,6 +56,7 @@ dbLoadRecords("$(ADD435I)/db/d435i_depth.template", "P=$(PREFIX),R=depth1:,PORT=
 
 # Autosave as st.d435i.cmd does, in a save dir of this prefix's own.
 set_requestfile_path("$(ADD435I)")
+set_requestfile_path("$(ADD435I)/db")
 set_savefile_path("$(ADD435I)/autosave/RS1")
 
 iocInit()

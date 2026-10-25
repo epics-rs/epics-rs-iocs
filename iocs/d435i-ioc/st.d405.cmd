@@ -79,6 +79,7 @@ dbLoadRecords("$(ADD435I)/db/d435i_depth.template", "P=$(PREFIX),R=depth1:,PORT=
 # The save file is per-prefix because the D435i instance shares this request
 # file -- one shared .sav would have the two cameras overwrite each other.
 set_requestfile_path("$(ADD435I)")
+set_requestfile_path("$(ADD435I)/db")
 set_savefile_path("$(ADD435I)/autosave/RS405")
 
 # Spelled out so create_monitor_set below runs after record init.

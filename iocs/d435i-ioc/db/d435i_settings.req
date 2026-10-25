@@ -1,0 +1,20 @@
+file "ADBase_settings.req", P=$(P), R=$(R)
+$(P)$(R)RSStreamMode
+$(P)$(R)RSExposure
+$(P)$(R)RSGain
+$(P)$(R)RSAutoExposure
+$(P)$(R)RSLaserPower
+$(P)$(R)RSEmitterEnabled
+$(P)$(R)RSDecimationEnable
+$(P)$(R)RSDecimationMag
+$(P)$(R)RSSpatialEnable
+$(P)$(R)RSSpatialAlpha
+$(P)$(R)RSSpatialDelta
+$(P)$(R)RSSpatialMag
+$(P)$(R)RSTemporalEnable
+$(P)$(R)RSTemporalAlpha
+$(P)$(R)RSTemporalDelta
+$(P)$(R)RSHoleFillEnable
+$(P)$(R)RSHoleFillMode
+$(P)$(R)RSAlignEnable
+$(P)$(R)RSPointCloudEnable
