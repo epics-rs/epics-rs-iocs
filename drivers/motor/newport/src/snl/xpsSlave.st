@@ -19,7 +19,10 @@ char* SNLtaskName;
 char* ip;
 char* master;
 char* slave;
-%%int xps_socket;
+/* Upstream has %%int xps_socket, one C global for every +r instance, so a
+   second instance's TCP_ConnectToServer redirects the first one to its
+   own IP. */
+int xps_socket;
 int val;
 /* Upstream declares char* masterRdbk and never sets it, so the strcpy of
    SingleAxisSlaveParametersGet's first success writes through NULL. Sized
@@ -50,7 +53,7 @@ ss slave_main
       SNLtaskName = macValueGet("name");
       
       /* Connect to the XPS controller (save the xps_socket ID) */
-      %%xps_socket = TCP_ConnectToServer(pVar->ip, PORT, TIMEOUT);
+      %%pVar->xps_socket = TCP_ConnectToServer(pVar->ip, PORT, TIMEOUT);
       
       DEBUG_PRINT(2, "init -> update", 0, 0, 0, 0);
       
@@ -65,7 +68,7 @@ ss slave_main
     when ()
     {
       /* Check if slave mode is on and set the on_pv appropriately */
-      %%pVar->val = SingleAxisSlaveParametersGet(xps_socket, pVar->slave, pVar->masterRdbk, &pVar->ratioRdbk);
+      %%pVar->val = SingleAxisSlaveParametersGet(pVar->xps_socket, pVar->slave, pVar->masterRdbk, &pVar->ratioRdbk);
       DEBUG_PRINT(2, "update(): val = %i, masterRdbk = %s, ratioRdbk = %f", val, masterRdbk, ratioRdbk, 0);
       
       /* Set the ok indictor to 1 if slave parameters exist */
@@ -94,12 +97,12 @@ ss slave_main
     {
       if (on_pv == 1)
       {
-        %%pVar->val = SingleAxisSlaveModeEnable(xps_socket, pVar->slave);
+        %%pVar->val = SingleAxisSlaveModeEnable(pVar->xps_socket, pVar->slave);
         DEBUG_PRINT(2, "on_pv == 1", 0, 0, 0, 0);
       }
       else
       {
-        %%pVar->val = SingleAxisSlaveModeDisable(xps_socket, pVar->slave);
+        %%pVar->val = SingleAxisSlaveModeDisable(pVar->xps_socket, pVar->slave);
         DEBUG_PRINT(2, "on_pv != 1", 0, 0, 0, 0);
       }
       DEBUG_PRINT(2, "modeChange -> idle", 0, 0, 0, 0);
@@ -112,7 +115,7 @@ ss slave_main
   {
     when ()
     {
-      %%pVar->val = SingleAxisSlaveParametersSet(xps_socket, pVar->slave, pVar->master, pVar->ratio_pv);
+      %%pVar->val = SingleAxisSlaveParametersSet(pVar->xps_socket, pVar->slave, pVar->master, pVar->ratio_pv);
       DEBUG_PRINT(2, "reinit(): val = %i", val, 0, 0, 0);
 
       /* reset the init PV */
