@@ -1061,6 +1061,7 @@ dependencies = [
  "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
+ "pkg-config",
  "realsense-rust",
 ]
 

@@ -3,6 +3,9 @@ name = "d435i"
 version = "0.1.0"
 edition = "2024"
 publish = false
+# realsense-sys links librealsense2 but declares no `links`; the key lets
+# build.rs export the libdir to the binaries that link this crate.
+links = "realsense2"
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "ad"] }
@@ -10,3 +13,6 @@ epics-libcom-rs = { workspace = true }
 parking_lot = "0.12"
 realsense-rust = "1.3"
 anyhow = "1.0"
+
+[build-dependencies]
+pkg-config = "0.3"
