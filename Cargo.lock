@@ -2895,6 +2895,8 @@ version = "0.1.0"
 dependencies = [
  "epics-libcom-rs",
  "epics-rs",
+ "epics-seq-rs",
+ "epics-snc-rs",
  "motor-common",
  "ssh2",
  "suppaftp",

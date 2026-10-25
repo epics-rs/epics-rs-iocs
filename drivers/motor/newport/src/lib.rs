@@ -21,6 +21,7 @@ pub mod pmnc;
 pub mod protocol;
 mod report;
 pub mod smc100;
+pub mod snl;
 mod util;
 pub mod xps;
 
