@@ -31,7 +31,15 @@ drvAsynMotorConfigure("$(CTRL)", "motorEnsemble", 0, 1)
 
 dbLoadRecords("$(AEROTECH_IOC)/db/aerotech.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
+# EnsembleTrajectoryScan.st's records, for the seq line below (NELM at most
+# 1000, NPULSE at most 8000):
+#   dbLoadRecords("$(AEROTECH_IOC)/db/trajectoryScan.db", "P=$(P),R=traj1:,NAXES=1,NELM=1000,NPULSE=1000")
+
 iocInit()
+
+# EnsembleTrajectoryScan.st runs PVT trajectories through doCommand.bcx
+# (doCommand.ab 1.2 or later), which must be loaded on the controller:
+#   seq &EnsembleTrajectoryScan, "P=$(P),R=traj1:,M1=m1,PORT=$(IPPORT)"
 
 # Example:
 #   dbl

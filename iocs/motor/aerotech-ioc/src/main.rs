@@ -41,6 +41,10 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
+    // trajectoryScan.db's busy records: opt-in in epics-rs, as a C IOC links
+    // busy's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+
     // Standard asyn iocsh commands — provides the drvAsyn*PortConfigure family.
     let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
@@ -61,6 +65,10 @@ async fn main() -> CaResult<()> {
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),
     );
+
+    // devAerotechSeq.dbd's registrar(EnsembleTrajectoryScanRegistrar): the
+    // seq shell commands and EnsembleTrajectoryScan.st.
+    motor_aerotech::snl::ensemble_trajectory_scan::EnsembleTrajectoryScanRegistrar();
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
