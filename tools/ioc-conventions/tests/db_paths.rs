@@ -2,9 +2,9 @@
 //! and is written in the one canonical form.
 //!
 //! Each startup script is run as iocsh runs it, from its own directory:
-//! the IOC's `set_default` macros and the framework's envPaths
-//! (`$(ADCORE)`, `$(ASYN)`, `$(AUTOSAVE)`, ... as the pinned epics-rs
-//! exports them) first, then every line macro-expanded in order,
+//! the IOC's `set_default`/`set_default_path` macros and the framework's
+//! envPaths (`$(ADCORE)`, `$(ASYN)`, `$(AUTOSAVE)`, ... as the pinned
+//! epics-rs exports them) first, then every line macro-expanded in order,
 //! `epicsEnvSet` updating the environment and `<` running the fragment
 //! with it, so a fragment's `$(TEMPLATE)` is the including st.cmd's.
 //! A load then opens its file as `dbOpenFile` does: a path with a `/`
@@ -96,26 +96,39 @@ fn package_dirs(root: &Path) -> HashMap<String, PathBuf> {
     dirs
 }
 
-/// `set_default("NAME", ...)` calls in the `.rs` files under `dir`, with the
-/// text after the name.
+/// `set_default("NAME", ...)` and `set_default_path("NAME", ...)` calls in
+/// the `.rs` files under `dir`, with the text after the name. epics-rs
+/// exports its envPaths through `set_default_path`, the `set_default` for a
+/// directory; an IOC may call either.
 fn set_defaults(dir: &Path) -> Vec<(String, String)> {
     let mut rs_files = Vec::new();
     walk(dir, "rs", &mut rs_files);
     let mut found = Vec::new();
     for rs in rs_files {
         let text = std::fs::read_to_string(&rs).expect("readable source");
+        found.extend(set_default_calls(&text));
+    }
+    found
+}
+
+fn set_default_calls(text: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find("set_default") {
+        rest = &rest[pos + "set_default".len()..];
+        let call = rest.strip_prefix("_path").unwrap_or(rest);
+        let Some(call) = call.strip_prefix('(') else {
+            continue;
+        };
         // rustfmt may wrap the call across lines.
-        let mut rest = text.as_str();
-        while let Some(pos) = rest.find("set_default(") {
-            rest = rest[pos + "set_default(".len()..].trim_start();
-            let Some(stripped) = rest.strip_prefix('"') else {
-                continue;
-            };
-            rest = stripped;
-            let Some(end) = rest.find('"') else { break };
-            let tail = &rest[end..rest.len().min(end + 200)];
-            found.push((rest[..end].to_string(), tail.to_string()));
-        }
+        rest = call.trim_start();
+        let Some(stripped) = rest.strip_prefix('"') else {
+            continue;
+        };
+        rest = stripped;
+        let Some(end) = rest.find('"') else { break };
+        let tail = &rest[end..rest.len().min(end + 200)];
+        found.push((rest[..end].to_string(), tail.to_string()));
     }
     found
 }
@@ -143,8 +156,8 @@ fn framework_env(packages: &HashMap<String, PathBuf>) -> HashMap<String, String>
         .collect()
 }
 
-/// The IOC's own `set_default` macros: its crate dir, its family dir, or a
-/// dependency crate's dir.
+/// The IOC's own `set_default`/`set_default_path` macros: its crate dir,
+/// its family dir, or a dependency crate's dir.
 fn ioc_env(ioc_dir: &Path, packages: &HashMap<String, PathBuf>) -> HashMap<String, String> {
     let mut env = HashMap::new();
     for (name, tail) in set_defaults(ioc_dir) {
@@ -487,6 +500,20 @@ fn a_fragment_sees_the_including_scripts_macros() {
     );
     env.insert("QUADEM".into(), "/q".into());
     assert_eq!(expand("${QUADEM}/$(X=d)", &env), "/q/d");
+}
+
+#[test]
+fn both_setters_default_a_macro() {
+    let names: Vec<_> = set_default_calls(
+        "env::set_default(\"A\", x);\n\
+         env::set_default_path(\n    \"B\",\n    y,\n);\n\
+         tracing::subscriber::set_default(subscriber);\n\
+         set_defaults(&dir);\n",
+    )
+    .into_iter()
+    .map(|(name, _)| name)
+    .collect();
+    assert_eq!(names, ["A", "B"]);
 }
 
 #[test]
