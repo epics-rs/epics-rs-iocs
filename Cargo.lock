@@ -5110,6 +5110,7 @@ dependencies = [
  "asyn-rs",
  "epics-rs",
  "tokio",
+ "uldaq-sys",
  "usb-2408",
 ]
 
@@ -5137,6 +5138,7 @@ dependencies = [
  "mca",
  "mca-rs",
  "tokio",
+ "uldaq-sys",
  "usb-ctr",
 ]
 
