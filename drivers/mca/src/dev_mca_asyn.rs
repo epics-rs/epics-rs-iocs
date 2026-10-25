@@ -398,6 +398,8 @@ impl Reads {
     /// The `mcaData` branch (`devMcaAsyn.c:355-358`):
     /// `pasynInt32Array->read(..., pPvt->data, pmca->nuse, &pPvt->nread)`.
     fn read_spectrum(&self, port: &mut dyn PortCalls) {
+        // NORD stays <= NUSE; C's NORD > NUSE comes only from
+        // drvFastSweep::readInt32Array ignoring maxChans (fastsweep.rs).
         let max_elements = self.nuse.load(Ordering::Relaxed).max(0) as usize;
         // C reads into its kept `data`, so the driver sees the last read.
         let buf = self.data.lock().unwrap().clone();

@@ -270,6 +270,9 @@ impl SweepState {
         let copy_len = (self.num_points.max(0) as usize).min(buf.len());
         let row = signal * self.max_points;
         buf[..copy_len].copy_from_slice(&self.p_data[row..row + copy_len]);
+        // C defect: `*nactual = numAcquired_` ignores maxChans, so once NUSE
+        // drops below numAcquired_ the record's NORD exceeds NUSE and names
+        // elements the read never copied. Kept clamped to the capacity.
         (self.num_acquired.max(0) as usize).min(buf.len())
     }
 }
