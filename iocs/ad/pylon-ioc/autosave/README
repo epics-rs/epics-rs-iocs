@@ -1,2 +1,3 @@
-This directory holds the save/restore files set_savefile_path names.
-It has to exist: autosave does not create it.
+This directory contains the save/restore files to retain settings between IOC reboots.
+The distribution directory does not contain a auto_settings.sav file, but this will
+be created the first time the IOC is run.
