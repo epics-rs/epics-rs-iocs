@@ -1,0 +1,2 @@
+This directory holds the save/restore files set_savefile_path names.
+SyringePump iocBoot/iocISCO and iocVindum ship none, so C autosave cannot write until one is made.

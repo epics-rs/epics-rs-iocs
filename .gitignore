@@ -5,7 +5,8 @@
 .caucus/sessions/
 
 # autosave state written at runtime by create_monitor_set
-/iocs/*/autosave/
+/iocs/*/autosave/*
+!/iocs/*/autosave/README
 # quadEM ships each IOC its autosave dir with a README placeholder, as C does
 /iocs/quadem/*/autosave/*
 !/iocs/quadem/*/autosave/README
