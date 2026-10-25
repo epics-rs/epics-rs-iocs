@@ -25,3 +25,8 @@ epicsEnvSet("CAMERA_ID", "0815-0000")
 # The emulator exposes the generic GenICam feature set only, so no
 # per-model template is loaded here.
 < $(ADPYLON)/st_base.cmd
+
+iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")

@@ -18,14 +18,6 @@ epicsEnvSet("CBUFFS", "50")
 # ADBase.template.
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(ADPYLON)/db")
 
-# Autosave configuration
-set_requestfile_path("$(ADPYLON)/db")
-set_requestfile_path("$(ADCORE)/db")
-set_savefile_path("$(ADPYLON)/autosave")
-save_restoreSet_status_prefix("$(PREFIX)")
-set_pass0_restoreFile("pylon_settings.req", "P=$(PREFIX),R=$(CAM)")
-set_pass1_restoreFile("pylon_settings.req", "P=$(PREFIX),R=$(CAM)")
-
 # ADPylonConfig(portName, cameraId, maxMemory, priority, stackSize)
 ADPylonConfig("$(PORT)", "$(CAMERA_ID)", 0, 0, 0)
 
@@ -35,4 +27,8 @@ dbLoadRecords("$(ADPYLON)/db/pylon.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT)
 # Load all common plugins (includes image1 StdArrays)
 < $(ADCORE)/ioc/commonPlugins.cmd
 
-create_monitor_set("pylon_settings.req", 30, "P=$(PREFIX),R=$(CAM)")
+# commonPlugins.cmd sets up autosave with ./autosave as the save path; these
+# keep the request and save files under $(ADPYLON) whatever the start dir.
+set_requestfile_path("$(ADPYLON)")
+set_requestfile_path("$(ADPYLON)/db")
+set_savefile_path("$(ADPYLON)/autosave")
