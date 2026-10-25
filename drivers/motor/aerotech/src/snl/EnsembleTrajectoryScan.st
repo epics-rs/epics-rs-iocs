@@ -363,24 +363,25 @@ ss EnsembleTrajectoryScan {
 			buildStatus = STATUS_SUCCESS; /* presume we'll be successful */
 			/* Upstream built with nelements as put, which monitor_inputs bounds only by the
 			 * controller's DGLOBALs (to -6 if unread); the arrays hold MAX_ELEMENTS. */
-			if ((nelements < 1) || (nelements > MAX_ELEMENTS)) {
-				nelements = MAX(1, MIN(nelements, MAX_ELEMENTS));
+			/* nelements is monitored, so it can change after it is bounded; upstream re-read
+			 * it in the loops below and in loadTrajectory.  npoints is the one bounded read. */
+			npoints = MAX(1, MIN(nelements, MAX_ELEMENTS));
+			if (npoints != nelements) {
+				nelements = npoints;
 				pvPut(nelements);
 			}
 			/* Initialize new trajectory */
 			/* If time mode is TIME_MODE_TOTAL then construct timeTrajectory and post it */
 			if (timeMode == TIME_MODE_TOTAL) {
-				dtime = time/(nelements-1);
-				for (i=0; i<nelements; i++) timeTrajectory[i] = dtime;
+				dtime = time/(npoints-1);
+				for (i=0; i<npoints; i++) timeTrajectory[i] = dtime;
 				pvPut(timeTrajectory);
 			} else {
-				for (i=0, time=0.; i<nelements; i++) {
+				for (i=0, time=0.; i<npoints; i++) {
 					time += timeTrajectory[i];
 				}
 				pvPut(time);
 			}
-
-			npoints = nelements;
 
 			/* calculate time from beginning of motion at which motor should reach each trajectory point */			
 			realTimeTrajectory[0] = 0.;
@@ -1438,7 +1439,7 @@ static int loadTrajectory(SS_ID ssId, struct UserVar *pVar, int *pstatus) {
 	 */ 
 	if ((pVar->pulseMode == PULSE_MODE_ARRAY) || (pVar->pulseMode == PULSE_MODE_TRAJPTS)) {
 		/* Program PSO array output */
-		int np;
+		int np, nPulses;
 		int maxArrayPulses = MIN(MAX_PSO_PULSES, pVar->numGlobalIntegers - IGLOBALINDEXSTART);
 
 		if ((pVar->pulseMode == PULSE_MODE_ARRAY) &&
@@ -1450,19 +1451,22 @@ static int loadTrajectory(SS_ID ssId, struct UserVar *pVar, int *pstatus) {
 			if (pVar->debugLevel) printf("loadTrajectory: motorStart=%f, pVar->pulsePositions[0]=%f\n",
 				pVar->motorStart[j], pVar->pulsePositions[0]);
 			iGlobalIndex = IGLOBALINDEXSTART;
-			if (pVar->numGlobalIntegers < (pVar->numPulsePositions + IGLOBALINDEXSTART)) {
+			/* numPulsePositions is monitored; upstream's loop re-read it after bounding it. */
+			nPulses = pVar->numPulsePositions;
+			if (pVar->numGlobalIntegers < (nPulses + IGLOBALINDEXSTART)) {
 				printf("EnsembleTrajectoryScan: The Ensemble only has enough global integers for %d pulses\n",
 					pVar->numGlobalIntegers - IGLOBALINDEXSTART);
-				pVar->numPulsePositions = pVar->numGlobalIntegers - IGLOBALINDEXSTART;
+				nPulses = pVar->numGlobalIntegers - IGLOBALINDEXSTART;
 			}
-			if (pVar->numPulsePositions > MAX_PSO_PULSES) {
+			if (nPulses > MAX_PSO_PULSES) {
 				printf("EnsembleTrajectoryScan: The Ensemble can't load more than %d PSOARRAY pulses\n",
 					MAX_PSO_PULSES);
-				pVar->numPulsePositions = MAX_PSO_PULSES;
+				nPulses = MAX_PSO_PULSES;
 			}
 			/* MAX_PSO_PULSES is 8192 but pulsePositions holds MAX_PULSES; upstream read past it. */
-			if (pVar->numPulsePositions > MAX_PULSES) pVar->numPulsePositions = MAX_PULSES;
-			for (i=0, np=0; i<pVar->numPulsePositions && np<maxArrayPulses; i++) {
+			if (nPulses > MAX_PULSES) nPulses = MAX_PULSES;
+			pVar->numPulsePositions = nPulses;
+			for (i=0, np=0; i<nPulses && np<maxArrayPulses; i++) {
 				/* Add this pulse-out location to the list */
 				np++;
 				position = pVar->pulsePositions[i];
@@ -1479,15 +1483,17 @@ static int loadTrajectory(SS_ID ssId, struct UserVar *pVar, int *pstatus) {
 			j = 0; /* For now, we only support one motor */
 			positionLast = pVar->motorStart[j];
 			iGlobalIndex = IGLOBALINDEXSTART;
-			if (pVar->numGlobalIntegers < (pVar->nelements + IGLOBALINDEXSTART)) {
+			/* Upstream counted to nelements, which a put during the build's move can raise past
+			 * motorTrajectory; npoints is the trajectory state build bounded. */
+			if (pVar->numGlobalIntegers < (pVar->npoints + IGLOBALINDEXSTART)) {
 				printf("EnsembleTrajectoryScan: The Ensemble only has enough global integers for %d pulses\n",
 					pVar->numGlobalIntegers - IGLOBALINDEXSTART);
 			}
-			if (pVar->nelements > MAX_PSO_PULSES) {
+			if (pVar->npoints > MAX_PSO_PULSES) {
 				printf("EnsembleTrajectoryScan: The Ensemble can't load more than %d PSOARRAY pulses\n",
 					MAX_PSO_PULSES);
 			}
-			for (i=0, np=0; i<pVar->nelements && np<maxArrayPulses; i++) {
+			for (i=0, np=0; i<pVar->npoints && np<maxArrayPulses; i++) {
 				/* enable pulses if we're within user specified range */
 				if (i >= pVar->startPulses && i <= pVar->endPulses) {
 					/* Add this pulse-out location to the list */
