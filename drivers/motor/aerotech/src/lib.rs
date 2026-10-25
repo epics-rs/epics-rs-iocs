@@ -10,6 +10,7 @@ pub mod drv_soloist;
 pub mod ensemble;
 mod exchange;
 pub mod ioc;
+pub mod snl;
 
 pub use a3200::{A3200_MAX_AXES, A3200Axis, A3200Controller};
 pub use ensemble::{ENSEMBLE_MAX_AXES, EnsembleAxis, EnsembleController};
