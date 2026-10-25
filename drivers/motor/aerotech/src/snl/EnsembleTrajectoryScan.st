@@ -388,11 +388,18 @@ ss EnsembleTrajectoryScan {
 
 			/* Calculate velocities and accelerations for trajectories.   Build abort command, in case we need it. */
 			n = sprintf(abortCommand, "ABORT");
+			/* Upstream dropped buildTrajectory's status, so a build whose velocities it never
+			 * computed (threshold unreadable, doCommand.ab too old) loaded the last build's. */
+			limitViolation = 0;
 			for (j=0; j<MAX_AXES; j++) {
 				if (moveAxis[j]) {
-					%%buildTrajectory(ssId, pVar, pVar->realTimeTrajectory, pVar->motorTrajectory[pVar->j],
+					%%pVar->status = buildTrajectory(ssId, pVar, pVar->realTimeTrajectory, pVar->motorTrajectory[pVar->j],
 					%%	pVar->epicsMotorDir[pVar->j], pVar->moveMode, pVar->npoints, pVar->npulses,
 					%%	pVar->epicsMotorOff[pVar->j], pVar->epicsMotorMres[pVar->j], pVar->velocity[pVar->j]);
+					if (status && !limitViolation) {
+						limitViolation = 1;
+						epicsSnprintf(buildMessage, MSGSIZE, "Can't build m%d", j+1);
+					}
 					n += sprintf(&abortCommand[n], " @%d", j);
 				}
 			}
@@ -401,7 +408,6 @@ ss EnsembleTrajectoryScan {
 			expectedTime = realTimeTrajectory[npoints-1];
 
 			/* Check trajectories against motor soft limits */
-			limitViolation = 0;
 			for (j=0; j<numAxes && !limitViolation; j++) {
 				if (moveAxis[j]) {
 					vmax = epicsMotorVMAX[j];
