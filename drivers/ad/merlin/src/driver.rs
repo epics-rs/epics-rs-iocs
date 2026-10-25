@@ -1435,21 +1435,55 @@ mod tests {
         );
     }
 
-    /// merlinTask stamps timeStamp and never calls updateTimeStamp
-    /// (merlinDetector.cpp:255-258): epicsTS is the zero NDArray starts with.
-    #[test]
-    fn a_frame_carries_no_epics_timestamp() {
+    /// The array a `prefix` frame publishes, on a port whose time source is
+    /// fixed at `at`.
+    fn stamped_frame(
+        name: &str,
+        prefix: &[u8; 3],
+        len: usize,
+        at: std::time::SystemTime,
+    ) -> Arc<NDArray> {
         use epics_rs::ad_core::plugin::channel::ndarray_channel;
-        use epics_rs::ad_core::timestamp::EpicsTimestamp;
-        let (sender, mut receiver) = ndarray_channel("MERLIN_FRAME_TS_SINK", 4);
+        let (sender, mut receiver) = ndarray_channel(&format!("{name}_SINK"), 4);
         let mut output = NDArrayOutput::new();
         output.add(sender);
         // 1 MiB of the limit is the flat-field buffer.
-        let det = detector_sized("MERLIN_FRAME_TS", 2 << 20);
-        run_quad_frame("MERLIN_FRAME_TS", det, output);
-        let array = receiver.blocking_recv().expect("the frame's array");
-        assert!(array.time_stamp > 0.0);
-        assert_eq!(array.timestamp, EpicsTimestamp::default());
+        let mut det = detector_sized(name, 2 << 20);
+        det.ad.port_base.register_timestamp_source(move || at);
+        let ctx = quad_frame_context(name, det, output);
+        let mut body = crate::protocol::tests::quad_header(768, 1);
+        body[..3].copy_from_slice(prefix);
+        body.resize(768 + len, 0);
+        epics_rs::ad_core::runtime::run_thread(move || async move {
+            crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+        })
+        .join()
+        .unwrap();
+        receiver.blocking_recv().expect("the frame's array")
+    }
+
+    /// Data and profile frames take epicsTS from the port's time source, which
+    /// C merlinTask never does, and timeStamp from the clock at the pass's
+    /// start, as C does (merlinDetector.cpp:101, :255-258).
+    #[test]
+    fn a_frame_carries_the_port_time_stamp() {
+        use epics_rs::ad_core::timestamp::EpicsTimestamp;
+        let at = std::time::UNIX_EPOCH + Duration::new(1_700_000_000, 250_000_000);
+        let stamp = EpicsTimestamp::from(at);
+        for (name, prefix, len) in [
+            ("MERLIN_FRAME_TS", b"MQ1", 256 * 256 * 2),
+            ("MERLIN_PROFILE_TS", b"PR1", (256 + 256) * 8),
+        ] {
+            let before = EpicsTimestamp::now().as_f64();
+            let array = stamped_frame(name, prefix, len, at);
+            let after = EpicsTimestamp::now().as_f64();
+            assert_eq!(array.timestamp, stamp, "{name}");
+            assert!(
+                (before..=after).contains(&array.time_stamp),
+                "{name}: {}",
+                array.time_stamp
+            );
+        }
     }
 
     /// merlinDetector.cpp sets the array size and type params only in the

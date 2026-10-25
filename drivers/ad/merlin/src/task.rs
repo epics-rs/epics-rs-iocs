@@ -346,9 +346,11 @@ async fn publish_image(
         .as_u8_slice_mut()
         .copy_from_slice(data.as_u8_slice());
     frame.set_unique_id(array_counter);
-    // C never calls updateTimeStamp, so epicsTS stays zero
-    // (merlinDetector.cpp:255-258).
     frame.set_time_stamp(start.as_f64());
+    // C merlinTask never stamps epicsTS (merlinDetector.cpp:255-258).
+    frame.set_timestamp(step(held, |base| {
+        EpicsTimestamp::from(base.update_time_stamp())
+    }));
     *frame.attributes_mut() = build_attributes(&header.attrs, acquisition_header);
     // C stores no array size, type or time-stamp param per frame; the
     // constructor's values stand (merlinDetector.cpp:1494-1497).
@@ -429,9 +431,11 @@ async fn publish_profiles(
     });
 
     frame.set_unique_id(array_counter);
-    // C never calls updateTimeStamp, so epicsTS stays zero
-    // (merlinDetector.cpp:255-258).
     frame.set_time_stamp(start.as_f64());
+    // C merlinTask never stamps epicsTS (merlinDetector.cpp:255-258).
+    frame.set_timestamp(step(held, |base| {
+        EpicsTimestamp::from(base.update_time_stamp())
+    }));
     *frame.attributes_mut() = build_attributes(&header.attrs, acquisition_header);
     // C stores no array size, type or time-stamp param per frame; the
     // constructor's values stand (merlinDetector.cpp:1494-1497).
