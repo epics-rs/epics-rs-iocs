@@ -1561,9 +1561,15 @@ impl PortDriver for AdsPortDriver {
                     )));
                 }
             };
-            let n = text.len().min(buf.len());
+            // C hands this to asynPortDriver::readOctet: at most maxChars - 1
+            // bytes, NUL-terminated, and nActual = strlen + 1 counts the NUL.
+            let Some(room) = buf.len().checked_sub(1) else {
+                return OctetReadResult::ok(0, EomReason::END);
+            };
+            let n = text.len().min(room);
             buf[..n].copy_from_slice(&text[..n]);
-            return OctetReadResult::ok(n, EomReason::END);
+            buf[n] = 0;
+            return OctetReadResult::ok(n + 1, EomReason::END);
         }
 
         let mut reply = self.shared.octet_buffer.lock();
@@ -2419,6 +2425,32 @@ mod tests {
         let n = d.read_float64_array(&user(reason), &mut buf).unwrap();
         assert_eq!(n, 5);
         assert_eq!(&buf[..5], &[0.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// asynPortDriver.cpp:2615, :2629: a STRING read keeps maxChars - 1
+    /// bytes and counts the NUL, so an lsi's LEN is strlen + 1.
+    #[test]
+    fn a_string_read_counts_the_nul_as_c_read_octet() {
+        let mut d = driver();
+        let reason = bind(
+            &mut d,
+            "ADSPORT=851/.ADR.16#4020,16#0,8,30?",
+            InterfaceType::Octet,
+        );
+        // What the PLC-info refresh sets for every ADST_STRING.
+        d.shared.params.lock()[reason].as_mut().unwrap().is_array = true;
+        d.shared.publish(reason, b"abc\0\0\0\0\0", 0);
+
+        let mut buf = [0xffu8; 8];
+        let r = d.read_octet(&user(reason), &mut buf);
+        r.status.unwrap();
+        assert_eq!(
+            (&buf[..r.nbytes_transferred], r.eom_reason),
+            (&b"abc\0"[..], EomReason::END)
+        );
+        let mut short = [0xffu8; 3];
+        let r = d.read_octet(&user(reason), &mut short);
+        assert_eq!(&short[..r.nbytes_transferred], &b"ab\0"[..]);
     }
 
     #[test]
