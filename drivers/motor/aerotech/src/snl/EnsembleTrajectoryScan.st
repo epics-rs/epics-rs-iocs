@@ -1459,6 +1459,8 @@ static int loadTrajectory(SS_ID ssId, struct UserVar *pVar, int *pstatus) {
 					MAX_PSO_PULSES);
 				pVar->numPulsePositions = MAX_PSO_PULSES;
 			}
+			/* MAX_PSO_PULSES is 8192 but pulsePositions holds MAX_PULSES; upstream read past it. */
+			if (pVar->numPulsePositions > MAX_PULSES) pVar->numPulsePositions = MAX_PULSES;
 			for (i=0, np=0; i<pVar->numPulsePositions && np<maxArrayPulses; i++) {
 				/* Add this pulse-out location to the list */
 				np++;
