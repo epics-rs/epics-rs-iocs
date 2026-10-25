@@ -33,6 +33,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::stdlib::strtod;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
+use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 use epics_rs::motor::trace::MotorTrace;
@@ -142,9 +143,14 @@ const MAX_SOCKETS: usize = 1000;
 static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
 
 /// C `ConnectToServer` (asynOctetSocket.cpp:60): asyn IP port
-/// `ip:port:N` from `drvAsynIPPortConfigure(name, "ip:port TCP", 0, 0, 1)`.
-/// The socket index and its port; `None` is C's -1, printed as C prints it.
-fn connect_to_server(ctx: &CommandContext, ip: &str, ip_port: i32) -> Option<(i32, PortHandle)> {
+/// `ip:port:N` from `drvAsynIPPortConfigure(name, "ip:port TCP", 0, 0, 1)`
+/// in `db`'s IOC. The socket index and its port; `None` is C's -1, printed
+/// as C prints it.
+pub(crate) fn connect_to_server(
+    db: &PvDatabase,
+    ip: &str,
+    ip_port: i32,
+) -> Option<(i32, PortHandle)> {
     let socket = NEXT_SOCKET.load(Ordering::Relaxed);
     if socket >= MAX_SOCKETS {
         println!("ConnectToServer: too many open sockets, max={MAX_SOCKETS}");
@@ -169,7 +175,7 @@ fn connect_to_server(ctx: &CommandContext, ip: &str, ip_port: i32) -> Option<(i3
         let (handle, _jh) = create_port_runtime(&claim, driver, RuntimeConfig::default()).ok()?;
         match claim.publish(
             handle.port_handle().clone(),
-            ctx.db().scan_control().interrupt_gate(),
+            db.scan_control().interrupt_gate(),
         ) {
             Ok(()) => Some(handle),
             Err(_) => {
@@ -657,7 +663,7 @@ pub fn xps_create_controller_command() -> CommandDef {
             register_port_with(ctx, &port_name, c_int(args, 3), head)?;
             // C goes on with socket -1 for either socket
             // (XPSController.cpp:179-193).
-            let poll = match connect_to_server(ctx, &ip, ip_port) {
+            let poll = match connect_to_server(ctx.db(), &ip, ip_port) {
                 Some((index, handle)) => XpsSocket::new(
                     handle,
                     index,
@@ -672,7 +678,7 @@ pub fn xps_create_controller_command() -> CommandDef {
                     XpsSocket::invalid(&port_name, SocketMode::Query)
                 }
             };
-            let profile_sock = Arc::new(match connect_to_server(ctx, &ip, ip_port) {
+            let profile_sock = Arc::new(match connect_to_server(ctx.db(), &ip, ip_port) {
                 Some((index, handle)) => XpsSocket::new(
                     handle,
                     index,
@@ -753,7 +759,7 @@ pub fn xps_create_axis_command() -> CommandDef {
             poller.install_built(asyn_user(&port_name, axis), || {
                 // C goes on with socket -1, whose TCP_SetTimeout prints
                 // (XPSAxis.cpp:146-152).
-                let move_sock = match connect_to_server(ctx, &ip, ip_port) {
+                let move_sock = match connect_to_server(ctx.db(), &ip, ip_port) {
                     Some((index, handle)) => XpsSocket::new(
                         handle,
                         index,
@@ -967,10 +973,11 @@ pub fn tclcall_command() -> CommandDef {
                 _ => Ok("(null)".to_owned()),
             };
             println!("XPS ip = {TCLCALL_IP}");
-            let socket = connect_to_server(ctx, TCLCALL_IP, TCLCALL_PORT).map(|(index, handle)| {
-                let port = handle.port_name().to_owned();
-                XpsSocket::new(handle, index, &port, SocketMode::Query, TCLCALL_TIMEOUT)
-            });
+            let socket =
+                connect_to_server(ctx.db(), TCLCALL_IP, TCLCALL_PORT).map(|(index, handle)| {
+                    let port = handle.port_name().to_owned();
+                    XpsSocket::new(handle, index, &port, SocketMode::Query, TCLCALL_TIMEOUT)
+                });
             if socket.is_none() {
                 println!(" Error TCP_ConnectToServer");
             }
@@ -996,7 +1003,7 @@ pub fn xps_aux_config_command() -> CommandDef {
         move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = opt_string(args, 0)?.unwrap_or_default();
             let ip = opt_string(args, 1)?.unwrap_or_default();
-            let Some((index, handle)) = connect_to_server(ctx, &ip, c_int(args, 2)) else {
+            let Some((index, handle)) = connect_to_server(ctx.db(), &ip, c_int(args, 2)) else {
                 println!("drvXPSAsynAuxConfig: error calling TCP_ConnectToServer");
                 return Ok(CommandOutcome::Continue);
             };
@@ -1659,7 +1666,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
 
             // C goes on with socket -1 for either socket (HXPDriver.cpp:106-116,
             // 559-562).
-            let poll_sock = match connect_to_server(ctx, &ip, ip_port) {
+            let poll_sock = match connect_to_server(ctx.db(), &ip, ip_port) {
                 Some((index, handle)) => XpsSocket::new(
                     handle,
                     index,
@@ -1688,7 +1695,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
                 .controller_poll(move || polled.lock().unwrap_or_else(|e| e.into_inner()).poll());
 
             for axis_no in 0..NUM_HXP_AXES {
-                let move_sock = match connect_to_server(ctx, &ip, ip_port) {
+                let move_sock = match connect_to_server(ctx.db(), &ip, ip_port) {
                     Some((index, handle)) => XpsSocket::new(
                         handle,
                         index,
