@@ -21,7 +21,10 @@ char* master;
 char* slave;
 %%int xps_socket;
 int val;
-char* masterRdbk;
+/* Upstream declares char* masterRdbk and never sets it, so the strcpy of
+   SingleAxisSlaveParametersGet's first success writes through NULL. Sized
+   to XPS_C8_drivers.cpp's SIZE_SMALL reply, the most that strcpy copies. */
+char masterRdbk[1024];
 double ratioRdbk;
 
 /* PV definitions */
