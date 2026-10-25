@@ -176,11 +176,10 @@ impl C300Controller {
         }
         let mut writes = match range {
             Err(_) => vec![StatusWrite::Problem(true)],
-            Ok(r) if r != 0.0 => vec![
+            Ok(_) => vec![
                 StatusWrite::GainSupport(true),
                 StatusWrite::HasEncoder(true),
             ],
-            Ok(_) => Vec::new(),
         };
 
         let factor = self.query(&format!("SYST:CHAN{chan}:DI:FACT?"));
@@ -484,6 +483,26 @@ mod tests {
     #[test]
     fn the_constructor_sets_gain_support_and_has_encoder() {
         let (_rig, io) = motor_common::testing::LineRig::new("c300CtorEncoder", c300_replies);
+        let controller = Arc::new(Mutex::new(C300Controller::new(io, 1)));
+        let mut axis = C300Axis::new(controller, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [
+                StatusWrite::GainSupport(true),
+                StatusWrite::HasEncoder(true)
+            ]
+        );
+    }
+
+    /// C300MotorDriver.cpp:228-237: any successful range read sets both
+    /// bits, a range of 0 included.
+    #[test]
+    fn a_zero_range_still_sets_gain_support_and_has_encoder() {
+        let (_rig, io) =
+            motor_common::testing::LineRig::new("c300CtorZeroRange", |cmd| match cmd.trim_end() {
+                "SYST:CHAN1:STAG:RANG?" => "0".into(),
+                c => c300_replies(c),
+            });
         let controller = Arc::new(Mutex::new(C300Controller::new(io, 1)));
         let mut axis = C300Axis::new(controller, 0);
         assert_eq!(
