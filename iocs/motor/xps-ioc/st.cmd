@@ -30,7 +30,13 @@ XPSCreateProfile("$(PORT)", 2000, "Administrator", "Administrator")
 
 dbLoadRecords("$(XPS_IOC)/db/xps.template", "P=$(P),M0=$(M0),PORT=$(PORT),ADDR=0")
 
+# xpsSlave.st's records, for the seq line below:
+#   dbLoadRecords("$(XPS_IOC)/db/xpsSlave.db", "P=$(P),R=slave")
+
 iocInit()
+
+# xpsSlave.st gears group S to positioner M on its own XPS socket:
+#   seq &xpsSlave, "P=$(P),R=slave,IP=$(IP),M=GROUP1.POSITIONER,S=GROUP2"
 
 # Run a TCL script file stored on the XPS (task name + parameters default "0"):
 #   XPSTclScriptExecute("$(PORT)", "MyScript.tcl")
