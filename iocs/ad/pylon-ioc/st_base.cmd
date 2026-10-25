@@ -31,6 +31,8 @@ dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=I
 
 # Load all other plugins using commonPlugins.cmd
 < $(ADCORE)/ioc/commonPlugins.cmd
+# As st.cmd.base: NDStats_settings.req includes calc's sseq_settings.req.
+set_requestfile_path("$(CALC)/db")
 
 # commonPlugins.cmd sets up autosave with ./autosave as the save path; these
 # keep the request and save files under $(ADPYLON) whatever the start dir.
