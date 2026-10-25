@@ -54,7 +54,13 @@ dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=I
 # Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
 < $(ADCORE)/ioc/commonPlugins.cmd
 
+set_requestfile_path("$(ADSPECSANALYSER)/db")
+set_requestfile_path("$(ADCORE)/db")
+set_requestfile_path("$(CALC)/db")
+
 iocInit()
+
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX),D=cam1:")
 
 # Example interactive commands:
 #   dbl                                       # List all PVs

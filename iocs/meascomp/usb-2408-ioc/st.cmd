@@ -2,9 +2,6 @@
 #
 # MEASCOMP is set by main.rs to iocs/meascomp; its db/ holds measComp's
 # templates, substitutions and _settings.req files verbatim.
-#
-# Not ported from save_restore.cmd: the save_restoreSet_* settings, which
-# epics-rs autosave does not provide.
 
 epicsEnvSet("PREFIX",        "USB2408:")
 epicsEnvSet("PORT",          "USB2408_1")
@@ -21,6 +18,11 @@ MultiFunctionConfig("$(PORT)", "$(UNIQUE_ID)", $(WDIG_POINTS), $(WGEN_POINTS))
 
 dbLoadTemplate("$(MEASCOMP)/db/USB2408.substitutions", "P=$(PREFIX),PORT=$(PORT),WDIG_POINTS=$(WDIG_POINTS),WGEN_POINTS=$(WGEN_POINTS)")
 
+save_restoreSet_Debug(0)
+save_restoreSet_IncompleteSetsOk(1)
+save_restoreSet_DatedBackupFiles(1)
+save_restoreSet_NumSeqFiles(3)
+save_restoreSet_SeqPeriodInSeconds(300)
 set_savefile_path("$(MEASCOMP)/usb-2408-ioc", "autosave")
 set_pass0_restoreFile("auto_settings.sav")
 set_pass1_restoreFile("auto_settings.sav")

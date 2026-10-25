@@ -23,10 +23,11 @@
 # db/*.substitutions file's own header for its exact deviations from
 # upstream.
 #
-# Omitted (matching drivers/love, drivers/scaler974, motor/amci precedent
-# in this workspace): autosave/save_restore machinery
-# (create_monitor_set/auto_settings.req) and the optional debug asynRecord
-# instance upstream's st.cmd loads. Neither is protocol logic.
+# Omitted: the optional debug asynRecord instance upstream's st.cmd loads.
+#
+# Autosave is upstream's save_restore_IOCSH.cmd once, with each family's
+# iocBoot auto_settings.req kept verbatim as auto_settings_ISCO.req and
+# auto_settings_Vindum.req, one monitor set each.
 #============================================================
 
 epicsEnvSet("P", "SP:")
@@ -168,6 +169,26 @@ dbLoadRecords("$(SYRINGEPUMP)/db/VindumController.template", "P=$(VPREFIX), PORT
 dbLoadRecords("$(SYRINGEPUMP)/db/VindumPumpN.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT), PUMP=A:")
 dbLoadRecords("$(SYRINGEPUMP)/db/VindumPumpN.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT), PUMP=B:")
 
+# ------------------------------------------------------------------
+# save_restore (upstream iocBoot/save_restore_IOCSH.cmd)
+# ------------------------------------------------------------------
+save_restoreSet_Debug(0)
+save_restoreSet_IncompleteSetsOk(1)
+save_restoreSet_DatedBackupFiles(1)
+save_restoreSet_NumSeqFiles(3)
+save_restoreSet_SeqPeriodInSeconds(300)
+set_savefile_path("$(SYRINGEPUMP)", "autosave")
+set_pass0_restoreFile("auto_settings_ISCO.sav")
+set_pass1_restoreFile("auto_settings_ISCO.sav")
+set_pass0_restoreFile("auto_settings_Vindum.sav")
+set_pass1_restoreFile("auto_settings_Vindum.sav")
+set_requestfile_path("$(SYRINGEPUMP)", "")
+set_requestfile_path("$(SYRINGEPUMP)", "db")
+set_requestfile_path("$(AUTOSAVE)", "db")
+
 ###############################################################################
 iocInit()
 ###############################################################################
+
+create_monitor_set("auto_settings_ISCO.req",30,"P=$(PREFIX)")
+create_monitor_set("auto_settings_Vindum.req",30,"P=$(VPREFIX)")

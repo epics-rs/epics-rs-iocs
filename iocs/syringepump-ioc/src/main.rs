@@ -25,6 +25,8 @@
 //! Usage:
 //!   cargo run -p syringepump-ioc -- st.cmd
 
+use std::sync::{Arc, Mutex};
+
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -66,6 +68,11 @@ async fn main() -> CaResult<()> {
     // module doc for the scope-split rationale).
     let runtime_handle = epics_rs::base::runtime::task::runtime_handle();
     app = modbus_rs::ioc::register_modbus_commands(app, runtime_handle);
+
+    let autosave_config = Arc::new(Mutex::new(
+        epics_rs::base::server::autosave::startup::AutosaveStartupConfig::new(),
+    ));
+    app = app.autosave_startup(autosave_config);
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

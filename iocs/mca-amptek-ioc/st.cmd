@@ -15,10 +15,7 @@
 # dbLoadRecords calls -- textually equivalent to what dbLoadTemplate would
 # have produced.
 #
-# Omitted (matching every other IOC in this workspace): autosave/
-# save_restore machinery (create_monitor_set/auto_settings.req) and the
-# optional debug asynRecord instance upstream's st.cmd loads. Neither is
-# protocol logic.
+# Omitted: the optional debug asynRecord instance upstream's st.cmd loads.
 #
 # Live boot test: point ADDRESS at 127.0.0.1 and run
 # `cargo run -p mca-amptek --example stub_dp5` in another terminal first --
@@ -49,5 +46,22 @@ dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=
 dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=6")
 dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=7")
 
+# ---- save_restore (upstream ../save_restore.cmd) ----
+save_restoreSet_status_prefix("mcaTest:")
+save_restoreSet_Debug(0)
+save_restoreSet_IncompleteSetsOk(1)
+save_restoreSet_DatedBackupFiles(1)
+save_restoreSet_NumSeqFiles(3)
+save_restoreSet_SeqPeriodInSeconds(300)
+set_savefile_path("$(MCA_AMPTEK_IOC)", "autosave")
+set_pass0_restoreFile("auto_settings.sav")
+set_pass1_restoreFile("auto_settings.sav")
+set_requestfile_path("$(MCA_AMPTEK_IOC)", "")
+set_requestfile_path("$(MCA_AMPTEK_IOC)", "db")
+dbLoadRecords("$(AUTOSAVE)/db/save_restoreStatus.db", "P=mcaTest:")
+
 #------------------------------------------------------------------------------
 iocInit()
+
+# save settings every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=mcaTest:,M=mca1,R=Amptek1:")

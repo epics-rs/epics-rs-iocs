@@ -3,9 +3,6 @@
 # main.rs sets MEASCOMP to iocs/meascomp, whose db/ holds measComp's
 # templates, substitutions and _settings.req files verbatim, SCALER to
 # scaler-rs and MCA to drivers/mca.
-#
-# Not ported from save_restore.cmd: the save_restoreSet_* settings, which
-# epics-rs autosave does not provide.
 
 epicsEnvSet("PREFIX",             "USBCTR:")
 epicsEnvSet("PORT",               "USBCTR_1")
@@ -52,6 +49,11 @@ dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME
 dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)8,  INP=@asyn($(PORT) 7),  CHANS=$(MAX_POINTS)")
 dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)9,  INP=@asyn($(PORT) 8),  CHANS=$(MAX_POINTS)")
 
+save_restoreSet_Debug(0)
+save_restoreSet_IncompleteSetsOk(1)
+save_restoreSet_DatedBackupFiles(1)
+save_restoreSet_NumSeqFiles(3)
+save_restoreSet_SeqPeriodInSeconds(300)
 set_savefile_path("$(MEASCOMP)/usb-ctr-ioc", "autosave")
 set_pass0_restoreFile("auto_settings.sav")
 set_pass1_restoreFile("auto_settings.sav")
