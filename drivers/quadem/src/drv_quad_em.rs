@@ -837,6 +837,31 @@ pub trait QuadEmDevice {
     /// `drvQuadEM::setAcquire` is pure virtual — every device implements it.
     fn set_acquire(&mut self, value: i32) -> AsynResult<()>;
 
+    /// Runs `f` with acquisition stopped if `stop`, then restarts it if
+    /// `restart` whatever `f` returned. C's `sendCommand` and `readStatus`
+    /// `goto error` past their `setAcquire(1)` (drvAHxxx.cpp:126-136,
+    /// :797-801; drvTetrAMM.cpp:127-136, :861-865; drvPCR4.cpp:137-146,
+    /// :685-689), so one refused command or unparsable status reply leaves the
+    /// meter stopped. C defect, not copied.
+    fn with_acquire_paused<T>(
+        &mut self,
+        stop: bool,
+        restart: bool,
+        f: impl FnOnce(&mut Self) -> AsynResult<T>,
+    ) -> AsynResult<T>
+    where
+        Self: Sized,
+    {
+        if stop {
+            let _ = self.set_acquire(0);
+        }
+        let result = f(self);
+        if restart {
+            let _ = self.set_acquire(1);
+        }
+        result
+    }
+
     fn set_range(&mut self, _value: i32) -> AsynResult<()> {
         Ok(())
     }

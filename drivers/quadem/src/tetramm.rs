@@ -123,25 +123,21 @@ impl TetrAmmDriver {
     /// As in C++, only the command's own status is returned.
     fn send_command(&mut self, out: &str) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring {
-            let _ = self.set_acquire(0);
-        }
-        let resp = self.write_read_meter(out)?;
-        if resp != "ACK" {
-            asyn_print!(
-                self.base.port_base,
-                ERROR,
-                "drvTetrAMM::sendCommand: error, outString={out} expected ACK, received {resp}\n"
-            );
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("TetrAMM: {out} -> {resp}, expected ACK"),
-            });
-        }
-        if prev_acquiring {
-            let _ = self.set_acquire(1);
-        }
-        Ok(())
+        self.with_acquire_paused(prev_acquiring, prev_acquiring, |this| {
+            let resp = this.write_read_meter(out)?;
+            if resp != "ACK" {
+                asyn_print!(
+                    this.base.port_base,
+                    ERROR,
+                    "drvTetrAMM::sendCommand: error, outString={out} expected ACK, received {resp}\n"
+                );
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("TetrAMM: {out} -> {resp}, expected ACK"),
+                });
+            }
+            Ok(())
+        })
     }
 
     fn get_firmware_version(&mut self) -> AsynResult<()> {
@@ -297,29 +293,20 @@ impl QuadEmDevice for TetrAmmDriver {
     }
 
     /// C++ `drvTetrAMM::readStatus`.
-    ///
-    /// An unparseable response takes C++'s `goto error`, which jumps past the
-    /// `setAcquire(1)` restore: a failed status read leaves the meter stopped.
     fn read_status(&mut self) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring {
-            let _ = self.set_acquire(0);
-        }
-        let mut last = trace::StatusExchange::default();
-        if let Err(e) = self.read_status_inner(&mut last) {
-            asyn_print!(
-                self.base.port_base,
-                ERROR,
-                "drvTetrAMM::getStatus: error, outString={}, inString={}\n",
-                last.out,
-                last.inp
-            );
-            return Err(e);
-        }
-        if prev_acquiring {
-            let _ = self.set_acquire(1);
-        }
-        Ok(())
+        self.with_acquire_paused(prev_acquiring, prev_acquiring, |this| {
+            let mut last = trace::StatusExchange::default();
+            this.read_status_inner(&mut last).inspect_err(|_| {
+                asyn_print!(
+                    this.base.port_base,
+                    ERROR,
+                    "drvTetrAMM::getStatus: error, outString={}, inString={}\n",
+                    last.out,
+                    last.inp
+                );
+            })
+        })
     }
 
     fn set_acquire_mode(&mut self, _value: i32) -> AsynResult<()> {
@@ -368,10 +355,10 @@ impl TetrAmmDriver {
     /// C++ `drvTetrAMM::setAcquireParams`.
     fn set_acquire_params(&mut self) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring {
-            let _ = self.set_acquire(0);
-        }
+        self.with_acquire_paused(prev_acquiring, prev_acquiring, Self::write_acquire_params)
+    }
 
+    fn write_acquire_params(&mut self) -> AsynResult<()> {
         let p = self.params();
         let base = &mut self.base.port_base;
         let num_channels = qe::int_param(base, p.num_channels, 0);
@@ -421,10 +408,6 @@ impl TetrAmmDriver {
         let _ = self.write_read_meter(&proto::cmd_naq(naq));
         let ntrg = proto::ntrg_value(acquire_mode, num_acquire);
         let _ = self.write_read_meter(&proto::cmd_ntrg(ntrg));
-
-        if prev_acquiring {
-            let _ = self.set_acquire(1);
-        }
         Ok(())
     }
 

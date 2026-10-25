@@ -154,28 +154,21 @@ impl AhxxxDriver {
     /// both for every command, so this does too.
     fn send_command(&mut self, out: &str) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring {
-            let _ = self.set_acquire(0);
-        }
-        let resp = self.write_read_meter(out)?;
-        if resp != "ACK" && resp != "AK" {
-            asyn_print!(
-                self.base.port_base,
-                ERROR,
-                "drvAHxxx:sendCommand: error, outString={out} expected ACK, received {resp}\n"
-            );
-            return Err(error(format!("AHxxx: {out} -> {resp}, expected ACK")));
-        }
-        if prev_acquiring {
-            let _ = self.set_acquire(1);
-        }
-        Ok(())
+        self.with_acquire_paused(prev_acquiring, prev_acquiring, |this| {
+            let resp = this.write_read_meter(out)?;
+            if resp != "ACK" && resp != "AK" {
+                asyn_print!(
+                    this.base.port_base,
+                    ERROR,
+                    "drvAHxxx:sendCommand: error, outString={out} expected ACK, received {resp}\n"
+                );
+                return Err(error(format!("AHxxx: {out} -> {resp}, expected ACK")));
+            }
+            Ok(())
+        })
     }
 
     /// C++ `drvAHxxx::readStatus`.
-    ///
-    /// As in `drvTetrAMM`, the `goto error` path skips the `setAcquire(1)`
-    /// restore, so a status read that fails leaves the meter stopped.
     ///
     /// A failed exchange's reply is still parsed ([`trace::Reply::parse`]);
     /// one that does not parse returns its own status. C discards each
@@ -453,24 +446,18 @@ impl QuadEmDevice for AhxxxDriver {
     /// C++ `drvAHxxx::readStatus`.
     fn read_status(&mut self) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring {
-            let _ = self.set_acquire(0);
-        }
-        let mut last = trace::StatusExchange::default();
-        if let Err(e) = self.read_status_inner(&mut last) {
-            asyn_print!(
-                self.base.port_base,
-                ERROR,
-                "drvAHxxx:getStatus: error, outString={}, inString={}\n",
-                last.out,
-                last.inp
-            );
-            return Err(e);
-        }
-        if prev_acquiring {
-            let _ = self.set_acquire(1);
-        }
-        Ok(())
+        self.with_acquire_paused(prev_acquiring, prev_acquiring, |this| {
+            let mut last = trace::StatusExchange::default();
+            this.read_status_inner(&mut last).inspect_err(|_| {
+                asyn_print!(
+                    this.base.port_base,
+                    ERROR,
+                    "drvAHxxx:getStatus: error, outString={}, inString={}\n",
+                    last.out,
+                    last.inp
+                );
+            })
+        })
     }
 
     /// C++ `drvAHxxx::reset`.

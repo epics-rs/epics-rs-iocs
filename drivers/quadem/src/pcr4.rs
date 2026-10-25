@@ -125,22 +125,18 @@ impl Pcr4Driver {
     /// then restart.
     fn send_command(&mut self, out: &str) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring {
-            let _ = self.set_acquire(0);
-        }
-        let resp = self.write_read_meter(out)?;
-        if resp != proto::ACK {
-            asyn_print!(
-                self.base.port_base,
-                ERROR,
-                "drvPCR4::sendCommand: error, outString={out} expected ACK, received {resp}\n"
-            );
-            return Err(error(format!("PCR4: {out} -> {resp}, expected ACK")));
-        }
-        if prev_acquiring {
-            let _ = self.set_acquire(1);
-        }
-        Ok(())
+        self.with_acquire_paused(prev_acquiring, prev_acquiring, |this| {
+            let resp = this.write_read_meter(out)?;
+            if resp != proto::ACK {
+                asyn_print!(
+                    this.base.port_base,
+                    ERROR,
+                    "drvPCR4::sendCommand: error, outString={out} expected ACK, received {resp}\n"
+                );
+                return Err(error(format!("PCR4: {out} -> {resp}, expected ACK")));
+            }
+            Ok(())
+        })
     }
 
     /// C++ `getFirmwareVersion`.
@@ -175,9 +171,19 @@ impl Pcr4Driver {
     /// meter is configured on a best-effort basis and the caller only learns
     /// about a failure through the next status read.
     fn set_acquire_params(&mut self) -> AsynResult<()> {
-        let p = self.params();
+        let trigger_mode = qe::int_param(&self.base.port_base, self.params().trigger_mode, 0);
         let prev_acquiring = self.shared.is_acquiring();
+        // In free-run the caller (setAcquire) starts the acquisition itself;
+        // only a triggered acquisition is restarted from here.
+        self.with_acquire_paused(
+            prev_acquiring || trigger_mode != 0,
+            prev_acquiring && trigger_mode != 0,
+            Self::write_acquire_params,
+        )
+    }
 
+    fn write_acquire_params(&mut self) -> AsynResult<()> {
+        let p = self.params();
         let range = qe::int_param(&self.base.port_base, p.range, 0);
         let num_channels = qe::int_param(&self.base.port_base, p.num_channels, 0);
         let trigger_mode = qe::int_param(&self.base.port_base, p.trigger_mode, 0);
@@ -185,10 +191,6 @@ impl Pcr4Driver {
             QeTriggerPolarity::from_i32(qe::int_param(&self.base.port_base, p.trigger_polarity, 0));
         let values_per_read = qe::int_param(&self.base.port_base, p.values_per_read, 0);
         let averaging_time = qe::double_param(&self.base.port_base, p.averaging_time, 0);
-
-        if prev_acquiring || trigger_mode != 0 {
-            let _ = self.set_acquire(0);
-        }
 
         let sample_time = proto::sample_time(values_per_read);
         self.base
@@ -211,20 +213,10 @@ impl Pcr4Driver {
         let _ = self.write_read_meter(&proto::cmd_values_per_read(values_per_read));
         let _ = self.write_read_meter(proto::cmd_trigger_polarity(trigger_polarity));
         let _ = self.write_read_meter(proto::cmd_trigger(trigger_mode));
-
-        // In free-run the caller (setAcquire) starts the acquisition itself;
-        // only a triggered acquisition is restarted from here.
-        if prev_acquiring && trigger_mode != 0 {
-            let _ = self.set_acquire(1);
-        }
         Ok(())
     }
 
     /// C++ `drvPCR4::readStatus`.
-    ///
-    /// As in the other quadEM ports the `goto error` path skips the
-    /// `setAcquire(1)` restore, so a status read that fails leaves the meter
-    /// stopped.
     ///
     /// A failed exchange's reply is still parsed ([`trace::Reply::parse`]);
     /// one that does not parse returns its own status. C discards each
@@ -441,25 +433,19 @@ impl QuadEmDevice for Pcr4Driver {
     /// C++ `drvPCR4::readStatus`.
     fn read_status(&mut self) -> AsynResult<()> {
         let trigger_mode = qe::int_param(&self.base.port_base, self.params().trigger_mode, 0);
-        let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring || trigger_mode != 0 {
-            let _ = self.set_acquire(0);
-        }
-        let mut last = trace::StatusExchange::default();
-        if let Err(e) = self.read_status_inner(&mut last) {
-            asyn_print!(
-                self.base.port_base,
-                ERROR,
-                "drvPCR4::getStatus: error, outString={}, inString={}\n",
-                last.out,
-                last.inp
-            );
-            return Err(e);
-        }
-        if prev_acquiring || trigger_mode != 0 {
-            let _ = self.set_acquire(1);
-        }
-        Ok(())
+        let pause = self.shared.is_acquiring() || trigger_mode != 0;
+        self.with_acquire_paused(pause, pause, |this| {
+            let mut last = trace::StatusExchange::default();
+            this.read_status_inner(&mut last).inspect_err(|_| {
+                asyn_print!(
+                    this.base.port_base,
+                    ERROR,
+                    "drvPCR4::getStatus: error, outString={}, inString={}\n",
+                    last.out,
+                    last.inp
+                );
+            })
+        })
     }
 
     fn set_num_acquire(&mut self, _value: i32) -> AsynResult<()> {
