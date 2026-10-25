@@ -8,10 +8,9 @@ use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 /// `ipSupport.dbd`'s `devAiMKS` (`"HPS SensaVac 937"`), `dev<Type>MPC`
-/// (`"asyn MPC"`), `dev<Type>TPG261` (`"asyn TPG261"`), `dev<Xx>StrParm`
-/// (`"asyn <xx> stringParm"`), `dev<Xx>Eurotherm` (`"asyn <xx> Eurotherm"`),
-/// `devAiHeidND261` (`"asyn ai HeidND261"`) and `dev<Type>Televac`
-/// (`"asyn Televac"`) rows; their dsets
+/// (`"asyn MPC"`), `dev<Type>TPG261` (`"asyn TPG261"`), `dev<Xx>Eurotherm`
+/// (`"asyn <xx> Eurotherm"`), `devAiHeidND261` (`"asyn ai HeidND261"`) and
+/// `dev<Type>Televac` (`"asyn Televac"`) rows; their dsets
 /// are `{6, 0, 0, init, 0, read/write, convert}`, with no convert on the
 /// non-analog types.
 static DEVICES: &[(&str, &[DevSup])] = &[
@@ -48,12 +47,6 @@ static DEVICES: &[(&str, &[DevSup])] = &[
                 link_type: DbLinkType::InstIo,
                 dset: Dset::new(6, &[2, 4, 5], false),
             },
-            DevSup {
-                name: "devAiStrParm",
-                choice: "asyn ai stringParm",
-                link_type: DbLinkType::InstIo,
-                dset: Dset::new(6, &[2, 4, 5], false),
-            },
         ],
     ),
     (
@@ -68,12 +61,6 @@ static DEVICES: &[(&str, &[DevSup])] = &[
             DevSup {
                 name: "devAoTPG261",
                 choice: ip_devices::tpg261::DTYP,
-                link_type: DbLinkType::InstIo,
-                dset: Dset::new(6, &[2, 4, 5], false),
-            },
-            DevSup {
-                name: "devAoStrParm",
-                choice: "asyn ao stringParm",
                 link_type: DbLinkType::InstIo,
                 dset: Dset::new(6, &[2, 4, 5], false),
             },
@@ -106,12 +93,6 @@ static DEVICES: &[(&str, &[DevSup])] = &[
                 link_type: DbLinkType::InstIo,
                 dset: Dset::new(6, &[2, 4], false),
             },
-            DevSup {
-                name: "devBiStrParm",
-                choice: "asyn bi stringParm",
-                link_type: DbLinkType::InstIo,
-                dset: Dset::new(6, &[2, 4], false),
-            },
         ],
     ),
     (
@@ -126,12 +107,6 @@ static DEVICES: &[(&str, &[DevSup])] = &[
             DevSup {
                 name: "devBoTPG261",
                 choice: ip_devices::tpg261::DTYP,
-                link_type: DbLinkType::InstIo,
-                dset: Dset::new(6, &[2, 4], false),
-            },
-            DevSup {
-                name: "devBoStrParm",
-                choice: "asyn bo stringParm",
                 link_type: DbLinkType::InstIo,
                 dset: Dset::new(6, &[2, 4], false),
             },
@@ -178,12 +153,6 @@ static DEVICES: &[(&str, &[DevSup])] = &[
                 link_type: DbLinkType::InstIo,
                 dset: Dset::new(6, &[2, 4], false),
             },
-            DevSup {
-                name: "devSiStrParm",
-                choice: "asyn si stringParm",
-                link_type: DbLinkType::InstIo,
-                dset: Dset::new(6, &[2, 4], false),
-            },
         ],
     ),
     (
@@ -196,36 +165,12 @@ static DEVICES: &[(&str, &[DevSup])] = &[
                 dset: Dset::new(6, &[2, 4], false),
             },
             DevSup {
-                name: "devSoStrParm",
-                choice: "asyn so stringParm",
-                link_type: DbLinkType::InstIo,
-                dset: Dset::new(6, &[2, 4], false),
-            },
-            DevSup {
                 name: "devSoEurotherm",
                 choice: "asyn so Eurotherm",
                 link_type: DbLinkType::InstIo,
                 dset: Dset::new(6, &[2, 4], false),
             },
         ],
-    ),
-    (
-        "longin",
-        &[DevSup {
-            name: "devLiStrParm",
-            choice: "asyn li stringParm",
-            link_type: DbLinkType::InstIo,
-            dset: Dset::new(6, &[2, 4], false),
-        }],
-    ),
-    (
-        "longout",
-        &[DevSup {
-            name: "devLoStrParm",
-            choice: "asyn lo stringParm",
-            link_type: DbLinkType::InstIo,
-            dset: Dset::new(6, &[2, 4], false),
-        }],
     ),
 ];
 
@@ -251,12 +196,17 @@ async fn main() -> CaResult<()> {
         Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
     });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
-    // devAiMKS, devMPC, devTPG261, devXxStrParm, devXxEurotherm,
-    // devAiHeidND261 and devTelevac: per-record device support, bound by DTYP.
+    // devXxStrParm's rows come from ip-rs, ahead of the rest as
+    // ipSupport.dbd lists them.
+    app = app.register_dynamic_device_support(
+        &ip_devices::strparm::DEVICE_ROWS,
+        ip_devices::strparm::device_support_factory(),
+    );
+    // devAiMKS, devMPC, devTPG261, devXxEurotherm, devAiHeidND261 and
+    // devTelevac: per-record device support, bound by DTYP.
     let mks = ip_devices::mks::device_support_factory();
     let mpc = ip_devices::mpc::device_support_factory();
     let tpg = ip_devices::tpg261::device_support_factory();
-    let strparm = ip_devices::strparm::device_support_factory();
     let eurotherm = ip_devices::eurotherm::device_support_factory();
     let nd261 = ip_devices::nd261::device_support_factory();
     let televac = ip_devices::televac::device_support_factory();
@@ -264,7 +214,6 @@ async fn main() -> CaResult<()> {
         mks(ctx)
             .or_else(|| mpc(ctx))
             .or_else(|| tpg(ctx))
-            .or_else(|| strparm(ctx))
             .or_else(|| eurotherm(ctx))
             .or_else(|| nd261(ctx))
             .or_else(|| televac(ctx))
