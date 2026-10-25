@@ -134,7 +134,10 @@ ss slave_main
       DEBUG_PRINT(2, "idle -> modeChange", 0, 0, 0, 0);
     } state modeChange
     
-    when ( efTest(init_pv_mon) )
+    /* Upstream tests efTest(init_pv_mon) alone. reinit's PVPUT(init_pv, 0)
+       raises the flag again after its efClear, once the monitor lands, so
+       each request ran SingleAxisSlaveParametersSet twice. */
+    when ( efTestAndClear(init_pv_mon) && init_pv == 1 )
     {
       /* A reinit has been requested */
       DEBUG_PRINT(2, "idle -> reinit", 0, 0, 0, 0);
