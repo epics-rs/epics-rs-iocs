@@ -15,7 +15,6 @@
 //! drives them from controller-level records this port does not serve.
 
 use std::fmt::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -139,8 +138,10 @@ fn trajectory_upload(firmware: &str) -> Result<(&'static str, bool), String> {
 /// `MAX_SOCKETS` (asynOctetSocket.cpp:36).
 const MAX_SOCKETS: usize = 1000;
 
-/// `nextSocket` (asynOctetSocket.cpp).
-static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
+/// `nextSocket` (asynOctetSocket.cpp), held for a whole `connect_to_server`.
+/// C reads and bumps it unlocked, so two sequencer threads (two xpsSlave
+/// instances) could both name port `ip:port:N` and the second fail.
+static NEXT_SOCKET: Mutex<usize> = Mutex::new(0);
 
 /// C `ConnectToServer` (asynOctetSocket.cpp:60): asyn IP port
 /// `ip:port:N` from `drvAsynIPPortConfigure(name, "ip:port TCP", 0, 0, 1)`
@@ -151,7 +152,8 @@ pub(crate) fn connect_to_server(
     ip: &str,
     ip_port: i32,
 ) -> Option<(i32, PortHandle)> {
-    let socket = NEXT_SOCKET.load(Ordering::Relaxed);
+    let mut next = NEXT_SOCKET.lock().unwrap();
+    let socket = *next;
     if socket >= MAX_SOCKETS {
         println!("ConnectToServer: too many open sockets, max={MAX_SOCKETS}");
         return None;
@@ -188,7 +190,7 @@ pub(crate) fn connect_to_server(
         refused("drvAsynIPPortConfigure: Can't register myself.");
         return None;
     };
-    NEXT_SOCKET.store(socket + 1, Ordering::Relaxed);
+    *next = socket + 1;
     Some((socket as i32, handle.port_handle().clone()))
 }
 
@@ -773,7 +775,7 @@ pub fn xps_create_axis_command() -> CommandDef {
                         );
                         println!(
                             "SetTCPTimeout, SocketIndex=-1, must be >=0 and < {}",
-                            NEXT_SOCKET.load(Ordering::Relaxed)
+                            *NEXT_SOCKET.lock().unwrap()
                         );
                         XpsSocket::invalid(&port_name, SocketMode::Fire)
                     }
@@ -1706,7 +1708,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
                     None => {
                         println!(
                             "SetTCPTimeout, SocketIndex=-1, must be >=0 and < {}",
-                            NEXT_SOCKET.load(Ordering::Relaxed)
+                            *NEXT_SOCKET.lock().unwrap()
                         );
                         XpsSocket::invalid(&port_name, SocketMode::Fire)
                     }
@@ -2734,6 +2736,26 @@ mod tests {
         assert_eq!(tclcall(Some(&socket), "a.tcl", "t", "1"), -3);
         assert_eq!(tclcall(None, "a.tcl", "t", "1"), -22);
     }
+
+    /// Two xpsSlave instances connect from their own sequencer threads:
+    /// each gets its own socket, where C's unlocked nextSocket could hand
+    /// both one port name.
+    #[epics_rs::base::epics_test]
+    async fn concurrent_connects_take_distinct_sockets() {
+        let db = PvDatabase::new();
+        let mut indices: Vec<i32> = std::thread::scope(|s| {
+            let joins: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| connect_to_server(&db, "127.0.0.1", 1).map(|(i, _)| i)))
+                .collect();
+            joins
+                .into_iter()
+                .map(|j| j.join().unwrap().unwrap())
+                .collect()
+        });
+        indices.sort();
+        indices.dedup();
+        assert_eq!(indices.len(), 4);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -3190,7 +3212,7 @@ mod report {
     /// XPSAxis.cpp:207-219); the axis prints at every level.
     #[epics_rs::base::epics_test]
     async fn xps_report_prints_the_controller_then_each_axis() {
-        let first = NEXT_SOCKET.load(Ordering::Relaxed);
+        let first = *NEXT_SOCKET.lock().unwrap();
         let args = vec![
             ArgValue::String("xpsRep".into()),
             ArgValue::String("127.0.0.1".into()),
