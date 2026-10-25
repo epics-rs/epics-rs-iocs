@@ -9,9 +9,9 @@
 #============================================================
 
 epicsEnvSet("CAM",    "cam1:")
-epicsEnvSet("QSIZE",  "200")
-epicsEnvSet("NCHANS", "128")
-epicsEnvSet("CBUFFS", "50")
+epicsEnvSet("QSIZE",  "2000")
+epicsEnvSet("NCHANS", "2048")
+epicsEnvSet("CBUFFS", "500")
 
 # Template-internal `include` lines resolve through the db search path:
 # pylon.template includes ADGenICam.template, which includes ad-core-rs's
@@ -20,6 +20,7 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(ADPYLON)/db")
 
 # ADPylonConfig(portName, cameraId, maxMemory, priority, stackSize)
 ADPylonConfig("$(PORT)", "$(CAMERA_ID)", 0, 0, 0)
+asynSetTraceIOMask($(PORT), 0, 2)
 
 # Main database
 dbLoadRecords("$(ADPYLON)/db/pylon.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT)")
