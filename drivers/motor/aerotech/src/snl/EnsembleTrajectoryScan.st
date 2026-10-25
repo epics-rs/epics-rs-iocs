@@ -865,7 +865,8 @@ static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos)
 			rawF = 0;
 		else
 			rawF = atof(&inputBuff[1]);
-		rawP = rawF / fabs(pVar->epicsMotorMres[j]);
+		/* Upstream truncated, so 0.58/0.01 read back as step 57; userToRaw rounds. */
+		rawP = NINT(rawF / fabs(pVar->epicsMotorMres[j]));
         if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1;
 		pos[j] = rawToUser(rawP, pVar->epicsMotorOff[j], dir, pVar->epicsMotorMres[j]);
     }
