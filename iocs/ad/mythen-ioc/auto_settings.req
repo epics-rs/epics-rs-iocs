@@ -1,6 +1,6 @@
 file "ADBase_settings.req",         P=$(P),  R=cam1:
 $(P)cam1:AcquireTime.PREC
-file "NDFile_settings.req",         P=$(P),  R=cam1:
+# C includes NDFile_settings.req for cam1:, which mythen.template lacks.
 file "mythen_settings.req",       P=$(P),  R=cam1:
 file "NDPluginBase_settings.req",   P=$(P),  R=image1:
 file "NDStdArrays_settings.req",    P=$(P),  R=image1:

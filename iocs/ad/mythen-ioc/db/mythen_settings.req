@@ -1,5 +1,6 @@
 file "ADBase_settings.req", P=$(P), R=$(R)
-file "NDFile_settings.req", P=$(P), R=$(R)
+# C also includes NDFile_settings.req and names NumCycles; mythen.template
+# has neither record, so each save reported 27 PVs unconnected.
 $(P)$(R)Setting
 $(P)$(R)BeamEnergy
 $(P)$(R)ThresholdEnergy
@@ -12,7 +13,6 @@ $(P)$(R)TriggerMode
 $(P)$(R)DelayTime
 $(P)$(R)UseGates
 $(P)$(R)NumGates
-$(P)$(R)NumCycles
 $(P)$(R)NumFrames
 $(P)$(R)ReadMode
 
