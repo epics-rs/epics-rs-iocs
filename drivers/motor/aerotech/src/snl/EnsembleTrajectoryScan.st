@@ -835,7 +835,8 @@ static int writeRead(SS_ID ssId, struct UserVar *pVar, char *command, char *repl
 		if (status) printf("writeRead: pasynOctetSyncIO->writeRead returned %d\n", status);
 	}
 	if (pVar->simMode || (pVar->debugLevel >= 3)) {
-		if (buffer[strlen(buffer)-1] == '\n') buffer[strlen(buffer)-1] = '\0';
+		/* abortCommand is empty until the first build, and upstream then read buffer[-1]. */
+		if ((strlen(buffer) > 0) && (buffer[strlen(buffer)-1] == '\n')) buffer[strlen(buffer)-1] = '\0';
 		printf("    writeRead:command='%s', reply='%s'\n", buffer, reply);
 	}
 	return(status);
