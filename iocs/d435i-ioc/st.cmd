@@ -54,7 +54,13 @@ dbLoadRecords("$(ADD435I)/db/d435i_depth.template", "P=$(PREFIX),R=depth1:,PORT=
 < $(ADD435I)/d435iDepthPlugins.cmd
 < $(ADD435I)/d435iPCPlugins.cmd
 
+# Autosave as st.d435i.cmd does, in a save dir of this prefix's own.
+set_requestfile_path("$(ADD435I)")
+set_savefile_path("$(ADD435I)/autosave/RS1")
+
 iocInit()
+
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
 
 # Example interactive commands:
 #   dbl                                # List all PVs

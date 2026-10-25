@@ -7,6 +7,10 @@
 # autosave state written at runtime by create_monitor_set
 /iocs/*/autosave/*
 !/iocs/*/autosave/README
+# d435i keeps one save dir per camera prefix
+!/iocs/d435i-ioc/autosave/*/
+/iocs/d435i-ioc/autosave/*/*
+!/iocs/d435i-ioc/autosave/*/README
 # quadEM ships each IOC its autosave dir with a README placeholder, as C does
 /iocs/quadem/*/autosave/*
 !/iocs/quadem/*/autosave/README
