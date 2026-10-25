@@ -815,6 +815,10 @@ static int writeRead(SS_ID ssId, struct UserVar *pVar, char *command, char *repl
 	strncpy(buffer, command, MAX_MESSAGE_STRING-3);
 
 	/*strcat(buffer, "\n");*/
+	/* A failed (or simulated) writeRead leaves reply as it was: in upstream, an
+	 * uninitialized caller buffer whose [0] and [1] every caller then parses.
+	 * Every reply buffer is MAX_MESSAGE_STRING. */
+	memset(reply, 0, MAX_MESSAGE_STRING);
 	/* Use 30 second timeout, some commands take a long time to reply */
 	if (!(pVar->simMode)) {
 		status = pasynOctetSyncIO->writeRead((asynUser *)pVar->pasynUser, buffer,
@@ -843,6 +847,7 @@ static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos)
 
 	for (j=0; j<pVar->numAxes; j++) {
 		sprintf(outputBuff, "PFBKPROG(@%d)", j);
+		memset(inputBuff, 0, MAX_MESSAGE_STRING);	/* see writeRead */
 		status = pasynOctetSyncIO->writeRead((asynUser *)pVar->pasynUser, outputBuff,
 							   strlen(outputBuff), inputBuff, MAX_MESSAGE_STRING, 
 							   30.0, &nwrite, &nread, &eomReason);
@@ -877,6 +882,7 @@ static int getMotorMoving(SS_ID ssId, struct UserVar *pVar, int movingMask)
 	sprintf(outputBuff, "PLANESTATUS(0)");
 
 	for (i=0, count=0; i<MAX_DONE_TRY; i++) {
+		memset(inputBuff, 0, MAX_MESSAGE_STRING);	/* see writeRead */
 		status = pasynOctetSyncIO->writeRead((asynUser *)pVar->pasynUser, outputBuff,
 							   strlen(outputBuff), inputBuff, MAX_MESSAGE_STRING, 
 							   30.0, &nwrite, &nread, &eomReason);
