@@ -71,6 +71,8 @@ impl PortDriver for FakeXps {
             "PositionerSGammaParametersGet" => "0,10,40,0.02,0.02",
             "GatheringCurrentNumberGet" => "0,2,100",
             "GatheringDataMultipleLinesGet" => "0,1;1.5\n2;2.5",
+            "SingleAxisSlaveParametersGet" if cmd.contains("(NORATIO,") => "0,G1.P1,",
+            "SingleAxisSlaveParametersGet" => "0,G1.P1,2.5",
             _ => "0,0",
         };
         self.reply = Some(format!("{values},EndOfAPI"));

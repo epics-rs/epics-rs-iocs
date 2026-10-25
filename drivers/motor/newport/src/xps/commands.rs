@@ -10,6 +10,8 @@
 //!
 //! [`SocketMode`]: super::rpc::SocketMode
 
+use epics_rs::base::runtime::stdlib::strtod;
+
 use super::rpc::{XpsResult, XpsSocket, g13 as g};
 
 /// Marshal an extended-event name list: each element is followed by its four
@@ -559,5 +561,101 @@ impl XpsSocket {
         let cmd = format!("EventExtendedRemove ({id})");
         self.exec(&cmd)?.require_ok()?;
         Ok(())
+    }
+
+    // --- Single-axis slave (gearing), xpsSlave.st -------------------------
+
+    /// `SingleAxisSlaveModeEnable(group)`.
+    pub fn single_axis_slave_mode_enable(&self, group: &str) -> XpsResult<()> {
+        self.exec(&format!("SingleAxisSlaveModeEnable ({group})"))?
+            .require_ok()?;
+        Ok(())
+    }
+
+    /// `SingleAxisSlaveModeDisable(group)`.
+    pub fn single_axis_slave_mode_disable(&self, group: &str) -> XpsResult<()> {
+        self.exec(&format!("SingleAxisSlaveModeDisable ({group})"))?
+            .require_ok()?;
+        Ok(())
+    }
+
+    /// `SingleAxisSlaveParametersSet(group, masterPositioner, ratio)`.
+    pub fn single_axis_slave_parameters_set(
+        &self,
+        group: &str,
+        master: &str,
+        ratio: f64,
+    ) -> XpsResult<()> {
+        let cmd = format!(
+            "SingleAxisSlaveParametersSet ({group},{master},{})",
+            g(ratio)
+        );
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `SingleAxisSlaveParametersGet(group)` into `master` and `ratio`. As C
+    /// (XPS_C8_drivers.cpp:7690-7705), each keeps what it held when its
+    /// field is missing, and `ratio` too when its field is no `%lf`.
+    pub fn single_axis_slave_parameters_get(
+        &self,
+        group: &str,
+        master: &mut String,
+        ratio: &mut f64,
+    ) -> XpsResult<()> {
+        let cmd = format!("SingleAxisSlaveParametersGet ({group},char *,double *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        if let Some(name) = r.field(1) {
+            *master = name.to_string();
+        }
+        if let Some(read) = r.field(2).map(|f| strtod(f.as_bytes()))
+            && read.len > 0
+        {
+            *ratio = read.value;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::fake::FakeLine;
+    use super::super::rpc::SocketMode;
+
+    /// XPS_C8_drivers.cpp:7574-7710: the SingleAxisSlave* wire strings, and
+    /// a failed or short Get leaves its out-parameters alone.
+    #[test]
+    fn single_axis_slave_calls_marshal_as_c() {
+        let line = FakeLine::new("xps_slave_calls", "");
+        let sock = line.socket(SocketMode::Query);
+        sock.single_axis_slave_parameters_set("G2", "G1.P1", 0.1)
+            .unwrap();
+        sock.single_axis_slave_mode_enable("G2").unwrap();
+        sock.single_axis_slave_mode_disable("G2").unwrap();
+        let (mut master, mut ratio) = (String::new(), 0.0);
+        sock.single_axis_slave_parameters_get("G2", &mut master, &mut ratio)
+            .unwrap();
+        assert_eq!((master.as_str(), ratio), ("G1.P1", 2.5));
+        assert_eq!(
+            line.take_log(),
+            [
+                "SingleAxisSlaveParametersSet (G2,G1.P1,0.1)",
+                "SingleAxisSlaveModeEnable (G2)",
+                "SingleAxisSlaveModeDisable (G2)",
+                "SingleAxisSlaveParametersGet (G2,char *,double *)",
+            ]
+        );
+
+        let (mut master, mut ratio) = ("kept".to_string(), 7.0);
+        sock.single_axis_slave_parameters_get("NORATIO", &mut master, &mut ratio)
+            .unwrap();
+        assert_eq!((master.as_str(), ratio), ("G1.P1", 7.0));
+
+        *line.fail.lock().unwrap() = "SingleAxisSlaveParametersGet";
+        let (mut master, mut ratio) = ("kept".to_string(), 7.0);
+        let err = sock
+            .single_axis_slave_parameters_get("G2", &mut master, &mut ratio)
+            .unwrap_err();
+        assert_eq!((err.code(), master.as_str(), ratio), (-3, "kept", 7.0));
     }
 }
