@@ -1,6 +1,6 @@
 //! ai/ao `special(SPC_LINCONV)` through each ip dset's convert slot
 //! (`aiRecord.c:187-198`, `aoRecord.c:254-265`). The expected ESLO/EOFF/ROFF
-//! are a C IOC built from base 8f5015b66, asyn and ip d00f687's five dset
+//! are a C IOC built from base 8f5015b66, asyn and ip d00f687's four dset
 //! sources, with the same records and puts.
 
 use std::collections::HashMap;
@@ -178,42 +178,6 @@ fn televac_ai_takes_a_unit_slope() {
             [1.0, 5.0, 0.0, -7.0, 1.1],
             [1.0, 5.0, 0.0, -7.0, 1.1],
             [1.0, 1.0, 0.0, -7.0, 1.1],
-        ]
-    );
-}
-
-/// `strParmConvert` is `MPCConvert`'s body, with the same ao cast.
-#[test]
-fn strparm_ai_takes_a_unit_slope_and_ao_rebases_eoff_only() {
-    let factory = ip_devices::strparm::device_support_factory;
-    let ai = linconv(
-        "LC:SPAI",
-        "ai",
-        "asyn ai stringParm",
-        "@asyn(P 1)",
-        factory(),
-    );
-    assert_eq!(
-        ai,
-        [
-            [1.0, 5.0, 0.0, -7.0, 1.1],
-            [1.0, 5.0, 0.0, -7.0, 1.1],
-            [1.0, 1.0, 0.0, -7.0, 1.1],
-        ]
-    );
-    let ao = linconv(
-        "LC:SPAO",
-        "ao",
-        "asyn ao stringParm",
-        "@asyn(P 1)",
-        factory(),
-    );
-    assert_eq!(
-        ao,
-        [
-            [2.0, 5.0, 4.0, -7.0, 1.1],
-            [2.0, 5.0, 4.0, -7.0, 1.1],
-            [2.0, 1.0, 4.0, -7.0, 1.1],
         ]
     );
 }

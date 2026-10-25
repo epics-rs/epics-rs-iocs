@@ -349,6 +349,9 @@ mca-rs = "0.32.0"
 # StreamDevice port (syringepump-ioc's Teledyne D/H). Not on crates.io; the
 # patch below supplies it at the same rev as every other epics-rs crate.
 stream-rs = { version = "0.32.0", package = "epics-stream-rs" }
+# synApps ip's SNL programs and devXxStrParm, which drivers/ip re-exports.
+# Not on crates.io; the patch below supplies it from epics-rs.
+ip-rs = "0.32.0"
 # float_roundtrip makes the parser correctly rounded, as C's strtod is;
 # without it some doubles parse 1 ULP off.
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -376,6 +379,7 @@ epics-rtems-boot = { git = "file:///home/stevek/work/epics-rs", rev = "505b4b632
 epics-seq-rs = { git = "file:///home/stevek/work/epics-rs", rev = "505b4b63230e88e9ad57d7742166cd3bffa15736" }
 epics-snc-rs = { git = "file:///home/stevek/work/epics-rs", rev = "505b4b63230e88e9ad57d7742166cd3bffa15736" }
 epics-stream-rs = { git = "file:///home/stevek/work/epics-rs", rev = "505b4b63230e88e9ad57d7742166cd3bffa15736" }
+ip-rs = { git = "file:///home/stevek/work/epics-rs", rev = "13ca1af7c7ff5c44ccfe844665b0b10e9e1dd4ae" }
 mca-rs = { git = "file:///home/stevek/work/epics-rs", rev = "505b4b63230e88e9ad57d7742166cd3bffa15736" }
 motor-rs = { git = "file:///home/stevek/work/epics-rs", rev = "505b4b63230e88e9ad57d7742166cd3bffa15736" }
 scaler-rs = { git = "file:///home/stevek/work/epics-rs", rev = "505b4b63230e88e9ad57d7742166cd3bffa15736" }

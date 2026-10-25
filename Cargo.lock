@@ -2235,6 +2235,7 @@ version = "0.1.0"
 dependencies = [
  "epics-libcom-rs",
  "epics-rs",
+ "ip-rs",
 ]
 
 [[package]]
@@ -2245,6 +2246,18 @@ dependencies = [
  "epics-rs",
  "ip-devices",
  "tokio",
+]
+
+[[package]]
+name = "ip-rs"
+version = "0.32.0"
+source = "git+file:///home/stevek/work/epics-rs?rev=13ca1af7c7ff5c44ccfe844665b0b10e9e1dd4ae#13ca1af7c7ff5c44ccfe844665b0b10e9e1dd4ae"
+dependencies = [
+ "asyn-rs",
+ "epics-base-rs",
+ "epics-libcom-rs",
+ "epics-seq-rs",
+ "epics-snc-rs",
 ]
 
 [[package]]
