@@ -360,6 +360,12 @@ ss EnsembleTrajectoryScan {
 			pvPut(buildMessage);
 
 			buildStatus = STATUS_SUCCESS; /* presume we'll be successful */
+			/* Upstream built with nelements as put, which monitor_inputs bounds only by the
+			 * controller's DGLOBALs (to -6 if unread); the arrays hold MAX_ELEMENTS. */
+			if ((nelements < 1) || (nelements > MAX_ELEMENTS)) {
+				nelements = MAX(1, MIN(nelements, MAX_ELEMENTS));
+				pvPut(nelements);
+			}
 			/* Initialize new trajectory */
 			/* If time mode is TIME_MODE_TOTAL then construct timeTrajectory and post it */
 			if (timeMode == TIME_MODE_TOTAL) {
