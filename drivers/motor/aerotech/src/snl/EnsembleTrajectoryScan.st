@@ -417,7 +417,8 @@ ss EnsembleTrajectoryScan {
                 		if (limitViolation) {
 							epicsSnprintf(buildMessage, MSGSIZE, "Limit: m%d at pt. %d (%f)", j+1, k+1, posActual);
 						}
-						if (velocity[j][k] > vmax) {
+						/* Upstream compared the signed velocity, so a negative-going trajectory had no V limit. */
+						if (fabs(velocity[j][k]) > vmax) {
 							limitViolation |= 1;
 							epicsSnprintf(buildMessage, MSGSIZE, "V limit: m%d at pt. %d (%f)", j+1, k+1,
 								velocity[j][k]);
