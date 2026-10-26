@@ -940,7 +940,11 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
             skip_image = true;
             continue;
         };
-        frame.pixels.write_into(array.fill().data_mut().view_mut());
+        array
+            .fill()
+            .data_mut()
+            .as_u8_slice_mut()
+            .copy_from_slice(frame.bytes());
         // Per frame, after its updateTimeStamps (eigerDetector.cpp:1880, :1892).
         let timestamp = port_stamp(&s.handle).await;
         let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
@@ -2088,8 +2092,9 @@ mod tests {
         std::mem::forget(runtime);
     }
 
-    /// A FileWriter-shaped file: `/entry/data/data` of u16 images, `[n, h, w]`.
-    fn h5_file(shape: [usize; 3]) -> Vec<u8> {
+    /// `/entry/data/data` of u16 images, its pixels counting up from 0;
+    /// `chunked` stores one image per chunk, as the FileWriter does.
+    fn h5_file(shape: &[usize], chunked: bool) -> Vec<u8> {
         let path = std::env::temp_dir().join(format!(
             "eiger-h5-{}-{:?}.h5",
             std::process::id(),
@@ -2102,11 +2107,17 @@ mod tests {
             .create_group("data")
             .unwrap();
         let n: usize = shape.iter().product();
-        data.new_dataset::<u16>()
-            .shape(shape)
+        let mut dataset = data.new_dataset::<u16>().shape(shape);
+        if chunked {
+            let mut one_image = shape.to_vec();
+            let images = one_image.len() - 2;
+            one_image[..images].fill(1);
+            dataset = dataset.chunk(&one_image);
+        }
+        dataset
             .create("data")
             .unwrap()
-            .write_raw(&(0..n as u16).collect::<Vec<_>>())
+            .write_raw(&(0..n).map(|i| i as u16).collect::<Vec<_>>())
             .unwrap();
         file.close().unwrap();
         let bytes = std::fs::read(&path).unwrap();
@@ -2218,7 +2229,9 @@ mod tests {
         );
 
         s.set_int(s.ad.base.array_callbacks, 1).await;
-        parse_h5(&s, &h5_file([2, 1, 2])).await.expect("parse");
+        parse_h5(&s, &h5_file(&[2, 1, 2], true))
+            .await
+            .expect("parse");
         let mut ids = Vec::new();
         for _ in 0..2 {
             ids.push(rx.recv().await.expect("array").unique_id);
@@ -2240,7 +2253,9 @@ mod tests {
         );
 
         s.set_int(callbacks, 1).await;
-        parse_h5(&s, &h5_file([2, 1, 2])).await.expect("parse");
+        parse_h5(&s, &h5_file(&[2, 1, 2], true))
+            .await
+            .expect("parse");
         assert_eq!(rx.recv().await.expect("frame 0").unique_id, 0);
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
         assert_eq!(rx.pending(), 0, "ArrayCallbacks=0 before frame 1");
@@ -2284,6 +2299,86 @@ mod tests {
             panic!("a uint16 frame is NDUInt16");
         };
         assert_eq!(got, &pixels[..]);
+    }
+
+    /// Allocations of exactly `bytes` while a new port named `name` parses
+    /// `file`, and that port's sink.
+    async fn h5_allocs(
+        name: &str,
+        file: &[u8],
+        bytes: usize,
+    ) -> (usize, epics_rs::ad_core::plugin::channel::NDArrayReceiver) {
+        let (s, rx) = h5_rig(name);
+        s.set_int(s.ad.base.array_callbacks, 1).await;
+        let counted = crate::alloc_count::count(bytes);
+        parse_h5(&s, file).await.expect("parse");
+        (counted.stop(), rx)
+    }
+
+    /// A FileWriter image costs its pool buffer and its decoded chunk, and no
+    /// other buffer of its size: C's `H5Dread` decodes the chunk into `pData`
+    /// (eigerDetector.cpp:1869). A read of the whole dataset decodes the same
+    /// chunks, so only its buffer of every image tells it apart.
+    #[tokio::test]
+    async fn an_h5_image_is_copied_from_its_chunk_into_its_pool_buffer() {
+        let (cols, rows) = (300usize, 200usize);
+        let size = cols * rows * 2;
+        let counted = crate::alloc_count::count(size);
+        let pooled = DriverPool::standalone(0).alloc(
+            vec![NDDimension::new(cols), NDDimension::new(rows)],
+            NDDataType::UInt16,
+        );
+        let pool_only = counted.stop();
+        drop(pooled);
+
+        let shapes: [(&str, &[usize]); 2] = [
+            ("EIGER_H5_ALLOCS", &[2, rows, cols]),
+            ("EIGER_H5_ALLOCS_4D", &[2, 2, rows, cols]),
+        ];
+        for (name, shape) in shapes {
+            let images: usize = shape[..shape.len() - 2].iter().product();
+            let file = h5_file(shape, true);
+            let (allocs, mut rx) = h5_allocs(name, &file, size).await;
+            assert_eq!(
+                allocs,
+                images * (pool_only + 1),
+                "{name} frame-sized allocations"
+            );
+            let (whole, _rx) = h5_allocs(&format!("{name}_WHOLE"), &file, images * size).await;
+            assert_eq!(whole, 0, "{name} whole-dataset allocations");
+            for image in 0..images {
+                let array = rx.recv().await.expect("the image is published");
+                let NDDataView::U16(got) = array.data().view() else {
+                    panic!("a uint16 image is NDUInt16");
+                };
+                let first = image * rows * cols;
+                assert!(
+                    got.iter().zip(first..).all(|(&p, i)| p == i as u16),
+                    "{name} image {image}"
+                );
+            }
+        }
+    }
+
+    /// C reads image `i`, threshold `j` in that order whatever the layout
+    /// (eigerDetector.cpp:1843-1870); SignedData relabels the same bits.
+    #[tokio::test]
+    async fn h5_images_publish_in_c_order_whether_chunked_or_not() {
+        for (name, chunked) in [("EIGER_H5_CHUNKED", true), ("EIGER_H5_WHOLE", false)] {
+            let (s, mut rx) = h5_rig(name);
+            s.set_int(s.ad.base.array_callbacks, 1).await;
+            s.set_int(s.p.signed_data, 1).await;
+            parse_h5(&s, &h5_file(&[2, 2, 1, 3], chunked))
+                .await
+                .expect("parse");
+            for k in 0..4i16 {
+                let array = rx.recv().await.expect("the image is published");
+                let NDDataView::I16(got) = array.data().view() else {
+                    panic!("a SignedData uint16 image is NDInt16");
+                };
+                assert_eq!(got, &[3 * k, 3 * k + 1, 3 * k + 2], "{name} image {k}");
+            }
+        }
     }
 
     /// One single-part stream v1 message; a PUSH socket refuses to send until
@@ -2438,7 +2533,9 @@ mod tests {
         s.ops.fetch(s.p.file_owner).unwrap();
         s.ops.put_int(s.p.fw_enable, 1).unwrap();
         s.set_int(s.ad.base.array_callbacks, 1).await;
-        parse_h5(&s, &h5_file([1, 1, 2])).await.expect("parse");
+        parse_h5(&s, &h5_file(&[1, 1, 2], true))
+            .await
+            .expect("parse");
         rx.recv().await.expect("array");
         let job = Arc::new(FileJob {
             name: "f.h5".into(),

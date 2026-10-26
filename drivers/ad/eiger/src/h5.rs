@@ -3,15 +3,20 @@
 //!
 //! The C driver opens the downloaded `_data_*.h5` blob straight out of memory
 //! with `H5LTopen_file_image` and reads `/entry/data/data` one hyperslab at a
-//! time. This port does the same with `hdf5-reader` (pure Rust, read-only),
+//! time. This port reads the same images with `hdf5-reader` (pure Rust, read-only),
 //! plus a locally-registered bitshuffle/LZ4 filter — HDF5 filter id 32008 —
 //! which is what libhdf5 loads out of `HDF5_PLUGIN_PATH` in the C build. No
 //! plugin path, no `libhdf5`, no `libbshuf` is needed here.
 
-use epics_rs::ad_core::ndarray::{NDDataType, NDDataViewMut};
+use std::ops::Range;
+use std::sync::Arc;
+
+use epics_rs::ad_core::ndarray::NDDataType;
 use hdf5_reader::error::{Error as H5Error, Result as H5Result};
 use hdf5_reader::messages::filter_pipeline::FilterDescription;
-use hdf5_reader::{Datatype, FilterRegistry, Hdf5File, OpenOptions, SliceInfo, SliceInfoElem};
+use hdf5_reader::{
+    ByteOrder, Dataset, DatasetChunk, Datatype, FilterRegistry, Hdf5File, OpenOptions,
+};
 
 use crate::bslz4;
 
@@ -58,10 +63,25 @@ pub fn layout_of(dims: &[u64]) -> Result<Layout, String> {
 /// The detector writes unsigned data. Bad pixels and gaps are very large
 /// positive numbers, which makes autoscaling awkward, so `signed_data`
 /// reinterprets the same bytes as signed (C, eigerDetector.cpp:1782-1794).
+/// C takes only the native unsigned types (`H5Tequal` against
+/// `H5T_NATIVE_UINT*`), so an image's bytes go into the NDArray unconverted.
 pub fn data_type_of(dtype: &Datatype, signed_data: bool) -> Result<NDDataType, String> {
-    let Datatype::FixedPoint { size, .. } = dtype else {
+    let native = if cfg!(target_endian = "little") {
+        ByteOrder::LittleEndian
+    } else {
+        ByteOrder::BigEndian
+    };
+    let Datatype::FixedPoint {
+        size,
+        signed: false,
+        byte_order,
+    } = dtype
+    else {
         return Err("invalid data type".into());
     };
+    if *byte_order != native {
+        return Err("invalid data type".into());
+    }
     Ok(match (size, signed_data) {
         (1, false) => NDDataType::UInt8,
         (1, true) => NDDataType::Int8,
@@ -102,39 +122,27 @@ pub struct H5Frame {
     pub dims: [usize; 2],
     /// The NDArray type the pixels go out as (C's `ndType`).
     pub data_type: NDDataType,
-    pub pixels: H5Pixels,
     /// 0-based threshold index within the frame (C's `j`).
     pub threshold: usize,
+    pixels: Pixels,
 }
 
-/// One hyperslab as `hdf5-reader` returns it, in the file's unsigned type.
-pub enum H5Pixels {
-    U8(Vec<u8>),
-    U16(Vec<u16>),
-    U32(Vec<u32>),
+/// Where one image's decoded bytes are held.
+enum Pixels {
+    /// Its own chunk: the FileWriter writes one image per chunk.
+    Chunk(DatasetChunk),
+    /// Its span of the whole dataset, read at once for any other layout.
+    Span(Arc<Vec<u8>>, Range<usize>),
 }
 
-impl H5Pixels {
-    /// Copy into `out`, an array of the frame's `data_type`. SignedData only
-    /// relabels the same bits.
-    ///
-    /// C's `H5Dread` reads straight into `pData` (eigerDetector.cpp:1869);
-    /// `hdf5-reader` reads a hyperslab only into an array of its own, so the
-    /// pixels pass once more here.
-    pub fn write_into(&self, out: NDDataViewMut<'_>) {
-        fn copy<S: Copy, D>(src: &[S], dst: &mut [D], cast: impl Fn(S) -> D) {
-            for (d, s) in dst.iter_mut().zip(src) {
-                *d = cast(*s);
-            }
-        }
-        match (self, out) {
-            (Self::U8(v), NDDataViewMut::U8(d)) => d.copy_from_slice(v),
-            (Self::U8(v), NDDataViewMut::I8(d)) => copy(v, d, |x| x as i8),
-            (Self::U16(v), NDDataViewMut::U16(d)) => d.copy_from_slice(v),
-            (Self::U16(v), NDDataViewMut::I16(d)) => copy(v, d, |x| x as i16),
-            (Self::U32(v), NDDataViewMut::U32(d)) => d.copy_from_slice(v),
-            (Self::U32(v), NDDataViewMut::I32(d)) => copy(v, d, |x| x as i32),
-            (_, out) => unreachable!("an H5 frame is never {:?}", out.data_type()),
+impl H5Frame {
+    /// The image's bytes as the NDArray holds them: SignedData only relabels
+    /// them. C's `H5Dread` decodes them into `pData` (eigerDetector.cpp:1869),
+    /// so copy them straight into the pool array.
+    pub fn bytes(&self) -> &[u8] {
+        match &self.pixels {
+            Pixels::Chunk(chunk) => chunk.bytes(),
+            Pixels::Span(all, at) => &all[at.clone()],
         }
     }
 }
@@ -150,8 +158,8 @@ fn report(err: &mut dyn FnMut(&str), msg: &str) -> Reported {
 
 /// Read every image out of an in-memory `_data_*.h5` blob.
 ///
-/// C reads one hyperslab at a time straight into a pooled NDArray; this reads
-/// the same hyperslabs and hands each back for the caller to copy into one.
+/// C reads one hyperslab at a time straight into a pooled NDArray; this
+/// decodes the same images, in C's order, for the caller to copy into one.
 ///
 /// `err` receives the lines C's `parseH5File` prints, in its words; `Err(Reported)`
 /// means one of them ended the parse.
@@ -179,75 +187,59 @@ pub fn parse(
 
     let layout = layout_of(dataset.shape()).map_err(|e| report(err, &e))?;
     let data_type = data_type_of(dataset.dtype(), signed_data).map_err(|e| report(err, &e))?;
-    let n_dims = dataset.ndim();
 
-    let mut frames = Vec::with_capacity(layout.n_images * layout.n_thresh);
-    for i in 0..layout.n_images {
-        for j in 0..layout.n_thresh {
-            let mut selections = vec![SliceInfoElem::Index(i as u64)];
-            if n_dims == 4 {
-                selections.push(SliceInfoElem::Index(j as u64));
-            }
-            selections.push(SliceInfoElem::Slice {
-                start: 0,
-                end: layout.height as u64,
-                step: 1,
-            });
-            selections.push(SliceInfoElem::Slice {
-                start: 0,
-                end: layout.width as u64,
-                step: 1,
-            });
-            let selection = SliceInfo { selections };
-
-            let pixels = read_slice(&dataset, &selection, data_type)
-                .map_err(|_| report(err, "couldn't read image"))?;
-            frames.push(H5Frame {
-                dims: [layout.width, layout.height],
-                data_type,
-                pixels,
-                threshold: j,
-            });
-        }
-    }
-    Ok(frames)
+    let images =
+        images(&dataset, &layout, data_type).map_err(|_| report(err, "couldn't read image"))?;
+    Ok(images
+        .into_iter()
+        .enumerate()
+        .map(|(k, pixels)| H5Frame {
+            dims: [layout.width, layout.height],
+            data_type,
+            threshold: k % layout.n_thresh,
+            pixels,
+        })
+        .collect())
 }
 
-/// Read one hyperslab in the file's unsigned type.
-///
-/// The file always stores unsigned data; `signed_data` only changes how the
-/// same bits are labelled (C reads with the *file* datatype into the
-/// NDArray's buffer, which is the same reinterpretation).
-fn read_slice(
-    dataset: &hdf5_reader::Dataset,
-    selection: &SliceInfo,
-    data_type: NDDataType,
-) -> H5Result<H5Pixels> {
-    Ok(match data_type.element_size() {
-        1 => H5Pixels::U8(
-            dataset
-                .read_slice::<u8>(selection)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
-        2 => H5Pixels::U16(
-            dataset
-                .read_slice::<u16>(selection)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
-        4 => H5Pixels::U32(
-            dataset
-                .read_slice::<u32>(selection)?
-                .into_raw_vec_and_offset()
-                .0,
-        ),
-        _ => {
-            return Err(H5Error::InvalidData(format!(
-                "unsupported data type {data_type:?}"
-            )));
-        }
-    })
+/// Every image's bytes, in C's order (`i`, then `j`).
+fn images(dataset: &Dataset, layout: &Layout, data_type: NDDataType) -> H5Result<Vec<Pixels>> {
+    if let Some(chunks) = image_chunks(dataset, layout)? {
+        return Ok(chunks.into_iter().map(Pixels::Chunk).collect());
+    }
+    let all = Arc::new(dataset.read_raw_bytes()?);
+    let size = layout.height * layout.width * data_type.element_size();
+    Ok((0..layout.n_images * layout.n_thresh)
+        .map(|k| Pixels::Span(Arc::clone(&all), k * size..(k + 1) * size))
+        .collect())
+}
+
+/// The decoded chunks in C's image order, when every image is a chunk of its
+/// own; `None` for any other layout.
+fn image_chunks(dataset: &Dataset, layout: &Layout) -> H5Result<Option<Vec<DatasetChunk>>> {
+    let four_d = dataset.ndim() == 4;
+    let mut one_image = vec![1, layout.height as u32, layout.width as u32];
+    if four_d {
+        one_image.insert(0, 1);
+    }
+    if dataset.chunks() != Some(one_image) {
+        return Ok(None);
+    }
+    let mut slots: Vec<Option<DatasetChunk>> = std::iter::repeat_with(|| None)
+        .take(layout.n_images * layout.n_thresh)
+        .collect();
+    for chunk in dataset.iter_chunks()? {
+        let chunk = chunk?;
+        let at = chunk.offsets();
+        let k = at[0] as usize * layout.n_thresh + if four_d { at[1] as usize } else { 0 };
+        let Some(slot) = slots.get_mut(k) else {
+            return Ok(None);
+        };
+        *slot = Some(chunk);
+    }
+    // An unwritten chunk reads as the fill value, which only the whole read
+    // materializes.
+    Ok(slots.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -310,6 +302,24 @@ mod tests {
             byte_order: hdf5_reader::ByteOrder::LittleEndian,
         };
         assert!(data_type_of(&f64t, false).is_err());
+    }
+
+    /// C's `H5Tequal` against `H5T_NATIVE_UINT*` (eigerDetector.cpp:1782-1794)
+    /// refuses a signed or a foreign-endian file type.
+    #[test]
+    fn only_native_unsigned_file_types_are_read() {
+        let fixed = |signed, byte_order| Datatype::FixedPoint {
+            size: 2,
+            signed,
+            byte_order,
+        };
+        let foreign = if cfg!(target_endian = "little") {
+            ByteOrder::BigEndian
+        } else {
+            ByteOrder::LittleEndian
+        };
+        assert!(data_type_of(&fixed(true, ByteOrder::LittleEndian), false).is_err());
+        assert!(data_type_of(&fixed(false, foreign), false).is_err());
     }
 
     /// The filter is what libhdf5 would have loaded from `HDF5_PLUGIN_PATH`;
