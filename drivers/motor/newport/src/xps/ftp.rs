@@ -57,7 +57,23 @@ const RETURN_SIZE: usize = 1500;
 /// -3 (`PASS` refused). `ip` is dotted-quad, as `inet_addr` reads it.
 pub fn ftp_connect(ip: &str, login: &str, password: &str) -> Result<TcpStream, i32> {
     let ip: Ipv4Addr = ip.parse().map_err(|_| -1)?;
-    ftp_connect_to(SocketAddr::from((ip, XPS_FTP_PORT)), login, password)
+    ftp_connect_to(SocketAddr::from((ip, ftp_port())), login, password)
+}
+
+#[cfg(not(test))]
+fn ftp_port() -> u16 {
+    XPS_FTP_PORT
+}
+
+/// The port [`ftp_connect`] calls in a test, whose own server stands in
+/// for the XPS's privileged 21.
+#[cfg(test)]
+pub(crate) static FTP_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(XPS_FTP_PORT);
+
+#[cfg(test)]
+fn ftp_port() -> u16 {
+    FTP_PORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// [`ftp_connect`] to `addr`.
@@ -187,7 +203,7 @@ fn get_port(sock: &mut TcpStream) -> Option<SocketAddr> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -198,7 +214,7 @@ mod tests {
     /// A one-session FTP server on an ephemeral port: the commands it got,
     /// and the stored file's bytes, sent down `log`. `user` is the reply
     /// to `USER`.
-    fn server(user: &'static str) -> (SocketAddr, mpsc::Receiver<String>) {
+    pub(crate) fn server(user: &'static str) -> (SocketAddr, mpsc::Receiver<String>) {
         let control = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = control.local_addr().unwrap();
         let (log, rx) = mpsc::channel();
