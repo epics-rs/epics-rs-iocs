@@ -814,7 +814,7 @@ mod tests {
         });
         let write_timeout = io.timeout();
         let ctrl = FaulhaberController::new(io, 1).unwrap();
-        assert_eq!(ctrl.reader.timeout(), Duration::from_secs(1));
+        assert_eq!(ctrl.reader.timeout(), Some(Duration::from_secs(1)));
         assert_eq!(ctrl.handle.timeout(), write_timeout);
     }
 

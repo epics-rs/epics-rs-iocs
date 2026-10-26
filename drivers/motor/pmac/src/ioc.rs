@@ -2195,7 +2195,8 @@ mod tests {
         Controller::new()
             .install(asyn_user("pmacDeferCommsCtl", 1), axis)
             .unwrap();
-        let axis_io = SyncIOHandle::from_handle(io.port().unwrap().clone(), 1, io.timeout());
+        let axis_io =
+            SyncIOHandle::from_handle(io.port().unwrap().clone(), 1, io.timeout().unwrap());
         rig.silence("");
         axis_io
             .write_int32(index::DEFER_MOVES, DEFERRED_FAST_MOVES)

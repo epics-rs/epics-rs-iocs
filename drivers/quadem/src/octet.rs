@@ -69,7 +69,11 @@ pub struct OctetIo {
 
 impl Clone for OctetIo {
     fn clone(&self) -> Self {
-        self.with_timeout(self.io.timeout())
+        let io = match self.io.timeout() {
+            Some(timeout) => self.io.with_timeout(timeout),
+            None => self.io.waiting_forever(),
+        };
+        Self { io }
     }
 }
 
@@ -182,16 +186,18 @@ pub fn reply_text(data: &[u8]) -> String {
     String::from_utf8_lossy(data).trim_end().to_string()
 }
 
-fn octet_user(timeout: Duration) -> AsynUser {
+/// `timeout` is the bound user's own, `None` being C's negative "wait
+/// forever".
+fn octet_user(timeout: Option<Duration>) -> AsynUser {
     AsynUser::new(OCTET_REASON)
         .with_addr(OCTET_ADDR)
-        .with_timeout(timeout)
+        .with_timeout_opt(timeout)
 }
 
 /// The octet interface under [`OctetIo::locked`].
 pub struct LockedOctet<'a> {
     calls: &'a mut dyn PortCalls,
-    timeout: Duration,
+    timeout: Option<Duration>,
 }
 
 impl LockedOctet<'_> {
