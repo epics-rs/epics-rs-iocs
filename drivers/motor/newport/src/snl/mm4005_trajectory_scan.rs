@@ -737,20 +737,68 @@ mod tests {
             assert_eq!(elements(&p), 1996);
         }
 
-        /// ss trajectoryScan state build builds a relative trajectory of
-        /// fewer than one element as one, padded to four.
+        /// ss trajectoryScan state build sends a relative trajectory of no
+        /// elements as C does: no element, no padding, then the pulses and
+        /// the verify.
         #[epics_rs::base::epics_test]
-        async fn a_relative_build_below_one_element_builds_one() {
-            let p = boot("mm4005RelativeMin", &[]).await;
+        async fn a_relative_build_of_no_elements_sends_none() {
+            let p = boot("mm4005RelativeEmpty", &[]).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(0)).await;
+            p.sent();
+            p.build().await;
+            expect(
+                &p.db,
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 0.0)],
+            )
+            .await;
+            let mut want: Vec<String> = ["NC", "1DC1", "UC0.500000", "MB0,ME0,MN11", "VC", "TB"]
+                .map(String::from)
+                .into();
+            want.extend((1..=6).map(|n| format!("1RC{n}")));
+            assert_eq!(p.sent(), want);
+        }
+
+        /// ss trajectoryScan state build sends an absolute trajectory of one
+        /// element, which has no move, as C does: no element.
+        #[epics_rs::base::epics_test]
+        async fn an_absolute_build_of_one_element_sends_none() {
+            let p = boot("mm4005AbsoluteEmpty", &[]).await;
+            put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(1)).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(1)).await;
+            p.sent();
+            p.build().await;
+            expect(
+                &p.db,
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 1.0)],
+            )
+            .await;
+            assert_eq!(elements(&p), 0);
+        }
+
+        /// ss trajectoryScan state build raises a count below those, where C
+        /// indexes before the arrays, to them.
+        #[epics_rs::base::epics_test]
+        async fn a_build_below_its_least_elements_builds_the_least() {
+            let p = boot("mm4005BelowLeast", &[]).await;
             put(&p.db, "T:traj1:Nelements", EpicsValue::Long(-1)).await;
             p.sent();
             p.build().await;
             expect(
                 &p.db,
-                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 4.0)],
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 0.0)],
             )
             .await;
-            assert_eq!(elements(&p), 4);
+            assert_eq!(elements(&p), 0);
+            put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(1)).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(0)).await;
+            p.sent();
+            p.build().await;
+            expect(
+                &p.db,
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 1.0)],
+            )
+            .await;
+            assert_eq!(elements(&p), 0);
         }
 
         /// ss trajectoryScan state build: a TB error after VC fails the
