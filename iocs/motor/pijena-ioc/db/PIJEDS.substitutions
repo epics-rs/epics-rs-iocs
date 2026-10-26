@@ -1,0 +1,13 @@
+# C's iocPiJena PIJEDS.substitutions on this IOC's two axes, P from st.cmd;
+# the values are the motor record this IOC had before. Signal 0,1,2,... is
+# controller axis 0,1,2,... The E-516 is a closed-loop piezo positioner; the
+# driver scales the record's steps by drive_resolution (1e-3 um), as C, so
+# MRES = 1e-3 gives EGU = um. Homing and hardware limit switches are not
+# supported; VELO is the slew rate.
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{N,  M,        DTYP,      S,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)",  "PIJEDS",  0,  "",    um,   Pos,  10,    0,     .5,    0,     0,     .5,    1e-3,  3,     100,   0,     ""}
+{2,  "m$(N)",  "PIJEDS",  1,  "",    um,   Pos,  10,    0,     .5,    0,     0,     .5,    1e-3,  3,     100,   0,     ""}
+}
