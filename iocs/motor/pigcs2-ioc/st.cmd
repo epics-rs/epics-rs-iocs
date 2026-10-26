@@ -27,8 +27,12 @@ asynSetOption("$(PORT)", -1, "baud", "115200")
 # controller-reported order) are attached.
 PI_GCS2_CreateController("$(CTRL)", "$(PORT)", $(NUMAXES), 0, 0, 100, 1000)
 
-# One motor record for axis 0 (the first discovered GCS axis).
-dbLoadRecords("$(PIGCS2_IOC)/db/pigcs2.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+# The asyn_motor.db of axis 0 (the first discovered GCS axis), as C's
+# PI_GCS2.cmd loads it.
+dbLoadTemplate("$(PIGCS2_IOC)/db/PI_GCS2.substitutions", "P=$(P),PORT=$(CTRL)")
+
+# motorUtil's records, as C's st.cmd loads them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
