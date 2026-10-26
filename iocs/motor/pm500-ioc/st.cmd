@@ -37,9 +37,10 @@ PM500Setup(1, 10)
 # PM500Config(card, asyn port, GPIB address): one axis per channel (X Y Z A ...).
 PM500Config(0, "$(SERIAL)")
 
-# One motor record per axis, signal S of card 0.
-# The boundary is raw steps of 0.01 controller units (drive_resolution).
-dbLoadRecords("$(PM500_IOC)/db/pm500.template", "P=$(P),M=m1,C=0,S=0,VELO=100,VBAS=0,ACCL=.5,HLM=10000,LLM=-10000,MRES=0.01,EGU=um,PREC=3")
+# The axis's motor.db, as C's PM500.cmd loads it, and motorUtil's records,
+# as C's st.cmd loads them.
+dbLoadTemplate("$(PM500_IOC)/db/PM500.substitutions", "P=$(P)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
