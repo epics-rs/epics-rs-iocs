@@ -24,7 +24,7 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 # smarActMCSCreateController(motorPortName, ioPortName, numAxes,
 #                            movingPollPeriod, idlePollPeriod, disableSpeed),
 # periods in seconds.
-smarActMCSCreateController("$(CTRL)", "$(IPPORT)", 1, 0.05, 1.0, 0)
+smarActMCSCreateController("$(CTRL)", "$(IPPORT)", 1, 0.020, 1.0, 0)
 
 # smarActMCSCreateAxis(controllerPortName, axisNumber, channel): records reach
 # axisNumber as @asyn($(CTRL),axisNumber); channel is the controller channel.
