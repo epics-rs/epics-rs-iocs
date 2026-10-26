@@ -11,7 +11,7 @@
 
 epicsEnvSet("P",      "aerotech:")
 epicsEnvSet("CTRL",   "AeroE1")
-epicsEnvSet("IPPORT", "ensAsyn")
+epicsEnvSet("IPPORT", "EnsemblePort")
 epicsEnvSet("HOST",   "192.168.1.40:8000")
 
 # ---- asyn octet port ----
@@ -50,4 +50,4 @@ motorUtilInit("$(P)")
 # Example:
 #   dbl
 #   camonitor aerotech:m1 aerotech:m1.RBV
-#   caput aerotech:m1 10
+#   caput aerotech:m1 .1

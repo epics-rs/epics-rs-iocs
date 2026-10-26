@@ -11,7 +11,7 @@
 
 epicsEnvSet("P",      "a3200:")
 epicsEnvSet("CTRL",   "L1")
-epicsEnvSet("IPPORT", "a3200Asyn")
+epicsEnvSet("IPPORT", "L0")
 epicsEnvSet("HOST",   "192.168.1.50:8000")
 
 # ---- asyn octet port ----
@@ -39,5 +39,5 @@ motorUtilInit("$(P)")
 
 # Example:
 #   dbl
-#   camonitor a3200:m1 a3200:m1.RBV
-#   caput a3200:m1 10
+#   camonitor a3200:X a3200:X.RBV
+#   caput a3200:X 10

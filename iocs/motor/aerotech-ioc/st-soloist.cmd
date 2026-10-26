@@ -6,7 +6,7 @@
 #============================================================
 
 epicsEnvSet("P",    "soloist:")
-epicsEnvSet("PORT", "soloist1")
+epicsEnvSet("PORT", "SoloistPort")
 
 drvAsynIPPortConfigure("$(PORT)", "192.168.1.41:8000", 0, 0, 0)
 # The driver sets no EOS; the Soloist's AsciiCmdEOSChar is "\n".

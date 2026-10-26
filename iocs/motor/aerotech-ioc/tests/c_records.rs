@@ -1,5 +1,5 @@
 //! Each startup script boots with the records C's iocAerotech loads for its
-//! controller, on the script's prefix and axes.
+//! controller, on the script's prefix.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -34,10 +34,7 @@ fn st_cmd_loads_the_c_ensemble_records() {
 
 #[test]
 fn st_soloist_cmd_loads_the_c_soloist_records() {
-    let c = c_st_cmd(
-        &[("aerotech:", "soloist:"), ("aerotech:m2", "soloist:m1")],
-        &["aerotech:m1"],
-    );
+    let c = c_st_cmd(&[("aerotech:", "soloist:")], &["aerotech:m1"]);
     assert_same_records(&booted_records(ioc(), &dir().join("st-soloist.cmd")), &c);
 }
 
@@ -45,7 +42,7 @@ fn st_soloist_cmd_loads_the_c_soloist_records() {
 fn st_a3200_cmd_loads_the_c_a3200_records() {
     let c = renamed(
         &read_dbl(&dir().join("tests/a3.asyn.dbl")),
-        &[("aerotech:", "a3200:"), ("aerotech:X", "a3200:m1")],
+        &[("aerotech:", "a3200:")],
         &["aerotech:Y"],
     );
     assert_same_records(&booted_records(ioc(), &dir().join("st.a3200.cmd")), &c);
