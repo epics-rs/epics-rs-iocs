@@ -23,8 +23,6 @@ fn atoi(s: impl CSrc) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use epics_seq_rs::{CharPtr, ProgOptions, VarModel};
 
     use super::*;
@@ -43,7 +41,7 @@ mod tests {
 
     #[test]
     fn num_counters_is_glibc_atoi() {
-        let value: CharPtr = Some(Arc::from(&b" +3x"[..]));
+        let value = CharPtr::from_bytes(b" +3x");
         assert_eq!(atoi(value), 3);
         assert_eq!(atoi("-2"), -2);
         use std::ffi::c_long;
