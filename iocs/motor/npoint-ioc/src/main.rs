@@ -36,7 +36,10 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // asyn's devEpics, for LC400_auxParameters.db.
+    // asyn.dbd, which every C motor IOC links: the asyn record and the
+    // devEpics asyn_motor.db and LC400_auxParameters.db use.
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, move || asyn_factory());
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.

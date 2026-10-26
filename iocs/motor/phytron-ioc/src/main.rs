@@ -37,7 +37,10 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // asyn's devEpics, for the Phytron_*.db aux records.
+    // asyn.dbd, which every C motor IOC links: the asyn record and the
+    // devEpics the Phytron_*.db records use.
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, move || asyn_factory());
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides the drvAsyn*PortConfigure family.

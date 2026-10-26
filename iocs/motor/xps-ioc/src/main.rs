@@ -45,6 +45,12 @@ async fn main() -> CaResult<()> {
     // busy's .dbd.
     app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
 
+    // asyn.dbd, which every C motor IOC links: the asyn record and the
+    // devEpics basic_asyn_motor.db use.
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, move || asyn_factory());
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+
     // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.
     let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);

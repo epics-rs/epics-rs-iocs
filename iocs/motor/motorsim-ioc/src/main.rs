@@ -37,8 +37,10 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // asyn's devEpics, which motorSimIOC links through asyn.dbd
-    // (motorSimApp/src/Makefile:23).
+    // asyn.dbd, which motorSimIOC links (motorSimApp/src/Makefile:23): the
+    // asyn record and the devEpics basic_asyn_motor.db's records use.
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, move || asyn_factory());
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // motorSimCreateController / motorSimConfigAxis commands, and the
