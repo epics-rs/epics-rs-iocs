@@ -20,6 +20,7 @@ dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 # ---- asyn IP octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P), R=asyn1, PORT=$(IPPORT), ADDR=0, OMAX=256, IMAX=256")
 
 # ---- MCS2 controller ----
 # MCS2CreateController(portName, MCS2PortName, numAxes, movingPollPeriod,

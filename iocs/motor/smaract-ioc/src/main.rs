@@ -45,6 +45,9 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
+    // asyn.dbd's asyn record, for st.cmd's asynRecord.db.
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, move || asyn_factory());
     // asyn's devEpics, for basic_asyn_motor.db's and MCS2_Extra.db's records,
     // and the asyn iocsh commands (`drvAsynIPPortConfigure`).
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
