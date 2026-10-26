@@ -177,7 +177,7 @@ Every row's "extra records" is **"motor record only"** — confirmed by counting
 |---|---|---|---|---|
 | `acsmotion-ioc` | `motor-acsmotion` | ACS SPiiPlus motion controller (serial/TCP ASCII, ACSPL+) | `iocs/motor/acsmotion-ioc/st.cmd` | motor record only |
 | `acstech80-ioc` | `motor-acstech80` | ACS Tech80 SPiiPlus (serial/TCP ASCII, ACSPL+) | `iocs/motor/acstech80-ioc/st.cmd` | motor record only |
-| `aerotech-ioc` | `motor-aerotech` | Aerotech Ensemble (ASCII over asyn octet); A3200 variant via separate startup | `iocs/motor/aerotech-ioc/st.cmd` (+ `st.a3200.cmd` for A3200) | motor record only |
+| `aerotech-ioc` | `motor-aerotech` | Aerotech Ensemble and Soloist (ASCII over asyn octet); A3200 variant via separate startup | `iocs/motor/aerotech-ioc/st.cmd` (+ `st.a3200.cmd` for A3200) | motor record only |
 | `agap-conex-ioc` | `motor-newport` (`agap.rs`, [ports from](https://github.com/epics-modules/motor) `motorNewport/newportApp/src/AGAP_CONEX.cpp`) | Newport CONEX-AGAP two-axis piezo gonio (serial ASCII) | `iocs/motor/agap-conex-ioc/st.cmd` | motor record only |
 | `ag-uc-ioc` | `motor-newport` (`agilis.rs`, ports from `AG_UC.cpp`) | Newport Agilis AG-UC2/AG-UC8/AG-UC8PC piezo stepper (serial ASCII) | `iocs/motor/ag-uc-ioc/st.cmd` | motor record only |
 | `amci-ioc` | `motor-amci` | AMCI ANF2 / ANG1 stepper controllers (Modbus/TCP registers, not serial ASCII) | `iocs/motor/amci-ioc/st.cmd` | motor record only |

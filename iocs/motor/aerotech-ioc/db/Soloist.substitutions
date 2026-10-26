@@ -1,4 +1,4 @@
-# C's iocAerotech Soloist.substitutions, P from st-soloist.cmd.
+# C's iocAerotech Soloist.substitutions, P from st.cmd.
 file "$(MOTOR)/db/motor.db"
 {
 pattern

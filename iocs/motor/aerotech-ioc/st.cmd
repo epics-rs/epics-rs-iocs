@@ -1,18 +1,20 @@
 #============================================================
-# st.cmd — Aerotech Ensemble motor IOC startup script
+# st.cmd — Aerotech Ensemble and Soloist motor IOC startup script
 #
 # Usage:
 #   cargo run -p aerotech-ioc -- st.cmd
 #
-# Requires an Aerotech Ensemble controller reachable over TCP (or swap in the
-# serial port line below). Homing uses the vendor HomeAsync.bcx program (task
-# 5), which must be loaded on the controller.
+# Requires an Aerotech Ensemble and a Soloist reachable over TCP (or swap in
+# the serial port lines below). Ensemble homing uses the vendor HomeAsync.bcx
+# program (task 5), which must be loaded on the controller.
 #============================================================
 
 epicsEnvSet("P",      "aerotech:")
 epicsEnvSet("CTRL",   "AeroE1")
 epicsEnvSet("IPPORT", "EnsemblePort")
 epicsEnvSet("HOST",   "192.168.1.40:8000")
+epicsEnvSet("SPORT",  "SoloistPort")
+epicsEnvSet("SHOST",  "192.168.1.41:8000")
 
 # ---- asyn octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
@@ -29,10 +31,22 @@ EnsembleAsynSetup(1)
 EnsembleAsynConfig(0, "$(IPPORT)", 0, 1, 100, 1000)
 drvAsynMotorConfigure("$(CTRL)", "motorEnsemble", 0, 1)
 
-# The axis's asyn_motor.db and motorUtil's records, as C's st.cmd and
-# Ensemble.cmd load them.
+# ---- Soloist controller (model 1) ----
+drvAsynIPPortConfigure("$(SPORT)", "$(SHOST)", 0, 0, 0)
+#drvAsynSerialPortConfigure("$(SPORT)", "/dev/ttyUSB1", 0, 0, 0)
+# The driver sets no EOS; the Soloist's AsciiCmdEOSChar is "\n".
+asynOctetSetInputEos("$(SPORT)", 0, "\n")
+asynOctetSetOutputEos("$(SPORT)", 0, "\n")
+
+# SoloistSetup(num_cards, scan_rate), SoloistConfig(card, asyn port, addr).
+SoloistSetup(1, 10)
+SoloistConfig(0, "$(SPORT)", 0)
+
+# The Ensemble's asyn_motor.db, the Soloist's motor.db and motorUtil's
+# records, as C's st.cmd, Ensemble.cmd and Soloist.cmd load them.
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 dbLoadTemplate("$(AEROTECH_IOC)/db/Ensemble.substitutions", "P=$(P),PORT=$(CTRL)")
+dbLoadTemplate("$(AEROTECH_IOC)/db/Soloist.substitutions", "P=$(P)")
 
 # EnsembleTrajectoryScan.st's records, for the seq line below (NELM at most
 # 1000, NPULSE at most 8000):

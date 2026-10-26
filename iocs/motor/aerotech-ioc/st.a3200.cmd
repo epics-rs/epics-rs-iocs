@@ -23,11 +23,14 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 A3200AsynSetup(1)
 
 # A3200AsynConfig(card, portName, asynAddress, numAxes, movingPollPeriod,
-#                 idlePollPeriod, taskNumber, linear), periods in ms.
-A3200AsynConfig(0, "$(IPPORT)", 0, 1, 100, 1000, 1, 1)
-drvAsynMotorConfigure("$(CTRL)", "motorA3200", 0, 1)
+#                 idlePollPeriod, taskNumber, linear), periods in ms. C's
+# a3.asyn.st.cmd.linux-x86 still passes the 2014 order (task 1, moving 1000,
+# idle 2500), which the current signature reads as a 1 ms moving poll on
+# task 2500; this line passes what C's means.
+A3200AsynConfig(0, "$(IPPORT)", 0, 2, 1000, 2500, 1, 0)
+drvAsynMotorConfigure("$(CTRL)", "motorA3200", 0, 2)
 
-# The axis's basic_asyn_motor.db and motorUtil's records, as C's
+# The axes' basic_asyn_motor.db and motorUtil's records, as C's
 # a3.asyn.st.cmd.linux-x86 loads them.
 dbLoadTemplate("$(AEROTECH_IOC)/db/a3.asyn.motor.substitutions", "P=$(P),PORT=$(CTRL)")
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
