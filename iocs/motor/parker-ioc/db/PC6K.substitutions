@@ -1,8 +1,9 @@
-# C's iocParker PC6K.substitutions on this IOC's one axis, P from
-# st-pc6k.cmd.
+# C's iocParker PC6K.substitutions, P from st-pc6k.cmd. Both axes are on
+# card 0, as in C; card 1 takes no records.
 file "$(MOTOR)/db/motor.db"
 {
 pattern
 {N,  M,       DTYP,    C,  S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,    PREC,  DHLM,  DLLM,  INIT}
 {1,  "m$(N)", "PC6K",  0,  0,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4,  5,     100,   -100,  ""}
+{2,  "m$(N)", "PC6K",  0,  1,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4,  5,     100,   -100,  ""}
 }

@@ -11,7 +11,7 @@ epicsEnvSet("P",      "OEM:")
 epicsEnvSet("CTRL",   "OEM")
 epicsEnvSet("IPPORT", "PORT")
 epicsEnvSet("HOST",   "192.168.1.220:5000")
-epicsEnvSet("NAXES",  "1")
+epicsEnvSet("NAXES",  "3")
 
 # ---- asyn IP octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
@@ -20,8 +20,8 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 # OEMCreateController(portName, OEMPortName, numAxes, movingPollPeriod, idlePollPeriod).
 OEMCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 20, 1000)
 
-# The axis's basic_asyn_motor.db and OEMSupport.template, as C's st.cmd.oem
-# loads them.
+# Each axis's basic_asyn_motor.db and OEMSupport.template, as C's
+# st.cmd.oem loads them.
 dbLoadTemplate("$(PARKER_IOC)/db/motor.substitutions.oem", "P=$(P),PORT=$(CTRL)")
 
 # The octet port's asyn record, as C's st.cmd.oem loads it.
