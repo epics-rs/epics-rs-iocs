@@ -1001,4 +1001,219 @@ mod tests {
         *line.group_status.lock().unwrap() = 12;
         assert_eq!(get_motor_moving(&v), 0);
     }
+
+    /// The program against trajectoryScan.db, as xps-ioc loads it, a motor
+    /// record `T:m1`, and an XPS on 127.0.0.1 that runs a trajectory until
+    /// `GroupMoveAbort`.
+    mod program {
+        use std::collections::HashMap;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        use epics_rs::base::runtime::task::sleep;
+        use epics_rs::base::server::database::PvDatabase;
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::types::EpicsValue;
+        use epics_seq_rs::{seq, seq_stop};
+
+        use super::*;
+
+        const DB: &str = include_str!("../../../../../iocs/motor/xps-ioc/db/trajectoryScan.db");
+
+        /// What the fake XPS has seen and holds.
+        #[derive(Default)]
+        struct Xps {
+            log: Vec<String>,
+            /// A MultipleAxesPVTExecution is running.
+            running: bool,
+            aborted: bool,
+        }
+
+        type Shared = Arc<(Mutex<Xps>, Condvar)>;
+
+        fn reply(xps: &Shared, cmd: &str) -> String {
+            let (state, cv) = &**xps;
+            let name = cmd.split(" (").next().unwrap_or_default().to_string();
+            let mut x = state.lock().unwrap();
+            x.log.push(name.clone());
+            let values = match name.as_str() {
+                "GroupStatusGet" if x.running => "0,45",
+                "GroupStatusGet" => "0,12",
+                "GroupPositionCurrentGet" => "0,0",
+                "PositionerSGammaParametersGet" => "0,10,40,0.02,0.02",
+                "MultipleAxesPVTVerificationResultGet" => "0,traj.trj,-0.5,2.5,1.2,3.4",
+                "MultipleAxesPVTParametersGet" => "0,traj.trj,1",
+                "EventExtendedStart" => "0,1",
+                "GroupMoveAbort" => {
+                    x.aborted = true;
+                    cv.notify_all();
+                    "0"
+                }
+                "MultipleAxesPVTExecution" => {
+                    // XPS error -27: the trajectory was aborted.
+                    x.running = true;
+                    x = cv.wait_while(x, |x| !x.aborted).unwrap();
+                    x.running = false;
+                    "-27"
+                }
+                _ => "0",
+            };
+            format!("{values},EndOfAPI")
+        }
+
+        /// The XPS, each connection one socket; a command ends at its `)`.
+        fn xps() -> (u16, Shared) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let shared = Shared::default();
+            let xps = shared.clone();
+            std::thread::spawn(move || {
+                for sock in listener.incoming() {
+                    let (mut sock, xps): (TcpStream, _) = (sock.unwrap(), xps.clone());
+                    std::thread::spawn(move || {
+                        let mut cmd = Vec::new();
+                        let mut buf = [0; 1024];
+                        while let Ok(n @ 1..) = sock.read(&mut buf) {
+                            cmd.extend_from_slice(&buf[..n]);
+                            if cmd.ends_with(b")") {
+                                let r = reply(&xps, &String::from_utf8_lossy(&cmd));
+                                cmd.clear();
+                                if sock.write_all(r.as_bytes()).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            (port, shared)
+        }
+
+        async fn ioc() -> Arc<PvDatabase> {
+            let macros: HashMap<String, String> = [
+                ("P", "T:"),
+                ("R", "traj1:"),
+                ("NAXES", "1"),
+                ("NELM", "2000"),
+                ("NPULSE", "2000"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into();
+            let (motor, factory) = epics_rs::motor::motor_record_factory();
+            let (db, _) = IocBuilder::new()
+                .register_record_type(motor, factory)
+                .register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()))
+                .db_string(DB, &macros)
+                .unwrap()
+                .db_string("record(motor, \"T:m1\") {}\n", &HashMap::new())
+                .unwrap()
+                .build_served()
+                .await
+                .unwrap();
+            // seq holds each state set in its first state until PINI is done.
+            db.mark_pini_done();
+            db
+        }
+
+        /// Poll until `holds` holds of the fake XPS.
+        async fn until(xps: &Shared, what: &str, holds: impl Fn(&Xps) -> bool) {
+            for _ in 0..500 {
+                if holds(&xps.0.lock().unwrap()) {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the XPS never saw {what}: {:?}", xps.0.lock().unwrap().log);
+        }
+
+        async fn put(db: &PvDatabase, pv: &str, v: EpicsValue) {
+            db.put_record_field_from_ca(pv, "VAL", v).await.unwrap();
+        }
+
+        fn value(db: &PvDatabase, pv: &str) -> f64 {
+            db.get_pv(pv).unwrap().to_f64().unwrap()
+        }
+
+        /// Poll until every `(pv, value)` holds; on timeout, name what each
+        /// read.
+        async fn expect(db: &PvDatabase, want: &[(&str, f64)]) {
+            for _ in 0..500 {
+                if want.iter().all(|&(pv, v)| value(db, pv) == v) {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            let got: Vec<_> = want.iter().map(|&(pv, _)| (pv, value(db, pv))).collect();
+            panic!("want {want:?}, got {got:?}");
+        }
+
+        /// XPS_trajectoryScan.st:586-603: an Abort while the trajectory runs
+        /// sends GroupMoveAbort on the abort socket, so the execution ends.
+        /// The xpsTrajectoryRun state set is in MultipleAxesPVTExecution
+        /// then, as C's is, and xpsTrajectoryAbort must still see abortMon.
+        #[ignore = "epics-seq-rs EventGate holds abortMon while xpsTrajectoryRun \
+                    blocks in MultipleAxesPVTExecution (seqrt, BIG for 0.33)"]
+        #[epics_rs::base::epics_test]
+        async fn abort_during_execute_aborts_the_trajectory() {
+            let (port, xps) = xps();
+            let (ftp_addr, _ftp_log) = ftp::tests::server("331 password\r\n");
+            ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
+            let db = ioc().await;
+            let file = std::env::temp_dir().join(format!("xpsa{}.trj", std::process::id()));
+            let file = file.to_str().unwrap().to_string();
+            put(
+                &db,
+                "T:traj1:TrajectoryFile",
+                EpicsValue::String(file.clone().into()),
+            )
+            .await;
+            put(&db, "T:traj1:Nelements", EpicsValue::Long(2)).await;
+            // An axis that does not move: T:m1 has no device to complete one.
+            put(&db, "T:traj1:M1Move", EpicsValue::Enum(0)).await;
+            let macros = format!(
+                "P=T:,R=traj1:,M1=m1,IPADDR=127.0.0.1,PORT={port},GROUP=G1,P1=P1,\
+                 USERNAME=Administrator,PASSWORD=pw"
+            );
+            let tid = seq(&XPS_trajectoryScan, &macros, 0, &db).expect("XPS_trajectoryScan starts");
+            // init clears buildMon as it ends (:200); xpsTrajectoryPosition's
+            // first poll comes a second after.
+            until(&xps, "a position poll", |x| {
+                x.log.iter().any(|c| c == "GroupPositionCurrentGet")
+            })
+            .await;
+
+            put(&db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            expect(&db, &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)]).await;
+            put(&db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
+            // xpsTrajectoryScan in wait_execute, which alone reads the
+            // element: its start loop (:421) ends only on 45 or FAILURE.
+            expect(&db, &[("T:traj1:ExecState", 2.0)]).await;
+            until(&xps, "the element read", |x| {
+                x.running && x.log.iter().any(|c| c == "MultipleAxesPVTParametersGet")
+            })
+            .await;
+
+            put(&db, "T:traj1:Abort", EpicsValue::Enum(1)).await;
+            expect(
+                &db,
+                &[
+                    ("T:traj1:Abort", 0.0),
+                    ("T:traj1:ExecStatus", 3.0),
+                    ("T:traj1:ExecState", 0.0),
+                    ("T:traj1:Execute", 0.0),
+                ],
+            )
+            .await;
+            let log = xps.0.lock().unwrap().log.clone();
+            let run = log
+                .iter()
+                .position(|c| c == "MultipleAxesPVTExecution")
+                .unwrap();
+            assert!(log[run..].contains(&"GroupMoveAbort".to_string()));
+            seq_stop(tid);
+            let _ = std::fs::remove_file(file);
+        }
+    }
 }
