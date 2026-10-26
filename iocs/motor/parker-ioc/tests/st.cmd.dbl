@@ -1,0 +1,14 @@
+# dbl of motor R7-4-5 motorParker iocBoot/iocParker st.cmd
+parker:alldone
+parker:alldoneBlink
+parker:allstop
+parker:m1
+parker:m1_able
+parker:m1_twCh
+parker:m1_vCh
+parker:m2
+parker:m2_able
+parker:m2_twCh
+parker:m2_vCh
+parker:moving
+parker:movingDiff

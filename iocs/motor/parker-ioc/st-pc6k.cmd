@@ -15,6 +15,9 @@ drvAsynIPPortConfigure("$(PORT)", "192.168.10.30:5002", 0, 0, 0)
 PC6KSetup(1, 60)
 PC6KConfig(0, "$(PORT)")
 
-dbLoadRecords("$(PARKER_IOC)/db/pc6k.template", "P=$(P),M=m1,C=0,S=0")
+# The axis's motor.db, as C's PC6K.cmd loads it, and motorUtil's records,
+# as C's st.cmd loads them.
+dbLoadTemplate("$(PARKER_IOC)/db/PC6K.substitutions", "P=$(P)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()

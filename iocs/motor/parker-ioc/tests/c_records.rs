@@ -30,3 +30,13 @@ fn st_acr_cmd_loads_the_c_acr_records() {
     );
     assert_same_records(&script_records(&dir().join("st.acr.cmd")), &c);
 }
+
+#[test]
+fn st_pc6k_cmd_loads_the_c_pc6k_records() {
+    let c = renamed(
+        &read_dbl(&dir().join("tests/st.cmd.dbl")),
+        &[("parker:", "PC6K:")],
+        &["parker:m2"],
+    );
+    assert_same_records(&script_records(&dir().join("st-pc6k.cmd")), &c);
+}
