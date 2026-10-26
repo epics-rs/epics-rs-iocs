@@ -1,0 +1,9 @@
+# C's iocMicroMo MVP2001.substitutions, P and PORT from st.cmd. C's file
+# loads $(MOTOR)/motorApp/Db/asyn_motor.db, a source-tree path no installed
+# MOTOR has.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{M,  DTYP,        ADDR, DESC, EGU, DIR, VELO,  VBAS, ACCL, BDST, BVEL, BACC, MRES,              PREC, DHLM,      DLLM,      INIT}
+{m1, "asynMotor", 0,    "m1", rev, Pos, 0.025, 0.0,  .1,   0,    0.01, 0.1,  0.000015798786653, 4,    3000000.0, -300000.0, ""}
+}

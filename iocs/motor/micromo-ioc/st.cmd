@@ -11,7 +11,7 @@
 
 epicsEnvSet("P",      "MVP:")
 epicsEnvSet("CTRL",   "MVP1")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -32,19 +32,20 @@ asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- MVP2001 controller + axes ----
 # MVP2001CreateController(portName, MVP2001PortName, numAxes, movingPollPeriod, idlePollPeriod).
-MVP2001CreateController("$(CTRL)", "$(SERIAL)", 1, 100, 1000)
+MVP2001CreateController("$(CTRL)", "$(SERIAL)", 1, 250, 1000)
 
 # MVP2001CreateAxis(portName, axisNo, encLinesPerRev, maxCurrentMa, limitPolarity).
 # axisNo is 0-based; limitPolarity 1 = normally-open, 0 = normally-closed.
-MVP2001CreateAxis("$(CTRL)", 0, 512, 1000, 1)
+MVP2001CreateAxis("$(CTRL)", 0, 16, 1000, 0)
 
-# One motor record per axis (OUT @asyn($(CTRL),axis)). Positions cross the driver
-# boundary in the controller's native encoder counts, so MRES = 1.
-dbLoadRecords("$(MICROMO_IOC)/db/mvp2001.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+# motorUtil's records and one asyn_motor.db per axis, as C's st.cmd and
+# MVP2001.cmd load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(MICROMO_IOC)/db/MVP2001.substitutions", "P=$(P),PORT=$(CTRL)")
 
 iocInit()
 
 # Example:
 #   dbl
 #   camonitor MVP:m1 MVP:m1.RBV
-#   caput MVP:m1 10000
+#   caput MVP:m1 1

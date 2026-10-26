@@ -38,9 +38,11 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // Standard asyn iocsh commands — provides `drvAsynSerialPortConfigure`.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
+    // asyn.dbd, as C's IOC links it: the asyn record and devEpics, for
+    // asyn_motor.db, and the iocsh commands (`drvAsynSerialPortConfigure`).
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, asyn_factory);
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // MVP2001 iocsh commands + motor device support.
     app = app.register_startup_command(mvp2001_create_controller_command());

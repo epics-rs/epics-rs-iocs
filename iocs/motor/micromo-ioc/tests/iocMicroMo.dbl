@@ -1,0 +1,13 @@
+# dbl of motor R7-4-5 motorMicroMo iocBoot/iocMicroMo st.cmd
+microMo:alldone
+microMo:alldoneBlink
+microMo:allstop
+microMo:m1
+microMo:m1Direction
+microMo:m1Offset
+microMo:m1Resolution
+microMo:m1_able
+microMo:m1_twCh
+microMo:m1_vCh
+microMo:moving
+microMo:movingDiff
