@@ -1,11 +1,11 @@
-# C's iocNewport motor.substitutions.SMC100, P and PORT from st.cmd; the
-# values are the motor record this IOC had before. The driver boundary is
-# raw steps of SMC100CreateController's eguPerStep, so MRES must equal it.
-# C's MRES is 0.00001 against eguPerStep "0.00005", which reads every
-# position back at a fifth of the stage's.
+# C's iocNewport motor.substitutions.SMC100, P and PORT from st.cmd. The
+# driver scales the record's steps by SMC100CreateController's eguPerStep,
+# so MRES must equal it; C's MRES 0.00001 against eguPerStep "0.00005"
+# reads every position back at a fifth of the stage's, so MRES here is
+# 0.00005.
 file "$(MOTOR)/db/basic_asyn_motor.db"
 {
 pattern
-{N,  M,       DTYP,         ADDR,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,     PREC,  DHLM,  DLLM,  INIT}
-{1,  "m$(N)", "asynMotor",  0,     "",    mm,   Pos,  1,     0,     .2,    0,     .5,    .2,    0.00005,  6,     25,    -5,    ""}
+{N,  M,       DTYP,         ADDR,  DESC,      EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,     PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "asynMotor",  0,     "GTS30V",  mm,   Pos,  1,     0,     .2,    0,     .5,    .2,    0.00005,  6,     25,    -5,    ""}
 }
