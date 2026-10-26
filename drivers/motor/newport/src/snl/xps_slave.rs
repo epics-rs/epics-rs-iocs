@@ -1,21 +1,15 @@
 //! `xpsSlave.st`, compiled by snc-rs from `build.rs` and run on
 //! `epics-seq-rs`.
 //!
-//! Its escaped C is XPS_C8_drivers.cpp: `TCP_ConnectToServer` makes the
-//! program's asyn IP port in the IOC `seq` started it in, and the
-//! SingleAxisSlave* calls run on that port's [`XpsSocket`]. The `%%`
-//! includes need no Rust.
+//! Its escaped C is XPS_C8_drivers.cpp, through [`super::xps_c8`]. The
+//! `%%` includes need no Rust.
 
-use std::collections::BTreeMap;
 use std::ffi::c_char;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
+use epics_seq_rs::SeqVar;
 use epics_seq_rs::c::*;
-use epics_seq_rs::{ProgramVars, SeqVar, StateSet};
 
-use crate::ioc::connect_to_server;
-use crate::xps::{SocketMode, XpsResult, XpsSocket};
+use super::xps_c8::{c_int, socket, tcp_connect_to_server, text};
 
 macro_rules! seqg_escaped {
     (r#"#define epicsExportSharedSymbols"#) => {};
@@ -59,57 +53,6 @@ macro_rules! seqg_escaped {
 
 epics_seq_rs::include_program!("xpsSlave");
 
-/// asynOctetSocket.cpp's `socketStructs`: the socket each
-/// `TCP_ConnectToServer` index names.
-static SOCKETS: Mutex<BTreeMap<i32, Arc<XpsSocket>>> = Mutex::new(BTreeMap::new());
-
-/// C `TCP_ConnectToServer`: the new socket's index, or -1. A positive
-/// `timeout` is C's writeRead socket, a negative one its write-only socket.
-fn tcp_connect_to_server<V: ProgramVars>(
-    env: &StateSet<V>,
-    ip: impl CSrc,
-    ip_port: i32,
-    timeout: f64,
-) -> i32 {
-    let Some((index, handle)) = connect_to_server(env.database(), &text(ip), ip_port) else {
-        return -1;
-    };
-    let mode = if timeout > 0.0 {
-        SocketMode::Query
-    } else {
-        SocketMode::Fire
-    };
-    let port = handle.port_name().to_string();
-    let socket = XpsSocket::new(
-        handle,
-        index,
-        &port,
-        mode,
-        Duration::from_secs_f64(timeout.abs()),
-    );
-    SOCKETS.lock().unwrap().insert(index, Arc::new(socket));
-    index
-}
-
-/// The socket `index` names; -1 is C's invalid socket, which answers -22.
-fn socket(index: i32) -> Arc<XpsSocket> {
-    SOCKETS
-        .lock()
-        .unwrap()
-        .get(&index)
-        .cloned()
-        .unwrap_or_else(|| Arc::new(XpsSocket::invalid("", SocketMode::Query)))
-}
-
-/// The `int` an XPS_C8_drivers.cpp call returns.
-fn c_int(result: XpsResult<()>) -> i32 {
-    result.map_or_else(|e| e.code(), |()| 0)
-}
-
-fn text(s: impl CSrc) -> String {
-    s.with_c_bytes(|b| String::from_utf8_lossy(b).into_owned())
-}
-
 /// C `SingleAxisSlaveParametersGet(socket, group, master, &ratio)`.
 fn single_axis_slave_parameters_get<const N: usize>(
     index: i32,
@@ -129,7 +72,11 @@ fn single_axis_slave_parameters_get<const N: usize>(
 mod tests {
     use epics_seq_rs::{ProgOptions, VarModel};
 
+    use std::sync::Arc;
+
+    use super::super::xps_c8::SOCKETS;
     use super::*;
+    use crate::xps::SocketMode;
     use crate::xps::fake::FakeLine;
 
     /// xpsSlave.st:1, with `option +d; option +r;` (:4, :6).
