@@ -423,6 +423,8 @@ mod tests {
             slow_xc: bool,
             /// Whether `TB` takes 300 ms to answer.
             slow_tb: bool,
+            /// Whether the next `NC` write takes 300 ms; cleared as it starts.
+            slow_nc: bool,
             /// Whether `AB` was written, which stops the axes.
             aborted: bool,
         }
@@ -483,7 +485,12 @@ mod tests {
             let mut m = mm.lock().unwrap();
             m.aborted |= cmd == "AB\r";
             let verify = std::mem::replace(&mut m.verifying, cmd == "VC\r");
-            m.refuse_verify && verify && cmd == "TB\r"
+            let refused = m.refuse_verify && verify && cmd == "TB\r";
+            if cmd == "NC\r" && std::mem::take(&mut m.slow_nc) {
+                drop(m);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            refused
         }
 
         /// `port`'s axis m1 of one simulated motor.
@@ -610,6 +617,7 @@ mod tests {
                 verifying: false,
                 slow_xc: false,
                 slow_tb: false,
+                slow_nc: false,
                 aborted: false,
             }));
             let (shared, writes) = (mm.clone(), mm.clone());
@@ -713,26 +721,33 @@ mod tests {
             p.sent().iter().filter(|c| c.contains("DT")).count()
         }
 
-        /// ss trajectoryScan state build bounds each build where its arrays
-        /// end: MAX_ELEMENTS relative, and absolute MAX_ELEMENTS-3 with a moved
-        /// axis, whose padding writes past the last element, else
-        /// MAX_ELEMENTS. An absolute build posts its padded count, as C.
+        /// ss trajectoryScan state build bounds each build where C stays in
+        /// its arrays: MAX_ELEMENTS relative; absolute, MAX_ELEMENTS-3 with a
+        /// moved axis, whose padding writes past the last element, else
+        /// MAX_ELEMENTS for TIME_MODE_TOTAL and MAX_ELEMENTS+1 per element.
+        /// An absolute build posts its padded count, as C.
         #[epics_rs::base::epics_test]
         async fn each_build_is_bounded_where_its_arrays_end() {
             let p = boot("mm4005Bounds", &[]).await;
-            // (M1Move, MoveMode, Nelements put, Nelements after, DT, DX)
-            for (axis, mode, n, after, dt, dx) in [
-                (1, 0, 2000, 2000.0, 2000, 2000),
-                (1, 0, 2001, 2000.0, 2000, 2000),
-                (0, 0, 2000, 2000.0, 2000, 0),
-                (0, 0, 2001, 2000.0, 2000, 0),
-                (1, 1, 1997, 1997.0, 1996, 1996),
-                (1, 1, 1998, 1997.0, 1996, 1996),
-                (0, 1, 2000, 2001.0, 2000, 0),
-                (0, 1, 2001, 2001.0, 2000, 0),
+            // (M1Move, MoveMode, TimeMode, Nelements put, Nelements after, DT, DX)
+            for (axis, mode, time, n, after, dt, dx) in [
+                (1, 0, 0, 2000, 2000.0, 2000, 2000),
+                (1, 0, 0, 2001, 2000.0, 2000, 2000),
+                (1, 0, 1, 2001, 2000.0, 2000, 2000),
+                (0, 0, 0, 2000, 2000.0, 2000, 0),
+                (0, 0, 0, 2001, 2000.0, 2000, 0),
+                (0, 0, 1, 2001, 2000.0, 2000, 0),
+                (1, 1, 0, 1997, 1997.0, 1996, 1996),
+                (1, 1, 0, 1998, 1997.0, 1996, 1996),
+                (1, 1, 1, 1998, 1997.0, 1996, 1996),
+                (0, 1, 0, 2000, 2001.0, 2000, 0),
+                (0, 1, 0, 2001, 2001.0, 2000, 0),
+                (0, 1, 1, 2001, 2001.0, 2000, 0),
+                (0, 1, 1, 2002, 2001.0, 2000, 0),
             ] {
                 put(&p.db, "T:traj1:M1Move", EpicsValue::Enum(axis)).await;
                 put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(mode)).await;
+                put(&p.db, "T:traj1:TimeMode", EpicsValue::Enum(time)).await;
                 put(&p.db, "T:traj1:Nelements", EpicsValue::Long(n)).await;
                 p.sent();
                 p.build().await;
@@ -743,8 +758,101 @@ mod tests {
                 .await;
                 let sent = p.sent();
                 let count = |s: &str| sent.iter().filter(|c| c.contains(s)).count();
-                assert_eq!((count("DT"), count("DX")), (dt, dx), "{axis} {mode} {n}");
+                assert_eq!(
+                    (count("DT"), count("DX")),
+                    (dt, dx),
+                    "{axis} {mode} {time} {n}"
+                );
             }
+        }
+
+        /// ss trajectoryScan state build sends an absolute per-element
+        /// trajectory of 2001 elements with no axis moved as C does: its 2000
+        /// points need no padding, so each keeps its own time.
+        #[epics_rs::base::epics_test]
+        async fn an_absolute_per_element_build_of_2001_is_sent_unpadded() {
+            let p = boot("mm4005PerElement2001", &[]).await;
+            put(&p.db, "T:traj1:M1Move", EpicsValue::Enum(0)).await;
+            put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(1)).await;
+            put(&p.db, "T:traj1:TimeMode", EpicsValue::Enum(1)).await;
+            put(
+                &p.db,
+                "T:traj1:TimeTraj",
+                EpicsValue::DoubleArray(vec![0.2; 2000].into()),
+            )
+            .await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(2001)).await;
+            expect(&p.db, &[("T:traj1:EndPulses", 2001.0)]).await;
+            p.sent();
+            p.build().await;
+            expect(
+                &p.db,
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 2001.0)],
+            )
+            .await;
+            let mut want: Vec<String> = ["NC", "1DC0", "UC0.500000"].map(String::from).into();
+            for i in 1..=2000 {
+                want.push(format!("{i}DT0.200000"));
+                if i % 20 == 0 {
+                    want.push("TB".into());
+                }
+            }
+            want.extend(["MB1,ME2000,MN11", "VC", "TB"].map(String::from));
+            assert_eq!(p.sent(), want);
+        }
+
+        /// ss trajectoryScan state build declares, times and pads from the
+        /// moveAxis and timeMode it began with: an M1Move and TimeMode put
+        /// while NC is written leaves 1DC1, the TIME_MODE_TOTAL times, and
+        /// axis 1 padded at its last velocity.
+        #[epics_rs::base::epics_test]
+        async fn a_put_during_nc_leaves_the_builds_snapshot() {
+            let p = boot("mm4005SnapshotAtNc", &[]).await;
+            put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(1)).await;
+            put(&p.db, "T:traj1:Time", EpicsValue::Double(6.0)).await;
+            put(
+                &p.db,
+                "T:traj1:M1Traj",
+                EpicsValue::DoubleArray(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0].into()),
+            )
+            .await;
+            put(
+                &p.db,
+                "T:traj1:TimeTraj",
+                EpicsValue::DoubleArray(vec![0.5; 6].into()),
+            )
+            .await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(6)).await;
+            expect(&p.db, &[("T:traj1:EndPulses", 6.0)]).await;
+            p.mm.lock().unwrap().slow_nc = true;
+            p.sent();
+            put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            for _ in 0..500 {
+                if !p.mm.lock().unwrap().slow_nc {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+            assert!(!p.mm.lock().unwrap().slow_nc, "NC is never written");
+            put(&p.db, "T:traj1:M1Move", EpicsValue::Enum(0)).await;
+            put(&p.db, "T:traj1:TimeMode", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[
+                    ("T:traj1:Build", 0.0),
+                    ("T:traj1:BuildStatus", 1.0),
+                    ("T:traj1:Nelements", 9.0),
+                ],
+            )
+            .await;
+            let mut want: Vec<String> = ["NC", "1DC1", "UC0.500000"].map(String::from).into();
+            for i in 1..=8 {
+                let d = if i <= 5 { "1.000000" } else { "0.100000" };
+                want.extend([format!("{i}DT{d}"), format!("1DX{d}")]);
+            }
+            // The dynamic-parameter reads after VC read moveAxis live, as C.
+            want.extend(["MB1,ME6,MN11", "VC", "TB"].map(String::from));
+            assert_eq!(p.sent(), want);
         }
 
         /// ss trajectoryScan state build sends an absolute trajectory of

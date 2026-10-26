@@ -74,9 +74,11 @@ int anyMoving;
 int ncomplete;
 int nextra;
 int npoints;
-/* State build's one bounded read of nelements, moveMode and moveAxis */
+/* State build's one bounded read of nelements, moveMode, timeMode and
+ * moveAxis */
 int buildElements;
 int buildMode;
+int buildTimeMode;
 int buildMoveAxis[MAX_AXES];
 int buildMoved;
 int dir;
@@ -205,19 +207,22 @@ ss trajectoryScan {
             pvPut(buildState);
             buildStatus=STATUS_UNDEFINED;
             pvPut(buildStatus);
-            /* Upstream built from the monitored nelements, moveMode and moveAxis,
-             * re-read throughout and nelements unbounded by the arrays:
+            /* Upstream built from the monitored nelements, moveMode, timeMode and
+             * moveAxis, re-read throughout and nelements unbounded by the arrays:
              * an absolute build of 1998-2000 elements writes motorTrajectory[j]
              * past its end for an axis moveAxis sets during the build, and the
              * build sends DX for an axis its DC never declared.  The build* copies
              * are the one bounded read.  Upstream's padding writes
              * timeTrajectory[npoints] on, moved axes or not, so a negative npoints
              * it pads (one not a multiple of 4) indexes before the arrays; any other
-             * count below 1 point sends no element and is kept.  Above, an absolute
-             * trajectory's padding past its last element needs it at most
-             * MAX_ELEMENTS-3 when an axis moves; any other is held to the
-             * arrays' MAX_ELEMENTS. */
+             * count below 1 point sends no element and is kept.  Above, each count
+             * is held where upstream stays in the arrays: relative, MAX_ELEMENTS;
+             * absolute with a moved axis, whose padding writes motorTrajectory[j]
+             * past the last element, MAX_ELEMENTS-3; absolute with none,
+             * MAX_ELEMENTS when TIME_MODE_TOTAL fills timeTrajectory[i<nelements],
+             * else MAX_ELEMENTS+1, whose MAX_ELEMENTS points need no padding. */
             buildMode = moveMode;
+            buildTimeMode = timeMode;
             buildElements = nelements;
             buildMoved = 0;
             for (j=0; j<numAxes; j++) {
@@ -230,7 +235,9 @@ ss trajectoryScan {
             } else {
                 if (buildMoved) {
                     if (buildElements > MAX_ELEMENTS-3) buildElements = MAX_ELEMENTS-3;
-                } else if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
+                } else if (buildTimeMode == TIME_MODE_TOTAL) {
+                    if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
+                } else if (buildElements > MAX_ELEMENTS+1) buildElements = MAX_ELEMENTS+1;
                 if (buildElements < 1 && (buildElements-1) % 4 != 0) buildElements = 1;
             }
             if (buildElements != nelements) {
@@ -250,7 +257,7 @@ ss trajectoryScan {
             %%writeOnly(ssId, pVar, pVar->stringOut);
             /* If time mode is TIME_MODE_TOTAL then construct timeTrajectory 
              * and post it */
-            if (timeMode == TIME_MODE_TOTAL) {
+            if (buildTimeMode == TIME_MODE_TOTAL) {
                 dtime = time_PV/buildElements;
                 for (i=0; i<buildElements; i++) timeTrajectory[i] = dtime;
                 pvPut(timeTrajectory);
