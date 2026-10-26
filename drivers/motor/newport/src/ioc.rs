@@ -4195,6 +4195,41 @@ mod xps_profile_tests {
         );
     }
 
+    /// buildProfile and runProfile: an axis useAxis turns off writes zero
+    /// columns, reads no SGamma or travel limits, and does not move.
+    #[test]
+    fn use_axis_off_keeps_the_axis_still() {
+        let rig = rig("XpsProfUnused");
+        rig.define();
+        rig.int(index::PROFILE_USE_AXIS, 1, 0);
+        rig.int(index::PROFILE_BUILD, 0, 1);
+        assert_eq!(
+            rig.read_int(index::PROFILE_BUILD_STATUS),
+            PROFILE_STATUS_SUCCESS
+        );
+        let log = rig.line.take_log();
+        for (call, n) in [
+            ("PositionerSGammaParametersGet (G1.P1,", 1),
+            ("PositionerSGammaParametersGet (G1.P2,", 0),
+            ("MultipleAxesPVTVerificationResultGet (G1.P2,", 1),
+            ("PositionerUserTravelLimitsGet (G1.P1,", 1),
+            ("PositionerUserTravelLimitsGet (G1.P2,", 0),
+        ] {
+            assert_eq!(Rig::count(&log, call), n, "{call} {log:?}");
+        }
+        let text = std::fs::read_to_string(&rig.file).unwrap();
+        assert!(
+            text.lines().all(|l| l.ends_with(", 0.000000, 0.000000")),
+            "{text}"
+        );
+
+        rig.int(index::PROFILE_EXECUTE, 0, 1);
+        rig.wait_executed();
+        let log = rig.line.take_log();
+        assert_eq!(Rig::count(&log, "GroupMoveAbsolute (G1.P1,"), 2, "{log:?}");
+        assert_eq!(Rig::count(&log, "GroupMoveAbsolute (G1.P2,"), 0, "{log:?}");
+    }
+
     /// abortProfile: GroupMoveAbort on the poll socket ends the run with
     /// ABORT and C's message; the poll reads the current element meanwhile.
     #[test]

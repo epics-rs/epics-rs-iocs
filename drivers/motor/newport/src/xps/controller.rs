@@ -513,7 +513,7 @@ impl XpsController {
                         e.code()
                     )
                 })?;
-            max_accels.push(accel);
+            max_accels.push(Some(accel));
         }
         let built = profile.generate(&max_accels).map_err(|e| e.to_string())?;
         // XPSController.cpp:624: the running maxima, in controller axis order.
@@ -529,7 +529,10 @@ impl XpsController {
         order.sort();
         let (mut pre_time_max, mut post_time_max) = (0.0_f64, 0.0_f64);
         for (axis_no, k) in order {
-            let (positions, ramp) = (&profile.axes[k].positions, built.ramps[k]);
+            let positions = &profile.axes[k].positions;
+            let Some(ramp) = built.ramps[k] else {
+                continue;
+            };
             pre_time_max = pre_time_max.max(ramp.pre_time);
             post_time_max = post_time_max.max(ramp.post_time);
             trace.print_self(

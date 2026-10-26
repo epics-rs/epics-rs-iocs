@@ -134,6 +134,13 @@ fn int_param(base: &PortDriverBase, index: usize) -> i32 {
     base.get_int32_param(index, 0).unwrap_or(0)
 }
 
+/// C `getIntegerParam(j, profileUseAxis_, &useAxis[j])`.
+fn use_axis(base: &PortDriverBase, addr: i32) -> bool {
+    base.get_int32_param(index::PROFILE_USE_AXIS, addr)
+        .unwrap_or(0)
+        != 0
+}
+
 /// The first `n` profile positions of the axis at `addr`.
 fn positions(ctx: &ControllerCtx<'_>, addr: i32, n: usize) -> Vec<f64> {
     ctx.profile
@@ -326,8 +333,12 @@ impl XpsProfile {
         let file_name = string_param(ctx.base, p.trajectory_file, MAX_FILENAME_LEN);
         let group = string_param(ctx.base, p.group_name, MAX_GROUPNAME_LEN);
         let registered = lock(controller).registered_axes();
-        let in_group: Vec<&RegisteredAxis> =
-            registered.iter().filter(|a| a.group == group).collect();
+        // Each axis in the group, and whether useAxis turns it on.
+        let in_group: Vec<(&RegisteredAxis, bool)> = registered
+            .iter()
+            .filter(|a| a.group == group)
+            .map(|a| (a, use_axis(ctx.base, a.axis_no)))
+            .collect();
 
         // C indexes the arrays at numPoints-2 and past their end unchecked.
         let max_points = ctx.profile.max_points;
@@ -340,9 +351,12 @@ impl XpsProfile {
         let n = num_points as usize;
         let times = ctx.profile.times[..n].to_vec();
 
-        let mut max_accelerations = Vec::with_capacity(in_group.len());
+        let mut max_accelerations = vec![None; in_group.len()];
         let (mut pre_time_max, mut post_time_max) = (0.0f64, 0.0f64);
-        for axis in &in_group {
+        for (k, &(axis, used)) in in_group.iter().enumerate() {
+            if !used {
+                continue;
+            }
             let sgamma = lock(controller)
                 .poll_socket()
                 .positioner_sgamma_parameters_get(&axis.positioner);
@@ -358,7 +372,7 @@ impl XpsProfile {
                     return done;
                 }
             };
-            max_accelerations.push(max_acceleration);
+            max_accelerations[k] = Some(max_acceleration);
             // C reduces it 10% for the ASCII roundoff; generate() does too.
             let reduced = max_acceleration * 0.9;
             let pos = positions(ctx, axis.axis_no, n);
@@ -387,7 +401,7 @@ impl XpsProfile {
             times,
             axes: in_group
                 .iter()
-                .map(|a| ProfileAxis {
+                .map(|(a, _)| ProfileAxis {
                     positioner: a.positioner.clone(),
                     positions: positions(ctx, a.axis_no, n),
                 })
@@ -405,7 +419,7 @@ impl XpsProfile {
         self.distances = registered
             .iter()
             .map(|a| {
-                let ramp = in_group.iter().position(|g| g.axis_no == a.axis_no);
+                let ramp = in_group.iter().position(|(g, _)| g.axis_no == a.axis_no);
                 let distances = ramp.map_or((0.0, 0.0), |i| {
                     (trajectory.pre_distance[i], trajectory.post_distance[i])
                 });
@@ -479,7 +493,7 @@ impl XpsProfile {
         // C reads them uninitialized when PositionerUserTravelLimitsGet
         // fails.
         let (mut low_limit, mut high_limit) = (f64::NEG_INFINITY, f64::INFINITY);
-        for axis in &in_group {
+        for &(axis, used) in &in_group {
             let (mut max_velocity, mut max_acceleration) = (0.0, 0.0);
             let result = sock.multiple_axes_pvt_verification_result_get(&axis.positioner);
             done.status = match result {
@@ -510,6 +524,9 @@ impl XpsProfile {
                     axis.positioner, done.status
                 );
                 return done;
+            }
+            if !used {
+                continue;
             }
             done.status = match sock.positioner_user_travel_limits_get(&axis.positioner) {
                 Ok((low, high)) => {
@@ -809,7 +826,7 @@ impl XpsProfile {
         let n = (num_points.max(0) as usize).min(ctx.profile.times.len());
         let axes = registered
             .iter()
-            .filter(|a| a.group == group)
+            .filter(|a| a.group == group && use_axis(ctx.base, a.axis_no))
             .map(|a| {
                 let pos = positions(ctx, a.axis_no, n);
                 let (pre, post) = self.distances.get(&a.axis_no).copied().unwrap_or_default();
@@ -899,7 +916,7 @@ struct RunPlan {
     pulses: (i32, i32, i32),
     times: Vec<f64>,
     absolute: bool,
-    /// The axes in the group, which move.
+    /// The axes in the group that useAxis turns on, which move.
     axes: Vec<RunAxis>,
     /// Every axis, which the gathering samples.
     gathered: Vec<String>,

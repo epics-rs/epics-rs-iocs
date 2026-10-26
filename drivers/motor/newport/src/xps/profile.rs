@@ -11,14 +11,6 @@
 //! and [`Profile::generate`], which builds the XPS trajectory-file text exactly
 //! as C `buildProfile` does. FTP upload, verification and execution live in the
 //! controller/ioc layers on top of this.
-//!
-//! # Simplification vs. C
-//!
-//! C distinguishes `useAxis` (an axis in the group but turned off for this
-//! scan, written as zero displacement/velocity) from in-group active axes.
-//! Here every axis in a [`Profile`] is active and in the group — the caller
-//! defines exactly the participating positioners and their position arrays — so
-//! the `useAxis==0` zero-fill path is not modelled.
 
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -70,8 +62,9 @@ pub struct TrajectoryFile {
     pub pre_distance: Vec<f64>,
     pub post_distance: Vec<f64>,
     /// Per axis, the reduced max acceleration and this axis's own ramp
-    /// times, before the running maximum and `XPS_MIN_PROFILE_ACCEL_TIME`.
-    pub ramps: Vec<Ramp>,
+    /// times, before the running maximum and `XPS_MIN_PROFILE_ACCEL_TIME`;
+    /// none for an axis the profile does not use.
+    pub ramps: Vec<Option<Ramp>>,
 }
 
 /// One axis's ramp sizing in [`TrajectoryFile::ramps`].
@@ -182,13 +175,18 @@ impl Profile {
     /// `max_acceleration` gives each axis's controller S-gamma max acceleration
     /// (same order as `self.axes`), read via `PositionerSGammaParametersGet`.
     /// Each is reduced by `XPS_ACCEL_ROUNDOFF_MARGIN` before use, exactly as C.
+    /// `None` is an axis C's `useAxis` turns off: it has no ramp, and every
+    /// element moves it by zero at zero velocity.
     ///
     /// The file is: one leading acceleration element (ramp from rest to the
     /// first segment velocity), `num_points - 1` trajectory elements (each a
     /// relative displacement + averaged end velocity per axis), and one trailing
     /// deceleration element (ramp to rest). Each numeric field is formatted with
     /// C `%f` (six fraction digits).
-    pub fn generate(&self, max_acceleration: &[f64]) -> Result<TrajectoryFile, ProfileError> {
+    pub fn generate(
+        &self,
+        max_acceleration: &[Option<f64>],
+    ) -> Result<TrajectoryFile, ProfileError> {
         let n = self.num_points();
         if n < 2 {
             return Err(ProfileError::Shape(format!(
@@ -233,13 +231,17 @@ impl Profile {
         let mut post_time_max = 0.0_f64;
         let mut ramps = Vec::with_capacity(self.axes.len());
         for (j, axis) in self.axes.iter().enumerate() {
-            let max_accel = max_acceleration[j] * XPS_ACCEL_ROUNDOFF_MARGIN;
+            let Some(controller_accel) = max_acceleration[j] else {
+                ramps.push(None);
+                continue;
+            };
+            let max_accel = controller_accel * XPS_ACCEL_ROUNDOFF_MARGIN;
             if max_accel <= 0.0 {
                 return Err(ProfileError::Acceleration(format!(
                     "axis {} ({}) max acceleration {} is not positive",
                     j,
                     axis.positioner,
-                    CFloat(max_acceleration[j]).g()
+                    CFloat(controller_accel).g()
                 )));
             }
             pre_velocity[j] = (axis.positions[1] - axis.positions[0]) / self.times[0];
@@ -251,7 +253,7 @@ impl Profile {
             };
             pre_time_max = pre_time_max.max(ramp.pre_time);
             post_time_max = post_time_max.max(ramp.post_time);
-            ramps.push(ramp);
+            ramps.push(Some(ramp));
         }
         pre_time_max = pre_time_max.max(XPS_MIN_PROFILE_ACCEL_TIME);
         post_time_max = post_time_max.max(XPS_MIN_PROFILE_ACCEL_TIME);
@@ -291,15 +293,18 @@ impl Profile {
                 t0
             };
             text.push_str(&format!("{:.6}", CFloat(self.times[i])));
-            for axis in &self.axes {
-                let d0 = axis.positions[i + 1] - axis.positions[i];
+            for (axis, used) in self.axes.iter().zip(max_acceleration) {
+                let mut d0 = axis.positions[i + 1] - axis.positions[i];
                 let d1 = if i < num_elements - 1 {
                     axis.positions[i + 2] - axis.positions[i + 1]
                 } else {
                     d0
                 };
                 // Velocity is the displacement averaged either side of the point.
-                let traj_vel = (d0 + d1) / (t0 + t1);
+                let mut traj_vel = (d0 + d1) / (t0 + t1);
+                if used.is_none() {
+                    (d0, traj_vel) = (0.0, 0.0);
+                }
                 text.push_str(&format!(
                     ", {d0:.6}, {traj_vel:.6}",
                     d0 = CFloat(d0),
@@ -383,7 +388,10 @@ mod tests {
             times: vec![1.0],
             axes: one_axis(&[0.0]),
         };
-        assert!(matches!(p.generate(&[10.0]), Err(ProfileError::Shape(_))));
+        assert!(matches!(
+            p.generate(&[Some(10.0)]),
+            Err(ProfileError::Shape(_))
+        ));
     }
 
     #[test]
@@ -394,7 +402,10 @@ mod tests {
             times: vec![1.0, 1.0, 1.0],
             axes: one_axis(&[0.0, 1.0]),
         };
-        assert!(matches!(p.generate(&[10.0]), Err(ProfileError::Shape(_))));
+        assert!(matches!(
+            p.generate(&[Some(10.0)]),
+            Err(ProfileError::Shape(_))
+        ));
     }
 
     #[test]
@@ -405,7 +416,10 @@ mod tests {
             times: vec![1.0, 0.0, 1.0],
             axes: one_axis(&[0.0, 1.0, 2.0]),
         };
-        assert!(matches!(p.generate(&[10.0]), Err(ProfileError::Time(_))));
+        assert!(matches!(
+            p.generate(&[Some(10.0)]),
+            Err(ProfileError::Time(_))
+        ));
 
         let p = Profile {
             group: "GROUP1".into(),
@@ -414,7 +428,7 @@ mod tests {
             axes: one_axis(&[0.0, 1.0, 2.0]),
         };
         assert!(matches!(
-            p.generate(&[0.0]),
+            p.generate(&[Some(0.0)]),
             Err(ProfileError::Acceleration(_))
         ));
     }
@@ -432,7 +446,7 @@ mod tests {
             times: vec![1.0, 1.0, 1.0],
             axes: one_axis(&[0.0, 1.0, 2.0]),
         };
-        let out = p.generate(&[10.0]).unwrap();
+        let out = p.generate(&[Some(10.0)]).unwrap();
         assert_eq!(out.pre_distance, vec![0.125]);
         assert_eq!(out.post_distance, vec![0.125]);
 
@@ -457,7 +471,7 @@ mod tests {
             times: vec![1.0, 1.0, 1.0],
             axes: one_axis(&[0.0, 2.0, 3.0]),
         };
-        let out = p.generate(&[100.0]).unwrap();
+        let out = p.generate(&[Some(100.0)]).unwrap();
         let lines: Vec<&str> = out.text.lines().collect();
         // Middle element 0 carries the averaged 1.5 velocity.
         assert_eq!(lines[1], "1.000000, 2.000000, 1.500000");
@@ -519,13 +533,44 @@ mod tests {
                 },
             ],
         };
-        let out = p.generate(&[100.0, 100.0]).unwrap();
+        let out = p.generate(&[Some(100.0), Some(100.0)]).unwrap();
         // numElements = 1: a single trajectory element between the ramps.
         let lines: Vec<&str> = out.text.lines().collect();
         assert_eq!(lines.len(), 3);
         // Element line has one (D, V) pair per axis: X moves 1, Y moves 2.
         assert_eq!(lines[1], "1.000000, 1.000000, 1.000000, 2.000000, 2.000000");
         assert_eq!(out.pre_distance.len(), 2);
+    }
+
+    /// XPSController.cpp:592-686: an axis turned off by useAxis keeps its
+    /// columns, all zero, and sizes no ramp.
+    #[test]
+    fn an_unused_axis_writes_zero_columns() {
+        let p = Profile {
+            group: "XY".into(),
+            move_mode: MoveMode::Absolute,
+            times: vec![1.0, 1.0, 1.0],
+            axes: vec![
+                ProfileAxis {
+                    positioner: "XY.X".into(),
+                    positions: vec![0.0, 1.0, 2.0],
+                },
+                ProfileAxis {
+                    positioner: "XY.Y".into(),
+                    positions: vec![0.0, 50.0, 100.0],
+                },
+            ],
+        };
+        let out = p.generate(&[Some(100.0), None]).unwrap();
+        assert_eq!(
+            out.text,
+            "0.250000, 0.125000, 1.000000, 0.000000, 0.000000\n\
+             1.000000, 1.000000, 1.000000, 0.000000, 0.000000\n\
+             1.000000, 1.000000, 1.000000, 0.000000, 0.000000\n\
+             0.250000, 0.125000, 0.000000, 0.000000, 0.000000\n"
+        );
+        assert_eq!((out.pre_distance[1], out.post_distance[1]), (0.0, 0.0));
+        assert!(out.ramps[0].is_some() && out.ramps[1].is_none());
     }
 
     #[test]
