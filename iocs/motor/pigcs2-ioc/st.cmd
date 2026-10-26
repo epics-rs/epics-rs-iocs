@@ -10,8 +10,8 @@
 #============================================================
 
 epicsEnvSet("P",       "pi:")
-epicsEnvSet("CTRL",    "PI1")
-epicsEnvSet("PORT",    "piAsyn")
+epicsEnvSet("CTRL",    "C867")
+epicsEnvSet("PORT",    "C867_ETH")
 epicsEnvSet("TTY",     "/dev/ttyUSB0")
 epicsEnvSet("NUMAXES", "1")
 
