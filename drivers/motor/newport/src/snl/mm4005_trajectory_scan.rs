@@ -375,4 +375,344 @@ mod tests {
         assert_eq!(difftime(105, 100), 5.0);
         assert!(time(0) > 1_700_000_000);
     }
+
+    mod program {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use epics_rs::asyn::interfaces::motor::AsynMotor;
+        use epics_rs::base::runtime::task::sleep;
+        use epics_rs::base::server::database::PvDatabase;
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::scan::ScanOwner;
+        use epics_rs::base::types::EpicsValue;
+        use epics_rs::motor::builder::{AxisSetup, MotorBuilder};
+        use epics_rs::motor::sim_motor::SimMotor;
+        use epics_rs::motor::trace::TraceUser;
+        use epics_seq_rs::{SeqThreadId, seq, seq_stop};
+        use motor_common::testing::LineRig;
+
+        use super::super::*;
+
+        const DB: &str = include_str!("../../../../../iocs/motor/mm4000-ioc/db/trajectoryScan.db");
+
+        /// m1 on a simulated axis at dial 0, user offset `$(OFF)`.
+        const MOTOR: &str = r#"record(motor, "T:m1") { field(DTYP, "asynMotor")
+            field(OUT, "@asyn($(PORT)m1,0)") field(MRES, "0.001") field(VELO, "1")
+            field(VMAX, "1") field(ACCL, "0.2") field(DHLM, "100") field(DLLM, "-100")
+            field(OFF, "$(OFF)") }"#;
+
+        /// What the fake MM4005 answers.
+        struct Mm4005 {
+            /// `MS` polls still to answer as moving.
+            moving: u32,
+            /// The `TB` reply.
+            tb: String,
+            /// The dial position `TP` answers.
+            position: f64,
+            /// The points `NQ` says were traced.
+            traced: usize,
+        }
+
+        type Shared = Arc<Mutex<Mm4005>>;
+
+        fn reply(mm: &Shared, cmd: &str) -> String {
+            let cmd = cmd.trim_end_matches('\r');
+            let mut m = mm.lock().unwrap();
+            match cmd {
+                "TB" => m.tb.clone(),
+                "TP" => format!("1TP{}", m.position),
+                "XC1" => "XC4".into(),
+                "MS" if m.moving > 0 => {
+                    m.moving -= 1;
+                    "1MSA".into()
+                }
+                "MS" => "1MS@".into(),
+                "NQ" => format!("NQ{}", m.traced),
+                "1GC?" => "1GC0.25".into(),
+                _ => match cmd.split_once("RC") {
+                    // 1RCn: element n of RC1, RC3, RC5, the value of the others
+                    Some((axis, n)) => {
+                        format!(
+                            "{axis}RC{}",
+                            ["7", "0.5", "8", "1.5", "9", "2.5"][n.parse::<usize>().unwrap() - 1]
+                        )
+                    }
+                    // nTQ: point n, theory then actual
+                    None => match cmd.strip_suffix("TQ") {
+                        Some(n) => {
+                            let n: f64 = n.parse().unwrap();
+                            format!("{n}TQ,1TH{},1TP{}", n, n + 0.25)
+                        }
+                        None => String::new(),
+                    },
+                },
+            }
+        }
+
+        /// `port`'s axis m1 of one simulated motor.
+        fn sim_axis(port: &str) {
+            let motor: Arc<Mutex<dyn AsynMotor>> =
+                Arc::new(Mutex::new(SimMotor::new().with_limits(-1e9, 1e9)));
+            let name = format!("{port}m1");
+            let AxisSetup {
+                axis, poll_loop, ..
+            } = MotorBuilder::new(motor)
+                .trace_user(TraceUser::Asyn {
+                    port: name.clone(),
+                    addr: 0,
+                })
+                .poll_interval(Duration::from_millis(10))
+                .build_axis();
+            epics_rs::motor::devices::register_controller_port(
+                &epics_rs::asyn::registry::open_owner(),
+                &name,
+                1,
+                (),
+            )
+            .unwrap();
+            epics_rs::motor::devices::register_axis(axis).unwrap();
+            poll_loop.start();
+        }
+
+        async fn put(db: &PvDatabase, pv: &str, v: EpicsValue) {
+            db.put_record_field_from_ca(pv, "VAL", v).await.unwrap();
+        }
+
+        fn value(db: &PvDatabase, pv: &str) -> f64 {
+            db.get_pv(pv).unwrap().to_f64().unwrap()
+        }
+
+        fn array(db: &PvDatabase, pv: &str, n: usize) -> Vec<f64> {
+            match db.get_pv(pv).unwrap() {
+                EpicsValue::DoubleArray(a) => a.as_slice()[..n].to_vec(),
+                v => panic!("{pv}: {v:?}"),
+            }
+        }
+
+        fn string(db: &PvDatabase, pv: &str) -> String {
+            match db.get_pv(pv).unwrap() {
+                EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+                v => panic!("{pv}: {v:?}"),
+            }
+        }
+
+        /// Poll until every `(pv, value)` holds; on timeout, name what each
+        /// read.
+        async fn expect(db: &PvDatabase, want: &[(&str, f64)]) {
+            for _ in 0..500 {
+                if want.iter().all(|&(pv, v)| value(db, pv) == v) {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            let got: Vec<_> = want.iter().map(|&(pv, _)| (pv, value(db, pv))).collect();
+            panic!("want {want:?}, got {got:?}");
+        }
+
+        struct Program {
+            db: Arc<PvDatabase>,
+            mm: Shared,
+            rig: LineRig,
+            /// The commands sent, each less its `\r`.
+            log: Mutex<Vec<String>>,
+            tid: SeqThreadId,
+            _scan: ScanOwner,
+        }
+
+        impl Drop for Program {
+            fn drop(&mut self) {
+                seq_stop(self.tid);
+            }
+        }
+
+        impl Program {
+            /// The commands sent since the last call.
+            fn sent(&self) -> Vec<String> {
+                let mut log = self.log.lock().unwrap();
+                log.extend(
+                    self.rig
+                        .sent()
+                        .into_iter()
+                        .map(|c| c.trim_end_matches('\r').to_string()),
+                );
+                std::mem::take(&mut *log)
+            }
+
+            /// Poll until `cmd` is sent, keeping what came before it for
+            /// [`Self::sent`].
+            async fn until(&self, cmd: &str) {
+                for _ in 0..500 {
+                    let sent = self.sent();
+                    let seen = sent.iter().any(|c| c == cmd);
+                    self.log.lock().unwrap().splice(0..0, sent);
+                    if seen {
+                        return;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+                panic!("never sent {cmd}: {:?}", self.sent());
+            }
+
+            async fn build(&self) {
+                put(&self.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+                expect(&self.db, &[("T:traj1:Build", 0.0)]).await;
+            }
+        }
+
+        /// trajectoryScan.db on NumAxes 1, T:m1 on a simulated axis, and the
+        /// program on a fake MM4005 port named `port`, once init has read
+        /// the axis's MDVS and posted it.
+        async fn boot(port: &str, set: &[(&str, &str)]) -> Program {
+            let mm = Arc::new(Mutex::new(Mm4005 {
+                moving: 0,
+                tb: "TB@ no error".into(),
+                position: 0.5,
+                traced: 0,
+            }));
+            let shared = mm.clone();
+            let (rig, _) = LineRig::new(port, move |cmd| reply(&shared, cmd));
+            sim_axis(port);
+            let mut macros: HashMap<String, String> = [
+                ("P", "T:"),
+                ("R", "traj1:"),
+                ("NAXES", "1"),
+                ("NELM", "2000"),
+                ("NPULSE", "2000"),
+                ("PORT", port),
+                ("OFF", "0"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into();
+            macros.extend(set.iter().map(|&(k, v)| (k.to_string(), v.to_string())));
+            let (motor, factory) = epics_rs::motor::motor_record_factory();
+            let (db, _) = IocBuilder::new()
+                .register_record_type(motor, factory)
+                .register_dynamic_device_support(
+                    &epics_rs::motor::devices::devices(),
+                    epics_rs::motor::devices::device_support_factory(),
+                )
+                .register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()))
+                .db_string(DB, &macros)
+                .unwrap()
+                .db_string(MOTOR, &macros)
+                .unwrap()
+                .build_served()
+                .await
+                .unwrap();
+            // seq holds each state set in its first state until PINI is done.
+            let scan = ScanOwner::start(db.clone());
+            let tid = seq(
+                &MM4005_trajectoryScan,
+                &format!("P=T:,R=traj1:,M1=m1,PORT={port}"),
+                0,
+                &db,
+            )
+            .expect("MM4005_trajectoryScan starts");
+            let p = Program {
+                db,
+                mm,
+                rig,
+                log: Mutex::default(),
+                tid,
+                _scan: scan,
+            };
+            p.until("1GC?").await;
+            expect(&p.db, &[("T:traj1:M1MDVS", 0.25)]).await;
+            p
+        }
+
+        /// ss trajectoryScan state build: the elements, pulses and verify
+        /// sent, and the dynamic parameters read back.
+        #[epics_rs::base::epics_test]
+        async fn build_defines_and_verifies_the_trajectory() {
+            let p = boot("mm4005Build", &[]).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(4)).await;
+            // monitor_inputs moves EndPulses to it.
+            expect(&p.db, &[("T:traj1:EndPulses", 4.0)]).await;
+            p.sent();
+            p.build().await;
+            expect(&p.db, &[("T:traj1:BuildStatus", 1.0)]).await;
+            let mut want = vec!["NC".to_string(), "1DC1".into(), "UC0.500000".into()];
+            for i in 1..=4 {
+                want.extend([format!("{i}DT2.500000"), "1DX0.000000".into()]);
+            }
+            want.extend(["MB1,ME4,MN11", "VC", "TB"].map(String::from));
+            want.extend((1..=6).map(|n| format!("1RC{n}")));
+            assert_eq!(p.sent(), want);
+            let got = ["MDVE", "MDVA", "MVE", "MVA", "MAE", "MAA"]
+                .map(|f| value(&p.db, &format!("T:traj1:M1{f}")));
+            assert_eq!(got, [7.0, 0.5, 8.0, 1.5, 9.0, 2.5]);
+            assert_eq!(string(&p.db, "T:traj1:BuildMessage"), " ");
+        }
+
+        /// ss trajectoryScan state build: a TB error after VC fails the
+        /// build with the controller's message.
+        #[epics_rs::base::epics_test]
+        async fn a_tb_error_fails_the_build() {
+            let p = boot("mm4005BuildError", &[]).await;
+            p.mm.lock().unwrap().tb = "TBE trajectory error".into();
+            p.build().await;
+            expect(&p.db, &[("T:traj1:BuildStatus", 2.0)]).await;
+            assert_eq!(
+                string(&p.db, "T:traj1:BuildMessage"),
+                "TBE trajectory error"
+            );
+        }
+
+        /// ss trajectoryScan states execute and wait_execute: the run polled
+        /// until the axes stop, then the flyback to the controller's
+        /// position.
+        #[epics_rs::base::epics_test]
+        async fn execute_runs_until_the_axes_stop() {
+            let p = boot("mm4005Execute", &[]).await;
+            p.build().await;
+            expect(&p.db, &[("T:traj1:BuildStatus", 1.0)]).await;
+            p.mm.lock().unwrap().moving = 2;
+            p.sent();
+            put(&p.db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[
+                    ("T:traj1:Execute", 0.0),
+                    ("T:traj1:ExecState", 0.0),
+                    ("T:traj1:ExecStatus", 1.0),
+                ],
+            )
+            .await;
+            let poll = ["TP", "XC1", "MS", "TB"];
+            let mut want = vec!["LS,0EC1.000000"];
+            for _ in 0..3 {
+                want.extend(poll);
+            }
+            want.push("TP");
+            assert_eq!(p.sent(), want);
+            assert_eq!(value(&p.db, "T:m1"), 0.5);
+            assert_eq!(value(&p.db, "T:traj1:M1Current"), 0.5);
+            assert_eq!(string(&p.db, "T:traj1:ExecMessage"), " ");
+        }
+
+        /// ss trajectoryScan state readback: each traced point's actual
+        /// position in user units, and its error from the theory.
+        #[epics_rs::base::epics_test]
+        async fn readback_reads_each_traced_point() {
+            let p = boot("mm4005Readback", &[("OFF", "10")]).await;
+            p.mm.lock().unwrap().traced = 2;
+            p.sent();
+            put(&p.db, "T:traj1:Readback", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[
+                    ("T:traj1:Readback", 0.0),
+                    ("T:traj1:ReadStatus", 1.0),
+                    ("T:traj1:Nactual", 2.0),
+                ],
+            )
+            .await;
+            assert_eq!(p.sent(), ["NQ", "1TQ", "2TQ"]);
+            assert_eq!(array(&p.db, "T:traj1:M1Actual", 3), [11.25, 12.25, 0.0]);
+            assert_eq!(array(&p.db, "T:traj1:M1Error", 3), [0.25, 0.25, 0.0]);
+        }
+    }
 }
