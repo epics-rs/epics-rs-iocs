@@ -11,6 +11,7 @@
 //! [`SocketMode`]: super::rpc::SocketMode
 
 use epics_rs::base::runtime::stdlib::strtod;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use super::rpc::{XpsResult, XpsSocket, g13 as g};
 
@@ -75,6 +76,25 @@ impl XpsSocket {
         let cmd = format!("GroupPositionCurrentGet ({positioner},double *)");
         let r = self.exec(&cmd)?.require_ok()?;
         Ok(r.double(1))
+    }
+
+    /// `GroupPositionCurrentGet(group, pos.len())` into `pos`: one encoder
+    /// position per positioner. As C (XPS_C8_drivers.cpp:3556-3600), an
+    /// element keeps what it held when its field is missing or no `%lf`.
+    pub fn group_positions_current_get(&self, group: &str, pos: &mut [f64]) -> XpsResult<()> {
+        let cmd = format!(
+            "GroupPositionCurrentGet ({group},{})",
+            vec!["double *"; pos.len()].join(",")
+        );
+        let r = self.exec(&cmd)?.require_ok()?;
+        for (i, p) in pos.iter_mut().enumerate() {
+            if let Some(read) = r.field(i + 1).map(|f| strtod(f.as_bytes()))
+                && read.len > 0
+            {
+                *p = read.value;
+            }
+        }
+        Ok(())
     }
 
     /// `GroupPositionSetpointGet(positioner, 1)` → commanded setpoint position.
@@ -405,6 +425,29 @@ impl XpsSocket {
         ))
     }
 
+    /// `MultipleAxesPVTParametersGet(group)` into `file` and `element`: the
+    /// running trajectory and its current element. As C
+    /// (XPS_C8_drivers.cpp:7439-7473), each keeps what it held when its
+    /// field is missing, and `element` too when its field is no `%d`.
+    pub fn multiple_axes_pvt_parameters_get(
+        &self,
+        group: &str,
+        file: &mut String,
+        element: &mut i32,
+    ) -> XpsResult<()> {
+        let cmd = format!("MultipleAxesPVTParametersGet ({group},char *,int *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        if let Some(name) = r.field(1) {
+            *file = name.to_string();
+        }
+        if let Some((value, len)) = r.field(2).map(|f| strtol(f, 10))
+            && len > 0
+        {
+            *element = long_to_int(value);
+        }
+        Ok(())
+    }
+
     /// `MultipleAxesPVTExecution(group, file, executionNumber)` — run the
     /// trajectory. The XPS holds the reply until the trajectory finishes, so
     /// this must run on a socket that is not needed for polling meanwhile.
@@ -645,6 +688,50 @@ mod tests {
                 "MultipleAxesPVTVerificationResultGet (G1.P1,char *,double *,double *,double *,double *)"
             ]
         );
+    }
+
+    /// XPS_C8_drivers.cpp:3556-3600: one `double *` per element; an element
+    /// whose field is no number, or is missing, keeps its value, and a
+    /// failed call leaves them all.
+    #[test]
+    fn group_positions_current_get_marshals_as_c() {
+        let line = FakeLine::new("xps_group_positions", "");
+        let sock = line.socket(SocketMode::Query);
+        let mut pos = [9.0; 5];
+        sock.group_positions_current_get("G1", &mut pos).unwrap();
+        assert_eq!(pos, [1.5, 9.0, 3.5, 9.0, 9.0]);
+        assert_eq!(
+            line.take_log(),
+            ["GroupPositionCurrentGet (G1,double *,double *,double *,double *,double *)"]
+        );
+
+        *line.fail.lock().unwrap() = "GroupPositionCurrentGet";
+        let mut pos = [9.0; 2];
+        let err = sock
+            .group_positions_current_get("G1", &mut pos)
+            .unwrap_err();
+        assert_eq!((err.code(), pos), (-3, [9.0; 2]));
+    }
+
+    /// XPS_C8_drivers.cpp:7439-7473: the file is reply field 1 and the
+    /// element field 2; a missing or non-`%d` field keeps its value.
+    #[test]
+    fn pvt_parameters_get_marshals_as_c() {
+        let line = FakeLine::new("xps_pvt_parameters", "");
+        let sock = line.socket(SocketMode::Query);
+        let (mut file, mut element) = (String::new(), 7);
+        sock.multiple_axes_pvt_parameters_get("G1", &mut file, &mut element)
+            .unwrap();
+        assert_eq!((file.as_str(), element), ("traj.trj", 42));
+        assert_eq!(
+            line.take_log(),
+            ["MultipleAxesPVTParametersGet (G1,char *,int *)"]
+        );
+
+        let (mut file, mut element) = ("kept".to_string(), 7);
+        sock.multiple_axes_pvt_parameters_get("NOELEMENT", &mut file, &mut element)
+            .unwrap();
+        assert_eq!((file.as_str(), element), ("traj.trj", 7));
     }
 
     /// XPS_C8_drivers.cpp:7574-7710: the SingleAxisSlave* wire strings, and

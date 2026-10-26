@@ -64,6 +64,7 @@ impl PortDriver for FakeXps {
                 group_status = format!("0,{}", self.group_status.lock().unwrap());
                 &group_status
             }
+            "GroupPositionCurrentGet" if cmd.contains("(G1,") => "0,1.5,x,3.5",
             "GroupPositionCurrentGet" if cmd.contains(".P2,") => "0,2.5",
             "GroupPositionCurrentGet" => "0,1.5",
             "GroupPositionSetpointGet" => "0,1.25",
@@ -71,6 +72,8 @@ impl PortDriver for FakeXps {
             "PositionerSGammaParametersGet" => "0,10,40,0.02,0.02",
             "PositionerUserTravelLimitsGet" => "0,-100,100",
             "MultipleAxesPVTVerificationResultGet" => "0,traj.trj,-0.5,2.5,1.2,3.4",
+            "MultipleAxesPVTParametersGet" if cmd.contains("(NOELEMENT,") => "0,traj.trj,x",
+            "MultipleAxesPVTParametersGet" => "0,traj.trj,42",
             "GatheringCurrentNumberGet" => "0,2,100",
             "GatheringDataMultipleLinesGet" => "0,1;1.5\n2;2.5",
             "SingleAxisSlaveParametersGet" if cmd.contains("(NORATIO,") => "0,G1.P1,",
