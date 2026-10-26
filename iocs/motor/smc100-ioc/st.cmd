@@ -8,7 +8,6 @@
 #============================================================
 
 epicsEnvSet("P",      "SMC100:")
-epicsEnvSet("M",      "m1")
 epicsEnvSet("PORT",   "MOTOR1")
 epicsEnvSet("SERIAL", "SERIAL1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
@@ -33,8 +32,9 @@ asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 #                        idlePollPeriod, eguPerStep)
 SMC100CreateController("$(PORT)", "$(SERIAL)", 1, 100, 1000, "0.00005")
 
-# The boundary is raw steps: MRES must equal eguPerStep above.
-dbLoadRecords("$(SMC100_IOC)/db/smc100.template", "P=$(P),M=$(M),PORT=$(PORT),ADDR=0,MRES=0.00005")
+# The axis's basic_asyn_motor.db, as C's st.cmd.SMC100 loads it. The
+# boundary is raw steps: its MRES must equal eguPerStep above.
+dbLoadTemplate("$(SMC100_IOC)/db/motor.substitutions.SMC100", "P=$(P),PORT=$(PORT)")
 
 iocInit()
 

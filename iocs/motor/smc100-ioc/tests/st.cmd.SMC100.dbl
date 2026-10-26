@@ -1,0 +1,5 @@
+# dbl of motor R7-4-5 motorNewport iocBoot/iocNewport st.cmd.SMC100
+IOC:m1
+IOC:m1Direction
+IOC:m1Offset
+IOC:m1Resolution
