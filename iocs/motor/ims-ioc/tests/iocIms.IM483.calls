@@ -1,0 +1,3 @@
+# c-expansion of st.cmd, IM483.cmd for MDrive-Eth.cmd over the C sources, its controller calls:
+IM483SMSetup(1, 10)
+IM483SMConfig(0, "serial1")

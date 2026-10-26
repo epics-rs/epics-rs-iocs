@@ -1,0 +1,4 @@
+# c-expansion of st.cmd.AG_UC over the C sources, its controller calls:
+AG_UCCreateController("Agilis1", "serial1", 2, 50, 500)
+AG_UCCreateAxis("Agilis1", 0, 0, 50, -30)
+AG_UCCreateAxis("Agilis1", 1, 0, 40, -50)

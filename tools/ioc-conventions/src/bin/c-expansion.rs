@@ -1,5 +1,7 @@
 //! Writes a C IOC's expansion, the `tests/*.db` an IOC's own tests compare
-//! its field values with ([`ioc_conventions::assert_same_fields`]).
+//! its field values with ([`ioc_conventions::assert_same_fields`]), and
+//! beside it the `.calls` they compare its controller calls with
+//! ([`ioc_conventions::assert_same_calls`]).
 //!
 //! ```text
 //! c-expansion --dbl <dbl> --ioc <iocBoot dir> --out <expansion>.db
@@ -18,7 +20,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ioc_conventions::{assert_same_records, c_expansion, read_db, read_dbl};
+use ioc_conventions::{assert_same_records, c_expansion, call_line, read_calls, read_db, read_dbl};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -46,8 +48,8 @@ fn main() {
     let out = out.expect("--out");
     let scripts: Vec<PathBuf> = scripts.iter().map(|s| ioc.join(s)).collect();
     let swap_text = swap.clone();
-    let (names, records, refused) = c_expansion(&scripts, &ioc, env, db_dirs, swap);
-    assert_same_records(&names, &read_dbl(&dbl));
+    let expansion = c_expansion(&scripts, &ioc, env, db_dirs, swap);
+    assert_same_records(&expansion.names, &read_dbl(&dbl));
 
     let mut ran: Vec<String> = scripts
         .iter()
@@ -62,22 +64,21 @@ fn main() {
             format!("{to} for {from}")
         }
     }));
-    let mut text = format!(
-        "# c-expansion of {} over the C sources, the records of {}:\n",
-        ran.join(", "),
-        dbl.file_name().unwrap().to_string_lossy()
-    );
+    let ran = ran.join(", ");
+    let dbl_name = dbl.file_name().unwrap().to_string_lossy();
+    let mut text =
+        format!("# c-expansion of {ran} over the C sources, the records of {dbl_name}:\n");
     let header = std::fs::read_to_string(&dbl).expect("readable dbl");
     for line in header.lines().take_while(|l| l.starts_with('#')) {
         text += &format!("{line}\n");
     }
-    let mut refused = refused;
+    let mut refused = expansion.refused;
     // One load refused per substitutions row is one refusal.
     refused.dedup();
     for load in refused {
         text += &format!("# C refuses {load}\n");
     }
-    for (name, record) in &records {
+    for (name, record) in &expansion.records {
         text += &format!("record({}, \"{}\") {{\n", record.rtyp, escape(name));
         for (field, value) in &record.fields {
             text += &format!("    field({field}, \"{}\")\n", escape(value));
@@ -86,9 +87,21 @@ fn main() {
     }
     std::fs::write(&out, text).unwrap_or_else(|e| panic!("{}: {e}", out.display()));
     assert!(
-        read_db(&out) == records,
+        read_db(&out) == expansion.records,
         "{} reads back other values",
         out.display()
+    );
+
+    let calls = out.with_extension("calls");
+    let mut text = format!("# c-expansion of {ran} over the C sources, its controller calls:\n");
+    for words in &expansion.calls {
+        text += &format!("{}\n", call_line(words));
+    }
+    std::fs::write(&calls, text).unwrap_or_else(|e| panic!("{}: {e}", calls.display()));
+    assert!(
+        read_calls(&calls) == expansion.calls,
+        "{} reads back other calls",
+        calls.display()
     );
 }
 

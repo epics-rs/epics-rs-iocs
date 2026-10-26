@@ -1,0 +1,2 @@
+# c-expansion of st.cmd, motor.cmd.hxp over the C sources, its controller calls:
+HXPCreateController("HXP1", "192.168.0.254", 5001, 200, 1000)

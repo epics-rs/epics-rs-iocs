@@ -1,0 +1,6 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+EnsembleAsynSetup(1)
+EnsembleAsynConfig(0, "EnsemblePort", 0, 1, 100, 1000)
+drvAsynMotorConfigure("AeroE1", "motorEnsemble", 0, 1)
+SoloistSetup(1, 10)
+SoloistConfig(0, "SoloistPort", 0)

@@ -1,0 +1,3 @@
+# c-expansion of st.cmd, no motor.cmd.SMCcorvus, no motor.cmd.SMChydra over the C sources, its controller calls:
+MicosSetup(1, 2, 10)
+MicosConfig(0, "serial1")

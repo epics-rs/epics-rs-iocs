@@ -1,0 +1,2 @@
+# c-expansion of st.cmd.AGAP_CONEX over the C sources, its controller calls:
+AGAP_CONEXCreateController("Agilis1", "serial1", 1, 50, 500)

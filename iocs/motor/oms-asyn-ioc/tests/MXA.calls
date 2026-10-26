@@ -1,0 +1,2 @@
+# c-expansion of st.cmd, MXA.cmd, no MAXnet.cmd, no MAXv.cmd over the C sources, its controller calls:
+omsMXAConfig("MXA1", 8, "MXA", 200, 2000, "AX LH PSO; AY LH PSO; AZ LH PSO; AT LH PSO; AU LH PSO; AV LH PSO; AR LH PSO; AS LH PSO;")

@@ -4,8 +4,9 @@
 use std::path::Path;
 
 use ioc_conventions::{
-    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_fields, assert_same_records,
-    booted_records, read_db, read_dbl, renamed, script_fields,
+    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_calls, assert_same_fields,
+    assert_same_records, booted_records, read_calls, read_db, read_dbl, renamed, script_calls,
+    script_fields,
 };
 
 fn assert_boots_as_c(script: &str, dbl: &str) {
@@ -32,6 +33,14 @@ fn st_cmd_sets_the_c_corvus_fields() {
     assert_sets_c_fields("st.cmd", "iocMicos.corvus.db");
 }
 
+/// st.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_cmd_makes_the_c_corvus_calls() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let c = read_calls(&dir.join("tests/iocMicos.corvus.calls"));
+    assert_same_calls(&script_calls(&dir.join("st.cmd")), &c);
+}
+
 #[test]
 fn st_hydra_cmd_loads_the_c_hydra_records() {
     assert_boots_as_c("st.hydra.cmd", "iocMicos.hydra.dbl");
@@ -42,6 +51,14 @@ fn st_hydra_cmd_sets_the_c_hydra_fields() {
     assert_sets_c_fields("st.hydra.cmd", "iocMicos.hydra.db");
 }
 
+/// st.hydra.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_hydra_cmd_makes_the_c_hydra_calls() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let c = read_calls(&dir.join("tests/iocMicos.hydra.calls"));
+    assert_same_calls(&script_calls(&dir.join("st.hydra.cmd")), &c);
+}
+
 #[test]
 fn st_moco_cmd_loads_the_c_moco_records() {
     assert_boots_as_c("st.moco.cmd", "iocMicos.moco.dbl");
@@ -50,6 +67,14 @@ fn st_moco_cmd_loads_the_c_moco_records() {
 #[test]
 fn st_moco_cmd_sets_the_c_moco_fields() {
     assert_sets_c_fields("st.moco.cmd", "iocMicos.moco.db");
+}
+
+/// st.moco.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_moco_cmd_makes_the_c_moco_calls() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let c = read_calls(&dir.join("tests/iocMicos.moco.calls"));
+    assert_same_calls(&script_calls(&dir.join("st.moco.cmd")), &c);
 }
 
 /// motorMicos ships no Taurus example: st.taurus.cmd is corvus's layout for

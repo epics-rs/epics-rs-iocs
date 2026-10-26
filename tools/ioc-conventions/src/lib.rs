@@ -16,9 +16,10 @@
 //! ([`read_dbl`], [`renamed`], [`assert_same_records`]), which value each
 //! field of them ends with ([`script_fields`]) against C's expansion of its
 //! own files ([`read_db`], [`renamed_fields`], [`assert_same_fields`]),
-//! whether the binary links asyn.dbd ([`assert_links_asyn_dbd`]), and whether
-//! the script starts motorUtil as C's st.cmd does
-//! ([`assert_inits_motor_util`]).
+//! which controller calls it makes ([`script_calls`]) against C's
+//! ([`read_calls`], [`assert_same_calls`]), whether the binary links
+//! asyn.dbd ([`assert_links_asyn_dbd`]), and whether the script starts
+//! motorUtil as C's st.cmd does ([`assert_inits_motor_util`]).
 //!
 //! A script is run as iocsh runs it, from its own directory: the IOC's
 //! `set_default`/`set_default_path` macros and the framework's envPaths
@@ -202,24 +203,34 @@ pub fn ioc_env(ioc_dir: &Path, packages: &HashMap<String, PathBuf>) -> HashMap<S
     env
 }
 
-/// macLib expansion of `$(NAME)`, `${NAME}` and `$(NAME=default)`; an
-/// undefined macro stays as written.
+/// macLib expansion of `$(NAME)`, `${NAME}` and `$(NAME=default)`, the
+/// default itself expanded, so it may nest; an undefined macro stays as
+/// written.
 pub fn expand(text: &str, env: &HashMap<String, String>) -> String {
     let mut out = String::new();
     let mut rest = text;
     while let Some(pos) = rest.find('$') {
         out.push_str(&rest[..pos]);
         let tail = &rest[pos + 1..];
-        let close = match tail.chars().next() {
-            Some('(') => ')',
-            Some('{') => '}',
+        let (open, close) = match tail.chars().next() {
+            Some('(') => ('(', ')'),
+            Some('{') => ('{', '}'),
             _ => {
                 out.push('$');
                 rest = tail;
                 continue;
             }
         };
-        let Some(end) = tail.find(close) else {
+        let mut depth = 0;
+        let end = tail.char_indices().find_map(|(i, c)| {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+            }
+            (depth == 0).then_some(i)
+        });
+        let Some(end) = end else {
             out.push_str(&rest[pos..]);
             return out;
         };
@@ -228,8 +239,8 @@ pub fn expand(text: &str, env: &HashMap<String, String>) -> String {
             Some((n, d)) => (n, Some(d)),
             None => (body, None),
         };
-        match env.get(name).map(String::as_str).or(default) {
-            Some(v) => out.push_str(v),
+        match env.get(name).cloned().or(default.map(|d| expand(d, env))) {
+            Some(v) => out.push_str(&v),
             None => out.push_str(&rest[pos..pos + 2 + end]),
         }
         rest = &tail[end + 1..];
@@ -496,6 +507,36 @@ impl<'a> Run<'a> {
                 "dbpf" if words.len() >= 3 => {
                     let at = self.at(&script, lineno);
                     self.put(&at, &words[1], &words[2]);
+                }
+                "iocshLoad" if words.len() >= 2 => {
+                    let file = cwd.join(&words[1]);
+                    if !file.is_file() {
+                        let at = self.at(&script, lineno);
+                        self.failures
+                            .push(format!("{at}: iocshLoad finds no {}", file.display()));
+                        continue;
+                    }
+                    // The command's macros hold while the file runs.
+                    let scoped: Vec<(String, String)> =
+                        macro_args(words.get(2).map_or("", String::as_str))
+                            .into_iter()
+                            .map(|(n, v)| {
+                                let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
+                                (text(n), text(v))
+                            })
+                            .collect();
+                    let saved: Vec<_> = scoped
+                        .iter()
+                        .map(|(n, _)| (n.clone(), env.get(n).cloned()))
+                        .collect();
+                    env.extend(scoped);
+                    self.script(&file, cwd, env, depth + 1);
+                    for (name, value) in saved {
+                        match value {
+                            Some(value) => env.insert(name, value),
+                            None => env.remove(&name),
+                        };
+                    }
                 }
                 "dbLoadRecords" | "dbLoadTemplate" => {
                     self.keep(raw);
@@ -782,22 +823,90 @@ pub fn script_fields(script: &Path) -> BTreeMap<String, Record> {
     run.fields.unwrap_or_default()
 }
 
+/// Commands a startup script runs that are not its controllers' calls:
+/// iocsh's own, the dbd's, record loads and puts, the asyn port beneath a
+/// controller (its transport, line settings, EOS and trace), and
+/// motorUtilInit, which [`assert_inits_motor_util`] checks.
+const NOT_CONTROLLER: &[&str] = &[
+    "asynOctetConnect",
+    "asynOctetSetInputEos",
+    "asynOctetSetOutputEos",
+    "asynSetOption",
+    "asynSetTraceIOMask",
+    "asynSetTraceInfoMask",
+    "asynSetTraceMask",
+    "cd",
+    "date",
+    "dbLoadDatabase",
+    "dbLoadRecords",
+    "dbLoadTemplate",
+    "dbpf",
+    "drvAsynIPPortConfigure",
+    "drvAsynIPServerPortConfigure",
+    "drvAsynSerialPortConfigure",
+    "epicsEnvSet",
+    "epicsThreadSleep",
+    "errlogInit",
+    "iocInit",
+    "iocshLoad",
+    "ld",
+    "motorUtilInit",
+];
+
+/// The controller calls among `calls`: the create, setup, config and
+/// poller commands, anything a script runs that [`NOT_CONTROLLER`] does not
+/// name. A `/* ... */` after the arguments is words to iocsh, which binds
+/// only as many as the command takes, so the call ends before it.
+fn controller_calls(mut calls: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    calls.retain(|words| {
+        !(NOT_CONTROLLER.contains(&words[0].as_str())
+            || words[0].ends_with("_registerRecordDeviceDriver"))
+    });
+    for words in &mut calls {
+        if let Some(at) = words.iter().position(|w| w.starts_with("/*")) {
+            words.truncate(at);
+        }
+    }
+    calls
+}
+
+/// The controller calls `script` makes, in the order run, each command's
+/// words macro-expanded.
+pub fn script_calls(script: &Path) -> Vec<Vec<String>> {
+    let root = workspace_root();
+    let mut run = Run::new(&root);
+    run.calls = Some(Vec::new());
+    run_script(&mut run, script);
+    controller_calls(run.calls.unwrap_or_default())
+}
+
+/// A C IOC's `scripts` as [`c_expansion`] runs them.
+pub struct CExpansion {
+    /// The names C's `dbl` would list.
+    pub names: BTreeSet<String>,
+    /// The records with their fields, as [`script_fields`] gives them.
+    pub records: BTreeMap<String, Record>,
+    /// The loads C refuses ([`Run::c_refused`]).
+    pub refused: Vec<String>,
+    /// The controller calls, as [`script_calls`] gives them.
+    pub calls: Vec<Vec<String>>,
+}
+
 /// A C IOC's `scripts`, run in turn from its iocBoot directory `cwd` with
 /// `env` for its envPaths, each db file opened from the source `Db`
 /// directories `db_dirs` ([`Run::c_db`]), its `<` fragments swapped as
-/// [`Run::c_swap`]: the names C's `dbl` would list,
-/// the records with their fields as [`script_fields`] gives them, and the
-/// loads C refuses ([`Run::c_refused`]). Panics naming every load that fails.
+/// [`Run::c_swap`]. Panics naming every load that fails.
 pub fn c_expansion(
     scripts: &[PathBuf],
     cwd: &Path,
     mut env: HashMap<String, String>,
     db_dirs: Vec<PathBuf>,
     swap: HashMap<String, String>,
-) -> (BTreeSet<String>, BTreeMap<String, Record>, Vec<String>) {
+) -> CExpansion {
     let mut run = Run::new(cwd);
     run.records = Some(BTreeSet::new());
     run.fields = Some(BTreeMap::new());
+    run.calls = Some(Vec::new());
     run.c_db = Some(db_dirs);
     run.c_swap = swap;
     for script in scripts {
@@ -809,11 +918,12 @@ pub fn c_expansion(
         "{scripts:?} loads:\n{}",
         run.failures.join("\n")
     );
-    (
-        run.records.unwrap_or_default(),
-        run.fields.unwrap_or_default(),
-        run.c_refused,
-    )
+    CExpansion {
+        names: run.records.unwrap_or_default(),
+        records: run.fields.unwrap_or_default(),
+        refused: run.c_refused,
+        calls: controller_calls(run.calls.unwrap_or_default()),
+    }
 }
 
 /// The IOC's servers on loopback, beaconing and searching only there. PVA
@@ -1013,6 +1123,32 @@ pub fn read_db(path: &Path) -> BTreeMap<String, Record> {
         .collect()
 }
 
+/// A C expansion's calls (`tests/*.calls`, written by `c-expansion`): one
+/// call per line as [`call_line`] writes it.
+pub fn read_calls(path: &Path) -> Vec<Vec<String>> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(args)
+        .collect()
+}
+
+/// A call as iocsh takes it: `command(arg, ...)`, each argument quoted
+/// unless it is a number.
+pub fn call_line(words: &[String]) -> String {
+    let args: Vec<String> = words[1..]
+        .iter()
+        .map(|w| {
+            assert!(!w.contains('"'), "{w:?}: a quote cannot be written");
+            match number(w) {
+                Some(_) => w.clone(),
+                None => format!("\"{w}\""),
+            }
+        })
+        .collect();
+    format!("{}({})", words[0], args.join(", "))
+}
+
 /// Whether `name` starts with the record-name prefix `prefix`. A prefix
 /// ending in a digit takes no further digit, so `m1` is not `m10`'s.
 fn has_prefix(name: &str, prefix: &str) -> bool {
@@ -1073,15 +1209,17 @@ pub fn renamed_fields(
         .collect()
 }
 
+/// A value as C reads a number from it, decimal or `0x` hex.
+fn number(v: &str) -> Option<f64> {
+    let v = v.trim();
+    match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => i64::from_str_radix(hex, 16).ok().map(|n| n as f64),
+        None => v.parse().ok(),
+    }
+}
+
 /// Two field values C would store alike: the same text, or the same number.
 fn same_value(a: &str, b: &str) -> bool {
-    let number = |v: &str| -> Option<f64> {
-        let v = v.trim();
-        match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
-            Some(hex) => i64::from_str_radix(hex, 16).ok().map(|n| n as f64),
-            None => v.parse().ok(),
-        }
-    };
     a == b || number(a).is_some_and(|x| number(b) == Some(x))
 }
 
@@ -1128,6 +1266,43 @@ pub fn assert_same_fields(rs: &BTreeMap<String, Record>, c: &BTreeMap<String, Re
     assert!(
         diffs.is_empty(),
         "field values differ ({}):\n  {}",
+        diffs.len(),
+        diffs.join("\n  ")
+    );
+}
+
+/// `rs` makes the calls `c` makes, in the same order, each argument the
+/// same text or number; the panic lists the calls only one side makes.
+pub fn assert_same_calls(rs: &[Vec<String>], c: &[Vec<String>]) {
+    let same = |a: &Vec<String>, b: &Vec<String>| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_value(x, y))
+    };
+    // Longest common subsequence, filled from the ends.
+    let mut lcs = vec![vec![0usize; c.len() + 1]; rs.len() + 1];
+    for i in (0..rs.len()).rev() {
+        for j in (0..c.len()).rev() {
+            lcs[i][j] = if same(&rs[i], &c[j]) {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j, mut diffs) = (0, 0, Vec::new());
+    while i < rs.len() || j < c.len() {
+        if i < rs.len() && j < c.len() && same(&rs[i], &c[j]) {
+            (i, j) = (i + 1, j + 1);
+        } else if j < c.len() && (i == rs.len() || lcs[i][j + 1] >= lcs[i + 1][j]) {
+            diffs.push(format!("only in C:  {}", call_line(&c[j])));
+            j += 1;
+        } else {
+            diffs.push(format!("only in rs: {}", call_line(&rs[i])));
+            i += 1;
+        }
+    }
+    assert!(
+        diffs.is_empty(),
+        "controller calls differ ({}):\n  {}",
         diffs.len(),
         diffs.join("\n  ")
     );
@@ -1244,5 +1419,89 @@ mod tests {
                 "c:x", "c:x_a", "c:x_s", "c:m1", "c:m1_a", "c:m1_r", "c:m2", "c:m2_a", "c:m2_g"
             ])
         );
+    }
+
+    #[test]
+    fn a_default_may_hold_a_macro() {
+        let env = HashMap::from([("POLL".to_string(), "0.5".to_string())]);
+        assert_eq!(
+            expand("$(MOVING=$(POLL=0.1)), $(IDLE=$(NONE=1.0))", &env),
+            "0.5, 1.0"
+        );
+        assert_eq!(expand("$(A=x)$(B)", &env), "x$(B)");
+    }
+
+    #[test]
+    fn an_iocsh_load_runs_its_file_under_its_macros_only() {
+        let dir = std::env::temp_dir().join(format!("ioc-conv-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ctl.iocsh"),
+            "drvAsynIPPortConfigure(\"$(P)_ETH\", \"h:1\")\n\
+             CtlCreate(\"$(P)\", \"$(P)_ETH\", 2) /* two axes */\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("st.cmd"),
+            "epicsEnvSet(\"P\", \"outer\")\n\
+             iocshLoad(\"ctl.iocsh\", \"P=A1\")\n\
+             CtlPoll(\"$(P)\", 100)\n",
+        )
+        .unwrap();
+        let root = dir.clone();
+        let mut run = Run::new(&root);
+        run.calls = Some(Vec::new());
+        run.script(&dir.join("st.cmd"), &dir, &mut HashMap::new(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(run.failures.is_empty(), "{:?}", run.failures);
+        let calls: Vec<String> = controller_calls(run.calls.unwrap())
+            .iter()
+            .map(|w| call_line(w))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "CtlCreate(\"A1\", \"A1_ETH\", 2)",
+                "CtlPoll(\"outer\", 100)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dropped_or_changed_call_fails_and_a_respelled_number_does_not() {
+        let calls =
+            |lines: &[&str]| -> Vec<Vec<String>> { lines.iter().map(|l| args(l)).collect() };
+        let c = calls(&[
+            "Create(\"A\", \"L0\", 2, 50, 500)",
+            "Axis(\"A\", 0, 0, 50, -30)",
+            "Axis(\"A\", 1, 0, 40, -50)",
+        ]);
+        assert_same_calls(
+            &calls(&[
+                "Create(\"A\", \"L0\", 2, 50.0, 500)",
+                "Axis(\"A\", 0, 0, 50, -30)",
+                "Axis(\"A\", 1, 0, 40, -50)",
+            ]),
+            &c,
+        );
+        let err = std::panic::catch_unwind(|| {
+            assert_same_calls(
+                &calls(&[
+                    "Create(\"A\", \"L0\", 1, 50, 500)",
+                    "Axis(\"A\", 0, 0, 50, -30)",
+                ]),
+                &c,
+            )
+        })
+        .unwrap_err();
+        let msg = err.downcast_ref::<String>().unwrap();
+        assert!(msg.starts_with("controller calls differ (3):"), "{msg}");
+        for line in [
+            "only in C:  Create(\"A\", \"L0\", 2, 50, 500)",
+            "only in rs: Create(\"A\", \"L0\", 1, 50, 500)",
+            "only in C:  Axis(\"A\", 1, 0, 40, -50)",
+        ] {
+            assert!(msg.contains(line), "{msg}");
+        }
     }
 }

@@ -4,8 +4,9 @@
 use std::path::Path;
 
 use ioc_conventions::{
-    assert_links_asyn_dbd, assert_same_fields, assert_same_records, booted_records, read_db,
-    read_dbl, renamed, renamed_fields, script_fields,
+    assert_links_asyn_dbd, assert_same_calls, assert_same_fields, assert_same_records,
+    booted_records, read_calls, read_db, read_dbl, renamed, renamed_fields, script_calls,
+    script_fields,
 };
 
 fn dir() -> &'static Path {
@@ -48,6 +49,13 @@ fn st_cmd_sets_the_c_phymotion_fields() {
     assert_same_fields(&script_fields(&dir().join("st.cmd")), &c);
 }
 
+/// st.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_cmd_makes_the_c_phymotion_calls() {
+    let c = read_calls(&dir().join("tests/st.cmd.phytron.calls"));
+    assert_same_calls(&script_calls(&dir().join("st.cmd")), &c);
+}
+
 #[test]
 fn st_mcc_cmd_loads_the_c_mcc_records() {
     let c = renamed(
@@ -75,6 +83,13 @@ fn st_mcc_cmd_sets_the_c_mcc_fields() {
         init.remove("LNK8");
     }
     assert_same_fields(&script_fields(&dir().join("st.mcc.cmd")), &c);
+}
+
+/// st.mcc.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_mcc_cmd_makes_the_c_mcc_calls() {
+    let c = read_calls(&dir().join("tests/st.cmd.mcc.calls"));
+    assert_same_calls(&script_calls(&dir().join("st.mcc.cmd")), &c);
 }
 
 /// The binary links asyn.dbd, as C's iocPhytron does.

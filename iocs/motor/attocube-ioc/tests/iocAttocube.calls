@@ -1,0 +1,3 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+ANC150AsynSetup(1)
+ANC150AsynConfig(0, "serial1", 3, 250, 2000)

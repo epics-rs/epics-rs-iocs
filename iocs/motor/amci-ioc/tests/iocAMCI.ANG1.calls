@@ -1,0 +1,10 @@
+# c-expansion of st.cmd, motor.substitutions.ANG1 for ANG1_motors.substitutions, st.cmd.ANG1 for motor.cmd.ANF2 over the C sources, its controller calls:
+modbusInterposeConfig("ang1_1", 0, 2000, 0)
+drvModbusAsynConfigure("ANG1_1_1_In_Word", "ang1_1", 0, 4, 0, 10, 0, 100, "ANG1_stepper")
+drvModbusAsynConfigure("ANG1_1_2_In_Word", "ang1_1", 0, 4, 10, 10, 0, 100, "ANG1_stepper")
+drvModbusAsynConfigure("ANG1_1_1_Out_Word", "ang1_1", 0, 6, 1024, 10, 0, 1, "ANG1_stepper")
+drvModbusAsynConfigure("ANG1_1_2_Out_Word", "ang1_1", 0, 6, 1034, 10, 0, 1, "ANG1_stepper")
+ANG1CreateController("ANG1_1_1", "ANG1_1_1_In_Word", "ANG1_1_1_Out_Word", 1, 100, 0)
+ANG1CreateController("ANG1_1_2", "ANG1_1_2_In_Word", "ANG1_1_2_Out_Word", 1, 100, 0)
+ANF2StartPoller("$(PORT1)", 200, 1000)
+ANF2StartPoller("$(PORT2)", 200, 1000)

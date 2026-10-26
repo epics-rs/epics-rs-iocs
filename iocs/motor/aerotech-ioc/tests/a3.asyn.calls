@@ -1,0 +1,4 @@
+# c-expansion of a3.asyn.st.cmd.linux-x86 over the C sources, its controller calls:
+A3200AsynSetup(1)
+A3200AsynConfig(0, "L0", 0, 2, 1, 1000, 2500)
+drvAsynMotorConfigure("L1", "motorA3200", 0, 2)

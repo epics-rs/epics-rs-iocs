@@ -4,8 +4,9 @@
 use std::path::Path;
 
 use ioc_conventions::{
-    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_fields, assert_same_records,
-    booted_records, read_db, read_dbl, renamed, renamed_fields, script_fields,
+    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_calls, assert_same_fields,
+    assert_same_records, booted_records, read_calls, read_db, read_dbl, renamed, renamed_fields,
+    script_calls, script_fields,
 };
 
 fn dir() -> &'static Path {
@@ -41,6 +42,13 @@ fn st_cmd_sets_the_c_oem_fields() {
     assert_sets_c_fields("st.cmd", "st.cmd.oem.db", OEM_RENAMES);
 }
 
+/// st.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_cmd_makes_the_c_oem_calls() {
+    let c = read_calls(&dir().join("tests/st.cmd.oem.calls"));
+    assert_same_calls(&script_calls(&dir().join("st.cmd")), &c);
+}
+
 #[test]
 fn st_acr_cmd_loads_the_c_acr_records() {
     let c = renamed(
@@ -70,6 +78,13 @@ fn st_acr_cmd_sets_the_c_acr_fields() {
     assert_same_fields(&script_fields(&dir().join("st.acr.cmd")), &c);
 }
 
+/// st.acr.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_acr_cmd_makes_the_c_acr_calls() {
+    let c = read_calls(&dir().join("tests/st.cmd.acr.calls"));
+    assert_same_calls(&script_calls(&dir().join("st.acr.cmd")), &c);
+}
+
 #[test]
 fn st_pc6k_cmd_loads_the_c_pc6k_records() {
     let c = renamed(
@@ -83,6 +98,13 @@ fn st_pc6k_cmd_loads_the_c_pc6k_records() {
 #[test]
 fn st_pc6k_cmd_sets_the_c_pc6k_fields() {
     assert_sets_c_fields("st-pc6k.cmd", "st.cmd.db", PC6K_RENAMES);
+}
+
+/// st-pc6k.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_pc6k_cmd_makes_the_c_pc6k_calls() {
+    let c = read_calls(&dir().join("tests/st.cmd.calls"));
+    assert_same_calls(&script_calls(&dir().join("st-pc6k.cmd")), &c);
 }
 
 /// The binary links asyn.dbd, as C's iocParker does.

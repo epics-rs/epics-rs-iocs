@@ -5,8 +5,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use ioc_conventions::{
-    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_fields, assert_same_records,
-    booted_records, read_db, read_dbl, renamed, renamed_fields, script_fields,
+    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_calls, assert_same_fields,
+    assert_same_records, booted_records, read_calls, read_db, read_dbl, renamed, renamed_fields,
+    script_calls, script_fields,
 };
 
 fn assert_boots(script: &str, want: &BTreeSet<String>) {
@@ -46,6 +47,14 @@ fn st_cmd_sets_the_c_mdrive_eth_fields() {
     assert_sets_c_fields("st.cmd", "iocIms.db", ETH_RENAMES);
 }
 
+/// st.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_cmd_makes_the_c_mdrive_eth_calls() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let c = read_calls(&dir.join("tests/iocIms.calls"));
+    assert_same_calls(&script_calls(&dir.join("st.cmd")), &c);
+}
+
 #[test]
 fn st_im483sm_cmd_loads_the_c_im483_records() {
     let want = c_dbl("iocIms.IM483.dbl");
@@ -57,6 +66,14 @@ fn st_im483sm_cmd_sets_the_c_im483_fields() {
     assert_sets_c_fields("st-im483sm.cmd", "iocIms.IM483.db", &[]);
 }
 
+/// st-im483sm.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_im483sm_cmd_makes_the_c_im483_calls() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let c = read_calls(&dir.join("tests/iocIms.IM483.calls"));
+    assert_same_calls(&script_calls(&dir.join("st-im483sm.cmd")), &c);
+}
+
 #[test]
 fn st_mdrive_cmd_loads_the_c_mdrive_records() {
     let want = c_dbl("iocIms.MDrive.dbl");
@@ -66,6 +83,14 @@ fn st_mdrive_cmd_loads_the_c_mdrive_records() {
 #[test]
 fn st_mdrive_cmd_sets_the_c_mdrive_fields() {
     assert_sets_c_fields("st-mdrive.cmd", "iocIms.MDrive.db", &[]);
+}
+
+/// st-mdrive.cmd makes C's controller calls, in C's order.
+#[test]
+fn st_mdrive_cmd_makes_the_c_mdrive_calls() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let c = read_calls(&dir.join("tests/iocIms.MDrive.calls"));
+    assert_same_calls(&script_calls(&dir.join("st-mdrive.cmd")), &c);
 }
 
 /// The binary links asyn.dbd, as C's iocIms does.
