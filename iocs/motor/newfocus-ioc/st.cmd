@@ -11,7 +11,7 @@
 #============================================================
 
 epicsEnvSet("P",     "NF:")
-epicsEnvSet("ASYN",  "PMNC1")
+epicsEnvSet("ASYN",  "serial1")
 epicsEnvSet("HOST",  "192.168.0.100:23")
 
 # ---- TCP octet port ----
