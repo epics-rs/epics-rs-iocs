@@ -1,3 +1,0 @@
-file "asyn_motor_settings.req",  P=$(P), M=m1
-file "asyn_motor_settings.req",  P=$(P), M=m2
-file "asyn_motor_settings.req",  P=$(P), M=m3
