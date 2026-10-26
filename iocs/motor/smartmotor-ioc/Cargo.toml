@@ -12,3 +12,6 @@ publish = false
 motor-smartmotor = { path = "../../../drivers/motor/smartmotor" }
 motor-common = { path = "../../../drivers/motor/common" }
 epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
+
+[dev-dependencies]
+ioc-conventions = { path = "../../../tools/ioc-conventions" }

@@ -31,9 +31,11 @@ SmartMotorSetup(1, 10)
 # chain.
 SmartMotorConfig(0, "$(SERIAL)")
 
-# Motor record for chain axis 0; load one per motor with S=n. The
-# SmartMotor works in encoder counts, so MRES = 1 and EGU = counts.
-dbLoadRecords("$(SMARTMOTOR_IOC)/db/smartmotor.template", "P=$(P),M=m1,C=$(CARD),S=0")
+# Chain axis 0's motor.db, as C's SmartMotor.cmd loads it (a row per motor,
+# S=n), and motorUtil's records, as C's st.cmd loads them. The SmartMotor
+# works in encoder counts, so MRES = 1 and EGU = counts.
+dbLoadTemplate("$(SMARTMOTOR_IOC)/db/SmartMotor.substitutions", "P=$(P),C=$(CARD)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
