@@ -10,7 +10,7 @@
 #============================================================
 
 epicsEnvSet("P",      "ESP300:")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial4")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
