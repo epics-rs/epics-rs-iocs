@@ -26,6 +26,9 @@ dbLoadTemplate("$(HXP_IOC)/db/motor.substitutions.hxp", "P=$(P),PORT=$(PORT)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor HXP:m3 HXP:m3.RBV

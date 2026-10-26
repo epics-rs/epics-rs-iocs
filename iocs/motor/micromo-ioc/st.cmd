@@ -45,6 +45,9 @@ dbLoadTemplate("$(MICROMO_IOC)/db/MVP2001.substitutions", "P=$(P),PORT=$(CTRL)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor MVP:m1 MVP:m1.RBV

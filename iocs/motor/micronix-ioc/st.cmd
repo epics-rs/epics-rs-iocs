@@ -44,6 +44,9 @@ dbLoadTemplate("$(MICRONIX_IOC)/db/motor.substitutions.mmc200", "P=$(P),PORT=$(P
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor MMC200:m1 MMC200:m1.RBV

@@ -64,6 +64,9 @@ iocInit()
 ANF2StartPoller("$(PORT1)", 200, 1000)
 ANF2StartPoller("$(PORT2)", 200, 1000)
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor AMCI:m1 AMCI:m1.RBV

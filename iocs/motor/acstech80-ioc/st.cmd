@@ -43,6 +43,9 @@ dbLoadTemplate("$(ACSTECH80_IOC)/db/SPiiPlus.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor ACS:m1 ACS:m1.RBV

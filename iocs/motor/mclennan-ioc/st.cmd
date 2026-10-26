@@ -44,6 +44,9 @@ dbLoadTemplate("$(MCLENNAN_IOC)/db/PM304.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor PM304:m1 PM304:m1.RBV

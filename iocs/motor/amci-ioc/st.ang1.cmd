@@ -35,6 +35,9 @@ ANG1CreateController("ANG1_1_2", "ANG1_1_2_In_Word", "ANG1_1_2_Out_Word", 1, 100
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor AMCI:m101 AMCI:m101.RBV

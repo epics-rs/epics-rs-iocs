@@ -39,6 +39,9 @@ dbLoadTemplate("$(KOHZU_IOC)/db/SC800.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor SC800:m1 SC800:m1.RBV

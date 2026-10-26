@@ -37,6 +37,9 @@ dbLoadTemplate("$(ESP300_IOC)/db/ESP300.substitutions", "P=$(P)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor ESP300:m21 ESP300:m21.RBV

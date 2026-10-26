@@ -43,6 +43,9 @@ dbLoadTemplate("$(FAULHABER_IOC)/db/MCDC2805.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor MCDC:m1 MCDC:m1.RBV

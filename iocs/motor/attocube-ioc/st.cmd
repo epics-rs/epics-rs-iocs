@@ -39,6 +39,9 @@ dbLoadTemplate("$(ATTOCUBE_IOC)/db/ANC150.substitutions", "P=$(P),PORT=$(CTRL)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor ANC150:m1 ANC150:m1.RBV

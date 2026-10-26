@@ -50,6 +50,9 @@ dbLoadTemplate("$(MM4000_IOC)/db/MM4000.substitutions", "P=$(P)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # MM4005_trajectoryScan.st runs trajectoryScan.db's trajectories on the
 # MM4005 over the same serial port, motor Mn its axis n:
 #   seq &MM4005_trajectoryScan, "P=$(P),R=traj1:,M1=m11,PORT=$(SERIAL)"
