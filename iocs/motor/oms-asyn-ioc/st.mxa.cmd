@@ -27,7 +27,9 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\n\r")
 #              idlePollPeriod, initString).
 omsMXAConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "")
 
-# Each axis's asyn_motor_model2.db, as C's MXA.cmd loads them.
+# Each axis's asyn_motor_model2.db, as C's MXA.cmd loads them. C passes
+# P=$(PREFIX), which its st.cmd never sets, so iocsh drops the load and C
+# boots with no motor records; P here is this IOC's prefix.
 dbLoadTemplate("$(OMS_ASYN_IOC)/db/MXA.substitutions", "P=$(P),PORT=$(PORT)")
 
 # motorUtil's records, as C's st.cmd loads them.
