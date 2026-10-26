@@ -647,6 +647,22 @@ mod tests {
             assert_eq!(string(&p.db, "T:traj1:BuildMessage"), " ");
         }
 
+        /// ss trajectoryScan state init reads NumAxes once, so a put past
+        /// MAX_AXES after it leaves the build's per-axis loops on its one
+        /// axis.
+        #[epics_rs::base::epics_test]
+        async fn a_num_axes_put_after_init_leaves_the_build_on_its_axes() {
+            let p = boot("mm4005NumAxesPut", &[]).await;
+            put(&p.db, "T:traj1:NumAxes", EpicsValue::Long(9)).await;
+            p.sent();
+            p.build().await;
+            expect(&p.db, &[("T:traj1:BuildStatus", 1.0)]).await;
+            let sent = p.sent();
+            let axes: Vec<_> = sent.iter().filter(|c| c.contains("DC")).collect();
+            assert_eq!(axes, ["1DC1"]);
+            assert_eq!(sent.iter().filter(|c| c.contains("RC")).count(), 6);
+        }
+
         /// ss trajectoryScan state build: a TB error after VC fails the
         /// build with the controller's message.
         #[epics_rs::base::epics_test]
