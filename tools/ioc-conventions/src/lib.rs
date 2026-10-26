@@ -13,8 +13,9 @@
 //! IOC's own tests can ask it which records a script loads
 //! ([`script_records`]), or which its IOC binary makes running it
 //! ([`booted_records`]), and compare them with the C IOC's `dbl`
-//! ([`read_dbl`], [`renamed`], [`assert_same_records`]), and whether the
-//! binary links asyn.dbd ([`assert_links_asyn_dbd`]).
+//! ([`read_dbl`], [`renamed`], [`assert_same_records`]), whether the
+//! binary links asyn.dbd ([`assert_links_asyn_dbd`]), and whether the script
+//! starts motorUtil as C's st.cmd does ([`assert_inits_motor_util`]).
 //!
 //! A script is run as iocsh runs it, from its own directory: the IOC's
 //! `set_default`/`set_default_path` macros and the framework's envPaths
@@ -360,6 +361,8 @@ pub struct Run<'a> {
     /// When set, every `epicsEnvSet`, `dbLoadRecords` and `dbLoadTemplate`
     /// line is kept here as written, each `<` fragment's in its place.
     pub lines: Option<Vec<String>>,
+    /// When set, every command's words, macro-expanded, in the order run.
+    pub calls: Option<Vec<Vec<String>>>,
 }
 
 impl<'a> Run<'a> {
@@ -372,6 +375,7 @@ impl<'a> Run<'a> {
             top: PathBuf::new(),
             records: None,
             lines: None,
+            calls: None,
         }
     }
 
@@ -425,6 +429,9 @@ impl<'a> Run<'a> {
             let Some(command) = words.first() else {
                 continue;
             };
+            if let Some(calls) = self.calls.as_mut() {
+                calls.push(words.clone());
+            }
             match command.as_str() {
                 "epicsEnvSet" if words.len() >= 3 => {
                     self.keep(raw);
@@ -669,13 +676,22 @@ pub fn booted_records(binary: &Path, script: &Path) -> BTreeSet<String> {
     let mut lines = run.lines.unwrap_or_default();
     lines.push(format!("dbl > {}\n", dbl.display()));
     std::fs::write(&cmd, lines.join("\n")).expect("write the booted script");
+    boot(binary, &cmd, script);
+    let records = dbl.is_file().then(|| read_dbl(&dbl));
+    std::fs::remove_dir_all(&tmp).expect("remove the temp dir");
+    records.unwrap_or_else(|| panic!("{} wrote no dbl", binary.display()))
+}
+
+/// `binary` run on `cmd` from `script`'s directory, servers on loopback;
+/// its stdout. Panics on a failed exit or any line on its stderr.
+fn boot(binary: &Path, cmd: &Path, script: &Path) -> String {
     let ca_port = TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .expect("a free loopback port")
         .port()
         .to_string();
     let out = Command::new(binary)
-        .arg(&cmd)
+        .arg(cmd)
         .current_dir(script.parent().expect("script has a parent"))
         .envs(LOOPBACK_ENV.iter().copied())
         .env("EPICS_CA_SERVER_PORT", &ca_port)
@@ -683,8 +699,6 @@ pub fn booted_records(binary: &Path, script: &Path) -> BTreeSet<String> {
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("{}: {e}", binary.display()));
-    let records = dbl.is_file().then(|| read_dbl(&dbl));
-    std::fs::remove_dir_all(&tmp).expect("remove the temp dir");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success() && stderr.trim().is_empty(),
@@ -693,7 +707,54 @@ pub fn booted_records(binary: &Path, script: &Path) -> BTreeSet<String> {
         script.display(),
         out.status
     );
-    records.unwrap_or_else(|| panic!("{} wrote no dbl", binary.display()))
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Panics unless `script` calls `motorUtilInit` once, after `iocInit`, with
+/// the `P` it loads `$(MOTOR)/db/motorUtil.db` with, as C's st.cmd does,
+/// and `binary` registers the command (its `help` names it).
+pub fn assert_inits_motor_util(binary: &Path, script: &Path) {
+    let root = workspace_root();
+    let mut run = Run::new(&root);
+    run.calls = Some(Vec::new());
+    run_script(&mut run, script);
+    let calls = run.calls.unwrap_or_default();
+    let prefix = calls
+        .iter()
+        .find(|w| {
+            w[0] == "dbLoadRecords" && w.get(1).is_some_and(|f| f.ends_with("/db/motorUtil.db"))
+        })
+        .and_then(|w| macro_args(w.get(2).map_or("", String::as_str)).remove(b"P".as_slice()))
+        .map(|p| String::from_utf8_lossy(&p).into_owned())
+        .unwrap_or_else(|| panic!("{} loads no motorUtil.db with a P", script.display()));
+    let init = calls
+        .iter()
+        .position(|w| w[0] == "iocInit")
+        .unwrap_or_else(|| panic!("{} calls no iocInit", script.display()));
+    let inits: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w[0] == "motorUtilInit")
+        .map(|(i, w)| (i > init, w.get(1).cloned().unwrap_or_default()))
+        .collect();
+    assert_eq!(
+        inits,
+        [(true, prefix)],
+        "{}: (after iocInit, prefix) of each motorUtilInit",
+        script.display()
+    );
+    let dir = scratch_dir();
+    let cmd = dir.join("help.cmd");
+    std::fs::write(&cmd, "help motorUtilInit\n").expect("write the help script");
+    let stdout = boot(binary, &cmd, script);
+    std::fs::remove_dir_all(&dir).expect("remove the temp dir");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("motorUtilInit") && !l.contains("help motorUtilInit")),
+        "{} does not register motorUtilInit:\n{stdout}",
+        binary.display()
+    );
 }
 
 /// A new directory of this process's own under the system temp dir.
