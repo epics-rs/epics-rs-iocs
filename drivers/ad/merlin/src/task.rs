@@ -17,7 +17,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataView, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -392,7 +392,7 @@ async fn publish_profiles(
     };
 
     let stride = header.x_size.max(header.y_size);
-    let NDDataBuffer::U32(_) = &profiles.image else {
+    let NDDataView::U32(_) = profiles.image.view() else {
         unreachable!("decode_profiles always returns U32")
     };
     // C fills the profile waveforms only once the array is allocated

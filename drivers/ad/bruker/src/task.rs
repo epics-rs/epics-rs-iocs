@@ -320,7 +320,7 @@ async fn publish_frame(
     // DataType says UInt32, and readSFRM stores the unsigned pixels in it.
     let Ok(mut array) = ctx.pool.alloc_with(
         vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
-        NDDataBuffer::I32(image.data.into_iter().map(|v| v as i32).collect()),
+        NDDataBuffer::from_vec(image.data.into_iter().map(|v| v as i32).collect()),
     ) else {
         return Ok(());
     };

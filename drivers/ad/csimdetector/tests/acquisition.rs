@@ -4,14 +4,14 @@
 use std::time::Duration;
 
 use ad_csimdetector::{MAX_SIGNALS, create_c_sim_detector};
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDataView};
 use epics_rs::ad_core::plugin::channel::ndarray_channel;
 
 const NUM_TIME_POINTS: usize = 16;
 
 fn f64s(data: &NDDataBuffer) -> Vec<f64> {
-    match data {
-        NDDataBuffer::F64(v) => v.clone(),
+    match data.view() {
+        NDDataView::F64(v) => v.to_vec(),
         other => panic!("expected F64, got {:?}", other.data_type()),
     }
 }

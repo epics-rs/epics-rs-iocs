@@ -16,7 +16,7 @@ use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAt
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::{ADDriver, ADStatus};
 use epics_rs::ad_core::error::ADResult;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDataView, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -1538,11 +1538,11 @@ impl Image {
             };
             return self;
         }
-        self.data = match self.data {
-            NDDataBuffer::U8(v) => NDDataBuffer::I8(v.into_iter().map(|x| x as i8).collect()),
-            NDDataBuffer::U16(v) => NDDataBuffer::I16(v.into_iter().map(|x| x as i16).collect()),
-            NDDataBuffer::U32(v) => NDDataBuffer::I32(v.into_iter().map(|x| x as i32).collect()),
-            other => other,
+        self.data = match self.data.view() {
+            NDDataView::U8(v) => NDDataBuffer::from_vec(v.iter().map(|&x| x as i8).collect()),
+            NDDataView::U16(v) => NDDataBuffer::from_vec(v.iter().map(|&x| x as i16).collect()),
+            NDDataView::U32(v) => NDDataBuffer::from_vec(v.iter().map(|&x| x as i32).collect()),
+            _ => return self,
         };
         self
     }
@@ -1723,8 +1723,8 @@ mod tests {
 
     #[test]
     fn signed_data_relabels_pixels_or_the_codec_type() {
-        let im = image(NDDataBuffer::U16(vec![1, 0xffff]), None).signed_if(true);
-        let NDDataBuffer::I16(v) = im.data else {
+        let im = image(NDDataBuffer::from_vec::<u16>(vec![1, 0xffff]), None).signed_if(true);
+        let NDDataView::I16(v) = im.data.view() else {
             panic!("expected I16");
         };
         assert_eq!(v, [1, -1]);
@@ -1737,15 +1737,15 @@ mod tests {
             compressor: 0,
             original_data_type: NDDataType::UInt32,
         };
-        let im = image(NDDataBuffer::U8(vec![1, 2, 3]), Some(codec)).signed_if(true);
+        let im = image(NDDataBuffer::from_vec::<u8>(vec![1, 2, 3]), Some(codec)).signed_if(true);
         assert_eq!(im.codec.unwrap().original_data_type, NDDataType::Int32);
-        let NDDataBuffer::U8(v) = im.data else {
+        let NDDataView::U8(v) = im.data.view() else {
             panic!("compressed bytes stay bytes");
         };
         assert_eq!(v, [1, 2, 3]);
 
-        let im = image(NDDataBuffer::U16(vec![1]), None).signed_if(false);
-        assert!(matches!(im.data, NDDataBuffer::U16(_)));
+        let im = image(NDDataBuffer::from_vec::<u16>(vec![1]), None).signed_if(false);
+        assert!(matches!(im.data.view(), NDDataView::U16(_)));
     }
 
     /// A detector that answers every GET as a two-valued enum and every PUT
@@ -1940,7 +1940,7 @@ mod tests {
             let mut counters = Counters::read(&s).await;
             publish(
                 &s,
-                image(NDDataBuffer::U16(vec![1, 2]), None),
+                image(NDDataBuffer::from_vec::<u16>(vec![1, 2]), None),
                 true,
                 &mut counters,
             )
@@ -1998,7 +1998,7 @@ mod tests {
         let mut counters = Counters::read(&s).await;
         publish(
             &s,
-            image(NDDataBuffer::U16(vec![1, 2]), None),
+            image(NDDataBuffer::from_vec::<u16>(vec![1, 2]), None),
             true,
             &mut counters,
         )
@@ -2129,7 +2129,7 @@ mod tests {
         push.send(image(0, false)).await.unwrap();
         frame_done(1).await;
         let a = rx.recv().await.expect("frame 0");
-        assert!(matches!(a.data, NDDataBuffer::U16(_)));
+        assert!(matches!(a.data.view(), NDDataView::U16(_)));
 
         set(vec![ParamUpdate::Int32(s.ad.base.array_callbacks, 0)]).await;
         push.send(image(1, false)).await.unwrap();
@@ -2149,7 +2149,7 @@ mod tests {
         frame_done(3).await;
         let a = rx.recv().await.expect("frame 2");
         assert!(
-            matches!(a.data, NDDataBuffer::I16(_)),
+            matches!(a.data.view(), NDDataView::I16(_)),
             "SignedData=1 on frame 2"
         );
 

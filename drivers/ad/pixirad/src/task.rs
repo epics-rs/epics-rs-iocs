@@ -13,7 +13,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDataViewMut, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -225,7 +225,7 @@ async fn data_loop(ctx: DataContext) {
                 });
         }
         if let Some(building) = image.as_mut() {
-            let NDDataBuffer::U16(pixels) = &mut building.array.data else {
+            let NDDataViewMut::U16(pixels) = building.array.data.view_mut() else {
                 unreachable!("allocated as NDUInt16")
             };
             let offset = if num_colors == 1 {

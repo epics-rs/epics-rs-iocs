@@ -191,7 +191,7 @@ fn compute_typed<T: SimPixel>(
 }
 
 macro_rules! compute_dispatch {
-    ($($dt:ident => $buf:ident : $t:ty),* $(,)?) => {
+    ($($dt:ident : $t:ty),* $(,)?) => {
         /// `computeArrays` (ADCSimDetector.cpp:216-253) — the switch over
         /// `NDDataType_t` that picks the template instantiation.
         pub fn compute_arrays(cfg: &SimConfig, elapsed_time: f64, rng: &mut Rng) -> ComputeResult {
@@ -200,7 +200,7 @@ macro_rules! compute_dispatch {
                 $(
                     NDDataType::$dt => {
                         let (v, f, n) = compute_typed::<$t>(cfg, &mut elapsed, rng);
-                        (NDDataBuffer::$buf(v), f, n)
+                        (NDDataBuffer::from_vec(v), f, n)
                     }
                 )*
             };
@@ -216,21 +216,22 @@ macro_rules! compute_dispatch {
 }
 
 compute_dispatch!(
-    Int8 => I8: i8,
-    UInt8 => U8: u8,
-    Int16 => I16: i16,
-    UInt16 => U16: u16,
-    Int32 => I32: i32,
-    UInt32 => U32: u32,
-    Int64 => I64: i64,
-    UInt64 => U64: u64,
-    Float32 => F32: f32,
-    Float64 => F64: f64,
+    Int8: i8,
+    UInt8: u8,
+    Int16: i16,
+    UInt16: u16,
+    Int32: i32,
+    UInt32: u32,
+    Int64: i64,
+    UInt64: u64,
+    Float32: f32,
+    Float64: f64,
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::NDDataView;
 
     /// An RNG substitute is not available (the field is a concrete `Rng`), so
     /// tests that need a known `rndm` set `noise = 0` and `amplitude[4] = 0`
@@ -265,8 +266,8 @@ mod tests {
     }
 
     fn f64s(result: &ComputeResult) -> &[f64] {
-        match &result.data {
-            NDDataBuffer::F64(v) => v,
+        match result.data.view() {
+            NDDataView::F64(v) => v,
             other => panic!("expected F64, got {:?}", other.data_type()),
         }
     }
@@ -459,8 +460,8 @@ mod tests {
         c.time_step = 1.0;
         c.data_type = NDDataType::Int32;
         let r = compute_arrays(&c, 0.0, &mut rng);
-        let v = match &r.data {
-            NDDataBuffer::I32(v) => v.clone(),
+        let v = match r.data.view() {
+            NDDataView::I32(v) => v.to_vec(),
             other => panic!("expected I32, got {:?}", other.data_type()),
         };
         assert_eq!(v[0], 2);
@@ -583,8 +584,8 @@ mod tests {
         let mut c = cfg(quiet(ch(0.0, 300.9, 1.0, 0.0), 0), 1);
         c.data_type = NDDataType::Int8;
         let r = compute_arrays(&c, 0.0, &mut rng);
-        match &r.data {
-            NDDataBuffer::I8(v) => assert_eq!(v[0], 44),
+        match r.data.view() {
+            NDDataView::I8(v) => assert_eq!(v[0], 44),
             other => panic!("expected I8, got {:?}", other.data_type()),
         }
 
@@ -593,8 +594,8 @@ mod tests {
         let mut c = cfg(quiet(ch(0.0, -1.9, 1.0, 0.0), 0), 1);
         c.data_type = NDDataType::UInt8;
         let r = compute_arrays(&c, 0.0, &mut rng);
-        match &r.data {
-            NDDataBuffer::U8(v) => assert_eq!(v[0], 255),
+        match r.data.view() {
+            NDDataView::U8(v) => assert_eq!(v[0], 255),
             other => panic!("expected U8, got {:?}", other.data_type()),
         }
     }

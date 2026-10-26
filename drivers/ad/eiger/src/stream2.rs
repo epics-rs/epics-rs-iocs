@@ -1047,7 +1047,7 @@ impl Stream2Api {
                     compressor: 0,
                     original_data_type: data_type,
                 };
-                (NDDataBuffer::U8(payload.to_vec()), Some(codec))
+                (NDDataBuffer::from_slice(payload), Some(codec))
             }
         };
 
@@ -1130,8 +1130,8 @@ fn threshold_number(channel: &str) -> i32 {
 /// The detector's pixels are little-endian, as every host this runs on.
 fn buffer_from_le(bytes: &[u8], data_type: NDDataType) -> NDDataBuffer {
     match data_type {
-        NDDataType::UInt8 => NDDataBuffer::U8(bytes.to_vec()),
-        NDDataType::UInt16 => NDDataBuffer::U16(
+        NDDataType::UInt8 => NDDataBuffer::from_slice(bytes),
+        NDDataType::UInt16 => NDDataBuffer::from_vec(
             bytes
                 .as_chunks::<2>()
                 .0
@@ -1139,7 +1139,7 @@ fn buffer_from_le(bytes: &[u8], data_type: NDDataType) -> NDDataBuffer {
                 .map(|c| u16::from_le_bytes(*c))
                 .collect(),
         ),
-        _ => NDDataBuffer::U32(
+        _ => NDDataBuffer::from_vec(
             bytes
                 .as_chunks::<4>()
                 .0
@@ -1167,7 +1167,7 @@ fn uncompress(
     if c.algorithm == "lz4" {
         let mut src = NDArray::with_data(
             vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
-            NDDataBuffer::U8(blob.to_vec()),
+            NDDataBuffer::from_slice(blob),
         );
         src.codec = Some(Codec {
             name: CodecName::LZ4HDF5,
@@ -1180,7 +1180,7 @@ fn uncompress(
         match ad_plugins_rs::codec::decompress_lz4hdf5(&src) {
             Ok(mut out) => Ok(std::mem::replace(
                 &mut out.data,
-                NDDataBuffer::U8(Vec::new()),
+                NDDataBuffer::from_vec(Vec::<u8>::new()),
             )),
             Err(e) => Err(err(
                 fname,
@@ -1516,7 +1516,7 @@ mod tests {
 
         let f = a.get_frame(0, true, true).unwrap();
         assert_eq!(f.dims, [3, 2]);
-        assert_same(&f.data, &NDDataBuffer::U16(px1.to_vec()));
+        assert_same(&f.data, &NDDataBuffer::from_slice(px1));
         assert_eq!(f.threshold, Some((1, 6000.0)));
         // Series start + 25e6 ticks of a 50 MHz clock.
         let ts = f.timestamp.unwrap();
@@ -1525,7 +1525,7 @@ mod tests {
         assert!(a.image.is_some(), "kept until its last threshold");
 
         let f = a.get_frame(1, true, false).unwrap();
-        assert_same(&f.data, &NDDataBuffer::U16(px2.to_vec()));
+        assert_same(&f.data, &NDDataBuffer::from_slice(px2));
         assert_eq!(f.threshold, Some((2, 9000.0)));
         assert!(f.timestamp.is_none());
         assert!(a.image.is_none(), "released after its last threshold");
@@ -1536,7 +1536,7 @@ mod tests {
         let pixels: Vec<u32> = (0..64).collect();
         let src = NDArray::with_data(
             vec![NDDimension::new(64)],
-            NDDataBuffer::U32(pixels.clone()),
+            NDDataBuffer::from_vec(pixels.clone()),
         );
         let lz4 = ad_plugins_rs::codec::compress_lz4hdf5(&src, 0).unwrap();
         let blob = lz4.data.as_u8_slice().to_vec();
@@ -1557,12 +1557,12 @@ mod tests {
         let codec = f.codec.unwrap();
         assert_eq!(codec.name, CodecName::LZ4HDF5);
         assert_eq!(codec.original_data_type, NDDataType::UInt32);
-        assert_same(&f.data, &NDDataBuffer::U8(blob.clone()));
+        assert_same(&f.data, &NDDataBuffer::from_vec(blob.clone()));
 
         load(&mut a, w.0);
         let f = a.get_frame(0, true, false).unwrap();
         assert!(f.codec.is_none());
-        assert_same(&f.data, &NDDataBuffer::U32(pixels));
+        assert_same(&f.data, &NDDataBuffer::from_vec(pixels));
     }
 
     #[tokio::test]
@@ -1570,7 +1570,7 @@ mod tests {
         let pixels: Vec<u16> = (0..256u16).map(|i| i % 37).collect();
         let src = NDArray::with_data(
             vec![NDDimension::new(256)],
-            NDDataBuffer::U16(pixels.clone()),
+            NDDataBuffer::from_vec(pixels.clone()),
         );
         let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
         let mut blob = Vec::new();
@@ -1594,14 +1594,14 @@ mod tests {
         let mut a = api().await;
         load(&mut a, w.0.clone());
         let f = a.get_frame(0, true, false).unwrap();
-        assert_same(&f.data, &NDDataBuffer::U16(pixels));
+        assert_same(&f.data, &NDDataBuffer::from_vec(pixels));
 
         load(&mut a, w.0);
         let f = a.get_frame(0, false, false).unwrap();
         assert_eq!(f.codec.unwrap().name, CodecName::BSLZ4);
         assert_same(
             &f.data,
-            &NDDataBuffer::U8(blob[bslz4::HEADER_LEN..].to_vec()),
+            &NDDataBuffer::from_vec(blob[bslz4::HEADER_LEN..].to_vec()),
         );
     }
 

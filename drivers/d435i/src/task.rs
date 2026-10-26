@@ -524,7 +524,7 @@ async fn process_color_frame(
         let ptr = unsafe { frame.get_data() as *const std::os::raw::c_void as *const u8 };
         let bytes = copy_frame_data(ptr, stride, row_bytes, h);
 
-        let data = NDDataBuffer::U8(bytes);
+        let data = NDDataBuffer::from_vec(bytes);
         // RGB1 layout: [3, width, height]
         let dims = vec![
             NDDimension::new(3),
@@ -582,7 +582,7 @@ async fn process_depth_frame(
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
 
-    let data = NDDataBuffer::U16(pixels);
+    let data = NDDataBuffer::from_vec(pixels);
     // Mono layout: [width, height]
     let dims = vec![NDDimension::new(w), NDDimension::new(h)];
 
@@ -636,7 +636,7 @@ async fn process_pointcloud(
                 NDDimension::new(w),
                 NDDimension::new(h),
             ],
-            NDDataBuffer::F32(data),
+            NDDataBuffer::from_vec(data),
         ) else {
             return;
         };

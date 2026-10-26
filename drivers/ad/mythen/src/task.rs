@@ -187,7 +187,7 @@ async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> 
     // refused alloc; the frame is dropped after the pool's reached-limit line.
     let Ok(mut array) = s.pool.alloc_with(
         vec![NDDimension::new(width), NDDimension::new(1)],
-        NDDataBuffer::U32(channels),
+        NDDataBuffer::from_vec(channels),
     ) else {
         return true;
     };

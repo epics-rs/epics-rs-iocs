@@ -19,7 +19,7 @@ use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType};
+use epics_rs::ad_core::ndarray::{NDArray, NDDataType, NDDataView};
 use epics_rs::ad_core::plugin::channel::ndarray_channel;
 
 use bruker::{BrukerRuntime, create_bruker_detector};
@@ -293,8 +293,8 @@ fn one_scan_reaches_the_plugins() {
     assert_eq!(array.dims[0].size, 4, "columns are the fast axis");
     assert_eq!(array.dims[1].size, 2);
     // C allocates NDInt32 (BISDetector.cpp:588) while DataType says UInt32.
-    match &array.data {
-        NDDataBuffer::I32(data) => assert_eq!(data, &vec![1, 2, 3, 4, 5, 6, 7, 8]),
+    match array.data.view() {
+        NDDataView::I32(data) => assert_eq!(data, &[1, 2, 3, 4, 5, 6, 7, 8]),
         other => panic!("the frame is NDInt32 as C allocates it, not {other:?}"),
     }
     assert_eq!(

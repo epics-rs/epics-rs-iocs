@@ -12,7 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::error::ADResult;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataView, NDDataViewMut, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PersistentArray, PublishedArray};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -87,7 +87,7 @@ pub(crate) fn refill_flat_field(
 ) -> Option<PublishedArray> {
     let flat = s.flat_field.as_mut()?;
     let array = flat.refill();
-    let NDDataBuffer::I32(pixels) = &mut array.data else {
+    let NDDataViewMut::I32(pixels) = array.data.view_mut() else {
         unreachable!("allocated as NDInt32")
     };
     pixels.copy_from_slice(data);
@@ -328,7 +328,7 @@ fn build_array(
     data: Vec<i32>,
     description: Option<String>,
 ) -> ADResult<DriverArray> {
-    let buffer = NDDataBuffer::I32(data);
+    let buffer = NDDataBuffer::from_vec(data);
     let mut attributes = NDAttributeList::new();
     if let Some(d) = description {
         attributes.add(tiff_description(d));
@@ -553,7 +553,9 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
                 let flat_field_valid = w.ctx.get_i32(w.ctx.p.flat_field_valid).await.unwrap_or(0);
                 if flat_field_valid != 0 {
                     let s = w.shared.lock();
-                    if let Some(NDDataBuffer::I32(flat)) = s.flat_field.as_ref().map(|f| &f.data) {
+                    if let Some(NDDataView::I32(flat)) =
+                        s.flat_field.as_ref().map(|f| f.data.view())
+                    {
                         apply_flat_field(&mut data, flat, s.average_flat_field);
                     }
                 }
@@ -667,10 +669,10 @@ mod tests {
     fn a_flat_field_read_publishes_the_array_allocated_at_construction() {
         let (pool, mut s) = flat_field_pool(8);
         let first = refill_flat_field(&mut s, &[5, 6], Some("d".into()), 5.5).unwrap();
-        assert!(matches!(&first.data, NDDataBuffer::I32(v) if v == &[5, 6]));
+        assert!(matches!(first.data.view(), NDDataView::I32(v) if v == &[5, 6]));
         drop(first);
         let second = refill_flat_field(&mut s, &[7, 8], None, 7.5).unwrap();
-        assert!(matches!(&second.data, NDDataBuffer::I32(v) if v == &[7, 8]));
+        assert!(matches!(second.data.view(), NDDataView::I32(v) if v == &[7, 8]));
         assert!(second.attributes.get("TIFFImageDescription").is_some());
         assert_eq!(s.average_flat_field, 7.5);
         assert_eq!(
@@ -690,8 +692,8 @@ mod tests {
         let (pool, mut s) = flat_field_pool(8);
         let held = refill_flat_field(&mut s, &[5, 6], None, 5.5).unwrap();
         let next = refill_flat_field(&mut s, &[7, 8], None, 7.5).unwrap();
-        assert!(matches!(&next.data, NDDataBuffer::I32(v) if v == &[7, 8]));
-        assert!(matches!(&held.data, NDDataBuffer::I32(v) if v == &[5, 6]));
+        assert!(matches!(next.data.view(), NDDataView::I32(v) if v == &[7, 8]));
+        assert!(matches!(held.data.view(), NDDataView::I32(v) if v == &[5, 6]));
         assert_eq!(s.average_flat_field, 7.5);
         assert_eq!((pool.num_alloc_buffers(), pool.allocated_bytes()), (1, 8));
         assert!(refill_flat_field(&mut Shared::default(), &[1, 2], None, 1.0).is_none());

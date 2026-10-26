@@ -160,7 +160,7 @@ impl NdStdArraysDriver {
             let info = array.info();
             // NDDriverStdArrays.cpp:184-214.
             if append_mode == 1 || (append_mode == 0 && info.num_elements < n_elements) {
-                convert::fill_buffer(&mut array.data, fill);
+                convert::fill_buffer(array.data.view_mut(), fill);
             }
             made = Some(Ok(info));
             Some(array)
@@ -269,7 +269,12 @@ impl NdStdArraysDriver {
                 if next_element + n >= total {
                     n = total.saturating_sub(next_element);
                 }
-                convert::copy_buffer(&mut array.refill().data, next_element, stride, &input[..n]);
+                convert::copy_buffer(
+                    array.refill().data.view_mut(),
+                    next_element,
+                    stride,
+                    &input[..n],
+                );
                 n
             })
             .unwrap_or(0);
@@ -545,7 +550,7 @@ pub fn create_nd_std_arrays(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer};
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataView};
 
     struct Fixture {
         det: NdStdArraysDriver,
@@ -628,8 +633,8 @@ mod tests {
     }
 
     fn f64s(a: &NDArray) -> Vec<f64> {
-        match &a.data {
-            NDDataBuffer::F64(v) => v.clone(),
+        match a.data.view() {
+            NDDataView::F64(v) => v.to_vec(),
             other => panic!("expected F64, got {:?}", other.data_type()),
         }
     }

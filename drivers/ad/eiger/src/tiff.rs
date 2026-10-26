@@ -120,8 +120,8 @@ pub fn decode(buf: &[u8]) -> Result<TiffImage, TiffError> {
         .ok_or_else(|| TiffError("pixel data out of range".into()))?;
 
     let data = match data_type {
-        NDDataType::UInt8 => NDDataBuffer::U8(strip.to_vec()),
-        NDDataType::UInt16 => NDDataBuffer::U16(
+        NDDataType::UInt8 => NDDataBuffer::from_slice(strip),
+        NDDataType::UInt16 => NDDataBuffer::from_vec(
             strip
                 .as_chunks::<2>()
                 .0
@@ -129,7 +129,7 @@ pub fn decode(buf: &[u8]) -> Result<TiffImage, TiffError> {
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect(),
         ),
-        _ => NDDataBuffer::U32(
+        _ => NDDataBuffer::from_vec(
             strip
                 .as_chunks::<4>()
                 .0
@@ -148,6 +148,7 @@ pub fn decode(buf: &[u8]) -> Result<TiffImage, TiffError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::NDDataView;
 
     /// Build the same single-strip TIFF the monitor interface serves.
     fn build(width: u32, height: u32, depth: u32, pixels: &[u8]) -> Vec<u8> {
@@ -188,7 +189,7 @@ mod tests {
         let raw: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
         let img = decode(&build(4, 3, 16, &raw)).unwrap();
         assert_eq!(img.dims, [4, 3]);
-        let NDDataBuffer::U16(got) = img.data else {
+        let NDDataView::U16(got) = img.data.view() else {
             panic!("expected U16 pixels");
         };
         assert_eq!(got, pixels);
@@ -200,7 +201,7 @@ mod tests {
         let raw: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
         let img = decode(&build(3, 2, 32, &raw)).unwrap();
         assert_eq!(img.dims, [3, 2]);
-        let NDDataBuffer::U32(got) = img.data else {
+        let NDDataView::U32(got) = img.data.view() else {
             panic!("expected U32 pixels");
         };
         assert_eq!(got, pixels);
@@ -210,7 +211,7 @@ mod tests {
     fn decodes_an_8_bit_monitor_image() {
         let pixels: Vec<u8> = (0..9u8).collect();
         let img = decode(&build(3, 3, 8, &pixels)).unwrap();
-        let NDDataBuffer::U8(got) = img.data else {
+        let NDDataView::U8(got) = img.data.view() else {
             panic!("expected U8 pixels");
         };
         assert_eq!(got, pixels);

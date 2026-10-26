@@ -191,13 +191,13 @@ fn read_slice(
     data_type: NDDataType,
 ) -> H5Result<NDDataBuffer> {
     Ok(match data_type {
-        NDDataType::UInt8 => NDDataBuffer::U8(
+        NDDataType::UInt8 => NDDataBuffer::from_vec(
             dataset
                 .read_slice::<u8>(selection)?
                 .into_raw_vec_and_offset()
                 .0,
         ),
-        NDDataType::Int8 => NDDataBuffer::I8(
+        NDDataType::Int8 => NDDataBuffer::from_vec(
             dataset
                 .read_slice::<u8>(selection)?
                 .into_raw_vec_and_offset()
@@ -206,13 +206,13 @@ fn read_slice(
                 .map(|v| v as i8)
                 .collect(),
         ),
-        NDDataType::UInt16 => NDDataBuffer::U16(
+        NDDataType::UInt16 => NDDataBuffer::from_vec(
             dataset
                 .read_slice::<u16>(selection)?
                 .into_raw_vec_and_offset()
                 .0,
         ),
-        NDDataType::Int16 => NDDataBuffer::I16(
+        NDDataType::Int16 => NDDataBuffer::from_vec(
             dataset
                 .read_slice::<u16>(selection)?
                 .into_raw_vec_and_offset()
@@ -221,13 +221,13 @@ fn read_slice(
                 .map(|v| v as i16)
                 .collect(),
         ),
-        NDDataType::UInt32 => NDDataBuffer::U32(
+        NDDataType::UInt32 => NDDataBuffer::from_vec(
             dataset
                 .read_slice::<u32>(selection)?
                 .into_raw_vec_and_offset()
                 .0,
         ),
-        NDDataType::Int32 => NDDataBuffer::I32(
+        NDDataType::Int32 => NDDataBuffer::from_vec(
             dataset
                 .read_slice::<u32>(selection)?
                 .into_raw_vec_and_offset()
@@ -313,7 +313,7 @@ mod tests {
         let pixels: Vec<u32> = (0..4096u32).map(|i| (i * 7) % 1013).collect();
         let src = NDArray::with_data(
             vec![NDDimension::new(pixels.len())],
-            NDDataBuffer::U32(pixels.clone()),
+            NDDataBuffer::from_vec(pixels.clone()),
         );
         let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
 

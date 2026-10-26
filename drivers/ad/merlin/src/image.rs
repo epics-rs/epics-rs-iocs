@@ -49,8 +49,8 @@ pub fn decode_image(
     }
 
     Ok(match bpp {
-        1 => NDDataBuffer::U8(out),
-        2 => NDDataBuffer::U16(
+        1 => NDDataBuffer::from_vec(out),
+        2 => NDDataBuffer::from_vec(
             out.as_chunks::<2>()
                 .0
                 .iter()
@@ -64,7 +64,7 @@ pub fn decode_image(
                 })
                 .collect(),
         ),
-        _ => NDDataBuffer::U32(
+        _ => NDDataBuffer::from_vec(
             out.as_chunks::<4>()
                 .0
                 .iter()
@@ -140,13 +140,14 @@ pub fn decode_profiles(
     Ok(Profiles {
         x,
         y,
-        image: NDDataBuffer::U32(image),
+        image: NDDataBuffer::from_vec(image),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::NDDataView;
 
     /// 2x3 (w x h) 8-bit image, rows tagged by their source row index.
     fn image8() -> Vec<u8> {
@@ -158,7 +159,7 @@ mod tests {
     #[test]
     fn decode_image8_flips_y_without_reading_past_the_payload() {
         let buf = decode_image(&image8(), 4, 2, 3, 8, true).unwrap();
-        let NDDataBuffer::U8(px) = buf else {
+        let NDDataView::U8(px) = buf.view() else {
             panic!("expected U8")
         };
         // Source rows are (0,1) (10,11) (20,21); output must start with the
@@ -171,7 +172,7 @@ mod tests {
         // 1x2 image, pixels 0x0102 and 0x0304 big-endian.
         let body = [b'X', 0x01, 0x02, 0x03, 0x04];
         let buf = decode_image(&body, 1, 1, 2, 16, true).unwrap();
-        let NDDataBuffer::U16(px) = buf else {
+        let NDDataView::U16(px) = buf.view() else {
             panic!("expected U16")
         };
         // Y-flipped: bottom row (0x0304) first.
@@ -182,7 +183,7 @@ mod tests {
     fn decode_image16_keeps_host_order_when_detector_does_not_swap() {
         let body = [b'X', 0x01, 0x02, 0x03, 0x04];
         let buf = decode_image(&body, 1, 1, 2, 16, false).unwrap();
-        let NDDataBuffer::U16(px) = buf else {
+        let NDDataView::U16(px) = buf.view() else {
             panic!("expected U16")
         };
         assert_eq!(px, vec![0x0403, 0x0201]);
@@ -192,7 +193,7 @@ mod tests {
     fn decode_image32_swaps_big_endian_pixels() {
         let body = [b'X', 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x03, 0x04];
         let buf = decode_image(&body, 1, 1, 2, 32, true).unwrap();
-        let NDDataBuffer::U32(px) = buf else {
+        let NDDataView::U32(px) = buf.view() else {
             panic!("expected U32")
         };
         assert_eq!(px, vec![0x0304, 0x0102]);
@@ -236,7 +237,7 @@ mod tests {
         let p = decode_profiles(&body, 1, 2, 3, true).unwrap();
         assert_eq!(p.x, vec![1, 2]);
         assert_eq!(p.y, vec![30, 20, 10]);
-        let NDDataBuffer::U32(img) = p.image else {
+        let NDDataView::U32(img) = p.image.view() else {
             panic!("expected U32")
         };
         // stride = max(2,3) = 3: row 0 is X (padded), row 1 is the flipped Y.

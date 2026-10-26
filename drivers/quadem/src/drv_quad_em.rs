@@ -1252,7 +1252,7 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     // that array is dropped after the pool's limit line.
     if let Ok(mut all) = ctx.pool.alloc_with(
         vec![NDDimension::new(QE_MAX_DATA), NDDimension::new(num_read)],
-        NDDataBuffer::F64(flat),
+        NDDataBuffer::from_vec(flat),
     ) {
         all.unique_id = counter;
         all.time_stamp = time_stamp;
@@ -1264,10 +1264,10 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     // Addresses 0-10: one [numRead] array per data item.
     for item in 0..QE_MAX_DATA {
         let column: Vec<f64> = samples.iter().map(|s| s[item]).collect();
-        let Ok(mut single) = ctx
-            .pool
-            .alloc_with(vec![NDDimension::new(num_read)], NDDataBuffer::F64(column))
-        else {
+        let Ok(mut single) = ctx.pool.alloc_with(
+            vec![NDDimension::new(num_read)],
+            NDDataBuffer::from_vec(column),
+        ) else {
             continue;
         };
         single.unique_id = counter;

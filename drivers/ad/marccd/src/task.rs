@@ -204,7 +204,7 @@ impl Worker {
         if array_callbacks != 0
             && let Ok(mut array) = self.pool.alloc_with(
                 vec![NDDimension::new(nx), NDDimension::new(ny)],
-                NDDataBuffer::U16(data),
+                NDDataBuffer::from_vec(data),
             )
         {
             array.unique_id = image_counter;

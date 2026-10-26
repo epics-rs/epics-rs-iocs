@@ -132,8 +132,8 @@ fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Result<NDDataBuffer
         )));
     }
     Ok(match data_type {
-        NDDataType::UInt8 => NDDataBuffer::U8(bytes.to_vec()),
-        NDDataType::UInt16 => NDDataBuffer::U16(
+        NDDataType::UInt8 => NDDataBuffer::from_slice(bytes),
+        NDDataType::UInt16 => NDDataBuffer::from_vec(
             bytes
                 .as_chunks::<2>()
                 .0
@@ -141,7 +141,7 @@ fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Result<NDDataBuffer
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect(),
         ),
-        NDDataType::UInt32 => NDDataBuffer::U32(
+        NDDataType::UInt32 => NDDataBuffer::from_vec(
             bytes
                 .as_chunks::<4>()
                 .0
@@ -269,7 +269,7 @@ pub fn decode_image(shape_part: &[u8], blob: &[u8], decompress: bool) -> Result<
     };
     Ok(DecodedImage {
         dims,
-        data: NDDataBuffer::U8(payload.to_vec()),
+        data: NDDataBuffer::from_slice(payload),
         codec: Some(codec),
     })
 }
@@ -385,7 +385,7 @@ impl Received {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::{NDArray, NDDimension};
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataView, NDDimension};
 
     fn dimage_header(series: u64, frame: u64) -> Vec<u8> {
         format!(r#"{{"htype":"dimage-1.0","series":{series},"frame":{frame},"hash":"x"}}"#)
@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(f.frame, 2);
         assert_eq!(f.dims, [4, 3]);
         assert!(f.codec.is_none());
-        let NDDataBuffer::U16(got) = f.data else {
+        let NDDataView::U16(got) = f.data.view() else {
             panic!("expected U16 pixels");
         };
         assert_eq!(got, pixels);
@@ -461,7 +461,7 @@ mod tests {
             panic!("expected an image");
         };
         assert!(f.codec.is_none(), "decompressed frames carry no codec");
-        let NDDataBuffer::U32(got) = f.data else {
+        let NDDataView::U32(got) = f.data.view() else {
             panic!("expected U32 pixels");
         };
         assert_eq!(got, pixels);
@@ -472,7 +472,7 @@ mod tests {
     fn bslz4_blob(pixels: &[u32]) -> Vec<u8> {
         let src = NDArray::with_data(
             vec![NDDimension::new(pixels.len())],
-            NDDataBuffer::U32(pixels.to_vec()),
+            NDDataBuffer::from_slice(pixels),
         );
         let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
         let mut blob = Vec::new();
@@ -494,7 +494,7 @@ mod tests {
             panic!("expected an image");
         };
         assert_eq!(f.dims, [64, 64]);
-        let NDDataBuffer::U32(got) = f.data else {
+        let NDDataView::U32(got) = f.data.view() else {
             panic!("expected U32 pixels");
         };
         assert_eq!(got, pixels);
@@ -515,11 +515,11 @@ mod tests {
         assert_eq!(codec.name, CodecName::BSLZ4);
         assert_eq!(codec.original_data_type, NDDataType::UInt32);
         // The 12-byte header is gone; the rest is the block stream verbatim.
-        let NDDataBuffer::U8(payload) = &f.data else {
+        let NDDataView::U8(payload) = f.data.view() else {
             panic!("expected raw bytes");
         };
         assert_eq!(payload.len(), blob.len() - bslz4::HEADER_LEN);
-        assert_eq!(payload.as_slice(), &blob[bslz4::HEADER_LEN..]);
+        assert_eq!(payload, &blob[bslz4::HEADER_LEN..]);
         assert_eq!(codec.compressed_size, payload.len());
     }
 
@@ -537,10 +537,10 @@ mod tests {
         };
         let codec = f.codec.expect("pass-through must carry a codec");
         assert_eq!(codec.name, CodecName::LZ4);
-        let NDDataBuffer::U8(payload) = &f.data else {
+        let NDDataView::U8(payload) = f.data.view() else {
             panic!("expected raw bytes");
         };
-        assert_eq!(payload.as_slice(), blob.as_slice());
+        assert_eq!(payload, blob.as_slice());
     }
 
     #[test]

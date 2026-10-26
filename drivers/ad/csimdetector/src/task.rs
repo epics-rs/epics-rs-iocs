@@ -210,7 +210,7 @@ async fn sim_task(mut ctx: CSimTaskContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType};
+    use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDataView};
 
     /// A `[MAX_SIGNALS, n]` array whose element `(i, j)` is `100*i + j`, so a
     /// correct extraction of signal `j` is `[j, 100+j, 200+j, ...]`.
@@ -224,7 +224,7 @@ mod tests {
         let data: Vec<f64> = (0..n)
             .flat_map(|i| (0..MAX_SIGNALS).map(move |j| (100 * i + j) as f64))
             .collect();
-        image.data = NDDataBuffer::F64(data);
+        image.data = NDDataBuffer::from_vec(data);
         image.unique_id = 42;
         image
     }
@@ -235,8 +235,8 @@ mod tests {
         let image = fixture(&pool, 5);
         for j in 0..MAX_SIGNALS {
             let array = extract_signal(&pool, &image, j).unwrap();
-            let got = match &array.data {
-                NDDataBuffer::F64(v) => v.clone(),
+            let got = match array.data.view() {
+                NDDataView::F64(v) => v.to_vec(),
                 other => panic!("expected F64, got {:?}", other.data_type()),
             };
             let want: Vec<f64> = (0..5).map(|i| (100 * i + j) as f64).collect();
@@ -266,7 +266,7 @@ mod tests {
     fn the_extracted_signal_keeps_the_source_data_type() {
         let pool = DriverPool::standalone(0);
         let mut image = fixture(&pool, 3);
-        image.data = NDDataBuffer::I16(vec![7; MAX_SIGNALS * 3]);
+        image.data = NDDataBuffer::from_vec::<i16>(vec![7; MAX_SIGNALS * 3]);
         let array = extract_signal(&pool, &image, 2).unwrap();
         assert_eq!(array.data.data_type(), NDDataType::Int16);
     }

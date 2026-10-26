@@ -58,7 +58,7 @@ pub fn decode_raw(bytes: &[u8]) -> Result<NDDataBuffer, RawError> {
         .iter()
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    Ok(NDDataBuffer::I32(pixels))
+    Ok(NDDataBuffer::from_vec(pixels))
 }
 
 /// What a poll of the frame file found.
@@ -117,6 +117,7 @@ pub fn read_raw_file(path: &Path) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::NDDataView;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -135,7 +136,8 @@ mod tests {
         let last = frame_bytes() - 4;
         bytes[last..].copy_from_slice(&42i32.to_le_bytes());
 
-        let NDDataBuffer::I32(pixels) = decode_raw(&bytes).unwrap() else {
+        let buf = decode_raw(&bytes).unwrap();
+        let NDDataView::I32(pixels) = buf.view() else {
             panic!("decode_raw must return an I32 buffer");
         };
         assert_eq!(pixels.len(), PII_SIZE_X * PII_SIZE_Y);

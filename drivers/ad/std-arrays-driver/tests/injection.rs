@@ -5,12 +5,12 @@
 use std::time::Duration;
 
 use ad_std_arrays_driver::create_nd_std_arrays;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDataView};
 use epics_rs::ad_core::plugin::channel::ndarray_channel;
 
 fn f64s(data: &NDDataBuffer) -> Vec<f64> {
-    match data {
-        NDDataBuffer::F64(v) => v.clone(),
+    match data.view() {
+        NDDataView::F64(v) => v.to_vec(),
         other => panic!("expected F64, got {:?}", other.data_type()),
     }
 }

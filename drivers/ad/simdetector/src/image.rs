@@ -18,7 +18,7 @@
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::error::ADResult;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDataViewMut, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 
 use crate::rng::Rng;
@@ -336,7 +336,7 @@ macro_rules! sim_buffers {
             ) -> ADResult<Self> {
                 let n = dims.iter().map(|d| d.size).product();
                 let zeroed = || match data_type {
-                    $(NDDataType::$dt => NDDataBuffer::$buf(vec![<$t as SimPixel>::ZERO; n])),*
+                    $(NDDataType::$dt => NDDataBuffer::from_vec(vec![<$t as SimPixel>::ZERO; n])),*
                 };
                 // C allocates each with a NULL pData (simDetector.cpp:631-638),
                 // so each is held to the pool's limit; `wrap` is not.
@@ -355,16 +355,16 @@ macro_rules! sim_buffers {
 
             fn compute(&mut self, cfg: &SimConfig, st: &mut DynState, reset: bool, rng: &mut Rng) {
                 match (
-                    &mut self.raw.data,
-                    &mut self.background.data,
-                    &mut self.ramp.data,
-                    &mut self.peak.data,
+                    self.raw.data.view_mut(),
+                    self.background.data.view_mut(),
+                    self.ramp.data.view_mut(),
+                    self.peak.data.view_mut(),
                 ) {
                     $((
-                        NDDataBuffer::$buf(raw),
-                        NDDataBuffer::$buf(background),
-                        NDDataBuffer::$buf(ramp),
-                        NDDataBuffer::$buf(peak),
+                        NDDataViewMut::$buf(raw),
+                        NDDataViewMut::$buf(background),
+                        NDDataViewMut::$buf(ramp),
+                        NDDataViewMut::$buf(peak),
                     ) => compute_array(&mut Bufs { raw, background, ramp, peak }, cfg, st, reset, rng),)*
                     _ => unreachable!("allocated with one data type"),
                 }
@@ -847,7 +847,7 @@ impl SimEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::NDArray;
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataView};
 
     fn pool() -> DriverPool {
         DriverPool::standalone(0)
@@ -857,16 +857,16 @@ mod tests {
         SimEngine::new(Rng::new(0xC0FFEE))
     }
 
-    fn pixels_u8(a: &NDArray) -> &Vec<u8> {
-        match &a.data {
-            NDDataBuffer::U8(v) => v,
+    fn pixels_u8(a: &NDArray) -> &[u8] {
+        match a.data.view() {
+            NDDataView::U8(v) => v,
             other => panic!("expected U8 buffer, got {:?}", other.data_type()),
         }
     }
 
-    fn pixels_f64(a: &NDArray) -> &Vec<f64> {
-        match &a.data {
-            NDDataBuffer::F64(v) => v,
+    fn pixels_f64(a: &NDArray) -> &[f64] {
+        match a.data.view() {
+            NDDataView::F64(v) => v,
             other => panic!("expected F64 buffer, got {:?}", other.data_type()),
         }
     }
@@ -1066,7 +1066,7 @@ mod tests {
         cfg.gain = 3.0;
         let mut eng = engine();
         let first = eng.compute_image(&cfg, &pool(), true).unwrap();
-        let first: Vec<u8> = pixels_u8(&first).clone();
+        let first: Vec<u8> = pixels_u8(&first).to_vec();
         let second = eng.compute_image(&cfg, &pool(), false).unwrap();
         let second = pixels_u8(&second);
         for (a, b) in first.iter().zip(second.iter()) {
@@ -1183,7 +1183,7 @@ mod tests {
         cfg.noise = 100.0;
         let mut eng = engine();
         let a = eng.compute_image(&cfg, &pool(), true).unwrap();
-        let a: Vec<f64> = pixels_f64(&a).clone();
+        let a: Vec<f64> = pixels_f64(&a).to_vec();
         let b = eng.compute_image(&cfg, &pool(), false).unwrap();
         let b = pixels_f64(&b);
         let is_rotation = (0..8).any(|k| (0..8).all(|i| b[i] == a[(i + k) % 8]));
@@ -1408,7 +1408,7 @@ mod tests {
         cfg.sim_mode = SimMode::Sine;
         cfg.gain = 100.0;
         let add = engine().compute_image(&cfg, &pool(), true).unwrap();
-        let add: Vec<f64> = pixels_f64(&add).clone();
+        let add: Vec<f64> = pixels_f64(&add).to_vec();
 
         cfg.x_sine.operation = SineOperation::Multiply;
         cfg.y_sine.operation = SineOperation::Multiply;
@@ -1427,7 +1427,7 @@ mod tests {
         cfg.y_sine.amplitude2 = 0.0;
         let mut eng = engine();
         let f1 = eng.compute_image(&cfg, &pool(), true).unwrap();
-        let f1: Vec<f64> = pixels_f64(&f1).clone();
+        let f1: Vec<f64> = pixels_f64(&f1).to_vec();
         let f2 = eng.compute_image(&cfg, &pool(), false).unwrap();
         let f2 = pixels_f64(&f2);
         // Sine period in x is exactly one frame width, so frame 2's samples repeat
@@ -1441,7 +1441,7 @@ mod tests {
         cfg.gain_x = 0.25;
         let mut eng = engine();
         let g1 = eng.compute_image(&cfg, &pool(), true).unwrap();
-        let g1: Vec<f64> = pixels_f64(&g1).clone();
+        let g1: Vec<f64> = pixels_f64(&g1).to_vec();
         let g2 = eng.compute_image(&cfg, &pool(), false).unwrap();
         assert_ne!(g1, *pixels_f64(&g2));
     }

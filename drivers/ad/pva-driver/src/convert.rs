@@ -9,7 +9,7 @@
 //!   selected `value` union variant (`getValueType`); compressed arrays
 //!   (`codec.name` non-empty) instead read the *original* (pre-compression)
 //!   type from `codec.parameters` (an `int`) and store the selected
-//!   variant's raw bytes verbatim as `NDDataBuffer::U8` — `codec.parameters`
+//!   variant's raw bytes verbatim as `UInt8` bytes — `codec.parameters`
 //!   never advertises `level`/`shuffle`/`compressor`, so `Codec` fields
 //!   beyond `original_data_type` are always `0` on decode (they play no
 //!   role in decompression and this converter never reads them).
@@ -121,10 +121,10 @@ fn decode_value_array(
     arr: &PvField,
 ) -> Result<(NDDataType, NDDataBuffer), ConvertError> {
     macro_rules! typed {
-        ($ndtype:expr, $typed_variant:ident, $scalar_variant:ident, $nd_variant:ident) => {{
+        ($ndtype:expr, $typed_variant:ident, $scalar_variant:ident) => {{
             let buf = match arr {
                 PvField::ScalarArrayTyped(TypedScalarArray::$typed_variant(v)) => {
-                    NDDataBuffer::$nd_variant(v.to_vec())
+                    NDDataBuffer::from_slice(v)
                 }
                 PvField::ScalarArray(items) => {
                     let mut out = Vec::with_capacity(items.len());
@@ -134,7 +134,7 @@ fn decode_value_array(
                             _ => return Err(ConvertError::WrongFieldType("value")),
                         }
                     }
-                    NDDataBuffer::$nd_variant(out)
+                    NDDataBuffer::from_vec(out)
                 }
                 _ => return Err(ConvertError::WrongFieldType("value")),
             };
@@ -142,16 +142,16 @@ fn decode_value_array(
         }};
     }
     match variant_name {
-        "byteValue" => typed!(NDDataType::Int8, Byte, Byte, I8),
-        "ubyteValue" => typed!(NDDataType::UInt8, UByte, UByte, U8),
-        "shortValue" => typed!(NDDataType::Int16, Short, Short, I16),
-        "ushortValue" => typed!(NDDataType::UInt16, UShort, UShort, U16),
-        "intValue" => typed!(NDDataType::Int32, Int, Int, I32),
-        "uintValue" => typed!(NDDataType::UInt32, UInt, UInt, U32),
-        "longValue" => typed!(NDDataType::Int64, Long, Long, I64),
-        "ulongValue" => typed!(NDDataType::UInt64, ULong, ULong, U64),
-        "floatValue" => typed!(NDDataType::Float32, Float, Float, F32),
-        "doubleValue" => typed!(NDDataType::Float64, Double, Double, F64),
+        "byteValue" => typed!(NDDataType::Int8, Byte, Byte),
+        "ubyteValue" => typed!(NDDataType::UInt8, UByte, UByte),
+        "shortValue" => typed!(NDDataType::Int16, Short, Short),
+        "ushortValue" => typed!(NDDataType::UInt16, UShort, UShort),
+        "intValue" => typed!(NDDataType::Int32, Int, Int),
+        "uintValue" => typed!(NDDataType::UInt32, UInt, UInt),
+        "longValue" => typed!(NDDataType::Int64, Long, Long),
+        "ulongValue" => typed!(NDDataType::UInt64, ULong, ULong),
+        "floatValue" => typed!(NDDataType::Float32, Float, Float),
+        "doubleValue" => typed!(NDDataType::Float64, Double, Double),
         other => Err(ConvertError::UnsupportedValueType(other.to_string())),
     }
 }
@@ -284,7 +284,7 @@ pub fn decode_nt_nd_array(pool: &DriverPool, value: &PvField) -> Result<DriverAr
         let name = codec_name_from_str(&codec_name_str)?;
         let compressed_size = scalar_int(s, "compressedSize")? as usize;
         (
-            NDDataBuffer::U8(raw),
+            NDDataBuffer::from_vec(raw),
             Some(Codec {
                 name,
                 compressed_size,
@@ -348,6 +348,7 @@ pub fn decode_nt_nd_array(pool: &DriverPool, value: &PvField) -> Result<DriverAr
 mod tests {
     use super::*;
     use epics_rs::ad_core::color::NDColorMode;
+    use epics_rs::ad_core::ndarray::NDDataView;
     use epics_rs::pva::nt::nd_array::{
         NdArrayBuffer, NdAttribute as WireAttribute, NdCodec, NdDimension as WireDimension,
         NdTimeStamp, NtNdArray, nt_nd_array_value,
@@ -402,8 +403,8 @@ mod tests {
         assert_eq!(arr.dims.len(), 2);
         assert_eq!(arr.dims[0].size, 4);
         assert_eq!(arr.dims[1].size, 3);
-        match &arr.data {
-            NDDataBuffer::U8(v) => assert_eq!(v.len(), 12),
+        match arr.data.view() {
+            NDDataView::U8(v) => assert_eq!(v.len(), 12),
             other => panic!("expected U8 buffer, got {other:?}"),
         }
         assert!(arr.codec.is_none());
@@ -503,8 +504,8 @@ mod tests {
         nt.compressed_size = 4;
         let arr = decode(&nt);
 
-        match &arr.data {
-            NDDataBuffer::U8(v) => assert_eq!(v.as_slice(), &[0xAA, 0xBB, 0xCC, 0xDD]),
+        match arr.data.view() {
+            NDDataView::U8(v) => assert_eq!(v, &[0xAA, 0xBB, 0xCC, 0xDD]),
             other => panic!("expected raw U8 buffer, got {other:?}"),
         }
         let codec = arr

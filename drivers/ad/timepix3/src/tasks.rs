@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataView, NDDataViewMut, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -2705,13 +2705,13 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
             );
             return None;
         };
-        let NDDataBuffer::I32(out) = &mut diff.data else {
+        let NDDataViewMut::I32(out) = diff.data.view_mut() else {
             unreachable!("an Int32 allocation")
         };
-        match (&t0.data, &t1.data) {
-            (NDDataBuffer::U32(a), NDDataBuffer::U32(b)) => band(out, a, b, clip),
-            (NDDataBuffer::U16(a), NDDataBuffer::U16(b)) => band(out, a, b, clip),
-            (NDDataBuffer::U8(a), NDDataBuffer::U8(b)) => band(out, a, b, clip),
+        match (t0.data.view(), t1.data.view()) {
+            (NDDataView::U32(a), NDDataView::U32(b)) => band(out, a, b, clip),
+            (NDDataView::U16(a), NDDataView::U16(b)) => band(out, a, b, clip),
+            (NDDataView::U8(a), NDDataView::U8(b)) => band(out, a, b, clip),
             (a, b) => {
                 ctx.trace(
                     TraceMask::ERROR,
@@ -2978,10 +2978,10 @@ async fn sum_buffer(
     output: SumOutput,
 ) -> NDDataBuffer {
     match output {
-        SumOutput::Sum => NDDataBuffer::U64(sum.to_vec()),
+        SumOutput::Sum => NDDataBuffer::from_slice(sum),
         SumOutput::Average => {
             let mut clamped = false;
-            let avg = sum
+            let avg: Vec<u32> = sum
                 .iter()
                 .map(|&v| {
                     let (a, c) = clamp_average_to_u32(v, frames);
@@ -2997,7 +2997,7 @@ async fn sum_buffer(
                 let (saturated, status) = accum.range_params(&ctx.p);
                 ctx.post_range(locking, saturated, status, posted).await;
             }
-            NDDataBuffer::U32(avg)
+            NDDataBuffer::from_vec(avg)
         }
     }
 }
@@ -3034,14 +3034,14 @@ async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: S
 
     if let Ok(mut array) = ctx
         .pool
-        .alloc_with(dims(), NDDataBuffer::F64(a.time_ms.clone()))
+        .alloc_with(dims(), NDDataBuffer::from_vec(a.time_ms.clone()))
     {
         ctx.attributes_as(locking, &mut array).await;
         ctx.publish_at(7, array, time_stamp).await;
     }
 
     if let Some(current) = a.current.filter(|c| c.len() == bins)
-        && let Ok(mut array) = ctx.pool.alloc_with(dims(), NDDataBuffer::U32(current))
+        && let Ok(mut array) = ctx.pool.alloc_with(dims(), NDDataBuffer::from_vec(current))
     {
         ctx.attributes_as(locking, &mut array).await;
         add_range_attributes(&mut array, "uint32", "counts", false);
@@ -3117,7 +3117,7 @@ async fn publish_img_sum(
 ) {
     let Ok(mut array) = ctx.pool.alloc_with(
         vec![NDDimension::new(width), NDDimension::new(height)],
-        NDDataBuffer::U64(sum),
+        NDDataBuffer::from_vec(sum),
     ) else {
         return;
     };
@@ -3248,9 +3248,11 @@ fn image_array(
     // C allocates the NDArray in the header's storage type
     // (serval_stream.cpp:157-159, :793-795).
     let data = match f.format {
-        PixelFormat::UInt8 => NDDataBuffer::U8(pixels.into_iter().map(|p| p as u8).collect()),
-        PixelFormat::UInt16 => NDDataBuffer::U16(pixels.into_iter().map(|p| p as u16).collect()),
-        PixelFormat::UInt32 => NDDataBuffer::U32(pixels),
+        PixelFormat::UInt8 => NDDataBuffer::from_vec(pixels.into_iter().map(|p| p as u8).collect()),
+        PixelFormat::UInt16 => {
+            NDDataBuffer::from_vec(pixels.into_iter().map(|p| p as u16).collect())
+        }
+        PixelFormat::UInt32 => NDDataBuffer::from_vec(pixels),
     };
     let array = ctx.pool.alloc_with(
         vec![NDDimension::new(f.width), NDDimension::new(f.height)],
@@ -3699,10 +3701,10 @@ mod tests {
                     .await
                     .expect("no array")
                     .unwrap();
-                let ok = match (format, &array.data) {
-                    (PixelFormat::UInt8, NDDataBuffer::U8(v)) => *v == [1, 200],
-                    (PixelFormat::UInt16, NDDataBuffer::U16(v)) => *v == [1, 200],
-                    (PixelFormat::UInt32, NDDataBuffer::U32(v)) => *v == [1, 200],
+                let ok = match (format, array.data.view()) {
+                    (PixelFormat::UInt8, NDDataView::U8(v)) => *v == [1, 200],
+                    (PixelFormat::UInt16, NDDataView::U16(v)) => *v == [1, 200],
+                    (PixelFormat::UInt32, NDDataView::U32(v)) => *v == [1, 200],
                     _ => false,
                 };
                 assert!(ok, "{kind:?} {format:?}: {:?}", array.data.data_type());
@@ -4302,11 +4304,11 @@ mod tests {
         let frame6 = recv(2).await;
         let time7 = recv(3).await;
         let both = 2 * u64::from(u32::MAX);
-        assert!(matches!(&sum4.data, NDDataBuffer::U64(v) if *v == vec![4, both]));
-        assert!(matches!(&sum5.data, NDDataBuffer::U64(v) if *v == vec![4, both]));
-        assert!(matches!(&frame6.data, NDDataBuffer::U32(v) if *v == vec![3, u32::MAX]));
+        assert!(matches!(sum4.data.view(), NDDataView::U64(v) if *v == vec![4, both]));
+        assert!(matches!(sum5.data.view(), NDDataView::U64(v) if *v == vec![4, both]));
+        assert!(matches!(frame6.data.view(), NDDataView::U32(v) if *v == vec![3, u32::MAX]));
         let step = 2.0 * crate::stream::TDC_CLOCK_PERIOD_SEC * 1e3;
-        assert!(matches!(&time7.data, NDDataBuffer::F64(v) if *v == vec![0.0, step]));
+        assert!(matches!(time7.data.view(), NDDataView::F64(v) if *v == vec![0.0, step]));
         assert_eq!(
             sum5.attributes
                 .get("ADTimePixNumericRange")
@@ -4322,8 +4324,8 @@ mod tests {
         push_processed_hst(&ctx).await;
         let avg4 = recv(0).await;
         let avg5 = recv(1).await;
-        assert!(matches!(&avg4.data, NDDataBuffer::U32(v) if *v == vec![2, u32::MAX]));
-        assert!(matches!(&avg5.data, NDDataBuffer::U32(v) if *v == vec![2, u32::MAX]));
+        assert!(matches!(avg4.data.view(), NDDataView::U32(v) if *v == vec![2, u32::MAX]));
+        assert!(matches!(avg5.data.view(), NDDataView::U32(v) if *v == vec![2, u32::MAX]));
         assert_eq!(
             avg5.attributes.get("ADTimePixCountUnits").map(|a| &a.value),
             Some(&NDAttrValue::String("counts/frame".into()))
@@ -4684,11 +4686,11 @@ mod tests {
             }
             got.push(last.unwrap());
         }
-        assert!(matches!(&got[0].data, NDDataBuffer::U64(v) if *v == vec![4, 6]));
-        assert!(matches!(&got[1].data, NDDataBuffer::U64(v) if *v == vec![4, 6]));
-        assert!(matches!(&got[2].data, NDDataBuffer::U32(v) if *v == vec![3, 4]));
+        assert!(matches!(got[0].data.view(), NDDataView::U64(v) if *v == vec![4, 6]));
+        assert!(matches!(got[1].data.view(), NDDataView::U64(v) if *v == vec![4, 6]));
+        assert!(matches!(got[2].data.view(), NDDataView::U32(v) if *v == vec![3, 4]));
         let t = crate::stream::TDC_CLOCK_PERIOD_SEC * 1e3;
-        assert!(matches!(&got[3].data, NDDataBuffer::F64(v) if *v == vec![t, 3.0 * t]));
+        assert!(matches!(got[3].data.view(), NDDataView::F64(v) if *v == vec![t, 3.0 * t]));
     }
 
     /// C `processImgFrame` hands every Img frame's running sum to the plugins
@@ -4735,15 +4737,15 @@ mod tests {
         set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
         push_processed_img(&ctx).await;
         let (sum, sum_n) = (recv(0).await, recv(1).await);
-        assert!(matches!(&sum.data, NDDataBuffer::U64(v) if *v == vec![4, 6]));
-        assert!(matches!(&sum_n.data, NDDataBuffer::U64(v) if *v == vec![4, 6]));
+        assert!(matches!(sum.data.view(), NDDataView::U64(v) if *v == vec![4, 6]));
+        assert!(matches!(sum_n.data.view(), NDDataView::U64(v) if *v == vec![4, 6]));
         assert_eq!(sum.dims.len(), 2);
 
         set_synced(&ctx, ctx.p.processed_img_output_type, 0, 1).await;
         push_processed_img(&ctx).await;
         let (avg, avg_n) = (recv(0).await, recv(1).await);
-        assert!(matches!(&avg.data, NDDataBuffer::U32(v) if *v == vec![2, 3]));
-        assert!(matches!(&avg_n.data, NDDataBuffer::U32(v) if *v == vec![2, 3]));
+        assert!(matches!(avg.data.view(), NDDataView::U32(v) if *v == vec![2, 3]));
+        assert!(matches!(avg_n.data.view(), NDDataView::U32(v) if *v == vec![2, 3]));
         assert_eq!(
             avg.attributes.get("ADTimePixCountUnits").map(|a| &a.value),
             Some(&NDAttrValue::String("counts/frame".into()))
@@ -5145,8 +5147,8 @@ mod tests {
             assert_eq!(next(&mut rx, PRV_IMG_ADDR).await.unique_id, n);
             let diff = next(&mut rx, 9).await;
             assert_eq!(diff.unique_id, n);
-            match &diff.data {
-                NDDataBuffer::I32(v) => assert_eq!(v, &band),
+            match diff.data.view() {
+                NDDataView::I32(v) => assert_eq!(v, &band),
                 other => panic!("{:?}", other.data_type()),
             }
             assert_eq!(
@@ -6222,7 +6224,7 @@ mod tests {
         let dims = || vec![NDDimension::new(1)];
         let mut array = ctx
             .pool
-            .alloc_with(dims(), NDDataBuffer::U32(vec![1]))
+            .alloc_with(dims(), NDDataBuffer::from_vec::<u32>(vec![1]))
             .unwrap();
         frame_stamps(&ctx, &frame).await(&mut array);
         assert_eq!(array.timestamp, EpicsTimestamp::from(fixed));
@@ -6231,7 +6233,7 @@ mod tests {
         ctx.outputs[4].lock().add(tx);
         let array = ctx
             .pool
-            .alloc_with(dims(), NDDataBuffer::U32(vec![1]))
+            .alloc_with(dims(), NDDataBuffer::from_vec::<u32>(vec![1]))
             .unwrap();
         ctx.publish_at(4, array, 1.0).await;
         let posted = tokio::time::timeout(Duration::from_secs(5), rx.recv())

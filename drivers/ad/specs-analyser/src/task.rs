@@ -583,7 +583,7 @@ impl Task {
         if array_callbacks != 0
             && let Ok(mut array) = self.w.pool.alloc_with(
                 vec![NDDimension::new(nx), NDDimension::new(ny)],
-                NDDataBuffer::F64(image),
+                NDDataBuffer::from_vec(image),
             )
         {
             array.unique_id = array_counter;

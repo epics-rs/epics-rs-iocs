@@ -64,7 +64,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
                 dims: vec![NDDimension::new(w as usize), NDDimension::new(h as usize)],
                 color_mode: NDColorMode::Mono,
                 data_type: NDDataType::UInt8,
-                data: NDDataBuffer::U8(buf.into_raw()),
+                data: NDDataBuffer::from_vec(buf.into_raw()),
             })
         }
         ColorType::L16 | ColorType::La16 => {
@@ -74,7 +74,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
                 dims: vec![NDDimension::new(w as usize), NDDimension::new(h as usize)],
                 color_mode: NDColorMode::Mono,
                 data_type: NDDataType::UInt16,
-                data: NDDataBuffer::U16(buf.into_raw()),
+                data: NDDataBuffer::from_vec(buf.into_raw()),
             })
         }
         ColorType::Rgb8 | ColorType::Rgba8 => {
@@ -88,7 +88,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
                 ],
                 color_mode: NDColorMode::RGB1,
                 data_type: NDDataType::UInt8,
-                data: NDDataBuffer::U8(buf.into_raw()),
+                data: NDDataBuffer::from_vec(buf.into_raw()),
             })
         }
         ColorType::Rgb16 | ColorType::Rgba16 => {
@@ -102,7 +102,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
                 ],
                 color_mode: NDColorMode::RGB1,
                 data_type: NDDataType::UInt16,
-                data: NDDataBuffer::U16(buf.into_raw()),
+                data: NDDataBuffer::from_vec(buf.into_raw()),
             })
         }
         other => Err(DecodeError::Unsupported(format!("{other:?}"))),
@@ -112,6 +112,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::NDDataView;
 
     fn encode_png(img: &image::DynamicImage) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -144,8 +145,8 @@ mod tests {
         assert_eq!(decoded.dims.len(), 2);
         assert_eq!(decoded.dims[0].size, 4);
         assert_eq!(decoded.dims[1].size, 3);
-        match decoded.data {
-            NDDataBuffer::U8(v) => assert_eq!(v.len(), 4 * 3),
+        match decoded.data.view() {
+            NDDataView::U8(v) => assert_eq!(v.len(), 4 * 3),
             _ => panic!("expected U8 buffer"),
         }
     }
@@ -164,8 +165,8 @@ mod tests {
         assert_eq!(decoded.dims.len(), 2);
         assert_eq!(decoded.dims[0].size, 5);
         assert_eq!(decoded.dims[1].size, 2);
-        match decoded.data {
-            NDDataBuffer::U16(v) => assert_eq!(v.len(), 5 * 2),
+        match decoded.data.view() {
+            NDDataView::U16(v) => assert_eq!(v.len(), 5 * 2),
             _ => panic!("expected U16 buffer"),
         }
     }
@@ -185,8 +186,8 @@ mod tests {
         assert_eq!(decoded.dims[0].size, 3);
         assert_eq!(decoded.dims[1].size, 6);
         assert_eq!(decoded.dims[2].size, 4);
-        match decoded.data {
-            NDDataBuffer::U8(v) => assert_eq!(v.len(), 3 * 6 * 4),
+        match decoded.data.view() {
+            NDDataView::U8(v) => assert_eq!(v.len(), 3 * 6 * 4),
             _ => panic!("expected U8 buffer"),
         }
     }
@@ -206,8 +207,8 @@ mod tests {
         assert_eq!(decoded.dims[0].size, 3);
         assert_eq!(decoded.dims[1].size, 3);
         assert_eq!(decoded.dims[2].size, 3);
-        match decoded.data {
-            NDDataBuffer::U16(v) => assert_eq!(v.len(), 3 * 3 * 3),
+        match decoded.data.view() {
+            NDDataView::U16(v) => assert_eq!(v.len(), 3 * 3 * 3),
             _ => panic!("expected U16 buffer"),
         }
     }
@@ -223,9 +224,9 @@ mod tests {
 
         assert_eq!(decoded.color_mode, NDColorMode::RGB1);
         assert_eq!(decoded.data_type, NDDataType::UInt8);
-        match decoded.data {
+        match decoded.data.view() {
             // 2x2 RGB1 (alpha dropped) = 3 * 2 * 2 = 12 bytes, not 16.
-            NDDataBuffer::U8(v) => assert_eq!(v.len(), 3 * 2 * 2),
+            NDDataView::U8(v) => assert_eq!(v.len(), 3 * 2 * 2),
             _ => panic!("expected U8 buffer"),
         }
     }

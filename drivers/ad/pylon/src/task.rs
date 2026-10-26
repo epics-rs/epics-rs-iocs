@@ -19,7 +19,7 @@ use parking_lot::RwLock;
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::color::{NDBayerPattern, NDColorMode};
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use ad_core_rs::ndarray::{NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::{DriverArray, DriverPool};
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
@@ -234,23 +234,8 @@ impl GrabShared {
             );
             return Err(NoArray::PoolExhausted);
         };
-        match &mut array.data {
-            NDDataBuffer::U8(v) => {
-                v.clear();
-                v.extend_from_slice(bytes);
-            }
-            NDDataBuffer::U16(v) => {
-                v.clear();
-                v.extend(
-                    bytes
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|b| u16::from_ne_bytes(*b)),
-                );
-            }
-            _ => unreachable!("pixel_layout yields only UInt8 and UInt16"),
-        }
+        // C's memcpy of dataSize bytes (ADPylon.cpp:696).
+        array.data.as_u8_slice_mut().copy_from_slice(bytes);
 
         let driver_id = self.unique_id.fetch_add(1, Ordering::Relaxed);
         array.unique_id = if self.unique_id_mode.load(Ordering::Relaxed) == UNIQUE_ID_CAMERA {
