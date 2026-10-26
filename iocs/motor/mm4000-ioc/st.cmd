@@ -38,10 +38,12 @@ MM4000Config(0, "$(SERIAL)")
 #   MM4000AsynConfig(0, "$(SERIAL)", 0, 1, 100, 250)
 #   drvAsynMotorConfigure("MM4", "motorMM4000", 0, 4)
 
-# One motor record per axis, signal S of card 0.
-# Positions travel the driver boundary in EGU (controller units, mm/deg)
-# directly; MRES only sets the record's raw-count resolution.
-dbLoadRecords("$(MM4000_IOC)/db/mm4000.template", "P=$(P),M=m1,C=0,S=0,MRES=0.0001,EGU=mm")
+# motorUtil's records and one motor.db per axis, signal S of card 0, as C's
+# st.cmd and MM4000.cmd load them. Positions travel the driver boundary in
+# EGU (controller units, mm/deg) directly; MRES only sets the record's
+# raw-count resolution.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(MM4000_IOC)/db/MM4000.substitutions", "P=$(P)")
 
 # MM4005_trajectoryScan.st's records, for the seq line below:
 #   dbLoadRecords("$(MM4000_IOC)/db/trajectoryScan.db", "P=$(P),R=traj1:,NAXES=1,NELM=2000,NPULSE=2000")
@@ -50,9 +52,9 @@ iocInit()
 
 # MM4005_trajectoryScan.st runs trajectoryScan.db's trajectories on the
 # MM4005 over the same serial port, motor Mn its axis n:
-#   seq &MM4005_trajectoryScan, "P=$(P),R=traj1:,M1=m1,PORT=$(SERIAL)"
+#   seq &MM4005_trajectoryScan, "P=$(P),R=traj1:,M1=m11,PORT=$(SERIAL)"
 
 # Example:
 #   dbl
-#   camonitor MM4000:m1 MM4000:m1.RBV
-#   caput MM4000:m1 5.0
+#   camonitor MM4000:m11 MM4000:m11.RBV
+#   caput MM4000:m11 5.0
