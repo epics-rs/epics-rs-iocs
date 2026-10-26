@@ -33,10 +33,17 @@ dbLoadRecords("$(XPS_IOC)/db/xps.template", "P=$(P),M0=$(M0),PORT=$(PORT),ADDR=0
 # xpsSlave.st's records, for the seq line below:
 #   dbLoadRecords("$(XPS_IOC)/db/xpsSlave.db", "P=$(P),R=slave")
 
+# XPS_trajectoryScan.st's records, for the seq line below:
+#   dbLoadRecords("$(XPS_IOC)/db/trajectoryScan.db", "P=$(P),R=traj1:,NAXES=1,NELM=2000,NPULSE=2000")
+
 iocInit()
 
 # xpsSlave.st gears group S to positioner M on its own XPS socket:
 #   seq &xpsSlave, "P=$(P),R=slave,IP=$(IP),M=GROUP1.POSITIONER,S=GROUP2"
+
+# XPS_trajectoryScan.st runs trajectoryScan.db's PVT trajectories on group
+# GROUP over its own XPS sockets, the file sent by FTP as USERNAME:
+#   seq &XPS_trajectoryScan, "P=$(P),R=traj1:,M1=$(M0),IPADDR=$(IP),PORT=5001,GROUP=GROUP1,P1=POSITIONER,USERNAME=Administrator,PASSWORD=Administrator"
 
 # Run a TCL script file stored on the XPS (task name + parameters default "0"):
 #   XPSTclScriptExecute("$(PORT)", "MyScript.tcl")

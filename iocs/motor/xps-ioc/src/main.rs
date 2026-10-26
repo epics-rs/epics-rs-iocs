@@ -2,7 +2,8 @@
 //!
 //! Assembles: an XPS controller (`XPSCreateController`, which opens its TCP
 //! sockets from an IP address and port) with its axes (`XPSCreateAxis`), the motor record
-//! type, the `xpsSlave` sequencer program, and the CA + PVA (QSRV) server.
+//! type, the `xpsSlave` and `XPS_trajectoryScan` sequencer programs, and the CA + PVA
+//! (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p xps-ioc -- st.cmd
@@ -40,6 +41,10 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
+    // trajectoryScan.db's busy records: opt-in in epics-rs, as a C IOC links
+    // busy's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+
     // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.
     let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
@@ -64,8 +69,9 @@ async fn main() -> CaResult<()> {
         epics_rs::motor::devices::device_support_factory(),
     );
 
-    // devNewportSeq.dbd's registrar(xpsSlaveRegistrar): the seq shell
-    // commands and xpsSlave.st.
+    // devNewportSeq.dbd's registrar(XPS_trajectoryScanRegistrar) and
+    // registrar(xpsSlaveRegistrar): the seq shell commands and the two .st.
+    motor_newport::snl::xps_trajectory_scan::XPS_trajectoryScanRegistrar();
     motor_newport::snl::xps_slave::xpsSlaveRegistrar();
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
