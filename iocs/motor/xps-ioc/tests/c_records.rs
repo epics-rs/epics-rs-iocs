@@ -26,7 +26,7 @@ fn st_cmd_loads_the_c_records() {
     ];
     let c = renamed(
         &read_dbl(&dir.join("tests/st.cmd.xps5.names")),
-        &[("IOC:", "XPS:"), ("IOC:m1", "XPS:m0")],
+        &[("IOC:", "XPS:")],
         &[&axes[..], UNSERVED].concat(),
     );
     let ioc = Path::new(env!("CARGO_BIN_EXE_xps-ioc"));

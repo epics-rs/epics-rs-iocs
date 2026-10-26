@@ -14,16 +14,16 @@
 #============================================================
 
 epicsEnvSet("P",     "XPS:")
-epicsEnvSet("PORT",  "MOTOR1")
+epicsEnvSet("PORT",  "XPS1")
 epicsEnvSet("IP",    "192.168.0.254")
 
 # ---- XPS controller + axes ----
 # XPSCreateController(portName, IPAddress, IPPort, numAxes, movingPollPeriod,
 #                     idlePollPeriod, enableSetPosition, setPositionSettlingTime)
-XPSCreateController("$(PORT)", "$(IP)", 5001, 1, 100, 1000, 0, 0)
+XPSCreateController("$(PORT)", "$(IP)", 5001, 1, 10, 500, 0, 500)
 # XPSCreateAxis(portName, axis, positionerName, stepsPerUnit)
 # stepsPerUnit is 1/MRES of the axis record.
-XPSCreateAxis("$(PORT)", 0, "GROUP1.POSITIONER", "20480")
+XPSCreateAxis("$(PORT)", 0, "GROUP1.POSITIONER", "1000")
 # XPSCreateProfile(portName, maxPoints, ftpUsername, ftpPassword)
 XPSCreateProfile("$(PORT)", 2000, "Administrator", "Administrator")
 
@@ -40,12 +40,16 @@ dbLoadTemplate("$(XPS_IOC)/db/motor.substitutions.xps5", "P=$(P),PORT=$(PORT)")
 
 iocInit()
 
+# This IOC does not use save/restore, so set values of some PVs
+dbpf("$(P)m1.RTRY", "0")
+dbpf("$(P)m1.TWV", "0.1")
+
 # xpsSlave.st gears group S to positioner M on its own XPS socket:
 #   seq &xpsSlave, "P=$(P),R=slave,IP=$(IP),M=GROUP1.POSITIONER,S=GROUP2"
 
 # XPS_trajectoryScan.st runs trajectoryScan.db's PVT trajectories on group
 # GROUP over its own XPS sockets, the file sent by FTP as USERNAME:
-#   seq &XPS_trajectoryScan, "P=$(P),R=traj1:,M1=m0,IPADDR=$(IP),PORT=5001,GROUP=GROUP1,P1=POSITIONER,USERNAME=Administrator,PASSWORD=Administrator"
+#   seq &XPS_trajectoryScan, "P=$(P),R=traj1:,M1=m1,IPADDR=$(IP),PORT=5001,GROUP=GROUP1,P1=POSITIONER,USERNAME=Administrator,PASSWORD=Administrator"
 
 # Run a TCL script file stored on the XPS (task name + parameters default "0"):
 #   XPSTclScriptExecute("$(PORT)", "MyScript.tcl")
@@ -99,5 +103,5 @@ iocInit()
 
 # Example:
 #   dbl
-#   camonitor XPS:m0 XPS:m0.RBV
-#   caput XPS:m0 10.0
+#   camonitor XPS:m1 XPS:m1.RBV
+#   caput XPS:m1 10.0
