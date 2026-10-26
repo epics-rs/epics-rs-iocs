@@ -11,7 +11,7 @@
 
 epicsEnvSet("P",      "SC800:")
 epicsEnvSet("CARD",   "0")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -25,21 +25,21 @@ asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # ---- SC800 controller ----
 # SC800Setup(num_cards, scan_rate in Hz)
-SC800Setup(1, 10)
+SC800Setup(1, 5)
 
 # SC800Config(card, asyn port, GPIB address) - axis count derived from the
 # controller model (SC-800 -> 8, SC-400 -> 4, SC-200 -> 2).
 SC800Config(0, "$(SERIAL)", 0)
 
-# One motor record per axis (DTYP SC-800, OUT #C$(CARD) S0, S1, ...). The SC-800 works in
-# motor steps, so MRES = 1 and EGU = steps. This example loads two axes; add
-# more (up to the model's axis count) as needed.
-dbLoadRecords("$(KOHZU_IOC)/db/sc800.template", "P=$(P),M=m1,C=$(CARD),S=0")
-dbLoadRecords("$(KOHZU_IOC)/db/sc800.template", "P=$(P),M=m2,C=$(CARD),S=1")
+# motorUtil's records and one motor.db per axis, as C's st.cmd and
+# SC800.cmd load them. This example loads one axis; add rows (up to the
+# model's axis count) as needed.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(KOHZU_IOC)/db/SC800.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
 
 # Example:
 #   dbl
 #   camonitor SC800:m1 SC800:m1.RBV
-#   caput SC800:m1 10000
+#   caput SC800:m1 10

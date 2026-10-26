@@ -1,0 +1,7 @@
+# C's iocKohzu SC800.substitutions, P and C from st.cmd.
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{N, M,       DTYP,     S, DESC,         EGU,     DIR, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES, PREC, DHLM, DLLM, INIT}
+{1, "m$(N)", "SC-800", 0, "motor $(N)", degrees, Pos, 10,   0.,   1.,   0,    1,    .2,   1e-3, 3,    100,  -100, ""}
+}

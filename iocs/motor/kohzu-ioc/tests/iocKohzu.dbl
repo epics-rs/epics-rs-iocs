@@ -1,0 +1,10 @@
+# dbl of motor R7-4-5 motorKohzu iocBoot/iocKohzu st.cmd
+kohzu:alldone
+kohzu:alldoneBlink
+kohzu:allstop
+kohzu:m1
+kohzu:m1_able
+kohzu:m1_twCh
+kohzu:m1_vCh
+kohzu:moving
+kohzu:movingDiff
