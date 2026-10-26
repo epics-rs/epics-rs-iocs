@@ -18,12 +18,8 @@ epicsEnvSet("DEVICE",  "/dev/ttyUSB0")
 # ---- motorUtil (allstop & alldone) ----
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
-# ---- asyn serial octet port (FTDI USB, 9600 8-N-1 typical) ----
+# ---- asyn serial octet port (FTDI USB), opened at 9600 8-N-1 ----
 drvAsynSerialPortConfigure("$(SERPORT)", "$(DEVICE)", 0, 0, 0)
-asynSetOption("$(SERPORT)", 0, "baud", "9600")
-asynSetOption("$(SERPORT)", 0, "bits", "8")
-asynSetOption("$(SERPORT)", 0, "parity", "none")
-asynSetOption("$(SERPORT)", 0, "stop", "1")
 
 # Port EOS as the C example sets it (smaractscu.iocsh:7-8);
 # the driver sends bare commands.
