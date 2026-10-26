@@ -12,3 +12,6 @@ publish = false
 [dependencies]
 motor-newport = { path = "../../../drivers/motor/newport" }
 epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
+
+[dev-dependencies]
+ioc-conventions = { path = "../../../tools/ioc-conventions" }

@@ -1,0 +1,16 @@
+# C's iocNewport motor.substitutions.xps5, P and PORT from st.cmd, on the
+# axis this IOC configures; the values are the motor record it had before.
+# MRES must be 1/stepsPerUnit of XPSCreateAxis.
+#
+# C's XPS_extra.db and profileMove{Controller,Axis}[XPS].template blocks are
+# left out. This driver serves none of XPS_MIN_JERK, XPS_MAX_JERK, XPS_STATUS
+# or XPS_PROFILE_*, and XpsHead overrides no profile hook, so the base
+# PROFILE_* records would report a build that drives nothing. Its profile
+# moves are the XPSDefineProfileFromFile / XPSBuildProfile /
+# XPSExecuteProfile commands.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{M,     DTYP,         ADDR,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,         PREC,  DHLM,  DLLM,  INIT}
+{"m0",  "asynMotor",  0,     "",    mm,   Pos,  10,    0,     .5,    0,     0,     .5,    0.000048828,  4,     100,   -100,  ""}
+}

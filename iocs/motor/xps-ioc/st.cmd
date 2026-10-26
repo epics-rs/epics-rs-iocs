@@ -14,7 +14,6 @@
 #============================================================
 
 epicsEnvSet("P",     "XPS:")
-epicsEnvSet("M0",    "m0")
 epicsEnvSet("PORT",  "MOTOR1")
 epicsEnvSet("IP",    "192.168.0.254")
 
@@ -28,7 +27,8 @@ XPSCreateAxis("$(PORT)", 0, "GROUP1.POSITIONER", "20480")
 # XPSCreateProfile(portName, maxPoints, ftpUsername, ftpPassword)
 XPSCreateProfile("$(PORT)", 2000, "Administrator", "Administrator")
 
-dbLoadRecords("$(XPS_IOC)/db/xps.template", "P=$(P),M0=$(M0),PORT=$(PORT),ADDR=0")
+# The axis's basic_asyn_motor.db, as C's st.cmd.xps5 loads it.
+dbLoadTemplate("$(XPS_IOC)/db/motor.substitutions.xps5", "P=$(P),PORT=$(PORT)")
 
 # xpsSlave.st's records, for the seq line below:
 #   dbLoadRecords("$(XPS_IOC)/db/xpsSlave.db", "P=$(P),R=slave")
@@ -43,7 +43,7 @@ iocInit()
 
 # XPS_trajectoryScan.st runs trajectoryScan.db's PVT trajectories on group
 # GROUP over its own XPS sockets, the file sent by FTP as USERNAME:
-#   seq &XPS_trajectoryScan, "P=$(P),R=traj1:,M1=$(M0),IPADDR=$(IP),PORT=5001,GROUP=GROUP1,P1=POSITIONER,USERNAME=Administrator,PASSWORD=Administrator"
+#   seq &XPS_trajectoryScan, "P=$(P),R=traj1:,M1=m0,IPADDR=$(IP),PORT=5001,GROUP=GROUP1,P1=POSITIONER,USERNAME=Administrator,PASSWORD=Administrator"
 
 # Run a TCL script file stored on the XPS (task name + parameters default "0"):
 #   XPSTclScriptExecute("$(PORT)", "MyScript.tcl")
