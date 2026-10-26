@@ -14,7 +14,7 @@
 
 epicsEnvSet("P",      "ACS:")
 epicsEnvSet("CARD",   "0")
-epicsEnvSet("PORT",   "ACS1")
+epicsEnvSet("PORT",   "serial61")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port (RS-232) ----
@@ -29,21 +29,21 @@ asynSetOption("$(PORT)", 0, "stop",   "1")
 
 # ---- SPiiPlus controller ----
 # SPiiPlusSetup(num_cards, scan_rate in Hz)
-SPiiPlusSetup(1, 10)
+SPiiPlusSetup(1, 60)
 
 # SPiiPlusConfig(card, asyn port, mode) - mode is
 # BUF (default; ACSPL program buffers), DIR (direct command interpreter), or CON
 # (kinematic CONNECT). Axis count is auto-detected.
-SPiiPlusConfig(0, "$(PORT)", "DIR")
+SPiiPlusConfig(0, "$(PORT)", "BUF")
 
-# One motor record per axis (DTYP "SPiiPlus", OUT #C$(CARD) S0, S1, ...). The SPiiPlus
-# works in controller counts, so MRES = 1 and EGU = counts.
-dbLoadRecords("$(ACSTECH80_IOC)/db/spiiplus.template", "P=$(P),M=m1,C=$(CARD),S=0")
-dbLoadRecords("$(ACSTECH80_IOC)/db/spiiplus.template", "P=$(P),M=m2,C=$(CARD),S=1")
+# motorUtil's records and one motor.db per axis (DTYP "SPiiPlus", OUT
+# #C$(CARD) S0, S1, ...), as C's st.cmd and SPiiPlus.cmd load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(ACSTECH80_IOC)/db/SPiiPlus.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
 
 # Example:
 #   dbl
 #   camonitor ACS:m1 ACS:m1.RBV
-#   caput ACS:m1 100000
+#   caput ACS:m1 10

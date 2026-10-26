@@ -16,6 +16,7 @@ name = "acstech80-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-acstech80",
  "motor-common",
 ]

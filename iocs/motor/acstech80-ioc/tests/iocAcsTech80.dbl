@@ -1,0 +1,14 @@
+# dbl of motor R7-4-5 motorAcsTech80 iocBoot/iocAcsTech80 st.cmd
+acsTech80:alldone
+acsTech80:alldoneBlink
+acsTech80:allstop
+acsTech80:m1
+acsTech80:m1_able
+acsTech80:m1_twCh
+acsTech80:m1_vCh
+acsTech80:m2
+acsTech80:m2_able
+acsTech80:m2_twCh
+acsTech80:m2_vCh
+acsTech80:moving
+acsTech80:movingDiff
