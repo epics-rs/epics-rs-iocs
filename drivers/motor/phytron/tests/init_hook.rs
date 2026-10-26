@@ -66,7 +66,9 @@ async fn after_init_dev_sup_waits_for_the_axis_first_read() {
         create_axis.handler.call(&axis, &ctx).unwrap();
     })
     .await;
-    line.sent();
+    // No axis existed at the startup pass, so any `1=H` is the axis's read:
+    // motor-rs polls a joined axis before its add returns, else the hook
+    // waits for the next pass.
     shell(|| init_hook_announce(InitHookState::AfterInitDevSup)).await;
     let sent: Vec<String> = line
         .sent()
