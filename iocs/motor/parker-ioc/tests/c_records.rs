@@ -3,7 +3,9 @@
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
+use ioc_conventions::{
+    assert_links_asyn_dbd, assert_same_records, booted_records, read_dbl, renamed,
+};
 
 fn dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -43,4 +45,10 @@ fn st_pc6k_cmd_loads_the_c_pc6k_records() {
         &["parker:m2"],
     );
     assert_same_records(&booted_records(ioc(), &dir().join("st-pc6k.cmd")), &c);
+}
+
+/// The binary links asyn.dbd, as C's iocParker does.
+#[test]
+fn the_ioc_links_asyn_dbd() {
+    assert_links_asyn_dbd(Path::new(env!("CARGO_BIN_EXE_parker-ioc")));
 }

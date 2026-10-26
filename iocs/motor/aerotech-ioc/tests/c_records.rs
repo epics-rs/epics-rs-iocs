@@ -4,7 +4,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
+use ioc_conventions::{
+    assert_links_asyn_dbd, assert_same_records, booted_records, read_dbl, renamed,
+};
 
 fn dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -46,4 +48,10 @@ fn st_a3200_cmd_loads_the_c_a3200_records() {
         &["aerotech:Y"],
     );
     assert_same_records(&booted_records(ioc(), &dir().join("st.a3200.cmd")), &c);
+}
+
+/// The binary links asyn.dbd, as C's iocAerotech does.
+#[test]
+fn the_ioc_links_asyn_dbd() {
+    assert_links_asyn_dbd(Path::new(env!("CARGO_BIN_EXE_aerotech-ioc")));
 }

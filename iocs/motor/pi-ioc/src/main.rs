@@ -41,9 +41,11 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // Standard asyn iocsh commands — provides the serial/IP port configure verbs.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
+    // asyn.dbd, as C's IOC links it: the asyn record, devEpics and the
+    // iocsh commands (the serial/IP port configure verbs).
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, asyn_factory);
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // PIC862 + PIC663 iocsh commands + motor device support.
     app = app.register_startup_command(pic862_setup_command());
