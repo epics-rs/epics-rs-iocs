@@ -413,6 +413,8 @@ mod tests {
             position: f64,
             /// The points `NQ` says were traced.
             traced: usize,
+            /// Whether `1TQ` answers no axis and `2TQ` a cut one.
+            short: bool,
         }
 
         type Shared = Arc<Mutex<Mm4005>>;
@@ -441,10 +443,14 @@ mod tests {
                     }
                     // nTQ: point n, theory then actual
                     None => match cmd.strip_suffix("TQ") {
-                        Some(n) => {
-                            let n: f64 = n.parse().unwrap();
-                            format!("{n}TQ,1TH{},1TP{}", n, n + 0.25)
-                        }
+                        Some(n) => match (m.short, n) {
+                            (true, "1") => "1TQ".into(),
+                            (true, "2") => "2TQ,1TH2,1T".into(),
+                            _ => {
+                                let n: f64 = n.parse().unwrap();
+                                format!("{n}TQ,1TH{},1TP{}", n, n + 0.25)
+                            }
+                        },
                         None => String::new(),
                     },
                 },
@@ -570,6 +576,7 @@ mod tests {
                 tb: "TB@ no error".into(),
                 position: 0.5,
                 traced: 0,
+                short: false,
             }));
             let shared = mm.clone();
             let (rig, _) = LineRig::new(port, move |cmd| reply(&shared, cmd));
@@ -783,6 +790,26 @@ mod tests {
             assert_eq!(p.sent(), ["NQ", "1TQ", "2TQ"]);
             assert_eq!(array(&p.db, "T:traj1:M1Actual", 3), [11.25, 12.25, 0.0]);
             assert_eq!(array(&p.db, "T:traj1:M1Error", 3), [0.25, 0.25, 0.0]);
+        }
+
+        /// ss trajectoryScan state readback: a point whose reply stops short
+        /// of an axis, or cuts its token, leaves that axis 0.
+        #[epics_rs::base::epics_test]
+        async fn readback_stops_a_point_at_a_short_reply() {
+            let p = boot("mm4005ReadbackShort", &[("OFF", "10")]).await;
+            {
+                let mut m = p.mm.lock().unwrap();
+                m.traced = 3;
+                m.short = true;
+            }
+            put(&p.db, "T:traj1:Readback", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Readback", 0.0), ("T:traj1:ReadStatus", 1.0)],
+            )
+            .await;
+            assert_eq!(array(&p.db, "T:traj1:M1Actual", 3), [0.0, 0.0, 13.25]);
+            assert_eq!(array(&p.db, "T:traj1:M1Error", 3), [0.0, 0.0, 0.25]);
         }
     }
 }

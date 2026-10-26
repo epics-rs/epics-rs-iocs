@@ -521,10 +521,16 @@ ss trajectoryScan {
                 tok_save = 0;
                 /* Skip the first token, which is nnTQ */
                 p = epicsStrtok_r(stringIn, ",", &tok_save);
+                /* Upstream read each token past its nTH or nTP unchecked: a reply
+                 * short of numAxes axes, as from a controller with fewer, read
+                 * NULL+3.  The parse stops at a token missing or shorter than its
+                 * prefix, leaving the rest of the point 0. */
                 for (j=0; (j<numAxes && p!=0); j++) {
                     p = epicsStrtok_r(0, ",", &tok_save);
+                    if (p == 0 || strlen(p) < 3) break;
                     posTheory = atof(p+3);
                     p = epicsStrtok_r(0, ",", &tok_save);
+                    if (p == 0 || strlen(p) < 3) break;
                     if (epicsMotorDir[j] == 0) dir=1; else dir=-1;
                     posActual = atof(p+3);
                     motorError[j][i] = posActual-posTheory;
