@@ -10,6 +10,7 @@
 //!   cargo run -p micos-ioc -- st.cmd           # SMC corvus
 //!   cargo run -p micos-ioc -- st.hydra.cmd     # SMC hydra
 //!   cargo run -p micos-ioc -- st.taurus.cmd    # SMC Taurus
+//!   cargo run -p micos-ioc -- st.moco.cmd      # MoCo
 
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -41,10 +42,17 @@ async fn main() -> CaResult<()> {
     for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
         app = app.register_startup_command(cmd);
     }
+    // motorUtilRegister: motorUtilInit, printChIDlist, listMovingMotors.
+    for cmd in epics_rs::motor::motor_util::motor_util_commands() {
+        app = app.register_startup_command(cmd);
+    }
 
-    // Standard asyn iocsh commands — provides the drvAsyn*PortConfigure family.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
+    // asyn.dbd, as C's IOC links it: the asyn record and devEpics, for
+    // asyn_motor.db, SMChydraAxis.db and asynRecord.db, and the iocsh
+    // commands (the drvAsyn*PortConfigure family).
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, asyn_factory);
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Corvus, hydra and Taurus iocsh commands share one motor device support.
     app = app.register_startup_command(corvus_create_controller_command());

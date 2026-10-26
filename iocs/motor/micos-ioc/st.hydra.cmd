@@ -4,14 +4,18 @@
 # Usage:
 #   cargo run -p micos-ioc -- st.hydra.cmd
 #
-# Requires an SMC hydra controller reachable over serial (or swap in the IP
-# port line below).
+# C's iocMicos st.cmd with motor.cmd.SMChydra alone (see st.cmd). Requires
+# an SMC hydra controller reachable over serial (or swap in the IP port
+# line below).
 #============================================================
 
 epicsEnvSet("P",      "micos:")
-epicsEnvSet("CTRL",   "MICOS1")
+epicsEnvSet("CTRL",   "Hydra1")
 epicsEnvSet("IPPORT", "hydraPort")
 epicsEnvSet("NAXES",  "2")
+
+# motorUtil (allstop & alldone)
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 # ---- asyn octet port (serial; use the IP line for Ethernet) ----
 drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyS1", 0, 0, 0)
@@ -22,18 +26,23 @@ drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyS1", 0, 0, 0)
 asynOctetSetInputEos("$(IPPORT)", 0, "\r\n")
 asynOctetSetOutputEos("$(IPPORT)", 0, "\r\n")
 
+dbLoadTemplate("$(MICOS_IOC)/db/motor.substitutions.SMChydra", "P=$(P),PORT=$(CTRL)")
+
 # ---- hydra controller ----
 # SMChydraCreateController(portName, hydraPort, numAxes, movingPollPeriod, idlePollPeriod).
 SMChydraCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 500)
 
-# One motor record per axis (OUT @asyn($(CTRL),axis)). The driver scales the
-# record's steps by the axis axisRes, as C.
-dbLoadRecords("$(MICOS_IOC)/db/hydra.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
-dbLoadRecords("$(MICOS_IOC)/db/hydra.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
+# Include an asyn record for each motor to make it easy to enable diagnostic messages
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=hydraComm,PORT=$(IPPORT),ADDR=0,OMAX=256,IMAX=256")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=hydraAsyn1,PORT=$(CTRL),ADDR=0,OMAX=256,IMAX=256")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=hydraAsyn2,PORT=$(CTRL),ADDR=1,OMAX=256,IMAX=256")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
-#   camonitor micos:m1 micos:m1.RBV
-#   caput micos:m1 5.0
+#   camonitor micos:m3 micos:m3.RBV
+#   caput micos:m3 5.0

@@ -1,0 +1,9 @@
+# C's iocMicos motor.substitutions.SMCcorvus, P and PORT from st.cmd.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{M,  DTYP,        ADDR, DESC, EGU, DIR, VMAX, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES, PREC, DHLM, DLLM, INIT}
+{m1, "asynMotor", 0,    "m1", mm,  Pos, 5.,   3.,   .05,  .5,   0,    1.0,  2,    5e-3, 6,    51,   0,    ""}
+{m2, "asynMotor", 1,    "m2", mm,  Pos, 5.,   3.,   .05,  .5,   0,    1.0,  2,    5e-3, 6,    51,   0,    ""}
+{m3, "asynMotor", 2,    "m3", mm,  Pos, 5.,   3.,   .05,  .5,   0,    1.0,  2,    5e-3, 6,    51,   0,    ""}
+}

@@ -1,0 +1,25 @@
+# dbl of motor R7-4-5 motorMicos iocBoot/iocMicos st.cmd with motor.cmd.SMChydra alone
+micos:alldone
+micos:alldoneBlink
+micos:allstop
+micos:hydraAsyn1
+micos:hydraAsyn2
+micos:hydraComm
+micos:m3
+micos:m3:RegulatorMode
+micos:m3Direction
+micos:m3Offset
+micos:m3Resolution
+micos:m3_able
+micos:m3_twCh
+micos:m3_vCh
+micos:m4
+micos:m4:RegulatorMode
+micos:m4Direction
+micos:m4Offset
+micos:m4Resolution
+micos:m4_able
+micos:m4_twCh
+micos:m4_vCh
+micos:moving
+micos:movingDiff

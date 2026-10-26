@@ -1,0 +1,23 @@
+# C's iocMicos motor.substitutions.SMChydra, P and PORT from st.hydra.cmd.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{M,  DTYP,        ADDR, DESC, EGU,     DIR, VMAX, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES, PREC, DHLM, DLLM, INIT}
+{m3, "asynMotor", 0,    "m3", degrees, Pos, 15.,  3.,   .05,  .5,   0,    1.0,  2,    0.01, 2,    175,  -175, ""}
+{m4, "asynMotor", 1,    "m4", degrees, Pos, 15.,  3.,   .05,  .5,   0,    1.0,  2,    0.01, 2,    175,  -175, ""}
+}
+
+#
+# The VAL macro passed to SMChydraAxis.db is the regulator mode,
+# which can have the following values:
+#   0 = "Open-Loop"
+#   1 = "Standard"
+#   2 = "Adaptive"
+#
+file "$(MICOS_IOC)/db/SMChydraAxis.db"
+{
+pattern
+{R,   ADDR, VAL}
+{m3:, 0,    1}
+{m4:, 1,    1}
+}
