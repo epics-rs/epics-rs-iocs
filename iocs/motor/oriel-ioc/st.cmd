@@ -12,28 +12,27 @@
 
 epicsEnvSet("P",      "ORIEL:")
 epicsEnvSet("CARD",   "0")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
 drvAsynSerialPortConfigure("$(SERIAL)", "$(TTY)")
 
 # Match the controller's configured serial settings.
-asynSetOption("$(SERIAL)", 0, "baud",   "9600")
+asynSetOption("$(SERIAL)", 0, "baud",   "4800")
 asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # ---- EMC18011 controller ----
 # EMC18011Setup(num_cards, scan_rate in Hz)
-EMC18011Setup(1, 10)
+EMC18011Setup(1, 60)
 
 # EMC18011Config(card, asyn port) - fixed 3 axes.
 EMC18011Config(0, "$(SERIAL)")
 
 # Each axis's motor.db, as C's EMC18011.cmd loads it, and motorUtil's
-# records, as C's st.cmd loads them. The controller works in millimetres
-# (EGU = mm) at a 0.01 mm step (MRES).
+# records, as C's st.cmd loads them.
 dbLoadTemplate("$(ORIEL_IOC)/db/EMC18011.substitutions", "P=$(P),C=$(CARD)")
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 

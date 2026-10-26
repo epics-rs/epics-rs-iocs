@@ -1,14 +1,12 @@
-# C's iocOriel EMC18011.substitutions on this IOC's three axes, P from
-# st.cmd; the values are the motor record this IOC had before. Signal 0,1,2
-# is controller motor 1,2,3. The driver converts record steps with C's
-# drive_resolution 0.01, the controller's millimetres, so MRES stays 0.01
-# for EGU mm. The controller only reports position when stopped, and only
-# for the currently selected motor.
+# C's iocOriel EMC18011.substitutions row on each of this IOC's three axes,
+# P from st.cmd. Signal 0,1,2 is controller motor 1,2,3. The controller
+# only reports position when stopped, and only for the currently selected
+# motor.
 file "$(MOTOR)/db/motor.db"
 {
 pattern
-{N,  M,        DTYP,        S,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
-{1,  "m$(N)",  "EMC18011",  0,  "",    mm,   Pos,  1,     0,     .2,    0,     0,     .5,    .01,   3,     25,    -25,   ""}
-{2,  "m$(N)",  "EMC18011",  1,  "",    mm,   Pos,  1,     0,     .2,    0,     0,     .5,    .01,   3,     25,    -25,   ""}
-{3,  "m$(N)",  "EMC18011",  2,  "",    mm,   Pos,  1,     0,     .2,    0,     0,     .5,    .01,   3,     25,    -25,   ""}
+{N,  M,        DTYP,        S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,    DLLM,  INIT}
+{1,  "m$(N)",  "EMC18011",  0,  "motor $(N)",  microns,  Pos,  10,    0.,    1.,    0,     1,     .2,    0.01,  3,     999999,  0.1,   ""}
+{2,  "m$(N)",  "EMC18011",  1,  "motor $(N)",  microns,  Pos,  10,    0.,    1.,    0,     1,     .2,    0.01,  3,     999999,  0.1,   ""}
+{3,  "m$(N)",  "EMC18011",  2,  "motor $(N)",  microns,  Pos,  10,    0.,    1.,    0,     1,     .2,    0.01,  3,     999999,  0.1,   ""}
 }
