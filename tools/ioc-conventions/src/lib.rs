@@ -11,7 +11,8 @@
 //!
 //! The startup-script walker those rules run on is this library, so an
 //! IOC's own tests can ask it which records a script loads
-//! ([`script_records`]) and compare them with the C IOC's `dbl`
+//! ([`script_records`]), or which its IOC binary makes running it
+//! ([`booted_records`]), and compare them with the C IOC's `dbl`
 //! ([`read_dbl`], [`renamed`], [`assert_same_records`]).
 //!
 //! A script is run as iocsh runs it, from its own directory: the IOC's
@@ -25,7 +26,10 @@
 //! that path too.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epics_rs::base::runtime::mac_lib::macro_defn_pairs_bytes;
 use epics_rs::base::server::db_loader::{
@@ -352,6 +356,9 @@ pub struct Run<'a> {
     /// When set, every load is parsed and the record names it creates,
     /// aliases included as C `dbl` lists them, are kept here.
     pub records: Option<BTreeSet<String>>,
+    /// When set, every `epicsEnvSet`, `dbLoadRecords` and `dbLoadTemplate`
+    /// line is kept here as written, each `<` fragment's in its place.
+    pub lines: Option<Vec<String>>,
 }
 
 impl<'a> Run<'a> {
@@ -363,6 +370,13 @@ impl<'a> Run<'a> {
             visited: HashSet::new(),
             top: PathBuf::new(),
             records: None,
+            lines: None,
+        }
+    }
+
+    fn keep(&mut self, raw: &str) {
+        if let Some(lines) = self.lines.as_mut() {
+            lines.push(raw.to_string());
         }
     }
 
@@ -412,6 +426,7 @@ impl<'a> Run<'a> {
             };
             match command.as_str() {
                 "epicsEnvSet" if words.len() >= 3 => {
+                    self.keep(raw);
                     if words[1] == "EPICS_DB_INCLUDE_PATH" {
                         let declared = args(raw).get(2).cloned().unwrap_or_default();
                         if !is_canonical_include_path(&declared) {
@@ -425,6 +440,7 @@ impl<'a> Run<'a> {
                     env.insert(words[1].clone(), words[2].clone());
                 }
                 "dbLoadRecords" | "dbLoadTemplate" => {
+                    self.keep(raw);
                     let written = args(raw).get(1).cloned().unwrap_or_default();
                     let file = words.get(1).cloned().unwrap_or_default();
                     let macros = words.get(2).cloned().unwrap_or_default();
@@ -588,17 +604,13 @@ impl<'a> Run<'a> {
     }
 }
 
-/// The records `script` loads, run from its own directory with its IOC's
-/// macros as the IOC runs it: every name C `dbl` would list, aliases
-/// included. Panics naming every load that fails.
-pub fn script_records(script: &Path) -> BTreeSet<String> {
-    let root = workspace_root();
-    let packages = package_dirs(&root);
+/// Run `script` from its own directory with its IOC's macros as the IOC
+/// runs it. Panics naming every load that fails.
+fn run_script(run: &mut Run, script: &Path) {
+    let packages = package_dirs(run.root);
     let ioc_dir = script.parent().expect("script has a parent");
     let mut env = framework_env(&packages);
     env.extend(ioc_env(ioc_dir, &packages));
-    let mut run = Run::new(&root);
-    run.records = Some(BTreeSet::new());
     run.top = script.canonicalize().unwrap_or_else(|_| script.into());
     run.script(script, ioc_dir, &mut env, 0);
     assert!(
@@ -607,7 +619,86 @@ pub fn script_records(script: &Path) -> BTreeSet<String> {
         script.display(),
         run.failures.join("\n")
     );
+}
+
+/// The records `script` loads: every name C `dbl` would list, aliases
+/// included.
+pub fn script_records(script: &Path) -> BTreeSet<String> {
+    let root = workspace_root();
+    let mut run = Run::new(&root);
+    run.records = Some(BTreeSet::new());
+    run_script(&mut run, script);
     run.records.unwrap_or_default()
+}
+
+/// The IOC's servers on loopback, beaconing and searching only there. PVA
+/// binds at startup, before the script runs, and takes port 0 as the
+/// kernel's choice; CA refuses port 0 (`envGetInetPortConfigParam`), so it
+/// is given a free one, though its server starts only at `iocInit`, which a
+/// booted run never reaches.
+const LOOPBACK_ENV: &[(&str, &str)] = &[
+    ("EPICS_PVAS_INTF_ADDR_LIST", "127.0.0.1"),
+    ("EPICS_PVAS_SERVER_PORT", "0"),
+    ("EPICS_PVAS_BROADCAST_PORT", "0"),
+    ("EPICS_PVAS_BEACON_ADDR_LIST", "127.0.0.1"),
+    ("EPICS_PVAS_AUTO_BEACON_ADDR_LIST", "NO"),
+    ("EPICS_PVA_ADDR_LIST", "127.0.0.1"),
+    ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+    ("EPICS_CAS_INTF_ADDR_LIST", "127.0.0.1"),
+    ("EPICS_CAS_BEACON_ADDR_LIST", "127.0.0.1"),
+    ("EPICS_CAS_AUTO_BEACON_ADDR_LIST", "NO"),
+    ("EPICS_CA_ADDR_LIST", "127.0.0.1"),
+    ("EPICS_CA_AUTO_ADDR_LIST", "NO"),
+];
+
+/// The records `binary`, the IOC, makes running `script`: its
+/// `epicsEnvSet`, `dbLoadRecords` and `dbLoadTemplate` lines, each `<`
+/// fragment's in its place, run by the IOC from the script's directory,
+/// then `dbl`. Driver configuration needs the hardware, so it is left out,
+/// as it was where the C `dbl` was captured. Panics on a failed walk
+/// ([`script_records`]), a failed exit, or any line on the IOC's stderr,
+/// where every load refusal goes.
+pub fn booted_records(binary: &Path, script: &Path) -> BTreeSet<String> {
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    let root = workspace_root();
+    let mut run = Run::new(&root);
+    run.lines = Some(Vec::new());
+    run_script(&mut run, script);
+    let tmp = std::env::temp_dir().join(format!(
+        "ioc-conventions-{}-{}",
+        std::process::id(),
+        RUNS.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let (cmd, dbl) = (tmp.join("booted.cmd"), tmp.join("booted.dbl"));
+    let mut lines = run.lines.unwrap_or_default();
+    lines.push(format!("dbl > {}\n", dbl.display()));
+    std::fs::write(&cmd, lines.join("\n")).expect("write the booted script");
+    let ca_port = TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free loopback port")
+        .port()
+        .to_string();
+    let out = Command::new(binary)
+        .arg(&cmd)
+        .current_dir(script.parent().expect("script has a parent"))
+        .envs(LOOPBACK_ENV.iter().copied())
+        .env("EPICS_CA_SERVER_PORT", &ca_port)
+        .env("EPICS_CAS_SERVER_PORT", &ca_port)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("{}: {e}", binary.display()));
+    let records = dbl.is_file().then(|| read_dbl(&dbl));
+    std::fs::remove_dir_all(&tmp).expect("remove the temp dir");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stderr.trim().is_empty(),
+        "{} running {} exits {}:\n{stderr}",
+        binary.display(),
+        script.display(),
+        out.status
+    );
+    records.unwrap_or_else(|| panic!("{} wrote no dbl", binary.display()))
 }
 
 /// A C IOC's `dbl` output: one record name per line. `#` lines say where
@@ -692,6 +783,40 @@ mod tests {
             names(&["e:m1", "e:m1_able"])
         );
         assert_eq!(renamed(&c, &[("n:", "e:")], &["n:m1"]), names(&["e:x"]));
+    }
+
+    #[test]
+    fn a_booted_script_keeps_the_record_and_macro_lines_in_order() {
+        let dir = std::env::temp_dir().join(format!("ioc-conv-lines-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        std::fs::write(dir.join("db/m.db"), "record(ao, \"$(P)x\") {}\n").unwrap();
+        std::fs::write(
+            dir.join("frag.cmd"),
+            "drvAsynIPPortConfigure(\"L0\", \"h:1\")\n\
+             dbLoadRecords(\"$(TOP)/db/m.db\", \"P=$(P)\")\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("st.cmd"),
+            "epicsEnvSet(\"P\", \"c:\")\n\
+             < frag.cmd\n\
+             iocInit()\n",
+        )
+        .unwrap();
+        let root = dir.clone();
+        let mut run = Run::new(&root);
+        run.lines = Some(Vec::new());
+        let mut env = HashMap::from([("TOP".to_string(), dir.to_str().unwrap().to_string())]);
+        run.script(&dir.join("st.cmd"), &dir, &mut env, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(run.failures.is_empty(), "{:?}", run.failures);
+        assert_eq!(
+            run.lines.unwrap(),
+            [
+                "epicsEnvSet(\"P\", \"c:\")",
+                "dbLoadRecords(\"$(TOP)/db/m.db\", \"P=$(P)\")"
+            ]
+        );
     }
 
     #[test]
