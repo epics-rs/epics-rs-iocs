@@ -1,0 +1,28 @@
+# tpmac pmacGeobrickExamplePortDriver's pmacGeobrickExample.req, its
+# mp49t:geo:A and B the $(P)m1 and $(P)m2 of st.cmd
+$(P)m1.DVAL
+$(P)m1.OFF
+$(P)m1.ADEL
+$(P)m1:FERRORMAX.VAL
+$(P)m1.RTRY
+$(P)m1.UEIP
+$(P)m1.RMOD
+$(P)m1.DIR
+$(P)m1.RMOD
+$(P)m1.DHLM
+$(P)m1.DLLM
+$(P)m1.VELO
+$(P)m1.ACCL
+$(P)m2.DVAL
+$(P)m2.OFF
+$(P)m2.ADEL
+$(P)m2:FERRORMAX.VAL
+$(P)m2.RTRY
+$(P)m2.UEIP
+$(P)m2.RMOD
+$(P)m2.DIR
+$(P)m2.RMOD
+$(P)m2.DHLM
+$(P)m2.DLLM
+$(P)m2.VELO
+$(P)m2.ACCL

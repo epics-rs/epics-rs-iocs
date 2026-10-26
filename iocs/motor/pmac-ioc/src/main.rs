@@ -7,10 +7,12 @@
 //! `pmacDisableLimitsCheck`, `pmacSetOpenLoopEncoderAxis`, `pmacCreateCsGroup`,
 //! `pmacCsGroupAddAxis`, `pmacAsynCoordCreate`, `pmacSetCoord*PollPeriod`),
 //! `drvAsynMotorConfigure` over the `pmacAsynCoord` driver, the motor record
-//! type, and the CA + PVA (QSRV) server.
+//! type, autosave, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p pmac-ioc -- st.cmd
+
+use std::sync::{Arc, Mutex};
 
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -59,6 +61,12 @@ async fn main() -> CaResult<()> {
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),
     );
+
+    // Autosave
+    let autosave_config = Arc::new(Mutex::new(
+        epics_rs::base::server::autosave::startup::AutosaveStartupConfig::new(),
+    ));
+    app = app.autosave_startup(autosave_config);
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

@@ -59,6 +59,24 @@ pmacCreateAxes("$(CTRL)", $(NUMAXES))
 #drvAsynMotorConfigure("CS2", "pmacAsynCoord", 0, 9)
 #dbLoadRecords("$(PMAC_IOC)/db/pmac_cs.template", "P=$(P),M=cs2x,PORT=CS2,ADDR=6")
 
+# ---- save/restore (C pmacGeobrickExamplePortDriver stpmacTest.src) ----
+save_restoreSet_Debug(0)
+# status-PV prefix, so save_restore can find its status PVs
+save_restoreSet_status_prefix("$(P)")
+# ok to restore a save set that had missing values, and to save a file if
+# some CA connections are bad
+save_restoreSet_IncompleteSetsOk(1)
+# a dated backup file each reboot rather than one .bu overwritten
+save_restoreSet_DatedBackupFiles(1)
+set_savefile_path("$(PMAC_IOC)", "autosave")
+set_requestfile_path("$(PMAC_IOC)", "")
+# restore positions before record init, settings before and after
+set_pass0_restoreFile("pmacGeobrickExample.sav")
+set_pass1_restoreFile("pmacGeobrickExample.sav")
+# three sequenced backups (pmacGeobrickExample.sav0..2), one each 600 s
+save_restoreSet_NumSeqFiles(3)
+save_restoreSet_SeqPeriodInSeconds(600)
+
 # ---- records ----
 # Controller parameters at address 0: global status, feed rate, CS group,
 # deferred moves.
@@ -67,6 +85,9 @@ dbLoadRecords("$(PMAC_IOC)/db/pmac.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=1")
 dbLoadRecords("$(PMAC_IOC)/db/pmac.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=2")
 
 iocInit()
+
+# save positions every 5 seconds
+create_monitor_set("pmacGeobrickExample.req", 5, "P=$(P)")
 
 # Example:
 #   dbl
