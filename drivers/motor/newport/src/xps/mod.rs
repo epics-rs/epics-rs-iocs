@@ -24,7 +24,7 @@ pub mod rpc;
 pub mod sftp;
 
 pub use axis::XpsAxis;
-pub use controller::{SetPositionFailure, XpsController};
+pub use controller::{SetPositionFailure, XpsController, XpsParams};
 pub use corrector::{CorrectorType, PidFailure, XpsCorrectorInfo};
 pub use gathering::{GatheringReadback, parse_gathering_buffer};
 pub use pco::PcoParams;

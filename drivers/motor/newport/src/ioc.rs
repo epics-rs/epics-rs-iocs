@@ -24,6 +24,7 @@ use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -35,7 +36,8 @@ use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedica
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
-use epics_rs::motor::controller_port::{ControllerCtx, ControllerPort};
+use epics_rs::motor::controller_port::{AxisUser, ControllerCtx, ControllerPort, ParamWrite};
+use epics_rs::motor::flags::{DriverCall, MotorCommand};
 use epics_rs::motor::trace::MotorTrace;
 use motor_common::connect::{
     EosConnectError, EosRefusal, connect_controller, connect_serial, connect_with_eos,
@@ -64,7 +66,7 @@ use crate::pmnc::{PmncAxis, PmncController};
 use crate::report::{AxisLines, ControllerHead, period_s};
 use crate::smc100::Smc100Axis;
 use crate::xps::profile_move::{ProfileHost, XpsProfile};
-use crate::xps::{PcoParams, SocketMode, XpsAxis, XpsController, XpsSocket, gpio, pco};
+use crate::xps::{PcoParams, SocketMode, XpsAxis, XpsController, XpsParams, XpsSocket, gpio, pco};
 
 /// `CONEX_TIMEOUT` of AG_CONEX.cpp:30 and AGAP_CONEX.cpp:31.
 const CONEX_TIMEOUT: Duration = Duration::from_secs(2);
@@ -583,6 +585,21 @@ struct XpsHead {
     enable_set_position: bool,
     settling_s: f64,
     profile: XpsProfile,
+    params: Option<XpsParams>,
+}
+
+impl XpsHead {
+    fn params(&self) -> XpsParams {
+        self.params
+            .expect("create_params runs when the port is registered")
+    }
+}
+
+/// The port's [`XpsParams`], for the controller its axes read them from.
+fn xps_params(port: &PortHandle) -> AsynResult<XpsParams> {
+    port.with_driver_blocking::<ControllerPort<XpsHead>, _>(|d| {
+        d.with_params(|head, _| head.params())
+    })
 }
 
 impl ProfileHost for XpsHead {
@@ -592,8 +609,42 @@ impl ProfileHost for XpsHead {
 }
 
 impl ControllerParams for XpsHead {
+    /// XPSController.cpp:173-189 without the position compare and TCL
+    /// script parameters.
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
-        self.profile.create_params(base)
+        let min_jerk = base.create_param("XPS_MIN_JERK", ParamType::Float64)?;
+        let max_jerk = base.create_param("XPS_MAX_JERK", ParamType::Float64)?;
+        self.profile.create_params(base)?;
+        self.params = Some(XpsParams {
+            min_jerk,
+            max_jerk,
+            status: base.create_param("XPS_STATUS", ParamType::Int32)?,
+            status_string: base.create_param("XPS_STATUS_STRING", ParamType::Octet)?,
+        });
+        Ok(())
+    }
+
+    /// C `writeFloat64` stores every value before the base; the axis's next
+    /// move reads the jerk times from the parameter.
+    fn write_float64(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: f64,
+    ) -> ParamWrite {
+        let p = self.params();
+        let reason = user.reason;
+        if reason != p.min_jerk && reason != p.max_jerk {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let call = DriverCall::new(move |motor, _| {
+            let any: &mut dyn std::any::Any = motor;
+            if let Some(axis) = any.downcast_mut::<XpsAxis>() {
+                axis.write_jerk(reason, value);
+            }
+            Ok(())
+        });
+        ParamWrite::PassToBase(user.run(base, MotorCommand::Driver(call)))
     }
 
     fn build_profile(&mut self, ctx: &mut ControllerCtx<'_>) -> AsynResult<()> {
@@ -705,9 +756,11 @@ pub fn xps_create_controller_command() -> CommandDef {
                 enable_set_position,
                 settling_s: f64::from(c_int(args, 7)) / 1000.0,
                 profile,
+                params: None,
             };
             let owner = ctx.db().scan_control().interrupt_gate();
             let handle = register_controller_port(owner, &port_name, c_int(args, 3), head)?;
+            let params = xps_params(&handle).map_err(|e| format!("XPSCreateController: {e}"))?;
             // C goes on with socket -1 for either socket
             // (XPSController.cpp:179-193).
             let poll = match connect_to_server(ctx.db(), &ip, ip_port) {
@@ -741,7 +794,7 @@ pub fn xps_create_controller_command() -> CommandDef {
                 }
             });
             let controller = Arc::new(Mutex::new(
-                XpsController::new(poll, enable_set_position, settling)
+                XpsController::new(poll, enable_set_position, settling, params)
                     .map_err(|e| format!("XPSCreateController: {e}"))?,
             ));
             // C starts the poller before any axis exists (XPSController.cpp:197).
@@ -3091,9 +3144,6 @@ mod xps_profile_tests {
         let (ftp_addr, ftp) = ftp::tests::server("331 password\r\n");
         ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
         let port_name = format!("{name}Ctrl");
-        let controller = Arc::new(Mutex::new(
-            XpsController::new(line.socket(SocketMode::Query), false, Duration::ZERO).unwrap(),
-        ));
         let (profile, thread) = XpsProfile::new(&port_name);
         let head = XpsHead {
             moving_s: 0.1,
@@ -3101,8 +3151,18 @@ mod xps_profile_tests {
             enable_set_position: false,
             settling_s: 0.0,
             profile,
+            params: None,
         };
         let port = register_controller_port(&open_owner(), &port_name, 2, head).unwrap();
+        let controller = Arc::new(Mutex::new(
+            XpsController::new(
+                line.socket(SocketMode::Query),
+                false,
+                Duration::ZERO,
+                xps_params(&port).unwrap(),
+            )
+            .unwrap(),
+        ));
         let profile_sock = Arc::new(exec.socket_with(SocketMode::Query, Duration::from_secs(30)));
         let poll = Box::new(thread.poll(controller.clone()));
         thread
@@ -3693,5 +3753,139 @@ mod xps_profile_tests {
              XPSController:readbackProfile: GatheringDataMultipleLinesGet, status=-3, numInBuffer=2\n\
              XPSController:readbackProfile: GatheringDataMultipleLinesGet, status=-3, numInBuffer=1\n"
         );
+    }
+
+    /// XPSAxis.cpp:227-231: move reads XPS_MIN_JERK and XPS_MAX_JERK, so a
+    /// put lands on the next PositionerSGammaParametersSet.
+    #[test]
+    fn a_jerk_put_reaches_the_next_sgamma_set() {
+        let rig = rig("XpsJerkPut");
+        for (name, value) in [("XPS_MIN_JERK", 0.05), ("XPS_MAX_JERK", 0.07)] {
+            let reason = rig.with(move |_, ctx| ctx.base.find_param(name).unwrap());
+            rig.port.write_float64_blocking(reason, 0, value).unwrap();
+            assert_eq!(rig.float_at(name, 0), value);
+        }
+        rig.port
+            .write_float64_blocking(index::MOVE_ABS, 0, 4.0)
+            .unwrap();
+        let log = rig.line.take_log();
+        assert!(
+            log.iter()
+                .any(|c| c.starts_with("PositionerSGammaParametersSet (G1.P1,")
+                    && c.ends_with(",0.05,0.07)")),
+            "{log:?}"
+        );
+    }
+
+    /// XPS_extra.db on the driver: devAsynFloat64's initAo reads the jerk
+    /// times the axis constructor set (devAsynFloat64.c:622-632,
+    /// XPSAxis.cpp:193-194), and the I/O Intr ai records read the position
+    /// and the group status the poll set (XPSAxis.cpp:581-582).
+    #[epics_rs::base::epics_test]
+    async fn xps_extra_records_read_the_driver_params() {
+        use std::collections::HashMap;
+
+        use epics_rs::asyn::adapter::register_asyn_device_support_for_builder;
+        use epics_rs::base::runtime::task::sleep;
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::PiniMode;
+        use epics_rs::base::types::EpicsValue;
+
+        let port_name = "XpsExtraRecCtrl";
+        let line = FakeLine::new("XpsExtraRecLine", "");
+        line.replies
+            .lock()
+            .unwrap()
+            .insert("PositionerSGammaParametersGet", "0,10,40,0.04,0.05".into());
+        let owner = Arc::new(PvDatabase::new());
+        let gate = owner.scan_control().interrupt_gate().clone();
+        // XPSCreateController and XPSCreateAxis, off the runtime as the shell
+        // runs them; the axis add returns once a pass polled it.
+        let shell = std::thread::spawn(move || {
+            let (profile, thread) = XpsProfile::new(port_name);
+            let head = XpsHead {
+                moving_s: 0.1,
+                idle_s: 0.1,
+                enable_set_position: false,
+                settling_s: 0.0,
+                profile,
+                params: None,
+            };
+            let port = register_controller_port(&gate, port_name, 1, head).unwrap();
+            let controller = Arc::new(Mutex::new(
+                XpsController::new(
+                    line.socket(SocketMode::Query),
+                    false,
+                    Duration::ZERO,
+                    xps_params(&port).unwrap(),
+                )
+                .unwrap(),
+            ));
+            let poller = Controller::new().controller_poll(thread.poll(controller.clone()));
+            poller.start(port_name, 100, 100, 10);
+            poller
+                .install_built(asyn_user(port_name, 0), || {
+                    let axis = XpsAxis::new(
+                        controller,
+                        line.socket(SocketMode::Fire),
+                        port_name,
+                        0,
+                        "G1.P1",
+                        1.0,
+                    );
+                    Ok((Arc::new(Mutex::new(axis)), None))
+                })
+                .unwrap();
+            (line, poller)
+        });
+        while !shell.is_finished() {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let (_line, _poller) = shell.join().unwrap();
+
+        let macros: HashMap<String, String> = [
+            ("P", "xpsExtra:"),
+            ("R", "m1"),
+            ("PORT", port_name),
+            ("ADDR", "0"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        let (db, _) = register_asyn_device_support_for_builder(IocBuilder::new())
+            .with_database(owner)
+            .db_string(
+                include_str!("../../../../iocs/motor/xps-ioc/db/XPS_extra.db"),
+                &macros,
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let val = |name: &str| {
+            db.get_record(format!("xpsExtra:m1{name}"))
+                .unwrap()
+                .read()
+                .record
+                .get_field("VAL")
+        };
+        assert_eq!(val("MIN_JERK_TIME"), Some(EpicsValue::Double(0.04)));
+        assert_eq!(val("MAX_JERK_TIME"), Some(EpicsValue::Double(0.05)));
+        // iocInit's initialProcess, then scanRun's interruptAccept
+        // (iocInit.c:195, dbScan.c:218).
+        db.pini_process(PiniMode::Yes).await;
+        db.scan_control().run();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while val("XPS_STATUS") != Some(EpicsValue::Double(12.0))
+            || val("READBACK") != Some(EpicsValue::Double(1.25))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "XPS_STATUS {:?}, READBACK {:?}",
+                val("XPS_STATUS"),
+                val("READBACK")
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 }

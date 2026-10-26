@@ -1,8 +1,5 @@
 # C's iocNewport motor.substitutions.xps5, P and PORT from st.cmd. MRES must
 # be 1/stepsPerUnit of XPSCreateAxis.
-#
-# C's XPS_extra.db block is left out. This driver serves none of
-# XPS_MIN_JERK, XPS_MAX_JERK or XPS_STATUS.
 file "$(MOTOR)/db/basic_asyn_motor.db"
 {
 pattern
@@ -15,6 +12,18 @@ pattern
 {"m6",  "asynMotor",  5,     "Nu",      degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
 {"m7",  "asynMotor",  6,     "Dummy1",  degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
 {"m8",  "asynMotor",  7,     "Dummy2",  degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
+}
+
+file "$(XPS_IOC)/db/XPS_extra.db"
+{
+pattern
+{R,   ADDR}
+{m1,  0}
+{m2,  1}
+{m3,  2}
+{m4,  3}
+{m5,  4}
+{m6,  5}
 }
 
 file "$(MOTOR)/db/profileMoveController.template"

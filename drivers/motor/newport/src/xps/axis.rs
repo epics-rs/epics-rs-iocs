@@ -21,11 +21,12 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, MoveToHomeTask, PidGainKind, PollFailure, PortSets, StatusWrite,
 };
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
-use super::controller::{DeferredMove, MoveState, SetPositionFailure, XpsController};
+use super::controller::{DeferredMove, MoveState, SetPositionFailure, XpsController, XpsParams};
 use super::corrector::{self, CorrectorType, PidFailure};
 use super::rpc::{XpsError, XpsResult, XpsSocket};
 
@@ -93,10 +94,15 @@ pub struct XpsAxis {
     positioner_name: String,
     group_name: String,
     step_size: f64,
-    /// Cached S-gamma jerk times read at construction, resent on every move
-    /// (C caches these in the `XPS_MIN_JERK`/`XPS_MAX_JERK` record params).
+    /// C's move reads `XPS_MIN_JERK`/`XPS_MAX_JERK` (XPSAxis.cpp:230-231);
+    /// motor-rs gives an axis no read of its port's parameters, so these are
+    /// written wherever the parameter is: the constructor and
+    /// [`Self::write_jerk`].
     min_jerk: f64,
     max_jerk: f64,
+    params: XpsParams,
+    /// The parameter sets the constructor and the last poll made.
+    sets: PortSets,
     /// Last group status code seen by [`poll`](AsynMotor::poll); `move` reads it
     /// to decide whether to auto-enable a disabled axis. Shared with
     /// [`XpsAxisReport`].
@@ -138,7 +144,7 @@ impl XpsAxis {
         let group_name = group_of(positioner_name).to_string();
         let move_sock = Arc::new(move_sock);
         let move_state = Arc::new(Mutex::new(MoveState::default()));
-        let (min_jerk, max_jerk, pid) = {
+        let (min_jerk, max_jerk, pid, params) = {
             let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // C ignores a failed read; its jerk times are then whatever the
             // uninitialised locals held, here 0.
@@ -155,8 +161,12 @@ impl XpsAxis {
                 move_state.clone(),
                 step_size,
             );
-            (min_jerk, max_jerk, pid)
+            (min_jerk, max_jerk, pid, ctrl.params())
         };
+        // XPSAxis.cpp:193-194.
+        let mut sets = PortSets::default();
+        sets.axis(params.min_jerk, ParamValue::Float64(min_jerk));
+        sets.axis(params.max_jerk, ParamValue::Float64(max_jerk));
         let axis = Self {
             controller,
             move_sock,
@@ -166,6 +176,8 @@ impl XpsAxis {
             step_size,
             min_jerk,
             max_jerk,
+            params,
+            sets,
             axis_status: Arc::new(AtomicI32::new(0)),
             moving: false,
             // XPSAxis.cpp:158-159.
@@ -224,6 +236,16 @@ impl XpsAxis {
             poll_socket: self.lock_controller().poll_socket().index(),
             move_socket: self.move_sock.index(),
             axis_status: self.axis_status.clone(),
+        }
+    }
+
+    /// A port write of `XPS_MIN_JERK` or `XPS_MAX_JERK` (`reason`), which
+    /// C's next move reads.
+    pub fn write_jerk(&mut self, reason: usize, value: f64) {
+        if reason == self.params.min_jerk {
+            self.min_jerk = value;
+        } else if reason == self.params.max_jerk {
+            self.max_jerk = value;
         }
     }
 
@@ -832,6 +854,10 @@ impl AsynMotor for XpsAxis {
         std::mem::take(&mut self.status_writes)
     }
 
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
+    }
+
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
         let stop_error = |command: &str, e: &XpsError| {
             trace_error(
@@ -1141,6 +1167,13 @@ impl XpsAxis {
                 self.positioner_name
             ),
         );
+        // XPSAxis.cpp:581-582.
+        self.sets
+            .axis(self.params.status, ParamValue::Int32(axis_status));
+        self.sets.axis(
+            self.params.status_string,
+            ParamValue::Octet(status_string.as_bytes().into()),
+        );
         let flags = StatusFlags::from_status(axis_status);
         // C reads the group state for every axis in the group; moving mode
         // instead waits for this axis's move socket to answer the move.
@@ -1252,6 +1285,14 @@ mod tests {
     use crate::xps::rpc::SocketMode;
     use motor_common::testing::Polled;
 
+    /// The parameters of a port the axes are on.
+    const PARAMS: XpsParams = XpsParams {
+        min_jerk: 100,
+        max_jerk: 101,
+        status: 102,
+        status_string: 103,
+    };
+
     fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Fail, Log) {
         let (mut axes, fail, log) = fake_axes(port, fail, false, &["G1.P1"]);
         (axes.remove(0), fail, log)
@@ -1289,6 +1330,7 @@ mod tests {
                 line.socket(SocketMode::Query),
                 enable_set_position,
                 Duration::ZERO,
+                PARAMS,
             )
             .unwrap(),
         ));
@@ -1340,7 +1382,13 @@ mod tests {
     fn record_steps_scale_by_step_size() {
         let line = FakeLine::new("xps_steps", "");
         let controller = Arc::new(Mutex::new(
-            XpsController::new(line.socket(SocketMode::Query), false, Duration::ZERO).unwrap(),
+            XpsController::new(
+                line.socket(SocketMode::Query),
+                false,
+                Duration::ZERO,
+                PARAMS,
+            )
+            .unwrap(),
         ));
         let mut axis = XpsAxis::new(
             controller,
@@ -1443,7 +1491,7 @@ mod tests {
             )
         };
         let controller = Arc::new(Mutex::new(
-            XpsController::new(socket(SocketMode::Query), false, Duration::ZERO).unwrap(),
+            XpsController::new(socket(SocketMode::Query), false, Duration::ZERO, PARAMS).unwrap(),
         ));
         if moving_mode {
             controller.lock().unwrap().set_moving_mode();
@@ -1738,6 +1786,49 @@ mod tests {
         let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error);
         assert_eq!(s.position, 1.25);
+    }
+
+    /// XPSAxis.cpp:193-194 sets the jerk times the constructor read;
+    /// :581-582 set the group status once both status reads succeed.
+    #[test]
+    fn the_constructor_and_poll_set_the_port_parameters() {
+        use epics_rs::asyn::interfaces::motor::PortSet;
+        let taken = |axis: &mut XpsAxis| -> Vec<(usize, String)> {
+            axis.take_port_sets()
+                .into_iter()
+                .map(|set| match set {
+                    PortSet::Axis { reason, value } => (reason, format!("{value:?}")),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let (mut axes, line) = fake_line_axes("xps_port_sets", "MOTOR_T", "", false, &["G1.P1"]);
+        let axis = &mut axes[0];
+        assert_eq!(
+            taken(axis),
+            [(100, "Float64(0.02)".into()), (101, "Float64(0.02)".into())]
+        );
+
+        let user = AsynUser::new(0);
+        line.replies
+            .lock()
+            .unwrap()
+            .insert("GroupStatusStringGet", "0,Ready state".into());
+        axis.polled(&user).unwrap();
+        assert_eq!(
+            taken(axis),
+            [
+                (102, "Int32(12)".into()),
+                (103, "Octet(\"Ready state\")".into())
+            ]
+        );
+
+        for fail in ["GroupStatusGet", "GroupStatusStringGet"] {
+            line.replies.lock().unwrap().clear();
+            *line.fail.lock().unwrap() = fail;
+            assert!(axis.polled(&user).is_err());
+            assert_eq!(taken(axis), [], "{fail}");
+        }
     }
 
     #[test]

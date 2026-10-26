@@ -55,6 +55,18 @@ pub struct DeferredMove {
     pub relative: bool,
 }
 
+/// The `XPSController` parameters an axis sets (XPSController.cpp:173-174,
+/// :188-189).
+#[derive(Clone, Copy, Debug)]
+pub struct XpsParams {
+    /// `XPS_MIN_JERK`, `XPS_MAX_JERK`.
+    pub min_jerk: usize,
+    pub max_jerk: usize,
+    /// `XPS_STATUS`, `XPS_STATUS_STRING`.
+    pub status: usize,
+    pub status_string: usize,
+}
+
 /// The [`XpsController::set_position`] step that failed, with its XPS code.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetPositionFailure {
@@ -158,17 +170,20 @@ pub struct XpsController {
     /// at once (`doMoveToHome`/`home`), so it is group-scoped state. While a
     /// group is here, poll reports its axes as not-homed/not-at-home.
     referencing_groups: HashSet<String>,
+    /// The port's parameters the axes set.
+    params: XpsParams,
 }
 
 impl XpsController {
     /// Build the controller over a connected `Query`-mode poll socket, reading
     /// the firmware version (C `XPSController` constructor). A firmware-read
     /// failure is tolerated (left blank), matching the C constructor which
-    /// ignores the return value.
+    /// ignores the return value. `params` are the port's, created before.
     pub fn new(
         poll: XpsSocket,
         enable_set_position: bool,
         set_position_settling: Duration,
+        params: XpsParams,
     ) -> XpsResult<Self> {
         let firmware = poll.firmware_version_get().unwrap_or_default();
         Ok(Self {
@@ -183,7 +198,13 @@ impl XpsController {
             use_sftp: false,
             axes: Vec::new(),
             referencing_groups: HashSet::new(),
+            params,
         })
+    }
+
+    /// The port's parameters the axes set.
+    pub fn params(&self) -> XpsParams {
+        self.params
     }
 
     /// The shared poll socket (`Query` mode).
