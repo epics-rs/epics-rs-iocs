@@ -1401,6 +1401,15 @@ int writeReadIntAndCheck(SS_ID ssId, struct UserVar *pVar, int n, int ival, char
 		if (status) return(-1);
 		iCheck = atol(&reply[1]);
 		if (ival == iCheck) break;
+		/* doCommand.ab acks a command before it zeroes cmdVar, and the ack was cleared above,
+		 * so a 0 with the ack set means the command ran.  Upstream wrote it again, for
+		 * doCommand.ab to run again, or after STARTABORT to run when it next starts. */
+		if (iCheck == 0) {
+			sprintf(stringOut, "IGLOBAL(%d)", cmdAckVar);
+			status = writeRead(ssId, pVar, stringOut, reply);
+			if (status) return(-1);
+			if (atol(&reply[1]) == ival) break;
+		}
 		printf("writeReadIntAndCheck: fix iglobal %d (%d != %d)\n", n, ival, iCheck);
 	}
 	if (i==10) return(-1);
