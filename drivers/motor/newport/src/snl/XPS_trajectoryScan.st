@@ -1029,6 +1029,11 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
 
     /* Create the trajectory file */
     trajFile =  fopen (pVar->trajectoryFile, "w");
+    /* Upstream wrote the file through the NULL a failed fopen returns. */
+    if (trajFile == NULL) {
+        printMessage("Error calling fopen, file=%s\n", pVar->trajectoryFile);
+        return;
+    }
 
     /* Compute the sign relationship of user coordinates to XPS coordinates for
      * each axis */
