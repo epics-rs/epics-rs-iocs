@@ -153,6 +153,7 @@ impl XpsAxis {
                 &group_name,
                 move_sock.clone(),
                 move_state.clone(),
+                step_size,
             );
             (min_jerk, max_jerk, pid)
         };

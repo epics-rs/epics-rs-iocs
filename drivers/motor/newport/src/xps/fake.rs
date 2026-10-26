@@ -1,7 +1,8 @@
 //! A scripted XPS for unit tests: every call succeeds with a canned reply,
 //! the call named in `fail` returns -3, and every command is logged.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -18,6 +19,18 @@ pub type Log = Arc<Mutex<Vec<String>>>;
 pub type Digital = Arc<Mutex<u16>>;
 pub type Firmware = Arc<Mutex<&'static str>>;
 pub type GroupStatus = Arc<Mutex<i32>>;
+/// Replies by command name, over the canned ones.
+pub type Replies = Arc<Mutex<HashMap<&'static str, String>>>;
+pub type Hold = Arc<(Mutex<HoldState>, Condvar)>;
+
+/// A held `MultipleAxesPVTExecution`: while `armed` it blocks until
+/// `GroupMoveAbort`, then answers -27 as the XPS does.
+#[derive(Default)]
+pub struct HoldState {
+    pub armed: bool,
+    pub entered: bool,
+    pub aborted: bool,
+}
 
 struct FakeXps {
     base: PortDriverBase,
@@ -27,6 +40,32 @@ struct FakeXps {
     digital: Digital,
     firmware: Firmware,
     group_status: GroupStatus,
+    replies: Replies,
+    hold: Hold,
+}
+
+impl FakeXps {
+    /// Whether a held `MultipleAxesPVTExecution` was aborted.
+    fn hold(&self, name: &str) -> bool {
+        let (state, changed) = &*self.hold;
+        let mut state = state.lock().unwrap();
+        match name {
+            "MultipleAxesPVTExecution" => {
+                state.entered = true;
+                changed.notify_all();
+                while state.armed && !state.aborted {
+                    state = changed.wait(state).unwrap();
+                }
+                state.armed && state.aborted
+            }
+            "GroupMoveAbort" => {
+                state.aborted = true;
+                changed.notify_all();
+                false
+            }
+            _ => false,
+        }
+    }
 }
 
 impl PortDriver for FakeXps {
@@ -40,10 +79,14 @@ impl PortDriver for FakeXps {
         let cmd = String::from_utf8_lossy(data);
         let name = cmd.split('(').next().unwrap_or("").trim();
         self.log.lock().unwrap().push(cmd.trim().to_string());
+        let aborted = self.hold(name);
+        let replied = self.replies.lock().unwrap().get(name).cloned();
         let digital;
         let firmware;
         let group_status;
         let values = match name {
+            _ if aborted => "-27",
+            _ if replied.is_some() => replied.as_deref().unwrap(),
             _ if name == *self.fail.lock().unwrap() => "-3",
             "GPIOAnalogGet" => "0,1.5,2.5,3.5,4.5",
             "GPIOAnalogGainGet" => "0,4",
@@ -102,6 +145,17 @@ impl PortDriver for FakeXps {
     }
 }
 
+/// What a [`FakeLine`] and its twins share.
+struct Script {
+    fail: Fail,
+    log: Log,
+    digital: Digital,
+    firmware: Firmware,
+    group_status: GroupStatus,
+    replies: Replies,
+    hold: Hold,
+}
+
 /// One fake XPS on asyn port `port`.
 pub struct FakeLine {
     port: String,
@@ -114,15 +168,53 @@ pub struct FakeLine {
     pub firmware: Firmware,
     /// What `GroupStatusGet` reads.
     pub group_status: GroupStatus,
+    pub replies: Replies,
+    pub hold: Hold,
 }
 
 impl FakeLine {
     pub fn new(port: &str, fail: &'static str) -> Self {
-        let fail = Arc::new(Mutex::new(fail));
-        let log = Log::default();
-        let digital = Digital::default();
-        let firmware = Arc::new(Mutex::new("0"));
-        let group_status = Arc::new(Mutex::new(12));
+        Self::serve(
+            port,
+            Script {
+                fail: Arc::new(Mutex::new(fail)),
+                log: Log::default(),
+                digital: Digital::default(),
+                firmware: Arc::new(Mutex::new("0")),
+                group_status: Arc::new(Mutex::new(12)),
+                replies: Replies::default(),
+                hold: Hold::default(),
+            },
+        )
+    }
+
+    /// The same XPS on a second asyn port, as a second socket to it is:
+    /// a call blocked on one does not hold up the other.
+    pub fn twin(&self, port: &str) -> Self {
+        Self::serve(
+            port,
+            Script {
+                fail: self.fail.clone(),
+                log: self.log.clone(),
+                digital: self.digital.clone(),
+                firmware: self.firmware.clone(),
+                group_status: self.group_status.clone(),
+                replies: self.replies.clone(),
+                hold: self.hold.clone(),
+            },
+        )
+    }
+
+    fn serve(port: &str, script: Script) -> Self {
+        let Script {
+            fail,
+            log,
+            digital,
+            firmware,
+            group_status,
+            replies,
+            hold,
+        } = script;
         let line = FakeXps {
             base: PortDriverBase::new(
                 port,
@@ -137,6 +229,8 @@ impl FakeLine {
             digital: digital.clone(),
             firmware: firmware.clone(),
             group_status: group_status.clone(),
+            replies: replies.clone(),
+            hold: hold.clone(),
         };
         let (rt, _jh) =
             create_port_runtime(&claim_port(port).unwrap(), line, RuntimeConfig::default())
@@ -149,17 +243,17 @@ impl FakeLine {
             digital,
             firmware,
             group_status,
+            replies,
+            hold,
         }
     }
 
     pub fn socket(&self, mode: SocketMode) -> XpsSocket {
-        XpsSocket::new(
-            self.rt.port_handle().clone(),
-            0,
-            &self.port,
-            mode,
-            Duration::from_secs(1),
-        )
+        self.socket_with(mode, Duration::from_secs(1))
+    }
+
+    pub fn socket_with(&self, mode: SocketMode, timeout: Duration) -> XpsSocket {
+        XpsSocket::new(self.rt.port_handle().clone(), 0, &self.port, mode, timeout)
     }
 
     /// The commands sent since the last call.

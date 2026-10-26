@@ -19,6 +19,7 @@ pub mod gathering;
 pub mod gpio;
 pub mod pco;
 pub mod profile;
+pub mod profile_move;
 pub mod rpc;
 pub mod sftp;
 

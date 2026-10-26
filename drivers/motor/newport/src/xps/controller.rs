@@ -28,6 +28,17 @@ struct AxisRef {
     group: String,
     move_sock: Arc<XpsSocket>,
     state: Arc<Mutex<MoveState>>,
+    /// C `stepSize_`.
+    step_size: f64,
+}
+
+/// What a profile reads of a registered axis (C `pAxes_[j]`).
+pub struct RegisteredAxis {
+    pub axis_no: i32,
+    pub positioner: String,
+    pub group: String,
+    pub move_sock: Arc<XpsSocket>,
+    pub step_size: f64,
 }
 
 /// The part of an axis a deferred group move reads and clears; the axis and
@@ -96,9 +107,10 @@ pub enum SetPositionFailure {
     ReferencingStop { code: i32, grouped: bool },
 }
 
-/// C `buildProfile`'s message for a failed `MultipleAxesPVTVerification`.
-fn verify_message(status: i32) -> String {
+/// C `buildProfile`'s message for `MultipleAxesPVTVerification`'s status.
+pub(crate) fn verify_message(status: i32) -> String {
     match -status {
+        0 => " ".into(),
         69 => "Acceleration Too High".into(),
         68 => "Velocity Too High".into(),
         70 => "Final Velocity Non Zero".into(),
@@ -269,6 +281,7 @@ impl XpsController {
         group: &str,
         move_sock: Arc<XpsSocket>,
         state: Arc<Mutex<MoveState>>,
+        step_size: f64,
     ) {
         self.axes.push(AxisRef {
             axis_no,
@@ -276,7 +289,26 @@ impl XpsController {
             group: group.to_string(),
             move_sock,
             state,
+            step_size,
         });
+    }
+
+    /// The registered axes in axis order, as C's `for (j=0; j<numAxes_;
+    /// j++)` profile loops visit them.
+    pub fn registered_axes(&self) -> Vec<RegisteredAxis> {
+        let mut axes: Vec<_> = self
+            .axes
+            .iter()
+            .map(|a| RegisteredAxis {
+                axis_no: a.axis_no,
+                positioner: a.positioner.clone(),
+                group: a.group.clone(),
+                move_sock: a.move_sock.clone(),
+                step_size: a.step_size,
+            })
+            .collect();
+        axes.sort_by_key(|a| a.axis_no);
+        axes
     }
 
     /// Whether profile builds upload over SFTP (C `useSFTP_`).
@@ -648,6 +680,7 @@ mod tests {
     /// C `buildProfile`'s `switch (-status)` (XPSController.cpp:756-774).
     #[test]
     fn verify_message_matches_c_switch() {
+        assert_eq!(verify_message(0), " ");
         assert_eq!(verify_message(-69), "Acceleration Too High");
         assert_eq!(verify_message(-68), "Velocity Too High");
         assert_eq!(verify_message(-70), "Final Velocity Non Zero");
