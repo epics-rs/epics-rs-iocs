@@ -1,0 +1,4 @@
+# C's iocSmarAct auto_positions.req names m1, m2 and m3 for every
+# controller, but motor.substitutions.smaractmcs loads only m1, so each MCS
+# save searched for the other two in vain.
+file "asyn_motor_positions.req", P=$(P), M=m1

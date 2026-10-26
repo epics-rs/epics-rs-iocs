@@ -37,9 +37,9 @@ dbLoadRecords("$(MOTOR)/db/asyn_motor.db", "P=$(P),M=m1,DTYP=asynMotor,PORT=$(CT
 set_requestfile_path("$(SMARACT_IOC)", "")
 set_requestfile_path("$(MOTOR)", "db")
 set_savefile_path("$(SMARACT_IOC)", "autosave")
-set_pass0_restoreFile("auto_positions.sav")
-set_pass0_restoreFile("auto_settings.sav")
-set_pass1_restoreFile("auto_settings.sav")
+set_pass0_restoreFile("auto_positions_mcs.sav")
+set_pass0_restoreFile("auto_settings_mcs.sav")
+set_pass1_restoreFile("auto_settings_mcs.sav")
 # C's AutoSave.cmd names $(PREFIX), which its st.cmd never sets
 save_restoreSet_status_prefix("$(P)")
 dbLoadRecords("$(AUTOSAVE)/db/save_restoreStatus.db", "P=$(P)")
@@ -50,9 +50,9 @@ iocInit()
 motorUtilInit("$(P)")
 
 # save motor positions every five seconds
-create_monitor_set("auto_positions.req", 5, "P=$(P)")
+create_monitor_set("auto_positions_mcs.req", 5, "P=$(P)")
 # save settings every thirty seconds
-create_monitor_set("auto_settings.req", 30, "P=$(P)")
+create_monitor_set("auto_settings_mcs.req", 30, "P=$(P)")
 
 # Example:
 #   dbl
