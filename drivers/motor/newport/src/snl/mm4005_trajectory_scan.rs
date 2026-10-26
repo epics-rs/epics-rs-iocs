@@ -220,6 +220,9 @@ macro_rules! seqg_escaped {
     ($env:ident, r#"writeOnly(ssId, pVar, pVar->stringOut);"#) => {
         write_only($env.var(), &$env.var().stringOut)
     };
+    ($env:ident, r#"writeOnly(ssId, pVar, "AB");"#) => {
+        write_only($env.var(), "AB")
+    };
     ($env:ident, r#"writeRead(ssId, pVar, pVar->stringOut);"#) => {
         write_read($env.var(), &$env.var().stringOut)
     };

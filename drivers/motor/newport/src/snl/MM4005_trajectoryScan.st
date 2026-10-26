@@ -591,8 +591,10 @@ ss trajectoryAbort {
         when (efTestAndClear(abortMon) && (abort==1)) {
             efSet(abortFlag);
             /* Send AB command */
-            strcpy(stringOut,"AB");
-            %%writeOnly(ssId, pVar, pVar->stringOut);
+            /* Upstream copied AB into stringOut, in which the trajectoryScan
+             * state set formats each command: an abort between its sprintf and
+             * its write sent AB, or a mix, in that command's place. */
+            %%writeOnly(ssId, pVar, "AB");
             execStatus = STATUS_ABORT;
             pvPut(execStatus);
             strcpy(execMessage, "Motion aborted");
