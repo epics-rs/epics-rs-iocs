@@ -10,7 +10,7 @@
 
 epicsEnvSet("P",      "oms:")
 epicsEnvSet("PORT",   "MAXnet1")
-epicsEnvSet("IPPORT", "omsAsyn")
+epicsEnvSet("IPPORT", "MAXNET")
 epicsEnvSet("HOST",   "192.168.1.30:5001")
 
 # ---- asyn octet port ----
@@ -25,7 +25,7 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 # omsMAXnetConfig(portName, numAxes, serialPortName, movingPollPeriod,
 #                 idlePollPeriod, initString). The axes are those the
 # controller reports, up to numAxes; initString is sent verbatim at boot.
-omsMAXnetConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "")
+omsMAXnetConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "AX LH PSO;")
 
 # The axis's asyn_motor.db, as C's MAXnet.cmd loads it.
 dbLoadTemplate("$(OMS_ASYN_IOC)/db/MAXnet.substitutions", "P=$(P),PORT=$(PORT)")
@@ -40,5 +40,5 @@ motorUtilInit("$(P)")
 
 # Example:
 #   dbl
-#   camonitor oms:m1 oms:m1.RBV
-#   caput oms:m1 1000
+#   camonitor oms:m2 oms:m2.RBV
+#   caput oms:m2 1

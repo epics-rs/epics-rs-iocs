@@ -1,5 +1,5 @@
 //! Each startup script boots with the records C's iocOmsAsyn st.cmd loads
-//! for its controller, on this IOC's prefix and axes.
+//! for its controller, on this IOC's prefix.
 
 use std::path::Path;
 
@@ -16,12 +16,12 @@ fn ioc() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_oms-asyn-ioc"))
 }
 
-/// C's st.cmd names the MAXnet's axis m2 and the MAXv's m1; there is no MAXv.
+/// C's st.cmd loads the MAXv's m1 beside the MAXnet's m2; there is no MAXv.
 #[test]
 fn st_cmd_loads_the_c_maxnet_records() {
     let c = renamed(
         &read_dbl(&dir().join("tests/iocOmsAsyn.dbl")),
-        &[("omsAsyn:", "oms:"), ("omsAsyn:m2", "oms:m1")],
+        &[("omsAsyn:", "oms:")],
         &["omsAsyn:m1"],
     );
     assert_same_records(&booted_records(ioc(), &dir().join("st.cmd")), &c);

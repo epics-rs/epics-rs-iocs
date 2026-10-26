@@ -1,11 +1,9 @@
-# C's iocOmsAsyn MAXnet.substitutions, P and PORT from st.cmd; the values
-# are the motor record this IOC had before. The driver reports positions in
-# controller-native steps, so MRES = 1 and EGU = steps. C's PORT is MAXNET,
-# the octet port, where devMotorAsyn finds no asynInt32 and the record fails
-# init; PORT here is the omsMAXnetConfig port.
+# C's iocOmsAsyn MAXnet.substitutions, P and PORT from st.cmd. C's PORT is
+# MAXNET, the octet port, where devMotorAsyn finds no asynInt32 and the
+# record fails init; PORT here is the omsMAXnetConfig port.
 file "$(MOTOR)/db/asyn_motor.db"
 {
 pattern
-{N,  M,       DTYP,         ADDR,  DESC,  EGU,    DIR,  VELO,   VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,     DLLM,      INIT}
-{1,  "m$(N)", "asynMotor",  0,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{N,  M,       DTYP,         ADDR,  DESC,          EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{2,  "m$(N)", "asynMotor",  0,     "motor $(N)",  deg,  Pos,  10,    0,     .2,    0,     1,     2,     0.01,  5,     0,     0,     ""}
 }

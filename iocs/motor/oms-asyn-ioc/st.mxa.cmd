@@ -10,7 +10,7 @@
 
 epicsEnvSet("P",      "oms:")
 epicsEnvSet("PORT",   "MXA1")
-epicsEnvSet("IPPORT", "mxaAsyn")
+epicsEnvSet("IPPORT", "MXA")
 epicsEnvSet("HOST",   "192.168.1.31:5001")
 
 # ---- asyn octet port ----
@@ -25,7 +25,7 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\n\r")
 # ---- MXA controller ----
 # omsMXAConfig(portName, numAxes, serialPortName, movingPollPeriod,
 #              idlePollPeriod, initString).
-omsMXAConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "")
+omsMXAConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "AX LH PSO; AY LH PSO; AZ LH PSO; AT LH PSO; AU LH PSO; AV LH PSO; AR LH PSO; AS LH PSO;")
 
 # Each axis's asyn_motor_model2.db, as C's MXA.cmd loads them. C passes
 # P=$(PREFIX), which its st.cmd never sets, so iocsh drops the load and C
