@@ -886,8 +886,8 @@ mod tests {
 
         /// ss trajectoryScan state build declares, times and pads from the
         /// moveAxis and timeMode it began with: an M1Move and TimeMode put
-        /// while NC is written leaves 1DC1, the TIME_MODE_TOTAL times, and
-        /// axis 1 padded at its last velocity.
+        /// while NC is written leaves 1DC1, the TIME_MODE_TOTAL times, axis 1
+        /// padded at its last velocity, and its RC reads.
         #[epics_rs::base::epics_test]
         async fn a_put_during_nc_leaves_the_builds_snapshot() {
             let p = boot("mm4005SnapshotAtNc", &[]).await;
@@ -933,8 +933,8 @@ mod tests {
                 let d = if i <= 5 { "1.000000" } else { "0.100000" };
                 want.extend([format!("{i}DT{d}"), format!("1DX{d}")]);
             }
-            // The dynamic-parameter reads after VC read moveAxis live, as C.
             want.extend(["MB1,ME6,MN11", "VC", "TB"].map(String::from));
+            want.extend((1..=6).map(|n| format!("1RC{n}")));
             assert_eq!(p.sent(), want);
         }
 
@@ -969,15 +969,15 @@ mod tests {
 
         /// ss trajectoryScan state build declares, pads and moves the axes
         /// moveAxis named when it began: an M1Move put while it waits on the
-        /// twentieth element's TB leaves its DX set as declared, either way.
-        /// The dynamic-parameter reads after VC read moveAxis live, as C.
+        /// twentieth element's TB leaves its DX set and its RC reads as
+        /// declared, either way.
         #[epics_rs::base::epics_test]
         async fn a_move_axis_put_mid_build_leaves_the_builds_axes() {
             let p = boot("mm4005MoveAxisMidBuild", &[]).await;
             put(&p.db, "T:traj1:Nelements", EpicsValue::Long(40)).await;
             expect(&p.db, &[("T:traj1:EndPulses", 40.0)]).await;
             p.mm.lock().unwrap().slow_tb = true;
-            for (declared, then, dx, rc) in [("1DC1", 0, 40, 0), ("1DC0", 1, 0, 6)] {
+            for (declared, then, dx, rc) in [("1DC1", 0, 40, 6), ("1DC0", 1, 0, 0)] {
                 p.sent();
                 put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
                 p.until("TB").await;

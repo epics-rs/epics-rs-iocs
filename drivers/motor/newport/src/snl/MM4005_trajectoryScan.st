@@ -372,8 +372,10 @@ ss trajectoryScan {
             for (j=0; j<buildAxes; j++) {
                 p = stringIn;
                 /* This query can only be done for axes which are active in the
-                 * trajectory */
-                if (!moveAxis[j]) continue;
+                 * trajectory.  Upstream tested the live moveAxis[j], a C defect:
+                 * an axis set after its DC0 was queried, one cleared after its
+                 * DC1 kept the last build's values. */
+                if (!buildMoveAxis[j]) continue;
                 /* We could query all parameters with one nRc, but the parsing
                  * is a pain, much simpler to query one at a time */
                 /* Maximum speed change element and value */
