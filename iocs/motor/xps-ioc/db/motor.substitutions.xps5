@@ -1,5 +1,5 @@
-# C's iocNewport motor.substitutions.xps5, P and PORT from st.cmd, on the
-# axis this IOC configures. MRES must be 1/stepsPerUnit of XPSCreateAxis.
+# C's iocNewport motor.substitutions.xps5, P and PORT from st.cmd. MRES must
+# be 1/stepsPerUnit of XPSCreateAxis.
 #
 # C's XPS_extra.db and profileMove{Controller,Axis}[XPS].template blocks are
 # left out. This driver serves none of XPS_MIN_JERK, XPS_MAX_JERK, XPS_STATUS
@@ -10,6 +10,13 @@
 file "$(MOTOR)/db/basic_asyn_motor.db"
 {
 pattern
-{M,     DTYP,         ADDR,  DESC,   EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
-{"m1",  "asynMotor",  0,     "Phi",  degrees,  Neg,  4.0,   0.1,   .25,   0,     1,     .2,    .001,  3,     180,   -180,  ""}
+{M,     DTYP,         ADDR,  DESC,      EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,    PREC,  DHLM,  DLLM,  INIT}
+{"m1",  "asynMotor",  0,     "Phi",     degrees,  Neg,  4.0,   0.1,   .25,   0,     1,     .2,    .001,    3,     180,   -180,  ""}
+{"m2",  "asynMotor",  1,     "Kappa",   degrees,  Neg,  6.0,   0.1,   .88,   0,     1,     .2,    .0001,   4,     180,   -180,  ""}
+{"m3",  "asynMotor",  2,     "Omega",   degrees,  Neg,  7.0,   0.1,   1.5,   0,     1,     .2,    .0001,   4,     360,   -180,  ""}
+{"m4",  "asynMotor",  3,     "Psi",     degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
+{"m5",  "asynMotor",  4,     "2theta",  degrees,  Neg,  4.0,   0.1,   1.0,   0,     1,     .2,    .0001,   4,     196,   -17,   ""}
+{"m6",  "asynMotor",  5,     "Nu",      degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
+{"m7",  "asynMotor",  6,     "Dummy1",  degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
+{"m8",  "asynMotor",  7,     "Dummy2",  degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
 }
