@@ -10,7 +10,7 @@
 #============================================================
 
 epicsEnvSet("P",      "MM3000:")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
