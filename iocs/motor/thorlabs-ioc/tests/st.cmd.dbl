@@ -1,0 +1,10 @@
+# dbl of motor R7-4-5 motorThorLabs iocBoot/iocThorLabs st.cmd
+thorlabs:alldone
+thorlabs:alldoneBlink
+thorlabs:allstop
+thorlabs:m1
+thorlabs:m1_able
+thorlabs:m1_twCh
+thorlabs:m1_vCh
+thorlabs:moving
+thorlabs:movingDiff

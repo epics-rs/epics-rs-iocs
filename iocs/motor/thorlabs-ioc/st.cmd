@@ -32,12 +32,12 @@ MDT695Setup(1, 10)
 # (1 for MDT694, else 3) is read from the controller.
 MDT695Config(0, "$(SERIAL)")
 
-# One motor record per channel (DTYP "MDT695", OUT #C$(CARD) S0, S1, ...). The controller
-# works in volts (EGU = V) at a 0.1 V step (MRES). Load only as many channels as the
-# controller has (3 for MDT693/695, 1 for MDT694).
-dbLoadRecords("$(THORLABS_IOC)/db/mdt695.template", "P=$(P),M=x,C=$(CARD),S=0")
-dbLoadRecords("$(THORLABS_IOC)/db/mdt695.template", "P=$(P),M=y,C=$(CARD),S=1")
-dbLoadRecords("$(THORLABS_IOC)/db/mdt695.template", "P=$(P),M=z,C=$(CARD),S=2")
+# Each channel's motor.db, as C's MDT695.cmd loads it, and motorUtil's
+# records, as C's st.cmd loads them. The controller works in volts (EGU = V)
+# at a 0.1 V step (MRES). Load only as many channels as the controller has
+# (3 for MDT693/695, 1 for MDT694).
+dbLoadTemplate("$(THORLABS_IOC)/db/MDT695.substitutions", "P=$(P),C=$(CARD)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
