@@ -837,6 +837,36 @@ mod tests {
             assert_eq!(string(&p.db, "T:traj1:ExecMessage"), "Motion aborted");
         }
 
+        /// ss trajectoryScan state execute: an abort during the move to an
+        /// absolute trajectory's start sends no execute command, and the run
+        /// ends aborted with AB sent after it.
+        #[epics_rs::base::epics_test]
+        async fn an_abort_during_the_move_to_the_start_executes_nothing() {
+            let p = boot("mm4005AbortStart", &[]).await;
+            put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(1)).await;
+            put(
+                &p.db,
+                "T:traj1:M1Traj",
+                EpicsValue::DoubleArray(vec![1.0; 5].into()),
+            )
+            .await;
+            p.sent();
+            put(&p.db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
+            expect(&p.db, &[("T:traj1:ExecState", 1.0), ("T:m1.DMOV", 0.0)]).await;
+            put(&p.db, "T:traj1:Abort", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[
+                    ("T:traj1:Execute", 0.0),
+                    ("T:traj1:ExecState", 0.0),
+                    ("T:traj1:ExecStatus", 3.0),
+                ],
+            )
+            .await;
+            assert_eq!(value(&p.db, "T:m1"), 1.0);
+            assert_eq!(p.sent(), ["AB", "AB"]);
+        }
+
         /// ss trajectoryScan state readback: each traced point's actual
         /// position in user units, and its error from the theory.
         #[epics_rs::base::epics_test]

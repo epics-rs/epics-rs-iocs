@@ -411,8 +411,12 @@ ss trajectoryScan {
             }
             /* Send the execute command, along with simulation mode and time
              * scaling factor */
-            sprintf(stringOut, "LS,%dEC%f",simMode,timeScale);
-            %%writeOnly(ssId, pVar, pVar->stringOut);
+            /* Upstream sent it after an abort during the move to the start,
+             * running the trajectory AB was meant to stop. */
+            if (!efTest(abortFlag)) {
+                sprintf(stringOut, "LS,%dEC%f",simMode,timeScale);
+                %%writeOnly(ssId, pVar, pVar->stringOut);
+            }
             /* Get start time of execute */
             startTime = time(0);
             execState = EXECUTE_STATE_EXECUTING;
@@ -432,7 +436,12 @@ ss trajectoryScan {
             /* Upstream tested execStatus == STATUS_ABORT, which an EXECUTING
              * pass the abort landed in overwrote with the axes it had stopped:
              * the run then flew back as a success.  abortFlag is the abort,
-             * and its status and message are posted again over that pass's. */
+             * and its status and message are posted again over that pass's.
+             * AB is sent again here, after any execute command this state set
+             * sent: trajectoryAbort's can reach the controller ahead of one
+             * sent as its abortFlag was set. */
+            strcpy(stringOut, "AB");
+            %%writeOnly(ssId, pVar, pVar->stringOut);
             execStatus = STATUS_ABORT;
             pvPut(execStatus);
             strcpy(execMessage, "Motion aborted");
