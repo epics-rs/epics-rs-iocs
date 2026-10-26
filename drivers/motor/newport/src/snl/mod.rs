@@ -3,3 +3,4 @@
 
 mod xps_c8;
 pub mod xps_slave;
+pub mod xps_trajectory_scan;
