@@ -1,0 +1,14 @@
+# C's iocPI PI_C862.substitutions on this IOC's axes, P and C from
+# st.cmd; the values are the motor record this IOC had before.
+#
+# PI C-862/C-863: one motor record for the controller's single axis, DTYP
+# "PIC862" with OUT #C$(C) S0.
+#
+# The C-862 works in raw controller counts (MA/MR/TP are integer counts, no
+# separate EGU scaling in the driver), so MRES = 1 and EGU = counts.
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{M,       DTYP,      S,  DESC,  EGU,     DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,     DLLM,      INIT}
+{"c862",  "PIC862",  0,  "",    counts,  Pos,  1000,  0,     0.2,   0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+}

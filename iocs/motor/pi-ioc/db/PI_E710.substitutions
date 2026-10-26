@@ -1,0 +1,18 @@
+# PI_E710.substitutions, as C's iocPI has for its other controllers,
+# on this IOC's axes, P and C from st.cmd; the values are the motor
+# record this IOC had before.
+#
+# PI E-710: one motor record per axis. DTYP is "PIE710", OUT #C$(C) S$(S); signal 0..5 = command digits 1..6, in
+# the order they responded to the connect-time #TP probe.
+#
+# The E-710 is a closed-loop DC servo working in POS_RES-sized steps (1 step =
+# 0.0001 um), so MRES = 1 and EGU is steps. Closed-loop device (NTM=No); it has
+# no stop command (stop is a zero relative move) and supports #GH homing.
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{M,        DTYP,      S,  DESC,  EGU,    DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,     DLLM,      INIT}
+{"e710a",  "PIE710",  0,  "",    steps,  Pos,  1000,  0,     0.2,   0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{"e710b",  "PIE710",  1,  "",    steps,  Pos,  1000,  0,     0.2,   0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{"e710c",  "PIE710",  2,  "",    steps,  Pos,  1000,  0,     0.2,   0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+}

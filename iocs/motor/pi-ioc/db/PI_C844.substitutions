@@ -1,0 +1,17 @@
+# C's iocPI PI_C844.substitutions on this IOC's axes, P and C from
+# st.cmd; the values are the motor record this IOC had before.
+#
+# PI C-844: one motor record per axis. DTYP is "PIC844", OUT #C$(C) S$(S) ; the
+# wire axis is $(S)+1, i.e. 1-4, selected by an "AXIS n;" command prefix.
+#
+# The record dial value is the wire value with two decimals; readback rounds to
+# the nearest integer count, so MRES = 1 and EGU = counts.
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{M,         DTYP,      S,  DESC,  EGU,     DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,    DLLM,     INIT}
+{"c844_1",  "PIC844",  0,  "",    counts,  Pos,  10,    0,     0.2,   0,     0,     .5,    1,     2,     100000,  -100000,  ""}
+{"c844_2",  "PIC844",  1,  "",    counts,  Pos,  10,    0,     0.2,   0,     0,     .5,    1,     2,     100000,  -100000,  ""}
+{"c844_3",  "PIC844",  2,  "",    counts,  Pos,  10,    0,     0.2,   0,     0,     .5,    1,     2,     100000,  -100000,  ""}
+{"c844_4",  "PIC844",  3,  "",    counts,  Pos,  10,    0,     0.2,   0,     0,     .5,    1,     2,     100000,  -100000,  ""}
+}

@@ -30,9 +30,11 @@ PIC862Setup(8, 10)
 # \x01{addr}VE.
 PIC862Config($(CARD), "$(PORT)", $(ADDR))
 
-# One motor record for the controller's single axis. The C-862 works in raw
-# controller counts, so MRES = 1.
-dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
+# The axis's motor.db, as C's PI_C862.cmd loads it, and motorUtil's records,
+# as C's st.cmd loads them. The C-862 works in raw controller counts, so
+# MRES = 1.
+dbLoadTemplate("$(PI_IOC)/db/PI_C862.substitutions", "P=$(P),C=$(CARD)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 # ---- PI C-663 controller (separate port) ----
 # The C-663 is a C-862 clone (CR out, LF+ETX in, \x01{addr}VE at connect).
@@ -44,7 +46,7 @@ dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
 #PIC663Setup(8, 10)
 # PIC663Config(card, asyn port, address)
 #PIC663Config(0, "serial663", 0)
-#dbLoadRecords("$(PI_IOC)/db/pic663.template", "P=$(P),M=c663,C=0,S=0")
+#dbLoadTemplate("$(PI_IOC)/db/PI_C663.substitutions", "P=$(P),C=0")
 
 # ---- PI C-630 stepper chain (separate port — different protocol/framing) ----
 # The C-630 is NOT a C-862 clone: it uses a per-command 1-digit axis address
@@ -57,9 +59,7 @@ dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
 #PIC630Setup(8, 3, 10)
 # PIC630Config(card, asyn port, cur0, ..., cur8); PIC630Setup sets the axes per chain
 #PIC630Config(1, "serial630", 5, 3, 0, 0, 0, 0, 0, 0, 0)
-#dbLoadRecords("$(PI_IOC)/db/pic630.template", "P=$(P),M=c630_1,C=1,S=0")
-#dbLoadRecords("$(PI_IOC)/db/pic630.template", "P=$(P),M=c630_2,C=1,S=1")
-#dbLoadRecords("$(PI_IOC)/db/pic630.template", "P=$(P),M=c630_3,C=1,S=2")
+#dbLoadTemplate("$(PI_IOC)/db/PI_C630.substitutions", "P=$(P),C=1")
 
 # ---- PI E-662 piezo controller (separate port — SCPI protocol, LF framing) --
 # Single-axis SCPI-like piezo controller (*IDN?, *ESR?, POS?, POS). No address,
@@ -70,7 +70,7 @@ dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
 #PIC662Setup(8, 10)
 # PIC662Config(card, asyn port)
 #PIC662Config(2, "serial662")
-#dbLoadRecords("$(PI_IOC)/db/pic662.template", "P=$(P),M=c662,C=2,S=0")
+#dbLoadTemplate("$(PI_IOC)/db/PI_E662.substitutions", "P=$(P),C=2")
 
 # ---- PI C-844 4-axis DC-servo controller (separate port — SCPI protocol) ----
 # Single-device, 4 axes selected by an "AXIS n;" prefix. *IDN?, no echo, both
@@ -81,10 +81,7 @@ dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
 #PIC844Setup(8, 10)
 # PIC844Config(card, asyn port, address)
 #PIC844Config(3, "serial844", 0)
-#dbLoadRecords("$(PI_IOC)/db/pic844.template", "P=$(P),M=c844_1,C=3,S=0")
-#dbLoadRecords("$(PI_IOC)/db/pic844.template", "P=$(P),M=c844_2,C=3,S=1")
-#dbLoadRecords("$(PI_IOC)/db/pic844.template", "P=$(P),M=c844_3,C=3,S=2")
-#dbLoadRecords("$(PI_IOC)/db/pic844.template", "P=$(P),M=c844_4,C=3,S=3")
+#dbLoadTemplate("$(PI_IOC)/db/PI_C844.substitutions", "P=$(P),C=3")
 
 # ---- PI C-848 multi-axis DC-servo controller (separate port) ----------------
 # Up to 4 axes, selected by byte 5 of each command (letters A-D). Axis count is
@@ -96,8 +93,7 @@ dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
 #PIC848Setup(8, 10)
 # PIC848Config(card, asyn port, address)
 #PIC848Config(4, "serial848", 0)
-#dbLoadRecords("$(PI_IOC)/db/pic848.template", "P=$(P),M=c848_1,C=4,S=0")
-#dbLoadRecords("$(PI_IOC)/db/pic848.template", "P=$(P),M=c848_2,C=4,S=1")
+#dbLoadTemplate("$(PI_IOC)/db/PI_C848.substitutions", "P=$(P),C=4")
 
 # ---- PI E-516 piezo controller (separate serial port) ----
 # The E-516 is a 3-axis closed-loop piezo. PIE516Config sets LF both ways, as
@@ -110,9 +106,7 @@ dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
 # PIE516Config(card, asyn port, address) - address is
 # unused here (axes select by the A/B/C command letter).
 #PIE516Config($(CARD), "piezo1", 0)
-#dbLoadRecords("$(PI_IOC)/db/pie516.template", "P=$(P),M=e516a,C=$(CARD),S=0")
-#dbLoadRecords("$(PI_IOC)/db/pie516.template", "P=$(P),M=e516b,C=$(CARD),S=1")
-#dbLoadRecords("$(PI_IOC)/db/pie516.template", "P=$(P),M=e516c,C=$(CARD),S=2")
+#dbLoadTemplate("$(PI_IOC)/db/PI_E516.substitutions", "P=$(P),C=$(CARD)")
 
 # ---- PI E-517 piezo controller (separate serial port) ----
 # The E-517 is a 3-axis closed-loop piezo (digit-addressed axes 1/2/3), same
@@ -124,9 +118,7 @@ dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
 # PIE517Config(card, asyn port, address) - address is
 # unused here.
 #PIE517Config($(CARD), "piezo2", 0)
-#dbLoadRecords("$(PI_IOC)/db/pie517.template", "P=$(P),M=e517a,C=$(CARD),S=0")
-#dbLoadRecords("$(PI_IOC)/db/pie517.template", "P=$(P),M=e517b,C=$(CARD),S=1")
-#dbLoadRecords("$(PI_IOC)/db/pie517.template", "P=$(P),M=e517c,C=$(CARD),S=2")
+#dbLoadTemplate("$(PI_IOC)/db/PI_E517.substitutions", "P=$(P),C=$(CARD)")
 
 # ---- PI E-710 DC-servo controller (separate serial port) ----
 # The E-710 is a closed-loop DC servo with up to 6 digit-addressed axes (1..6),
@@ -139,9 +131,7 @@ dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
 # PIE710Config(card, asyn port, address) - address is
 # the GPIB address, unused on serial.
 #PIE710Config($(CARD), "piezo4", 0)
-#dbLoadRecords("$(PI_IOC)/db/pie710.template", "P=$(P),M=e710a,C=$(CARD),S=0")
-#dbLoadRecords("$(PI_IOC)/db/pie710.template", "P=$(P),M=e710b,C=$(CARD),S=1")
-#dbLoadRecords("$(PI_IOC)/db/pie710.template", "P=$(P),M=e710c,C=$(CARD),S=2")
+#dbLoadTemplate("$(PI_IOC)/db/PI_E710.substitutions", "P=$(P),C=$(CARD)")
 
 # ---- PI E-816 piezo controller (separate serial port) ----
 # The E-816 is a piezo controller with up to 12 letter-addressed axes (A..L),
@@ -154,9 +144,7 @@ dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,C=$(CARD),S=0")
 # PIE816Config(card, asyn port, address) - address is
 # unused here (axes select by the A..L command letter).
 #PIE816Config($(CARD), "piezo5", 0)
-#dbLoadRecords("$(PI_IOC)/db/pie816.template", "P=$(P),M=e816a,C=$(CARD),S=0")
-#dbLoadRecords("$(PI_IOC)/db/pie816.template", "P=$(P),M=e816b,C=$(CARD),S=1")
-#dbLoadRecords("$(PI_IOC)/db/pie816.template", "P=$(P),M=e816c,C=$(CARD),S=2")
+#dbLoadTemplate("$(PI_IOC)/db/PI_E816.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
 
