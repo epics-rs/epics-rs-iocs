@@ -1,0 +1,15 @@
+# dbl of motor R7-4-5 motorAMCI iocBoot/iocAMCI st.cmd with st.cmd.ANG1 in
+# place of motor.cmd.ANF2, loading motor.substitutions.ANG1
+amci:alldone
+amci:alldoneBlink
+amci:allstop
+amci:m101
+amci:m101Direction
+amci:m101Offset
+amci:m101Resolution
+amci:m102
+amci:m102Direction
+amci:m102Offset
+amci:m102Resolution
+amci:moving
+amci:movingDiff

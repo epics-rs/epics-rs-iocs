@@ -7,7 +7,8 @@
 //! record type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
-//!   cargo run -p amci-ioc -- st.cmd
+//!   cargo run -p amci-ioc -- st.cmd        # ANF2
+//!   cargo run -p amci-ioc -- st.ang1.cmd   # ANG1
 
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -39,10 +40,12 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`, the
-    // underlying octet port a Modbus link runs over.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
+    // asyn.dbd, as C's IOC links it: the asyn record and devEpics, for
+    // asyn_motor.db and ANF2Aux.template, and the iocsh commands
+    // (`drvAsynIPPortConfigure`, the octet port a Modbus link runs over).
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, asyn_factory);
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Modbus iocsh commands: modbusInterposeConfig, drvModbusAsynConfigure.
     let handle = epics_rs::base::runtime::task::runtime_handle();

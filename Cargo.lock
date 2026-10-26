@@ -328,6 +328,7 @@ version = "0.1.0"
 dependencies = [
  "epics-modbus-rs",
  "epics-rs",
+ "ioc-conventions",
  "motor-amci",
  "motor-common",
 ]
