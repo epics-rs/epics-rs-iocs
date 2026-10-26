@@ -1,14 +1,9 @@
-# C's iocThorLabs MDT695.substitutions on this IOC's three channels, P from
-# st.cmd; the values are the motor record this IOC had before. Signal 0,1,2
-# is channel X,Y,Z; load only as many as the controller has (3 for
-# MDT693/695, 1 for MDT694). The controller is open-loop voltage control;
-# the driver scales the record's steps by C's drive_resolution, 0.1 V, so
-# MRES = 0.1 gives EGU = V. Set DHLM/DLLM to its voltage range.
+# C's iocThorLabs MDT695.substitutions, P and C from st.cmd. Signal 0,1,2 is
+# channel X,Y,Z; the controller is open-loop voltage control, and the driver
+# scales the record's steps by C's drive_resolution, 0.1 V.
 file "$(MOTOR)/db/motor.db"
 {
 pattern
-{M,    DTYP,      S,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
-{"x",  "MDT695",  0,  "",    V,    Pos,  10,    0,     .2,    0,     0,     .5,    .1,    1,     75,    0,     ""}
-{"y",  "MDT695",  1,  "",    V,    Pos,  10,    0,     .2,    0,     0,     .5,    .1,    1,     75,    0,     ""}
-{"z",  "MDT695",  2,  "",    V,    Pos,  10,    0,     .2,    0,     0,     .5,    .1,    1,     75,    0,     ""}
+{N,  M,        DTYP,      S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)",  "MDT695",  0,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
 }

@@ -12,7 +12,7 @@
 
 epicsEnvSet("P",      "THORLABS:")
 epicsEnvSet("CARD",   "0")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -32,10 +32,8 @@ MDT695Setup(1, 10)
 # (1 for MDT694, else 3) is read from the controller.
 MDT695Config(0, "$(SERIAL)")
 
-# Each channel's motor.db, as C's MDT695.cmd loads it, and motorUtil's
-# records, as C's st.cmd loads them. The controller works in volts (EGU = V)
-# at a 0.1 V step (MRES). Load only as many channels as the controller has
-# (3 for MDT693/695, 1 for MDT694).
+# Channel X's motor.db, as C's MDT695.cmd loads it, and motorUtil's records,
+# as C's st.cmd loads them.
 dbLoadTemplate("$(THORLABS_IOC)/db/MDT695.substitutions", "P=$(P),C=$(CARD)")
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
@@ -46,5 +44,5 @@ motorUtilInit("$(P)")
 
 # Example:
 #   dbl
-#   camonitor THORLABS:x THORLABS:x.RBV
-#   caput THORLABS:x 40.0
+#   camonitor THORLABS:m1 THORLABS:m1.RBV
+#   caput THORLABS:m1 4.0
