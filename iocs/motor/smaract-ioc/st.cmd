@@ -26,6 +26,7 @@ dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P), R=asyn1, PORT=$(IPPORT), ADDR
 # MCS2CreateController(portName, MCS2PortName, numAxes, movingPollPeriod,
 #                      idlePollPeriod, unusedMask), periods in ms.
 MCS2CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 100, 0)
+asynSetTraceIOMask("$(CTRL)", -1, 0x8)
 
 # One motor per channel, ADDR the channel, with the rows of C's
 # motor.substitutions.smaractmcs2.
