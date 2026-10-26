@@ -30,15 +30,6 @@ async fn main() -> CaResult<()> {
     };
 
     epics_rs::base::runtime::env::set_default("SMARACT_IOC", env!("CARGO_MANIFEST_DIR"));
-    // motor-rs ships motorApp/Db's asyn_motor_*.req in its ioc dir; MOTOR
-    // names the crate dir, so st.cmd reaches them as $(MOTOR)/ioc.
-    let motor_dir = std::path::Path::new(epics_rs::motor::MOTOR_IOC_DIR)
-        .parent()
-        .expect("MOTOR_IOC_DIR is <crate>/ioc");
-    epics_rs::base::runtime::env::set_default(
-        "MOTOR",
-        motor_dir.to_str().expect("cargo paths are UTF-8"),
-    );
 
     let mut app = IocApplication::new();
 
@@ -50,9 +41,9 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
+    // asyn's devEpics, for basic_asyn_motor.db's and MCS2_Extra.db's records,
+    // and the asyn iocsh commands (`drvAsynIPPortConfigure`).
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // SmarAct iocsh commands (MCS2 + SCU + MCS) + motor device support.
     app = app.register_startup_command(mcs2_create_controller_command());

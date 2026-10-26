@@ -38,16 +38,14 @@ smarActSCUCreateAxis("$(CTRL)", 0, 0)
 smarActSCUCreateAxis("$(CTRL)", 1, 1)
 smarActSCUCreateAxis("$(CTRL)", 2, 2)
 
-# One motor record per axis. The driver reports positions in motor-record steps
-# (1000 steps = 1 micron for linear, 1 millidegree for rotary), so MRES = 0.001
-# makes the record read directly in microns / millidegrees.
-dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
-dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
-dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m3,PORT=$(CTRL),ADDR=2")
+# One motor per axis with the SCU1 rows of C's motor.substitutions.smaractscu.
+dbLoadRecords("$(MOTOR)/db/asyn_motor.db", "P=$(P),M=m1,DTYP=asynMotor,PORT=$(CTRL),ADDR=0,DESC=motor 1,EGU=mm,DIR=Pos,VELO=1,VBAS=0,ACCL=0.2,BDST=0,BVEL=1,BACC=0.2,MRES=1e-3,PREC=3,DHLM=20000,DLLM=-20000,INIT=")
+dbLoadRecords("$(MOTOR)/db/asyn_motor.db", "P=$(P),M=m2,DTYP=asynMotor,PORT=$(CTRL),ADDR=1,DESC=motor 2,EGU=mm,DIR=Pos,VELO=1,VBAS=0,ACCL=0.2,BDST=0,BVEL=1,BACC=0.2,MRES=1e-3,PREC=3,DHLM=20000,DLLM=-20000,INIT=")
+dbLoadRecords("$(MOTOR)/db/asyn_motor.db", "P=$(P),M=m3,DTYP=asynMotor,PORT=$(CTRL),ADDR=2,DESC=motor 3,EGU=mm,DIR=Pos,VELO=1,VBAS=0,ACCL=0.2,BDST=0,BVEL=1,BACC=0.2,MRES=1e-3,PREC=3,DHLM=20000,DLLM=-20000,INIT=")
 
 # ---- autosave/restore machinery (C iocSmarAct AutoSave.cmd) ----
 set_requestfile_path("$(SMARACT_IOC)", "")
-set_requestfile_path("$(MOTOR)", "ioc")
+set_requestfile_path("$(MOTOR)", "db")
 set_savefile_path("$(SMARACT_IOC)", "autosave")
 set_pass0_restoreFile("auto_positions.sav")
 set_pass0_restoreFile("auto_settings.sav")

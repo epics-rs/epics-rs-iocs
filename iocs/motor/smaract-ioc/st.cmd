@@ -7,10 +7,6 @@
 # Requires a SmarAct MCS2 controller reachable over TCP at the host:port below.
 # MCS2CreateController reads the controller serial number, so it must be
 # reachable when the command runs.
-#
-# The positioner type (PTYP) and calibration must be configured on the
-# controller (or with the SmarAct tools) beforehand — those auxiliary parameters
-# are not exposed through the motor record.
 #============================================================
 
 epicsEnvSet("P",      "MCS2:")
@@ -27,16 +23,18 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #                      idlePollPeriod, unusedMask), periods in ms.
 MCS2CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000, 0)
 
-# One motor record per channel, ADDR the channel. The driver reports
-# positions in nanometres (linear) / micro-degrees (rotary), so MRES = 1 and
-# EGU = nm.
-dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
-dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
-dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m3,PORT=$(CTRL),ADDR=2")
+# One motor per channel, ADDR the channel, with the rows of C's
+# motor.substitutions.smaractmcs2.
+dbLoadRecords("$(MOTOR)/db/basic_asyn_motor.db", "P=$(P),M=m1,DTYP=asynMotor,PORT=$(CTRL),ADDR=0,DESC=motor 1,EGU=mm,DIR=Pos,VELO=.0,VBAS=.0,ACCL=.0,BDST=0,BVEL=1,BACC=.2,MRES=1.e-6,PREC=6,DHLM=0,DLLM=0,INIT=")
+dbLoadRecords("$(SMARACT_IOC)/db/MCS2_Extra.db", "P=$(P),M=m1:,PORT=$(CTRL),ADDR=0,TIMEOUT=1.0")
+dbLoadRecords("$(MOTOR)/db/basic_asyn_motor.db", "P=$(P),M=m2,DTYP=asynMotor,PORT=$(CTRL),ADDR=1,DESC=motor 2,EGU=mm,DIR=Pos,VELO=.0,VBAS=.0,ACCL=.0,BDST=0,BVEL=1,BACC=.2,MRES=1.e-6,PREC=6,DHLM=0,DLLM=0,INIT=")
+dbLoadRecords("$(SMARACT_IOC)/db/MCS2_Extra.db", "P=$(P),M=m2:,PORT=$(CTRL),ADDR=1,TIMEOUT=1.0")
+dbLoadRecords("$(MOTOR)/db/basic_asyn_motor.db", "P=$(P),M=m3,DTYP=asynMotor,PORT=$(CTRL),ADDR=2,DESC=motor 3,EGU=mm,DIR=Pos,VELO=.0,VBAS=.0,ACCL=.0,BDST=0,BVEL=1,BACC=.2,MRES=1.e-6,PREC=6,DHLM=0,DLLM=0,INIT=")
+dbLoadRecords("$(SMARACT_IOC)/db/MCS2_Extra.db", "P=$(P),M=m3:,PORT=$(CTRL),ADDR=2,TIMEOUT=1.0")
 
 # ---- autosave/restore machinery (C iocSmarAct AutoSave.cmd) ----
 set_requestfile_path("$(SMARACT_IOC)", "")
-set_requestfile_path("$(MOTOR)", "ioc")
+set_requestfile_path("$(MOTOR)", "db")
 set_savefile_path("$(SMARACT_IOC)", "autosave")
 set_pass0_restoreFile("auto_positions.sav")
 set_pass0_restoreFile("auto_settings.sav")
@@ -55,4 +53,4 @@ create_monitor_set("auto_settings.req", 30, "P=$(P)")
 # Example:
 #   dbl
 #   camonitor MCS2:m1 MCS2:m1.RBV
-#   caput MCS2:m1 1000000
+#   caput MCS2:m1 1.0
