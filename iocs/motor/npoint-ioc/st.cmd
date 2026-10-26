@@ -29,11 +29,11 @@ asynOctetSetOutputEos("$(IPPORT)", 0, "\n")
 # C300CreateController(portName, C300PortName, numAxes, movingPollPeriod, idlePollPeriod).
 C300CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000)
 
-# One motor record per axis (OUT @asyn($(CTRL),axis)). Positions cross the
-# driver boundary in the controller's native units, so MRES = 1.
-dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
-dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
-dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m3,PORT=$(CTRL),ADDR=2")
+# Each axis's asyn_motor.db, as C's C300.cmd loads them.
+dbLoadTemplate("$(NPOINT_IOC)/db/C300.substitutions", "P=$(P),PORT=$(CTRL)")
+
+# motorUtil's records, as C's st.cmd loads them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 

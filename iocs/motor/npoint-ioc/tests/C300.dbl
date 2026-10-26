@@ -1,0 +1,27 @@
+# dbl of motor R7-4-5 motorNPoint iocBoot/iocNPoint st.cmd with < C300.cmd
+nPoint:alldone
+nPoint:alldoneBlink
+nPoint:allstop
+nPoint:m1
+nPoint:m1_able
+nPoint:m1Direction
+nPoint:m1Offset
+nPoint:m1Resolution
+nPoint:m1_twCh
+nPoint:m1_vCh
+nPoint:m2
+nPoint:m2_able
+nPoint:m2Direction
+nPoint:m2Offset
+nPoint:m2Resolution
+nPoint:m2_twCh
+nPoint:m2_vCh
+nPoint:m3
+nPoint:m3_able
+nPoint:m3Direction
+nPoint:m3Offset
+nPoint:m3Resolution
+nPoint:m3_twCh
+nPoint:m3_vCh
+nPoint:moving
+nPoint:movingDiff
