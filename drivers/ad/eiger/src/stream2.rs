@@ -11,7 +11,7 @@ use std::ops::Range;
 
 use bytes::Bytes;
 use epics_rs::ad_core::codec::{Codec, CodecName};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -1091,7 +1091,7 @@ impl Stream2Api {
                 let out = fill.data_mut().as_u8_slice_mut();
                 match compression {
                     None => out.copy_from_slice(blob),
-                    Some(c) => uncompress(blob, c, dims, data_type, out)?,
+                    Some(c) => uncompress(blob, c, data_type, out)?,
                 }
                 le_to_host(fill.data_mut().view_mut());
                 array
@@ -1180,43 +1180,48 @@ fn threshold_number(channel: &str) -> i32 {
 fn uncompress(
     blob: &[u8],
     c: &Compression,
-    dims: [usize; 2],
     data_type: NDDataType,
     out: &mut [u8],
 ) -> Result<(), Reported> {
     let fname = "uncompress";
     if c.algorithm == "lz4" {
-        let mut src = NDArray::with_data(
-            vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
-            NDDataBuffer::from_slice(blob),
-        );
-        src.codec = Some(Codec {
-            name: CodecName::LZ4HDF5,
-            compressed_size: blob.len(),
-            level: 0,
-            shuffle: 0,
-            compressor: 0,
-            original_data_type: data_type,
-        });
-        match ad_plugins_rs::codec::decompress_lz4hdf5(&src) {
-            Ok(decoded) => {
-                out.copy_from_slice(decoded.data().as_u8_slice());
-                Ok(())
-            }
-            Err(e) => Err(err(
-                fname,
-                &format!("decompress_lz4hdf5 failed, result={e:?}\n"),
-            )),
-        }
+        decompress_lz4hdf5(blob, out)
+            .ok_or_else(|| err(fname, "decompress_lz4hdf5 failed, result=0\n"))
     } else {
         bslz4::decode_blocks_into(&blob[bslz4::HEADER_LEN..], out, data_type.element_size(), 0)
             .map_err(|e| err(fname, &format!("bshuf_decompress_lz4 failed, result={e}")))
     }
 }
 
+/// lz4hdf5.c `decompress_lz4hdf5` into `out`: a `[u64 BE total][u32 BE
+/// block]` header, then `[u32 BE len][block]` frames, a block stored raw
+/// when LZ4 did not shrink it. `None` when it is malformed or does not fill
+/// `out` exactly. C never advances past a zero block size; it is refused.
+fn decompress_lz4hdf5(buf: &[u8], out: &mut [u8]) -> Option<()> {
+    let total = u64::from_be_bytes(buf.get(0..8)?.try_into().ok()?) as usize;
+    let block_size = u32::from_be_bytes(buf.get(8..12)?.try_into().ok()?) as usize;
+    if block_size == 0 || total != out.len() {
+        return None;
+    }
+    let mut pos = 12usize;
+    for block in out.chunks_mut(block_size) {
+        let clen = u32::from_be_bytes(buf.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        pos += 4;
+        let payload = buf.get(pos..pos.checked_add(clen)?)?;
+        if clen == block.len() {
+            block.copy_from_slice(payload);
+        } else if lz4_flex::block::decompress_into(payload, block).ok()? != block.len() {
+            return None;
+        }
+        pos += clen;
+    }
+    Some(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer};
 
     /// A minimal CBOR writer for the fixtures.
     #[derive(Default)]
@@ -1595,6 +1600,72 @@ pub(crate) mod tests {
         let f = a.get_frame(0, true, false, false, &pool).unwrap();
         assert!(f.array.codec.is_none());
         assert_same(f.array.data(), &NDDataBuffer::from_vec(pixels));
+    }
+
+    /// An lz4 frame decompresses into its pool buffer, with no other buffer
+    /// of its size: C decompresses into `pData` (stream2Api.cpp:48, :303).
+    #[tokio::test]
+    async fn an_lz4_frame_decompresses_straight_into_its_pool_buffer() {
+        let (cols, rows) = (300usize, 200usize);
+        let size = cols * rows * 4;
+        let pixels: Vec<u32> = (0..cols * rows).map(|i| (i % 1000) as u32).collect();
+        let src = NDArray::with_data(
+            vec![NDDimension::new(cols * rows)],
+            NDDataBuffer::from_vec(pixels.clone()),
+        );
+        let lz4 = ad_plugins_rs::codec::compress_lz4hdf5(&src, 0).unwrap();
+
+        let mut w = W::default();
+        w.magic()
+            .map(2)
+            .text("type")
+            .text("image")
+            .text("data")
+            .map(1);
+        w.text("threshold_1")
+            .multidim(rows as u64, cols as u64, 70)
+            .tag(56500)
+            .array(3);
+        w.text("lz4").uint(4).bytes(lz4.data().as_u8_slice());
+
+        let mut a = api().await;
+        let pool = DriverPool::standalone(0);
+        load(&mut a, w.0);
+        let counted = crate::alloc_count::count(size);
+        let pooled = DriverPool::standalone(0).alloc(
+            vec![NDDimension::new(cols), NDDimension::new(rows)],
+            NDDataType::UInt32,
+        );
+        let pool_only = counted.stop();
+        drop(pooled);
+        let counted = crate::alloc_count::count(size);
+        let f = a.get_frame(0, true, false, false, &pool).unwrap();
+        assert_eq!(counted.stop(), pool_only, "frame-sized allocations");
+        assert_same(f.array.data(), &NDDataBuffer::from_vec(pixels));
+    }
+
+    /// The header's total must be the frame's size, and its block size
+    /// nonzero.
+    #[test]
+    fn an_lz4_container_that_does_not_fill_the_frame_is_refused() {
+        let pixels: Vec<u8> = (0..64).collect();
+        let src = NDArray::with_data(
+            vec![NDDimension::new(64)],
+            NDDataBuffer::from_vec(pixels.clone()),
+        );
+        let lz4 = ad_plugins_rs::codec::compress_lz4hdf5(&src, 0).unwrap();
+        let blob = lz4.data().as_u8_slice();
+        let mut out = [0u8; 64];
+        assert_eq!(decompress_lz4hdf5(blob, &mut out), Some(()));
+        assert_eq!(out[..], pixels[..]);
+
+        let mut short = blob.to_vec();
+        short[..8].copy_from_slice(&63u64.to_be_bytes());
+        assert_eq!(decompress_lz4hdf5(&short, &mut out), None);
+        let mut no_block = blob.to_vec();
+        no_block[8..12].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(decompress_lz4hdf5(&no_block, &mut out), None);
+        assert_eq!(decompress_lz4hdf5(&blob[..blob.len() - 1], &mut out), None);
     }
 
     #[tokio::test]
