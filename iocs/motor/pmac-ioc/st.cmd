@@ -61,8 +61,10 @@ pmacCreateAxes("$(CTRL)", $(NUMAXES))
 
 # ---- save/restore (C pmacGeobrickExamplePortDriver stpmacTest.src) ----
 save_restoreSet_Debug(0)
-# status-PV prefix, so save_restore can find its status PVs
+# status-PV prefix, so save_restore can find its status PVs, which C's
+# example never loads
 save_restoreSet_status_prefix("$(P)")
+dbLoadRecords("$(AUTOSAVE)/db/save_restoreStatus.db", "P=$(P)")
 # ok to restore a save set that had missing values, and to save a file if
 # some CA connections are bad
 save_restoreSet_IncompleteSetsOk(1)
