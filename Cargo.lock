@@ -2227,6 +2227,7 @@ name = "ioc-conventions"
 version = "0.1.0"
 dependencies = [
  "cfloat-gate",
+ "epics-rs",
 ]
 
 [[package]]
