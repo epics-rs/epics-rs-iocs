@@ -22,6 +22,10 @@ motorSimConfigAxis("$(PORT)", 1, 100, -100, 0, 0)
 # Each axis's basic_asyn_motor.db, as C's motorSim.cmd loads them.
 dbLoadTemplate("$(MOTORSIM_IOC)/db/motorSim.substitutions", "P=$(P),PORT=$(PORT)")
 
+# motorUtil's records. C's st.cmd runs motorUtilInit("IOC:") without loading
+# motorUtil.db, so the allstop and alldone it serves never exist.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+
 iocInit()
 
 # Example:
