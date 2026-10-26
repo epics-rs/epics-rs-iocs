@@ -11,7 +11,7 @@
 #============================================================
 
 epicsEnvSet("P",      "PM500:")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial3")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -49,5 +49,5 @@ motorUtilInit("$(P)")
 
 # Example:
 #   dbl
-#   camonitor PM500:m1 PM500:m1.RBV
-#   caput PM500:m1 5.0
+#   camonitor PM500:m31 PM500:m31.RBV
+#   caput PM500:m31 5.0
