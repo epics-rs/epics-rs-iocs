@@ -1,6 +1,8 @@
 # C's iocNewport motor.substitutions.SMC100, P and PORT from st.cmd; the
 # values are the motor record this IOC had before. The driver boundary is
 # raw steps of SMC100CreateController's eguPerStep, so MRES must equal it.
+# C's MRES is 0.00001 against eguPerStep "0.00005", which reads every
+# position back at a fifth of the stage's.
 file "$(MOTOR)/db/basic_asyn_motor.db"
 {
 pattern
