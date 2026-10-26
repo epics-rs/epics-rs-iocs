@@ -1030,7 +1030,9 @@ static int buildTrajectory(SS_ID ssId, struct UserVar *pVar, double *realTimeTra
 #endif
 
 	for (i=0; i<npoints; i++) {
-		if (fabs(velocity[i]) > maxV) {
+		/* Upstream passed a NaN velocity (0/0 from a zero time step with no motion, as a flat
+		 * one-point build has), and state build sent the motors to a start position of NaN. */
+		if (!isfinite(velocity[i]) || (fabs(velocity[i]) > maxV)) {
 			printf("velocity > limit %f at point %d: vel=%f\n", maxV, i, velocity[i]);
 			return(-1);
 		}
