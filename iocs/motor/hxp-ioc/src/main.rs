@@ -34,17 +34,16 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // asyn's devEpics, for HXP_extra.db / HXP_coords.db at address 0, and
-    // the sseq HXP_coords.db syncs the motors with after setting a
-    // coordinate system (opt-in in epics-rs).
+    // asyn.dbd, as C's IOC links it: the asyn record, devEpics for
+    // HXP_extra.db / HXP_coords.db at address 0, and the iocsh commands
+    // (`drvAsynIPPortConfigure`). Then the sseq HXP_coords.db syncs the
+    // motors with after setting a coordinate system (opt-in in epics-rs).
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, asyn_factory);
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
     app = app.register_record_type("sseq", || {
         Box::new(epics_rs::base::server::records::sseq::SseqRecord::default())
     });
-
-    // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // HXP controller create command (creates all six axes) and the motor
     // device support.
