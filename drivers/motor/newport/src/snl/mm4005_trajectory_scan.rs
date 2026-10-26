@@ -106,10 +106,11 @@ fn write_only(v: &seqg::seqg_vars, command: impl CSrc) -> i32 {
         .map_or_else(|e| e.status() as i32, |_| 0)
 }
 
-/// C `writeRead`: the asyn status, the reply in `stringIn` as the port's
-/// read leaves it there, a NUL after it when there is room. An exchange
-/// that failed before its read leaves `stringIn` as it was.
+/// C `writeRead`: the asyn status, and `stringIn` emptied, then the reply
+/// as the port's read leaves it there. An exchange that failed before its
+/// read leaves it empty.
 fn write_read(v: &seqg::seqg_vars, command: impl CSrc) -> i32 {
+    v.stringIn.with_c_dst(|b| b.fill(0));
     let (read, status) = user(v)
         .with_timeout(Duration::from_secs(30))
         .write_read(0, &terminated(command), MAX_MM4000_STRING)
@@ -122,9 +123,6 @@ fn write_read(v: &seqg::seqg_vars, command: impl CSrc) -> i32 {
         v.stringIn.with_c_dst(|b| {
             let n = read.len().min(b.len());
             b[..n].copy_from_slice(&read[..n]);
-            if let Some(end) = b.get_mut(n) {
-                *end = 0;
-            }
         });
     }
     status.map_or_else(|e| e.status() as i32, |()| 0)
@@ -215,7 +213,7 @@ macro_rules! seqg_escaped {
     (r#"static int getMotorMoving(SS_ID ssId, struct UserVar *pVar);"#) => {};
     (r#"static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar);"#) => {};
     (r#"static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar);"#) => {};
-    (r#"static int writeOnly(SS_ID ssId, struct UserVar *pVar, char *command) { asynStatus status; size_t nwrite; char buffer[256]; strncpy(buffer, command, 256 -3); strcat(buffer, "\r"); status = pasynOctetSyncIO->write((asynUser *)pVar->pasynUser, buffer, strlen(buffer), 1.0, &nwrite); return(status); } static int writeRead(SS_ID ssId, struct UserVar *pVar, char *command) { asynStatus status; size_t nwrite, nread; int eomReason; char buffer[256]; strncpy(buffer, command, 256 -3); strcat(buffer, "\r"); status = pasynOctetSyncIO->writeRead((asynUser *)pVar->pasynUser, buffer, strlen(buffer), pVar->stringIn, 256, 30.0, &nwrite, &nread, &eomReason); return(status); } static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos) { char *p, *tok_save; int j; int dir; writeRead(ssId, pVar, "TP"); tok_save = 0; p = epicsStrtok_r(pVar->stringIn, ",", &tok_save); for (j=0; (j<pVar->numAxes && p!=0); j++) { if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1; pos[j] = atof(p+3)*dir + pVar->epicsMotorOff[j]; p = epicsStrtok_r(0, ",", &tok_save); } return(0); } static int getMotorMoving(SS_ID ssId, struct UserVar *pVar) { char *p, *tok_save; int j; int result=0, mask=0x01; writeRead(ssId, pVar, "MS"); tok_save = 0; p = epicsStrtok_r(pVar->stringIn, ",", &tok_save); for (j=0; (j<pVar->numAxes && p!=0); j++) { if (*(p+3) & 0x01) result |= mask; mask = mask << 1; p = epicsStrtok_r(0, ",", &tok_save); } return(result); } static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar) { int j; int result=0, mask=0x01; for (j=0; j<pVar->numAxes; j++) { seq_pvGet(ssId, pVar->epicsMotorDoneIndex[j], 0); if (pVar->epicsMotorDone[j] == 0) result |= mask; mask = mask << 1; } return(result); } static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar) { int j; while(getEpicsMotorMoving(ssId, pVar)) { for (j=0; j<pVar->numAxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } epicsThreadSleep(0.1); } for (j=0; j<pVar->numAxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } return(0); }"#) => {};
+    (r#"static int writeOnly(SS_ID ssId, struct UserVar *pVar, char *command) { asynStatus status; size_t nwrite; char buffer[256]; strncpy(buffer, command, 256 -3); strcat(buffer, "\r"); status = pasynOctetSyncIO->write((asynUser *)pVar->pasynUser, buffer, strlen(buffer), 1.0, &nwrite); return(status); } static int writeRead(SS_ID ssId, struct UserVar *pVar, char *command) { asynStatus status; size_t nwrite, nread; int eomReason; char buffer[256]; strncpy(buffer, command, 256 -3); strcat(buffer, "\r"); memset(pVar->stringIn, 0, 256); status = pasynOctetSyncIO->writeRead((asynUser *)pVar->pasynUser, buffer, strlen(buffer), pVar->stringIn, 256, 30.0, &nwrite, &nread, &eomReason); return(status); } static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos) { char *p, *tok_save; int j; int dir; writeRead(ssId, pVar, "TP"); tok_save = 0; p = epicsStrtok_r(pVar->stringIn, ",", &tok_save); for (j=0; (j<pVar->numAxes && p!=0); j++) { if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1; pos[j] = atof(p+3)*dir + pVar->epicsMotorOff[j]; p = epicsStrtok_r(0, ",", &tok_save); } return(0); } static int getMotorMoving(SS_ID ssId, struct UserVar *pVar) { char *p, *tok_save; int j; int result=0, mask=0x01; writeRead(ssId, pVar, "MS"); tok_save = 0; p = epicsStrtok_r(pVar->stringIn, ",", &tok_save); for (j=0; (j<pVar->numAxes && p!=0); j++) { if (*(p+3) & 0x01) result |= mask; mask = mask << 1; p = epicsStrtok_r(0, ",", &tok_save); } return(result); } static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar) { int j; int result=0, mask=0x01; for (j=0; j<pVar->numAxes; j++) { seq_pvGet(ssId, pVar->epicsMotorDoneIndex[j], 0); if (pVar->epicsMotorDone[j] == 0) result |= mask; mask = mask << 1; } return(result); } static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar) { int j; while(getEpicsMotorMoving(ssId, pVar)) { for (j=0; j<pVar->numAxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } epicsThreadSleep(0.1); } for (j=0; j<pVar->numAxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } return(0); }"#) => {};
     ($env:ident, r#"pVar->status = pasynOctetSyncIO->connect(pVar->asynPort, 0,"#, r#"(asynUser **)&pVar->pasynUser,"#, r#"NULL);"#) => {
         $env.var().status.set(connect($env.var().asynPort.get()))
     };
@@ -300,10 +298,9 @@ mod tests {
         assert_eq!(rig.sent(), [format!("{}\r", &long[..253])]);
     }
 
-    /// The reply lands as the port's read leaves it: a NUL after it, the
-    /// rest of the last reply behind that.
+    /// The reply lands in an emptied `stringIn`, none of the last behind it.
     #[test]
-    fn a_reply_is_terminated_over_the_last() {
+    fn a_reply_replaces_the_last() {
         let (v, _rig) = vars("mm4005_over", |cmd| match cmd {
             "1GC?\r" => "1GC0.25".into(),
             _ => "XC12".into(),
@@ -312,13 +309,13 @@ mod tests {
         write_read(&v, &v.stringOut);
         write_read(&v, "XC1");
         v.stringIn
-            .with_c_dst(|b| assert_eq!(&b[..8], b"XC12\x0025\x00"));
+            .with_c_dst(|b| assert_eq!(&b[..8], b"XC12\0\0\0\0"));
     }
 
-    /// A refused write leaves `stringIn` as the last reply left it, as C's
-    /// writeRead returns before its read.
+    /// A refused write leaves `stringIn` empty: C's writeRead returns before
+    /// its read, after the memset.
     #[test]
-    fn a_failed_write_leaves_the_last_reply() {
+    fn a_failed_write_empties_the_reply() {
         let (rig, _) = LineRig::failing(
             "mm4005_refused",
             |_| "TB@ no error".into(),
@@ -329,7 +326,7 @@ mod tests {
         connect(v.asynPort.get());
         assert_eq!(write_read(&v, "TB"), 0);
         assert_ne!(write_read(&v, "XC1"), 0);
-        assert_eq!(text(&v.stringIn), "TB@ no error");
+        assert_eq!(text(&v.stringIn), "");
         assert_eq!(rig.sent(), ["TB\r", "XC1\r"]);
     }
 
@@ -415,6 +412,10 @@ mod tests {
             traced: usize,
             /// Whether `1TQ` answers no axis and `2TQ` a cut one.
             short: bool,
+            /// Whether the `TB` that reads `VC`'s result is refused.
+            refuse_verify: bool,
+            /// Whether `VC` was the last write.
+            verifying: bool,
         }
 
         type Shared = Arc<Mutex<Mm4005>>;
@@ -455,6 +456,13 @@ mod tests {
                     },
                 },
             }
+        }
+
+        /// Whether the write of `cmd` is refused.
+        fn refused(mm: &Shared, cmd: &str) -> bool {
+            let mut m = mm.lock().unwrap();
+            let verify = std::mem::replace(&mut m.verifying, cmd == "VC\r");
+            m.refuse_verify && verify && cmd == "TB\r"
         }
 
         /// `port`'s axis m1 of one simulated motor.
@@ -577,9 +585,15 @@ mod tests {
                 position: 0.5,
                 traced: 0,
                 short: false,
+                refuse_verify: false,
+                verifying: false,
             }));
-            let shared = mm.clone();
-            let (rig, _) = LineRig::new(port, move |cmd| reply(&shared, cmd));
+            let (shared, writes) = (mm.clone(), mm.clone());
+            let (rig, _) = LineRig::failing(
+                port,
+                move |cmd| reply(&shared, cmd),
+                move |cmd| refused(&writes, cmd),
+            );
             sim_axis(port);
             let mut macros: HashMap<String, String> = [
                 ("P", "T:"),
@@ -736,6 +750,21 @@ mod tests {
                 string(&p.db, "T:traj1:BuildMessage"),
                 "TBE trajectory error"
             );
+        }
+
+        /// ss trajectoryScan state build: a refused TB after VC fails the
+        /// build, though the TB before it, at the twentieth element, answered
+        /// no error.
+        #[epics_rs::base::epics_test]
+        async fn a_refused_verify_read_fails_the_build() {
+            let p = boot("mm4005VerifyRefused", &[]).await;
+            p.mm.lock().unwrap().refuse_verify = true;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(20)).await;
+            p.sent();
+            p.build().await;
+            expect(&p.db, &[("T:traj1:BuildStatus", 2.0)]).await;
+            assert_eq!(p.sent().iter().filter(|c| *c == "TB").count(), 2);
+            assert_eq!(string(&p.db, "T:traj1:BuildMessage"), "");
         }
 
         /// ss trajectoryScan states execute and wait_execute: the run polled

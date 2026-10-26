@@ -614,6 +614,9 @@ static int writeRead(SS_ID ssId, struct UserVar *pVar, char *command)
     /* Copy command so we can add terminator */
     strncpy(buffer, command, MAX_MM4000_STRING-3);
     strcat(buffer, "\r");
+    /* A failed writeRead leaves stringIn as it was: in upstream, a TB that
+     * failed after one answering "TB@" read as no error.  Empty it first. */
+    memset(pVar->stringIn, 0, MAX_MM4000_STRING);
     /* Use 30 second timeout, some commands take a long time to reply */
     status = pasynOctetSyncIO->writeRead((asynUser *)pVar->pasynUser, buffer,
                                strlen(buffer), pVar->stringIn, MAX_MM4000_STRING, 
