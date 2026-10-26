@@ -27,7 +27,9 @@ XPSCreateAxis("$(PORT)", 0, "GROUP1.POSITIONER", "20480")
 # XPSCreateProfile(portName, maxPoints, ftpUsername, ftpPassword)
 XPSCreateProfile("$(PORT)", 2000, "Administrator", "Administrator")
 
-# The axis's basic_asyn_motor.db, as C's st.cmd.xps5 loads it.
+# The axis's basic_asyn_motor.db, as C's st.cmd.xps5 loads it. C's other
+# XPSCreateController example, st.cmd.xps6, loads a motor.substitutions.xps6
+# that C does not ship, so it boots with no motor records.
 dbLoadTemplate("$(XPS_IOC)/db/motor.substitutions.xps5", "P=$(P),PORT=$(PORT)")
 
 # xpsSlave.st's records, for the seq line below:
