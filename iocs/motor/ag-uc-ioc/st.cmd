@@ -11,10 +11,8 @@
 #============================================================
 
 epicsEnvSet("P",      "AGILIS:")
-epicsEnvSet("M0",     "m0")
-epicsEnvSet("M1",     "m1")
-epicsEnvSet("PORT",   "MOTOR1")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("PORT",   "Agilis1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -33,16 +31,19 @@ asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- Agilis controller + axes ----
 # AG_UCCreateController(portName, serialPort, numAxes, movingPollPeriod, idlePollPeriod)
-AG_UCCreateController("$(PORT)", "$(SERIAL)", 2, 100, 1000)
+AG_UCCreateController("$(PORT)", "$(SERIAL)", 2, 50, 500)
 # AG_UCCreateAxis(portName, axis, hasLimits, forwardAmplitude, reverseAmplitude)
-AG_UCCreateAxis("$(PORT)", 0, 0, 50, -50)
-AG_UCCreateAxis("$(PORT)", 1, 0, 50, -50)
+AG_UCCreateAxis("$(PORT)", 0, 0, 50, -30)
+AG_UCCreateAxis("$(PORT)", 1, 0, 40, -50)
 
-dbLoadRecords("$(AG_UC_IOC)/db/agilis.template", "P=$(P),M0=$(M0),M1=$(M1),PORT=$(PORT)")
+# Each axis's basic_asyn_motor.db and the serial line's asyn record, as
+# C's st.cmd.AG_UC loads them.
+dbLoadTemplate("$(AG_UC_IOC)/db/motor.substitutions.AG_UC", "P=$(P),PORT=$(PORT)")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=serial1,PORT=$(SERIAL),ADDR=0,OMAX=256,IMAX=256")
 
 iocInit()
 
 # Example:
 #   dbl
-#   camonitor AGILIS:m0 AGILIS:m0.RBV
-#   caput AGILIS:m0 1      # 1000 steps at MRES .001
+#   camonitor AGILIS:m1 AGILIS:m1.RBV
+#   caput AGILIS:m1 1      # 1000 steps at MRES .001
