@@ -1,10 +1,8 @@
 # C's iocNewport motor.substitutions.xps5, P and PORT from st.cmd. MRES must
 # be 1/stepsPerUnit of XPSCreateAxis.
 #
-# C's XPS_extra.db and profileMove{Controller,Axis}[XPS].template blocks are
-# left out. This driver serves none of XPS_MIN_JERK, XPS_MAX_JERK, XPS_STATUS
-# or XPS_PROFILE_*, and XpsHead overrides no profile hook, so the base
-# PROFILE_* records would report a build that drives nothing.
+# C's XPS_extra.db block is left out. This driver serves none of
+# XPS_MIN_JERK, XPS_MAX_JERK or XPS_STATUS.
 file "$(MOTOR)/db/basic_asyn_motor.db"
 {
 pattern
@@ -17,4 +15,46 @@ pattern
 {"m6",  "asynMotor",  5,     "Nu",      degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
 {"m7",  "asynMotor",  6,     "Dummy1",  degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
 {"m8",  "asynMotor",  7,     "Dummy2",  degrees,  Neg,  4.0,   0.1,   .5,    0,     1,     .2,    .00025,  4,     190,   -190,  ""}
+}
+
+file "$(MOTOR)/db/profileMoveController.template"
+{
+pattern
+{R,       NAXES,  NPOINTS,  NPULSES,  TIMEOUT}
+{Prof1:,  6,      2000,     2000,     1}
+}
+
+file "$(XPS_IOC)/db/profileMoveControllerXPS.template"
+{
+pattern
+{R,       NAXES,  NPOINTS,  NPULSES,  TIMEOUT}
+{Prof1:,  6,      2000,     2000,     1}
+}
+
+file "$(MOTOR)/db/profileMoveAxis.template"
+{
+pattern
+{R,       M,  ADDR,  NPOINTS,  NREADBACK,  MOTOR,      PREC,  TIMEOUT}
+{Prof1:,  1,  0,     2000,     2000,       "$(P)m1",   3,     1}
+{Prof1:,  2,  1,     2000,     2000,       "$(P)m2",   4,     1}
+{Prof1:,  3,  2,     2000,     2000,       "$(P)m3",   4,     1}
+{Prof1:,  4,  3,     2000,     2000,       "$(P)m4",   4,     1}
+{Prof1:,  5,  4,     2000,     2000,       "$(P)m5",   4,     1}
+{Prof1:,  6,  5,     2000,     2000,       "$(P)m6",   4,     1}
+{Prof1:,  7,  6,     2000,     2000,       "$(P)m6",   4,     1}
+{Prof1:,  8,  7,     2000,     2000,       "$(P)m6",   4,     1}
+}
+
+file "$(XPS_IOC)/db/profileMoveAxisXPS.template"
+{
+pattern
+{R,       M,  ADDR,  NPOINTS,  NREADBACK,  PREC,  TIMEOUT}
+{Prof1:,  1,  0,     2000,     2000,       3,     1}
+{Prof1:,  2,  1,     2000,     2000,       4,     1}
+{Prof1:,  3,  2,     2000,     2000,       4,     1}
+{Prof1:,  4,  3,     2000,     2000,       4,     1}
+{Prof1:,  5,  4,     2000,     2000,       4,     1}
+{Prof1:,  6,  5,     2000,     2000,       4,     1}
+{Prof1:,  7,  6,     2000,     2000,       4,     1}
+{Prof1:,  8,  7,     2000,     2000,       4,     1}
 }

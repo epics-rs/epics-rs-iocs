@@ -12,13 +12,11 @@ use ioc_conventions::{
 const RENAMES: &[(&str, &str)] = &[("IOC:", "XPS:")];
 
 /// XPS_extra.db's records, whose XPS_MIN_JERK, XPS_MAX_JERK and XPS_STATUS
-/// this driver lacks, and the profile-move records (XPS_PROFILE_*, and
-/// PROFILE_* with no XpsHead hook).
+/// this driver lacks.
 fn unserved() -> Vec<String> {
     let extra = ["MIN_JERK_TIME", "MAX_JERK_TIME", "READBACK", "XPS_STATUS"];
     (1..=6)
         .flat_map(|m| extra.map(|r| format!("IOC:m{m}{r}")))
-        .chain(["IOC:Prof1:".to_string()])
         .collect()
 }
 
