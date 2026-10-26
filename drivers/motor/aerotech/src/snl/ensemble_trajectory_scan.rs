@@ -1288,5 +1288,20 @@ mod tests {
             );
             seq_stop(p.tid);
         }
+
+        /// EnsembleTrajectoryScan.st:187: init sizes the program to NumAxes
+        /// once, so one put past MAX_AXES after it leaves a build as it was.
+        #[epics_rs::base::epics_test]
+        async fn a_num_axes_put_after_init_leaves_the_build_alone() {
+            let p = boot("ensNumAxes", [0.0, 0.5]).await;
+            put(&p.db, "T:traj1:NumAxes", EpicsValue::Long(9)).await;
+            put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)],
+            )
+            .await;
+            seq_stop(p.tid);
+        }
     }
 }
