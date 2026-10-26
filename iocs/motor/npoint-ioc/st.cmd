@@ -13,8 +13,8 @@
 #============================================================
 
 epicsEnvSet("P",      "NPOINT:")
-epicsEnvSet("CTRL",   "C300_1")
-epicsEnvSet("IPPORT", "C300")
+epicsEnvSet("CTRL",   "C300")
+epicsEnvSet("IPPORT", "serial1")
 epicsEnvSet("HOST",   "192.168.0.100:23")
 epicsEnvSet("NAXES",  "3")
 
@@ -27,7 +27,7 @@ asynOctetSetOutputEos("$(IPPORT)", 0, "\n")
 
 # ---- C300 controller ----
 # C300CreateController(portName, C300PortName, numAxes, movingPollPeriod, idlePollPeriod).
-C300CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000)
+C300CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 250, 2000)
 
 # Each axis's asyn_motor.db, as C's C300.cmd loads them.
 dbLoadTemplate("$(NPOINT_IOC)/db/C300.substitutions", "P=$(P),PORT=$(CTRL)")
@@ -43,4 +43,4 @@ motorUtilInit("$(P)")
 # Example:
 #   dbl
 #   camonitor NPOINT:m1 NPOINT:m1.RBV
-#   caput NPOINT:m1 100000
+#   caput NPOINT:m1 10

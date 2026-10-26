@@ -1,11 +1,9 @@
-# C's iocNPoint C300.substitutions, P and PORT from st.cmd; the values are
-# the motor record this IOC had before. Positions cross the driver boundary
-# in the controller's native units, so MRES = 1.
+# C's iocNPoint C300.substitutions, P and PORT from st.cmd.
 file "$(MOTOR)/db/asyn_motor.db"
 {
 pattern
-{N,  M,       DTYP,         ADDR,  DESC,  EGU,     DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,    DLLM,     INIT}
-{1,  "m$(N)", "asynMotor",  0,     "",    counts,  Pos,  1,     0,     .2,    0,     0,     .5,    1,     0,     524288,  -524288,  ""}
-{2,  "m$(N)", "asynMotor",  1,     "",    counts,  Pos,  1,     0,     .2,    0,     0,     .5,    1,     0,     524288,  -524288,  ""}
-{3,  "m$(N)", "asynMotor",  2,     "",    counts,  Pos,  1,     0,     .2,    0,     0,     .5,    1,     0,     524288,  -524288,  ""}
+{N,  M,       DTYP,         ADDR,  DESC,          EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,             PREC,  DHLM,  DLLM,   INIT}
+{1,  "m$(N)", "asynMotor",  0,     "motor $(N)",  um,   Pos,  1,     .1,    .2,    0,     1,     .2,    9.5367431641e-5,  5,     50,    -50,    ""}
+{2,  "m$(N)", "asynMotor",  1,     "motor $(N)",  um,   Pos,  1,     .1,    .2,    0,     1,     .2,    9.5367431641e-5,  5,     50,    -50,    ""}
+{3,  "m$(N)", "asynMotor",  2,     "motor $(N)",  um,   Pos,  1,     .1,    .2,    0,     1,     .2,    2.384185791e-5,   5,     12.5,  -12.5,  ""}
 }
