@@ -762,6 +762,9 @@ macro_rules! seqg_escaped {
     ($env:ident, r#"pVar->abortSocket = getSocket(ssId, pVar, 10.);"#) => {
         $env.var().abortSocket.set(get_socket($env, 10.))
     };
+    ($env:ident, r#"pVar->positionSocket = getSocket(ssId, pVar, 1.0);"#) => {
+        $env.var().positionSocket.set(get_socket($env, 1.0))
+    };
     ($env:ident, r#"buildAndVerify(ssId, pVar);"#) => {
         build_and_verify($env.var())
     };
@@ -1019,6 +1022,7 @@ mod tests {
         use epics_seq_rs::{seq, seq_stop};
 
         use super::*;
+        use crate::xps::XpsSocket;
 
         const DB: &str = include_str!("../../../../../iocs/motor/xps-ioc/db/trajectoryScan.db");
 
@@ -1128,6 +1132,14 @@ mod tests {
             panic!("the XPS never saw {what}: {:?}", xps.0.lock().unwrap().log);
         }
 
+        /// The program's macros for one axis on the XPS at `port`.
+        fn macros(port: u16) -> String {
+            format!(
+                "P=T:,R=traj1:,M1=m1,IPADDR=127.0.0.1,PORT={port},GROUP=G1,P1=P1,\
+                 USERNAME=Administrator,PASSWORD=pw"
+            )
+        }
+
         async fn put(db: &PvDatabase, pv: &str, v: EpicsValue) {
             db.put_record_field_from_ca(pv, "VAL", v).await.unwrap();
         }
@@ -1149,8 +1161,39 @@ mod tests {
             panic!("want {want:?}, got {got:?}");
         }
 
-        /// XPS_trajectoryScan.st:586-603: an Abort while the trajectory runs
-        /// sends GroupMoveAbort on the abort socket, so the execution ends.
+        /// init's positionSocket: the position polls ask this program's XPS,
+        /// though another one holds socket 0.
+        #[epics_rs::base::epics_test]
+        async fn positions_are_read_from_its_own_xps() {
+            let (decoy_port, decoy) = xps();
+            let (port, xps) = xps();
+            let db = ioc().await;
+            let (index, handle) =
+                crate::ioc::connect_to_server(&db, "127.0.0.1", decoy_port.into()).unwrap();
+            let name = handle.port_name().to_string();
+            let decoy_socket = XpsSocket::new(
+                handle,
+                index,
+                &name,
+                SocketMode::Query,
+                Duration::from_secs(1),
+            );
+            SOCKETS
+                .lock()
+                .unwrap()
+                .insert(index, Arc::new(decoy_socket));
+            let tid =
+                seq(&XPS_trajectoryScan, &macros(port), 0, &db).expect("XPS_trajectoryScan starts");
+            until(&xps, "a position poll", |x| {
+                x.log.iter().any(|c| c == "GroupPositionCurrentGet")
+            })
+            .await;
+            assert_eq!(decoy.0.lock().unwrap().log, Vec::<String>::new());
+            seq_stop(tid);
+        }
+
+        /// ss xpsTrajectoryAbort: an Abort while the trajectory runs sends
+        /// GroupMoveAbort on the abort socket, so the execution ends.
         /// The xpsTrajectoryRun state set is in MultipleAxesPVTExecution
         /// then, as C's is, and xpsTrajectoryAbort must still see abortMon.
         #[ignore = "epics-seq-rs EventGate holds abortMon while xpsTrajectoryRun \
@@ -1172,11 +1215,8 @@ mod tests {
             put(&db, "T:traj1:Nelements", EpicsValue::Long(2)).await;
             // An axis that does not move: T:m1 has no device to complete one.
             put(&db, "T:traj1:M1Move", EpicsValue::Enum(0)).await;
-            let macros = format!(
-                "P=T:,R=traj1:,M1=m1,IPADDR=127.0.0.1,PORT={port},GROUP=G1,P1=P1,\
-                 USERNAME=Administrator,PASSWORD=pw"
-            );
-            let tid = seq(&XPS_trajectoryScan, &macros, 0, &db).expect("XPS_trajectoryScan starts");
+            let tid =
+                seq(&XPS_trajectoryScan, &macros(port), 0, &db).expect("XPS_trajectoryScan starts");
             // init clears buildMon as it ends (:200); xpsTrajectoryPosition's
             // first poll comes a second after.
             until(&xps, "a position poll", |x| {

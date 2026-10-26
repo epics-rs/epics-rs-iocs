@@ -190,6 +190,9 @@ ss xpsTrajectoryScan {
             %%pVar->pollSocket = getSocket(ssId, pVar, POLL_TIMEOUT);
             %%pVar->driveSocket = getSocket(ssId, pVar, DRIVE_TIMEOUT);
             %%pVar->abortSocket = getSocket(ssId, pVar, ABORT_TIMEOUT);
+            /* Upstream never assigned positionSocket, so getMotorPositions asked socket 0:
+             * the first one the IOC opened, to whichever XPS it went. */
+            %%pVar->positionSocket = getSocket(ssId, pVar, POLL_TIMEOUT);
         
             for (j=0; j<numAxes; j++) {
                 motorCurrentIndex[j]   =  pvIndex(motorCurrent[j]);
