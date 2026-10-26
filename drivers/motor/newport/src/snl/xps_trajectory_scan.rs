@@ -1024,7 +1024,7 @@ mod tests {
         use epics_rs::motor::builder::{AxisSetup, MotorBuilder};
         use epics_rs::motor::sim_motor::SimMotor;
         use epics_rs::motor::trace::TraceUser;
-        use epics_seq_rs::{seq, seq_stop};
+        use epics_seq_rs::{SeqThreadId, seq, seq_stop};
 
         use super::*;
         use crate::xps::XpsSocket;
@@ -1210,6 +1210,75 @@ mod tests {
             panic!("want {want:?}, got {got:?}");
         }
 
+        struct Program {
+            db: Arc<PvDatabase>,
+            xps: Shared,
+            tid: SeqThreadId,
+            file: String,
+            _scan: ScanOwner,
+            _ftp_log: std::sync::mpsc::Receiver<String>,
+        }
+
+        impl Drop for Program {
+            fn drop(&mut self) {
+                seq_stop(self.tid);
+                let _ = std::fs::remove_file(&self.file);
+            }
+        }
+
+        /// The program on its own XPS and FTP server, T:m1 on asyn port
+        /// `port` as `ioc` sets it, Nelements 2, once init is done.
+        async fn boot(port: &str, set: &[(&str, &str)]) -> Program {
+            let (xps_port, xps) = xps();
+            let (ftp_addr, ftp_log) = ftp::tests::server("331 password\r\n");
+            ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
+            let (db, scan) = ioc(port, set).await;
+            let file = std::env::temp_dir().join(format!("{port}{}.trj", std::process::id()));
+            let file = file.to_str().unwrap().to_string();
+            put(
+                &db,
+                "T:traj1:TrajectoryFile",
+                EpicsValue::String(file.clone().into()),
+            )
+            .await;
+            put(&db, "T:traj1:Nelements", EpicsValue::Long(2)).await;
+            let tid = seq(&XPS_trajectoryScan, &macros(xps_port), 0, &db)
+                .expect("XPS_trajectoryScan starts");
+            // init clears buildMon as it ends; xpsTrajectoryPosition's
+            // first poll comes a second after.
+            until(&xps, "a position poll", |x| {
+                x.log.iter().any(|c| c == "GroupPositionCurrentGet")
+            })
+            .await;
+            Program {
+                db,
+                xps,
+                tid,
+                file,
+                _scan: scan,
+                _ftp_log: ftp_log,
+            }
+        }
+
+        /// Execute, the run let end as done once wait_execute reads the
+        /// element, as the start loop ends only on 45; a failed execute
+        /// never gets that far.
+        async fn execute_to_the_end(p: &Program) {
+            put(&p.db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
+            for _ in 0..500 {
+                let started = {
+                    let x = p.xps.0.lock().unwrap();
+                    x.running && x.log.iter().any(|c| c == "MultipleAxesPVTParametersGet")
+                };
+                if started || value(&p.db, "T:traj1:ExecStatus") == 2.0 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            p.xps.0.lock().unwrap().released = true;
+            p.xps.1.notify_all();
+        }
+
         /// init's positionSocket: the position polls ask this program's XPS,
         /// though another one holds socket 0.
         #[epics_rs::base::epics_test]
@@ -1245,65 +1314,26 @@ mod tests {
         /// MAX_AXES motors, and the program runs on.
         #[epics_rs::base::epics_test]
         async fn num_axes_past_max_axes_is_clamped_before_init_assigns() {
-            let (port, xps) = xps();
-            let (db, _scan) = ioc("xpsNumAxes", &[("NAXES", "9")]).await;
-            let tid =
-                seq(&XPS_trajectoryScan, &macros(port), 0, &db).expect("XPS_trajectoryScan starts");
-            until(&xps, "a position poll", |x| {
-                x.log.iter().any(|c| c == "GroupPositionCurrentGet")
-            })
-            .await;
-            seq_stop(tid);
+            boot("xpsNumAxes", &[("NAXES", "9")]).await;
         }
 
         /// ss xpsTrajectoryScan state execute: T:m1 at user 10, dial 0, is
         /// within the XPS's -5..5 once its offset of 10 is taken off.
         #[epics_rs::base::epics_test]
         async fn soft_limits_are_checked_in_dial() {
-            let (port, xps) = xps();
-            let (ftp_addr, _ftp_log) = ftp::tests::server("331 password\r\n");
-            ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
-            let (db, _scan) = ioc("xpsLimits", &[("OFF", "10")]).await;
-            let file = std::env::temp_dir().join(format!("xpsl{}.trj", std::process::id()));
-            let file = file.to_str().unwrap().to_string();
-            put(
-                &db,
-                "T:traj1:TrajectoryFile",
-                EpicsValue::String(file.clone().into()),
+            let p = boot("xpsLimits", &[("OFF", "10")]).await;
+            put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)],
             )
             .await;
-            put(&db, "T:traj1:Nelements", EpicsValue::Long(2)).await;
-            let tid =
-                seq(&XPS_trajectoryScan, &macros(port), 0, &db).expect("XPS_trajectoryScan starts");
-            until(&xps, "a position poll", |x| {
-                x.log.iter().any(|c| c == "GroupPositionCurrentGet")
-            })
-            .await;
-
-            put(&db, "T:traj1:Build", EpicsValue::Enum(1)).await;
-            expect(&db, &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)]).await;
-            put(&db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
-            // The run ends once wait_execute reads the element, as the start
-            // loop ends only on 45; a failed execute never gets that far.
-            for _ in 0..500 {
-                let started = {
-                    let x = xps.0.lock().unwrap();
-                    x.running && x.log.iter().any(|c| c == "MultipleAxesPVTParametersGet")
-                };
-                if started || value(&db, "T:traj1:ExecStatus") == 2.0 {
-                    break;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-            xps.0.lock().unwrap().released = true;
-            xps.1.notify_all();
+            execute_to_the_end(&p).await;
             expect(
-                &db,
+                &p.db,
                 &[("T:traj1:Execute", 0.0), ("T:traj1:ExecStatus", 1.0)],
             )
             .await;
-            seq_stop(tid);
-            let _ = std::fs::remove_file(file);
         }
 
         /// ss xpsTrajectoryAbort: an Abort while the trajectory runs sends
@@ -1314,42 +1344,22 @@ mod tests {
                     blocks in MultipleAxesPVTExecution (seqrt, BIG for 0.33)"]
         #[epics_rs::base::epics_test]
         async fn abort_during_execute_aborts_the_trajectory() {
-            let (port, xps) = xps();
-            let (ftp_addr, _ftp_log) = ftp::tests::server("331 password\r\n");
-            ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
-            let (db, _scan) = ioc("xpsAbort", &[]).await;
-            let file = std::env::temp_dir().join(format!("xpsa{}.trj", std::process::id()));
-            let file = file.to_str().unwrap().to_string();
-            put(
-                &db,
-                "T:traj1:TrajectoryFile",
-                EpicsValue::String(file.clone().into()),
-            )
-            .await;
-            put(&db, "T:traj1:Nelements", EpicsValue::Long(2)).await;
-            let tid =
-                seq(&XPS_trajectoryScan, &macros(port), 0, &db).expect("XPS_trajectoryScan starts");
-            // init clears buildMon as it ends (:200); xpsTrajectoryPosition's
-            // first poll comes a second after.
-            until(&xps, "a position poll", |x| {
-                x.log.iter().any(|c| c == "GroupPositionCurrentGet")
-            })
-            .await;
-
-            put(&db, "T:traj1:Build", EpicsValue::Enum(1)).await;
-            expect(&db, &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)]).await;
-            put(&db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
+            let p = boot("xpsAbort", &[]).await;
+            let (db, xps) = (&p.db, &p.xps);
+            put(db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            expect(db, &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)]).await;
+            put(db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
             // xpsTrajectoryScan in wait_execute, which alone reads the
             // element: its start loop (:421) ends only on 45 or FAILURE.
-            expect(&db, &[("T:traj1:ExecState", 2.0)]).await;
-            until(&xps, "the element read", |x| {
+            expect(db, &[("T:traj1:ExecState", 2.0)]).await;
+            until(xps, "the element read", |x| {
                 x.running && x.log.iter().any(|c| c == "MultipleAxesPVTParametersGet")
             })
             .await;
 
-            put(&db, "T:traj1:Abort", EpicsValue::Enum(1)).await;
+            put(db, "T:traj1:Abort", EpicsValue::Enum(1)).await;
             expect(
-                &db,
+                db,
                 &[
                     ("T:traj1:Abort", 0.0),
                     ("T:traj1:ExecStatus", 3.0),
@@ -1364,8 +1374,6 @@ mod tests {
                 .position(|c| c == "MultipleAxesPVTExecution")
                 .unwrap();
             assert!(log[run..].contains(&"GroupMoveAbort".to_string()));
-            seq_stop(tid);
-            let _ = std::fs::remove_file(file);
         }
     }
 }
