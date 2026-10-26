@@ -1135,20 +1135,21 @@ mod tests {
         }
 
         /// The trajectory database on NumAxes 1 and T:m1 on the simulated
-        /// axis of asyn port `port`, its user offset `off`.
-        async fn ioc(port: &str, off: &str) -> (Arc<PvDatabase>, ScanOwner) {
+        /// axis of asyn port `port`, its user offset 0, unless `set` says.
+        async fn ioc(port: &str, set: &[(&str, &str)]) -> (Arc<PvDatabase>, ScanOwner) {
             sim_axis(port);
-            let macros: HashMap<String, String> = [
+            let mut macros: HashMap<String, String> = [
                 ("P", "T:"),
                 ("R", "traj1:"),
                 ("NAXES", "1"),
                 ("NELM", "2000"),
                 ("NPULSE", "2000"),
                 ("PORT", port),
-                ("OFF", off),
+                ("OFF", "0"),
             ]
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .into();
+            macros.extend(set.iter().map(|&(k, v)| (k.to_string(), v.to_string())));
             let (motor, factory) = epics_rs::motor::motor_record_factory();
             let (db, _) = IocBuilder::new()
                 .register_record_type(motor, factory)
@@ -1215,7 +1216,7 @@ mod tests {
         async fn positions_are_read_from_its_own_xps() {
             let (decoy_port, decoy) = xps();
             let (port, xps) = xps();
-            let (db, _scan) = ioc("xpsPositions", "0").await;
+            let (db, _scan) = ioc("xpsPositions", &[]).await;
             let (index, handle) =
                 crate::ioc::connect_to_server(&db, "127.0.0.1", decoy_port.into()).unwrap();
             let name = handle.port_name().to_string();
@@ -1240,6 +1241,21 @@ mod tests {
             seq_stop(tid);
         }
 
+        /// ss xpsTrajectoryScan state init: NumAxes past MAX_AXES assigns
+        /// MAX_AXES motors, and the program runs on.
+        #[epics_rs::base::epics_test]
+        async fn num_axes_past_max_axes_is_clamped_before_init_assigns() {
+            let (port, xps) = xps();
+            let (db, _scan) = ioc("xpsNumAxes", &[("NAXES", "9")]).await;
+            let tid =
+                seq(&XPS_trajectoryScan, &macros(port), 0, &db).expect("XPS_trajectoryScan starts");
+            until(&xps, "a position poll", |x| {
+                x.log.iter().any(|c| c == "GroupPositionCurrentGet")
+            })
+            .await;
+            seq_stop(tid);
+        }
+
         /// ss xpsTrajectoryScan state execute: T:m1 at user 10, dial 0, is
         /// within the XPS's -5..5 once its offset of 10 is taken off.
         #[epics_rs::base::epics_test]
@@ -1247,7 +1263,7 @@ mod tests {
             let (port, xps) = xps();
             let (ftp_addr, _ftp_log) = ftp::tests::server("331 password\r\n");
             ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
-            let (db, _scan) = ioc("xpsLimits", "10").await;
+            let (db, _scan) = ioc("xpsLimits", &[("OFF", "10")]).await;
             let file = std::env::temp_dir().join(format!("xpsl{}.trj", std::process::id()));
             let file = file.to_str().unwrap().to_string();
             put(
@@ -1301,7 +1317,7 @@ mod tests {
             let (port, xps) = xps();
             let (ftp_addr, _ftp_log) = ftp::tests::server("331 password\r\n");
             ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
-            let (db, _scan) = ioc("xpsAbort", "0").await;
+            let (db, _scan) = ioc("xpsAbort", &[]).await;
             let file = std::env::temp_dir().join(format!("xpsa{}.trj", std::process::id()));
             let file = file.to_str().unwrap().to_string();
             put(

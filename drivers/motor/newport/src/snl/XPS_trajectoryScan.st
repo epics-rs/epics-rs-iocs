@@ -159,6 +159,9 @@ ss xpsTrajectoryScan {
                        " xpsAddress=%s groupName=%s\n",
                        xpsAddress, groupName);
             }
+            /* Force numAxes to be <= MAX_AXES.
+             * Upstream clamped it after this loop had assigned NumAxes motors. */
+            if (numAxes > MAX_AXES) numAxes = MAX_AXES;
             for (i=0; i<numAxes; i++) {
                 axisName[i] = malloc(NAME_LEN);
                 sprintf(macroBuf, "P%d", i+1);
@@ -183,9 +186,6 @@ ss xpsTrajectoryScan {
                 }
             }
 
-            /* Force numAxes to be <= MAX_AXES */
-            if (numAxes > MAX_AXES) numAxes = MAX_AXES;
-            
             /* Get sockets for communicating with XPS */
             %%pVar->pollSocket = getSocket(ssId, pVar, POLL_TIMEOUT);
             %%pVar->driveSocket = getSocket(ssId, pVar, DRIVE_TIMEOUT);
