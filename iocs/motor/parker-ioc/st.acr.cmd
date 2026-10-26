@@ -8,7 +8,7 @@
 #============================================================
 
 epicsEnvSet("P",      "ACR:")
-epicsEnvSet("CTRL",   "PARKER1")
+epicsEnvSet("CTRL",   "ACR1")
 epicsEnvSet("IPPORT", "ARIES1")
 epicsEnvSet("HOST",   "gse-aries1:5002")
 epicsEnvSet("NAXES",  "1")
@@ -30,6 +30,10 @@ dbLoadTemplate("$(PARKER_IOC)/db/motor.substitutions.acr", "P=$(P),PORT=$(CTRL)"
 dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=asyn1,PORT=$(IPPORT),ADDR=0,OMAX=256,IMAX=256")
 
 iocInit()
+
+# As C's st.cmd.acr, which uses no save/restore.
+dbpf("$(P)m1.RTRY", "0")
+dbpf("$(P)m1.TWV", "0.1")
 
 # Example:
 #   dbl

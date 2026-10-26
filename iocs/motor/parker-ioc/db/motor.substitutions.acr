@@ -1,11 +1,11 @@
 # C's iocParker motor.substitutions.acr on this IOC's one controller, P and
 # PORT from st.acr.cmd. C's binary I/O rows are named $(P)$(PORT):<R>, P
-# IOC:; the values are the motor record this IOC had before.
+# IOC:.
 file "$(MOTOR)/db/basic_asyn_motor.db"
 {
 pattern
-{N,  M,       DTYP,         ADDR,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,     PREC,  DHLM,  DLLM,  INIT}
-{1,  "m$(N)", "asynMotor",  0,     "",    mm,   Pos,  .05,   .01,   .5,    0,     1,     .2,    1.25e-7,  5,     200,   -2,    ""}
+{N,  M,       DTYP,         ADDR,  DESC,          EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,     PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "asynMotor",  0,     "motor $(N)",  mm,   Pos,  .05,   .01,   .5,    0,     1,     .2,    1.25e-7,  5,     200,   -2,    ""}
 }
 
 file "$(PARKER_IOC)/db/ACRAux.template"

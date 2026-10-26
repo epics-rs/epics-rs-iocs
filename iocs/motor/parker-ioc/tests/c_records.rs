@@ -32,7 +32,7 @@ fn st_acr_cmd_loads_the_c_acr_records() {
     // the second controller this IOC does not configure.
     let c = renamed(
         &read_dbl(&dir().join("tests/st.cmd.acr.dbl")),
-        &[("IOC:ACR1:", "ACR:PARKER1:"), ("IOC:", "ACR:")],
+        &[("IOC:", "ACR:")],
         &["IOC:m2", "IOC:ACR2:", "IOC:asyn2"],
     );
     assert_same_records(&booted_records(ioc(), &dir().join("st.acr.cmd")), &c);

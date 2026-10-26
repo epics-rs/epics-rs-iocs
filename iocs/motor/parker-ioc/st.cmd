@@ -8,8 +8,8 @@
 #============================================================
 
 epicsEnvSet("P",      "OEM:")
-epicsEnvSet("CTRL",   "PARKER1")
-epicsEnvSet("IPPORT", "OEM")
+epicsEnvSet("CTRL",   "OEM")
+epicsEnvSet("IPPORT", "PORT")
 epicsEnvSet("HOST",   "192.168.1.220:5000")
 epicsEnvSet("NAXES",  "1")
 
@@ -18,7 +18,7 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
 # ---- OEM750 controller ----
 # OEMCreateController(portName, OEMPortName, numAxes, movingPollPeriod, idlePollPeriod).
-OEMCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000)
+OEMCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 20, 1000)
 
 # The axis's basic_asyn_motor.db and OEMSupport.template, as C's st.cmd.oem
 # loads them.

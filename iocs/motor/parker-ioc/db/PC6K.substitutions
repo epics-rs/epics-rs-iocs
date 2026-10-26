@@ -1,8 +1,8 @@
 # C's iocParker PC6K.substitutions on this IOC's one axis, P from
-# st-pc6k.cmd; the values are the motor record this IOC had before.
+# st-pc6k.cmd.
 file "$(MOTOR)/db/motor.db"
 {
 pattern
-{N,  M,       DTYP,    C,  S,  DESC,  EGU,    DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,     DLLM,      INIT}
-{1,  "m$(N)", "PC6K",  0,  0,  "",    steps,  Pos,  1000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{N,  M,       DTYP,    C,  S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,    PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "PC6K",  0,  0,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4,  5,     100,   -100,  ""}
 }
