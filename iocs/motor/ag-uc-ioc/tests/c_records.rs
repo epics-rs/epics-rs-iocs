@@ -1,8 +1,9 @@
-//! st.cmd loads the records C's st.cmd.AG_UC loads, on the script's prefix.
+//! st.cmd boots with the records C's st.cmd.AG_UC loads, on the script's
+//! prefix.
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, read_dbl, renamed, script_records};
+use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
 
 #[test]
 fn st_cmd_loads_the_c_ag_uc_records() {
@@ -12,5 +13,6 @@ fn st_cmd_loads_the_c_ag_uc_records() {
         &[("IOC:", "AGILIS:")],
         &[],
     );
-    assert_same_records(&script_records(&dir.join("st.cmd")), &c);
+    let ioc = Path::new(env!("CARGO_BIN_EXE_ag-uc-ioc"));
+    assert_same_records(&booted_records(ioc, &dir.join("st.cmd")), &c);
 }

@@ -1,9 +1,9 @@
-//! st.cmd loads the records C's iocNewport loads for an HXP, on the
+//! st.cmd boots with the records C's iocNewport loads for an HXP, on the
 //! script's prefix.
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, read_dbl, renamed, script_records};
+use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
 
 #[test]
 fn st_cmd_loads_the_c_hxp_records() {
@@ -13,5 +13,6 @@ fn st_cmd_loads_the_c_hxp_records() {
         &[("newport:", "HXP:"), ("xxx:hxp:c0:", "HXP:")],
         &[],
     );
-    assert_same_records(&script_records(&dir.join("st.cmd")), &c);
+    let ioc = Path::new(env!("CARGO_BIN_EXE_hxp-ioc"));
+    assert_same_records(&booted_records(ioc, &dir.join("st.cmd")), &c);
 }
