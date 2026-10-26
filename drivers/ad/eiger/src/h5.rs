@@ -8,14 +8,12 @@
 //! which is what libhdf5 loads out of `HDF5_PLUGIN_PATH` in the C build. No
 //! plugin path, no `libhdf5`, no `libbshuf` is needed here.
 
-use std::ops::Range;
-use std::sync::Arc;
-
 use epics_rs::ad_core::ndarray::NDDataType;
 use hdf5_reader::error::{Error as H5Error, Result as H5Result};
 use hdf5_reader::messages::filter_pipeline::FilterDescription;
 use hdf5_reader::{
-    ByteOrder, Dataset, DatasetChunk, Datatype, FilterRegistry, Hdf5File, OpenOptions,
+    ByteOrder, Dataset, DatasetChunk, Datatype, FilterRegistry, Hdf5File, OpenOptions, SliceInfo,
+    SliceInfoElem,
 };
 
 use crate::bslz4;
@@ -124,26 +122,28 @@ pub struct H5Frame {
     pub data_type: NDDataType,
     /// 0-based threshold index within the frame (C's `j`).
     pub threshold: usize,
-    pixels: Pixels,
+    /// `None` when the image failed to read.
+    pixels: Option<Pixels>,
 }
 
 /// Where one image's decoded bytes are held.
 enum Pixels {
     /// Its own chunk: the FileWriter writes one image per chunk.
     Chunk(DatasetChunk),
-    /// Its span of the whole dataset, read at once for any other layout.
-    Span(Arc<Vec<u8>>, Range<usize>),
+    /// Its own hyperslab, read for any other layout.
+    Slab(Vec<u8>),
 }
 
 impl H5Frame {
-    /// The image's bytes as the NDArray holds them: SignedData only relabels
-    /// them. C's `H5Dread` decodes them into `pData` (eigerDetector.cpp:1869),
-    /// so copy them straight into the pool array.
-    pub fn bytes(&self) -> &[u8] {
-        match &self.pixels {
+    /// The image's bytes as the NDArray holds them, `None` when it failed to
+    /// read: SignedData only relabels them. C's `H5Dread` decodes them into
+    /// `pData` (eigerDetector.cpp:1869), so copy them straight into the pool
+    /// array.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.pixels.as_ref().map(|pixels| match pixels {
             Pixels::Chunk(chunk) => chunk.bytes(),
-            Pixels::Span(all, at) => &all[at.clone()],
-        }
+            Pixels::Slab(bytes) => bytes,
+        })
     }
 }
 
@@ -162,7 +162,8 @@ fn report(err: &mut dyn FnMut(&str), msg: &str) -> Reported {
 /// decodes the same images, in C's order, for the caller to copy into one.
 ///
 /// `err` receives the lines C's `parseH5File` prints, in its words; `Err(Reported)`
-/// means one of them ended the parse.
+/// means one of them ended the parse. An image that fails to read does not:
+/// C reports it at its turn (eigerDetector.cpp:1869-1874).
 pub fn parse(
     buf: &[u8],
     signed_data: bool,
@@ -188,9 +189,7 @@ pub fn parse(
     let layout = layout_of(dataset.shape()).map_err(|e| report(err, &e))?;
     let data_type = data_type_of(dataset.dtype(), signed_data).map_err(|e| report(err, &e))?;
 
-    let images =
-        images(&dataset, &layout, data_type).map_err(|_| report(err, "couldn't read image"))?;
-    Ok(images
+    Ok(images(&dataset, &layout, data_type)
         .into_iter()
         .enumerate()
         .map(|(k, pixels)| H5Frame {
@@ -202,50 +201,108 @@ pub fn parse(
         .collect())
 }
 
-/// Every image's bytes, in C's order (`i`, then `j`).
-fn images(dataset: &Dataset, layout: &Layout, data_type: NDDataType) -> H5Result<Vec<Pixels>> {
-    if let Some(chunks) = image_chunks(dataset, layout)? {
-        return Ok(chunks.into_iter().map(Pixels::Chunk).collect());
+/// Every image's bytes, in C's order (`i`, then `j`), `None` for each one
+/// that failed to read.
+fn images(dataset: &Dataset, layout: &Layout, data_type: NDDataType) -> Vec<Option<Pixels>> {
+    if let Some(chunks) = image_chunks(dataset, layout) {
+        return chunks
+            .into_iter()
+            .map(|chunk| chunk.map(Pixels::Chunk))
+            .collect();
     }
-    let all = Arc::new(dataset.read_raw_bytes()?);
-    let size = layout.height * layout.width * data_type.element_size();
-    Ok((0..layout.n_images * layout.n_thresh)
-        .map(|k| Pixels::Span(Arc::clone(&all), k * size..(k + 1) * size))
-        .collect())
+    (0..layout.n_images * layout.n_thresh)
+        .map(|k| {
+            read_image(dataset, layout, data_type, k)
+                .ok()
+                .map(Pixels::Slab)
+        })
+        .collect()
 }
 
-/// The decoded chunks in C's image order, when every image is a chunk of its
-/// own; `None` for any other layout.
-fn image_chunks(dataset: &Dataset, layout: &Layout) -> H5Result<Option<Vec<DatasetChunk>>> {
+/// The chunks in C's image order, `None` for each one that failed to decode,
+/// when every image is a chunk of its own; `None` for any other layout.
+fn image_chunks(dataset: &Dataset, layout: &Layout) -> Option<Vec<Option<DatasetChunk>>> {
     let four_d = dataset.ndim() == 4;
     let mut one_image = vec![1, layout.height as u32, layout.width as u32];
     if four_d {
         one_image.insert(0, 1);
     }
     if dataset.chunks() != Some(one_image) {
-        return Ok(None);
+        return None;
     }
-    let mut slots: Vec<Option<DatasetChunk>> = std::iter::repeat_with(|| None)
-        .take(layout.n_images * layout.n_thresh)
-        .collect();
-    for chunk in dataset.iter_chunks()? {
-        let chunk = chunk?;
-        let at = chunk.offsets();
-        let k = at[0] as usize * layout.n_thresh + if four_d { at[1] as usize } else { 0 };
-        let Some(slot) = slots.get_mut(k) else {
-            return Ok(None);
-        };
-        *slot = Some(chunk);
+    let chunks: Vec<_> = dataset.iter_chunks().ok()?.map(Result::ok).collect();
+    // A chunk that fails to decode carries no offsets, so it is placed by its
+    // position in the index: sound only when every image has a chunk and
+    // every decoded one sits at its own image's position. An unwritten chunk
+    // reads as the fill value, which only `read_image` materializes.
+    let in_place = chunks.len() == layout.n_images * layout.n_thresh
+        && chunks.iter().enumerate().all(|(k, chunk)| {
+            chunk.as_ref().is_none_or(|chunk| {
+                let at = chunk.offsets();
+                at[0] as usize * layout.n_thresh + if four_d { at[1] as usize } else { 0 } == k
+            })
+        });
+    in_place.then_some(chunks)
+}
+
+/// Image `k`'s bytes, read as C reads every image, one hyperslab at a time
+/// (eigerDetector.cpp:1857-1869); the typed read costs one pass more than
+/// C, on layouts the FileWriter does not write.
+fn read_image(
+    dataset: &Dataset,
+    layout: &Layout,
+    data_type: NDDataType,
+    k: usize,
+) -> H5Result<Vec<u8>> {
+    let mut selections = vec![SliceInfoElem::Index((k / layout.n_thresh) as u64)];
+    if dataset.ndim() == 4 {
+        selections.push(SliceInfoElem::Index((k % layout.n_thresh) as u64));
     }
-    // An unwritten chunk reads as the fill value, which only the whole read
-    // materializes.
-    Ok(slots.into_iter().collect())
+    for len in [layout.height, layout.width] {
+        selections.push(SliceInfoElem::Slice {
+            start: 0,
+            end: len as u64,
+            step: 1,
+        });
+    }
+    let slab = SliceInfo { selections };
+    Ok(match data_type.element_size() {
+        1 => dataset.read_slice::<u8>(&slab)?.into_iter().collect(),
+        2 => dataset
+            .read_slice::<u16>(&slab)?
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect(),
+        _ => dataset
+            .read_slice::<u32>(&slab)?
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect(),
+    })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+
+    /// `src`'s pixels as the FileWriter frames one bslz4 chunk.
+    pub(crate) fn filewriter_chunk(src: &NDArray) -> Vec<u8> {
+        let raw = src.data().as_u8_slice();
+        let element_size = src.data().data_type().element_size();
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&(raw.len() as u64).to_be_bytes());
+        chunk.extend_from_slice(
+            &((bslz4::default_block_size(element_size) * element_size) as u32).to_be_bytes(),
+        );
+        chunk.extend_from_slice(
+            ad_plugins_rs::codec::compress_bslz4(src)
+                .unwrap()
+                .data()
+                .as_u8_slice(),
+        );
+        chunk
+    }
 
     #[test]
     fn a_3d_dataset_is_one_threshold() {
@@ -331,12 +388,7 @@ mod tests {
             vec![NDDimension::new(pixels.len())],
             NDDataBuffer::from_vec(pixels.clone()),
         );
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
-
-        let mut chunk = Vec::new();
-        chunk.extend_from_slice(&((pixels.len() * 4) as u64).to_be_bytes());
-        chunk.extend_from_slice(&((bslz4::default_block_size(4) * 4) as u32).to_be_bytes());
-        chunk.extend_from_slice(compressed.data().as_u8_slice());
+        let chunk = filewriter_chunk(&src);
 
         let desc = FilterDescription {
             id: FILTER_BSLZ4,

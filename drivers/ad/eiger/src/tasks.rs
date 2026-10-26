@@ -886,6 +886,8 @@ async fn parse_task(
         s.trace()
             .flow("parseTask", format_args!("file={}", file.name));
         let data = file.data.lock().clone();
+        // C never assigns parseH5File's status (eigerDetector.cpp:1683), so
+        // its line is dead; a file that cannot be parsed reports it here.
         if let Some(data) = data
             && parse_h5(&s, &data).await.is_err()
         {
@@ -910,8 +912,9 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
     // Once per file, counted on locally (eigerDetector.cpp:1841-1842, :1903-1904).
     let mut counters = Counters::read(s).await;
 
-    // C `break`s out of the threshold loop on a refused alloc
-    // (eigerDetector.cpp:1849), dropping the rest of that image's thresholds.
+    // C `break`s out of the threshold loop on a refused alloc or a failed
+    // read (eigerDetector.cpp:1853, :1874), dropping the rest of that image's
+    // thresholds; the next image goes on.
     let mut skip_image = false;
     for frame in frames {
         if frame.threshold == 0 {
@@ -940,11 +943,16 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
             skip_image = true;
             continue;
         };
+        let Some(bytes) = frame.bytes() else {
+            trace.err("parseH5File", "couldn't read image");
+            skip_image = true;
+            continue;
+        };
         array
             .fill()
             .data_mut()
             .as_u8_slice_mut()
-            .copy_from_slice(frame.bytes());
+            .copy_from_slice(bytes);
         // Per frame, after its updateTimeStamps (eigerDetector.cpp:1880, :1892).
         let timestamp = port_stamp(&s.handle).await;
         let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
@@ -1639,7 +1647,7 @@ pub fn signals() -> (Signals, Receivers) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::{NDDataType, NDDataView};
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView};
 
     #[test]
     fn stream_apis_follow_c_create_and_delete() {
@@ -2095,30 +2103,79 @@ mod tests {
     /// `/entry/data/data` of u16 images, its pixels counting up from 0;
     /// `chunked` stores one image per chunk, as the FileWriter does.
     fn h5_file(shape: &[usize], chunked: bool) -> Vec<u8> {
+        h5_bytes(|data| {
+            let n: usize = shape.iter().product();
+            let mut dataset = data.new_dataset::<u16>().shape(shape);
+            if chunked {
+                dataset = dataset.chunk(&one_image(shape));
+            }
+            dataset
+                .create("data")
+                .unwrap()
+                .write_raw(&(0..n).map(|i| i as u16).collect::<Vec<_>>())
+                .unwrap();
+        })
+    }
+
+    /// A FileWriter data file: [`h5_file`]'s chunked pixels, each chunk
+    /// bslz4-compressed, except that chunk `corrupt` fails to decode and
+    /// chunk `unwritten` is left out.
+    fn filewriter_h5(shape: &[usize], corrupt: usize, unwritten: Option<usize>) -> Vec<u8> {
+        h5_bytes(|data| {
+            let one_image = one_image(shape);
+            let size: usize = one_image.iter().product();
+            let images: usize = shape.iter().product::<usize>() / size;
+            let dataset = data
+                .new_dataset::<u16>()
+                .shape(shape)
+                .chunk(&one_image)
+                .filter_pipeline(rust_hdf5::FilterPipeline {
+                    filters: vec![rust_hdf5::Filter {
+                        id: h5::FILTER_BSLZ4,
+                        flags: 0,
+                        cd_values: vec![],
+                    }],
+                })
+                .create("data")
+                .unwrap();
+            for k in (0..images).filter(|&k| Some(k) != unwritten) {
+                let pixels: Vec<u16> = (k * size..(k + 1) * size).map(|i| i as u16).collect();
+                let chunk = if k == corrupt {
+                    vec![0; 8]
+                } else {
+                    crate::h5::tests::filewriter_chunk(&NDArray::with_data(
+                        vec![NDDimension::new(size)],
+                        NDDataBuffer::from_vec(pixels),
+                    ))
+                };
+                dataset.write_chunk_raw(k, &chunk, 0).unwrap();
+            }
+        })
+    }
+
+    /// `shape` with every axis but the last two cut to 1.
+    fn one_image(shape: &[usize]) -> Vec<usize> {
+        let mut one = shape.to_vec();
+        let images = one.len() - 2;
+        one[..images].fill(1);
+        one
+    }
+
+    /// The bytes of an HDF5 file whose `/entry/data` group `fill` writes.
+    fn h5_bytes(fill: impl FnOnce(&rust_hdf5::H5Group)) -> Vec<u8> {
         let path = std::env::temp_dir().join(format!(
             "eiger-h5-{}-{:?}.h5",
             std::process::id(),
             std::thread::current().id()
         ));
         let file = rust_hdf5::H5File::create(&path).unwrap();
-        let data = file
-            .create_group("entry")
-            .unwrap()
-            .create_group("data")
-            .unwrap();
-        let n: usize = shape.iter().product();
-        let mut dataset = data.new_dataset::<u16>().shape(shape);
-        if chunked {
-            let mut one_image = shape.to_vec();
-            let images = one_image.len() - 2;
-            one_image[..images].fill(1);
-            dataset = dataset.chunk(&one_image);
-        }
-        dataset
-            .create("data")
-            .unwrap()
-            .write_raw(&(0..n).map(|i| i as u16).collect::<Vec<_>>())
-            .unwrap();
+        fill(
+            &file
+                .create_group("entry")
+                .unwrap()
+                .create_group("data")
+                .unwrap(),
+        );
         file.close().unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -2154,7 +2211,7 @@ mod tests {
             create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
                 .expect("runtime");
         let outputs = Outputs::new();
-        let (tx, rx) = ndarray_channel(&format!("{name}_SINK"), 4);
+        let (tx, rx) = ndarray_channel(&format!("{name}_SINK"), 8);
         outputs.main.lock().add(tx);
         let s = shared(
             ops,
@@ -2377,6 +2434,47 @@ mod tests {
                     panic!("a SignedData uint16 image is NDInt16");
                 };
                 assert_eq!(got, &[3 * k, 3 * k + 1, 3 * k + 2], "{name} image {k}");
+            }
+        }
+    }
+
+    /// C's `break` on a failed `H5Dread` leaves only the threshold loop
+    /// (eigerDetector.cpp:1843-1874): the failed image's earlier thresholds
+    /// are published, its later ones are not, and the next image goes on.
+    #[tokio::test]
+    async fn a_failed_h5_read_skips_only_the_rest_of_its_image() {
+        let (rows, cols) = (2usize, 3usize);
+        // Three images of two thresholds; image 1 fails at threshold 1, then
+        // 0, then at 1 with the last chunk unwritten: that one reads as the
+        // fill value.
+        let cases: [(&str, usize, Option<usize>, &[usize]); 3] = [
+            ("EIGER_H5_BAD_T1", 3, None, &[0, 1, 2, 4, 5]),
+            ("EIGER_H5_BAD_T0", 2, None, &[0, 1, 4, 5]),
+            ("EIGER_H5_BAD_UNWRITTEN", 3, Some(5), &[0, 1, 2, 4, 5]),
+        ];
+        for (name, corrupt, unwritten, published) in cases {
+            let (s, mut rx) = h5_rig(name);
+            s.set_int(s.ad.base.array_callbacks, 1).await;
+            parse_h5(&s, &filewriter_h5(&[3, 2, rows, cols], corrupt, unwritten))
+                .await
+                .expect("a failed image read does not fail the file");
+            assert_eq!(rx.pending(), published.len(), "{name}: published images");
+            assert_eq!(
+                s.get_int(s.ad.base.array_counter).await,
+                published.len() as i32
+            );
+            for (id, &k) in published.iter().enumerate() {
+                let array = rx.recv().await.expect("the image is published");
+                assert_eq!(array.unique_id, id as i32, "{name}");
+                let NDDataView::U16(got) = array.data().view() else {
+                    panic!("a uint16 image is NDUInt16");
+                };
+                let first = k * rows * cols;
+                let pixel = |i: usize| if Some(k) == unwritten { 0 } else { i as u16 };
+                assert!(
+                    got.iter().zip(first..).all(|(&p, i)| p == pixel(i)),
+                    "{name}: chunk {k}"
+                );
             }
         }
     }
