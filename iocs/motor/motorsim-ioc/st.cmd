@@ -8,16 +8,17 @@
 #============================================================
 
 epicsEnvSet("P",     "SIM:")
-epicsEnvSet("PORT",  "MOTOR1")
+epicsEnvSet("PORT",  "motorSim1")
 
 # ---- simulated controller: 2 axes ----
 # motorSimCreateController(portName, numAxes, priority, stackSize)
 motorSimCreateController("$(PORT)", 2)
 
-# Optional per-axis reconfigure of hard limits / home / start:
+# Per-axis hard limits, home and start, in steps, as C's motorSim.cmd sets
+# them:
 # motorSimConfigAxis(portName, axis, hiHardLimit, lowHardLimit, home, start)
-motorSimConfigAxis("$(PORT)", 0, 100, -100, 0, 0)
-motorSimConfigAxis("$(PORT)", 1, 100, -100, 0, 0)
+motorSimConfigAxis("$(PORT)", 0, 20000, -20000,  500, 0)
+motorSimConfigAxis("$(PORT)", 1, 20000, -20000, 1500, 0)
 
 # Each axis's basic_asyn_motor.db, as C's motorSim.cmd loads them.
 dbLoadTemplate("$(MOTORSIM_IOC)/db/motorSim.substitutions", "P=$(P),PORT=$(PORT)")
@@ -34,4 +35,4 @@ motorUtilInit("$(P)")
 # Example:
 #   dbl
 #   camonitor SIM:m1 SIM:m1.RBV
-#   caput SIM:m1 5.0
+#   caput SIM:m1 1.0
