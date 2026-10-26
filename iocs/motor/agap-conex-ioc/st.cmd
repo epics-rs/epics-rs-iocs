@@ -10,10 +10,8 @@
 #============================================================
 
 epicsEnvSet("P",      "AGAP:")
-epicsEnvSet("MU",     "u")
-epicsEnvSet("MV",     "v")
-epicsEnvSet("PORT",   "MOTOR1")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("PORT",   "Agilis1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 epicsEnvSet("CID",    "1")
 
@@ -34,13 +32,19 @@ asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- CONEX-AGAP controller (creates both U and V axes) ----
 # AGAP_CONEXCreateController(portName, serialPort, controllerID, movingPollPeriod, idlePollPeriod)
-AGAP_CONEXCreateController("$(PORT)", "$(SERIAL)", $(CID), 100, 1000)
+AGAP_CONEXCreateController("$(PORT)", "$(SERIAL)", $(CID), 50, 500)
 
-dbLoadRecords("$(AGAP_CONEX_IOC)/db/agap.template", "P=$(P),MU=$(MU),MV=$(MV),PORT=$(PORT)")
+# Each axis's basic_asyn_motor.db and the serial line's asyn record, as
+# C's st.cmd.AGAP_CONEX loads them.
+dbLoadTemplate("$(AGAP_CONEX_IOC)/db/motor.substitutions.AGAP_CONEX", "P=$(P),PORT=$(PORT)")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=serial1,PORT=$(SERIAL),ADDR=0,OMAX=256,IMAX=256")
 
 iocInit()
 
+dbpf("$(P)m1.RTRY", "0")
+dbpf("$(P)m1.NTM", "0")
+
 # Example:
 #   dbl
-#   camonitor AGAP:u AGAP:u.RBV AGAP:v AGAP:v.RBV
-#   caput AGAP:u 0.5   (MRES 1e-4 = the driver stepSize_)
+#   camonitor AGAP:m1 AGAP:m1.RBV AGAP:m2 AGAP:m2.RBV
+#   caput AGAP:m1 0.5   (MRES 1e-4 = the driver stepSize_)

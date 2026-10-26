@@ -1,0 +1,10 @@
+# C's iocNewport motor.substitutions.AGAP_CONEX, P and PORT from st.cmd. MRES
+# must equal the driver's fixed stepSize_ (1e-4): positions cross the driver
+# boundary in steps.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{N,  M,        DTYP,         ADDR,  DESC,      EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,   PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)",  "asynMotor",  0,     "U tilt",  mm,   Pos,  .5,    0.1,   .25,   0,     1,     .2,    .0001,  4,     2,     -2,    ""}
+{2,  "m$(N)",  "asynMotor",  1,     "V tilt",  mm,   Pos,  .5,    0.1,   .25,   0,     1,     .2,    .0001,  4,     2,     -2,    ""}
+}
