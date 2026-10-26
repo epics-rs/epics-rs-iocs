@@ -13,7 +13,8 @@
 //! IOC's own tests can ask it which records a script loads
 //! ([`script_records`]), or which its IOC binary makes running it
 //! ([`booted_records`]), and compare them with the C IOC's `dbl`
-//! ([`read_dbl`], [`renamed`], [`assert_same_records`]).
+//! ([`read_dbl`], [`renamed`], [`assert_same_records`]), and whether the
+//! binary links asyn.dbd ([`assert_links_asyn_dbd`]).
 //!
 //! A script is run as iocsh runs it, from its own directory: the IOC's
 //! `set_default`/`set_default_path` macros and the framework's envPaths
@@ -659,17 +660,11 @@ const LOOPBACK_ENV: &[(&str, &str)] = &[
 /// ([`script_records`]), a failed exit, or any line on the IOC's stderr,
 /// where every load refusal goes.
 pub fn booted_records(binary: &Path, script: &Path) -> BTreeSet<String> {
-    static RUNS: AtomicUsize = AtomicUsize::new(0);
     let root = workspace_root();
     let mut run = Run::new(&root);
     run.lines = Some(Vec::new());
     run_script(&mut run, script);
-    let tmp = std::env::temp_dir().join(format!(
-        "ioc-conventions-{}-{}",
-        std::process::id(),
-        RUNS.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let tmp = scratch_dir();
     let (cmd, dbl) = (tmp.join("booted.cmd"), tmp.join("booted.dbl"));
     let mut lines = run.lines.unwrap_or_default();
     lines.push(format!("dbl > {}\n", dbl.display()));
@@ -699,6 +694,44 @@ pub fn booted_records(binary: &Path, script: &Path) -> BTreeSet<String> {
         out.status
     );
     records.unwrap_or_else(|| panic!("{} wrote no dbl", binary.display()))
+}
+
+/// A new directory of this process's own under the system temp dir.
+fn scratch_dir() -> PathBuf {
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "ioc-conventions-{}-{}",
+        std::process::id(),
+        RUNS.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
+
+/// Panics unless `binary` links asyn.dbd, as every C motor IOC lists it
+/// beside motorSupport.dbd: booted, it loads asynRecord.db from `$(ASYN)`
+/// and a devEpics `asynInt32` longin.
+pub fn assert_links_asyn_dbd(binary: &Path) {
+    let dir = scratch_dir();
+    std::fs::create_dir(dir.join("db")).expect("temp db dir");
+    std::fs::write(
+        dir.join("db/devEpics.db"),
+        "record(longin, \"A:li\") { field(DTYP, \"asynInt32\") field(INP, \"@asyn(none,0)\") }\n",
+    )
+    .expect("write the devEpics record");
+    std::fs::write(
+        dir.join("asyn.cmd"),
+        format!(
+            "epicsEnvSet(\"PROBE\", \"{}\")\n\
+             dbLoadRecords(\"$(ASYN)/db/asynRecord.db\", \"P=A:,R=asyn,PORT=none,ADDR=0,OMAX=0,IMAX=0\")\n\
+             dbLoadRecords(\"$(PROBE)/db/devEpics.db\")\n",
+            dir.display()
+        ),
+    )
+    .expect("write the script");
+    let records = booted_records(binary, &dir.join("asyn.cmd"));
+    std::fs::remove_dir_all(&dir).expect("remove the temp dir");
+    assert_eq!(records, BTreeSet::from(["A:asyn".into(), "A:li".into()]));
 }
 
 /// A C IOC's `dbl` output: one record name per line. `#` lines say where
