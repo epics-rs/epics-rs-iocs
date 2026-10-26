@@ -562,7 +562,7 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
                 if flat_field_valid != 0 {
                     let s = w.shared.lock();
                     if let Some(NDDataView::I32(flat)) =
-                        s.flat_field.as_ref().map(|f| f.data.view())
+                        s.flat_field.as_ref().map(|f| f.data().view())
                     {
                         apply_flat_field(&mut data, flat, s.average_flat_field);
                     }
@@ -677,10 +677,10 @@ mod tests {
     fn a_flat_field_read_publishes_the_array_allocated_at_construction() {
         let (pool, mut s) = flat_field_pool(8);
         let first = refill_flat_field(&mut s, &[5, 6], Some("d".into()), 5.5).unwrap();
-        assert!(matches!(first.data.view(), NDDataView::I32(v) if v == &[5, 6]));
+        assert!(matches!(first.data().view(), NDDataView::I32(v) if v == [5, 6]));
         drop(first);
         let second = refill_flat_field(&mut s, &[7, 8], None, 7.5).unwrap();
-        assert!(matches!(second.data.view(), NDDataView::I32(v) if v == &[7, 8]));
+        assert!(matches!(second.data().view(), NDDataView::I32(v) if v == [7, 8]));
         assert!(second.attributes.get("TIFFImageDescription").is_some());
         assert_eq!(s.average_flat_field, 7.5);
         assert_eq!(
@@ -700,8 +700,8 @@ mod tests {
         let (pool, mut s) = flat_field_pool(8);
         let held = refill_flat_field(&mut s, &[5, 6], None, 5.5).unwrap();
         let next = refill_flat_field(&mut s, &[7, 8], None, 7.5).unwrap();
-        assert!(matches!(next.data.view(), NDDataView::I32(v) if v == &[7, 8]));
-        assert!(matches!(held.data.view(), NDDataView::I32(v) if v == &[5, 6]));
+        assert!(matches!(next.data().view(), NDDataView::I32(v) if v == [7, 8]));
+        assert!(matches!(held.data().view(), NDDataView::I32(v) if v == [5, 6]));
         assert_eq!(s.average_flat_field, 7.5);
         assert_eq!((pool.num_alloc_buffers(), pool.allocated_bytes()), (1, 8));
         assert!(refill_flat_field(&mut Shared::default(), &[1, 2], None, 1.0).is_none());
@@ -813,7 +813,7 @@ mod tests {
         .unwrap();
         assert_eq!(a.unique_id, 7);
         assert_eq!(a.dims.len(), 2);
-        assert_eq!(a.data_size, 16);
+        assert_eq!(a.data_size(), 16);
         assert_eq!(
             a.attributes
                 .get("TIFFImageDescription")

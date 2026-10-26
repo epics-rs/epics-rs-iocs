@@ -775,7 +775,7 @@ impl SimEngine {
         }
 
         let stale = self.buffers.as_ref().is_none_or(|b| {
-            b.raw.data.data_type() != cfg.data_type
+            b.raw.data().data_type() != cfg.data_type
                 || !b
                     .raw
                     .dims
@@ -858,14 +858,14 @@ mod tests {
     }
 
     fn pixels_u8(a: &NDArray) -> &[u8] {
-        match a.data.view() {
+        match a.data().view() {
             NDDataView::U8(v) => v,
             other => panic!("expected U8 buffer, got {:?}", other.data_type()),
         }
     }
 
     fn pixels_f64(a: &NDArray) -> &[f64] {
-        match a.data.view() {
+        match a.data().view() {
             NDDataView::F64(v) => v,
             other => panic!("expected F64 buffer, got {:?}", other.data_type()),
         }
@@ -1566,8 +1566,8 @@ mod tests {
             ] {
                 cfg.sim_mode = mode;
                 let img = engine().compute_image(&cfg, &pool(), true).unwrap();
-                assert_eq!(img.data.data_type(), dt, "{dt:?} / {mode:?}");
-                assert_eq!(img.data.len(), 16);
+                assert_eq!(img.data().data_type(), dt, "{dt:?} / {mode:?}");
+                assert_eq!(img.data().len(), 16);
             }
         }
     }

@@ -64,7 +64,7 @@ async fn a_waveform_write_is_published_as_an_ndarray() {
 
     assert_eq!(array.dims.len(), 1);
     assert_eq!(array.dims[0].size, 8);
-    assert_eq!(f64s(&array.data), data);
+    assert_eq!(f64s(array.data()), data);
     assert_eq!(array.unique_id, 1);
 
     // Single image mode: acquisition self-clears after the complete array.
@@ -130,7 +130,7 @@ async fn append_mode_publishes_a_growing_array_on_each_write() {
         .await
         .expect("timed out")
         .expect("closed");
-    assert_eq!(f64s(&first.data), vec![1.0, 2.0, 3.0, -1.0, -1.0, -1.0]);
+    assert_eq!(f64s(first.data()), vec![1.0, 2.0, 3.0, -1.0, -1.0, -1.0]);
 
     // Second append: elements 3..5.
     handle
@@ -141,6 +141,6 @@ async fn append_mode_publishes_a_growing_array_on_each_write() {
         .await
         .expect("timed out")
         .expect("closed");
-    assert_eq!(f64s(&second.data), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(f64s(second.data()), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     assert_eq!(second.unique_id, 2, "NDArrayCounter increments per publish");
 }

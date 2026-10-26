@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(arr.dims.len(), 2);
         assert_eq!(arr.dims[0].size, 4);
         assert_eq!(arr.dims[1].size, 3);
-        match arr.data.view() {
+        match arr.data().view() {
             NDDataView::U8(v) => assert_eq!(v.len(), 12),
             other => panic!("expected U8 buffer, got {other:?}"),
         }
@@ -460,7 +460,7 @@ mod tests {
                 }],
             );
             let arr = decode(&nt);
-            assert_eq!(arr.data.data_type(), expected);
+            assert_eq!(arr.data().data_type(), expected);
         }
     }
 
@@ -511,7 +511,7 @@ mod tests {
         nt.compressed_size = 4;
         let arr = decode(&nt);
 
-        match arr.data.view() {
+        match arr.data().view() {
             NDDataView::U8(v) => assert_eq!(v, &[0xAA, 0xBB, 0xCC, 0xDD]),
             other => panic!("expected raw U8 buffer, got {other:?}"),
         }

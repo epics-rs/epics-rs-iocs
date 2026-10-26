@@ -62,7 +62,7 @@ async fn acquisition_publishes_the_2d_array_and_all_eight_signals() {
     assert_eq!(image.dims[1].size, NUM_TIME_POINTS);
     assert_eq!(image.unique_id, 0, "uniqueId_ starts at 0");
 
-    let samples = f64s(&image.data);
+    let samples = f64s(image.data());
     assert_eq!(samples.len(), MAX_SIGNALS * NUM_TIME_POINTS);
     for i in 0..NUM_TIME_POINTS {
         let want = ((i as f64 / 4.0) * 2.0 * std::f64::consts::PI).sin();
@@ -83,7 +83,7 @@ async fn acquisition_publishes_the_2d_array_and_all_eight_signals() {
         assert_eq!(array.dims[0].size, NUM_TIME_POINTS);
         assert_eq!(array.unique_id, 0, "signal {j} keeps the parent uniqueId");
 
-        let got = f64s(&array.data);
+        let got = f64s(array.data());
         let want: Vec<f64> = (0..NUM_TIME_POINTS)
             .map(|i| samples[i * MAX_SIGNALS + j])
             .collect();
@@ -132,7 +132,7 @@ async fn the_acquire_time_limit_stops_the_acquisition_by_itself() {
         .await
         .expect("timed out waiting for the 2-D array")
         .expect("2-D output closed");
-    let samples = f64s(&image.data);
+    let samples = f64s(image.data());
 
     // The computed head carries the offset; the tail is the memset zero.
     for i in 0..5 {

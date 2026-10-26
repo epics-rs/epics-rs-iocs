@@ -447,7 +447,7 @@ async fn publish_array(
         ),
         _ => (0, 0, 0),
     };
-    let data_type = array.data.data_type();
+    let data_type = array.data().data_type();
     // ArraySize_RBV is total bytes (C ADCore NDPluginBase convention):
     //   size = prod(dims) * bytes_per_element
     let num_elements: i64 = array.dims.iter().map(|d| d.size as i64).product();

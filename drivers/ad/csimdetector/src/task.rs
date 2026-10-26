@@ -66,7 +66,7 @@ fn extract_signal(pool: &DriverPool, image: &NDArray, i: usize) -> ADResult<Driv
         },
         image.dims[1].clone(),
     ];
-    let mut array = pool.convert(image, &dims_out, image.data.data_type())?;
+    let mut array = pool.convert(image, &dims_out, image.data().data_type())?;
     // `NDArrayPool::convert` copies the timestamps and attributes but not
     // `uniqueId`, which C's does (NDArrayPool.cpp:658-660).
     array.unique_id = image.unique_id;
@@ -235,7 +235,7 @@ mod tests {
         let image = fixture(&pool, 5);
         for j in 0..MAX_SIGNALS {
             let array = extract_signal(&pool, &image, j).unwrap();
-            let got = match array.data.view() {
+            let got = match array.data().view() {
                 NDDataView::F64(v) => v.to_vec(),
                 other => panic!("expected F64, got {:?}", other.data_type()),
             };
@@ -268,6 +268,6 @@ mod tests {
         let mut image = fixture(&pool, 3);
         image.data = NDDataBuffer::from_vec::<i16>(vec![7; MAX_SIGNALS * 3]);
         let array = extract_signal(&pool, &image, 2).unwrap();
-        assert_eq!(array.data.data_type(), NDDataType::Int16);
+        assert_eq!(array.data().data_type(), NDDataType::Int16);
     }
 }

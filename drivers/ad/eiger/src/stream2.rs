@@ -1178,10 +1178,7 @@ fn uncompress(
             original_data_type: data_type,
         });
         match ad_plugins_rs::codec::decompress_lz4hdf5(&src) {
-            Ok(mut out) => Ok(std::mem::replace(
-                &mut out.data,
-                NDDataBuffer::from_vec(Vec::<u8>::new()),
-            )),
+            Ok(out) => Ok(out.data().clone()),
             Err(e) => Err(err(
                 fname,
                 &format!("decompress_lz4hdf5 failed, result={e:?}\n"),
@@ -1539,7 +1536,7 @@ mod tests {
             NDDataBuffer::from_vec(pixels.clone()),
         );
         let lz4 = ad_plugins_rs::codec::compress_lz4hdf5(&src, 0).unwrap();
-        let blob = lz4.data.as_u8_slice().to_vec();
+        let blob = lz4.data().as_u8_slice().to_vec();
 
         let mut w = W::default();
         w.magic()
@@ -1576,7 +1573,7 @@ mod tests {
         let mut blob = Vec::new();
         blob.extend((256u64 * 2).to_be_bytes());
         blob.extend(((bslz4::default_block_size(2) * 2) as u32).to_be_bytes());
-        blob.extend(compressed.data.as_u8_slice());
+        blob.extend(compressed.data().as_u8_slice());
 
         let mut w = W::default();
         w.magic()

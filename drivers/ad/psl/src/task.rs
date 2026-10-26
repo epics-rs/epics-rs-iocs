@@ -331,7 +331,7 @@ async fn publish_frame(
             ParamSetValue::new(
                 ctx.ad_params.base.array_size,
                 0,
-                ParamValue::Int32(array.data_size as i32),
+                ParamValue::Int32(array.data_size() as i32),
             ),
             ParamSetValue::new(
                 ctx.ad_params.base.data_type,

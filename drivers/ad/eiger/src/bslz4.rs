@@ -243,7 +243,7 @@ mod tests {
             NDDataBuffer::from_vec(values.clone()),
         );
         let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
-        let payload = compressed.data.as_u8_slice();
+        let payload = compressed.data().as_u8_slice();
 
         let decoded = decode_blocks(payload, n, 2, 0).expect("decode");
         let decoded: Vec<u16> = decoded
@@ -290,10 +290,10 @@ mod tests {
             NDDataBuffer::from_vec(values.clone()),
         );
         let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
-        let ours = decode_blocks(compressed.data.as_u8_slice(), n, 4, 0).unwrap();
+        let ours = decode_blocks(compressed.data().as_u8_slice(), n, 4, 0).unwrap();
 
         let theirs = ad_plugins_rs::codec::decompress_bslz4(&compressed).unwrap();
-        let NDDataView::U32(theirs) = theirs.data.view() else {
+        let NDDataView::U32(theirs) = theirs.data().view() else {
             panic!("expected U32");
         };
         let ours: Vec<u32> = ours
@@ -328,7 +328,7 @@ mod tests {
         let mut framed = Vec::new();
         framed.extend_from_slice(&((n * 2) as u64).to_be_bytes());
         framed.extend_from_slice(&((default_block_size(2) * 2) as u32).to_be_bytes());
-        framed.extend_from_slice(compressed.data.as_u8_slice());
+        framed.extend_from_slice(compressed.data().as_u8_slice());
 
         let decoded = decode_with_header(&framed, 2, Some(n * 2)).unwrap();
         let decoded: Vec<u16> = decoded
@@ -363,7 +363,7 @@ mod tests {
         let mut framed = Vec::new();
         framed.extend_from_slice(&((n * 2) as u64).to_be_bytes());
         framed.extend_from_slice(&0u32.to_be_bytes()); // 0 = default
-        framed.extend_from_slice(compressed.data.as_u8_slice());
+        framed.extend_from_slice(compressed.data().as_u8_slice());
 
         let decoded = decode_with_header(&framed, 2, None).unwrap();
         assert_eq!(decoded.len(), n * 2);

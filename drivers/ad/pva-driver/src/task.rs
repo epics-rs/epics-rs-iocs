@@ -337,7 +337,7 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
     let (min_x, min_y) = (x.offset as i32, y.offset as i32);
     let (bin_x, bin_y) = (x.binning as i32, y.binning as i32);
     let (reverse_x, reverse_y) = (x.reverse as i32, y.reverse as i32);
-    let data_type = array.data.data_type() as u8 as i32;
+    let data_type = array.data().data_type() as u8 as i32;
     let color_mode = info.color_mode as i32;
     let total_bytes = info.total_bytes as i32;
 

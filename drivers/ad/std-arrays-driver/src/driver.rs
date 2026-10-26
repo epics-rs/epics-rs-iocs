@@ -264,7 +264,7 @@ impl NdStdArraysDriver {
             .persistent(0, |array| {
                 // arrayInfo_.nElements is the buffer's element count;
                 // NDDriverStdArrays.cpp:221-223 clamp the write to its tail.
-                let total = array.data.len();
+                let total = array.data().len();
                 let mut n = n_elements;
                 if next_element + n >= total {
                     n = total.saturating_sub(next_element);
@@ -633,7 +633,7 @@ mod tests {
     }
 
     fn f64s(a: &NDArray) -> Vec<f64> {
-        match a.data.view() {
+        match a.data().view() {
             NDDataView::F64(v) => v.to_vec(),
             other => panic!("expected F64, got {:?}", other.data_type()),
         }

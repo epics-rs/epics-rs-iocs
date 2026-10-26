@@ -320,7 +320,7 @@ mod tests {
         let mut chunk = Vec::new();
         chunk.extend_from_slice(&((pixels.len() * 4) as u64).to_be_bytes());
         chunk.extend_from_slice(&((bslz4::default_block_size(4) * 4) as u32).to_be_bytes());
-        chunk.extend_from_slice(compressed.data.as_u8_slice());
+        chunk.extend_from_slice(compressed.data().as_u8_slice());
 
         let desc = FilterDescription {
             id: FILTER_BSLZ4,

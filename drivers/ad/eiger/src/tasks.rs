@@ -2136,7 +2136,7 @@ mod tests {
         push.send(image(0, false)).await.unwrap();
         frame_done(1).await;
         let a = rx.recv().await.expect("frame 0");
-        assert!(matches!(a.data.view(), NDDataView::U16(_)));
+        assert!(matches!(a.data().view(), NDDataView::U16(_)));
 
         set(vec![ParamUpdate::Int32(s.ad.base.array_callbacks, 0)]).await;
         push.send(image(1, false)).await.unwrap();
@@ -2156,7 +2156,7 @@ mod tests {
         frame_done(3).await;
         let a = rx.recv().await.expect("frame 2");
         assert!(
-            matches!(a.data.view(), NDDataView::I16(_)),
+            matches!(a.data().view(), NDDataView::I16(_)),
             "SignedData=1 on frame 2"
         );
 
