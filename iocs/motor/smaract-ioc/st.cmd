@@ -24,7 +24,7 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 # ---- MCS2 controller ----
 # MCS2CreateController(portName, MCS2PortName, numAxes, movingPollPeriod,
 #                      idlePollPeriod, unusedMask), periods in ms.
-MCS2CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000, 0)
+MCS2CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 100, 0)
 
 # One motor per channel, ADDR the channel, with the rows of C's
 # motor.substitutions.smaractmcs2.
