@@ -43,7 +43,14 @@ MM4000Config(0, "$(SERIAL)")
 # directly; MRES only sets the record's raw-count resolution.
 dbLoadRecords("$(MM4000_IOC)/db/mm4000.template", "P=$(P),M=m1,C=0,S=0,MRES=0.0001,EGU=mm")
 
+# MM4005_trajectoryScan.st's records, for the seq line below:
+#   dbLoadRecords("$(MM4000_IOC)/db/trajectoryScan.db", "P=$(P),R=traj1:,NAXES=1,NELM=2000,NPULSE=2000")
+
 iocInit()
+
+# MM4005_trajectoryScan.st runs trajectoryScan.db's trajectories on the
+# MM4005 over the same serial port, motor Mn its axis n:
+#   seq &MM4005_trajectoryScan, "P=$(P),R=traj1:,M1=m1,PORT=$(SERIAL)"
 
 # Example:
 #   dbl

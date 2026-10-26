@@ -2,8 +2,8 @@
 //!
 //! Assembles: a serial octet port (`drvAsynSerialPortConfigure`), the Newport
 //! MM4000 controller (model 1: `MM4000Setup`/`MM4000Config`; model 2:
-//! `MM4000AsynSetup`/`MM4000AsynConfig` + `drvAsynMotorConfigure`), the motor record type, and
-//! the CA + PVA (QSRV) server.
+//! `MM4000AsynSetup`/`MM4000AsynConfig` + `drvAsynMotorConfigure`), the motor record type, the
+//! `MM4005_trajectoryScan` sequencer program, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p mm4000-ioc -- st.cmd
@@ -39,6 +39,10 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
+    // trajectoryScan.db's busy records: opt-in in epics-rs, as a C IOC links
+    // busy's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+
     // Standard asyn iocsh commands — provides `drvAsynSerialPortConfigure`.
     let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
@@ -53,6 +57,10 @@ async fn main() -> CaResult<()> {
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),
     );
+
+    // devNewportSeq.dbd's registrar(MM4005_trajectoryScanRegistrar): the seq
+    // shell commands and MM4005_trajectoryScan.st.
+    motor_newport::snl::mm4005_trajectory_scan::MM4005_trajectoryScanRegistrar();
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
