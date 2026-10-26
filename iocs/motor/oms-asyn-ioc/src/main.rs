@@ -36,15 +36,12 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // asyn.dbd, which every C motor IOC links: the asyn record and the
-    // devEpics asyn_motor.db and asyn_motor_model2.db use.
+    // asyn.dbd, which every C motor IOC links: the asyn record, the devEpics
+    // asyn_motor.db and asyn_motor_model2.db use, and the iocsh commands (the
+    // drvAsyn*PortConfigure family).
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
-
-    // Standard asyn iocsh commands — provides the drvAsyn*PortConfigure family.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // OMS config commands + motor device support.
     for cmd in oms_commands() {
