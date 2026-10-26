@@ -11,3 +11,6 @@ publish = false
 [dependencies]
 motor-motorsim = { path = "../../../drivers/motor/motorsim" }
 epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
+
+[dev-dependencies]
+ioc-conventions = { path = "../../../tools/ioc-conventions" }

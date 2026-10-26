@@ -1,0 +1,9 @@
+# C's iocMotorSim motorSim.substitutions on this IOC's two axes, P and PORT
+# from st.cmd; the values are the motor records this IOC had before.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{N,  M,       DTYP,         ADDR,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "asynMotor",  0,     "",    mm,   Pos,  5,     0,     .5,    0,     0,     .5,    0.01,  4,     100,   -100,  ""}
+{2,  "m$(N)", "asynMotor",  1,     "",    mm,   Pos,  5,     0,     .5,    0,     0,     .5,    0.01,  4,     100,   -100,  ""}
+}
