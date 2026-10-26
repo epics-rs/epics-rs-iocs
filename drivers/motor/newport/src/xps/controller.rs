@@ -559,9 +559,9 @@ impl XpsController {
         let mut start_moves = Vec::with_capacity(profile.axes.len());
         let mut end_moves = Vec::with_capacity(profile.axes.len());
         for (j, ax) in profile.axes.iter().enumerate() {
-            let (min_pos, max_pos, _max_vel, _max_accel) = self
+            let (_file, min_pos, max_pos, _max_vel, _max_accel) = self
                 .poll
-                .multiple_axes_pvt_verification_result_get(&ax.positioner, file_name)
+                .multiple_axes_pvt_verification_result_get(&ax.positioner)
                 .map_err(|e| {
                     format!(
                         "MultipleAxesPVTVerificationResultGet error for axis {}, status={}\n",

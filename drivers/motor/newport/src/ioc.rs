@@ -2419,6 +2419,15 @@ mod tests {
     /// A controller over a fake XPS with one G1 axis and a three-point
     /// profile.
     fn profiled(port: &str, firmware: &'static str) -> Mutex<XpsController> {
+        profiled_at(port, firmware, vec![0.0, 1.0, 2.0])
+    }
+
+    /// [`profiled`] with the profile's `positions`.
+    fn profiled_at(
+        port: &str,
+        firmware: &'static str,
+        positions: Vec<f64>,
+    ) -> Mutex<XpsController> {
         // The IP port's own FLOW lines stay off the motor port's trace.
         let line = FakeLine::new(&format!("{port}_ip"), "");
         *line.firmware.lock().unwrap() = firmware;
@@ -2437,7 +2446,7 @@ mod tests {
             times: vec![1.0, 1.0, 1.0],
             axes: vec![crate::xps::ProfileAxis {
                 positioner: "G1.P1".into(),
-                positions: vec![0.0, 1.0, 2.0],
+                positions,
             }],
         })
         .unwrap();
@@ -2473,7 +2482,14 @@ mod tests {
 
     /// The build's verdict, the upload always succeeding.
     fn build_result(port: &str, firmware: &'static str, file_name: &str) -> Result<(), String> {
-        let controller = profiled(port, firmware);
+        build_result_of(profiled(port, firmware), port, file_name)
+    }
+
+    fn build_result_of(
+        controller: Mutex<XpsController>,
+        port: &str,
+        file_name: &str,
+    ) -> Result<(), String> {
         let target = TrajectoryUpload {
             motor_port: port,
             host: "10.0.0.5",
@@ -2511,6 +2527,33 @@ mod tests {
             (upload("/Mine", true), true)
         );
         assert_eq!(build("xpsBuildNone", "0", None), (vec![], false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// XPSController.cpp:801-817 checks the start plus the verified travel
+    /// (the fake XPS's -0.5..2.5) against the fake's -100..100 soft limits.
+    #[test]
+    fn the_build_checks_the_verified_travel_against_the_soft_limits() {
+        let dir = std::env::temp_dir().join(format!("xps-travel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("traj.trj");
+        let file = file.to_str().unwrap();
+        let build = |port: &str, start: f64| {
+            let controller = profiled_at(port, "XPS-C8 V2", vec![start, start + 0.5, start + 1.0]);
+            build_result_of(controller, port, file)
+        };
+        assert_eq!(build("xpsTravelIn", 0.0), Ok(()));
+        assert_eq!(
+            build("xpsTravelHigh", 98.0),
+            Err(
+                "High soft limit violation for axis G1.P1, position=100.500000, limit=100.000000\n"
+                    .into()
+            )
+        );
+        assert_eq!(
+            build("xpsTravelLow", -99.6),
+            Err("Low soft limit violation for axis G1.P1, position=-100.100000, limit=-100.000000\n".into())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

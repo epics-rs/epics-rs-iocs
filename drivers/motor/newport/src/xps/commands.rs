@@ -384,19 +384,25 @@ impl XpsSocket {
         Ok(())
     }
 
-    /// `MultipleAxesPVTVerificationResultGet(positioner, file)` → the verified
-    /// trajectory's dynamic bounds `(minPos, maxPos, maxVel, maxAccel)` for one
-    /// positioner, relative to its start (used for the software-limit check).
+    /// `MultipleAxesPVTVerificationResultGet(positioner)` → the last verified
+    /// trajectory's `(file, minPos, maxPos, maxVel, maxAccel)` for one
+    /// positioner, positions relative to its start. The file name is an
+    /// out-parameter (XPS_C8_drivers.cpp:7353).
     pub fn multiple_axes_pvt_verification_result_get(
         &self,
         positioner: &str,
-        file: &str,
-    ) -> XpsResult<(f64, f64, f64, f64)> {
+    ) -> XpsResult<(String, f64, f64, f64, f64)> {
         let cmd = format!(
-            "MultipleAxesPVTVerificationResultGet ({positioner},{file},double *,double *,double *,double *)"
+            "MultipleAxesPVTVerificationResultGet ({positioner},char *,double *,double *,double *,double *)"
         );
         let r = self.exec(&cmd)?.require_ok()?;
-        Ok((r.double(1), r.double(2), r.double(3), r.double(4)))
+        Ok((
+            r.string(1).to_string(),
+            r.double(2),
+            r.double(3),
+            r.double(4),
+            r.double(5),
+        ))
     }
 
     /// `MultipleAxesPVTExecution(group, file, executionNumber)` — run the
@@ -621,6 +627,25 @@ impl XpsSocket {
 mod tests {
     use super::super::fake::FakeLine;
     use super::super::rpc::SocketMode;
+
+    /// XPS_C8_drivers.cpp:7353-7385: the file name is an out-parameter, so
+    /// the bounds are reply fields 2-5.
+    #[test]
+    fn pvt_verification_result_get_marshals_as_c() {
+        let line = FakeLine::new("xps_pvt_result", "");
+        let sock = line.socket(SocketMode::Query);
+        assert_eq!(
+            sock.multiple_axes_pvt_verification_result_get("G1.P1")
+                .unwrap(),
+            ("traj.trj".into(), -0.5, 2.5, 1.2, 3.4)
+        );
+        assert_eq!(
+            line.take_log(),
+            [
+                "MultipleAxesPVTVerificationResultGet (G1.P1,char *,double *,double *,double *,double *)"
+            ]
+        );
+    }
 
     /// XPS_C8_drivers.cpp:7574-7710: the SingleAxisSlave* wire strings, and
     /// a failed or short Get leaves its out-parameters alone.
