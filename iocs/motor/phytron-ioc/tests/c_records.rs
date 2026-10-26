@@ -9,17 +9,32 @@ fn dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+// C's I/O and controller rows carry no prefix; this IOC's are under its P.
+const RENAMES: [(&str, &str); 5] = [
+    ("TEST:", "phytron:"),
+    ("phytron-", "phytron:-"),
+    ("phyA", "phytron:phyA"),
+    ("phyD", "phytron:phyD"),
+    ("phy:", "phytron:phy:"),
+];
+
+/// C's st.cmd.phytron with motor.substitutions.phytron's phyMOTION blocks
+/// (see st.cmd).
+#[test]
+fn st_cmd_loads_the_c_phymotion_records() {
+    let c = renamed(
+        &read_dbl(&dir().join("tests/st.cmd.phytron.dbl")),
+        &RENAMES,
+        &["TEST:m2"],
+    );
+    assert_same_records(&script_records(&dir().join("st.cmd")), &c);
+}
+
 #[test]
 fn st_mcc_cmd_loads_the_c_mcc_records() {
-    // C's I/O rows carry no prefix; this IOC's are under its P.
     let c = renamed(
         &read_dbl(&dir().join("tests/st.cmd.mcc.dbl")),
-        &[
-            ("TEST:", "phytron:"),
-            ("phyA", "phytron:phyA"),
-            ("phyD", "phytron:phyD"),
-            ("phy:", "phytron:phy:"),
-        ],
+        &RENAMES,
         &["TEST:m2"],
     );
     assert_same_records(&script_records(&dir().join("st.mcc.cmd")), &c);

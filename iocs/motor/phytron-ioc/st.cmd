@@ -46,7 +46,10 @@ dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_motor.db", "P=$(P),M=m1,PORT=$(CTRL),AD
 
 # The module's aux records, with C's motor.substitutions.phytron values. The
 # axis records' P must be the controller records' P: an axis re-initialises
-# when the controller's $(P)-RESET_ processes.
+# when the controller's $(P)-RESET_ processes. C's st.cmd.phytron loads that
+# file's active MCC-2 blocks, so its phyMOTION gets Phytron_MCC.db records
+# and an m2 at ADDR 12, none of its axes 11, 21, 31; these are the file's
+# commented phyMOTION blocks.
 dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_MCM01.db", "P=$(P),PORT=$(CTRL),ADDR=0,TIMEOUT=10")
 dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_I1AM01.db", "P=$(P),M=m1,PORT=$(CTRL),ADDR=11,SCAN=1 second,TIMEOUT=1,INIT=YES,HOMING=0,MODE=1,POS_OFFSET=0,NEG_OFFSET=0,INIT_TIME=20,POS_TIME=20,BOOST=0,SWITCH_TYP=0,PWR_STAGE=1,ENC_TYP=1,ENC_SFI=0,ENC_DIR=1,STOP_CURR=20,RUN_CURR=80,BOOST_CURR=100,CURRENT_DELAY=20,STEP_RES=0,PS_MON=1")
 dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_AIO.db", "P=$(P)phyA1,PORT=phyA1")
