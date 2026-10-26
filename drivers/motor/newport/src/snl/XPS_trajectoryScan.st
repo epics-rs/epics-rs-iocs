@@ -684,8 +684,12 @@ static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos)
     
     status = GroupPositionCurrentGet(pVar->positionSocket,
                                      pVar->groupName,pVar->numAxes,pos);
-    if (status != 0)
+    if (status != 0) {
         printMessage("Error performing GroupPositionCurrentGet%i\n", status);
+        /* Upstream converted pos after a failed read too: the user positions it
+         * still held moved by OFF each time. */
+        return(status);
+    }
     /* Convert from XPS units (which are EPICS motor dial units) to user units */
     for (j=0; j<pVar->numAxes; j++) {
         if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1;
