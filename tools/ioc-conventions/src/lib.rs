@@ -13,9 +13,12 @@
 //! IOC's own tests can ask it which records a script loads
 //! ([`script_records`]), or which its IOC binary makes running it
 //! ([`booted_records`]), and compare them with the C IOC's `dbl`
-//! ([`read_dbl`], [`renamed`], [`assert_same_records`]), whether the
-//! binary links asyn.dbd ([`assert_links_asyn_dbd`]), and whether the script
-//! starts motorUtil as C's st.cmd does ([`assert_inits_motor_util`]).
+//! ([`read_dbl`], [`renamed`], [`assert_same_records`]), which value each
+//! field of them ends with ([`script_fields`]) against C's expansion of its
+//! own files ([`read_db`], [`renamed_fields`], [`assert_same_fields`]),
+//! whether the binary links asyn.dbd ([`assert_links_asyn_dbd`]), and whether
+//! the script starts motorUtil as C's st.cmd does
+//! ([`assert_inits_motor_util`]).
 //!
 //! A script is run as iocsh runs it, from its own directory: the IOC's
 //! `set_default`/`set_default_path` macros and the framework's envPaths
@@ -27,7 +30,7 @@
 //! through `EPICS_DB_INCLUDE_PATH`, and every template `include` through
 //! that path too.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -348,6 +351,14 @@ fn macro_args(text: &str) -> HashMap<Vec<u8>, Vec<u8>> {
         .collect()
 }
 
+/// A record as its loads leave it: its type and the last value each field
+/// was given.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Record {
+    pub rtyp: String,
+    pub fields: BTreeMap<String, String>,
+}
+
 pub struct Run<'a> {
     pub root: &'a Path,
     pub failures: Vec<String>,
@@ -363,6 +374,20 @@ pub struct Run<'a> {
     pub lines: Option<Vec<String>>,
     /// When set, every command's words, macro-expanded, in the order run.
     pub calls: Option<Vec<Vec<String>>>,
+    /// When set, every load is parsed and each record it creates is kept
+    /// here by name with its fields, then each `dbpf` line put into them.
+    pub fields: Option<BTreeMap<String, Record>>,
+    /// When set, the script is a C IOC's, run from its source tree: rs's
+    /// path rules do not apply, and a db file opens as the C IOC's installed
+    /// `db/` would hold it, by its name from these source `Db` directories.
+    pub c_db: Option<Vec<PathBuf>>,
+    /// A C run's `<` fragments and substitutions files by name, each read
+    /// as the named file instead, a fragment skipped when that is empty: the
+    /// edit a C capture made to its script.
+    pub c_swap: HashMap<String, String>,
+    /// A C run's loads that do not open or do not parse, which C refuses,
+    /// creating none of their records.
+    pub c_refused: Vec<String>,
 }
 
 impl<'a> Run<'a> {
@@ -376,6 +401,10 @@ impl<'a> Run<'a> {
             records: None,
             lines: None,
             calls: None,
+            fields: None,
+            c_db: None,
+            c_swap: HashMap::new(),
+            c_refused: Vec::new(),
         }
     }
 
@@ -408,6 +437,8 @@ impl<'a> Run<'a> {
             .unwrap_or_else(|_| script.to_path_buf());
         self.visited.insert(script.clone());
         let text = std::fs::read_to_string(&script).expect("readable .cmd");
+        let mut cwd = cwd.to_path_buf();
+        let cwd = &mut cwd;
         for (lineno, raw) in text.lines().enumerate() {
             let raw = raw.trim_start();
             if raw.is_empty() || raw.starts_with('#') {
@@ -415,9 +446,18 @@ impl<'a> Run<'a> {
             }
             let line = expand(raw, env);
             if let Some(file) = line.strip_prefix('<') {
-                let file = cwd.join(file.trim());
+                let file = match self.c_swap.get(file.trim()) {
+                    Some(swap) if swap.is_empty() => continue,
+                    Some(swap) => cwd.join(swap),
+                    None => cwd.join(file.trim()),
+                };
                 if file.is_file() {
                     self.script(&file, cwd, env, depth + 1);
+                } else if self.c_db.is_some()
+                    && (file.ends_with("envPaths") || file.ends_with("cdCommands"))
+                {
+                    // A C build writes envPaths, or cdCommands on vxWorks; the
+                    // caller's env stands for it, cdCommands' directories too.
                 } else {
                     let at = self.at(&script, lineno);
                     self.failures
@@ -446,6 +486,16 @@ impl<'a> Run<'a> {
                         }
                     }
                     env.insert(words[1].clone(), words[2].clone());
+                }
+                "cd" if words.len() >= 2 => {
+                    *cwd = match env.get(&words[1]) {
+                        Some(dir) if self.c_db.is_some() => PathBuf::from(dir),
+                        _ => cwd.join(&words[1]),
+                    }
+                }
+                "dbpf" if words.len() >= 3 => {
+                    let at = self.at(&script, lineno);
+                    self.put(&at, &words[1], &words[2]);
                 }
                 "dbLoadRecords" | "dbLoadTemplate" => {
                     self.keep(raw);
@@ -477,6 +527,16 @@ impl<'a> Run<'a> {
         env: &HashMap<String, String>,
     ) -> Option<PathBuf> {
         self.checked += 1;
+        if self.c_db.is_some() {
+            let file = &self
+                .c_swap
+                .get(file)
+                .map_or(file.to_string(), String::clone);
+            if template && cwd.join(file).is_file() {
+                return Some(cwd.join(file));
+            }
+            return self.open_c(at, file);
+        }
         if written.contains("..") {
             self.failures
                 .push(format!("{at}: path traversal in {written:?}"));
@@ -536,11 +596,11 @@ impl<'a> Run<'a> {
         cwd: &Path,
         env: &HashMap<String, String>,
     ) {
-        let Some(records) = self.records.as_mut() else {
+        if self.records.is_none() && self.fields.is_none() {
             return;
-        };
+        }
         let config = DbLoadConfig {
-            include_paths: include_path(cwd, env),
+            include_paths: self.c_db.clone().unwrap_or_else(|| include_path(cwd, env)),
             ..DbLoadConfig::default()
         };
         match parse_db_file(path, MacroDefs::from_byte_map(&macros), &config) {
@@ -556,9 +616,29 @@ impl<'a> Run<'a> {
                                 path.display()
                             ));
                         }
-                        records.insert(name);
+                        if let Some(records) = self.records.as_mut() {
+                            records.insert(name);
+                        }
+                    }
+                    if let Some(fields) = self.fields.as_mut() {
+                        let record = fields
+                            .entry(def.name.to_str_lossy().into_owned())
+                            .or_default();
+                        if def.record_type != "*" {
+                            record.rtyp = def.record_type;
+                        }
+                        for field in def.fields {
+                            let value =
+                                String::from_utf8_lossy(field.value.as_bytes()).into_owned();
+                            record.fields.insert(field.name, value);
+                        }
                     }
                 }
+            }
+            Err(_) if self.c_db.is_some() => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                self.c_refused
+                    .push(format!("{at}: {name}, which does not parse"))
             }
             Err(e) => self
                 .failures
@@ -577,7 +657,7 @@ impl<'a> Run<'a> {
         cwd: &Path,
         env: &HashMap<String, String>,
     ) {
-        if self.records.is_none() {
+        if self.records.is_none() && self.fields.is_none() {
             return;
         }
         let text = std::fs::read(subs).expect("readable substitutions");
@@ -593,7 +673,15 @@ impl<'a> Run<'a> {
                 SubstitutionEvent::Notice(_) => continue,
             };
             let file = expand(&load.file, env);
-            let Some(found) = open_db(&file, cwd, env) else {
+            let found = if self.c_db.is_some() {
+                match self.open_c(at, &file) {
+                    Some(found) => Some(found),
+                    None => continue,
+                }
+            } else {
+                open_db(&file, cwd, env)
+            };
+            let Some(found) = found else {
                 self.failures.push(format!(
                     "{at}: {} line {} names {file:?}, which does not open",
                     subs.display(),
@@ -609,6 +697,51 @@ impl<'a> Run<'a> {
             self.failures
                 .push(format!("{at}: {} stops: {fault:?}", subs.display()));
         }
+    }
+
+    /// `dbpf("record.FIELD", value)`: the field ends with `value`.
+    fn put(&mut self, at: &str, target: &str, value: &str) {
+        let Some(fields) = self.fields.as_mut() else {
+            return;
+        };
+        let (name, field) = target.split_once('.').unwrap_or((target, "VAL"));
+        match fields.get_mut(name) {
+            Some(record) => {
+                record.fields.insert(field.to_string(), value.to_string());
+            }
+            None => self
+                .failures
+                .push(format!("{at}: dbpf names {name:?}, which no load made")),
+        }
+    }
+
+    /// A C IOC's load of `file`: the source `Db` file of that name, which
+    /// the build installs into the IOC's `db/`; none is a load C refuses. Two
+    /// different files of one name fail, since which one the build installs
+    /// is not known.
+    fn open_c(&mut self, at: &str, file: &str) -> Option<PathBuf> {
+        let name = Path::new(file).file_name()?;
+        let found: Vec<PathBuf> = self
+            .c_db
+            .iter()
+            .flatten()
+            .map(|d| d.join(name))
+            .filter(|p| p.is_file())
+            .collect();
+        let differs = found
+            .windows(2)
+            .any(|w| std::fs::read(&w[0]).ok() != std::fs::read(&w[1]).ok());
+        match found.first() {
+            None => self.c_refused.push(format!(
+                "{at}: {}, which no C Db directory holds",
+                name.to_string_lossy()
+            )),
+            Some(_) if differs => self
+                .failures
+                .push(format!("{at}: {file:?} differs between {found:?}")),
+            Some(path) => return Some(path.clone()),
+        }
+        None
     }
 }
 
@@ -637,6 +770,50 @@ pub fn script_records(script: &Path) -> BTreeSet<String> {
     run.records = Some(BTreeSet::new());
     run_script(&mut run, script);
     run.records.unwrap_or_default()
+}
+
+/// The records `script` loads, each with the value every field ends with:
+/// as its loads set it, then as its `dbpf` lines put it.
+pub fn script_fields(script: &Path) -> BTreeMap<String, Record> {
+    let root = workspace_root();
+    let mut run = Run::new(&root);
+    run.fields = Some(BTreeMap::new());
+    run_script(&mut run, script);
+    run.fields.unwrap_or_default()
+}
+
+/// A C IOC's `scripts`, run in turn from its iocBoot directory `cwd` with
+/// `env` for its envPaths, each db file opened from the source `Db`
+/// directories `db_dirs` ([`Run::c_db`]), its `<` fragments swapped as
+/// [`Run::c_swap`]: the names C's `dbl` would list,
+/// the records with their fields as [`script_fields`] gives them, and the
+/// loads C refuses ([`Run::c_refused`]). Panics naming every load that fails.
+pub fn c_expansion(
+    scripts: &[PathBuf],
+    cwd: &Path,
+    mut env: HashMap<String, String>,
+    db_dirs: Vec<PathBuf>,
+    swap: HashMap<String, String>,
+) -> (BTreeSet<String>, BTreeMap<String, Record>, Vec<String>) {
+    let mut run = Run::new(cwd);
+    run.records = Some(BTreeSet::new());
+    run.fields = Some(BTreeMap::new());
+    run.c_db = Some(db_dirs);
+    run.c_swap = swap;
+    for script in scripts {
+        run.top = script.canonicalize().unwrap_or_else(|_| script.clone());
+        run.script(script, cwd, &mut env, 0);
+    }
+    assert!(
+        run.failures.is_empty(),
+        "{scripts:?} loads:\n{}",
+        run.failures.join("\n")
+    );
+    (
+        run.records.unwrap_or_default(),
+        run.fields.unwrap_or_default(),
+        run.c_refused,
+    )
 }
 
 /// The IOC's servers on loopback, beaconing and searching only there. PVA
@@ -806,6 +983,36 @@ pub fn read_dbl(path: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// A C expansion (`tests/*.db`, written by `c-expansion`): its records with
+/// their fields.
+pub fn read_db(path: &Path) -> BTreeMap<String, Record> {
+    let defs = parse_db_file(
+        path,
+        MacroDefs::from_byte_map(&HashMap::new()),
+        &DbLoadConfig::default(),
+    )
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    defs.into_iter()
+        .map(|def| {
+            let fields = def
+                .fields
+                .into_iter()
+                .map(|f| {
+                    (
+                        f.name,
+                        String::from_utf8_lossy(f.value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            let rtyp = def.record_type;
+            (
+                def.name.to_str_lossy().into_owned(),
+                Record { rtyp, fields },
+            )
+        })
+        .collect()
+}
+
 /// Whether `name` starts with the record-name prefix `prefix`. A prefix
 /// ending in a digit takes no further digit, so `m1` is not `m10`'s.
 fn has_prefix(name: &str, prefix: &str) -> bool {
@@ -822,22 +1029,108 @@ fn has_prefix(name: &str, prefix: &str) -> bool {
 /// matches is kept as it is.
 pub fn renamed(c: &BTreeSet<String>, renames: &[(&str, &str)], drops: &[&str]) -> BTreeSet<String> {
     c.iter()
-        .filter_map(|name| {
-            let rename = renames
+        .filter_map(|name| rename(name, renames, drops))
+        .collect()
+}
+
+/// One name through [`renamed`]'s rule; `None` when it is dropped.
+fn rename(name: &str, renames: &[(&str, &str)], drops: &[&str]) -> Option<String> {
+    let rename = renames
+        .iter()
+        .filter(|(from, _)| has_prefix(name, from))
+        .max_by_key(|(from, _)| from.len());
+    let drop = drops
+        .iter()
+        .filter(|from| has_prefix(name, from))
+        .max_by_key(|from| from.len());
+    match (rename, drop) {
+        (_, Some(d)) if rename.is_none_or(|(from, _)| d.len() >= from.len()) => None,
+        (Some((from, to)), _) => Some(format!("{to}{}", &name[from.len()..])),
+        _ => Some(name.to_string()),
+    }
+}
+
+/// C's records as [`renamed`] names them, and every field value that leads
+/// with a record name, a link, renamed the same way.
+pub fn renamed_fields(
+    c: &BTreeMap<String, Record>,
+    renames: &[(&str, &str)],
+    drops: &[&str],
+) -> BTreeMap<String, Record> {
+    c.iter()
+        .filter_map(|(name, record)| {
+            let fields = record
+                .fields
                 .iter()
-                .filter(|(from, _)| has_prefix(name, from))
-                .max_by_key(|(from, _)| from.len());
-            let drop = drops
-                .iter()
-                .filter(|from| has_prefix(name, from))
-                .max_by_key(|from| from.len());
-            match (rename, drop) {
-                (_, Some(d)) if rename.is_none_or(|(from, _)| d.len() >= from.len()) => None,
-                (Some((from, to)), _) => Some(format!("{to}{}", &name[from.len()..])),
-                _ => Some(name.clone()),
-            }
+                .map(|(field, value)| {
+                    let value = rename(value, renames, &[]).unwrap_or_else(|| value.clone());
+                    (field.clone(), value)
+                })
+                .collect();
+            let rtyp = record.rtyp.clone();
+            Some((rename(name, renames, drops)?, Record { rtyp, fields }))
         })
         .collect()
+}
+
+/// Two field values C would store alike: the same text, or the same number.
+fn same_value(a: &str, b: &str) -> bool {
+    let number = |v: &str| -> Option<f64> {
+        let v = v.trim();
+        match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+            Some(hex) => i64::from_str_radix(hex, 16).ok().map(|n| n as f64),
+            None => v.parse().ok(),
+        }
+    };
+    a == b || number(a).is_some_and(|x| number(b) == Some(x))
+}
+
+/// Every record of `c` that `rs` also has holds the same type and the same
+/// value in every field either side sets; the panic lists each difference.
+/// Which records exist is [`assert_same_records`]'s to check.
+pub fn assert_same_fields(rs: &BTreeMap<String, Record>, c: &BTreeMap<String, Record>) {
+    let mut diffs = Vec::new();
+    for (name, c_record) in c {
+        let Some(rs_record) = rs.get(name) else {
+            continue;
+        };
+        if rs_record.rtyp != c_record.rtyp {
+            diffs.push(format!(
+                "{name}: rs {}, C {}",
+                rs_record.rtyp, c_record.rtyp
+            ));
+            continue;
+        }
+        let fields: BTreeSet<&String> = rs_record
+            .fields
+            .keys()
+            .chain(c_record.fields.keys())
+            .collect();
+        for field in fields {
+            let (rs_value, c_value) = (rs_record.fields.get(field), c_record.fields.get(field));
+            // An empty value sets a field to its default, as leaving it unset does.
+            let same = match (rs_value, c_value) {
+                (Some(a), Some(b)) => same_value(a, b),
+                (Some(v), None) | (None, Some(v)) => v.is_empty(),
+                (None, None) => true,
+            };
+            if !same {
+                let shown =
+                    |v: Option<&String>| v.map_or("unset".to_string(), |v| format!("{v:?}"));
+                diffs.push(format!(
+                    "{name}.{field}: rs {}, C {}",
+                    shown(rs_value),
+                    shown(c_value)
+                ));
+            }
+        }
+    }
+    assert!(
+        diffs.is_empty(),
+        "field values differ ({}):\n  {}",
+        diffs.len(),
+        diffs.join("\n  ")
+    );
 }
 
 /// `rs` and `c` hold the same names; the panic lists each side's extras.
