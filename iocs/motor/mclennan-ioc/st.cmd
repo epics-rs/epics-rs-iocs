@@ -11,7 +11,7 @@
 
 epicsEnvSet("P",      "PM304:")
 epicsEnvSet("CARD",   "0")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -35,16 +35,16 @@ PM304Setup(1, 10)
 
 # PM304Config(card, asyn port, n_axes) - the model
 # (PM304 vs PM600) is auto-detected from the 1ID reply.
-PM304Config(0, "$(SERIAL)", 2)
+PM304Config(0, "$(SERIAL)", 1)
 
-# One motor record per axis (DTYP "Mclennan PM304", OUT #C$(CARD) S0, S1, ...). The controller
-# works in motor steps, so MRES = 1 and EGU = steps.
-dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m1,C=$(CARD),S=0")
-dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m2,C=$(CARD),S=1")
+# motorUtil's records and the axis's motor.db, as C's st.cmd and
+# PM304.cmd load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(MCLENNAN_IOC)/db/PM304.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
 
 # Example:
 #   dbl
 #   camonitor PM304:m1 PM304:m1.RBV
-#   caput PM304:m1 10000
+#   caput PM304:m1 10

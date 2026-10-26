@@ -1,0 +1,10 @@
+# dbl of motor R7-4-5 motorMclennan iocBoot/iocMclennan st.cmd
+mclennan:alldone
+mclennan:alldoneBlink
+mclennan:allstop
+mclennan:m1
+mclennan:m1_able
+mclennan:m1_twCh
+mclennan:m1_vCh
+mclennan:moving
+mclennan:movingDiff
