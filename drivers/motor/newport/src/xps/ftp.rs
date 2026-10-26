@@ -157,6 +157,8 @@ fn code(reply: &[u8]) -> i32 {
 /// read on to its last line when it is multi-line. `None` is C's -1, a
 /// 530 or 421 reply; any other code passes.
 fn send_ftp_command_and_receive(sock: &mut TcpStream, command: &str) -> Option<Vec<u8>> {
+    // C appends the newline with sprintf(command, "%s\n", command), its own
+    // source; on glibc 2.39 that sends a bare newline, so no upload happens.
     let _ = sock.write_all(format!("{command}\n").as_bytes());
     // C writes its -1 recv into str_rec[-1]; it reads as an empty reply.
     let mut reply = recv(sock).unwrap_or_default();
