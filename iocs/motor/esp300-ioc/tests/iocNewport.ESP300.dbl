@@ -1,0 +1,18 @@
+# dbl of motor R7-4-5 motorNewport iocBoot/iocNewport st.cmd with < ESP300.cmd
+newport:alldone
+newport:alldoneBlink
+newport:allstop
+newport:m21
+newport:m21_able
+newport:m21_twCh
+newport:m21_vCh
+newport:m22
+newport:m22_able
+newport:m22_twCh
+newport:m22_vCh
+newport:m23
+newport:m23_able
+newport:m23_twCh
+newport:m23_vCh
+newport:moving
+newport:movingDiff

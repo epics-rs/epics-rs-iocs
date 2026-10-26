@@ -29,13 +29,15 @@ ESP300Setup(1, 10)
 # ESP300Config(card, asyn port, GPIB address)
 ESP300Config(0, "$(SERIAL)")
 
-# One motor record per discovered axis, signal S of card 0.
-# MRES must equal the axis drive resolution (the boundary is raw steps).
-dbLoadRecords("$(ESP300_IOC)/db/esp300.template", "P=$(P),M=m1,C=0,S=0,MRES=5e-5,EGU=mm")
+# motorUtil's records and one motor.db per axis, signal S of card 0, as C's
+# st.cmd and ESP300.cmd load them. MRES must equal the axis drive
+# resolution (the boundary is raw steps).
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(ESP300_IOC)/db/ESP300.substitutions", "P=$(P)")
 
 iocInit()
 
 # Example:
 #   dbl
-#   camonitor ESP300:m1 ESP300:m1.RBV
-#   caput ESP300:m1 5.0
+#   camonitor ESP300:m21 ESP300:m21.RBV
+#   caput ESP300:m21 5.0
