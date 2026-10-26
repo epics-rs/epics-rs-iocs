@@ -387,6 +387,9 @@ impl PortDriver for PilatusDriver {
 
         // C's setStringParam and ADDriver::writeOctet statuses are both
         // overwritten by callParamCallbacks() (pilatusDetector.cpp:1630).
+        // C also drops checkPath's (:1615), so a FilePath that does not
+        // exist is written without error; that defect is not copied.
+        let mut checked = Ok(());
         let _ = self
             .ad
             .port_base
@@ -396,7 +399,7 @@ impl PortDriver for PilatusDriver {
         } else if function == p.flat_field_file {
             self.read_flat_field_file(&value);
         } else if function == params.base.file_path {
-            self.img_path(&value);
+            checked = self.img_path(&value);
         } else if function == p.oscill_axis {
             self.cam_write_read(&cmd_oscill_axis(&value), CAMSERVER_DEFAULT_TIMEOUT);
         } else if function == p.cbf_template_file {
@@ -405,7 +408,7 @@ impl PortDriver for PilatusDriver {
             let _ = self.ad.write_octet(user, data);
         }
 
-        let status = self.ad.port_base.call_param_callbacks(0);
+        let status = self.ad.port_base.call_param_callbacks(0).and(checked);
         if let Err(e) = status {
             return Err(AsynError::Status {
                 status: e.status(),
@@ -750,6 +753,42 @@ mod tests {
             "checkPath writes the path back with its separator"
         );
         assert_eq!(det.ad.port_base.get_int32_param(exists, 0).unwrap(), 1);
+    }
+
+    /// A FilePath that does not exist still goes to camserver as `imgpath`,
+    /// but checkPath's error fails the write, which C drops
+    /// (pilatusDetector.cpp:1615).
+    #[test]
+    fn a_missing_file_path_fails_the_write() {
+        let sent = recording_camserver("PILATUS_MISSING_PATH_CAM");
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
+        let links = DriverLinks {
+            flat_field_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+            cam: camserver("PILATUS_MISSING_PATH_CAM"),
+        };
+        let mut det = PilatusDriver::new("PILATUS_MISSING_PATH", 8, 8, 0, links).unwrap();
+        let (file_path, exists) = (
+            det.ad.params.base.file_path,
+            det.ad.params.base.file_path_exists,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = format!("{}/missing", dir.path().to_str().unwrap());
+        let Err(AsynError::Status { status, message }) =
+            det.write_octet(&mut AsynUser::new(file_path), missing.as_bytes())
+        else {
+            panic!("a missing FilePath must fail the write");
+        };
+        assert_eq!(status, AsynStatus::Error);
+        assert_eq!(
+            message,
+            format!("pilatusDetector:writeOctet: status=3, function={file_path}, value={missing}")
+        );
+        assert_eq!(sent.lock().last(), Some(&format!("imgpath {missing}")));
+        assert_eq!(det.ad.port_base.get_int32_param(exists, 0).unwrap(), 0);
     }
 
     /// ADDriver::writeFloat64 is asynPortDriver's (pilatusDetector.cpp:1571),

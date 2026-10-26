@@ -4,7 +4,7 @@
 
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
-use epics_rs::asyn::error::AsynStatus;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::trace::TraceMask;
 
 use crate::camserver::CamParams;
@@ -86,24 +86,33 @@ impl PilatusDriver {
     }
 
     /// C's `NDFilePath` branch of `writeOctet` (pilatusDetector.cpp:1612-1615).
-    pub(crate) fn img_path(&mut self, path: &str) {
+    pub(crate) fn img_path(&mut self, path: &str) -> AsynResult<()> {
         self.cam_write_read(&cmd_imgpath(path), CAMSERVER_DEFAULT_TIMEOUT);
-        self.check_path();
+        self.check_path()
     }
 
-    /// C `asynNDArrayDriver::checkPath()` (asynNDArrayDriver.cpp:98-111).
-    fn check_path(&mut self) {
+    /// C `asynNDArrayDriver::checkPath()` (asynNDArrayDriver.cpp:98-111),
+    /// which fails a path that does not exist.
+    fn check_path(&mut self) -> AsynResult<()> {
         let base = self.ad.params.base;
         let Ok(path) = self.ad.port_base.get_string_param(base.file_path, 0) else {
-            return;
+            return Ok(());
         };
         let mut path = String::from_utf8_lossy(path).into_owned();
         if path.is_empty() {
-            return;
+            return Ok(());
         }
         let exists = check_path_str(&mut path);
         self.set_str(base.file_path, path);
         self.set_i32(base.file_path_exists, i32::from(exists));
+        if exists {
+            Ok(())
+        } else {
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "checkPath: the directory does not exist".into(),
+            })
+        }
     }
 
     /// C `setAcquireParams()`.
