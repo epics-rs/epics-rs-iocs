@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use ioc_conventions::{
-    assert_links_asyn_dbd, assert_same_records, booted_records, read_dbl, renamed,
+    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_records, booted_records, read_dbl,
+    renamed,
 };
 
 fn dir() -> &'static Path {
@@ -54,4 +55,23 @@ fn st_a3200_cmd_loads_the_c_a3200_records() {
 #[test]
 fn the_ioc_links_asyn_dbd() {
     assert_links_asyn_dbd(Path::new(env!("CARGO_BIN_EXE_aerotech-ioc")));
+}
+
+/// st.cmd starts motorUtil after iocInit, as C's iocAerotech st.cmd does.
+#[test]
+fn st_cmd_inits_motor_util() {
+    assert_inits_motor_util(ioc(), &dir().join("st.cmd"));
+}
+
+/// st-soloist.cmd starts motorUtil after iocInit, as C's iocAerotech st.cmd does.
+#[test]
+fn st_soloist_cmd_inits_motor_util() {
+    assert_inits_motor_util(ioc(), &dir().join("st-soloist.cmd"));
+}
+
+/// st.a3200.cmd starts motorUtil after iocInit, as C's iocAerotech
+/// a3.asyn.st.cmd.linux-x86 does.
+#[test]
+fn st_a3200_cmd_inits_motor_util() {
+    assert_inits_motor_util(ioc(), &dir().join("st.a3200.cmd"));
 }

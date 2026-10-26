@@ -39,6 +39,10 @@ async fn main() -> CaResult<()> {
     for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
         app = app.register_startup_command(cmd);
     }
+    // motorUtilRegister: motorUtilInit, printChIDlist, listMovingMotors.
+    for cmd in epics_rs::motor::motor_util::motor_util_commands() {
+        app = app.register_startup_command(cmd);
+    }
 
     // asyn.dbd, which every C motor IOC links: the asyn record, the devEpics
     // basic_asyn_motor.db and the OEM_RESOLUTION records use, and the iocsh

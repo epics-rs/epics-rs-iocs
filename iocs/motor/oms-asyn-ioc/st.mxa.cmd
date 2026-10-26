@@ -36,3 +36,6 @@ dbLoadTemplate("$(OMS_ASYN_IOC)/db/MXA.substitutions", "P=$(P),PORT=$(PORT)")
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")

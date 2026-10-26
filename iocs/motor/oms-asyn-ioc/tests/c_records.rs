@@ -4,7 +4,8 @@
 use std::path::Path;
 
 use ioc_conventions::{
-    assert_links_asyn_dbd, assert_same_records, booted_records, read_dbl, renamed,
+    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_records, booted_records, read_dbl,
+    renamed,
 };
 
 fn dir() -> &'static Path {
@@ -40,4 +41,16 @@ fn st_mxa_cmd_loads_the_c_mxa_records() {
 #[test]
 fn the_ioc_links_asyn_dbd() {
     assert_links_asyn_dbd(Path::new(env!("CARGO_BIN_EXE_oms-asyn-ioc")));
+}
+
+/// st.cmd starts motorUtil after iocInit, as C's iocOmsAsyn st.cmd does.
+#[test]
+fn st_cmd_inits_motor_util() {
+    assert_inits_motor_util(ioc(), &dir().join("st.cmd"));
+}
+
+/// st.mxa.cmd starts motorUtil after iocInit, as C's iocOmsAsyn st.cmd does.
+#[test]
+fn st_mxa_cmd_inits_motor_util() {
+    assert_inits_motor_util(ioc(), &dir().join("st.mxa.cmd"));
 }

@@ -36,6 +36,10 @@ async fn main() -> CaResult<()> {
     for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
         app = app.register_startup_command(cmd);
     }
+    // motorUtilRegister: motorUtilInit, printChIDlist, listMovingMotors.
+    for cmd in epics_rs::motor::motor_util::motor_util_commands() {
+        app = app.register_startup_command(cmd);
+    }
 
     // asyn.dbd, which motorSimIOC links (motorSimApp/src/Makefile:23): the
     // asyn record and the devEpics basic_asyn_motor.db's records use.

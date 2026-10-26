@@ -40,6 +40,9 @@ dbLoadTemplate("$(AEROTECH_IOC)/db/Ensemble.substitutions", "P=$(P),PORT=$(CTRL)
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # EnsembleTrajectoryScan.st runs PVT trajectories through doCommand.bcx
 # (doCommand.ab 1.2 or later), which must be loaded on the controller:
 #   seq &EnsembleTrajectoryScan, "P=$(P),R=traj1:,M1=m1,PORT=$(IPPORT)"

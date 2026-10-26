@@ -34,6 +34,9 @@ dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
 #   camonitor a3200:m1 a3200:m1.RBV

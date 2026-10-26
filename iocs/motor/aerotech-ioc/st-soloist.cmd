@@ -23,3 +23,6 @@ dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 dbLoadTemplate("$(AEROTECH_IOC)/db/Soloist.substitutions", "P=$(P)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
