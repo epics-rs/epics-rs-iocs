@@ -35,7 +35,7 @@ MM300Setup(1, 10)
 # MM3000Config(card, asyn port, GPIB address)
 MM3000Config(0, "$(SERIAL)")
 
-# The axis's motor.db, as C's MM3000.cmd loads it, and motorUtil's records,
+# The axes' motor.db, as C's MM3000.cmd loads it, and motorUtil's records,
 # as C's st.cmd loads them.
 dbLoadTemplate("$(MM3000_IOC)/db/MM3000.substitutions", "P=$(P)")
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")

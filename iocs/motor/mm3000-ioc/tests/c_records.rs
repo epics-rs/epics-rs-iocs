@@ -1,5 +1,5 @@
 //! st.cmd boots with the records C's iocNewport st.cmd loads with its
-//! MM3000.cmd, on this IOC's prefix and axis.
+//! MM3000.cmd, on this IOC's prefix.
 
 use std::path::Path;
 
@@ -10,12 +10,10 @@ use ioc_conventions::{
 
 const RENAMES: &[(&str, &str)] = &[("newport:", "MM3000:")];
 
-const DROPS: &[&str] = &["newport:m2", "newport:m3", "newport:m4"];
-
 #[test]
 fn st_cmd_loads_the_c_records() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let c = renamed(&read_dbl(&dir.join("tests/st.cmd.dbl")), RENAMES, DROPS);
+    let c = renamed(&read_dbl(&dir.join("tests/st.cmd.dbl")), RENAMES, &[]);
     let ioc = Path::new(env!("CARGO_BIN_EXE_mm3000-ioc"));
     assert_same_records(&booted_records(ioc, &dir.join("st.cmd")), &c);
 }
@@ -24,7 +22,7 @@ fn st_cmd_loads_the_c_records() {
 #[test]
 fn st_cmd_sets_the_c_fields() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let c = renamed_fields(&read_db(&dir.join("tests/st.cmd.db")), RENAMES, DROPS);
+    let c = renamed_fields(&read_db(&dir.join("tests/st.cmd.db")), RENAMES, &[]);
     assert_same_fields(&script_fields(&dir.join("st.cmd")), &c);
 }
 

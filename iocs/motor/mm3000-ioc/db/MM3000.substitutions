@@ -1,9 +1,12 @@
-# C's iocNewport MM3000.substitutions on this IOC's one axis, P from
-# st.cmd. Signal 0,1,2,... is controller axis 1,2,3,...; the driver jogs by
-# moving to DHLM/DLLM, so set real soft limits.
+# C's iocNewport MM3000.substitutions, P from st.cmd. Signal 0,1,2,... is
+# controller axis 1,2,3,...; the driver jogs by moving to DHLM/DLLM, so set
+# real soft limits.
 file "$(MOTOR)/db/motor.db"
 {
 pattern
 {N,  M,       DTYP,      C,  S,  DESC,          EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
 {1,  "m$(N)", "MM3000",  0,  0,  "motor $(N)",  mm,   Pos,  1,     .1,    .2,    0,     1,     .2,    5e-5,  5,     100,   -100,  ""}
+{2,  "m$(N)", "MM3000",  0,  1,  "motor $(N)",  mm,   Pos,  1,     .1,    .2,    0,     1,     .2,    5e-5,  5,     100,   -100,  ""}
+{3,  "m$(N)", "MM3000",  0,  2,  "motor $(N)",  mm,   Pos,  1,     .1,    .2,    0,     1,     .2,    5e-5,  5,     100,   -100,  ""}
+{4,  "m$(N)", "MM3000",  0,  3,  "motor $(N)",  mm,   Pos,  1,     .1,    .2,    0,     1,     .2,    5e-5,  5,     100,   -100,  ""}
 }
