@@ -23,9 +23,10 @@ PMNC87xxSetup(1, 2, 10)
 # PMNC87xxConfig(card, asyn port): one motor axis per discovered channel.
 PMNC87xxConfig(0, "$(ASYN)")
 
-# One motor record per discovered channel, signal S of card 0.
-# The template takes C's PMNC87xx.substitutions values (MRES 2.5e-4).
-dbLoadRecords("$(NEWFOCUS_IOC)/db/newfocus.template", "P=$(P),M=m1,C=0,S=0")
+# The axis's motor.db, as C's PMNC87xx.cmd loads it, and motorUtil's
+# records, as C's st.cmd loads them.
+dbLoadTemplate("$(NEWFOCUS_IOC)/db/PMNC87xx.substitutions", "P=$(P)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
