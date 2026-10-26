@@ -663,6 +663,60 @@ mod tests {
             assert_eq!(sent.iter().filter(|c| c.contains("RC")).count(), 6);
         }
 
+        /// The element times `DT` sent since the last [`Program::sent`].
+        fn elements(p: &Program) -> usize {
+            p.sent().iter().filter(|c| c.contains("DT")).count()
+        }
+
+        /// ss trajectoryScan state build bounds a relative trajectory to
+        /// MAX_ELEMENTS.
+        #[epics_rs::base::epics_test]
+        async fn a_relative_build_past_max_elements_builds_max_elements() {
+            let p = boot("mm4005RelativeMax", &[]).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(2001)).await;
+            p.sent();
+            p.build().await;
+            expect(
+                &p.db,
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 2000.0)],
+            )
+            .await;
+            assert_eq!(elements(&p), 2000);
+        }
+
+        /// ss trajectoryScan state build bounds an absolute trajectory to
+        /// MAX_ELEMENTS-3, the most its padding past the last element fits.
+        #[epics_rs::base::epics_test]
+        async fn an_absolute_build_leaves_room_for_its_padding() {
+            let p = boot("mm4005AbsoluteMax", &[]).await;
+            put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(1)).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(2000)).await;
+            p.sent();
+            p.build().await;
+            expect(
+                &p.db,
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 1997.0)],
+            )
+            .await;
+            assert_eq!(elements(&p), 1996);
+        }
+
+        /// ss trajectoryScan state build builds a relative trajectory of
+        /// fewer than one element as one, padded to four.
+        #[epics_rs::base::epics_test]
+        async fn a_relative_build_below_one_element_builds_one() {
+            let p = boot("mm4005RelativeMin", &[]).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(-1)).await;
+            p.sent();
+            p.build().await;
+            expect(
+                &p.db,
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 4.0)],
+            )
+            .await;
+            assert_eq!(elements(&p), 4);
+        }
+
         /// ss trajectoryScan state build: a TB error after VC fails the
         /// build with the controller's message.
         #[epics_rs::base::epics_test]

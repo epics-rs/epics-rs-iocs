@@ -74,6 +74,9 @@ int anyMoving;
 int ncomplete;
 int nextra;
 int npoints;
+/* State build's one bounded read of nelements and moveMode */
+int buildElements;
+int buildMode;
 int dir;
 double dtime;
 double dpos;
@@ -197,6 +200,24 @@ ss trajectoryScan {
             pvPut(buildState);
             buildStatus=STATUS_UNDEFINED;
             pvPut(buildStatus);
+            /* Upstream built from the monitored nelements and moveMode, re-read
+             * throughout and unbounded by the arrays.  buildElements and buildMode
+             * are the one bounded read: a relative trajectory needs 1 element, any
+             * other 2 and, for the padding past its last element, at most
+             * MAX_ELEMENTS-3. */
+            buildMode = moveMode;
+            buildElements = nelements;
+            if (buildMode == MOVE_MODE_RELATIVE) {
+                if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
+                if (buildElements < 1) buildElements = 1;
+            } else {
+                if (buildElements > MAX_ELEMENTS-3) buildElements = MAX_ELEMENTS-3;
+                if (buildElements < 2) buildElements = 2;
+            }
+            if (buildElements != nelements) {
+                nelements = buildElements;
+                pvPut(nelements);
+            }
             /* Initialize new trajectory */
             strcpy(stringOut, "NC");
             %%writeOnly(ssId, pVar, pVar->stringOut);
@@ -211,8 +232,8 @@ ss trajectoryScan {
             /* If time mode is TIME_MODE_TOTAL then construct timeTrajectory 
              * and post it */
             if (timeMode == TIME_MODE_TOTAL) {
-                dtime = time_PV/nelements;
-                for (i=0; i<nelements; i++) timeTrajectory[i] = dtime;
+                dtime = time_PV/buildElements;
+                for (i=0; i<buildElements; i++) timeTrajectory[i] = dtime;
                 pvPut(timeTrajectory);
             }
 
@@ -220,10 +241,10 @@ ss trajectoryScan {
              * If not, pad with up to 3 entries of PAD_TIME duration each.
              * Continue the trajectory at the same velocity. 
              * Change nelements and post new value */
-            if (moveMode == MOVE_MODE_RELATIVE) {
-                npoints=nelements;
+            if (buildMode == MOVE_MODE_RELATIVE) {
+                npoints=buildElements;
             } else {
-                npoints=nelements-1;
+                npoints=buildElements-1;
             }
             nextra = (npoints % 4);
             if (nextra != 0) {
@@ -234,22 +255,23 @@ ss trajectoryScan {
                     timeTrajectory[npoints+i] = PAD_TIME;
                     for (j=0; j<numAxes; j++) {
                         if (!moveAxis[j]) continue;
-                        if (moveMode == MOVE_MODE_RELATIVE) {
-                            motorTrajectory[j][nelements+i] = 
-                                        motorTrajectory[j][nelements-1] *
-                                        PAD_TIME / timeTrajectory[nelements-1];
+                        if (buildMode == MOVE_MODE_RELATIVE) {
+                            motorTrajectory[j][buildElements+i] = 
+                                        motorTrajectory[j][buildElements-1] *
+                                        PAD_TIME / timeTrajectory[buildElements-1];
                         } else {
-                            dpos = (motorTrajectory[j][nelements-1] -
-                                            motorTrajectory[j][nelements-2]) *
-                                        PAD_TIME / timeTrajectory[nelements-2];
-                            motorTrajectory[j][nelements+i] = 
-                                        motorTrajectory[j][nelements-1] +
+                            dpos = (motorTrajectory[j][buildElements-1] -
+                                            motorTrajectory[j][buildElements-2]) *
+                                        PAD_TIME / timeTrajectory[buildElements-2];
+                            motorTrajectory[j][buildElements+i] = 
+                                        motorTrajectory[j][buildElements-1] +
                                                                 dpos*(i+1);
                         }
                     }
                 }
-                nelements += nextra;
+                buildElements += nextra;
                 npoints += nextra;
+                nelements = buildElements;
                 pvPut(nelements);
                 pvPut(timeTrajectory);
                 /* Post the new trajectory position arrays */
@@ -263,13 +285,13 @@ ss trajectoryScan {
                                 expectedTime += timeTrajectory[i];
             /* Define each element in trajectory */
             for (i=0; i<npoints; i++) {
-                sprintf(buildMessage, "Building element %d/%d", i+1, nelements);
+                sprintf(buildMessage, "Building element %d/%d", i+1, buildElements);
                 pvPut(buildMessage);
                 sprintf(stringOut, "%dDT%f", i+1, timeTrajectory[i]);
                 %%writeOnly(ssId, pVar, pVar->stringOut);
                 for (j=0; j<numAxes; j++) {
                     if (!moveAxis[j]) continue;
-                    if (moveMode == MOVE_MODE_RELATIVE) {
+                    if (buildMode == MOVE_MODE_RELATIVE) {
                         dpos = motorTrajectory[j][i];
                     } else {
                         dpos = motorTrajectory[j][i+1] - motorTrajectory[j][i];
