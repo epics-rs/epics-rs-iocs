@@ -2283,6 +2283,7 @@ mod tests {
                                     addr: 0,
                                     updates,
                                     time_stamp: None,
+                                    gate: None,
                                 },
                                 AsynUser::new(0),
                             )

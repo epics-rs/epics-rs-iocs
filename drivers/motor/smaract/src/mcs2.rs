@@ -153,6 +153,7 @@ pub fn post_on(port: PortHandle) -> ProblemPost {
                 ParamValue::Int32(problem),
             )],
             time_stamp: None,
+            gate: None,
         };
         let _ = port.try_submit(op, AsynUser::default());
     })
