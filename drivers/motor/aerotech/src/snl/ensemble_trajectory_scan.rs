@@ -1111,4 +1111,182 @@ mod tests {
         assert_eq!(exchange(&v, b"TASKSTATE(1)", &reply), 3);
         assert_eq!(text(&reply), "");
     }
+
+    mod program {
+        use std::collections::HashMap;
+
+        use epics_rs::asyn::interfaces::motor::AsynMotor;
+        use epics_rs::base::runtime::task::sleep;
+        use epics_rs::base::server::database::PvDatabase;
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::scan::ScanOwner;
+        use epics_rs::base::types::EpicsValue;
+        use epics_rs::motor::builder::{AxisSetup, MotorBuilder};
+        use epics_rs::motor::sim_motor::SimMotor;
+        use epics_rs::motor::trace::TraceUser;
+        use epics_seq_rs::{SeqThreadId, seq, seq_stop};
+
+        use super::*;
+
+        const DB: &str =
+            include_str!("../../../../../iocs/motor/aerotech-ioc/db/trajectoryScan.db");
+
+        /// m1 on a simulated axis, within ±100 and at most 1 per second.
+        const MOTOR: &str = r#"record(motor, "T:m1") { field(DTYP, "asynMotor")
+            field(OUT, "@asyn($(PORT)m1,0)") field(MRES, "0.001") field(VELO, "1")
+            field(VMAX, "1") field(ACCL, "0.2") field(DHLM, "100") field(DLLM, "-100") }"#;
+
+        /// The controller doCommand.bcx runs on: globals read back as
+        /// written, a `cmdVar` acked as doCommand.ab acks it (VERSION as
+        /// 1.2), 100 globals of each kind, and `%0` to anything else.
+        fn ensemble(globals: &Mutex<HashMap<String, String>>, cmd: &str) -> String {
+            let mut g = globals.lock().unwrap();
+            if let Some((global, value)) = cmd.split_once(" = ") {
+                if global == format!("IGLOBAL({CMD_VAR})") && value != "0" {
+                    if value == Command::Version.number().to_string() {
+                        g.insert(format!("IGLOBAL({IARG1_VAR})"), "1".into());
+                        g.insert(format!("IGLOBAL({IARG2_VAR})"), "2".into());
+                    }
+                    g.insert(format!("IGLOBAL({CMD_ACK_VAR})"), value.into());
+                }
+                g.insert(global.into(), value.into());
+                return "%".into();
+            }
+            match cmd {
+                "getparm(124)" | "getparm(125)" => "%100".into(),
+                "TASKSTATE(1)" => "%3".into(),
+                _ if cmd == format!("GETPARM({VELOCITY_COMMAND_THRESHOLD_PARM_NUM})") => {
+                    "%100".into()
+                }
+                _ => format!("%{}", g.get(cmd).map_or("0", String::as_str)),
+            }
+        }
+
+        /// `port`'s axis m1 of one simulated motor.
+        fn sim_axis(port: &str) {
+            let motor: Arc<Mutex<dyn AsynMotor>> =
+                Arc::new(Mutex::new(SimMotor::new().with_limits(-1e9, 1e9)));
+            let name = format!("{port}m1");
+            let AxisSetup {
+                axis, poll_loop, ..
+            } = MotorBuilder::new(motor)
+                .trace_user(TraceUser::Asyn {
+                    port: name.clone(),
+                    addr: 0,
+                })
+                .poll_interval(Duration::from_millis(10))
+                .build_axis();
+            epics_rs::motor::devices::register_controller_port(
+                &epics_rs::asyn::registry::open_owner(),
+                &name,
+                1,
+                (),
+            )
+            .unwrap();
+            epics_rs::motor::devices::register_axis(axis).unwrap();
+            poll_loop.start();
+        }
+
+        struct Program {
+            db: Arc<PvDatabase>,
+            tid: SeqThreadId,
+            _scan: ScanOwner,
+            _ensemble: (LineRig, SyncIOHandle),
+        }
+
+        /// The program on NumAxes 1 and an Ensemble at `port`, m1 to move
+        /// along `traj` in a second, once init is done.
+        async fn boot(port: &str, traj: [f64; 2]) -> Program {
+            let globals = Mutex::default();
+            let (rig, io) = LineRig::new(port, move |cmd| ensemble(&globals, cmd.trim()));
+            sim_axis(port);
+            let macros: HashMap<String, String> = [
+                ("P", "T:"),
+                ("R", "traj1:"),
+                ("NAXES", "1"),
+                ("NELM", "1000"),
+                ("NPULSE", "1000"),
+                ("PORT", port),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into();
+            let (motor, factory) = epics_rs::motor::motor_record_factory();
+            let (db, _) = IocBuilder::new()
+                .register_record_type(motor, factory)
+                .register_dynamic_device_support(
+                    &epics_rs::motor::devices::devices(),
+                    epics_rs::motor::devices::device_support_factory(),
+                )
+                .register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()))
+                .db_string(DB, &macros)
+                .unwrap()
+                .db_string(MOTOR, &macros)
+                .unwrap()
+                .build_served()
+                .await
+                .unwrap();
+            put(&db, "T:traj1:Nelements", EpicsValue::Long(2)).await;
+            put(&db, "T:traj1:Time", EpicsValue::Double(1.0)).await;
+            put(&db, "T:traj1:M1Traj", EpicsValue::DoubleArray(traj.into())).await;
+            // seq holds each state set in its first state until PINI is done.
+            let scan = ScanOwner::start(db.clone());
+            let macros = format!("P=T:,R=traj1:,M1=m1,PORT={port}");
+            let tid = seq(&EnsembleTrajectoryScan, &macros, 0, &db)
+                .expect("EnsembleTrajectoryScan starts");
+            // init clears buildMon before its last reads.
+            let mut sent = Vec::new();
+            for _ in 0..500 {
+                sent.extend(rig.sent());
+                if sent.iter().any(|c| c.trim() == "getparm(124)") {
+                    return Program {
+                        db,
+                        tid,
+                        _scan: scan,
+                        _ensemble: (rig, io),
+                    };
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("init never read the global integers: {sent:?}");
+        }
+
+        async fn put(db: &PvDatabase, pv: &str, v: EpicsValue) {
+            db.put_record_field_from_ca(pv, "VAL", v).await.unwrap();
+        }
+
+        fn value(db: &PvDatabase, pv: &str) -> f64 {
+            db.get_pv(pv).unwrap().to_f64().unwrap()
+        }
+
+        /// Poll until every `(pv, value)` holds; on timeout, name what each
+        /// read.
+        async fn expect(db: &PvDatabase, want: &[(&str, f64)]) {
+            for _ in 0..500 {
+                if want.iter().all(|&(pv, v)| value(db, pv) == v) {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            let got: Vec<_> = want.iter().map(|&(pv, _)| (pv, value(db, pv))).collect();
+            panic!("want {want:?}, got {got:?}");
+        }
+
+        /// EnsembleTrajectoryScan.st:421: a build past VMAX fails whichever
+        /// way the motor goes.
+        #[epics_rs::base::epics_test]
+        async fn a_build_past_vmax_backwards_fails() {
+            let p = boot("ensVlimit", [0.0, -5.0]).await;
+            put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 2.0)],
+            )
+            .await;
+            assert_eq!(
+                p.db.get_pv("T:traj1:BuildMessage").unwrap(),
+                EpicsValue::String("V limit: m1 at pt. 1 (-5.000000)".into())
+            );
+            seq_stop(p.tid);
+        }
+    }
 }
