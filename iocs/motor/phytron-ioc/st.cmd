@@ -9,8 +9,8 @@
 #============================================================
 
 epicsEnvSet("P",      "phytron:")
-epicsEnvSet("CTRL",   "phyPort")
-epicsEnvSet("IPPORT", "phyAsyn")
+epicsEnvSet("CTRL",   "phyMotionPort")
+epicsEnvSet("IPPORT", "testRemote")
 epicsEnvSet("HOST",   "192.168.1.20:22222")
 
 # ---- asyn octet port (Ethernet; use the serial line for USB/RS-232) ----
@@ -23,9 +23,12 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 1)
 # ---- phyMOTION controller ----
 # phytronCreateController(controllerName, asynPort, movingPollPeriod,
 #                         idlePollPeriod, timeout, noResetAtBoot), all in ms.
-# noResetAtBoot=1 skips the boot reset (a reset waits ~5 s, then polls the
-# controller for up to 120 s). Pass 0 to reset the controller at boot like C.
-phytronCreateController("$(CTRL)", "$(IPPORT)", 100, 1000, 1000, 1)
+# noResetAtBoot unset resets the controller at boot (a reset waits ~5 s, then
+# polls the controller for up to 120 s); 1 skips the reset.
+phytronCreateController("$(CTRL)", "$(IPPORT)", 10, 10, 1000)
+asynSetOption("$(CTRL)", 0, "pollMethod", "parallel")
+asynSetOption("$(CTRL)", 0, "fakeHomedEnable", "true")
+asynSetOption("$(CTRL)", 0, "clearAxisStatus", "true")
 
 # One axis per I1AM01 module.index: phytronCreateAxis(controllerName, module,
 # index). Load one motor record per axis with ADDR = module*10 + index.
@@ -40,9 +43,9 @@ phytronCreateAnalog("phyA3", "$(CTRL)", 1, 3, "")
 phytronCreateAnalog("phyA4", "$(CTRL)", 1, 4, "")
 phytronCreateDigital("phyD1", "$(CTRL)", 1, 1, "")
 
-# The axis's Phytron_motor.db, as C's motor.substitutions.phytron loads it;
-# the values are the motor record this IOC had before, in controller steps.
-dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_motor.db", "P=$(P),M=m1,PORT=$(CTRL),ADDR=11,DESC=,DIR=Pos,VELO=1000,VBAS=0,VMAX=0,ACCL=0.2,BDST=0,BVEL=0,BACC=0.5,MRES=1,ERES=0,UEIP=No,PREC=0,EGU=steps,DHLM=100000,DLLM=-100000,INIT=")
+# The axis's Phytron_motor.db, with the m1 row of the phyMOTION (MRES) block
+# of C's motor.substitutions.phytron.
+dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_motor.db", "P=$(P),M=m1,PORT=$(CTRL),ADDR=11,DESC=motor 1,EGU=mm,MRES=0.000625,ERES=0.00005,UEIP=No,DIR=Pos,VELO=2.5,VBAS=1,VMAX=25,ACCL=.5,BDST=0,BVEL=25,BACC=.2,PREC=5,RDBD=0,RTRY=0,OFF=-0.49,DHLM=1440,DLLM=-1440,MDEL=0.001,INIT=")
 
 # The module's aux records, with C's motor.substitutions.phytron values. The
 # axis records' P must be the controller records' P: an axis re-initialises
