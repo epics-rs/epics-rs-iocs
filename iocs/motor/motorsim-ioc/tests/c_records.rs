@@ -1,5 +1,5 @@
 //! st.cmd boots with the records C's iocMotorSim st.cmd loads, on this
-//! IOC's prefix and its two axes.
+//! IOC's prefix.
 
 use std::path::Path;
 
@@ -9,12 +9,11 @@ use ioc_conventions::{
 };
 
 const RENAMES: &[(&str, &str)] = &[("IOC:", "SIM:")];
-const DROPS: &[&str] = &["IOC:m3", "IOC:m4", "IOC:m5", "IOC:m6", "IOC:m7", "IOC:m8"];
 
 #[test]
 fn st_cmd_loads_the_c_records() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut c = renamed(&read_dbl(&dir.join("tests/motorSim.dbl")), RENAMES, DROPS);
+    let mut c = renamed(&read_dbl(&dir.join("tests/motorSim.dbl")), RENAMES, &[]);
     // motorUtil.db, which C's st.cmd runs motorUtilInit without.
     c.extend(
         ["allstop", "alldone", "moving", "alldoneBlink", "movingDiff"].map(|r| format!("SIM:{r}")),
@@ -27,7 +26,7 @@ fn st_cmd_loads_the_c_records() {
 #[test]
 fn st_cmd_sets_the_c_fields() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let c = renamed_fields(&read_db(&dir.join("tests/motorSim.db")), RENAMES, DROPS);
+    let c = renamed_fields(&read_db(&dir.join("tests/motorSim.db")), RENAMES, &[]);
     assert_same_fields(&script_fields(&dir.join("st.cmd")), &c);
 }
 

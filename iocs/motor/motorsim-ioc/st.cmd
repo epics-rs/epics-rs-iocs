@@ -10,15 +10,21 @@
 epicsEnvSet("P",     "SIM:")
 epicsEnvSet("PORT",  "motorSim1")
 
-# ---- simulated controller: 2 axes ----
+# ---- simulated controller: 8 axes ----
 # motorSimCreateController(portName, numAxes, priority, stackSize)
-motorSimCreateController("$(PORT)", 2)
+motorSimCreateController("$(PORT)", 8)
 
 # Per-axis hard limits, home and start, in steps, as C's motorSim.cmd sets
 # them:
 # motorSimConfigAxis(portName, axis, hiHardLimit, lowHardLimit, home, start)
 motorSimConfigAxis("$(PORT)", 0, 20000, -20000,  500, 0)
 motorSimConfigAxis("$(PORT)", 1, 20000, -20000, 1500, 0)
+motorSimConfigAxis("$(PORT)", 2, 20000, -20000, 2500, 0)
+motorSimConfigAxis("$(PORT)", 3, 20000, -20000, 3000, 0)
+motorSimConfigAxis("$(PORT)", 4, 20000, -20000,  500, 0)
+motorSimConfigAxis("$(PORT)", 5, 20000, -20000, 1500, 0)
+motorSimConfigAxis("$(PORT)", 6, 20000, -20000, 2500, 0)
+motorSimConfigAxis("$(PORT)", 7, 20000, -20000, 3000, 0)
 
 # Each axis's basic_asyn_motor.db, as C's motorSim.cmd loads them.
 dbLoadTemplate("$(MOTORSIM_IOC)/db/motorSim.substitutions", "P=$(P),PORT=$(PORT)")
