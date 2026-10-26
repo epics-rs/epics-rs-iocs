@@ -37,8 +37,8 @@ PM500Setup(1, 10)
 # PM500Config(card, asyn port, GPIB address): one axis per channel (X Y Z A ...).
 PM500Config(0, "$(SERIAL)")
 
-# The axis's motor.db, as C's PM500.cmd loads it, and motorUtil's records,
-# as C's st.cmd loads them.
+# The axes' motor.db rows, as C's PM500.cmd loads them, and motorUtil's
+# records, as C's st.cmd loads them.
 dbLoadTemplate("$(PM500_IOC)/db/PM500.substitutions", "P=$(P)")
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
