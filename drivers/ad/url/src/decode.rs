@@ -22,10 +22,10 @@
 //! driver rejects them as unsupported rather than fabricating a lossy
 //! float-to-int mapping.
 
-use image::ColorType;
+use image::{ColorType, DynamicImage};
 
 use epics_rs::ad_core::color::NDColorMode;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDataViewMut, NDDimension};
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -49,70 +49,83 @@ pub struct DecodedImage {
     pub dims: Vec<NDDimension>,
     pub color_mode: NDColorMode,
     pub data_type: NDDataType,
-    pub data: NDDataBuffer,
+    /// The decoder's pixels, as C keeps the Magick `Image` until it writes
+    /// them into `pData`.
+    image: DynamicImage,
+}
+
+impl DecodedImage {
+    /// C `NDArrayInfo::totalBytes` of the frame these pixels fill.
+    pub fn total_bytes(&self) -> usize {
+        self.dims.iter().map(|d| d.size).product::<usize>() * self.data_type.element_size()
+    }
+
+    /// C `image.write(0, 0, ncols, nrows, map, storageType, pData)`
+    /// (URLDriver.cpp:139): the pixels into the frame allocated with
+    /// `dims` and `data_type`, alpha dropped.
+    pub fn write_into(&self, out: NDDataViewMut<'_>) {
+        fn drop_alpha<const N: usize, T: Copy>(out: &mut [T], src: &[T]) {
+            let (out, _) = out.as_chunks_mut::<N>();
+            for (dst, px) in out.iter_mut().zip(src.chunks_exact(N + 1)) {
+                dst.copy_from_slice(&px[..N]);
+            }
+        }
+        match (&self.image, out) {
+            (DynamicImage::ImageLuma8(b), NDDataViewMut::U8(out)) => out.copy_from_slice(b),
+            (DynamicImage::ImageLumaA8(b), NDDataViewMut::U8(out)) => drop_alpha::<1, _>(out, b),
+            (DynamicImage::ImageLuma16(b), NDDataViewMut::U16(out)) => out.copy_from_slice(b),
+            (DynamicImage::ImageLumaA16(b), NDDataViewMut::U16(out)) => drop_alpha::<1, _>(out, b),
+            (DynamicImage::ImageRgb8(b), NDDataViewMut::U8(out)) => out.copy_from_slice(b),
+            (DynamicImage::ImageRgba8(b), NDDataViewMut::U8(out)) => drop_alpha::<3, _>(out, b),
+            (DynamicImage::ImageRgb16(b), NDDataViewMut::U16(out)) => out.copy_from_slice(b),
+            (DynamicImage::ImageRgba16(b), NDDataViewMut::U16(out)) => drop_alpha::<3, _>(out, b),
+            _ => unreachable!("the frame is allocated with the image's type"),
+        }
+    }
 }
 
 /// Decode `bytes` (an already-fetched image file) into driver-shaped data.
 pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
-    let img = image::load_from_memory(bytes).map_err(DecodeError::Image)?;
-
-    match img.color() {
-        ColorType::L8 | ColorType::La8 => {
-            let buf = img.into_luma8();
-            let (w, h) = buf.dimensions();
-            Ok(DecodedImage {
-                dims: vec![NDDimension::new(w as usize), NDDimension::new(h as usize)],
-                color_mode: NDColorMode::Mono,
-                data_type: NDDataType::UInt8,
-                data: NDDataBuffer::from_vec(buf.into_raw()),
-            })
-        }
-        ColorType::L16 | ColorType::La16 => {
-            let buf = img.into_luma16();
-            let (w, h) = buf.dimensions();
-            Ok(DecodedImage {
-                dims: vec![NDDimension::new(w as usize), NDDimension::new(h as usize)],
-                color_mode: NDColorMode::Mono,
-                data_type: NDDataType::UInt16,
-                data: NDDataBuffer::from_vec(buf.into_raw()),
-            })
-        }
-        ColorType::Rgb8 | ColorType::Rgba8 => {
-            let buf = img.into_rgb8();
-            let (w, h) = buf.dimensions();
-            Ok(DecodedImage {
-                dims: vec![
-                    NDDimension::new(3),
-                    NDDimension::new(w as usize),
-                    NDDimension::new(h as usize),
-                ],
-                color_mode: NDColorMode::RGB1,
-                data_type: NDDataType::UInt8,
-                data: NDDataBuffer::from_vec(buf.into_raw()),
-            })
-        }
-        ColorType::Rgb16 | ColorType::Rgba16 => {
-            let buf = img.into_rgb16();
-            let (w, h) = buf.dimensions();
-            Ok(DecodedImage {
-                dims: vec![
-                    NDDimension::new(3),
-                    NDDimension::new(w as usize),
-                    NDDimension::new(h as usize),
-                ],
-                color_mode: NDColorMode::RGB1,
-                data_type: NDDataType::UInt16,
-                data: NDDataBuffer::from_vec(buf.into_raw()),
-            })
-        }
-        other => Err(DecodeError::Unsupported(format!("{other:?}"))),
-    }
+    let image = image::load_from_memory(bytes).map_err(DecodeError::Image)?;
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    let (color_mode, data_type) = match image.color() {
+        ColorType::L8 | ColorType::La8 => (NDColorMode::Mono, NDDataType::UInt8),
+        ColorType::L16 | ColorType::La16 => (NDColorMode::Mono, NDDataType::UInt16),
+        ColorType::Rgb8 | ColorType::Rgba8 => (NDColorMode::RGB1, NDDataType::UInt8),
+        ColorType::Rgb16 | ColorType::Rgba16 => (NDColorMode::RGB1, NDDataType::UInt16),
+        other => return Err(DecodeError::Unsupported(format!("{other:?}"))),
+    };
+    let dims = match color_mode {
+        NDColorMode::Mono => vec![NDDimension::new(w), NDDimension::new(h)],
+        _ => vec![
+            NDDimension::new(3),
+            NDDimension::new(w),
+            NDDimension::new(h),
+        ],
+    };
+    Ok(DecodedImage {
+        dims,
+        color_mode,
+        data_type,
+        image,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::NDDataView;
+    use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataView};
+
+    /// `write_into` a stale buffer of the decoded frame's type.
+    fn pixels(decoded: &DecodedImage) -> NDDataBuffer {
+        let n = decoded.total_bytes() / decoded.data_type.element_size();
+        let mut buf = match decoded.data_type {
+            NDDataType::UInt8 => NDDataBuffer::from_vec(vec![0xa5u8; n]),
+            _ => NDDataBuffer::from_vec(vec![0xa5a5u16; n]),
+        };
+        decoded.write_into(buf.view_mut());
+        buf
+    }
 
     fn encode_png(img: &image::DynamicImage) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -145,10 +158,8 @@ mod tests {
         assert_eq!(decoded.dims.len(), 2);
         assert_eq!(decoded.dims[0].size, 4);
         assert_eq!(decoded.dims[1].size, 3);
-        match decoded.data.view() {
-            NDDataView::U8(v) => assert_eq!(v.len(), 4 * 3),
-            _ => panic!("expected U8 buffer"),
-        }
+        let expected: Vec<u8> = (0..3).flat_map(|y| (0..4).map(move |x| x + y)).collect();
+        assert!(matches!(pixels(&decoded).view(), NDDataView::U8(v) if v == expected));
     }
 
     #[test]
@@ -165,10 +176,10 @@ mod tests {
         assert_eq!(decoded.dims.len(), 2);
         assert_eq!(decoded.dims[0].size, 5);
         assert_eq!(decoded.dims[1].size, 2);
-        match decoded.data.view() {
-            NDDataView::U16(v) => assert_eq!(v.len(), 5 * 2),
-            _ => panic!("expected U16 buffer"),
-        }
+        let expected: Vec<u16> = (0..2)
+            .flat_map(|y| (0..5).map(move |x| (x + y) * 1000))
+            .collect();
+        assert!(matches!(pixels(&decoded).view(), NDDataView::U16(v) if v == expected));
     }
 
     #[test]
@@ -186,10 +197,10 @@ mod tests {
         assert_eq!(decoded.dims[0].size, 3);
         assert_eq!(decoded.dims[1].size, 6);
         assert_eq!(decoded.dims[2].size, 4);
-        match decoded.data.view() {
-            NDDataView::U8(v) => assert_eq!(v.len(), 3 * 6 * 4),
-            _ => panic!("expected U8 buffer"),
-        }
+        let expected: Vec<u8> = (0..4)
+            .flat_map(|y| (0..6).flat_map(move |x| [x, y, x + y]))
+            .collect();
+        assert!(matches!(pixels(&decoded).view(), NDDataView::U8(v) if v == expected));
     }
 
     #[test]
@@ -207,10 +218,10 @@ mod tests {
         assert_eq!(decoded.dims[0].size, 3);
         assert_eq!(decoded.dims[1].size, 3);
         assert_eq!(decoded.dims[2].size, 3);
-        match decoded.data.view() {
-            NDDataView::U16(v) => assert_eq!(v.len(), 3 * 3 * 3),
-            _ => panic!("expected U16 buffer"),
-        }
+        let expected: Vec<u16> = (0..3)
+            .flat_map(|y| (0..3).flat_map(move |x| [x * 100, y * 100, 0]))
+            .collect();
+        assert!(matches!(pixels(&decoded).view(), NDDataView::U16(v) if v == expected));
     }
 
     #[test]
@@ -224,11 +235,9 @@ mod tests {
 
         assert_eq!(decoded.color_mode, NDColorMode::RGB1);
         assert_eq!(decoded.data_type, NDDataType::UInt8);
-        match decoded.data.view() {
-            // 2x2 RGB1 (alpha dropped) = 3 * 2 * 2 = 12 bytes, not 16.
-            NDDataView::U8(v) => assert_eq!(v.len(), 3 * 2 * 2),
-            _ => panic!("expected U8 buffer"),
-        }
+        // 2x2 RGB1 (alpha dropped) = 3 * 2 * 2 = 12 bytes, not 16.
+        let expected = [0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0];
+        assert!(matches!(pixels(&decoded).view(), NDDataView::U8(v) if v == expected));
     }
 
     #[test]

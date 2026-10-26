@@ -9,9 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{
-    NDArrayMut, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension,
-};
+use epics_rs::ad_core::ndarray::{NDArrayMut, NDDataType, NDDataView, NDDataViewMut, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -2352,14 +2350,25 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                 let started = EpicsTimestamp::now().as_f64();
                 // C's ImageData holds a uint8 frame as UINT16.
                 let value_bytes = f.format.bytes().max(2);
-                let update =
-                    ctx.shared
-                        .img
-                        .lock()
-                        .add_shaped(&f.pixels, &[f.width, f.height], value_bytes);
+                // processImgFrame fills ImgImageData's buffer and the address 2
+                // array from the running sum, and ImgImageSumNFrames' and the
+                // address 3 array from the window sum, under imgMutex_
+                // (serval_stream.cpp:1257-1312).
+                let dims = || vec![NDDimension::new(f.width), NDDimension::new(f.height)];
+                let (update, frames, (running, running_array), sum_n) = {
+                    let mut img = ctx.shared.img.lock();
+                    let update = img.add_shaped(&f.pixels, &[f.width, f.height], value_bytes);
+                    let sum = |sum: &[u64]| {
+                        let array = sum_array(&ctx.pool, dims(), sum, 1, SumOutput::Sum);
+                        (int64_array(sum), array.map(|(array, _)| array))
+                    };
+                    let running = sum(img.running());
+                    let sum_n = update.sum_updated.then(|| sum(img.window().sum()));
+                    (update, img.frame_count(), running, sum_n)
+                };
+                let (sum_n, sum_n_array) = sum_n.unzip();
                 post_accum_range(ctx, Accum::Img, update.range).await;
                 post_window(ctx, Accum::Img, &update).await;
-                let frames = ctx.shared.img.lock().frame_count();
                 post_metrics(ctx, Accum::Img, started).await;
                 let (total, range) = ctx.shared.img.lock().public_total();
                 post_accum_range(ctx, Accum::Img, range).await;
@@ -2368,7 +2377,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                 // The running sum, the frame and the window sum, in that
                 // order (serval_stream.cpp:1318-1333). The frame stays stored
                 // as imgCurrentFrame_, which readInt32Array serves.
-                ctx.post_int64_array(p.img_image_data, ADDR, int64_array(&update.running));
+                ctx.post_int64_array(p.img_image_data, ADDR, running);
                 let frame: Vec<i32> = f.pixels.iter().map(|&v| v as i32).collect();
                 let frame = ParamValue::Int32Array(frame.into());
                 ctx.post(
@@ -2378,16 +2387,18 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                         ParamSetValue::array(p.img_image_frame, ADDR, frame),
                     ],
                 );
-                if let Some(sum_n) = &update.sum_n {
-                    ctx.post_int64_array(p.img_image_sum_n_frames, ADDR, int64_array(sum_n));
+                if let Some(sum_n) = sum_n {
+                    ctx.post_int64_array(p.img_image_sum_n_frames, ADDR, sum_n);
                 }
                 // processImgFrame hands the running sum to the plugins on address 2
                 // and the window sum, when it updates, on 3; C does not check
                 // NDArrayCallbacks here (serval_stream.cpp:1257-1343).
                 let uid = i32::try_from(frames).unwrap_or(i32::MAX);
-                publish_img_sum(ctx, 2, f.width, f.height, update.running, uid).await;
-                if let Some(sum_n) = update.sum_n {
-                    publish_img_sum(ctx, 3, f.width, f.height, sum_n, uid).await;
+                if let Some(array) = running_array {
+                    publish_img_sum(ctx, 2, array, uid).await;
+                }
+                if let Some(array) = sum_n_array.flatten() {
+                    publish_img_sum(ctx, 3, array, uid).await;
                 }
             }
             publish_image(ctx, addr, array).await;
@@ -2422,7 +2433,12 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                 .prv_hst
                 .frame(h.frame_number, EpicsTimestamp::now().as_f64())
                 .rate;
-            let update = ctx.shared.hst.lock().add(&h.counts);
+            let (update, running, sum_n) = {
+                let mut hst = ctx.shared.hst.lock();
+                let update = hst.add(&h.counts);
+                let sum_n = update.sum_updated.then(|| hst.window_sum());
+                (update, hst.running().to_vec(), sum_n)
+            };
             post_accum_range(ctx, Accum::PrvHst, update.range).await;
             let frames = {
                 let mut hst = ctx.shared.hst.lock();
@@ -2463,7 +2479,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
             );
             // The window sum, the time axis, the running sum and the frame,
             // in that order (histogram_io.cpp:619-708).
-            if let Some(sum_n) = &update.sum_n {
+            if let Some(sum_n) = &sum_n {
                 ctx.post_int64_array(p.prv_hst_histogram_sum_n_frames, ADDR, int64_array(sum_n));
             }
             let frame: Vec<i32> = h.counts.iter().map(|&v| v as i32).collect();
@@ -2475,7 +2491,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
                     ParamValue::Float64Array(h.time_axis_ms().into()),
                 )],
             );
-            ctx.post_int64_array(p.prv_hst_histogram_data, ADDR, int64_array(&update.running));
+            ctx.post_int64_array(p.prv_hst_histogram_data, ADDR, int64_array(&running));
             ctx.post(
                 ADDR,
                 vec![ParamSetValue::array(
@@ -2494,8 +2510,8 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) -> bool {
             if ctx.mirrored(Mirrored::ArrayCallbacks) != 0 {
                 let time_ms = h.time_axis_ms();
                 let arrays = HstArrays {
-                    window: update.sum_n.map(|w| (w, update.frames_summed as u64)),
-                    running: update.running,
+                    window: sum_n.map(|w| (w, update.frames_summed as u64)),
+                    running,
                     frame_count: frames,
                     current: Some(h.counts),
                     time_ms,
@@ -2975,39 +2991,45 @@ fn add_time_attributes(array: &mut DriverArray, time_ms: &[f64]) {
     }
 }
 
-/// A sum as published on address 4 or 5: the sum itself, or its per-frame
-/// average clamped to u32 with any clamp latched as `OutputClamped`.
-async fn sum_buffer(
-    ctx: &Ctx,
-    locking: Locking,
-    accum: Accum,
+/// A sum as published on addresses 2-5, in a pool array allocated first as
+/// C does: the sum itself, or its per-frame average clamped to u32
+/// (serval_stream.cpp:1472-1487, ADTimePix.cpp:1209-1230). The flag says an
+/// average clamped, for [`post_clamped`].
+fn sum_array(
+    pool: &DriverPool,
+    dims: Vec<NDDimension>,
     sum: &[u64],
     frames: u64,
     output: SumOutput,
-) -> NDDataBuffer {
-    match output {
-        SumOutput::Sum => NDDataBuffer::from_slice(sum),
-        SumOutput::Average => {
-            let mut clamped = false;
-            let avg: Vec<u32> = sum
-                .iter()
-                .map(|&v| {
-                    let (a, c) = clamp_average_to_u32(v, frames);
-                    clamped |= c;
-                    a
-                })
-                .collect();
-            if clamped {
-                let posted = accum
-                    .get(&ctx.shared)
-                    .lock()
-                    .report_range(RangeState::OutputClamped);
-                let (saturated, status) = accum.range_params(&ctx.p);
-                ctx.post_range(locking, saturated, status, posted).await;
+) -> Option<(DriverArray, bool)> {
+    let data_type = match output {
+        SumOutput::Sum => NDDataType::UInt64,
+        SumOutput::Average => NDDataType::UInt32,
+    };
+    let mut array = pool.alloc(dims, data_type).ok()?;
+    let mut clamped = false;
+    match array.fill().data_mut().view_mut() {
+        NDDataViewMut::U64(out) => out.copy_from_slice(sum),
+        NDDataViewMut::U32(out) => {
+            for (o, &v) in out.iter_mut().zip(sum) {
+                let (a, c) = clamp_average_to_u32(v, frames);
+                clamped |= c;
+                *o = a;
             }
-            NDDataBuffer::from_vec(avg)
         }
+        _ => unreachable!("allocated as the output's type"),
     }
+    Some((array, clamped))
+}
+
+/// The `OutputClamped` latch C sets while filling a clamped average.
+async fn post_clamped(ctx: &Ctx, locking: Locking, accum: Accum) {
+    let posted = accum
+        .get(&ctx.shared)
+        .lock()
+        .report_range(RangeState::OutputClamped);
+    let (saturated, status) = accum.range_params(&ctx.p);
+    ctx.post_range(locking, saturated, status, posted).await;
 }
 
 /// The PrvHst NDArrays in C's order: running sum on 5, bin times on 7, the
@@ -3023,21 +3045,12 @@ async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: S
     let dims = || vec![NDDimension::new(bins)];
     let (range, units) = output.range_units();
 
-    let data = sum_buffer(
-        ctx,
-        locking,
-        Accum::PrvHst,
-        &a.running,
-        a.frame_count.max(1),
-        output,
-    )
-    .await;
-    if let Ok(mut array) = ctx.pool.alloc(dims(), data.data_type()) {
-        array
-            .fill()
-            .data_mut()
-            .as_u8_slice_mut()
-            .copy_from_slice(data.as_u8_slice());
+    if let Some((mut array, clamped)) =
+        sum_array(&ctx.pool, dims(), &a.running, a.frame_count.max(1), output)
+    {
+        if clamped {
+            post_clamped(ctx, locking, Accum::PrvHst).await;
+        }
         ctx.attributes_as(locking, &mut array).await;
         add_time_attributes(&mut array, &a.time_ms);
         let saturated = Accum::PrvHst.saturated(&ctx.shared);
@@ -3070,28 +3083,18 @@ async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: S
         ctx.publish_at(6, array, time_stamp).await;
     }
 
-    if let Some((window, frames)) = a.window.filter(|(w, _)| w.len() >= bins) {
-        let data = sum_buffer(
-            ctx,
-            locking,
-            Accum::PrvHst,
-            &window[..bins],
-            frames.max(1),
-            output,
-        )
-        .await;
-        if let Ok(mut array) = ctx.pool.alloc(dims(), data.data_type()) {
-            array
-                .fill()
-                .data_mut()
-                .as_u8_slice_mut()
-                .copy_from_slice(data.as_u8_slice());
-            ctx.attributes_as(locking, &mut array).await;
-            add_time_attributes(&mut array, &a.time_ms);
-            let saturated = Accum::PrvHst.saturated(&ctx.shared);
-            add_range_attributes(&mut array, range, units, saturated);
-            ctx.publish_at(4, array, time_stamp).await;
+    if let Some((window, frames)) = a.window.filter(|(w, _)| w.len() >= bins)
+        && let Some((mut array, clamped)) =
+            sum_array(&ctx.pool, dims(), &window[..bins], frames.max(1), output)
+    {
+        if clamped {
+            post_clamped(ctx, locking, Accum::PrvHst).await;
         }
+        ctx.attributes_as(locking, &mut array).await;
+        add_time_attributes(&mut array, &a.time_ms);
+        let saturated = Accum::PrvHst.saturated(&ctx.shared);
+        add_range_attributes(&mut array, range, units, saturated);
+        ctx.publish_at(4, array, time_stamp).await;
     }
 }
 
@@ -3134,26 +3137,8 @@ async fn push_processed_hst(ctx: &Ctx) {
 }
 
 /// One of processImgFrame's NDUInt64 sums on address 2 or 3.
-async fn publish_img_sum(
-    ctx: &Ctx,
-    addr: usize,
-    width: usize,
-    height: usize,
-    sum: Vec<u64>,
-    unique_id: i32,
-) {
-    let Ok(mut array) = ctx.pool.alloc(
-        vec![NDDimension::new(width), NDDimension::new(height)],
-        NDDataType::UInt64,
-    ) else {
-        return;
-    };
+async fn publish_img_sum(ctx: &Ctx, addr: usize, mut array: DriverArray, unique_id: i32) {
     let mut frame = array.fill();
-    frame
-        .data_mut()
-        .as_mut_slice::<u64>()
-        .expect("allocated as NDUInt64")
-        .copy_from_slice(&sum);
     frame.set_unique_id(unique_id);
     // serval_stream.cpp:1271-1275, :1301-1305: stamped before getAttributes.
     frame.set_time_stamp(EpicsTimestamp::now().as_f64());
@@ -3178,37 +3163,40 @@ async fn push_processed_img(ctx: &Ctx) {
     {
         return;
     }
-    let (running, frames, window, shape) = {
+    // C holds imgMutex_ throughout and fills each array from its sum
+    // (serval_stream.cpp:1464-1531).
+    let (running, window) = {
         let img = ctx.shared.img.lock();
+        let pixels = img.running().len();
+        if pixels == 0 {
+            return;
+        }
+        let dims = || img.shape().iter().map(|&n| NDDimension::new(n)).collect();
+        let frames = img.frame_count().max(1);
+        let running = sum_array(&ctx.pool, dims(), img.running(), frames, output);
         let buffered = img.buffered_frames() as u64;
-        (
-            img.running().to_vec(),
-            img.frame_count(),
-            (buffered > 0).then(|| (img.window_sum(), buffered)),
-            img.shape().to_vec(),
-        )
+        let window = (buffered > 0 && img.window().sum().len() >= pixels)
+            .then(|| {
+                sum_array(
+                    &ctx.pool,
+                    dims(),
+                    &img.window().sum()[..pixels],
+                    buffered,
+                    output,
+                )
+            })
+            .flatten();
+        (running, window)
     };
-    if running.is_empty() {
-        return;
-    }
-    let dims = || shape.iter().map(|&n| NDDimension::new(n)).collect();
     let (range, units) = output.range_units();
 
-    let data = sum_buffer(
-        ctx,
-        Locking::Locked,
-        Accum::Img,
-        &running,
-        frames.max(1),
-        output,
-    )
-    .await;
-    if let Ok(mut array) = ctx.pool.alloc(dims(), data.data_type()) {
-        array
-            .fill()
-            .data_mut()
-            .as_u8_slice_mut()
-            .copy_from_slice(data.as_u8_slice());
+    for (addr, sum) in [(2, running), (3, window)] {
+        let Some((mut array, clamped)) = sum else {
+            continue;
+        };
+        if clamped {
+            post_clamped(ctx, Locking::Locked, Accum::Img).await;
+        }
         wall_clock_stamp(&mut array);
         let _ = ctx
             .pool
@@ -3217,35 +3205,7 @@ async fn push_processed_img(ctx: &Ctx) {
             .await;
         let saturated = Accum::Img.saturated(&ctx.shared);
         add_range_attributes(&mut array, range, units, saturated);
-        ctx.publish_stamped(2, array).await;
-    }
-
-    if let Some((window, frames)) = window.filter(|(w, _)| w.len() >= running.len()) {
-        let data = sum_buffer(
-            ctx,
-            Locking::Locked,
-            Accum::Img,
-            &window[..running.len()],
-            frames,
-            output,
-        )
-        .await;
-        if let Ok(mut array) = ctx.pool.alloc(dims(), data.data_type()) {
-            array
-                .fill()
-                .data_mut()
-                .as_u8_slice_mut()
-                .copy_from_slice(data.as_u8_slice());
-            wall_clock_stamp(&mut array);
-            let _ = ctx
-                .pool
-                .owner()
-                .get_attributes(array.fill().attributes_mut())
-                .await;
-            let saturated = Accum::Img.saturated(&ctx.shared);
-            add_range_attributes(&mut array, range, units, saturated);
-            ctx.publish_stamped(3, array).await;
-        }
+        ctx.publish_stamped(addr, array).await;
     }
 }
 
@@ -4788,10 +4748,12 @@ mod tests {
                 .expect("no array")
                 .unwrap()
         };
-        for i in 0..2 {
+        for (i, sums) in [[1u64, 2], [4, 6]].into_iter().enumerate() {
             let (sum, sum_n) = (recv(0).await, recv(1).await);
-            assert_eq!(sum.unique_id, i + 1);
-            assert_eq!(sum_n.unique_id, i + 1);
+            assert_eq!(sum.unique_id, i as i32 + 1);
+            assert_eq!(sum_n.unique_id, i as i32 + 1);
+            assert!(matches!(sum.data().view(), NDDataView::U64(v) if *v == sums));
+            assert!(matches!(sum_n.data().view(), NDDataView::U64(v) if *v == sums));
         }
         // The second frame's pair was the last one sent.
         set_synced(&ctx, ctx.ad.base.array_callbacks, 0, 1).await;
@@ -6320,7 +6282,9 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         let c = ctx.clone();
-        let sum = tokio::spawn(async move { publish_img_sum(&c, 2, 1, 1, vec![1], 1).await });
+        let dims = vec![NDDimension::new(1), NDDimension::new(1)];
+        let (array, _) = sum_array(&ctx.pool, dims, &[1], 1, SumOutput::Sum).unwrap();
+        let sum = tokio::spawn(async move { publish_img_sum(&c, 2, array, 1).await });
         let posted = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()

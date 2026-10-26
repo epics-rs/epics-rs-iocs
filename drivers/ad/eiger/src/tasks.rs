@@ -15,8 +15,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::{ADDriver, ADStatus};
-use epics_rs::ad_core::error::ADResult;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDataView, NDDimension};
+use epics_rs::ad_core::ndarray::NDDimension;
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -33,6 +32,7 @@ use crate::params::{
     TRIGGER_MODE_CONTINUOUS, TRIGGER_MODE_EXTE, TRIGGER_MODE_EXTS, TRIGGER_MODE_INTE,
     TRIGGER_MODE_INTS,
 };
+use crate::pixels::le_to_host;
 use crate::rest::{self, ApiVersion, RestApi};
 use crate::stream::{StreamApi, StreamMessage};
 use crate::stream2::{Frame, Stream2Api};
@@ -928,22 +928,29 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
         attrs.add(threshold_number_attr(number));
         attrs.add(threshold_energy_attr(energy));
 
-        // Per frame, after its updateTimeStamps (eigerDetector.cpp:1880, :1892).
-        let timestamp = port_stamp(&s.handle).await;
-        let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
-        let image = Image {
-            dims: frame.dims,
-            data: frame.data,
-            codec: None,
-            attributes: attrs,
-            threshold_index: frame.threshold,
-            timestamp: Some(timestamp),
-        };
-        let Ok(array) = prepare(s, image, &counters).await else {
+        // C allocates before its updateTimeStamps (eigerDetector.cpp:1849).
+        let Ok(mut array) = s.pool.alloc(
+            vec![
+                NDDimension::new(frame.dims[0]),
+                NDDimension::new(frame.dims[1]),
+            ],
+            frame.data_type,
+        ) else {
             trace.err("parseH5File", "couldn't allocate NDArray");
             skip_image = true;
             continue;
         };
+        frame.pixels.write_into(array.fill().data_mut().view_mut());
+        // Per frame, after its updateTimeStamps (eigerDetector.cpp:1880, :1892).
+        let timestamp = port_stamp(&s.handle).await;
+        let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+        let image = Image {
+            array,
+            attributes: attrs,
+            threshold_index: frame.threshold,
+            timestamp: Some(timestamp),
+        };
+        let array = prepare(s, image, &counters).await;
         if array_callbacks {
             trace.flow_single_colon("parseH5File", "calling NDArray callback");
         }
@@ -1161,23 +1168,34 @@ async fn monitor_task(s: Arc<Shared>) {
             if let Ok(buf) = s.rest().get_monitor_image(timeout) {
                 match tiff::decode(&buf) {
                     Ok(image) => {
-                        let Ok(array) = build_array(
-                            &s.pool,
-                            image.dims,
-                            image.data,
-                            None,
-                            NDAttributeList::new(),
-                            unique_id,
-                            port_stamp(&s.handle).await,
+                        let Ok(mut array) = s.pool.alloc(
+                            vec![
+                                NDDimension::new(image.dims[0]),
+                                NDDimension::new(image.dims[1]),
+                            ],
+                            image.data_type,
                         ) else {
                             s.trace().err("parseTiffFile", "couldn't allocate NDArray");
                             s.trace().err("monitorTask", "couldn't parse file");
                             rt::sleep(MONITOR_PERIOD).await;
                             continue;
                         };
+                        {
+                            let mut fill = array.fill();
+                            fill.data_mut()
+                                .as_u8_slice_mut()
+                                .copy_from_slice(image.strip);
+                            le_to_host(fill.data_mut().view_mut());
+                        }
+                        stamp(
+                            &mut array,
+                            NDAttributeList::new(),
+                            unique_id,
+                            port_stamp(&s.handle).await,
+                        );
                         unique_id += 1;
                         ArrayPublisher::new(s.outputs.monitor.clone())
-                            .publish(array)
+                            .publish(array.share())
                             .await;
                     }
                     Err(e) => {
@@ -1310,9 +1328,16 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
         let signed_data = s.get_int(s.p.signed_data).await != 0;
         let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
         let mut counters = Counters::read(s).await;
-        let msg = match received.decode(decompress) {
+        let msg = match received.decode(decompress, signed_data, &s.pool) {
             Ok(m) => m,
             Err(crate::stream::StreamError::WrongHtype(_)) => continue,
+            // A refused alloc is getFrame's STREAM_ERROR (streamApi.cpp:370),
+            // which ends the series like any other failed frame.
+            Err(e @ crate::stream::StreamError::NoArray(_)) => {
+                epics_rs::base::stderr_println!("StreamApi::getFrame: {e}");
+                s.trace().err("streamTask", "failed to get frame packet");
+                return false;
+            }
             // UPSTREAM DEFECT (streamApi.cpp:1503-1507 in the caller): C assigns
             // `err = mStreamAPI->getFrame(&pArray, ...)` and then dereferences
             // `pArray` without ever testing `err`, so a failed decode reads an
@@ -1336,32 +1361,13 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                 // C's addresses 0 and 1. It also carries no ThresholdNumber /
                 // ThresholdEnergy attributes; only the HDF5 and stream2 paths add
                 // those.
-                let number = frame.frame;
                 let image = Image {
-                    dims: frame.dims,
-                    data: frame.data,
-                    codec: frame.codec,
+                    array: frame.array,
                     attributes: NDAttributeList::new(),
                     threshold_index: 0,
                     timestamp: None,
                 };
-                // A refused alloc is getFrame's STREAM_ERROR (streamApi.cpp:370),
-                // which ends the series like any other failed frame above.
-                if publish(
-                    s,
-                    image.signed_if(signed_data),
-                    array_callbacks,
-                    &mut counters,
-                )
-                .await
-                .is_err()
-                {
-                    epics_rs::base::stderr_println!(
-                        "StreamApi::getFrame: failed to allocate NDArray for frame {number}"
-                    );
-                    s.trace().err("streamTask", "failed to get frame packet");
-                    return false;
-                }
+                publish(s, image, array_callbacks, &mut counters).await;
             }
         }
     }
@@ -1421,13 +1427,18 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
 
         for thresh in 0..num_thresholds {
             let decompress = s.get_int(s.p.stream_decompress).await != 0;
+            // C reads SignedData after getFrame (eigerDetector.cpp:1519) and
+            // relabels the array; here the label is the array's type, fixed
+            // where getFrame allocates it, so it is read first.
+            let signed_data = s.get_int(s.p.signed_data).await != 0;
             // UPSTREAM DEFECT (eigerDetector.cpp:1505): C does not test what
             // getFrame returns and publishes `pArray` regardless, unset when the
-            // data type was unknown. Here that frame is skipped.
-            let Ok(frame) = stream.get_frame(thresh, decompress, ts_source) else {
+            // data type was unknown or the pool refused it. Here that frame is
+            // skipped.
+            let Ok(frame) = stream.get_frame(thresh, decompress, signed_data, ts_source, &s.pool)
+            else {
                 continue;
             };
-            let signed_data = s.get_int(s.p.signed_data).await != 0;
             let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
             let mut counters = Counters::read(s).await;
             let mut attributes = NDAttributeList::new();
@@ -1436,28 +1447,12 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
                 attributes.add(threshold_energy_attr(energy));
             }
             let image = Image {
-                dims: frame.dims,
-                data: frame.data,
-                codec: frame.codec,
+                array: frame.array,
                 attributes,
                 threshold_index: thresh,
                 timestamp: frame.timestamp,
             };
-            // A refused alloc is getFrame's STREAM_ERROR (stream2Api.cpp:290),
-            // skipped like the other failed frames above.
-            if publish(
-                s,
-                image.signed_if(signed_data),
-                array_callbacks,
-                &mut counters,
-            )
-            .await
-            .is_err()
-            {
-                epics_rs::base::stderr_println!(
-                    "Stream2Api::getFrame: failed to allocate NDArray for frame"
-                );
-            }
+            publish(s, image, array_callbacks, &mut counters).await;
         }
     }
 }
@@ -1476,42 +1471,27 @@ async fn port_stamp(handle: &PortHandle) -> EpicsTimestamp {
         .into()
 }
 
-fn build_array(
-    pool: &DriverPool,
-    dims: [usize; 2],
-    data: NDDataBuffer,
-    codec: Option<epics_rs::ad_core::codec::Codec>,
+/// Stamp a filled frame with its uniqueId, time and attributes.
+fn stamp(
+    array: &mut DriverArray,
     attributes: NDAttributeList,
     unique_id: i32,
     timestamp: EpicsTimestamp,
-) -> ADResult<DriverArray> {
-    // A compressed frame holds its payload bytes, which its dims do not size.
-    let mut array = pool.alloc_sized(
-        vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
-        data.data_type(),
-        data.total_bytes(),
-    )?;
+) {
     let mut frame = array.fill();
-    frame
-        .data_mut()
-        .as_u8_slice_mut()
-        .copy_from_slice(data.as_u8_slice());
     frame.set_unique_id(unique_id);
     // C sets `timeStamp = ts.secPastEpoch + ts.nsec/1.e9` (stream2Api.cpp:337),
     // as updateTimeStamps does.
     frame.set_timestamp(timestamp);
     frame.set_time_stamp(f64::from(timestamp.sec) + f64::from(timestamp.nsec) / 1.0e9);
     *frame.attributes_mut() = attributes;
-    frame.set_codec(codec);
-    Ok(array)
 }
 
-/// One image on its way out: what [`publish`] needs to build the NDArray and to
-/// pick the threshold output it also goes to.
+/// One image on its way out: what [`publish`] needs to stamp the NDArray and
+/// to pick the threshold output it also goes to.
 struct Image {
-    dims: [usize; 2],
-    data: NDDataBuffer,
-    codec: Option<epics_rs::ad_core::codec::Codec>,
+    /// Filled, SignedData already its type (see [`crate::pixels::frame_type`]).
+    array: DriverArray,
     attributes: NDAttributeList,
     /// 0-based threshold index; picks `outputs.thresholds[i]`, which is C's
     /// asyn address `thresh + 1`.
@@ -1520,39 +1500,6 @@ struct Image {
     /// STREAM_AS_TIMESTAMP_SOURCE is set, or parseH5File's own. `None` stamps
     /// the array now.
     timestamp: Option<EpicsTimestamp>,
-}
-
-impl Image {
-    /// Relabel unsigned pixels as signed (C's `SignedData`,
-    /// eigerDetector.cpp:1519) when `signed` is set.
-    ///
-    /// The detector's counts are unsigned, but bad pixels and gaps are very
-    /// large positive numbers that wreck autoscaling; re-tagging the same bits
-    /// as signed turns them into small negatives at the cost of half the count
-    /// range. C changes `pArray->dataType`, which on a still-compressed frame
-    /// is the type the codec plugin decompresses to, so a codec's
-    /// `original_data_type` is relabelled instead of its bytes.
-    fn signed_if(mut self, signed: bool) -> Self {
-        if !signed {
-            return self;
-        }
-        if let Some(codec) = &mut self.codec {
-            codec.original_data_type = match codec.original_data_type {
-                NDDataType::UInt8 => NDDataType::Int8,
-                NDDataType::UInt16 => NDDataType::Int16,
-                NDDataType::UInt32 => NDDataType::Int32,
-                other => other,
-            };
-            return self;
-        }
-        self.data = match self.data.view() {
-            NDDataView::U8(v) => NDDataBuffer::from_vec(v.iter().map(|&x| x as i8).collect()),
-            NDDataView::U16(v) => NDDataBuffer::from_vec(v.iter().map(|&x| x as i16).collect()),
-            NDDataView::U32(v) => NDDataBuffer::from_vec(v.iter().map(|&x| x as i32).collect()),
-            _ => return self,
-        };
-        self
-    }
 }
 
 /// C's `imageCounter` / `numImagesCounter` locals: each path reads them where
@@ -1571,26 +1518,16 @@ impl Counters {
     }
 }
 
-/// `Err` when the pool refuses the frame (C's `alloc` returning NULL); the
-/// caller prints C's line for its path, and the counters stay as they were.
-async fn publish(
-    s: &Arc<Shared>,
-    image: Image,
-    array_callbacks: bool,
-    counters: &mut Counters,
-) -> ADResult<()> {
+async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool, counters: &mut Counters) {
     let threshold_index = image.threshold_index;
-    let array = prepare(s, image, counters).await?;
+    let array = prepare(s, image, counters).await;
     deliver(s, array, threshold_index, array_callbacks, counters).await;
-    Ok(())
 }
 
-/// Stamp and allocate one image; [`publish`]'s first half.
-async fn prepare(s: &Arc<Shared>, image: Image, counters: &Counters) -> ADResult<PublishedArray> {
+/// Stamp one image; [`publish`]'s first half.
+async fn prepare(s: &Arc<Shared>, image: Image, counters: &Counters) -> PublishedArray {
     let Image {
-        dims,
-        data,
-        codec,
+        mut array,
         attributes,
         threshold_index: _,
         timestamp,
@@ -1604,7 +1541,8 @@ async fn prepare(s: &Arc<Shared>, image: Image, counters: &Counters) -> ADResult
         Some(ts) => ts,
         None => port_stamp(&s.handle).await,
     };
-    Ok(build_array(&s.pool, dims, data, codec, attributes, unique_id, timestamp)?.share())
+    stamp(&mut array, attributes, unique_id, timestamp);
+    array.share()
 }
 
 /// Publish one image on the main output and on its threshold's output
@@ -1697,6 +1635,7 @@ pub fn signals() -> (Signals, Receivers) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::{NDDataType, NDDataView};
 
     #[test]
     fn stream_apis_follow_c_create_and_delete() {
@@ -1717,42 +1656,26 @@ mod tests {
         assert!(rx.stream_apis.try_recv().is_err());
     }
 
-    fn image(data: NDDataBuffer, codec: Option<epics_rs::ad_core::codec::Codec>) -> Image {
+    /// A filled 2x1 NDUInt16 image from `pool`.
+    fn image(pool: &DriverPool) -> Image {
+        let mut array = pool
+            .alloc(
+                vec![NDDimension::new(2), NDDimension::new(1)],
+                NDDataType::UInt16,
+            )
+            .unwrap();
+        array
+            .fill()
+            .data_mut()
+            .as_mut_slice::<u16>()
+            .unwrap()
+            .copy_from_slice(&[1, 2]);
         Image {
-            dims: [2, 1],
-            data,
-            codec,
+            array,
             attributes: NDAttributeList::new(),
             threshold_index: 0,
             timestamp: None,
         }
-    }
-
-    #[test]
-    fn signed_data_relabels_pixels_or_the_codec_type() {
-        let im = image(NDDataBuffer::from_vec::<u16>(vec![1, 0xffff]), None).signed_if(true);
-        let NDDataView::I16(v) = im.data.view() else {
-            panic!("expected I16");
-        };
-        assert_eq!(v, [1, -1]);
-
-        let codec = epics_rs::ad_core::codec::Codec {
-            name: epics_rs::ad_core::codec::CodecName::BSLZ4,
-            compressed_size: 3,
-            level: 0,
-            shuffle: 0,
-            compressor: 0,
-            original_data_type: NDDataType::UInt32,
-        };
-        let im = image(NDDataBuffer::from_vec::<u8>(vec![1, 2, 3]), Some(codec)).signed_if(true);
-        assert_eq!(im.codec.unwrap().original_data_type, NDDataType::Int32);
-        let NDDataView::U8(v) = im.data.view() else {
-            panic!("compressed bytes stay bytes");
-        };
-        assert_eq!(v, [1, 2, 3]);
-
-        let im = image(NDDataBuffer::from_vec::<u16>(vec![1]), None).signed_if(false);
-        assert!(matches!(im.data.view(), NDDataView::U16(_)));
     }
 
     /// A detector that answers every GET as a two-valued enum and every PUT
@@ -1945,14 +1868,7 @@ mod tests {
 
         for _ in 0..2 {
             let mut counters = Counters::read(&s).await;
-            publish(
-                &s,
-                image(NDDataBuffer::from_vec::<u16>(vec![1, 2]), None),
-                true,
-                &mut counters,
-            )
-            .await
-            .unwrap();
+            publish(&s, image(&s.pool), true, &mut counters).await;
         }
         let mut ids = Vec::new();
         for _ in 0..2 {
@@ -2003,14 +1919,7 @@ mod tests {
         );
 
         let mut counters = Counters::read(&s).await;
-        publish(
-            &s,
-            image(NDDataBuffer::from_vec::<u16>(vec![1, 2]), None),
-            true,
-            &mut counters,
-        )
-        .await
-        .unwrap();
+        publish(&s, image(&s.pool), true, &mut counters).await;
         rx.recv().await.expect("array");
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 1);
         assert_eq!(s.get_int(s.ad.base.array_size).await, 0);
@@ -2136,7 +2045,7 @@ mod tests {
         push.send(image(0, false)).await.unwrap();
         frame_done(1).await;
         let a = rx.recv().await.expect("frame 0");
-        assert!(matches!(a.data().view(), NDDataView::U16(_)));
+        assert!(matches!(a.data().view(), NDDataView::U16(p) if p == [1, 0xffff]));
 
         set(vec![ParamUpdate::Int32(s.ad.base.array_callbacks, 0)]).await;
         push.send(image(1, false)).await.unwrap();
@@ -2156,7 +2065,7 @@ mod tests {
         frame_done(3).await;
         let a = rx.recv().await.expect("frame 2");
         assert!(
-            matches!(a.data().view(), NDDataView::I16(_)),
+            matches!(a.data().view(), NDDataView::I16(p) if p == [1, -1]),
             "SignedData=1 on frame 2"
         );
 
@@ -2335,6 +2244,46 @@ mod tests {
         assert_eq!(rx.recv().await.expect("frame 0").unique_id, 0);
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
         assert_eq!(rx.pending(), 0, "ArrayCallbacks=0 before frame 1");
+    }
+
+    /// A stream2 frame costs its pool buffer and no other buffer of its
+    /// size: C copies the message's pixels into `pData` once
+    /// (stream2Api.cpp:290-303).
+    #[tokio::test]
+    async fn a_stream2_frame_decodes_straight_into_its_pool_buffer() {
+        use crate::stream2::tests::{end, image, start};
+
+        let (cols, rows) = (300usize, 200usize);
+        let size = cols * rows * 2;
+        let dims = || vec![NDDimension::new(cols), NDDimension::new(rows)];
+        let counted = crate::alloc_count::count(size);
+        let pooled = DriverPool::standalone(0).alloc(dims(), NDDataType::UInt16);
+        let pool_only = counted.stop();
+        drop(pooled);
+
+        let (s, mut rx) = h5_rig("EIGER_STREAM2_ALLOCS");
+        s.set_int(s.ad.base.array_callbacks, 1).await;
+        let pixels: Vec<u16> = (0..cols * rows).map(|i| i as u16).collect();
+        let mut stream = Stream2Api::with_received(vec![
+            start(&[("threshold_1", 6000.0)]),
+            image(&[("threshold_1", &pixels)], rows as u64, cols as u64),
+            end(),
+        ]);
+        let counted = crate::alloc_count::count(size);
+        assert!(
+            stream2_series(&s, &mut stream).await,
+            "the end completes it"
+        );
+        let allocs = counted.stop();
+
+        assert_eq!(allocs, pool_only, "frame-sized allocations");
+        let array = rx.recv().await.expect("the frame is published");
+        let sizes: Vec<usize> = array.dims.iter().map(|d| d.size).collect();
+        assert_eq!(sizes, [cols, rows]);
+        let NDDataView::U16(got) = array.data().view() else {
+            panic!("a uint16 frame is NDUInt16");
+        };
+        assert_eq!(got, &pixels[..]);
     }
 
     /// One single-part stream v1 message; a PUSH socket refuses to send until

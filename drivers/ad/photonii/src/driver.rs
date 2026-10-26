@@ -385,10 +385,10 @@ mod tests {
         );
     }
 
-    /// Both C halves: DataType starts NDUInt32 (PhotonII.cpp:124) and the
-    /// frames are NDInt32 (:416).
+    /// DataType starts NDUInt32 (PhotonII.cpp:124); the frames are NDInt32
+    /// (:416), which `a_frame_leaves_the_array_params_alone` reads back.
     #[test]
-    fn data_type_is_cs_seed_and_frames_are_cs_int32() {
+    fn data_type_is_cs_seed() {
         let det = detector("PII_DTYPE");
         assert_eq!(
             det.ad
@@ -397,8 +397,6 @@ mod tests {
                 .unwrap(),
             NDDataType::UInt32 as i32
         );
-        let frame = crate::raw::decode_raw(&vec![0u8; crate::raw::frame_bytes()]).unwrap();
-        assert_eq!(frame.data_type(), NDDataType::Int32);
     }
 
     #[test]

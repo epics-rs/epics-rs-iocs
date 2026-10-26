@@ -274,10 +274,9 @@ async fn publish_frame(
     payload: Vec<u8>,
     unique_id: i32,
 ) {
-    let data = match image::decode_payload(header, &payload) {
-        Ok(data) => data,
-        Err(_) => return,
-    };
+    if image::check_payload(header, &payload).is_err() {
+        return;
+    }
 
     // C reads the clock for timeStamp, then takes the port's moved stamp as
     // epicsTS (PSL.cpp:606-609).
@@ -300,14 +299,11 @@ async fn publish_frame(
 
     // C dereferences a refused alloc unchecked (PSL.cpp:573); here the frame
     // is dropped after the pool's limit line.
-    let Ok(mut array) = ctx.pool.alloc(dims, data.data_type()) else {
+    let Ok(mut array) = ctx.pool.alloc(dims, header.data_type) else {
         return;
     };
     let mut frame = array.fill();
-    frame
-        .data_mut()
-        .as_u8_slice_mut()
-        .copy_from_slice(data.as_u8_slice());
+    image::decode_into(&payload, frame.data_mut().view_mut());
     frame.set_unique_id(unique_id);
     frame.set_timestamp(ts);
     frame.set_time_stamp(now.as_f64());
@@ -386,7 +382,7 @@ mod tests {
     use super::*;
     use crate::driver::create_psl_detector;
     use epics_rs::ad_core::color::NDColorMode;
-    use epics_rs::ad_core::ndarray::NDDataType;
+    use epics_rs::ad_core::ndarray::{NDDataType, NDDataView};
     use epics_rs::ad_core::plugin::channel::{NDArrayOutput, ndarray_channel};
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::registry::claim_port;
@@ -430,8 +426,12 @@ mod tests {
         })
         .join()
         .unwrap();
-        arrays.blocking_recv().unwrap();
+        let array = arrays.blocking_recv().unwrap();
         std::mem::forget(det);
+        assert!(
+            matches!(array.data().view(), NDDataView::U16(p) if p == [1, 2]),
+            "the published pixels are the payload's"
+        );
 
         let int = |reason| handle.read_int32_blocking(reason, 0).unwrap();
         assert_eq!(int(base.array_size_x), 2);

@@ -2,8 +2,9 @@
 //! timeStamp but never its epicsTS (drvQuadEM.cpp:334-336, :352-353), which
 //! the NDArray constructor zeroes (NDArray.cpp:31-32), so plugins read
 //! EpicsTSSec_RBV and EpicsTSNsec_RBV as 0. Here every array carries the
-//! port's timestamp. Driven through an FX4 port, whose meter is a local
-//! WebSocket server.
+//! port's timestamp. Each single-item array is that item's column of the
+//! whole array (:338-350). Driven through an FX4 port, whose meter is a
+//! local WebSocket server.
 
 use std::sync::mpsc;
 use std::thread;
@@ -18,7 +19,7 @@ use epics_rs::ad_core::plugin::channel::ndarray_channel;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::registry::claim_port;
 use quadem::create_fx4;
-use quadem::drv_quad_em::{QE_ADDR_ALL, QE_CURRENT1};
+use quadem::drv_quad_em::{QE_ADDR_ALL, QE_CURRENT1, QE_MAX_DATA, QE_SUM_ALL};
 use quadem::fx4_proto::{ADC_PATHS, GATE_PATH, sample_time};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,7 +78,7 @@ fn published_arrays_carry_epics_ts() {
     let handle = port.port_handle();
 
     let (array_tx, array_rx) = mpsc::channel();
-    for addr in [QE_ADDR_ALL, QE_CURRENT1] {
+    for addr in [QE_ADDR_ALL, QE_CURRENT1, QE_SUM_ALL] {
         let (sender, mut receiver) = ndarray_channel("EPICS_TS_SINK", 4);
         port.outputs[addr].lock().add(sender);
         let array_tx = array_tx.clone();
@@ -88,6 +89,12 @@ fn published_arrays_carry_epics_ts() {
         });
     }
 
+    // CurrentScale defaults to 0, which would zero every column.
+    for input in 0..4 {
+        handle
+            .write_float64_blocking(port.params.current_scale, input, 1.0)
+            .expect("CurrentScale");
+    }
     // One sample per callback: numAverage = AveragingTime / SampleTime, at
     // the default ValuesPerRead of 1.
     handle
@@ -97,14 +104,23 @@ fn published_arrays_carry_epics_ts() {
         .write_int32_blocking(port.nd_params.acquire, 0, 1)
         .expect("acquire");
 
-    let mut seen = Vec::new();
-    while seen.len() < 2 {
+    let mut seen = std::collections::BTreeMap::new();
+    while seen.len() < 3 {
         let (addr, array) = array_rx.recv_timeout(TIMEOUT).expect("an array");
-        if seen.contains(&addr) {
+        if seen.contains_key(&addr) {
             continue;
         }
         assert_ne!(array.timestamp, EpicsTimestamp::default(), "address {addr}");
         assert_eq!(array.time_stamp, array.timestamp.as_f64(), "address {addr}");
-        seen.push(addr);
+        let data = array.data().as_slice::<f64>().expect("NDFloat64").to_vec();
+        seen.insert(addr, data);
     }
+    let all = &seen[&QE_ADDR_ALL];
+    assert_eq!(all.len(), QE_MAX_DATA);
+    for item in [QE_CURRENT1, QE_SUM_ALL] {
+        assert_eq!(seen[&item], [all[item]], "address {item}");
+    }
+    // Four equal currents: a column the write skipped would read 0 here.
+    assert_ne!(all[QE_CURRENT1], 0.0);
+    assert_eq!(all[QE_SUM_ALL], 4.0 * all[QE_CURRENT1]);
 }

@@ -39,6 +39,8 @@ pub enum Bslz4Error {
         expected: usize,
     },
     Lz4(String),
+    /// A block size the library refuses (`bshuf_decompress_lz4` returns -81).
+    BlockSize(usize),
 }
 
 impl std::fmt::Display for Bslz4Error {
@@ -50,6 +52,7 @@ impl std::fmt::Display for Bslz4Error {
                 "bslz4 header declares {header} bytes, frame geometry needs {expected}"
             ),
             Self::Lz4(m) => write!(f, "bslz4 lz4 block: {m}"),
+            Self::BlockSize(n) => write!(f, "bslz4 block size {n} is not a multiple of 8"),
         }
     }
 }
@@ -112,27 +115,26 @@ fn shuffle_bit_eightelem(input: &[u8], out: &mut [u8], size: usize, elem_size: u
     }
 }
 
-/// Undo the bitshuffle transform of one block (`bshuf_untrans_bit_elem_scal`).
+/// Undo the bitshuffle transform of one block into `out`
+/// (`bshuf_untrans_bit_elem_scal`).
 ///
-/// `size` (element count) is a multiple of 8.
-fn untrans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> {
-    let n = size * elem_size;
-    let mut tmp = vec![0u8; n];
-    let mut out = vec![0u8; n];
+/// `out.len() / elem_size` (element count) is a multiple of 8.
+fn untrans_bit_elem(input: &[u8], out: &mut [u8], elem_size: usize) {
+    let size = out.len() / elem_size;
+    let mut tmp = vec![0u8; out.len()];
     trans_byte_bitrow(input, &mut tmp, size, elem_size);
-    shuffle_bit_eightelem(&tmp, &mut out, size, elem_size);
-    out
+    shuffle_bit_eightelem(&tmp, out, size, elem_size);
 }
 
-/// LZ4-decode and un-bitshuffle one `[u32 len BE][lz4]` block.
+/// LZ4-decode and un-bitshuffle one `[u32 len BE][lz4]` block into `out`.
 ///
-/// Returns the block's bytes and the offset just past the frame.
+/// Returns the offset just past the frame.
 fn decode_block(
     buf: &[u8],
     pos: usize,
-    size: usize,
+    out: &mut [u8],
     elem_size: usize,
-) -> Result<(Vec<u8>, usize), Bslz4Error> {
+) -> Result<usize, Bslz4Error> {
     if pos + 4 > buf.len() {
         return Err(Bslz4Error::Truncated("block length"));
     }
@@ -144,44 +146,49 @@ fn decode_block(
     if end > buf.len() {
         return Err(Bslz4Error::Truncated("block payload"));
     }
-    let shuffled = lz4_flex::block::decompress(&buf[start..end], size * elem_size)
+    let shuffled = lz4_flex::block::decompress(&buf[start..end], out.len())
         .map_err(|e| Bslz4Error::Lz4(e.to_string()))?;
-    if shuffled.len() != size * elem_size {
+    if shuffled.len() != out.len() {
         return Err(Bslz4Error::Truncated("block decoded short"));
     }
-    Ok((untrans_bit_elem(&shuffled, size, elem_size), end))
+    untrans_bit_elem(&shuffled, out, elem_size);
+    Ok(end)
 }
 
-/// Decode a header-less bslz4 block stream (library `bshuf_decompress_lz4`).
+/// Decode a header-less bslz4 block stream into `out`, its
+/// `n_elems * elem_size` bytes (library `bshuf_decompress_lz4`).
 ///
 /// `block_size` is in elements; pass 0 for the encoder default.
-pub fn decode_blocks(
+pub fn decode_blocks_into(
     buf: &[u8],
-    n_elems: usize,
+    out: &mut [u8],
     elem_size: usize,
     block_size: usize,
-) -> Result<Vec<u8>, Bslz4Error> {
+) -> Result<(), Bslz4Error> {
     let block_size = if block_size == 0 {
         default_block_size(elem_size)
     } else {
         block_size
     };
+    if !block_size.is_multiple_of(BLOCKED_MULT) {
+        return Err(Bslz4Error::BlockSize(block_size));
+    }
+    let n_elems = out.len() / elem_size;
 
-    let mut out = Vec::with_capacity(n_elems * elem_size);
     let mut pos = 0usize;
-
+    let mut at = 0usize;
     for _ in 0..(n_elems / block_size) {
-        let (block, next) = decode_block(buf, pos, block_size, elem_size)?;
-        out.extend_from_slice(&block);
-        pos = next;
+        let n = block_size * elem_size;
+        pos = decode_block(buf, pos, &mut out[at..at + n], elem_size)?;
+        at += n;
     }
     // One trailing partial block, rounded down to a multiple of 8.
     let last = n_elems % block_size;
     let last = last - last % BLOCKED_MULT;
     if last > 0 {
-        let (block, next) = decode_block(buf, pos, last, elem_size)?;
-        out.extend_from_slice(&block);
-        pos = next;
+        let n = last * elem_size;
+        pos = decode_block(buf, pos, &mut out[at..at + n], elem_size)?;
+        at += n;
     }
     // The final `n_elems % 8` elements were stored raw.
     let leftover = (n_elems % BLOCKED_MULT) * elem_size;
@@ -189,41 +196,51 @@ pub fn decode_blocks(
         if pos + leftover > buf.len() {
             return Err(Bslz4Error::Truncated("trailing raw elements"));
         }
-        out.extend_from_slice(&buf[pos..pos + leftover]);
+        out[at..at + leftover].copy_from_slice(&buf[pos..pos + leftover]);
     }
-    Ok(out)
+    Ok(())
 }
 
-/// Decode a bslz4 payload that carries the 12-byte header.
-///
-/// `expected_bytes`, when given, is checked against the header's declared size:
-/// the image header and the compressed payload must agree on the frame size
-/// before we allocate from it.
-pub fn decode_with_header(
-    buf: &[u8],
-    elem_size: usize,
-    expected_bytes: Option<usize>,
-) -> Result<Vec<u8>, Bslz4Error> {
+/// The 12-byte header's `(total bytes, block size in elements)`.
+fn header(buf: &[u8], elem_size: usize) -> Result<(usize, usize), Bslz4Error> {
     if buf.len() < HEADER_LEN {
         return Err(Bslz4Error::Truncated("header"));
     }
     let total_bytes = u64::from_be_bytes(buf[0..8].try_into().unwrap()) as usize;
     let block_bytes = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+    // The header records the block size in bytes; the codec works in elements.
+    Ok((total_bytes, block_bytes / elem_size))
+}
 
-    if let Some(expected) = expected_bytes
-        && total_bytes != expected
-    {
+/// Decode a bslz4 payload that carries the 12-byte header (the HDF5 filter's
+/// chunk).
+pub fn decode_with_header(buf: &[u8], elem_size: usize) -> Result<Vec<u8>, Bslz4Error> {
+    let elem_size = elem_size.max(1);
+    let (total_bytes, block_size) = header(buf, elem_size)?;
+    let mut out = vec![0u8; total_bytes - total_bytes % elem_size];
+    decode_blocks_into(&buf[HEADER_LEN..], &mut out, elem_size, block_size)?;
+    Ok(out)
+}
+
+/// Decode a bslz4 payload that carries the 12-byte header into `out`.
+///
+/// The header's declared size must be `out.len()`: the image header and the
+/// compressed payload must agree on the frame size the buffer was allocated
+/// for.
+pub fn decode_with_header_into(
+    buf: &[u8],
+    out: &mut [u8],
+    elem_size: usize,
+) -> Result<(), Bslz4Error> {
+    let elem_size = elem_size.max(1);
+    let (total_bytes, block_size) = header(buf, elem_size)?;
+    if total_bytes != out.len() {
         return Err(Bslz4Error::SizeMismatch {
             header: total_bytes,
-            expected,
+            expected: out.len(),
         });
     }
-
-    let elem_size = elem_size.max(1);
-    let n_elems = total_bytes / elem_size;
-    // The header records the block size in bytes; the codec works in elements.
-    let block_size = block_bytes / elem_size;
-    decode_blocks(&buf[HEADER_LEN..], n_elems, elem_size, block_size)
+    decode_blocks_into(&buf[HEADER_LEN..], out, elem_size, block_size)
 }
 
 #[cfg(test)]
@@ -231,6 +248,19 @@ mod tests {
     use super::*;
     use epics_rs::ad_core::codec::{Codec, CodecName};
     use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDataView, NDDimension};
+
+    /// [`decode_blocks_into`] a buffer of stale bytes, as a reused pool
+    /// buffer holds.
+    fn decode_blocks(
+        buf: &[u8],
+        n_elems: usize,
+        elem_size: usize,
+        block_size: usize,
+    ) -> Result<Vec<u8>, Bslz4Error> {
+        let mut out = vec![0xA5; n_elems * elem_size];
+        decode_blocks_into(buf, &mut out, elem_size, block_size)?;
+        Ok(out)
+    }
 
     /// Encode with ad-plugins' independent bitshuffle implementation (written
     /// from the reference library) and decode with ours: the two must agree.
@@ -330,7 +360,8 @@ mod tests {
         framed.extend_from_slice(&((default_block_size(2) * 2) as u32).to_be_bytes());
         framed.extend_from_slice(compressed.data().as_u8_slice());
 
-        let decoded = decode_with_header(&framed, 2, Some(n * 2)).unwrap();
+        let mut decoded = vec![0xA5; n * 2];
+        decode_with_header_into(&framed, &mut decoded, 2).unwrap();
         let decoded: Vec<u16> = decoded
             .as_chunks::<2>()
             .0
@@ -342,7 +373,7 @@ mod tests {
         // A header that disagrees with the declared frame geometry is rejected
         // rather than used to size an allocation.
         assert_eq!(
-            decode_with_header(&framed, 2, Some(n * 2 + 8)),
+            decode_with_header_into(&framed, &mut vec![0; n * 2 + 8], 2),
             Err(Bslz4Error::SizeMismatch {
                 header: n * 2,
                 expected: n * 2 + 8,
@@ -365,21 +396,31 @@ mod tests {
         framed.extend_from_slice(&0u32.to_be_bytes()); // 0 = default
         framed.extend_from_slice(compressed.data().as_u8_slice());
 
-        let decoded = decode_with_header(&framed, 2, None).unwrap();
+        let decoded = decode_with_header(&framed, 2).unwrap();
         assert_eq!(decoded.len(), n * 2);
     }
 
     #[test]
     fn truncated_payloads_are_rejected() {
         assert_eq!(
-            decode_with_header(&[0u8; 4], 2, None),
+            decode_with_header(&[0u8; 4], 2),
             Err(Bslz4Error::Truncated("header"))
         );
         // Header promises 1024 bytes but no blocks follow.
         let mut framed = Vec::new();
         framed.extend_from_slice(&1024u64.to_be_bytes());
         framed.extend_from_slice(&0u32.to_be_bytes());
-        assert!(decode_with_header(&framed, 2, None).is_err());
+        assert!(decode_with_header(&framed, 2).is_err());
+    }
+
+    /// bshuf_decompress_lz4 refuses a block size that is not a multiple of
+    /// 8 (bitshuffle_core.c:1687); one would write past the frame here.
+    #[test]
+    fn a_block_size_off_the_8_element_grid_is_rejected() {
+        assert_eq!(
+            decode_blocks(&[0u8; 64], 150, 2, 100),
+            Err(Bslz4Error::BlockSize(100))
+        );
     }
 
     #[test]

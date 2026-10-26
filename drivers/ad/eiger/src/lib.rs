@@ -20,11 +20,14 @@ use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 
+#[cfg(test)]
+mod alloc_count;
 pub mod bslz4;
 pub mod driver;
 pub mod h5;
 pub mod param;
 pub mod params;
+mod pixels;
 pub mod rest;
 pub mod stream;
 pub mod stream2;

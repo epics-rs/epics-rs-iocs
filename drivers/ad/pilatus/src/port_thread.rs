@@ -329,13 +329,16 @@ impl PilatusDriver {
         let Some((nx, ny)) = dims else {
             return;
         };
+        // C reads into pFlatField itself (:290), so a failed read leaves the
+        // flat field plugins already hold half overwritten; this stages it.
+        let mut data = vec![0; nx * ny];
         let read = ImageReader {
             ad: self.ad.params,
             cx: &mut self.ad.port_base,
             stop: &self.stop,
         }
-        .read_image_file(file, None, 0.0, nx, ny, &bad_pixels);
-        let Ok((mut data, description)) = read else {
+        .read_image_file(file, None, 0.0, [nx, ny], &mut data, &bad_pixels);
+        let Ok(description) = read else {
             self.ad.port_base.trace(
                 TraceMask::ERROR,
                 &format!(

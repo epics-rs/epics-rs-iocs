@@ -10,14 +10,16 @@
 //! * `dimage-1.0`   — 4 parts: header, shape/type/encoding, blob, timestamps.
 //! * `dseries_end-1.0` — 1 part: the series is over.
 //!
-//! The decoders are pure functions over byte slices so a frame can be decoded
+//! The decoders work over byte slices and a pool, so a frame can be decoded
 //! without a detector or a socket.
 
 use epics_rs::ad_core::codec::{Codec, CodecName};
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use serde_json::Value;
 
 use crate::bslz4;
+use crate::pixels::{frame_type, le_to_host};
 
 const ZMQ_PORT: u16 = 9999;
 
@@ -27,6 +29,8 @@ pub enum StreamError {
     WrongHtype(String),
     Decode(String),
     Transport(String),
+    /// The pool refused the frame's array (streamApi.cpp:370).
+    NoArray(u64),
 }
 
 impl std::fmt::Display for StreamError {
@@ -35,6 +39,7 @@ impl std::fmt::Display for StreamError {
             Self::WrongHtype(h) => write!(f, "wrong header type, htype={h}"),
             Self::Decode(m) => write!(f, "{m}"),
             Self::Transport(m) => write!(f, "zmq: {m}"),
+            Self::NoArray(frame) => write!(f, "failed to allocate NDArray for frame {frame}"),
         }
     }
 }
@@ -43,26 +48,23 @@ impl std::error::Error for StreamError {}
 
 type Result<T> = std::result::Result<T, StreamError>;
 
-/// The pixels of one `dimage` message, before the series/frame ids are attached.
-#[derive(Debug)]
-pub struct DecodedImage {
-    /// `[width, height]`, in the order the detector reports the shape.
-    pub dims: [usize; 2],
-    pub data: NDDataBuffer,
-    /// Set when the frame is passed through still compressed.
-    pub codec: Option<Codec>,
-}
-
 /// A decoded image frame.
-#[derive(Debug)]
 pub struct StreamFrame {
     pub series: u64,
     pub frame: u64,
-    /// `[width, height]`, in the order the detector reports the shape.
-    pub dims: [usize; 2],
-    pub data: NDDataBuffer,
-    /// Set when the frame is passed through still compressed.
-    pub codec: Option<Codec>,
+    /// `[width, height]`, in the order the detector reports the shape, and a
+    /// codec when the frame is passed through still compressed.
+    pub array: DriverArray,
+}
+
+impl std::fmt::Debug for StreamFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamFrame")
+            .field("series", &self.series)
+            .field("frame", &self.frame)
+            .field("array", &*self.array)
+            .finish()
+    }
 }
 
 /// What one multipart message turned out to be.
@@ -70,7 +72,7 @@ pub struct StreamFrame {
 pub enum StreamMessage {
     /// Series start; carries the series id.
     Header(u64),
-    Image(StreamFrame),
+    Image(Box<StreamFrame>),
     /// End of series (C `dseries_end`).
     End,
 }
@@ -119,46 +121,9 @@ fn codec_of(encoding: &str) -> Result<Option<CodecName>> {
     }
 }
 
-/// Reinterpret decoded bytes as the frame's element type.
-///
-/// The detector is little-endian and so is every host this runs on; the C driver
-/// memcpy's straight into the NDArray, which assumes the same.
-fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Result<NDDataBuffer> {
-    let elem = data_type.element_size();
-    if !bytes.len().is_multiple_of(elem) {
-        return Err(StreamError::Decode(format!(
-            "frame is {} bytes, not a multiple of the {elem}-byte element",
-            bytes.len()
-        )));
-    }
-    Ok(match data_type {
-        NDDataType::UInt8 => NDDataBuffer::from_slice(bytes),
-        NDDataType::UInt16 => NDDataBuffer::from_vec(
-            bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect(),
-        ),
-        NDDataType::UInt32 => NDDataBuffer::from_vec(
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-        ),
-        other => {
-            return Err(StreamError::Decode(format!(
-                "unsupported stream data type {other:?}"
-            )));
-        }
-    })
-}
-
-/// Decode the `dimage_d` part and its blob into pixels
-/// (C `StreamAPI::getFrame`, streamApi.cpp:302).
+/// Decode the `dimage_d` part and its blob into an array from `pool`
+/// (C `StreamAPI::getFrame`, streamApi.cpp:302), the pixels written straight
+/// into it as C writes `pData` (:378-391). `frame` names a refused alloc.
 ///
 /// With `decompress` set the blob is decoded here; otherwise it is passed
 /// through with a [`Codec`] attached for a downstream codec plugin to handle,
@@ -167,7 +132,14 @@ fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Result<NDDataBuffer
 /// UPSTREAM DEFECT (streamApi.cpp:389): C ignores `uncompress()`'s return value,
 /// so a failed decode silently publishes a frame of garbage. Here the error
 /// propagates and the frame is dropped.
-pub fn decode_image(shape_part: &[u8], blob: &[u8], decompress: bool) -> Result<DecodedImage> {
+fn decode_image(
+    shape_part: &[u8],
+    blob: &[u8],
+    decompress: bool,
+    signed: bool,
+    pool: &DriverPool,
+    frame: u64,
+) -> Result<DriverArray> {
     let v: Value = serde_json::from_slice(shape_part)
         .map_err(|e| StreamError::Decode(format!("failed to parse image shape JSON: {e}")))?;
 
@@ -209,6 +181,11 @@ pub fn decode_image(shape_part: &[u8], blob: &[u8], decompress: bool) -> Result<
         .checked_mul(dims[1])
         .ok_or_else(|| StreamError::Decode("frame dimensions overflow".into()))?;
     let uncompressed = n_elems * data_type.element_size();
+    let nd_dims = vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])];
+    let pixels = |pool: &DriverPool| {
+        pool.alloc(nd_dims.clone(), frame_type(data_type, signed))
+            .map_err(|_| StreamError::NoArray(frame))
+    };
 
     let Some(codec_name) = codec else {
         // Uncompressed: the blob is the pixels.
@@ -218,36 +195,38 @@ pub fn decode_image(shape_part: &[u8], blob: &[u8], decompress: bool) -> Result<
                 blob.len()
             )));
         }
-        return Ok(DecodedImage {
-            dims,
-            data: buffer_from_bytes(&blob[..uncompressed], data_type)?,
-            codec: None,
-        });
+        let mut array = pixels(pool)?;
+        let mut fill = array.fill();
+        fill.data_mut()
+            .as_u8_slice_mut()
+            .copy_from_slice(&blob[..uncompressed]);
+        le_to_host(fill.data_mut().view_mut());
+        return Ok(array);
     };
 
     if decompress {
-        let bytes = match codec_name {
-            CodecName::LZ4 => lz4_flex::block::decompress(blob, uncompressed)
-                .map_err(|e| StreamError::Decode(format!("LZ4 decompress failed: {e}")))?,
-            CodecName::BSLZ4 => {
-                bslz4::decode_with_header(blob, data_type.element_size(), Some(uncompressed))
-                    .map_err(|e| StreamError::Decode(e.to_string()))?
-            }
-            other => {
-                return Err(StreamError::Decode(format!("unhandled codec {other:?}")));
-            }
-        };
-        if bytes.len() != uncompressed {
+        if !matches!(codec_name, CodecName::LZ4 | CodecName::BSLZ4) {
             return Err(StreamError::Decode(format!(
-                "decompressed to {} bytes, expected {uncompressed}",
-                bytes.len()
+                "unhandled codec {codec_name:?}"
             )));
         }
-        return Ok(DecodedImage {
-            dims,
-            data: buffer_from_bytes(&bytes, data_type)?,
-            codec: None,
-        });
+        let mut array = pixels(pool)?;
+        let mut fill = array.fill();
+        let out = fill.data_mut().as_u8_slice_mut();
+        if codec_name == CodecName::LZ4 {
+            let n = lz4_flex::block::decompress_into(blob, out)
+                .map_err(|e| StreamError::Decode(format!("LZ4 decompress failed: {e}")))?;
+            if n != uncompressed {
+                return Err(StreamError::Decode(format!(
+                    "decompressed to {n} bytes, expected {uncompressed}"
+                )));
+            }
+        } else {
+            bslz4::decode_with_header_into(blob, out, data_type.element_size())
+                .map_err(|e| StreamError::Decode(e.to_string()))?;
+        }
+        le_to_host(fill.data_mut().view_mut());
+        return Ok(array);
     }
 
     // Pass-through: hand the compressed bytes downstream with a codec attached.
@@ -265,13 +244,17 @@ pub fn decode_image(shape_part: &[u8], blob: &[u8], decompress: bool) -> Result<
         level: 0,
         shuffle: 0,
         compressor: 0,
-        original_data_type: data_type,
+        // SignedData relabels the type the codec plugin decompresses to.
+        original_data_type: frame_type(data_type, signed),
     };
-    Ok(DecodedImage {
-        dims,
-        data: NDDataBuffer::from_slice(payload),
-        codec: Some(codec),
-    })
+    // A compressed frame holds its payload bytes, which its dims do not size.
+    let mut array = pool
+        .alloc_sized(nd_dims, NDDataType::UInt8, payload.len())
+        .map_err(|_| StreamError::NoArray(frame))?;
+    let mut fill = array.fill();
+    fill.data_mut().as_u8_slice_mut().copy_from_slice(payload);
+    fill.set_codec(Some(codec));
+    Ok(array)
 }
 
 /// Classify and decode one multipart stream message.
@@ -285,7 +268,12 @@ fn dheader_series(first: &[u8]) -> Result<u64> {
     json_u64(&v, "series")
 }
 
-pub fn decode_message(parts: &[&[u8]], decompress: bool) -> Result<StreamMessage> {
+pub fn decode_message(
+    parts: &[&[u8]],
+    decompress: bool,
+    signed: bool,
+    pool: &DriverPool,
+) -> Result<StreamMessage> {
     let first = parts
         .first()
         .ok_or_else(|| StreamError::Decode("empty zmq message".into()))?;
@@ -310,14 +298,12 @@ pub fn decode_message(parts: &[&[u8]], decompress: bool) -> Result<StreamMessage
             .map_err(|e| StreamError::Decode(format!("failed to parse dimage header: {e}")))?;
         let series = json_u64(&v, "series")?;
         let frame = json_u64(&v, "frame")?;
-        let image = decode_image(parts[1], parts[2], decompress)?;
-        return Ok(StreamMessage::Image(StreamFrame {
+        let array = decode_image(parts[1], parts[2], decompress, signed, pool, frame)?;
+        return Ok(StreamMessage::Image(Box::new(StreamFrame {
             series,
             frame,
-            dims: image.dims,
-            data: image.data,
-            codec: image.codec,
-        }));
+            array,
+        })));
     }
 
     Err(StreamError::WrongHtype(htype))
@@ -376,16 +362,29 @@ impl Received {
         dheader_series(first)
     }
 
-    pub fn decode(&self, decompress: bool) -> Result<StreamMessage> {
+    pub fn decode(
+        &self,
+        decompress: bool,
+        signed: bool,
+        pool: &DriverPool,
+    ) -> Result<StreamMessage> {
         let parts: Vec<&[u8]> = self.0.iter().map(|f| f.as_ref()).collect();
-        decode_message(&parts, decompress)
+        decode_message(&parts, decompress, signed, pool)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::{NDArray, NDDataView, NDDimension};
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataView};
+
+    fn decode(parts: &[&[u8]], decompress: bool) -> Result<StreamMessage> {
+        decode_message(parts, decompress, false, &DriverPool::standalone(0))
+    }
+
+    fn sizes(array: &DriverArray) -> Vec<usize> {
+        array.dims.iter().map(|d| d.size).collect()
+    }
 
     fn dimage_header(series: u64, frame: u64) -> Vec<u8> {
         format!(r#"{{"htype":"dimage-1.0","series":{series},"frame":{frame},"hash":"x"}}"#)
@@ -402,7 +401,7 @@ mod tests {
     #[test]
     fn decodes_a_series_header() {
         let part = br#"{"htype":"dheader-1.0","series":17,"header_detail":"basic"}"#;
-        match decode_message(&[part.as_slice()], true).unwrap() {
+        match decode(&[part.as_slice()], true).unwrap() {
             StreamMessage::Header(series) => assert_eq!(series, 17),
             _ => panic!("expected a header"),
         }
@@ -412,7 +411,7 @@ mod tests {
     fn decodes_a_series_end() {
         let part = br#"{"htype":"dseries_end-1.0","series":17}"#;
         assert!(matches!(
-            decode_message(&[part.as_slice()], true).unwrap(),
+            decode(&[part.as_slice()], true).unwrap(),
             StreamMessage::End
         ));
     }
@@ -421,7 +420,7 @@ mod tests {
     fn an_unknown_htype_is_a_stray_packet() {
         let part = br#"{"htype":"dconfig-1.0"}"#;
         assert_eq!(
-            decode_message(&[part.as_slice()], true).unwrap_err(),
+            decode(&[part.as_slice()], true).unwrap_err(),
             StreamError::WrongHtype("dconfig-1.0".into())
         );
     }
@@ -434,15 +433,15 @@ mod tests {
         let header = dimage_header(5, 2);
         let times = br#"{"htype":"dconfig-1.0","start_time":0,"stop_time":1}"#;
 
-        let msg = decode_message(&[&header, &shape, &blob, times.as_slice()], true).unwrap();
+        let msg = decode(&[&header, &shape, &blob, times.as_slice()], true).unwrap();
         let StreamMessage::Image(f) = msg else {
             panic!("expected an image");
         };
         assert_eq!(f.series, 5);
         assert_eq!(f.frame, 2);
-        assert_eq!(f.dims, [4, 3]);
-        assert!(f.codec.is_none());
-        let NDDataView::U16(got) = f.data.view() else {
+        assert_eq!(sizes(&f.array), [4, 3]);
+        assert!(f.array.codec.is_none());
+        let NDDataView::U16(got) = f.array.data().view() else {
             panic!("expected U16 pixels");
         };
         assert_eq!(got, pixels);
@@ -456,12 +455,14 @@ mod tests {
         let shape = shape_part(8, 8, "uint32", "lz4<", blob.len());
         let header = dimage_header(1, 0);
 
-        let StreamMessage::Image(f) = decode_message(&[&header, &shape, &blob], true).unwrap()
-        else {
+        let StreamMessage::Image(f) = decode(&[&header, &shape, &blob], true).unwrap() else {
             panic!("expected an image");
         };
-        assert!(f.codec.is_none(), "decompressed frames carry no codec");
-        let NDDataView::U32(got) = f.data.view() else {
+        assert!(
+            f.array.codec.is_none(),
+            "decompressed frames carry no codec"
+        );
+        let NDDataView::U32(got) = f.array.data().view() else {
             panic!("expected U32 pixels");
         };
         assert_eq!(got, pixels);
@@ -489,12 +490,11 @@ mod tests {
         let shape = shape_part(64, 64, "uint32", "bs32-lz4<", blob.len());
         let header = dimage_header(3, 9);
 
-        let StreamMessage::Image(f) = decode_message(&[&header, &shape, &blob], true).unwrap()
-        else {
+        let StreamMessage::Image(f) = decode(&[&header, &shape, &blob], true).unwrap() else {
             panic!("expected an image");
         };
-        assert_eq!(f.dims, [64, 64]);
-        let NDDataView::U32(got) = f.data.view() else {
+        assert_eq!(sizes(&f.array), [64, 64]);
+        let NDDataView::U32(got) = f.array.data().view() else {
             panic!("expected U32 pixels");
         };
         assert_eq!(got, pixels);
@@ -507,15 +507,18 @@ mod tests {
         let shape = shape_part(64, 64, "uint32", "bs32-lz4<", blob.len());
         let header = dimage_header(3, 9);
 
-        let StreamMessage::Image(f) = decode_message(&[&header, &shape, &blob], false).unwrap()
-        else {
+        let StreamMessage::Image(f) = decode(&[&header, &shape, &blob], false).unwrap() else {
             panic!("expected an image");
         };
-        let codec = f.codec.expect("pass-through must carry a codec");
+        let codec = f
+            .array
+            .codec
+            .clone()
+            .expect("pass-through must carry a codec");
         assert_eq!(codec.name, CodecName::BSLZ4);
         assert_eq!(codec.original_data_type, NDDataType::UInt32);
         // The 12-byte header is gone; the rest is the block stream verbatim.
-        let NDDataView::U8(payload) = f.data.view() else {
+        let NDDataView::U8(payload) = f.array.data().view() else {
             panic!("expected raw bytes");
         };
         assert_eq!(payload.len(), blob.len() - bslz4::HEADER_LEN);
@@ -531,13 +534,16 @@ mod tests {
         let shape = shape_part(16, 16, "uint16", "lz4<", blob.len());
         let header = dimage_header(1, 1);
 
-        let StreamMessage::Image(f) = decode_message(&[&header, &shape, &blob], false).unwrap()
-        else {
+        let StreamMessage::Image(f) = decode(&[&header, &shape, &blob], false).unwrap() else {
             panic!("expected an image");
         };
-        let codec = f.codec.expect("pass-through must carry a codec");
+        let codec = f
+            .array
+            .codec
+            .clone()
+            .expect("pass-through must carry a codec");
         assert_eq!(codec.name, CodecName::LZ4);
-        let NDDataView::U8(payload) = f.data.view() else {
+        let NDDataView::U8(payload) = f.array.data().view() else {
             panic!("expected raw bytes");
         };
         assert_eq!(payload, blob.as_slice());
@@ -550,7 +556,7 @@ mod tests {
         let blob = vec![0xFFu8; 64];
         let shape = shape_part(8, 8, "uint32", "lz4<", blob.len());
         let header = dimage_header(1, 1);
-        assert!(decode_message(&[&header, &shape, &blob], true).is_err());
+        assert!(decode(&[&header, &shape, &blob], true).is_err());
     }
 
     #[test]
@@ -559,10 +565,49 @@ mod tests {
         let header = dimage_header(1, 1);
 
         let shape = shape_part(4, 4, "uint32", "zstd<", blob.len());
-        assert!(decode_message(&[&header, &shape, &blob], true).is_err());
+        assert!(decode(&[&header, &shape, &blob], true).is_err());
 
         let shape = shape_part(4, 4, "float32", "<", blob.len());
-        assert!(decode_message(&[&header, &shape, &blob], true).is_err());
+        assert!(decode(&[&header, &shape, &blob], true).is_err());
+    }
+
+    /// C relabels the array after getFrame (eigerDetector.cpp:1519-1533).
+    #[test]
+    fn signed_data_allocates_the_signed_type_over_the_same_bits() {
+        let raw: Vec<u8> = [1u16, 0xffff]
+            .iter()
+            .flat_map(|p| p.to_le_bytes())
+            .collect();
+        let header = dimage_header(1, 1);
+        let pool = DriverPool::standalone(0);
+
+        let shape = shape_part(2, 1, "uint16", "<", raw.len());
+        let msg = decode_message(&[&header, &shape, &raw], true, true, &pool).unwrap();
+        let StreamMessage::Image(f) = msg else {
+            panic!("expected an image");
+        };
+        assert!(matches!(f.array.data().view(), NDDataView::I16(p) if p == [1, -1]));
+
+        let blob = lz4_flex::block::compress(&raw);
+        let shape = shape_part(2, 1, "uint16", "lz4<", blob.len());
+        let msg = decode_message(&[&header, &shape, &blob], false, true, &pool).unwrap();
+        let StreamMessage::Image(f) = msg else {
+            panic!("expected an image");
+        };
+        let codec = f.array.codec.as_ref().expect("passed through");
+        assert_eq!(codec.original_data_type, NDDataType::Int16);
+    }
+
+    #[test]
+    fn a_refused_array_names_its_frame() {
+        let raw = vec![0u8; 16];
+        let shape = shape_part(4, 2, "uint16", "<", raw.len());
+        let header = dimage_header(1, 9);
+        let pool = DriverPool::standalone(1);
+        assert_eq!(
+            decode_message(&[&header, &shape, &raw], true, false, &pool).unwrap_err(),
+            StreamError::NoArray(9)
+        );
     }
 
     #[test]
@@ -571,6 +616,6 @@ mod tests {
         let blob = vec![0u8; 16];
         let shape = shape_part(4, 4, "uint32", "<", blob.len());
         let header = dimage_header(1, 1);
-        assert!(decode_message(&[&header, &shape, &blob], true).is_err());
+        assert!(decode(&[&header, &shape, &blob], true).is_err());
     }
 }

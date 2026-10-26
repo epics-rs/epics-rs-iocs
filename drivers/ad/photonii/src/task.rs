@@ -17,7 +17,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::NDDimension;
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -398,10 +398,21 @@ async fn publish_frame(
         ))));
     }
 
-    let bytes = raw::read_raw_file(path)
+    // C dereferences a refused alloc unchecked (PhotonII.cpp:416); here the frame
+    // is dropped after the pool's limit line.
+    let Ok(mut array) = ctx.pool.alloc(
+        vec![NDDimension::new(PII_SIZE_X), NDDimension::new(PII_SIZE_Y)],
+        NDDataType::Int32,
+    ) else {
+        return Ok(());
+    };
+    let mut frame = array.fill();
+    let pixels = frame
+        .data_mut()
+        .as_mut_slice::<i32>()
+        .expect("allocated NDInt32");
+    raw::read_raw(path, pixels)
         .map_err(|e| read_raw_failed(Abort::Error(format!("cannot read {file_name}: {e}"))))?;
-    let data = raw::decode_raw(&bytes)
-        .map_err(|e| read_raw_failed(Abort::Error(format!("cannot decode {file_name}: {e}"))))?;
 
     // C updateTimeStamp (PhotonII.cpp:435): the port's stamp, moved now.
     let ts: EpicsTimestamp = ctx
@@ -410,19 +421,6 @@ async fn publish_frame(
         .await
         .unwrap_or_else(|_| SystemTime::now())
         .into();
-    // C dereferences a refused alloc unchecked (PhotonII.cpp:416); here the frame
-    // is dropped after the pool's limit line.
-    let Ok(mut array) = ctx.pool.alloc(
-        vec![NDDimension::new(PII_SIZE_X), NDDimension::new(PII_SIZE_Y)],
-        data.data_type(),
-    ) else {
-        return Ok(());
-    };
-    let mut frame = array.fill();
-    frame
-        .data_mut()
-        .as_u8_slice_mut()
-        .copy_from_slice(data.as_u8_slice());
     frame.set_unique_id(array_counter);
     frame.set_timestamp(ts);
     // C stamped every frame of an acquisition with the acquisition's start
@@ -638,14 +636,30 @@ mod tests {
     }
 
     /// PhotonIITask stores no array size, dimension, colour, type or time
-    /// stamp param per frame (PhotonII.cpp:398-440).
+    /// stamp param per frame (PhotonII.cpp:398-440). The file's pixels land in
+    /// an NDInt32 frame (:416, :209).
     #[test]
     fn a_frame_leaves_the_array_params_alone() {
-        let (ctx, _listener) = silent_ctx("PII_FRAME_PARAMS");
+        use epics_rs::ad_core::ndarray::NDDataView;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+
+        let (mut ctx, _listener) = silent_ctx("PII_FRAME_PARAMS");
+        let mut output = NDArrayOutput::new();
+        let (sink, mut frames) = ndarray_channel("PII_FRAME_PARAMS_SINK", 1);
+        output.add(sink);
+        ctx.output = ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(output)));
         let handle = ctx.handle.clone();
         let base = ctx.ad_params.base;
         let path = std::env::temp_dir().join(format!("pii-frame-{}.raw", std::process::id()));
-        std::fs::write(&path, vec![0u8; raw::frame_bytes()]).unwrap();
+        let pixels: Vec<i32> = (0..PII_SIZE_X * PII_SIZE_Y).map(|i| i as i32 - 7).collect();
+        std::fs::write(
+            &path,
+            pixels
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let file = path.to_string_lossy().into_owned();
         let (tx, rx) = std::sync::mpsc::channel();
         rt::run_thread(move || async move {
@@ -658,6 +672,8 @@ mod tests {
         .unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(rx.recv().unwrap());
+        let frame = frames.blocking_recv().expect("the frame is published");
+        assert!(matches!(frame.data().view(), NDDataView::I32(got) if got == pixels));
         let int = |reason| handle.read_int32_blocking(reason, 0).unwrap();
         assert_eq!(int(base.n_dimensions), 0);
         assert_eq!(int(base.epics_ts_sec), 0);

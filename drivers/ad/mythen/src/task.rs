@@ -20,7 +20,7 @@ use epics_rs::asyn::request::ParamSetValue;
 
 use crate::detector::Detector;
 use crate::driver::MythenParams;
-use crate::protocol::{CHANNELS_PER_MODULE, READ_MODE_RAW, decode_raw_readout, words_from_bytes};
+use crate::protocol::{CHANNELS_PER_MODULE, READ_MODE_RAW, decode_raw_readout};
 use crate::transport::M1K_TIMEOUT;
 
 /// Corrected readout is always 24-bit (C `dataCallback`, mythen.cpp:976).
@@ -166,37 +166,38 @@ async fn read_status(s: &Arc<Shared>) -> ADStatus {
 /// Returns false when the detector answered with an error word, which is what
 /// makes the caller re-read the status.
 async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> bool {
-    let words = words_from_bytes(reply);
-    match words.first() {
-        // C `pData[0] < 0` — the detector reports a failed readout in the
-        // first word.
-        Some(&first) if (first as i32) < 0 => return false,
-        None => return false,
-        Some(_) => {}
+    // C `pData[0] < 0` — the detector reports a failed readout in the first
+    // word.
+    match reply.first_chunk::<4>() {
+        Some(&first) if i32::from_le_bytes(first) >= 0 => {}
+        _ => return false,
     }
 
-    let channels = decode_raw_readout(nmodules, nbits, &words);
     // C declares the NDArray one module wide (`dims[0] = MAX_DIMS`) while it
     // fills 1280 * nmodules elements, so a second module is invisible to every
     // downstream plugin (mythen.cpp:965, :1044). The array is as wide as the
     // data it carries.
     let width = nmodules * CHANNELS_PER_MODULE;
-    debug_assert_eq!(channels.len(), width);
 
-    // C allocates before it counts (mythen.cpp:973, :993) and dereferences a
-    // refused alloc; the frame is dropped after the pool's reached-limit line.
+    // C allocates before it decodes and counts (mythen.cpp:973-977, :993) and
+    // dereferences a refused alloc; the frame is dropped after the pool's
+    // reached-limit line.
     let Ok(mut array) = s.pool.alloc(
         vec![NDDimension::new(width), NDDimension::new(1)],
         NDDataType::UInt32,
     ) else {
         return true;
     };
-    array
-        .fill()
-        .data_mut()
-        .as_mut_slice::<u32>()
-        .expect("allocated as NDUInt32")
-        .copy_from_slice(&channels);
+    // The caller passes only a whole reply, which fills every channel.
+    decode_raw_readout(
+        nbits,
+        reply,
+        array
+            .fill()
+            .data_mut()
+            .as_mut_slice::<u32>()
+            .expect("allocated as NDUInt32"),
+    );
 
     let mut attributes = NDAttributeList::new();
     attributes.add(NDAttribute::new_static(

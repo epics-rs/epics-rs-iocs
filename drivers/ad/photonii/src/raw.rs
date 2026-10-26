@@ -5,10 +5,9 @@
 //! time at or after the start of the acquisition, then reads it.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
-
-use epics_rs::ad_core::ndarray::NDDataBuffer;
 
 use crate::types::{PII_PIXEL_BYTES, PII_SIZE_X, PII_SIZE_Y};
 
@@ -18,6 +17,8 @@ pub enum RawError {
     /// The file holds a different number of bytes than the detector geometry
     /// calls for.
     WrongSize { expected: usize, got: usize },
+    /// Opening or reading the file failed.
+    Io(String),
 }
 
 impl std::fmt::Display for RawError {
@@ -26,6 +27,7 @@ impl std::fmt::Display for RawError {
             Self::WrongSize { expected, got } => {
                 write!(f, "raw file holds {got} bytes, expected {expected}")
             }
+            Self::Io(e) => f.write_str(e),
         }
     }
 }
@@ -37,28 +39,32 @@ pub fn frame_bytes() -> usize {
     PII_SIZE_X * PII_SIZE_Y * PII_PIXEL_BYTES
 }
 
-/// Turn the bytes of a `.raw` file into a 32-bit signed image buffer.
+/// Read a `.raw` file straight into a frame's 32-bit signed pixels, as C
+/// `fread`s it into `pImage->pData` (PhotonII.cpp:209).
 ///
 /// C read the file straight into an `NDArray` allocated with `ADSizeX` ×
 /// `ADSizeY` while sizing the read from the *detector* geometry, so shrinking
 /// `SizeX` overran the heap buffer. The driver never sends a region of interest
 /// to p2util — every frame it writes is a full sensor readout — so the size is
 /// fixed here and a file of any other length is refused instead of copied.
-pub fn decode_raw(bytes: &[u8]) -> Result<NDDataBuffer, RawError> {
+pub fn read_raw(path: &Path, pixels: &mut [i32]) -> Result<(), RawError> {
+    let io = |e: std::io::Error| RawError::Io(e.to_string());
+    let mut file = fs::File::open(path).map_err(io)?;
     let expected = frame_bytes();
-    if bytes.len() != expected {
-        return Err(RawError::WrongSize {
-            expected,
-            got: bytes.len(),
-        });
+    let got = file.metadata().map_err(io)?.len() as usize;
+    if got != expected {
+        return Err(RawError::WrongSize { expected, got });
     }
-    let pixels: Vec<i32> = bytes
-        .as_chunks::<PII_PIXEL_BYTES>()
-        .0
-        .iter()
-        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    Ok(NDDataBuffer::from_vec(pixels))
+    // One pass from the file into the pixels, through a stack chunk.
+    let mut chunk = [0u8; 16 * 1024];
+    for out in pixels.chunks_mut(chunk.len() / PII_PIXEL_BYTES) {
+        let bytes = &mut chunk[..out.len() * PII_PIXEL_BYTES];
+        file.read_exact(bytes).map_err(io)?;
+        for (p, c) in out.iter_mut().zip(bytes.as_chunks::<PII_PIXEL_BYTES>().0) {
+            *p = i32::from_le_bytes(*c);
+        }
+    }
+    Ok(())
 }
 
 /// What a poll of the frame file found.
@@ -109,15 +115,9 @@ fn at_or_after_second(mtime: SystemTime, not_before: SystemTime) -> bool {
     floor(mtime) >= floor(not_before)
 }
 
-/// Read the whole frame file.
-pub fn read_raw_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    fs::read(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::NDDataView;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -128,41 +128,55 @@ mod tests {
         p
     }
 
+    /// `read_raw` of `bytes` written to a scratch file, into stale pixels.
+    fn read(name: &str, bytes: &[u8]) -> Result<Vec<i32>, RawError> {
+        let p = scratch(name);
+        fs::write(&p, bytes).unwrap();
+        let mut pixels = vec![0x5a5a_5a5a; PII_SIZE_X * PII_SIZE_Y];
+        let read = read_raw(&p, &mut pixels).map(|()| pixels);
+        fs::remove_file(&p).ok();
+        read
+    }
+
     #[test]
-    fn decode_raw_reads_little_endian_int32_pixels() {
+    fn read_raw_reads_little_endian_int32_pixels() {
         let mut bytes = vec![0u8; frame_bytes()];
         bytes[0..4].copy_from_slice(&1_000_000i32.to_le_bytes());
         bytes[4..8].copy_from_slice(&(-7i32).to_le_bytes());
         let last = frame_bytes() - 4;
         bytes[last..].copy_from_slice(&42i32.to_le_bytes());
 
-        let buf = decode_raw(&bytes).unwrap();
-        let NDDataView::I32(pixels) = buf.view() else {
-            panic!("decode_raw must return an I32 buffer");
-        };
-        assert_eq!(pixels.len(), PII_SIZE_X * PII_SIZE_Y);
+        let pixels = read("le.raw", &bytes).unwrap();
         assert_eq!(pixels[0], 1_000_000);
         assert_eq!(pixels[1], -7);
+        assert!(pixels[2..pixels.len() - 1].iter().all(|&p| p == 0));
         assert_eq!(pixels[pixels.len() - 1], 42);
     }
 
     #[test]
-    fn decode_raw_rejects_a_short_file() {
-        let bytes = vec![0u8; frame_bytes() - 4];
+    fn read_raw_rejects_a_short_file() {
         assert!(matches!(
-            decode_raw(&bytes),
+            read("short.raw", &vec![0u8; frame_bytes() - 4]),
             Err(RawError::WrongSize { expected, got })
                 if expected == frame_bytes() && got == frame_bytes() - 4
         ));
     }
 
     #[test]
-    fn decode_raw_rejects_a_long_file() {
-        let bytes = vec![0u8; frame_bytes() + 1];
+    fn read_raw_rejects_a_long_file() {
         assert!(matches!(
-            decode_raw(&bytes),
+            read("long.raw", &vec![0u8; frame_bytes() + 1]),
             Err(RawError::WrongSize { expected, got })
                 if expected == frame_bytes() && got == frame_bytes() + 1
+        ));
+    }
+
+    #[test]
+    fn read_raw_reports_a_missing_file() {
+        let mut pixels = vec![0; PII_SIZE_X * PII_SIZE_Y];
+        assert!(matches!(
+            read_raw(&scratch("absent.raw"), &mut pixels),
+            Err(RawError::Io(_))
         ));
     }
 
@@ -214,14 +228,6 @@ mod tests {
         let now = SystemTime::now();
         fs::write(&p, [0u8; 16]).unwrap();
         assert_eq!(check_raw_file(&p, now, 16), FileState::Ready);
-        fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn read_raw_file_returns_the_bytes() {
-        let p = scratch("read.raw");
-        fs::write(&p, [1u8, 2, 3, 4]).unwrap();
-        assert_eq!(read_raw_file(&p).unwrap(), vec![1u8, 2, 3, 4]);
         fs::remove_file(&p).ok();
     }
 }

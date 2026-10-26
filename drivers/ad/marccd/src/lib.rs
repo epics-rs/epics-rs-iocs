@@ -24,7 +24,7 @@
 //!   timer thread or `epicsTimerCancel` on abort is needed. External trigger
 //!   modes have no timer in either version.
 //! * **Published images are 16-bit only.** C's `readTiff` copies raw strip
-//!   bytes into an `NDUInt16` buffer; [`image::decode_tiff`] accepts a 16-bit
+//!   bytes into an `NDUInt16` buffer; [`image::TiffFile`] accepts a 16-bit
 //!   single-sample TIFF and rejects other bit depths.
 //! * **Multi-strip TIFFs decode correctly.** C's `readTiff` passes strip index
 //!   `0` on every loop iteration; the `tiff` crate reads every strip. marServer

@@ -12,6 +12,8 @@
 //! - [`driver`] — the asyn port driver and its parameters.
 //! - [`task`] — the data and status background tasks.
 
+#[cfg(test)]
+mod alloc_count;
 pub mod connection;
 pub mod driver;
 pub mod image;

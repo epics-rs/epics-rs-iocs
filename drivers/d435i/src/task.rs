@@ -394,22 +394,20 @@ async fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame
     }
 }
 
-/// Copy frame data, stripping any row stride padding.
-/// Returns a tightly-packed buffer of `row_bytes * h` bytes.
-fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, h: usize) -> Vec<u8> {
+/// Copy frame data into `out`, `row_bytes` per row, stripping any row stride
+/// padding.
+fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, out: &mut [u8]) {
     if stride == row_bytes {
         // No padding — fast path
-        let total = row_bytes * h;
-        unsafe { std::slice::from_raw_parts(frame_ptr, total) }.to_vec()
+        out.copy_from_slice(unsafe { std::slice::from_raw_parts(frame_ptr, out.len()) });
     } else {
         // Strip per-row padding
-        let mut buf = Vec::with_capacity(row_bytes * h);
-        for row in 0..h {
+        for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
             let offset = row * stride;
-            let row_slice = unsafe { std::slice::from_raw_parts(frame_ptr.add(offset), row_bytes) };
-            buf.extend_from_slice(row_slice);
+            dst.copy_from_slice(unsafe {
+                std::slice::from_raw_parts(frame_ptr.add(offset), row_bytes)
+            });
         }
-        buf
     }
 }
 
@@ -522,7 +520,6 @@ async fn process_color_frame(
         let row_bytes = w * 3; // RGB8: 3 bytes per pixel
 
         let ptr = unsafe { frame.get_data() as *const std::os::raw::c_void as *const u8 };
-        let bytes = copy_frame_data(ptr, stride, row_bytes, h);
 
         // RGB1 layout: [3, width, height]
         let dims = vec![
@@ -538,7 +535,7 @@ async fn process_color_frame(
             return;
         };
         let mut out = array.fill();
-        out.data_mut().as_u8_slice_mut().copy_from_slice(&bytes);
+        copy_frame_data(ptr, stride, row_bytes, out.data_mut().as_u8_slice_mut());
         out.set_unique_id(array_counter);
         out.update_time_stamps(ts);
 
@@ -572,15 +569,6 @@ async fn process_depth_frame(
     let row_bytes = w * 2; // Z16: 2 bytes per pixel
 
     let ptr = unsafe { frame.get_data() as *const std::os::raw::c_void as *const u8 };
-    let bytes = copy_frame_data(ptr, stride, row_bytes, h);
-
-    // Reinterpret as u16 (RealSense USB protocol is little-endian)
-    let pixels: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
 
     // Mono layout: [width, height]
     let dims = vec![NDDimension::new(w), NDDimension::new(h)];
@@ -590,10 +578,15 @@ async fn process_depth_frame(
         return;
     };
     let mut out = array.fill();
-    out.data_mut()
+    copy_frame_data(ptr, stride, row_bytes, out.data_mut().as_u8_slice_mut());
+    // RealSense USB protocol is little-endian.
+    for p in out
+        .data_mut()
         .as_mut_slice::<u16>()
         .expect("allocated as NDUInt16")
-        .copy_from_slice(&pixels);
+    {
+        *p = u16::from_le(*p);
+    }
     out.set_unique_id(array_counter);
     out.update_time_stamps(ts);
 
@@ -625,13 +618,6 @@ async fn process_pointcloud(
             return;
         }
 
-        // Flatten vertices [N][3] → Vec<f32>
-        let data: Vec<f32> = vertices
-            .iter()
-            .take(count)
-            .flat_map(|v| v.xyz.iter().copied())
-            .collect();
-
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
         let Ok(mut array) = ctx.color_pool.alloc(
             vec![
@@ -644,11 +630,15 @@ async fn process_pointcloud(
             return;
         };
         let mut frame = array.fill();
-        frame
+        // librealsense emits one vertex per depth pixel, so `count` is w * h.
+        let (points, _) = frame
             .data_mut()
             .as_mut_slice::<f32>()
             .expect("allocated as NDFloat32")
-            .copy_from_slice(&data);
+            .as_chunks_mut::<3>();
+        for (dst, v) in points.iter_mut().zip(&vertices[..count]) {
+            *dst = v.xyz;
+        }
         frame.set_unique_id(array_counter);
         frame.update_time_stamps(ts);
 
@@ -1296,5 +1286,21 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
         // Pipeline is dropped here (ActivePipeline::drop calls rs2_delete_pipeline)
         ctx.end_acquisition().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_frame_data_strips_the_row_padding() {
+        let frame = [1u8, 2, 3, 0xee, 4, 5, 6, 0xee];
+        let mut out = [0u8; 6];
+        copy_frame_data(frame.as_ptr(), 4, 3, &mut out);
+        assert_eq!(out, [1, 2, 3, 4, 5, 6]);
+        let mut out = [0u8; 8];
+        copy_frame_data(frame.as_ptr(), 4, 4, &mut out);
+        assert_eq!(out, frame);
     }
 }

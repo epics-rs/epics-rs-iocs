@@ -127,7 +127,7 @@ async fn acquire_one_image(
             })
         });
 
-    let decoded = match decoded {
+    let mut decoded = match decoded {
         Ok(decoded) => decoded,
         Err(message) => {
             if let Some(message) = message {
@@ -149,9 +149,9 @@ async fn acquire_one_image(
     let ndims = decoded.dims.len();
     let ncols = decoded.dims[ndims - 2].size as i32;
     let nrows = decoded.dims[ndims - 1].size as i32;
-    let total_bytes: i64 = decoded.data.total_bytes() as i64;
+    let total_bytes: i64 = decoded.total_bytes() as i64;
     let array_size = total_bytes.min(i32::MAX as i64) as i32;
-    let data_type = decoded.data.data_type();
+    let data_type = decoded.data_type;
 
     let array_callbacks = ctx
         .handle
@@ -183,13 +183,10 @@ async fn acquire_one_image(
     let Some(array) = ctx.pool.owner().replace_array(0, || {
         let mut array = ctx
             .pool
-            .alloc(decoded.dims, decoded.data.data_type())
+            .alloc(std::mem::take(&mut decoded.dims), decoded.data_type)
             .ok()?;
         let mut frame = array.fill();
-        frame
-            .data_mut()
-            .as_u8_slice_mut()
-            .copy_from_slice(decoded.data.as_u8_slice());
+        decoded.write_into(frame.data_mut().view_mut());
         frame.set_unique_id(image_counter);
         frame.set_timestamp(end_ts);
         frame.set_time_stamp(start_time.as_f64());

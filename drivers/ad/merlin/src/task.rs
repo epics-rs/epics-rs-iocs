@@ -17,7 +17,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDDataType, NDDataView, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -303,7 +303,7 @@ async fn publish_image(
         set_status_message(held, ctx.ad_params, "Error: Unsupported bit depth");
         return false;
     }
-    let data = match image::decode_image(
+    let payload = match image::image_payload(
         body,
         header.offset,
         header.x_size,
@@ -311,7 +311,7 @@ async fn publish_image(
         header.pixel_depth,
         ctx.det_type.swaps_pixels(),
     ) {
-        Ok(d) => d,
+        Ok(p) => p,
         Err(_) => {
             set_status_message(held, ctx.ad_params, "Error: unsupported frame");
             return false;
@@ -323,7 +323,7 @@ async fn publish_image(
             NDDimension::new(header.x_size),
             NDDimension::new(header.y_size),
         ],
-        data.data_type(),
+        payload.data_type(),
     ) else {
         // merlinDetector.cpp:436-442 (copyToNDArray8, and its 16/32 twins).
         trace(
@@ -341,10 +341,7 @@ async fn publish_image(
         return false;
     };
     let mut frame = array.fill();
-    frame
-        .data_mut()
-        .as_u8_slice_mut()
-        .copy_from_slice(data.as_u8_slice());
+    payload.decode_into(frame.data_mut().view_mut());
     frame.set_unique_id(array_counter);
     frame.set_time_stamp(start.as_f64());
     // C merlinTask never stamps epicsTS (merlinDetector.cpp:255-258).
@@ -399,9 +396,6 @@ async fn publish_profiles(
     };
 
     let stride = header.x_size.max(header.y_size);
-    let NDDataView::U32(_) = profiles.image.view() else {
-        unreachable!("decode_profiles always returns U32")
-    };
     // C fills the profile waveforms only once the array is allocated
     // (merlinDetector.cpp:384-391).
     let Ok(mut array) = ctx.pool.alloc(
@@ -418,10 +412,12 @@ async fn publish_profiles(
         return false;
     };
     let mut frame = array.fill();
-    frame
-        .data_mut()
-        .as_u8_slice_mut()
-        .copy_from_slice(profiles.image.as_u8_slice());
+    profiles.pack_into(
+        frame
+            .data_mut()
+            .as_mut_slice::<u32>()
+            .expect("allocated NDUInt32"),
+    );
 
     // doCallbacksInt32Array, Y then X (merlinDetector.cpp:415-416).
     let (x, y) = (ctx.params.profile_x, ctx.params.profile_y);

@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::DriverPool;
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -324,7 +324,32 @@ impl Task {
         } = self.l;
         let nx = energy_channels.max(0) as usize;
         let ny = non_energy_channels.max(0) as usize;
-        let mut image = vec![0.0f64; nx * ny];
+        // C allocates pImage before the iterations and sums into it
+        // (specsAnalyser.cpp:454, :584-588), dereferencing a refused alloc;
+        // here a refused frame sums into a local buffer and is dropped.
+        let mut array = self
+            .w
+            .pool
+            .alloc(
+                vec![NDDimension::new(nx), NDDimension::new(ny)],
+                NDDataType::Float64,
+            )
+            .ok();
+        let mut frame = array.as_mut().map(DriverArray::fill);
+        let mut refused = Vec::new();
+        let image = match &mut frame {
+            Some(frame) => frame
+                .data_mut()
+                .as_mut_slice::<f64>()
+                .expect("allocated as NDFloat64"),
+            None => {
+                refused.resize(nx * ny, 0.0);
+                &mut refused[..]
+            }
+        };
+        // C zeroes only its `image` copy (:445), so an aborted scan publishes
+        // the reused pool buffer's stale pixels; the pool buffer is zeroed.
+        image.fill(0.0);
         let mut spectrum = vec![0.0f64; nx];
 
         self.set_i32(self.w.p.percent_complete_iteration, 0);
@@ -499,7 +524,7 @@ impl Task {
                     } else {
                         self.do_callbacks_f64_array(self.w.p.acq_spectrum, spectrum.clone());
                     }
-                    self.do_callbacks_f64_array(self.w.p.acq_image, image.clone());
+                    self.do_callbacks_f64_array(self.w.p.acq_image, image.to_vec());
 
                     let pct_iter = if energy_channels > 0 {
                         (current_data_point * 100) / energy_channels
@@ -578,20 +603,10 @@ impl Task {
         self.set_i32(self.w.ad.base.array_counter, array_counter);
         self.set_i32(self.w.ad.num_images_counter, num_images_counter);
 
-        // C dereferences a refused alloc unchecked (specsAnalyser.cpp:454, :493);
-        // here the frame is dropped after the pool's limit line.
         if array_callbacks != 0
-            && let Ok(mut array) = self.w.pool.alloc(
-                vec![NDDimension::new(nx), NDDimension::new(ny)],
-                NDDataType::Float64,
-            )
+            && let Some(mut array) = array
         {
             let mut frame = array.fill();
-            frame
-                .data_mut()
-                .as_mut_slice::<f64>()
-                .expect("allocated as NDFloat64")
-                .copy_from_slice(&image);
             frame.set_unique_id(array_counter);
             frame.set_time_stamp(acq_start_epoch);
             frame.set_timestamp(EpicsTimestamp::now());

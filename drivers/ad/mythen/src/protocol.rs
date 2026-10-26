@@ -118,35 +118,27 @@ pub fn readout_len(read_mode: i32, nmodules: usize, nbits: i32) -> usize {
     INT_REPLY_LEN * nmodules * words_per_module
 }
 
-/// Unpack a `-readoutraw` reply into one count per channel
-/// (C `decodeRawReadout`, mythen.cpp:1026).
+/// Unpack the little-endian 32-bit words of a `-readoutraw` reply into `out`,
+/// one count per channel (C `decodeRawReadout`, mythen.cpp:1026).
 ///
 /// The raw readout packs `32 / nbits` channels into each 32-bit word; the
 /// corrected (`-readout`) reply is one 24-bit count per word, which is the same
-/// function with `nbits = 24`.
-pub fn decode_raw_readout(nmodules: usize, nbits: i32, data: &[u32]) -> Vec<u32> {
+/// function with `nbits = 24`. Only the channels of whole words that arrived
+/// are written.
+pub fn decode_raw_readout(nbits: i32, reply: &[u8], out: &mut [u32]) {
     let per_word = channels_per_word(nbits);
     let mask = channel_mask(nbits);
-    let words = (CHANNELS_PER_MODULE / per_word) * nmodules;
-    let words = words.min(data.len());
-
-    let mut result = vec![0u32; words * per_word];
-    for (j, shift) in (0..per_word).map(|j| (j, (nbits as usize * j) as u32)) {
-        for i in 0..words {
-            result[i * per_word + j] = (data[i] >> shift) & mask;
-        }
-    }
-    result
-}
-
-/// Reinterpret a readout reply as little-endian 32-bit words.
-pub fn words_from_bytes(bytes: &[u8]) -> Vec<u32> {
-    bytes
+    for (word, channels) in reply
         .as_chunks::<4>()
         .0
         .iter()
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+        .zip(out.chunks_exact_mut(per_word))
+    {
+        let word = u32::from_le_bytes(*word);
+        for (j, channel) in channels.iter_mut().enumerate() {
+            *channel = (word >> (nbits as usize * j)) & mask;
+        }
+    }
 }
 
 /// What `-get status` reports (C `getStatus`, mythen.cpp:509).
@@ -307,11 +299,18 @@ mod tests {
         assert_eq!(readout_len(1, 2, 4), 4 * 2560);
     }
 
+    /// `words` as the reply bytes, decoded into a stale `channels`-wide buffer.
+    fn decode(nbits: i32, words: &[u32], channels: usize) -> Vec<u32> {
+        let reply: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut out = vec![u32::MAX; channels];
+        decode_raw_readout(nbits, &reply, &mut out);
+        out
+    }
+
     #[test]
     fn a_24_bit_raw_readout_is_one_channel_per_word() {
         let data: Vec<u32> = (0..1280).map(|i| i as u32 | 0xff00_0000).collect();
-        let out = decode_raw_readout(1, 24, &data);
-        assert_eq!(out.len(), 1280);
+        let out = decode(24, &data, 1280);
         // The top byte is not part of a 24-bit count.
         assert_eq!(out[0], 0);
         assert_eq!(out[7], 7);
@@ -327,8 +326,7 @@ mod tests {
                 b(0) | (b(1) << 8) | (b(2) << 16) | (b(3) << 24)
             })
             .collect();
-        let out = decode_raw_readout(1, 8, &data);
-        assert_eq!(out.len(), 1280);
+        let out = decode(8, &data, 1280);
         for (i, v) in out.iter().enumerate() {
             assert_eq!(*v, (i as u32) % 251, "channel {i}");
         }
@@ -344,8 +342,7 @@ mod tests {
                 })
             })
             .collect();
-        let out = decode_raw_readout(1, 4, &data);
-        assert_eq!(out.len(), 1280);
+        let out = decode(4, &data, 1280);
         for (i, v) in out.iter().enumerate() {
             assert_eq!(*v, (i as u32) % 16, "channel {i}");
         }
@@ -360,8 +357,7 @@ mod tests {
                 lo | (hi << 16)
             })
             .collect();
-        let out = decode_raw_readout(2, 16, &data);
-        assert_eq!(out.len(), 2560);
+        let out = decode(16, &data, 2560);
         for (i, v) in out.iter().enumerate() {
             assert_eq!(*v, (i as u32) & 0xffff, "channel {i}");
         }
@@ -369,10 +365,14 @@ mod tests {
 
     #[test]
     fn a_short_readout_decodes_only_the_words_that_arrived() {
-        let data = vec![7u32; 100];
-        let out = decode_raw_readout(1, 24, &data);
-        assert_eq!(out.len(), 100);
-        assert!(out.iter().all(|&v| v == 7));
+        let out = decode(24, &[7u32; 100], 1280);
+        assert!(out[..100].iter().all(|&v| v == 7));
+        assert!(out[100..].iter().all(|&v| v == u32::MAX));
+        // A trailing partial word is dropped, as a short reply is rejected
+        // before this point.
+        let mut out = [u32::MAX; 2];
+        decode_raw_readout(24, &[1, 0, 0, 0, 9], &mut out);
+        assert_eq!(out, [1, u32::MAX]);
     }
 
     #[test]
@@ -432,14 +432,5 @@ mod tests {
         // 50 polls is MAX_TRIGGER_TIMEOUT_COUNT: about a minute in total.
         let total: f64 = (0..50).map(|n| trigger_backoff(n).as_secs_f64()).sum();
         assert!((total - 111.11).abs() < 0.01, "total wait {total}");
-    }
-
-    #[test]
-    fn readout_bytes_become_little_endian_words() {
-        let bytes = [1u8, 0, 0, 0, 0, 1, 0, 0];
-        assert_eq!(words_from_bytes(&bytes), vec![1, 256]);
-        // A trailing partial word is dropped, as a short reply is rejected
-        // before this point.
-        assert_eq!(words_from_bytes(&[1, 0, 0, 0, 9]), vec![1]);
     }
 }

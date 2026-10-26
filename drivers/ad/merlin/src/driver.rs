@@ -1260,6 +1260,54 @@ mod tests {
         .unwrap();
     }
 
+    /// A 16-bit frame costs its pool buffer and no other buffer of its size:
+    /// C swaps and flips the socket bytes into `pData` in one pass
+    /// (merlinDetector.cpp:464-490).
+    #[test]
+    fn a_frame_decodes_straight_into_its_pool_buffer() {
+        use epics_rs::ad_core::ndarray::NDDataView;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+
+        let (w, h) = (200usize, 120usize);
+        let size = w * h * 2;
+        let dims = || vec![NDDimension::new(w), NDDimension::new(h)];
+        let counted = crate::alloc_count::count(size);
+        let pooled = DriverPool::standalone(0).alloc(dims(), NDDataType::UInt16);
+        let pool_only = counted.stop();
+        drop(pooled);
+
+        let det = detector_sized("MERLIN_FRAME_ALLOCS", 0);
+        let mut output = NDArrayOutput::new();
+        let (tx, mut rx) = ndarray_channel("MERLIN_FRAME_ALLOCS_SINK", 4);
+        output.add(tx);
+        let ctx = quad_frame_context("MERLIN_FRAME_ALLOCS", det, output);
+        let header = String::from_utf8(crate::protocol::tests::quad_header(768, 1))
+            .unwrap()
+            .replacen("256,256,", &format!("{w},{h},"), 1);
+        let mut body = header.into_bytes();
+        // Big-endian pixels, each the value of its row-major index.
+        body.extend((0..w * h).flat_map(|i| (i as u16).to_be_bytes()));
+        let counted = crate::alloc_count::count(size);
+        epics_rs::ad_core::runtime::run_thread(move || async move {
+            crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+        })
+        .join()
+        .unwrap();
+        let allocs = counted.stop();
+
+        assert_eq!(allocs, pool_only, "frame-sized allocations");
+        assert_eq!(rx.pending(), 1, "the frame is published");
+        let array = rx.blocking_recv().unwrap();
+        let NDDataView::U16(pixels) = array.data().view() else {
+            panic!("a 16-bit frame is NDUInt16");
+        };
+        // Source row h-1-y lands on row y.
+        let expected: Vec<u16> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| ((h - 1 - y) * w + x) as u16))
+            .collect();
+        assert_eq!(pixels, &expected[..]);
+    }
+
     /// merlinTask only stores what a frame the pool refuses sets (the counters,
     /// :145-152, and the status message, :441-442) and `continue`s past its
     /// callParamCallbacks (:305): the next driver callback posts them.

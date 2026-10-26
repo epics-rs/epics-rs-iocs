@@ -8,7 +8,7 @@
 //! which is what libhdf5 loads out of `HDF5_PLUGIN_PATH` in the C build. No
 //! plugin path, no `libhdf5`, no `libbshuf` is needed here.
 
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDataViewMut};
 use hdf5_reader::error::{Error as H5Error, Result as H5Result};
 use hdf5_reader::messages::filter_pipeline::FilterDescription;
 use hdf5_reader::{Datatype, FilterRegistry, Hdf5File, OpenOptions, SliceInfo, SliceInfoElem};
@@ -83,7 +83,7 @@ pub fn bslz4_filter(
     data: &[u8],
     element_size: usize,
 ) -> H5Result<Vec<u8>> {
-    bslz4::decode_with_header(data, element_size, None)
+    bslz4::decode_with_header(data, element_size)
         .map_err(|e| H5Error::FilterError(format!("bslz4: {e}")))
 }
 
@@ -100,9 +100,43 @@ pub fn filter_registry() -> FilterRegistry {
 pub struct H5Frame {
     /// `[width, height]`, matching C's `ndDims`.
     pub dims: [usize; 2],
-    pub data: NDDataBuffer,
+    /// The NDArray type the pixels go out as (C's `ndType`).
+    pub data_type: NDDataType,
+    pub pixels: H5Pixels,
     /// 0-based threshold index within the frame (C's `j`).
     pub threshold: usize,
+}
+
+/// One hyperslab as `hdf5-reader` returns it, in the file's unsigned type.
+pub enum H5Pixels {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+}
+
+impl H5Pixels {
+    /// Copy into `out`, an array of the frame's `data_type`. SignedData only
+    /// relabels the same bits.
+    ///
+    /// C's `H5Dread` reads straight into `pData` (eigerDetector.cpp:1869);
+    /// `hdf5-reader` reads a hyperslab only into an array of its own, so the
+    /// pixels pass once more here.
+    pub fn write_into(&self, out: NDDataViewMut<'_>) {
+        fn copy<S: Copy, D>(src: &[S], dst: &mut [D], cast: impl Fn(S) -> D) {
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d = cast(*s);
+            }
+        }
+        match (self, out) {
+            (Self::U8(v), NDDataViewMut::U8(d)) => d.copy_from_slice(v),
+            (Self::U8(v), NDDataViewMut::I8(d)) => copy(v, d, |x| x as i8),
+            (Self::U16(v), NDDataViewMut::U16(d)) => d.copy_from_slice(v),
+            (Self::U16(v), NDDataViewMut::I16(d)) => copy(v, d, |x| x as i16),
+            (Self::U32(v), NDDataViewMut::U32(d)) => d.copy_from_slice(v),
+            (Self::U32(v), NDDataViewMut::I32(d)) => copy(v, d, |x| x as i32),
+            (_, out) => unreachable!("an H5 frame is never {:?}", out.data_type()),
+        }
+    }
 }
 
 /// A failure whose line `parse` has already printed.
@@ -117,8 +151,7 @@ fn report(err: &mut dyn FnMut(&str), msg: &str) -> Reported {
 /// Read every image out of an in-memory `_data_*.h5` blob.
 ///
 /// C reads one hyperslab at a time straight into a pooled NDArray; this reads
-/// the same hyperslabs and hands each back as an owned buffer for the caller to
-/// publish.
+/// the same hyperslabs and hands each back for the caller to copy into one.
 ///
 /// `err` receives the lines C's `parseH5File` prints, in its words; `Err(Reported)`
 /// means one of them ended the parse.
@@ -167,11 +200,12 @@ pub fn parse(
             });
             let selection = SliceInfo { selections };
 
-            let data = read_slice(&dataset, &selection, data_type)
+            let pixels = read_slice(&dataset, &selection, data_type)
                 .map_err(|_| report(err, "couldn't read image"))?;
             frames.push(H5Frame {
                 dims: [layout.width, layout.height],
-                data,
+                data_type,
+                pixels,
                 threshold: j,
             });
         }
@@ -179,66 +213,38 @@ pub fn parse(
     Ok(frames)
 }
 
-/// Read one hyperslab as the NDArray element type.
+/// Read one hyperslab in the file's unsigned type.
 ///
 /// The file always stores unsigned data; `signed_data` only changes how the
-/// same bits are labelled, so the read is always unsigned and the buffer is
-/// re-tagged (C reads with the *file* datatype into the NDArray's buffer, which
-/// is the same reinterpretation).
+/// same bits are labelled (C reads with the *file* datatype into the
+/// NDArray's buffer, which is the same reinterpretation).
 fn read_slice(
     dataset: &hdf5_reader::Dataset,
     selection: &SliceInfo,
     data_type: NDDataType,
-) -> H5Result<NDDataBuffer> {
-    Ok(match data_type {
-        NDDataType::UInt8 => NDDataBuffer::from_vec(
+) -> H5Result<H5Pixels> {
+    Ok(match data_type.element_size() {
+        1 => H5Pixels::U8(
             dataset
                 .read_slice::<u8>(selection)?
                 .into_raw_vec_and_offset()
                 .0,
         ),
-        NDDataType::Int8 => NDDataBuffer::from_vec(
-            dataset
-                .read_slice::<u8>(selection)?
-                .into_raw_vec_and_offset()
-                .0
-                .into_iter()
-                .map(|v| v as i8)
-                .collect(),
-        ),
-        NDDataType::UInt16 => NDDataBuffer::from_vec(
+        2 => H5Pixels::U16(
             dataset
                 .read_slice::<u16>(selection)?
                 .into_raw_vec_and_offset()
                 .0,
         ),
-        NDDataType::Int16 => NDDataBuffer::from_vec(
-            dataset
-                .read_slice::<u16>(selection)?
-                .into_raw_vec_and_offset()
-                .0
-                .into_iter()
-                .map(|v| v as i16)
-                .collect(),
-        ),
-        NDDataType::UInt32 => NDDataBuffer::from_vec(
+        4 => H5Pixels::U32(
             dataset
                 .read_slice::<u32>(selection)?
                 .into_raw_vec_and_offset()
                 .0,
         ),
-        NDDataType::Int32 => NDDataBuffer::from_vec(
-            dataset
-                .read_slice::<u32>(selection)?
-                .into_raw_vec_and_offset()
-                .0
-                .into_iter()
-                .map(|v| v as i32)
-                .collect(),
-        ),
-        other => {
+        _ => {
             return Err(H5Error::InvalidData(format!(
-                "unsupported data type {other:?}"
+                "unsupported data type {data_type:?}"
             )));
         }
     })
@@ -247,7 +253,7 @@ fn read_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::{NDArray, NDDimension};
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 
     #[test]
     fn a_3d_dataset_is_one_threshold() {

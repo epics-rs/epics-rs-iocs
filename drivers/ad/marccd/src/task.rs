@@ -29,7 +29,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use crate::driver::MarccdDriver;
 use crate::file_name::{format_file_template, full_file_template};
-use crate::image::decode_tiff;
+use crate::image::TiffFile;
 use crate::protocol::{
     cmd_start_series_timed, cmd_start_series_triggered_itemp, cmd_start_series_triggered_timed,
 };
@@ -191,28 +191,45 @@ impl Worker {
             (full, nx.max(0) as usize, ny.max(0) as usize, ic, ac)
         });
 
-        let data = match self.read_tiff(l, &full_file_name, nx, ny) {
-            Ok(d) => d,
+        // C dereferences a refused alloc (marCCD.cpp:314); the frame is
+        // dropped after the pool's reached-limit line.
+        let mut array = (array_callbacks != 0)
+            .then(|| {
+                self.pool.alloc(
+                    vec![NDDimension::new(nx), NDDimension::new(ny)],
+                    NDDataType::UInt16,
+                )
+            })
+            .and_then(Result::ok);
+        // C reads the file whatever ArrayCallbacks says (marCCD.cpp:319):
+        // series mode waits on it for the next file.
+        let mut scratch = Vec::new();
+        let read = match &mut array {
+            Some(array) => self.read_tiff(
+                l,
+                &full_file_name,
+                nx,
+                ny,
+                array
+                    .fill()
+                    .data_mut()
+                    .as_mut_slice::<u16>()
+                    .expect("allocated as NDUInt16"),
+            ),
+            None => {
+                scratch.resize(nx * ny, 0);
+                self.read_tiff(l, &full_file_name, nx, ny, &mut scratch)
+            }
+        };
+        if let Err(s) = read {
             // Fixed (upstream-c-defects.md #14): on a read error C still runs
             // doCallbacksGenericPointer with the unfilled buffer, publishing
             // garbage as a frame. Propagate the error and do not publish.
-            Err(s) => return s,
-        };
+            return s;
+        }
 
-        // C dereferences a refused alloc (marCCD.cpp:314); the frame is
-        // dropped after the pool's reached-limit line.
-        if array_callbacks != 0
-            && let Ok(mut array) = self.pool.alloc(
-                vec![NDDimension::new(nx), NDDimension::new(ny)],
-                NDDataType::UInt16,
-            )
-        {
+        if let Some(mut array) = array {
             let mut frame = array.fill();
-            frame
-                .data_mut()
-                .as_mut_slice::<u16>()
-                .expect("allocated as NDUInt16")
-                .copy_from_slice(&data);
             frame.set_unique_id(image_counter);
             // C uses `acqStartTime` for the double timestamp, and the port's
             // `updateTimeStamp` for the epicsTS (marCCD.cpp:323-325).
@@ -234,8 +251,8 @@ impl Worker {
         AsynStatus::Success
     }
 
-    /// C `readTiff` — wait for a new file, then retry the decode until the
-    /// writer has finished; the lock is released only for the waits.
+    /// C `readTiff` — wait for a new file, then retry the decode into `out`
+    /// until the writer has finished; the lock is released only for the waits.
     ///
     /// Fixed (upstream-c-defects.md #13): when the retry loop exhausts `timeout`
     /// without a successful decode, C falls through and returns `asynSuccess`
@@ -247,7 +264,8 @@ impl Worker {
         file: &str,
         nx: usize,
         ny: usize,
-    ) -> Result<Vec<u16>, AsynStatus> {
+        out: &mut [u16],
+    ) -> Result<(), AsynStatus> {
         let timeout = l.step(|d| d.get_f64(d.p.tiff_timeout));
         let t_start = Instant::now();
         let start_time = epoch_secs(SystemTime::now());
@@ -305,38 +323,40 @@ impl Worker {
         }
 
         // The file exists but may not be completely written; retry the decode.
-        let mut decoded = None;
+        let mut decoded = false;
         delta_time = 0.0;
         while delta_time <= timeout {
-            match decode_tiff(path) {
-                Ok(img) if img.width as usize == nx && img.height as usize == ny => {
-                    decoded = Some(img.data);
-                    break;
-                }
-                Ok(img) if img.width as usize != nx => {
+            match TiffFile::open(path) {
+                Ok(tiff) if tiff.width as usize != nx => {
                     self.trace(
                         TraceMask::ERROR,
                         &format!(
                             "marCCD::readTiff, image width incorrect ={}, should be {nx}\n",
-                            img.width
+                            tiff.width
                         ),
                     );
                 }
-                Ok(img) => {
+                Ok(tiff) if tiff.height as usize != ny => {
                     self.trace(
                         TraceMask::ERROR,
                         &format!(
                             "marCCD::readTiff, image length incorrect ={}, should be {ny}\n",
-                            img.height
+                            tiff.height
                         ),
                     );
                 }
-                Err(_) => {
-                    self.trace(
-                        TraceMask::FLOW,
-                        &format!("marCCD::readTiff, error reading TIFF file {file}\n"),
-                    );
-                }
+                opened => match opened.and_then(|tiff| tiff.read_into(out)) {
+                    Ok(()) => {
+                        decoded = true;
+                        break;
+                    }
+                    Err(_) => {
+                        self.trace(
+                            TraceMask::FLOW,
+                            &format!("marCCD::readTiff, error reading TIFF file {file}\n"),
+                        );
+                    }
+                },
             }
             if l.unlocked(|| self.stop.wait_timeout(secs(FILE_READ_DELAY))) {
                 return Err(AsynStatus::Error);
@@ -344,13 +364,13 @@ impl Worker {
             delta_time = t_start.elapsed().as_secs_f64();
         }
 
-        let Some(data) = decoded else {
+        if !decoded {
             // Fixed (upstream-c-defects.md #13): the retry loop timed out
             // without a valid frame. Do not fabricate a buffer or return it as
             // success.
             return Err(AsynStatus::Error);
-        };
-        Ok(data)
+        }
+        Ok(())
     }
 }
 
@@ -863,11 +883,13 @@ mod tests {
         std::mem::forget(det);
     }
 
-    /// marCCD.cpp:327-328 reads the driver's attributes into every frame.
+    /// marCCD.cpp:327-328 reads the driver's attributes into every frame,
+    /// whose pixels readTiff decodes into it (:319).
     #[test]
     fn each_frame_carries_the_driver_attributes() {
         use tiff::encoder::{TiffEncoder, colortype};
 
+        const PIXELS: [u16; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 65535];
         let name = "MARCCD_ATTRS";
         fake_server(name, |c| {
             if c.starts_with("get_size") {
@@ -886,7 +908,7 @@ mod tests {
         let file = std::env::temp_dir().join(format!("{name}_{}.tif", std::process::id()));
         TiffEncoder::new(std::fs::File::create(&file).unwrap())
             .unwrap()
-            .write_image::<colortype::Gray16>(4, 4, &[7u16; 16])
+            .write_image::<colortype::Gray16>(4, 4, &PIXELS)
             .unwrap();
         let path = file.to_string_lossy().into_owned();
         h.write_int32_blocking(ad.base.array_callbacks, 0, 1)
@@ -930,6 +952,7 @@ mod tests {
             frame.attributes.get("Period").unwrap().value,
             NDAttrValue::Float64(2.5)
         );
+        assert_eq!(frame.data().as_slice::<u16>(), Some(&PIXELS[..]));
         std::mem::forget(det);
     }
 

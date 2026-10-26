@@ -12,9 +12,11 @@ use std::ops::Range;
 use bytes::Bytes;
 use epics_rs::ad_core::codec::{Codec, CodecName};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
 use crate::bslz4;
+use crate::pixels::{frame_type, le_to_host};
 
 const ZMQ_PORT: u16 = 31001;
 
@@ -869,10 +871,9 @@ pub enum Frame {
 
 /// One threshold's frame, ready to publish.
 pub struct Stream2Frame {
-    /// `[x, y]`: C's `dims[0] = dim[1]`, `dims[1] = dim[0]`.
-    pub dims: [usize; 2],
-    pub data: NDDataBuffer,
-    pub codec: Option<Codec>,
+    /// `[x, y]` (C's `dims[0] = dim[1]`, `dims[1] = dim[0]`), filled, with a
+    /// codec when it is passed through still compressed.
+    pub array: DriverArray,
     pub timestamp: Option<EpicsTimestamp>,
     /// `ThresholdNumber` and `ThresholdEnergy`, from the start message's entry
     /// at this threshold's index.
@@ -921,6 +922,18 @@ impl Stream2Api {
             image: None,
             cached_ts: (String::new(), EpicsTimestamp { sec: 0, nsec: 0 }),
         })
+    }
+
+    /// A Stream2Api with `messages` already received and no peer.
+    #[cfg(test)]
+    pub(crate) fn with_received(messages: Vec<Vec<u8>>) -> Self {
+        Self {
+            socket: <zeromq::PullSocket as zeromq::Socket>::new(),
+            pending: messages.into_iter().map(Bytes::from).collect(),
+            threshold_energy: Vec::new(),
+            image: None,
+            cached_ts: (String::new(), EpicsTimestamp { sec: 0, nsec: 0 }),
+        }
     }
 
     /// `poll` plus `zmq_msg_recv` of one frame.
@@ -986,15 +999,19 @@ impl Stream2Api {
         }
     }
 
-    /// C `Stream2API::getFrame`. `Err` after printing C's line; the image
-    /// message is released after its last threshold either way.
+    /// C `Stream2API::getFrame`: the frame in an array from `pool`, its
+    /// pixels written straight into it as C writes `pData`. `Err` after
+    /// printing C's line; the image message is released after its last
+    /// threshold either way.
     pub fn get_frame(
         &mut self,
         thresh: usize,
         decompress: bool,
+        signed: bool,
         extract_timestamp: bool,
+        pool: &DriverPool,
     ) -> Result<Stream2Frame, Reported> {
-        let result = self.frame(thresh, decompress, extract_timestamp);
+        let result = self.frame(thresh, decompress, signed, extract_timestamp, pool);
         if self
             .image
             .as_ref()
@@ -1009,7 +1026,9 @@ impl Stream2Api {
         &mut self,
         thresh: usize,
         decompress: bool,
+        signed: bool,
         extract_timestamp: bool,
+        pool: &DriverPool,
     ) -> Result<Stream2Frame, Reported> {
         let Some((buf, im)) = &self.image else {
             return Err(Reported);
@@ -1029,11 +1048,11 @@ impl Stream2Api {
             }
         };
         let blob = &buf[sid.bytes.clone()];
+        let nd_dims = vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])];
+        let refused = |_| err(fname, "failed to allocate NDArray for frame");
 
-        let (data, codec) = match &sid.compression {
-            None => (buffer_from_le(blob, data_type), None),
-            Some(c) if decompress => (uncompress(blob, c, dims, data_type)?, None),
-            Some(c) => {
+        let array = match &sid.compression {
+            Some(c) if !decompress => {
                 let (name, payload) = if c.algorithm == "lz4" {
                     (CodecName::LZ4HDF5, blob)
                 } else {
@@ -1045,9 +1064,37 @@ impl Stream2Api {
                     level: 0,
                     shuffle: 0,
                     compressor: 0,
-                    original_data_type: data_type,
+                    // SignedData relabels the type the codec plugin
+                    // decompresses to.
+                    original_data_type: frame_type(data_type, signed),
                 };
-                (NDDataBuffer::from_slice(payload), Some(codec))
+                // A compressed frame holds its payload bytes, which its dims
+                // do not size.
+                let mut array = pool
+                    .alloc_sized(nd_dims, NDDataType::UInt8, payload.len())
+                    .map_err(refused)?;
+                let mut fill = array.fill();
+                fill.data_mut().as_u8_slice_mut().copy_from_slice(payload);
+                fill.set_codec(Some(codec));
+                array
+            }
+            compression => {
+                // parse_msg holds the bytes, or the compressed orig_size, to
+                // the dims, so this is the dims' size without their product.
+                let bytes = compression
+                    .as_ref()
+                    .map_or(blob.len(), |c| c.orig_size as usize);
+                let mut array = pool
+                    .alloc_sized(nd_dims, frame_type(data_type, signed), bytes)
+                    .map_err(refused)?;
+                let mut fill = array.fill();
+                let out = fill.data_mut().as_u8_slice_mut();
+                match compression {
+                    None => out.copy_from_slice(blob),
+                    Some(c) => uncompress(blob, c, dims, data_type, out)?,
+                }
+                le_to_host(fill.data_mut().view_mut());
+                array
             }
         };
 
@@ -1059,9 +1106,7 @@ impl Stream2Api {
             .map(|(channel, energy)| (threshold_number(channel), *energy));
 
         Ok(Stream2Frame {
-            dims,
-            data,
-            codec,
+            array,
             timestamp,
             threshold,
         })
@@ -1127,30 +1172,7 @@ fn threshold_number(channel: &str) -> i32 {
     if neg { n.wrapping_neg() } else { n }
 }
 
-/// The detector's pixels are little-endian, as every host this runs on.
-fn buffer_from_le(bytes: &[u8], data_type: NDDataType) -> NDDataBuffer {
-    match data_type {
-        NDDataType::UInt8 => NDDataBuffer::from_slice(bytes),
-        NDDataType::UInt16 => NDDataBuffer::from_vec(
-            bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes(*c))
-                .collect(),
-        ),
-        _ => NDDataBuffer::from_vec(
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| u32::from_le_bytes(*c))
-                .collect(),
-        ),
-    }
-}
-
-/// stream2Api.cpp `uncompress`.
+/// stream2Api.cpp `uncompress`, into `out`.
 ///
 /// UPSTREAM DEFECT (stream2Api.cpp:303): `getFrame` ignores what `uncompress`
 /// returns, so a failed decode publishes the uninitialised NDArray. Here the
@@ -1160,10 +1182,9 @@ fn uncompress(
     c: &Compression,
     dims: [usize; 2],
     data_type: NDDataType,
-) -> Result<NDDataBuffer, Reported> {
+    out: &mut [u8],
+) -> Result<(), Reported> {
     let fname = "uncompress";
-    let elem_size = data_type.element_size();
-    let n_elems = (c.orig_size as usize) / elem_size;
     if c.algorithm == "lz4" {
         let mut src = NDArray::with_data(
             vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
@@ -1178,25 +1199,23 @@ fn uncompress(
             original_data_type: data_type,
         });
         match ad_plugins_rs::codec::decompress_lz4hdf5(&src) {
-            Ok(out) => Ok(out.data().clone()),
+            Ok(decoded) => {
+                out.copy_from_slice(decoded.data().as_u8_slice());
+                Ok(())
+            }
             Err(e) => Err(err(
                 fname,
                 &format!("decompress_lz4hdf5 failed, result={e:?}\n"),
             )),
         }
     } else {
-        match bslz4::decode_blocks(&blob[bslz4::HEADER_LEN..], n_elems, elem_size, 0) {
-            Ok(bytes) => Ok(buffer_from_le(&bytes, data_type)),
-            Err(e) => Err(err(
-                fname,
-                &format!("bshuf_decompress_lz4 failed, result={e}"),
-            )),
-        }
+        bslz4::decode_blocks_into(&blob[bslz4::HEADER_LEN..], out, data_type.element_size(), 0)
+            .map_err(|e| err(fname, &format!("bshuf_decompress_lz4 failed, result={e}")))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A minimal CBOR writer for the fixtures.
@@ -1266,7 +1285,7 @@ mod tests {
         }
     }
 
-    fn start(thresholds: &[(&str, f64)]) -> Vec<u8> {
+    pub(crate) fn start(thresholds: &[(&str, f64)]) -> Vec<u8> {
         let mut w = W::default();
         w.magic().map(5).text("type").text("start");
         w.text("series_id").uint(7);
@@ -1286,7 +1305,7 @@ mod tests {
         w.0
     }
 
-    fn image(channels: &[(&str, &[u16])], rows: u64, cols: u64) -> Vec<u8> {
+    pub(crate) fn image(channels: &[(&str, &[u16])], rows: u64, cols: u64) -> Vec<u8> {
         let mut w = W::default();
         w.magic().map(4).text("type").text("image");
         w.text("series_date").text("2025-12-05T12:34:56.5Z");
@@ -1473,6 +1492,21 @@ mod tests {
         assert_eq!(threshold_number("t1"), 0);
     }
 
+    pub(crate) fn end() -> Vec<u8> {
+        let mut w = W::default();
+        w.magic()
+            .map(2)
+            .text("type")
+            .text("end")
+            .text("series_id")
+            .uint(7);
+        w.0
+    }
+
+    fn sizes(array: &DriverArray) -> Vec<usize> {
+        array.dims.iter().map(|d| d.size).collect()
+    }
+
     fn assert_same(got: &NDDataBuffer, want: &NDDataBuffer) {
         assert_eq!(got.data_type(), want.data_type());
         assert_eq!(got.as_u8_slice(), want.as_u8_slice());
@@ -1481,13 +1515,7 @@ mod tests {
     /// A Stream2Api whose socket is never used: the frame and timestamp paths
     /// work on the stored messages only.
     async fn api() -> Stream2Api {
-        Stream2Api {
-            socket: <zeromq::PullSocket as zeromq::Socket>::new(),
-            pending: VecDeque::new(),
-            threshold_energy: Vec::new(),
-            image: None,
-            cached_ts: (String::new(), EpicsTimestamp { sec: 0, nsec: 0 }),
-        }
+        Stream2Api::with_received(Vec::new())
     }
 
     fn load(api: &mut Stream2Api, buf: Vec<u8>) {
@@ -1511,9 +1539,10 @@ mod tests {
             image(&[("threshold_1", px1), ("threshold_2", px2)], 2, 3),
         );
 
-        let f = a.get_frame(0, true, true).unwrap();
-        assert_eq!(f.dims, [3, 2]);
-        assert_same(&f.data, &NDDataBuffer::from_slice(px1));
+        let pool = DriverPool::standalone(0);
+        let f = a.get_frame(0, true, false, true, &pool).unwrap();
+        assert_eq!(sizes(&f.array), [3, 2]);
+        assert_same(f.array.data(), &NDDataBuffer::from_slice(px1));
         assert_eq!(f.threshold, Some((1, 6000.0)));
         // Series start + 25e6 ticks of a 50 MHz clock.
         let ts = f.timestamp.unwrap();
@@ -1521,8 +1550,8 @@ mod tests {
         assert_eq!(ts.nsec, 0);
         assert!(a.image.is_some(), "kept until its last threshold");
 
-        let f = a.get_frame(1, true, false).unwrap();
-        assert_same(&f.data, &NDDataBuffer::from_slice(px2));
+        let f = a.get_frame(1, true, false, false, &pool).unwrap();
+        assert_same(f.array.data(), &NDDataBuffer::from_slice(px2));
         assert_eq!(f.threshold, Some((2, 9000.0)));
         assert!(f.timestamp.is_none());
         assert!(a.image.is_none(), "released after its last threshold");
@@ -1549,17 +1578,23 @@ mod tests {
         w.text("lz4").uint(4).bytes(&blob);
 
         let mut a = api().await;
+        let pool = DriverPool::standalone(0);
         load(&mut a, w.0.clone());
-        let f = a.get_frame(0, false, false).unwrap();
-        let codec = f.codec.unwrap();
+        let f = a.get_frame(0, false, false, false, &pool).unwrap();
+        let codec = f.array.codec.clone().unwrap();
         assert_eq!(codec.name, CodecName::LZ4HDF5);
         assert_eq!(codec.original_data_type, NDDataType::UInt32);
-        assert_same(&f.data, &NDDataBuffer::from_vec(blob.clone()));
+        assert_same(f.array.data(), &NDDataBuffer::from_vec(blob.clone()));
+
+        load(&mut a, w.0.clone());
+        let f = a.get_frame(0, false, true, false, &pool).unwrap();
+        let codec = f.array.codec.clone().unwrap();
+        assert_eq!(codec.original_data_type, NDDataType::Int32, "SignedData");
 
         load(&mut a, w.0);
-        let f = a.get_frame(0, true, false).unwrap();
-        assert!(f.codec.is_none());
-        assert_same(&f.data, &NDDataBuffer::from_vec(pixels));
+        let f = a.get_frame(0, true, false, false, &pool).unwrap();
+        assert!(f.array.codec.is_none());
+        assert_same(f.array.data(), &NDDataBuffer::from_vec(pixels));
     }
 
     #[tokio::test]
@@ -1589,15 +1624,22 @@ mod tests {
         w.text("bslz4").uint(2).bytes(&blob);
 
         let mut a = api().await;
+        let pool = DriverPool::standalone(0);
         load(&mut a, w.0.clone());
-        let f = a.get_frame(0, true, false).unwrap();
-        assert_same(&f.data, &NDDataBuffer::from_vec(pixels));
+        let f = a.get_frame(0, true, false, false, &pool).unwrap();
+        assert_same(f.array.data(), &NDDataBuffer::from_vec(pixels.clone()));
+
+        // SignedData labels the same bits signed.
+        load(&mut a, w.0.clone());
+        let f = a.get_frame(0, true, true, false, &pool).unwrap();
+        let signed: Vec<i16> = pixels.iter().map(|&p| p as i16).collect();
+        assert_same(f.array.data(), &NDDataBuffer::from_vec(signed));
 
         load(&mut a, w.0);
-        let f = a.get_frame(0, false, false).unwrap();
-        assert_eq!(f.codec.unwrap().name, CodecName::BSLZ4);
+        let f = a.get_frame(0, false, false, false, &pool).unwrap();
+        assert_eq!(f.array.codec.as_ref().unwrap().name, CodecName::BSLZ4);
         assert_same(
-            &f.data,
+            f.array.data(),
             &NDDataBuffer::from_vec(blob[bslz4::HEADER_LEN..].to_vec()),
         );
     }
@@ -1617,7 +1659,10 @@ mod tests {
             .bytes(&[0, 1, 0, 2]);
         let mut a = api().await;
         load(&mut a, w.0);
-        assert!(a.get_frame(0, true, false).is_err());
+        assert!(
+            a.get_frame(0, true, false, false, &DriverPool::standalone(0))
+                .is_err()
+        );
         assert!(a.image.is_none());
     }
 }

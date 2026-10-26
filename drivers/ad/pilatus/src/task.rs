@@ -9,9 +9,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
+use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDDataType, NDDataView, NDDataViewMut, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PersistentArray, PublishedArray};
 use epics_rs::ad_core::params::ADBaseParams;
@@ -24,7 +23,7 @@ use parking_lot::Mutex;
 
 use crate::camserver::{CamParams, Ctx};
 use crate::file_name::{MultipleFileFormat, format_file_template, make_multiple_file_format};
-use crate::image::{apply_flat_field, correct_bad_pixels, decode_tiff};
+use crate::image::{TiffFile, apply_flat_field, correct_bad_pixels};
 use crate::protocol::{cmd_exposure, cmd_header_string, cmd_mx_f64};
 use crate::types::{
     BadPixel, CAMSERVER_ACQUIRE_TIMEOUT, CAMSERVER_DEFAULT_TIMEOUT, Event, FILE_READ_DELAY,
@@ -210,8 +209,8 @@ impl<P: CamParams> ImageReader<'_, P> {
         AsynStatus::Success
     }
 
-    /// C `readTiff()` — wait for the file, then retry the decode until the writer
-    /// has finished, and finally apply the bad-pixel map.
+    /// C `readTiff()` — wait for the file, then retry the decode into `out`
+    /// until the writer has finished, and finally apply the bad-pixel map.
     ///
     /// Fixed (upstream-c-defects.md #8): when the retry loop exhausts `timeout`
     /// without a successful decode, C falls through and returns `asynSuccess` with
@@ -223,10 +222,10 @@ impl<P: CamParams> ImageReader<'_, P> {
         file: &Path,
         start_time: Option<SystemTime>,
         timeout: f64,
-        nx: usize,
-        ny: usize,
+        [nx, ny]: [usize; 2],
+        out: &mut [i32],
         bad_pixels: &[BadPixel],
-    ) -> Result<(Vec<i32>, Option<String>), AsynStatus> {
+    ) -> Result<Option<String>, AsynStatus> {
         let t_start = Instant::now();
         let mut delta_time = 0.0f64;
 
@@ -238,32 +237,34 @@ impl<P: CamParams> ImageReader<'_, P> {
         let mut decoded = None;
         while delta_time <= timeout {
             // The file exists but may not be completely written yet.
-            match decode_tiff(file) {
-                Ok(img) if img.width as usize == nx && img.height as usize == ny => {
-                    decoded = Some(img);
-                    break;
-                }
-                Ok(img) if img.width as usize != nx => self.cx.trace(
+            match TiffFile::open(file) {
+                Ok(tiff) if tiff.width as usize != nx => self.cx.trace(
                     TraceMask::ERROR,
                     &format!(
                         "pilatusDetector::readTiff, image width incorrect ={}, should be {nx}\n",
-                        img.width
+                        tiff.width
                     ),
                 ),
-                Ok(img) => self.cx.trace(
+                Ok(tiff) if tiff.height as usize != ny => self.cx.trace(
                     TraceMask::ERROR,
                     &format!(
                         "pilatusDetector::readTiff, image length incorrect ={}, should be {ny}\n",
-                        img.height
+                        tiff.height
                     ),
                 ),
-                Err(_) => self.cx.trace(
-                    TraceMask::FLOW,
-                    &format!(
-                        "pilatusDetector::readTiff, error reading TIFF file {}\n",
-                        file.display()
+                opened => match opened.and_then(|tiff| tiff.read_into(out)) {
+                    Ok(description) => {
+                        decoded = Some(description);
+                        break;
+                    }
+                    Err(_) => self.cx.trace(
+                        TraceMask::FLOW,
+                        &format!(
+                            "pilatusDetector::readTiff, error reading TIFF file {}\n",
+                            file.display()
+                        ),
                     ),
-                ),
+                },
             }
             // Sleep, but check for the stop event so a long acquisition can abort.
             if self.stop.wait_timeout(secs(FILE_READ_DELAY)) {
@@ -273,14 +274,13 @@ impl<P: CamParams> ImageReader<'_, P> {
             delta_time = t_start.elapsed().as_secs_f64();
         }
 
-        let Some(img) = decoded else {
+        let Some(description) = decoded else {
             // Fixed (upstream-c-defects.md #8): the retry loop timed out without a
             // valid frame. Do not fabricate a buffer or publish it.
             return Err(AsynStatus::Error);
         };
-        let (mut data, description) = (img.data, img.description);
-        correct_bad_pixels(&mut data, bad_pixels);
-        Ok((data, description))
+        correct_bad_pixels(out, bad_pixels);
+        Ok(description)
     }
 
     /// C `readImageFile()`.
@@ -292,12 +292,12 @@ impl<P: CamParams> ImageReader<'_, P> {
         file: &str,
         start_time: Option<SystemTime>,
         timeout: f64,
-        nx: usize,
-        ny: usize,
+        dims: [usize; 2],
+        out: &mut [i32],
         bad_pixels: &[BadPixel],
-    ) -> Result<(Vec<i32>, Option<String>), AsynStatus> {
+    ) -> Result<Option<String>, AsynStatus> {
         if ends_with_ignore_case(file, ".tif") || ends_with_ignore_case(file, ".tiff") {
-            self.read_tiff(Path::new(file), start_time, timeout, nx, ny, bad_pixels)
+            self.read_tiff(Path::new(file), start_time, timeout, dims, out, bad_pixels)
         } else if ends_with_ignore_case(file, ".cbf") {
             self.cx
                 .set_str(self.ad.status_message, "CBF files are not supported".into());
@@ -319,33 +319,19 @@ impl<P: CamParams> ImageReader<'_, P> {
     }
 }
 
-fn build_array(
-    pool: &DriverPool,
+/// C stamps `pImage` after the flat field (pilatusDetector.cpp:1225-1227).
+fn stamp_frame(
+    array: &mut DriverArray,
     unique_id: i32,
     ts: EpicsTimestamp,
-    nx: usize,
-    ny: usize,
-    data: Vec<i32>,
     description: Option<String>,
-) -> ADResult<DriverArray> {
-    let mut attributes = NDAttributeList::new();
-    if let Some(d) = description {
-        attributes.add(tiff_description(d));
-    }
-    let mut array = pool.alloc(
-        vec![NDDimension::new(nx), NDDimension::new(ny)],
-        NDDataType::Int32,
-    )?;
+) {
     let mut frame = array.fill();
-    frame
-        .data_mut()
-        .as_mut_slice::<i32>()
-        .expect("allocated as NDInt32")
-        .copy_from_slice(&data);
     frame.set_unique_id(unique_id);
     frame.update_time_stamps(ts);
-    *frame.attributes_mut() = attributes;
-    Ok(array)
+    if let Some(d) = description {
+        frame.attributes_mut().add(tiff_description(d));
+    }
 }
 
 /// C `pImage->pAttributeList->add("TIFFImageDescription", ...)`
@@ -523,57 +509,66 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
 
             if array_callbacks != 0 {
                 let (nx, ny) = max_size(&mut w.ctx).await;
-                let reason = w.ctx.ad.status_message;
-                w.ctx
-                    .set_str(reason, format!("Reading image file {full_file_name}"));
-                w.ctx.callbacks().await;
-
-                let bad_pixels = w.shared.lock().bad_pixels.clone();
-                let read = w.ctx.image_reader().read_image_file(
-                    &full_file_name,
-                    Some(start_time),
-                    (num_exposures as f64 * acquire_time) + read_image_file_timeout,
-                    nx,
-                    ny,
-                    &bad_pixels,
-                );
-                let (mut data, description) = match read {
-                    Ok(v) => v,
-                    Err(s) => {
-                        status = s;
-                        acquire = false;
-                        aborted = true;
-                        continue;
-                    }
-                };
-
-                // We successfully read an image — increment the array counter.
-                let image_counter = w
-                    .ctx
-                    .get_i32(w.ctx.ad.base.array_counter)
-                    .await
-                    .unwrap_or(0)
-                    + 1;
-                w.ctx.set_i32(w.ctx.ad.base.array_counter, image_counter);
-                w.ctx.callbacks().await;
-
-                let flat_field_valid = w.ctx.get_i32(w.ctx.p.flat_field_valid).await.unwrap_or(0);
-                if flat_field_valid != 0 {
-                    let s = w.shared.lock();
-                    if let Some(NDDataView::I32(flat)) =
-                        s.flat_field.as_ref().map(|f| f.data().view())
-                    {
-                        apply_flat_field(&mut data, flat, s.average_flat_field);
-                    }
-                }
-
                 // C dereferences a refused alloc (pilatusDetector.cpp:1190);
-                // the frame is dropped after the pool's reached-limit line.
-                // C updateTimeStamps (pilatusDetector.cpp:1227).
-                let ts = w.ctx.update_time_stamp().await;
-                if let Ok(array) =
-                    build_array(&w.pool, image_counter, ts, nx, ny, data, description)
-                {
+                // here the frame is skipped after the pool's reached-limit
+                // line, without waiting for its file.
+                if let Ok(mut array) = w.pool.alloc(
+                    vec![NDDimension::new(nx), NDDimension::new(ny)],
+                    NDDataType::Int32,
+                ) {
+                    let reason = w.ctx.ad.status_message;
+                    w.ctx
+                        .set_str(reason, format!("Reading image file {full_file_name}"));
+                    w.ctx.callbacks().await;
+
+                    let bad_pixels = w.shared.lock().bad_pixels.clone();
+                    let mut frame = array.fill();
+                    let pixels = frame
+                        .data_mut()
+                        .as_mut_slice::<i32>()
+                        .expect("allocated as NDInt32");
+                    let read = w.ctx.image_reader().read_image_file(
+                        &full_file_name,
+                        Some(start_time),
+                        (num_exposures as f64 * acquire_time) + read_image_file_timeout,
+                        [nx, ny],
+                        pixels,
+                        &bad_pixels,
+                    );
+                    let description = match read {
+                        Ok(v) => v,
+                        Err(s) => {
+                            status = s;
+                            acquire = false;
+                            aborted = true;
+                            continue;
+                        }
+                    };
+
+                    // We successfully read an image — increment the array counter.
+                    let image_counter = w
+                        .ctx
+                        .get_i32(w.ctx.ad.base.array_counter)
+                        .await
+                        .unwrap_or(0)
+                        + 1;
+                    w.ctx.set_i32(w.ctx.ad.base.array_counter, image_counter);
+                    w.ctx.callbacks().await;
+
+                    let flat_field_valid =
+                        w.ctx.get_i32(w.ctx.p.flat_field_valid).await.unwrap_or(0);
+                    if flat_field_valid != 0 {
+                        let s = w.shared.lock();
+                        if let Some(NDDataView::I32(flat)) =
+                            s.flat_field.as_ref().map(|f| f.data().view())
+                        {
+                            apply_flat_field(pixels, flat, s.average_flat_field);
+                        }
+                    }
+
+                    // C updateTimeStamps (pilatusDetector.cpp:1227).
+                    let ts = w.ctx.update_time_stamp().await;
+                    stamp_frame(&mut array, image_counter, ts, description);
                     w.output.publish(array).await;
                 }
             }
@@ -798,23 +793,55 @@ mod tests {
         path
     }
 
+    /// C reads the TIFF straight into the pool's `pImage` and corrects its
+    /// bad pixels there (pilatusDetector.cpp:695, :744).
     #[test]
-    fn build_array_carries_tiff_description() {
-        let a = build_array(
-            &DriverPool::standalone(0),
+    fn a_frame_decodes_into_its_pool_array() {
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
+        let mut det = flat_field_driver("PILATUS_FRAME_READ", flat_field_tx);
+        let path = flat_field_tiff("frame", 2, &[7, 9]);
+        let mut array = det
+            .ad
+            .pool
+            .alloc(
+                vec![NDDimension::new(2), NDDimension::new(1)],
+                NDDataType::Int32,
+            )
+            .unwrap();
+        let mut frame = array.fill();
+        let pixels = frame.data_mut().as_mut_slice::<i32>().unwrap();
+        pixels.fill(-1);
+        let stop = Event::new();
+        let read = ImageReader {
+            ad: det.ad.params,
+            cx: &mut det.ad.port_base,
+            stop: &stop,
+        }
+        .read_image_file(
+            &path.to_string_lossy(),
+            None,
+            0.0,
+            [2, 1],
+            pixels,
+            &[BadPixel {
+                bad_index: 0,
+                replace_index: 1,
+            }],
+        );
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(read, Ok(None)));
+        assert_eq!(pixels, [9, 9]);
+
+        stamp_frame(
+            &mut array,
             7,
             EpicsTimestamp::default(),
-            2,
-            2,
-            vec![1, 2, 3, 4],
             Some("desc".into()),
-        )
-        .unwrap();
-        assert_eq!(a.unique_id, 7);
-        assert_eq!(a.dims.len(), 2);
-        assert_eq!(a.data_size(), 16);
+        );
+        assert_eq!(array.unique_id, 7);
         assert_eq!(
-            a.attributes
+            array
+                .attributes
                 .get("TIFFImageDescription")
                 .map(|x| x.value.as_string()),
             Some("desc".to_string())

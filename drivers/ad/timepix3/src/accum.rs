@@ -22,12 +22,10 @@ const PROCESSING_TIME_SAMPLES: usize = 10;
 /// What one frame produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
-    /// The running sum after this frame — always fresh.
-    pub running: Vec<u64>,
-    /// The window sum, present only on the frames where the update interval
-    /// elapses and the window took the frame (C `should_update_sum`,
-    /// serval_stream.cpp:1180-1182).
-    pub sum_n: Option<Vec<u64>>,
+    /// Set only on the frames where the update interval elapses and the
+    /// window took the frame (C `should_update_sum`,
+    /// serval_stream.cpp:1180-1182); the window sum is then fresh.
+    pub sum_updated: bool,
     /// The frames the window holds (C `FramesSummed`).
     pub frames_summed: usize,
     /// The window's new configuration, when this frame's geometry, the
@@ -395,17 +393,15 @@ impl Accumulator {
             .then(|| self.window.push(frame));
 
         self.since_update += 1;
-        let sum_n = (window_push == Some(RollingSumStatus::Ok)
+        let sum_updated = window_push == Some(RollingSumStatus::Ok)
             && self.since_update >= self.update_interval
-            && self.window.frame_count() > 0)
-            .then(|| {
-                self.since_update = 0;
-                self.window_sum()
-            });
+            && self.window.frame_count() > 0;
+        if sum_updated {
+            self.since_update = 0;
+        }
 
         Update {
-            running: self.running.clone(),
-            sum_n,
+            sum_updated,
             frames_summed: self.window.frame_count(),
             frame_counts,
             reset,
@@ -420,15 +416,20 @@ impl Accumulator {
 mod tests {
     use super::*;
 
+    /// The window sum a frame published, if it updated it.
+    fn sum_n(a: &Accumulator, u: &Update) -> Option<Vec<u64>> {
+        u.sum_updated.then(|| a.window_sum())
+    }
+
     #[test]
     fn the_running_sum_accumulates_every_frame() {
         let mut a = Accumulator::new();
         let u = a.add(&[1, 2, 3]);
-        assert_eq!(u.running, vec![1, 2, 3]);
+        assert_eq!(a.running(), [1, 2, 3]);
         assert_eq!(u.frame_counts, 6);
         assert!(u.reset);
         let u = a.add(&[10, 20, 30]);
-        assert_eq!(u.running, vec![11, 22, 33]);
+        assert_eq!(a.running(), [11, 22, 33]);
         assert!(!u.reset);
         assert_eq!(a.frame_count(), 2);
         assert_eq!(a.total_counts(), 66);
@@ -495,10 +496,10 @@ mod tests {
         a.add(&[2, 2]);
         let u = a.add(&[4, 4]);
         // Frames 2 and 3 only.
-        assert_eq!(u.sum_n, Some(vec![6, 6]));
+        assert_eq!(sum_n(&a, &u), Some(vec![6, 6]));
         assert_eq!(u.frames_summed, 2);
         // The running sum still holds all three.
-        assert_eq!(u.running, vec![7, 7]);
+        assert_eq!(a.running(), [7, 7]);
     }
 
     #[test]
@@ -506,12 +507,12 @@ mod tests {
         let mut a = Accumulator::new();
         a.set_frames_to_sum(10);
         a.set_update_interval(3);
-        assert!(a.add(&[1]).sum_n.is_none());
-        assert!(a.add(&[1]).sum_n.is_none());
+        assert!(!a.add(&[1]).sum_updated);
+        assert!(!a.add(&[1]).sum_updated);
         let u = a.add(&[1]);
-        assert_eq!(u.sum_n, Some(vec![3]));
+        assert_eq!(sum_n(&a, &u), Some(vec![3]));
         assert_eq!(u.frames_summed, 3);
-        assert!(a.add(&[1]).sum_n.is_none());
+        assert!(!a.add(&[1]).sum_updated);
     }
 
     #[test]
@@ -539,7 +540,7 @@ mod tests {
         assert_eq!(a.buffered_frames(), 2);
         let u = a.add(&[10]);
         // Frames 5 and 10 (4 was trimmed).
-        assert_eq!(u.sum_n, Some(vec![15]));
+        assert_eq!(sum_n(&a, &u), Some(vec![15]));
     }
 
     /// The window holds what the retention budget allows beside its sum
@@ -555,8 +556,8 @@ mod tests {
         let u = a.add(&frame(4));
         let c = a.window();
         assert_eq!((c.effective_frames(), u.frames_summed), (2, 2));
-        assert_eq!(u.sum_n.as_deref().map(|s| s[0]), Some(6));
-        assert_eq!(u.running[0], 7);
+        assert_eq!(sum_n(&a, &u).map(|s| s[0]), Some(6));
+        assert_eq!(a.running()[0], 7);
 
         // A budget below one frame leaves no window and no sum of N.
         let mut a = Accumulator::new();
@@ -566,7 +567,10 @@ mod tests {
             u.window_config.map(|c| c.status),
             Some(RollingSumStatus::BudgetTooSmall)
         );
-        assert_eq!((u.window_push, u.sum_n, u.frames_summed), (None, None, 0));
+        assert_eq!(
+            (u.window_push, u.sum_updated, u.frames_summed),
+            (None, false, 0)
+        );
         assert_eq!(a.current_frame().map(<[u32]>::len), Some(131072));
     }
 
@@ -574,9 +578,9 @@ mod tests {
     fn a_zero_update_interval_cannot_stall_the_sum() {
         let mut a = Accumulator::new();
         a.set_update_interval(0);
-        assert!(a.add(&[1]).sum_n.is_some());
+        assert!(a.add(&[1]).sum_updated);
         a.set_update_interval(-3);
-        assert!(a.add(&[1]).sum_n.is_some());
+        assert!(a.add(&[1]).sum_updated);
     }
 
     #[test]
@@ -586,8 +590,8 @@ mod tests {
         a.add(&[1, 2, 3]);
         let u = a.add(&[5, 5]);
         assert!(u.reset);
-        assert_eq!(u.running, vec![5, 5]);
-        assert_eq!(u.sum_n, Some(vec![5, 5]));
+        assert_eq!(a.running(), [5, 5]);
+        assert_eq!(sum_n(&a, &u), Some(vec![5, 5]));
         assert_eq!(a.frame_count(), 1);
         assert_eq!(a.total_counts(), 10);
     }
@@ -601,7 +605,7 @@ mod tests {
         assert_eq!(a.total_counts(), 0);
         assert_eq!(a.buffered_frames(), 0);
         assert_eq!(a.current_frame(), Some(&[1, 2][..]));
-        let u = a.add(&[9, 9]);
-        assert_eq!(u.running, vec![9, 9]);
+        a.add(&[9, 9]);
+        assert_eq!(a.running(), [9, 9]);
     }
 }
