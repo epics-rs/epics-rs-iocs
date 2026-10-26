@@ -74,13 +74,18 @@ int anyMoving;
 int ncomplete;
 int nextra;
 int npoints;
+/* The axes init set up, at most MAX_AXES.  Upstream ran every per-axis loop to
+ * numAxes as last put: past these after a NumAxes put above them, and past the
+ * arrays above MAX_AXES.  Each runs to the lesser of numAxes and initAxes. */
+int initAxes;
 /* State build's one bounded read of nelements, moveMode, timeMode and
- * moveAxis */
+ * moveAxis, and its one read of the axes */
 int buildElements;
 int buildMode;
 int buildTimeMode;
 int buildMoveAxis[MAX_AXES];
 int buildMoved;
+int buildAxes;
 int dir;
 double dtime;
 double dpos;
@@ -119,13 +124,10 @@ ss trajectoryScan {
     /* Initialize things when first starting */
     state init {
         when() {
-            /* Read numAxes once here, as XPS_trajectoryScan.st does: upstream's
-             * monitored value ran every per-axis loop past the axes set up here
-             * after a later NumAxes put. */
-            pvGet(numAxes);
-            /* Force numAxes to be <= MAX_AXES */
-            if (numAxes > MAX_AXES) numAxes = MAX_AXES;
-            for (i=0; i<numAxes; i++) {
+            /* Force initAxes to be <= MAX_AXES */
+            initAxes = numAxes;
+            if (initAxes > MAX_AXES) initAxes = MAX_AXES;
+            for (i=0; i<initAxes; i++) {
                 sprintf(macroBuf, "M%d", i+1);
                 sprintf(motorName, "%s%s.VAL", macValueGet("P"), macValueGet(macroBuf));
                 pvAssign(epicsMotorPos[i], motorName);
@@ -145,12 +147,12 @@ ss trajectoryScan {
                printf("trajectoryScan error in pasynOctetSyncIO->connect\n");
                printf("   status=%d, port=%s\n", status, asynPort);
             }
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<initAxes; j++) {
                 motorCurrentIndex[j]   =  pvIndex(motorCurrent[j]);
                 epicsMotorDoneIndex[j] =  pvIndex(epicsMotorDone[j]);
             }
             /* Read the maximum allowable speed error between blocks */
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<initAxes; j++) {
                 sprintf(stringOut, "%dGC?", j+1);
                 %%writeRead(ssId, pVar, pVar->stringOut);
                 /* Parse the return string which is of the form 1GCxxx */
@@ -191,7 +193,7 @@ ss trajectoryScan {
             /* One of the motorMDVS values has changed.  The event flag is on
              * the array, so we can't tell which one.  No harm in writing all
              * the values to the MM4005. */
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<numAxes && j<initAxes; j++) {
                 sprintf(stringOut, "%dGC%f", j+1, motorMDVS[j]);
                 %%writeOnly(ssId, pVar, pVar->stringOut);
             }
@@ -212,7 +214,8 @@ ss trajectoryScan {
              * an absolute build of 1998-2000 elements writes motorTrajectory[j]
              * past its end for an axis moveAxis sets during the build, and the
              * build sends DX for an axis its DC never declared.  The build* copies
-             * are the one bounded read.  Upstream's padding writes
+             * are the one bounded read, and buildAxes the one of numAxes, which
+             * upstream re-read as well.  Upstream's padding writes
              * timeTrajectory[npoints] on, moved axes or not, so a negative npoints
              * it pads (one not a multiple of 4) indexes before the arrays; any other
              * count below 1 point sends no element and is kept.  Above, each count
@@ -224,8 +227,10 @@ ss trajectoryScan {
             buildMode = moveMode;
             buildTimeMode = timeMode;
             buildElements = nelements;
+            buildAxes = numAxes;
+            if (buildAxes > initAxes) buildAxes = initAxes;
             buildMoved = 0;
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<buildAxes; j++) {
                 buildMoveAxis[j] = moveAxis[j];
                 if (buildMoveAxis[j]) buildMoved = 1;
             }
@@ -248,7 +253,7 @@ ss trajectoryScan {
             strcpy(stringOut, "NC");
             %%writeOnly(ssId, pVar, pVar->stringOut);
             /* Define which motors are to be moved */
-            for (i=0; i<numAxes; i++) {
+            for (i=0; i<buildAxes; i++) {
                 sprintf(stringOut, "%dDC%d", i+1, buildMoveAxis[i]);
                 %%writeOnly(ssId, pVar, pVar->stringOut);
             }
@@ -279,7 +284,7 @@ ss trajectoryScan {
                  * padding elements, keeping velocity constant */
                 for (i=0; i<nextra; i++) {
                     timeTrajectory[npoints+i] = PAD_TIME;
-                    for (j=0; j<numAxes; j++) {
+                    for (j=0; j<buildAxes; j++) {
                         if (!buildMoveAxis[j]) continue;
                         if (buildMode == MOVE_MODE_RELATIVE) {
                             motorTrajectory[j][buildElements+i] = 
@@ -301,7 +306,7 @@ ss trajectoryScan {
                 pvPut(nelements);
                 pvPut(timeTrajectory);
                 /* Post the new trajectory position arrays */
-                for (j=0; j<numAxes; j++) {
+                for (j=0; j<buildAxes; j++) {
                    pvPut(motorTrajectory[j]);
                 }
             }
@@ -315,7 +320,7 @@ ss trajectoryScan {
                 pvPut(buildMessage);
                 sprintf(stringOut, "%dDT%f", i+1, timeTrajectory[i]);
                 %%writeOnly(ssId, pVar, pVar->stringOut);
-                for (j=0; j<numAxes; j++) {
+                for (j=0; j<buildAxes; j++) {
                     if (!buildMoveAxis[j]) continue;
                     if (buildMode == MOVE_MODE_RELATIVE) {
                         dpos = motorTrajectory[j][i];
@@ -364,7 +369,7 @@ ss trajectoryScan {
                 strncpy(buildMessage, stringIn, MAX_STRING_SIZE-1);
             }
             /* Read dynamic parameters, post them */
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<buildAxes; j++) {
                 p = stringIn;
                 /* This query can only be done for axes which are active in the
                  * trajectory */
@@ -422,10 +427,10 @@ ss trajectoryScan {
             execStatus = STATUS_UNDEFINED;
             pvPut(execStatus);
             /* Get the initial positions of the motors */
-            for (j=0; j<numAxes; j++) initialPos[j] = epicsMotorPos[j];
+            for (j=0; j<numAxes && j<initAxes; j++) initialPos[j] = epicsMotorPos[j];
             /* Move to start position if required */
             if (moveMode == MOVE_MODE_ABSOLUTE) {
-                for (j=0; j<numAxes; j++) {
+                for (j=0; j<numAxes && j<initAxes; j++) {
                     if (!moveAxis[j]) continue;
                     epicsMotorPos[j] = motorTrajectory[j][0];
                     pvPut(epicsMotorPos[j]);
@@ -480,7 +485,7 @@ ss trajectoryScan {
         when(execState==EXECUTE_STATE_EXECUTING) {
             /* Get the current motor positions, post them */
             %%getMotorPositions(ssId, pVar, pVar->motorCurrent);
-            for (j=0; j<numAxes; j++) pvPut(motorCurrent[j]);
+            for (j=0; j<numAxes && j<initAxes; j++) pvPut(motorCurrent[j]);
             /* Send XC1 command, read last trajectory element done */
             %%writeRead(ssId, pVar, "XC1");
             /* Parse response, which is of the form XCnnnn */
@@ -517,8 +522,8 @@ ss trajectoryScan {
             pvPut(execMessage);
             /* Get the current motor positions, post them */
             %%getMotorPositions(ssId, pVar, pVar->motorCurrent);
-            for (j=0; j<numAxes; j++) pvPut(motorCurrent[j]);
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<numAxes && j<initAxes; j++) pvPut(motorCurrent[j]);
+            for (j=0; j<numAxes && j<initAxes; j++) {
                 if (!moveAxis[j]) continue;
                 epicsMotorPos[j] = motorCurrent[j];
                 pvPut(epicsMotorPos[j]);
@@ -543,7 +548,7 @@ ss trajectoryScan {
             readStatus=STATUS_UNDEFINED;
             pvPut(readStatus);
             /* Erase the readback and error arrays */
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<numAxes && j<initAxes; j++) {
                 for (i=0; i<MAX_PULSES; i++) {
                     motorReadbacks[j][i] = 0.;
                     motorError[j][i] = 0.;
@@ -569,7 +574,7 @@ ss trajectoryScan {
                  * short of numAxes axes, as from a controller with fewer, read
                  * NULL+3.  The parse stops at a token missing or shorter than its
                  * prefix, leaving the rest of the point 0. */
-                for (j=0; (j<numAxes && p!=0); j++) {
+                for (j=0; (j<numAxes && j<initAxes && p!=0); j++) {
                     p = epicsStrtok_r(0, ",", &tok_save);
                     if (p == 0 || strlen(p) < 3) break;
                     posTheory = atof(p+3);
@@ -584,7 +589,7 @@ ss trajectoryScan {
                 }
             }
             /* Post the readback and error arrays */
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<numAxes && j<initAxes; j++) {
                 pvPut(motorReadbacks[j]);
                 pvPut(motorError[j]);
             }
@@ -634,6 +639,12 @@ ss trajectoryAbort {
 /* C functions */
 %{
 
+/* The axes a function runs over: numAxes as last put, up to initAxes. */
+static int axesInUse(struct UserVar *pVar)
+{
+    return pVar->numAxes < pVar->initAxes ? pVar->numAxes : pVar->initAxes;
+}
+
 /* writeOnly sends a command to the MM4005 */
 static int writeOnly(SS_ID ssId, struct UserVar *pVar, char *command)
 {
@@ -678,6 +689,7 @@ static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos)
     char *p, *tok_save;
     int j;
     int dir;
+    int naxes = axesInUse(pVar);
 
     /* Read the current positions of all the axes */
     writeRead(ssId, pVar, "TP");
@@ -685,7 +697,7 @@ static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos)
      * 1TP2.65,2TP3.1 ... */
     tok_save = 0;
     p = epicsStrtok_r(pVar->stringIn, ",", &tok_save);
-    for (j=0; (j<pVar->numAxes && p!=0); j++) {
+    for (j=0; (j<naxes && p!=0); j++) {
         if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1;
         pos[j] = atof(p+3)*dir + pVar->epicsMotorOff[j];
         p = epicsStrtok_r(0, ",", &tok_save);
@@ -702,6 +714,7 @@ static int getMotorMoving(SS_ID ssId, struct UserVar *pVar)
     char *p, *tok_save;
     int j;
     int result=0, mask=0x01;
+    int naxes = axesInUse(pVar);
 
     /* Read the current status of all the axes */
     writeRead(ssId, pVar, "MS");
@@ -709,7 +722,7 @@ static int getMotorMoving(SS_ID ssId, struct UserVar *pVar)
      * 1MSA,2MS@ ... */
     tok_save = 0;
     p = epicsStrtok_r(pVar->stringIn, ",", &tok_save);
-    for (j=0; (j<pVar->numAxes && p!=0); j++) {
+    for (j=0; (j<naxes && p!=0); j++) {
         /* The low order bit in the status byte is the MOVING bit */
         if (*(p+3) & 0x01) result |= mask;
         mask = mask << 1;
@@ -725,8 +738,9 @@ static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar)
 {
     int j;
     int result=0, mask=0x01;
+    int naxes = axesInUse(pVar);
 
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<naxes; j++) {
 		seq_pvGet(ssId, pVar->epicsMotorDoneIndex[j], 0);
         if (pVar->epicsMotorDone[j] == 0) result |= mask;
         mask = mask << 1;
@@ -740,18 +754,19 @@ static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar)
 static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar)
 {
     int j;
+    int naxes = axesInUse(pVar);
 
     /* Logic is that we always want to post position motor positions 
      * after the end of move is detected. */
     while(getEpicsMotorMoving(ssId, pVar)) {
         /* Get the current motor positions, post them */
-        for (j=0; j<pVar->numAxes; j++) {
+        for (j=0; j<naxes; j++) {
             pVar->motorCurrent[j] = pVar->epicsMotorPos[j];
 			seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0);
         }
         epicsThreadSleep(POLL_INTERVAL);
     }
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<naxes; j++) {
         pVar->motorCurrent[j] = pVar->epicsMotorPos[j];
 		seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0);
     }

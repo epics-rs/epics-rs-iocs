@@ -42,9 +42,14 @@ fn difftime(t1: i64, t0: u64) -> f64 {
     t1 as f64 - t0 as i64 as f64
 }
 
-/// `numAxes` as a loop bound.
-fn axes(v: &seqg::seqg_vars) -> std::ops::Range<usize> {
-    0..usize::try_from(v.numAxes.get()).unwrap_or(0)
+/// C `axesInUse`.
+fn axes_in_use(v: &seqg::seqg_vars) -> i32 {
+    v.numAxes.get().min(v.initAxes.get())
+}
+
+/// `n` axes as a loop bound.
+fn axes(n: i32) -> std::ops::Range<usize> {
+    0..usize::try_from(n).unwrap_or(0)
 }
 
 /// The C `int dir` of axis `j`: 1 when its motor record's `DIR` is Pos.
@@ -135,7 +140,7 @@ fn get_motor_positions(v: &seqg::seqg_vars) -> i32 {
     // 1TP2.65,2TP3.1 ...
     let tok_save = SeqVar::new(CharPtr::default());
     let mut p = epicsStrtok_r(&v.stringIn, ",", &tok_save);
-    for j in axes(v) {
+    for j in axes(axes_in_use(v)) {
         if p.is_null() {
             break;
         }
@@ -153,7 +158,7 @@ fn get_motor_moving(v: &seqg::seqg_vars) -> i32 {
     let tok_save = SeqVar::new(CharPtr::default());
     let mut p = epicsStrtok_r(&v.stringIn, ",", &tok_save);
     let mut result = 0;
-    for j in axes(v) {
+    for j in axes(axes_in_use(v)) {
         if p.is_null() {
             break;
         }
@@ -169,7 +174,7 @@ fn get_motor_moving(v: &seqg::seqg_vars) -> i32 {
 fn get_epics_motor_moving(env: &Env) -> i32 {
     let v = env.var();
     let mut result = 0;
-    for j in axes(v) {
+    for j in axes(axes_in_use(v)) {
         env.pv_get(
             ChId(v.epicsMotorDoneIndex.at(j).get() as u32),
             CompType::Default,
@@ -185,8 +190,9 @@ fn get_epics_motor_moving(env: &Env) -> i32 {
 /// `motorCurrent` until none moves.
 fn wait_epics_motors(env: &Env) {
     let v = env.var();
+    let naxes = axes_in_use(v);
     let post = || {
-        for j in axes(v) {
+        for j in axes(naxes) {
             v.motorCurrent[j].set(v.epicsMotorPos[j].get());
             env.pv_put(
                 ChId(v.motorCurrentIndex.at(j).get() as u32),
@@ -213,7 +219,7 @@ macro_rules! seqg_escaped {
     (r#"static int getMotorMoving(SS_ID ssId, struct UserVar *pVar);"#) => {};
     (r#"static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar);"#) => {};
     (r#"static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar);"#) => {};
-    (r#"static int writeOnly(SS_ID ssId, struct UserVar *pVar, char *command) { asynStatus status; size_t nwrite; char buffer[256]; strncpy(buffer, command, 256 -3); strcat(buffer, "\r"); status = pasynOctetSyncIO->write((asynUser *)pVar->pasynUser, buffer, strlen(buffer), 1.0, &nwrite); return(status); } static int writeRead(SS_ID ssId, struct UserVar *pVar, char *command) { asynStatus status; size_t nwrite, nread; int eomReason; char buffer[256]; strncpy(buffer, command, 256 -3); strcat(buffer, "\r"); memset(pVar->stringIn, 0, 256); status = pasynOctetSyncIO->writeRead((asynUser *)pVar->pasynUser, buffer, strlen(buffer), pVar->stringIn, 256, 30.0, &nwrite, &nread, &eomReason); return(status); } static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos) { char *p, *tok_save; int j; int dir; writeRead(ssId, pVar, "TP"); tok_save = 0; p = epicsStrtok_r(pVar->stringIn, ",", &tok_save); for (j=0; (j<pVar->numAxes && p!=0); j++) { if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1; pos[j] = atof(p+3)*dir + pVar->epicsMotorOff[j]; p = epicsStrtok_r(0, ",", &tok_save); } return(0); } static int getMotorMoving(SS_ID ssId, struct UserVar *pVar) { char *p, *tok_save; int j; int result=0, mask=0x01; writeRead(ssId, pVar, "MS"); tok_save = 0; p = epicsStrtok_r(pVar->stringIn, ",", &tok_save); for (j=0; (j<pVar->numAxes && p!=0); j++) { if (*(p+3) & 0x01) result |= mask; mask = mask << 1; p = epicsStrtok_r(0, ",", &tok_save); } return(result); } static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar) { int j; int result=0, mask=0x01; for (j=0; j<pVar->numAxes; j++) { seq_pvGet(ssId, pVar->epicsMotorDoneIndex[j], 0); if (pVar->epicsMotorDone[j] == 0) result |= mask; mask = mask << 1; } return(result); } static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar) { int j; while(getEpicsMotorMoving(ssId, pVar)) { for (j=0; j<pVar->numAxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } epicsThreadSleep(0.1); } for (j=0; j<pVar->numAxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } return(0); }"#) => {};
+    (r#"static int axesInUse(struct UserVar *pVar) { return pVar->numAxes < pVar->initAxes ? pVar->numAxes : pVar->initAxes; } static int writeOnly(SS_ID ssId, struct UserVar *pVar, char *command) { asynStatus status; size_t nwrite; char buffer[256]; strncpy(buffer, command, 256 -3); strcat(buffer, "\r"); status = pasynOctetSyncIO->write((asynUser *)pVar->pasynUser, buffer, strlen(buffer), 1.0, &nwrite); return(status); } static int writeRead(SS_ID ssId, struct UserVar *pVar, char *command) { asynStatus status; size_t nwrite, nread; int eomReason; char buffer[256]; strncpy(buffer, command, 256 -3); strcat(buffer, "\r"); memset(pVar->stringIn, 0, 256); status = pasynOctetSyncIO->writeRead((asynUser *)pVar->pasynUser, buffer, strlen(buffer), pVar->stringIn, 256, 30.0, &nwrite, &nread, &eomReason); return(status); } static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos) { char *p, *tok_save; int j; int dir; int naxes = axesInUse(pVar); writeRead(ssId, pVar, "TP"); tok_save = 0; p = epicsStrtok_r(pVar->stringIn, ",", &tok_save); for (j=0; (j<naxes && p!=0); j++) { if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1; pos[j] = atof(p+3)*dir + pVar->epicsMotorOff[j]; p = epicsStrtok_r(0, ",", &tok_save); } return(0); } static int getMotorMoving(SS_ID ssId, struct UserVar *pVar) { char *p, *tok_save; int j; int result=0, mask=0x01; int naxes = axesInUse(pVar); writeRead(ssId, pVar, "MS"); tok_save = 0; p = epicsStrtok_r(pVar->stringIn, ",", &tok_save); for (j=0; (j<naxes && p!=0); j++) { if (*(p+3) & 0x01) result |= mask; mask = mask << 1; p = epicsStrtok_r(0, ",", &tok_save); } return(result); } static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar) { int j; int result=0, mask=0x01; int naxes = axesInUse(pVar); for (j=0; j<naxes; j++) { seq_pvGet(ssId, pVar->epicsMotorDoneIndex[j], 0); if (pVar->epicsMotorDone[j] == 0) result |= mask; mask = mask << 1; } return(result); } static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar) { int j; int naxes = axesInUse(pVar); while(getEpicsMotorMoving(ssId, pVar)) { for (j=0; j<naxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } epicsThreadSleep(0.1); } for (j=0; j<naxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } return(0); }"#) => {};
     ($env:ident, r#"pVar->status = pasynOctetSyncIO->connect(pVar->asynPort, 0,"#, r#"(asynUser **)&pVar->pasynUser,"#, r#"NULL);"#) => {
         $env.var().status.set(connect($env.var().asynPort.get()))
     };
@@ -280,6 +286,7 @@ mod tests {
         v.asynPort.set(CharPtr::from(name));
         assert_eq!(connect(v.asynPort.get()), 0);
         v.numAxes.set(1);
+        v.initAxes.set(1);
         (v, rig)
     }
 
@@ -351,6 +358,7 @@ mod tests {
     fn motor_positions_are_user_units() {
         let (v, rig) = vars("mm4005_tp", |_| "1TP2.5,2TP-3".into());
         v.numAxes.set(3);
+        v.initAxes.set(3);
         v.epicsMotorDir[1].set(1.0);
         v.epicsMotorOff[0].set(10.0);
         v.motorCurrent[2].set(7.0);
@@ -365,8 +373,25 @@ mod tests {
     fn moving_is_the_low_bit_of_each_status() {
         let (v, rig) = vars("mm4005_ms", |_| "1MSA,2MS@,3MSC".into());
         v.numAxes.set(3);
+        v.initAxes.set(3);
         assert_eq!(get_motor_moving(&v), 0b101);
         assert_eq!(rig.sent(), ["MS\r"]);
+    }
+
+    /// axesInUse: each function runs over the lesser of numAxes and
+    /// initAxes, and none below 0.
+    #[test]
+    fn functions_run_over_the_axes_in_use() {
+        for (name, num, init, want) in [
+            ("mm4005_in_use_num", 2, 3, 0b01),
+            ("mm4005_in_use_init", 3, 2, 0b01),
+            ("mm4005_in_use_none", -1, 3, 0),
+        ] {
+            let (v, _rig) = vars(name, |_| "1MSA,2MS@,3MSC".into());
+            v.numAxes.set(num);
+            v.initAxes.set(init);
+            assert_eq!(get_motor_moving(&v), want, "{name}");
+        }
     }
 
     /// `startTime` is the `unsigned long` of a signed `time_t`.
@@ -397,9 +422,9 @@ mod tests {
 
         const DB: &str = include_str!("../../../../../iocs/motor/mm4000-ioc/db/trajectoryScan.db");
 
-        /// m1 on a simulated axis at dial 0, user offset `$(OFF)`.
-        const MOTOR: &str = r#"record(motor, "T:m1") { field(DTYP, "asynMotor")
-            field(OUT, "@asyn($(PORT)m1,0)") field(MRES, "0.001") field(VELO, "1")
+        /// `$(M)` on a simulated axis at dial 0, user offset `$(OFF)`.
+        const MOTOR: &str = r#"record(motor, "T:$(M)") { field(DTYP, "asynMotor")
+            field(OUT, "@asyn($(PORT)$(M),0)") field(MRES, "0.001") field(VELO, "1")
             field(VMAX, "1") field(ACCL, "0.2") field(DHLM, "100") field(DLLM, "-100")
             field(OFF, "$(OFF)") }"#;
 
@@ -455,7 +480,7 @@ mod tests {
                 }
                 "MS" => "1MS@".into(),
                 "NQ" => format!("NQ{}", m.traced),
-                "1GC?" => "1GC0.25".into(),
+                _ if cmd.ends_with("GC?") => format!("{}0.25", &cmd[..cmd.len() - 1]),
                 _ => match cmd.split_once("RC") {
                     // 1RCn: element n of RC1, RC3, RC5, the value of the others
                     Some((axis, n)) => {
@@ -493,11 +518,11 @@ mod tests {
             refused
         }
 
-        /// `port`'s axis m1 of one simulated motor.
-        fn sim_axis(port: &str) {
+        /// `port`'s axis `m` of one simulated motor.
+        fn sim_axis(port: &str, m: &str) {
             let motor: Arc<Mutex<dyn AsynMotor>> =
                 Arc::new(Mutex::new(SimMotor::new().with_limits(-1e9, 1e9)));
-            let name = format!("{port}m1");
+            let name = format!("{port}{m}");
             let AxisSetup {
                 axis, poll_loop, ..
             } = MotorBuilder::new(motor)
@@ -603,9 +628,9 @@ mod tests {
             }
         }
 
-        /// trajectoryScan.db on NumAxes 1, T:m1 on a simulated axis, and the
-        /// program on a fake MM4005 port named `port`, once init has read
-        /// the axis's MDVS and posted it.
+        /// trajectoryScan.db on NumAxes 1, T:m1 and T:m2 on simulated axes,
+        /// and the program on a fake MM4005 port named `port`, once init has
+        /// read M1's MDVS and posted it.
         async fn boot(port: &str, set: &[(&str, &str)]) -> Program {
             let mm = Arc::new(Mutex::new(Mm4005 {
                 moving: 0,
@@ -626,7 +651,6 @@ mod tests {
                 move |cmd| reply(&shared, cmd),
                 move |cmd| written(&writes, cmd),
             );
-            sim_axis(port);
             let mut macros: HashMap<String, String> = [
                 ("P", "T:"),
                 ("R", "traj1:"),
@@ -640,7 +664,7 @@ mod tests {
             .into();
             macros.extend(set.iter().map(|&(k, v)| (k.to_string(), v.to_string())));
             let (motor, factory) = epics_rs::motor::motor_record_factory();
-            let (db, _) = IocBuilder::new()
+            let mut ioc = IocBuilder::new()
                 .register_record_type(motor, factory)
                 .register_dynamic_device_support(
                     &epics_rs::motor::devices::devices(),
@@ -648,17 +672,18 @@ mod tests {
                 )
                 .register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()))
                 .db_string(DB, &macros)
-                .unwrap()
-                .db_string(MOTOR, &macros)
-                .unwrap()
-                .build_served()
-                .await
                 .unwrap();
+            for m in ["m1", "m2"] {
+                sim_axis(port, m);
+                macros.insert("M".to_string(), m.to_string());
+                ioc = ioc.db_string(MOTOR, &macros).unwrap();
+            }
+            let (db, _) = ioc.build_served().await.unwrap();
             // seq holds each state set in its first state until PINI is done.
             let scan = ScanOwner::start(db.clone());
             let tid = seq(
                 &MM4005_trajectoryScan,
-                &format!("P=T:,R=traj1:,M1=m1,PORT={port}"),
+                &format!("P=T:,R=traj1:,M1=m1,M2=m2,PORT={port}"),
                 0,
                 &db,
             )
@@ -700,9 +725,8 @@ mod tests {
             assert_eq!(string(&p.db, "T:traj1:BuildMessage"), " ");
         }
 
-        /// ss trajectoryScan state init reads NumAxes once, so a put past
-        /// MAX_AXES after it leaves the build's per-axis loops on its one
-        /// axis.
+        /// ss trajectoryScan state build: a NumAxes put past the axes init set
+        /// up, and past MAX_AXES, builds on those.
         #[epics_rs::base::epics_test]
         async fn a_num_axes_put_after_init_leaves_the_build_on_its_axes() {
             let p = boot("mm4005NumAxesPut", &[]).await;
@@ -714,6 +738,65 @@ mod tests {
             let axes: Vec<_> = sent.iter().filter(|c| c.contains("DC")).collect();
             assert_eq!(axes, ["1DC1"]);
             assert_eq!(sent.iter().filter(|c| c.contains("RC")).count(), 6);
+        }
+
+        /// ss trajectoryScan states build and execute: NumAxes lowered after
+        /// init builds and executes that many axes, as upstream's monitored
+        /// numAxes does.
+        #[epics_rs::base::epics_test]
+        async fn num_axes_lowered_after_init_runs_that_many() {
+            let p = boot("mm4005NumAxesLow", &[("NAXES", "2")]).await;
+            expect(&p.db, &[("T:traj1:M2MDVS", 0.25)]).await;
+            put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(1)).await;
+            put(&p.db, "T:traj1:M2Move", EpicsValue::Enum(1)).await;
+            put(
+                &p.db,
+                "T:traj1:M2Traj",
+                EpicsValue::DoubleArray(vec![1.0; 10].into()),
+            )
+            .await;
+            put(&p.db, "T:traj1:NumAxes", EpicsValue::Long(1)).await;
+            p.sent();
+            p.build().await;
+            expect(&p.db, &[("T:traj1:BuildStatus", 1.0)]).await;
+            let sent = p.sent();
+            let axes: Vec<_> = sent.iter().filter(|c| c.contains("DC")).collect();
+            assert_eq!(axes, ["1DC1"]);
+            assert!(
+                !sent
+                    .iter()
+                    .any(|c| c.starts_with("2DX") || c.starts_with("2RC")),
+                "{sent:?}"
+            );
+            put(&p.db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Execute", 0.0), ("T:traj1:ExecStatus", 1.0)],
+            )
+            .await;
+            assert_eq!(value(&p.db, "T:m2"), 0.0);
+            assert_eq!(value(&p.db, "T:traj1:M2Current"), 0.0);
+        }
+
+        /// ss trajectoryScan state init sets up at most MAX_AXES axes, from a
+        /// NumAxes above it.
+        #[epics_rs::base::epics_test]
+        async fn init_sets_up_at_most_max_axes() {
+            let p = boot("mm4005NumAxesMax", &[("NAXES", "9")]).await;
+            expect(&p.db, &[("T:traj1:M8MDVS", 0.25)]).await;
+            p.build().await;
+            expect(&p.db, &[("T:traj1:BuildStatus", 1.0)]).await;
+            let sent = p.sent();
+            let of = |what: &str| -> Vec<String> {
+                sent.iter().filter(|c| c.contains(what)).cloned().collect()
+            };
+            assert_eq!(
+                of("GC?"),
+                (1..=8).map(|j| format!("{j}GC?")).collect::<Vec<_>>()
+            );
+            let mut want = vec!["1DC1".to_string()];
+            want.extend((2..=8).map(|j| format!("{j}DC0")));
+            assert_eq!(of("DC"), want);
         }
 
         /// The element times `DT` sent since the last [`Program::sent`].
