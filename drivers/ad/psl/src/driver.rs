@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::EnumEntry;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
@@ -425,7 +425,8 @@ impl PslDetector {
 
     /// Report whether the directory the server saves into exists here as well
     /// (C `asynNDArrayDriver::checkPath`, asynNDArrayDriver.cpp:98-111): an
-    /// empty path is left alone, any other is stored with its separator.
+    /// empty path is left alone, any other is stored with its separator, and
+    /// one that does not exist is an error.
     fn check_path(&mut self) -> AsynResult<()> {
         let p = self.ad.params.base;
         let mut path = String::from_utf8_lossy(self.ad.port_base.get_string_param(p.file_path, 0)?)
@@ -438,7 +439,14 @@ impl PslDetector {
         self.ad
             .port_base
             .set_int32_param(p.file_path_exists, 0, exists as i32)?;
-        Ok(())
+        if exists {
+            Ok(())
+        } else {
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "checkPath: the directory does not exist".into(),
+            })
+        }
     }
 
     fn get_i32(&self, reason: usize) -> i32 {
@@ -632,9 +640,11 @@ impl PortDriver for PslDetector {
 
         let p = self.ad.params;
         let status = if reason == p.base.file_path {
-            let status = self.send(&protocol::set_record_path(&text));
-            let _ = self.check_path();
-            status
+            let sent = self.send(&protocol::set_record_path(&text));
+            // C drops checkPath's status (PSL.cpp:886), so a FilePath that
+            // does not exist is written without error; not copied.
+            let checked = self.check_path();
+            sent.and(checked)
         } else if reason == p.base.file_name {
             self.send(&protocol::set_record_name(&text))
         } else if reason == self.params.tiff_comment {
@@ -1053,6 +1063,40 @@ mod tests {
         assert_eq!(det.get_i32(p.file_path_exists), 1);
         let _ = det.write_octet(&mut AsynUser::new(p.file_path), b"");
         assert_eq!(det.get_i32(p.file_path_exists), 1);
+    }
+
+    /// With the server answering, a FilePath write fails only when checkPath
+    /// finds the directory missing, which C drops (PSL.cpp:886).
+    #[test]
+    fn a_missing_file_path_fails_the_write() {
+        let mut det = detector("PSL_MISSING_PATH");
+        det.server = server_replying("PSL_MISSING_PATH_SRV", "OK");
+        let reason = det.ad.params.base.file_path;
+        let exists = det.ad.params.base.file_path_exists;
+
+        let dir = std::env::temp_dir().display().to_string();
+        assert!(
+            det.write_octet(&mut AsynUser::new(reason), dir.as_bytes())
+                .is_ok()
+        );
+        assert_eq!(det.get_i32(exists), 1);
+
+        let missing = std::env::temp_dir()
+            .join(format!("psl_missing_{}", std::process::id()))
+            .join("sub")
+            .display()
+            .to_string();
+        let Err(AsynError::Status { status, message }) =
+            det.write_octet(&mut AsynUser::new(reason), missing.as_bytes())
+        else {
+            panic!("a missing FilePath must fail the write");
+        };
+        assert_eq!(status, AsynStatus::Error);
+        assert_eq!(
+            message,
+            format!("PSL:writeOctet: status=3, function={reason}, value={missing}")
+        );
+        assert_eq!(det.get_i32(exists), 0);
     }
 
     /// A PSLViewer that answers every command with `reply`, on a read that
