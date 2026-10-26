@@ -109,6 +109,10 @@ ss trajectoryScan {
     /* Initialize things when first starting */
     state init {
         when() {
+            /* Read numAxes once here, as XPS_trajectoryScan.st does: upstream's
+             * monitored value ran every per-axis loop past the axes set up here
+             * after a later NumAxes put. */
+            pvGet(numAxes);
             /* Force numAxes to be <= MAX_AXES */
             if (numAxes > MAX_AXES) numAxes = MAX_AXES;
             for (i=0; i<numAxes; i++) {
