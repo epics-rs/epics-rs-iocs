@@ -1416,6 +1416,59 @@ mod tests {
             .await;
         }
 
+        /// A build of `n` elements in `mode` moving no axis, on its own XPS:
+        /// it reads no element, so it builds Nelements as put, the
+        /// acceleration elements alone when that is none.
+        async fn build_moving_no_axis(port: &str, mode: u16, n: i32) -> Program {
+            let p = boot(port, &[]).await;
+            put(&p.db, "T:traj1:M1Move", EpicsValue::Enum(0)).await;
+            put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(mode)).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(n)).await;
+            put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[
+                    ("T:traj1:Build", 0.0),
+                    ("T:traj1:BuildStatus", 1.0),
+                    ("T:traj1:Nelements", n.into()),
+                ],
+            )
+            .await;
+            assert_eq!(
+                std::fs::read_to_string(&p.file).unwrap(),
+                "0.000000, 0.000000, 0.000000\n".repeat(2)
+            );
+            p
+        }
+
+        /// ss xpsTrajectoryScan state build: an absolute trajectory of one
+        /// element that moves no axis builds one.
+        #[epics_rs::base::epics_test]
+        async fn one_absolute_element_moving_no_axis_builds_one() {
+            // MOVE_MODE_ABSOLUTE
+            build_moving_no_axis("xpsNoMoveAbs", 1, 1).await;
+        }
+
+        /// ss xpsTrajectoryScan states build and execute: a relative
+        /// trajectory of no element that moves no axis builds none, and
+        /// executes pulsing over none.
+        #[epics_rs::base::epics_test]
+        async fn no_relative_element_moving_no_axis_builds_and_executes_none() {
+            // MOVE_MODE_RELATIVE
+            let p = build_moving_no_axis("xpsNoMoveRel", 0, 0).await;
+            execute_to_the_end(&p).await;
+            expect(
+                &p.db,
+                &[
+                    ("T:traj1:Execute", 0.0),
+                    ("T:traj1:ExecStatus", 1.0),
+                    ("T:traj1:StartPulses", 0.0),
+                    ("T:traj1:EndPulses", 0.0),
+                ],
+            )
+            .await;
+        }
+
         /// ss xpsTrajectoryScan state execute: pulses stay within the
         /// trajectory built, whatever Nelements was put after it.
         #[epics_rs::base::epics_test]

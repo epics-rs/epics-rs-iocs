@@ -264,17 +264,25 @@ ss xpsTrajectoryScan {
             /* Upstream built from nelements and moveMode as put: nelements unbounded by
              * the arrays, and both monitored, so buildAndVerify and execute re-read them
              * after a later put.  buildElements and buildMode are the one bounded read;
-             * a relative trajectory needs 1 element, any other 2. */
+             * buildAndVerify reads the last element of each axis moved, and the one
+             * before it unless relative, so only a trajectory that moves one needs 1
+             * or 2.  One that moves none reads nothing, and Nelements below 1 builds
+             * no elements, as upstream. */
             buildMode = moveMode;
             buildElements = nelements;
             if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
-            if (buildMode == MOVE_MODE_RELATIVE) {
-                if (buildElements < 1) buildElements = 1;
-            } else if (buildElements < 2) buildElements = 2;
+            for (j=0; j<numAxes; j++) {
+                if (moveAxis[j]) {
+                    if (buildMode == MOVE_MODE_RELATIVE) {
+                        if (buildElements < 1) buildElements = 1;
+                    } else if (buildElements < 2) buildElements = 2;
+                }
+            }
             if (buildElements != nelements) {
                 nelements = buildElements;
                 pvPut(nelements);
             }
+            if (buildElements < 0) buildElements = 0;
             if (buildMode == MOVE_MODE_RELATIVE)
                 npoints = buildElements;
             else
@@ -365,8 +373,12 @@ ss xpsTrajectoryScan {
                  * Compute the time between pulses as the total time over which pulses 
                  * should be output divided by the number of pulses to be output. */
                 pulseTime=0;
-                for (i=startPulses; i<=endPulses; i++) {
-                    pulseTime += timeTrajectory[i-1];
+                /* Upstream summed timeTrajectory[-1] here for an empty trajectory, its
+                 * window clamped to 0..0. */
+                if (buildElements > 0) {
+                    for (i=startPulses; i<=endPulses; i++) {
+                        pulseTime += timeTrajectory[i-1];
+                    }
                 }
                 pulsePeriod = pulseTime/npulses;
             } else {
