@@ -55,9 +55,14 @@ fn difftime(t1: i64, t0: u64) -> f64 {
     t1 as f64 - t0 as i64 as f64
 }
 
-/// `numAxes` as a loop bound.
-fn axes(v: &seqg::seqg_vars) -> std::ops::Range<usize> {
-    0..usize::try_from(v.numAxes.get()).unwrap_or(0)
+/// C `axesInUse`.
+fn axes_in_use(v: &seqg::seqg_vars) -> i32 {
+    v.numAxes.get().min(v.initAxes.get())
+}
+
+/// `n` axes as a loop bound.
+fn axes(n: i32) -> std::ops::Range<usize> {
+    0..usize::try_from(n).unwrap_or(0)
 }
 
 /// `axisName[j]`, the `GROUP.Pn` init made.
@@ -107,7 +112,9 @@ fn positioner_user_travel_limits_get(
 /// C `getMotorPositions(ssId, pVar, pVar->motorCurrent)`: the group's
 /// positions, in user units.
 fn get_motor_positions(v: &seqg::seqg_vars) -> i32 {
-    let mut pos: Vec<f64> = axes(v).map(|j| v.motorCurrent[j].get()).collect();
+    let mut pos: Vec<f64> = axes(axes_in_use(v))
+        .map(|j| v.motorCurrent[j].get())
+        .collect();
     let status = c_int(
         socket(v.positionSocket.get()).group_positions_current_get(&text(&v.groupName), &mut pos),
     );
@@ -146,10 +153,10 @@ fn get_group_status(v: &seqg::seqg_vars) -> i32 {
     group_status(v, "Error performing GroupStatusGet, status=%d\n")
 }
 
-/// `seq_pvPut` of each `motorCurrent`.
-fn put_motor_current(env: &Env) {
+/// `seq_pvPut` of the first `naxes` `motorCurrent`.
+fn put_motor_current(env: &Env, naxes: i32) {
     let v = env.var();
-    for j in axes(v) {
+    for j in axes(naxes) {
         env.pv_put(
             ChId(v.motorCurrentIndex.at(j).get() as u32),
             CompType::Default,
@@ -161,7 +168,7 @@ fn put_motor_current(env: &Env) {
 fn get_epics_motor_moving(env: &Env) -> i32 {
     let v = env.var();
     let mut result = 0;
-    for j in axes(v) {
+    for j in axes(axes_in_use(v)) {
         env.pv_get(
             ChId(v.epicsMotorDoneIndex.at(j).get() as u32),
             CompType::Default,
@@ -176,21 +183,23 @@ fn get_epics_motor_moving(env: &Env) -> i32 {
 /// C `waitMotors`: post the group's positions until it stops.
 fn wait_motors(env: &Env) {
     let v = env.var();
+    let naxes = axes_in_use(v);
     while get_motor_moving(v) != 0 {
         get_motor_positions(v);
-        put_motor_current(env);
+        put_motor_current(env, naxes);
         epicsThreadSleep(POLL_INTERVAL);
     }
     get_motor_positions(v);
-    put_motor_current(env);
+    put_motor_current(env, naxes);
 }
 
 /// C `waitEpicsMotors`: post each motor record's position as
 /// `motorCurrent` until none moves.
 fn wait_epics_motors(env: &Env) {
     let v = env.var();
+    let naxes = axes_in_use(v);
     let post = || {
-        for j in axes(v) {
+        for j in axes(naxes) {
             v.motorCurrent[j].set(v.epicsMotorPos[j].get());
             env.pv_put(
                 ChId(v.motorCurrentIndex.at(j).get() as u32),
@@ -218,6 +227,7 @@ fn get_socket(env: &Env, timeout: f64) -> i32 {
 /// C `trajectoryExecute`: gathering and the pulse event set up, then the
 /// trajectory run, which returns when it ends, and both taken down.
 fn trajectory_execute(v: &seqg::seqg_vars) {
+    let naxes = axes_in_use(v);
     let debug = v.debugLevel.get() > 0;
     let poll_socket = v.pollSocket.get();
     let poll = socket(poll_socket);
@@ -239,11 +249,11 @@ fn trajectory_execute(v: &seqg::seqg_vars) {
     }
 
     let mut buffer = String::new();
-    for j in axes(v) {
+    for j in axes(naxes) {
         let name = axis_name(v, j);
         buffer += &format!("{name}.SetpointPosition;{name}.CurrentPosition;");
     }
-    let n = v.numAxes.get() * NUM_GATHERING_ITEMS;
+    let n = naxes * NUM_GATHERING_ITEMS;
     if debug {
         print_message(
             "XPS_trajectoryScan: trajectoryExecute: calling GatheringConfigurationSet(%d, %d, %s)\n",
@@ -400,6 +410,7 @@ fn trajectory_execute(v: &seqg::seqg_vars) {
 /// before it and a deceleration one after it at each axis's maximum
 /// acceleration, written, sent to the XPS and verified there.
 fn build_and_verify(v: &seqg::seqg_vars) {
+    let naxes = v.buildAxes.get();
     let debug = v.debugLevel.get() > 0;
     let poll_socket = v.pollSocket.get();
     let poll = socket(poll_socket);
@@ -409,13 +420,13 @@ fn build_and_verify(v: &seqg::seqg_vars) {
     let relative = v.buildMode.get() == MOVE_MODE_RELATIVE;
     let nelements = v.buildElements.get();
     let time_trajectory = v.timeTrajectory.get();
-    let trajectory: Vec<[f64; 2000]> = axes(v).map(|j| v.motorTrajectory[j].get()).collect();
+    let trajectory: Vec<[f64; 2000]> = axes(naxes).map(|j| v.motorTrajectory[j].get()).collect();
     let last = (nelements - 1) as usize;
 
     let (mut pre_time_max, mut post_time_max) = (0.0, 0.0);
     let mut pre_velocity = [0.0; MAX_AXES];
     let mut post_velocity = [0.0; MAX_AXES];
-    for j in axes(v) {
+    for j in axes(naxes) {
         if v.buildMoveAxis.at(j).get() == 0 {
             continue;
         }
@@ -451,7 +462,7 @@ fn build_and_verify(v: &seqg::seqg_vars) {
     }
 
     // In user units: the EPICS moves before and after the scan use them.
-    for j in axes(v) {
+    for j in axes(naxes) {
         v.preDistance
             .at(j)
             .set(0.5 * pre_velocity[j] * pre_time_max);
@@ -468,9 +479,9 @@ fn build_and_verify(v: &seqg::seqg_vars) {
         );
         return;
     };
-    let dir: Vec<f64> = axes(v).map(|j| dir(v, j)).collect();
+    let dir: Vec<f64> = axes(naxes).map(|j| dir(v, j)).collect();
     let mut out = format!("{}", CFloat(pre_time_max));
-    for j in axes(v) {
+    for j in axes(naxes) {
         out += &format!(
             ", {}, {}",
             CFloat(v.preDistance.at(j).get() * dir[j]),
@@ -488,7 +499,7 @@ fn build_and_verify(v: &seqg::seqg_vars) {
         } else {
             t0
         };
-        for j in axes(v) {
+        for j in axes(naxes) {
             let traj = &trajectory[j];
             let (mut d0, d1);
             if relative {
@@ -515,7 +526,7 @@ fn build_and_verify(v: &seqg::seqg_vars) {
                 out += &format!("{}", CFloat(time_trajectory[iu]));
             }
             out += &format!(", {}, {}", CFloat(d0), CFloat(traj_vel));
-            if j + 1 == axes(v).end {
+            if j + 1 == axes(naxes).end {
                 out += "\n";
             }
         }
@@ -523,7 +534,7 @@ fn build_and_verify(v: &seqg::seqg_vars) {
 
     // Its final velocity must be 0.
     out += &format!("{}", CFloat(post_time_max));
-    for j in axes(v) {
+    for j in axes(naxes) {
         out += &format!(
             ", {}, {}",
             CFloat(v.postDistance.at(j).get() * dir[j]),
@@ -592,7 +603,7 @@ fn build_and_verify(v: &seqg::seqg_vars) {
         );
     }
 
-    for j in axes(v) {
+    for j in axes(naxes) {
         let name = axis_name(v, j);
         match poll.multiple_axes_pvt_verification_result_get(&name) {
             Ok((_, min_pos, max_pos, max_velocity, max_acceleration)) => {
@@ -630,6 +641,7 @@ fn current_element(v: &seqg::seqg_vars) -> i32 {
 /// C `readGathering`: the setpoint and actual position of each axis at
 /// each pulse, as `motorReadbacks` in user units and `motorError`.
 fn read_gathering(v: &seqg::seqg_vars) {
+    let naxes = axes_in_use(v);
     let debug = v.debugLevel.get() > 0;
     let poll = socket(v.pollSocket.get());
     if debug {
@@ -690,7 +702,7 @@ fn read_gathering(v: &seqg::seqg_vars) {
                 None => (bptr, &[][..]),
             };
             let mut field = line;
-            for j in axes(v) {
+            for j in axes(naxes) {
                 let (setpoint, actual, num_chars) =
                     (SeqVar::new(0.0), SeqVar::new(0.0), SeqVar::new(0));
                 let nitems = sscanf(field, "%lf;%lf%n", &[&setpoint, &actual, &num_chars]);
@@ -755,7 +767,7 @@ macro_rules! seqg_escaped {
     (r#"static void readGathering(SS_ID ssId, struct UserVar *pVar);"#) => {};
     (r#"static int trajectoryAbort(SS_ID ssId, struct UserVar *pVar);"#) => {};
     (r#"static void printMessage(const char *pformat, ...);"#) => {};
-    (r#"static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos) { int status; int j; int dir; status = GroupPositionCurrentGet(pVar->positionSocket, pVar->groupName,pVar->numAxes,pos); if (status != 0) { printMessage("Error performing GroupPositionCurrentGet%i\n", status); return(status); } for (j=0; j<pVar->numAxes; j++) { if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1; pos[j] = pos[j]*dir + pVar->epicsMotorOff[j]; } return(status); } static int getMotorMoving(SS_ID ssId, struct UserVar *pVar) { int status; int moving=0; int groupStatus=0; status = GroupStatusGet(pVar->pollSocket,pVar->groupName,&groupStatus); if (status != 0) printMessage("Error performing GroupStatusGet %i\n",status); if (groupStatus > 42) moving = 1; return(moving); } static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar) { int j; int result=0, mask=0x01; for (j=0; j<pVar->numAxes; j++) { seq_pvGet(ssId, pVar->epicsMotorDoneIndex[j], 0); if (pVar->epicsMotorDone[j] == 0) result |= mask; mask = mask << 1; } return(result); } static int waitMotors(SS_ID ssId, struct UserVar *pVar) { int j; while(getMotorMoving(ssId, pVar)) { getMotorPositions(ssId, pVar, pVar->motorCurrent); for (j=0; j<pVar->numAxes; j++) { seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } epicsThreadSleep(0.1); } getMotorPositions(ssId, pVar, pVar->motorCurrent); for (j=0; j<pVar->numAxes; j++) { seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } return(0); } static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar) { int j; while(getEpicsMotorMoving(ssId, pVar)) { for (j=0; j<pVar->numAxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } epicsThreadSleep(0.1); } for (j=0; j<pVar->numAxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } return(0); } static int getSocket(SS_ID ssId, struct UserVar *pVar, double timeout) { int sock = 0; sock = TCP_ConnectToServer(pVar->xpsAddress, pVar->xpsPort, timeout); if (sock < 0) printMessage("Error TCP_ConnectToServer, status=%d\n",sock); return (sock); } static void trajectoryExecute(SS_ID ssId, struct UserVar *pVar) { int status; int j; char buffer[60 * 2 * 8]; int eventId; if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " entry\n"); } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling GatheringReset(%d)\n", pVar->pollSocket); } status = GatheringReset(pVar->pollSocket); if (status != 0) { printMessage("Error performing GatheringReset, status=%d\n",status); return; } strcpy(buffer, ""); for (j=0; j<pVar->numAxes; j++) { strcat (buffer, pVar->axisName[j]); strcat (buffer, ".SetpointPosition;"); strcat (buffer, pVar->axisName[j]); strcat (buffer, ".CurrentPosition;"); } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling GatheringConfigurationSet(%d, %d, %s)\n", pVar->pollSocket, pVar->numAxes*2, buffer); } status = GatheringConfigurationSet(pVar->pollSocket, pVar->numAxes*2, buffer); if (status != 0) printMessage("Error performing GatheringConfigurationSet, status=%d, buffer=%p\n", status, buffer); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling MultipleAxesPVTPulseOutputSet(%d, %s, %d, %d, %f)\n", pVar->pollSocket, pVar->groupName, pVar->startPulses+1, pVar->endPulses+1, pVar->pulsePeriod); } status = MultipleAxesPVTPulseOutputSet(pVar->pollSocket, pVar->groupName, pVar->startPulses+1, pVar->endPulses+1, pVar->pulsePeriod); sprintf(buffer, "Always;%s.PVT.TrajectoryPulse", pVar->groupName); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling EventExtendedConfigurationTriggerSet(%d, %d, %s, %s, %s, %s, %s)\n", pVar->pollSocket, 2, buffer, "", "", "", ""); } status = EventExtendedConfigurationTriggerSet(pVar->pollSocket, 2, buffer, "", "", "", ""); if (status != 0) { printMessage("Error performing EventExtendedConfigurationTriggerSet, status=%d, buffer=%s\n", status, buffer); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling EventExtendedConfigurationActionSet(%d, %d, %s, %s, %s, %s, %s)\n", pVar->pollSocket, 1, "GatheringOneData", "", "", "", ""); } status = EventExtendedConfigurationActionSet(pVar->pollSocket, 1, "GatheringOneData", "", "", "", ""); if (status != 0) { printMessage("Error performing EventExtendedConfigurationActionSet, status=%d\n", status); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling EventExtendedStart(%d, %p)\n", pVar->pollSocket, &eventId); } status= EventExtendedStart(pVar->pollSocket, &eventId); if (status != 0) { printMessage("Error performing EventExtendedStart, status=%d\n",status); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling MultipleAxesPVTExecution(%d, %s, %s, %d)\n", pVar->driveSocket, pVar->groupName, pVar->trajectoryFile, 1); } status = MultipleAxesPVTExecution(pVar->driveSocket, pVar->groupName, pVar->trajectoryFile, 1); if ((status != 0) && (status != -27)) printMessage("Error performing MultipleAxesPVTExecution, status=%d\n", status); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling EventExtendedRemove(%d, %d)\n", pVar->pollSocket, eventId); } status = EventExtendedRemove(pVar->pollSocket, eventId); if (status != 0) { printMessage("Error performing ExtendedEventRemove, status=%d\n",status); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling GatheringStop(%d)\n", pVar->pollSocket); } status = GatheringStop(pVar->pollSocket); if ((status != 0) && (status != -30)) printMessage("Error performing GatheringStop, status=%d\n", status); return; } static void buildAndVerify(SS_ID ssId, struct UserVar *pVar) { FILE *trajFile; int i, j, status; int npoints; double trajVel; double D0, D1, T0, T1; SOCKET ftpSocket; char fileName[100]; double distance; double maxVelocity[8], maxAcceleration[8]; double minJerkTime[8], maxJerkTime[8]; double preTimeMax, postTimeMax; double preVelocity[8], postVelocity[8]; double time; int dir[8]; if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: buildAndVerify:" " entry\n"); } preTimeMax = 0.; postTimeMax = 0.; for (j=0; j<pVar->numAxes; j++) { preVelocity[j] = 0.; postVelocity[j] = 0.; } for (j=0; j<pVar->numAxes; j++) { if (!pVar->buildMoveAxis[j]) continue; status = PositionerSGammaParametersGet(pVar->pollSocket, pVar->axisName[j], &maxVelocity[j], &maxAcceleration[j], &minJerkTime[j], &maxJerkTime[j]); if (status != 0) { printMessage("Error calling positionerSGammaParametersSet, status=%d\n", status); maxAcceleration[j] = 0.; } maxAcceleration[j] = 0.9 * maxAcceleration[j]; if (pVar->buildMode == 0) { distance = pVar->motorTrajectory[j][0]; } else { distance = pVar->motorTrajectory[j][1] - pVar->motorTrajectory[j][0]; } preVelocity[j] = distance/pVar->timeTrajectory[0]; time = fabs(preVelocity[j]) / maxAcceleration[j]; if (time > preTimeMax) preTimeMax = time; if (pVar->buildMode == 0) { distance = pVar->motorTrajectory[j][pVar->buildElements-1]; } else { distance = pVar->motorTrajectory[j][pVar->buildElements-1] - pVar->motorTrajectory[j][pVar->buildElements-2]; } postVelocity[j] = distance/pVar->timeTrajectory[pVar->buildElements-1]; time = fabs(postVelocity[j]) / maxAcceleration[j]; if (time > postTimeMax) postTimeMax = time; } for (j=0; j<pVar->numAxes; j++) { pVar->preDistance[j] = 0.5 * preVelocity[j] * preTimeMax; pVar->postDistance[j] = 0.5 * postVelocity[j] * postTimeMax; } trajFile = fopen (pVar->trajectoryFile, "w"); if (trajFile == NULL) { printMessage("Error calling fopen, file=%s\n", pVar->trajectoryFile); return; } for (j=0; j<pVar->numAxes; j++) { if (pVar->epicsMotorDir[j] == 0) dir[j]=1; else dir[j]=-1; } fprintf(trajFile,"%f", preTimeMax); for (j=0; j<pVar->numAxes; j++) fprintf(trajFile,", %f, %f", pVar->preDistance[j]*dir[j], preVelocity[j]*dir[j]); fprintf(trajFile,"\n"); if (pVar->buildMode == 0) npoints = pVar->buildElements; else npoints = pVar->buildElements-1; for (i=0; i<npoints; i++) { T0 = pVar->timeTrajectory[i]; if (i < npoints-1) T1 = pVar->timeTrajectory[i+1]; else T1 = T0; for (j=0; j<pVar->numAxes; j++) { if (pVar->buildMode == 0) { D0 = pVar->motorTrajectory[j][i] * dir[j]; if (i < npoints-1) D1 = pVar->motorTrajectory[j][i+1] * dir[j]; else D1 = D0; } else { D0 = pVar->motorTrajectory[j][i+1] *dir[j] - pVar->motorTrajectory[j][i] * dir[j]; if (i < npoints-1) D1 = pVar->motorTrajectory[j][i+2] * dir[j] - pVar->motorTrajectory[j][i+1] * dir[j]; else D1 = D0; } trajVel = ((D0 + D1) / (T0 + T1)); if (!(pVar->buildMoveAxis[j])) { D0 = 0.0; trajVel = 0.0; } if (j == 0) fprintf(trajFile,"%f", pVar->timeTrajectory[i]); fprintf(trajFile,", %f, %f",D0,trajVel); if (j == (pVar->numAxes-1)) fprintf(trajFile,"\n"); } } fprintf(trajFile,"%f", postTimeMax); for (j=0; j<pVar->numAxes; j++) fprintf(trajFile,", %f, %f", pVar->postDistance[j]*dir[j], 0.); fprintf(trajFile,"\n"); fclose (trajFile); status = ftpConnect(pVar->xpsAddress, pVar->userName, pVar->password, &ftpSocket); if (status != 0) { printMessage("Error calling ftpConnect, status=%d\n", status); return; } status = ftpChangeDir(ftpSocket, "/Admin/public/Trajectories"); if (status != 0) { printMessage("Error calling ftpChangeDir, status=%d\n", status); return; } status = ftpStoreFile(ftpSocket, pVar->trajectoryFile); if (status != 0) { printMessage("Error calling ftpStoreFile, status=%d\n", status); return; } status = ftpDisconnect(ftpSocket); if (status != 0) { printMessage("Error calling ftpDisconnect, status=%d\n", status); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: buildAndVerify:" " calling MultipleAxesPVTVerification(%d, %s, %s)\n", pVar->pollSocket, pVar->groupName, pVar->trajectoryFile); } status = MultipleAxesPVTVerification(pVar->pollSocket, pVar->groupName, pVar->trajectoryFile); pVar->buildStatus = 2; if (status == 0) { strcpy(pVar->buildMessage, " "); pVar->buildStatus = 1; } else if (status == -69) strcpy(pVar->buildMessage, "Acceleration Too High"); else if (status == -68) strcpy(pVar->buildMessage, "Velocity Too High"); else if (status == -70) strcpy(pVar->buildMessage, "Final Velocity Non Zero"); else if (status == -75) strcpy(pVar->buildMessage, "Negative or Null Delta Time"); else sprintf(pVar->buildMessage, "Unknown trajectory verify error=%d", status); if (status == 0){ pVar->buildStatus = 1; } if (1) { for (j=0; j<pVar->numAxes; j++) { status = MultipleAxesPVTVerificationResultGet(pVar->pollSocket, pVar->axisName[j], fileName, &pVar->motorMinPos[j], &pVar->motorMaxPos[j], &pVar->motorMVA[j], &pVar->motorMAA[j]); if (status != 0) { printMessage("Error performing MultipleAxesPVTVerificationResultGet for axis %s, status=%d\n", pVar->axisName[j], status); } } } else { for (j=0; j<pVar->numAxes; j++) { pVar->motorMVA[j] = 0; pVar->motorMAA[j] = 0; } } return; } static int currentElement(SS_ID ssId, struct UserVar *pVar) { int status; int number=0; char fileName[100]; status = MultipleAxesPVTParametersGet(pVar->pollSocket, pVar->groupName, fileName, &number); if (status != 0) printMessage("Error performing MultipleAxesPVTParametersGet, status=%d\n", status); return (number); } static int getGroupStatus(SS_ID ssId, struct UserVar *pVar) { int status; int groupStatus=0; status = GroupStatusGet(pVar->pollSocket,pVar->groupName,&groupStatus); if (status != 0) printMessage("Error performing GroupStatusGet, status=%d\n", status); return(groupStatus); } static void readGathering(SS_ID ssId, struct UserVar *pVar) { char *buffer, *bptr, *tptr; int currentSamples, maxSamples; double setpointPosition, actualPosition; int status; int dir; int i, j; int nitems; int numRead, numInBuffer, numChars; if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: readGathering:" " entry\n"); } status = GatheringCurrentNumberGet(pVar->pollSocket, &currentSamples, &maxSamples); if (status != 0) { printMessage("Error calling GatherCurrentNumberGet, status=%d\n", status); return; } if (currentSamples != pVar->npulses) { printMessage("readGathering: error, npulses=%d, currentSamples=%d\n", pVar->npulses, currentSamples); return; } if (currentSamples > 2000) currentSamples = 2000; buffer = (char *)calloc(65536, sizeof(char)); numInBuffer = 0; for (numRead=0; numRead<currentSamples;) { status = -1; numInBuffer = currentSamples - numRead; while (status && (numInBuffer > 0)) { status = GatheringDataMultipleLinesGet(pVar->pollSocket, numRead, numInBuffer, buffer); if (pVar->debugLevel > 0) { printMessage("readGathering: GatheringDataMultipleLinesGet, status=%d, numInBuffer=%d\n", status, numInBuffer); } if (status) numInBuffer /= 2; } if (numInBuffer == 0) { printMessage("Error reading gathering data, numInBuffer = 0\n"); goto done; } bptr = buffer; for (i=0; i<numInBuffer; i++) { tptr = strstr(bptr, "\n"); if (tptr) *tptr = 0; for (j=0; j<pVar->numAxes; j++) { nitems = sscanf(bptr, "%lf;%lf%n", &setpointPosition, &actualPosition, &numChars); bptr += numChars+1; if (nitems != 2) { printMessage("Error reading Gathering.dat file, nitems=%d, should be %d\n", nitems, 2); goto done; } pVar->motorError[j][numRead] = actualPosition - setpointPosition; if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1; pVar->motorReadbacks[j][numRead] = actualPosition * dir + pVar->epicsMotorOff[j]; } numRead++; pVar->nactual = numRead; bptr = tptr + 1; } } done: free(buffer); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: readGathering:" " exit\n"); } return; } static int trajectoryAbort(SS_ID ssId, struct UserVar *pVar) { int status; status = GroupMoveAbort(pVar->abortSocket,pVar->groupName); if (status != 0) printMessage("Error performing GroupMoveAbort, status=%d\n", status); return (0); } static void printMessage(const char *pformat, ...) { va_list pvar; FILE *fp = stdout; epicsTimeStamp now; char nowText[40]; epicsTimeGetCurrent(&now); nowText[0] = 0; epicsTimeToStrftime(nowText,sizeof(nowText), "%Y/%m/%d %H:%M:%S.%03f",&now); fprintf(fp,"%s ",nowText); va_start(pvar, pformat); vfprintf(fp,pformat,pvar); va_end(pvar); fflush(fp); }"#) => {};
+    (r#"static int axesInUse(struct UserVar *pVar) { return pVar->numAxes < pVar->initAxes ? pVar->numAxes : pVar->initAxes; } static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos) { int status; int j; int dir; int naxes = axesInUse(pVar); status = GroupPositionCurrentGet(pVar->positionSocket, pVar->groupName,naxes,pos); if (status != 0) { printMessage("Error performing GroupPositionCurrentGet%i\n", status); return(status); } for (j=0; j<naxes; j++) { if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1; pos[j] = pos[j]*dir + pVar->epicsMotorOff[j]; } return(status); } static int getMotorMoving(SS_ID ssId, struct UserVar *pVar) { int status; int moving=0; int groupStatus=0; status = GroupStatusGet(pVar->pollSocket,pVar->groupName,&groupStatus); if (status != 0) printMessage("Error performing GroupStatusGet %i\n",status); if (groupStatus > 42) moving = 1; return(moving); } static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar) { int j; int naxes = axesInUse(pVar); int result=0, mask=0x01; for (j=0; j<naxes; j++) { seq_pvGet(ssId, pVar->epicsMotorDoneIndex[j], 0); if (pVar->epicsMotorDone[j] == 0) result |= mask; mask = mask << 1; } return(result); } static int waitMotors(SS_ID ssId, struct UserVar *pVar) { int j; int naxes = axesInUse(pVar); while(getMotorMoving(ssId, pVar)) { getMotorPositions(ssId, pVar, pVar->motorCurrent); for (j=0; j<naxes; j++) { seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } epicsThreadSleep(0.1); } getMotorPositions(ssId, pVar, pVar->motorCurrent); for (j=0; j<naxes; j++) { seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } return(0); } static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar) { int j; int naxes = axesInUse(pVar); while(getEpicsMotorMoving(ssId, pVar)) { for (j=0; j<naxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } epicsThreadSleep(0.1); } for (j=0; j<naxes; j++) { pVar->motorCurrent[j] = pVar->epicsMotorPos[j]; seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0); } return(0); } static int getSocket(SS_ID ssId, struct UserVar *pVar, double timeout) { int sock = 0; sock = TCP_ConnectToServer(pVar->xpsAddress, pVar->xpsPort, timeout); if (sock < 0) printMessage("Error TCP_ConnectToServer, status=%d\n",sock); return (sock); } static void trajectoryExecute(SS_ID ssId, struct UserVar *pVar) { int status; int j; char buffer[60 * 2 * 8]; int eventId; int naxes = axesInUse(pVar); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " entry\n"); } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling GatheringReset(%d)\n", pVar->pollSocket); } status = GatheringReset(pVar->pollSocket); if (status != 0) { printMessage("Error performing GatheringReset, status=%d\n",status); return; } strcpy(buffer, ""); for (j=0; j<naxes; j++) { strcat (buffer, pVar->axisName[j]); strcat (buffer, ".SetpointPosition;"); strcat (buffer, pVar->axisName[j]); strcat (buffer, ".CurrentPosition;"); } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling GatheringConfigurationSet(%d, %d, %s)\n", pVar->pollSocket, naxes*2, buffer); } status = GatheringConfigurationSet(pVar->pollSocket, naxes*2, buffer); if (status != 0) printMessage("Error performing GatheringConfigurationSet, status=%d, buffer=%p\n", status, buffer); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling MultipleAxesPVTPulseOutputSet(%d, %s, %d, %d, %f)\n", pVar->pollSocket, pVar->groupName, pVar->startPulses+1, pVar->endPulses+1, pVar->pulsePeriod); } status = MultipleAxesPVTPulseOutputSet(pVar->pollSocket, pVar->groupName, pVar->startPulses+1, pVar->endPulses+1, pVar->pulsePeriod); sprintf(buffer, "Always;%s.PVT.TrajectoryPulse", pVar->groupName); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling EventExtendedConfigurationTriggerSet(%d, %d, %s, %s, %s, %s, %s)\n", pVar->pollSocket, 2, buffer, "", "", "", ""); } status = EventExtendedConfigurationTriggerSet(pVar->pollSocket, 2, buffer, "", "", "", ""); if (status != 0) { printMessage("Error performing EventExtendedConfigurationTriggerSet, status=%d, buffer=%s\n", status, buffer); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling EventExtendedConfigurationActionSet(%d, %d, %s, %s, %s, %s, %s)\n", pVar->pollSocket, 1, "GatheringOneData", "", "", "", ""); } status = EventExtendedConfigurationActionSet(pVar->pollSocket, 1, "GatheringOneData", "", "", "", ""); if (status != 0) { printMessage("Error performing EventExtendedConfigurationActionSet, status=%d\n", status); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling EventExtendedStart(%d, %p)\n", pVar->pollSocket, &eventId); } status= EventExtendedStart(pVar->pollSocket, &eventId); if (status != 0) { printMessage("Error performing EventExtendedStart, status=%d\n",status); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling MultipleAxesPVTExecution(%d, %s, %s, %d)\n", pVar->driveSocket, pVar->groupName, pVar->trajectoryFile, 1); } status = MultipleAxesPVTExecution(pVar->driveSocket, pVar->groupName, pVar->trajectoryFile, 1); if ((status != 0) && (status != -27)) printMessage("Error performing MultipleAxesPVTExecution, status=%d\n", status); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling EventExtendedRemove(%d, %d)\n", pVar->pollSocket, eventId); } status = EventExtendedRemove(pVar->pollSocket, eventId); if (status != 0) { printMessage("Error performing ExtendedEventRemove, status=%d\n",status); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: trajectoryExecute:" " calling GatheringStop(%d)\n", pVar->pollSocket); } status = GatheringStop(pVar->pollSocket); if ((status != 0) && (status != -30)) printMessage("Error performing GatheringStop, status=%d\n", status); return; } static void buildAndVerify(SS_ID ssId, struct UserVar *pVar) { FILE *trajFile; int i, j, status; int npoints; double trajVel; double D0, D1, T0, T1; SOCKET ftpSocket; char fileName[100]; double distance; double maxVelocity[8], maxAcceleration[8]; double minJerkTime[8], maxJerkTime[8]; double preTimeMax, postTimeMax; double preVelocity[8], postVelocity[8]; double time; int dir[8]; if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: buildAndVerify:" " entry\n"); } preTimeMax = 0.; postTimeMax = 0.; for (j=0; j<pVar->buildAxes; j++) { preVelocity[j] = 0.; postVelocity[j] = 0.; } for (j=0; j<pVar->buildAxes; j++) { if (!pVar->buildMoveAxis[j]) continue; status = PositionerSGammaParametersGet(pVar->pollSocket, pVar->axisName[j], &maxVelocity[j], &maxAcceleration[j], &minJerkTime[j], &maxJerkTime[j]); if (status != 0) { printMessage("Error calling positionerSGammaParametersSet, status=%d\n", status); maxAcceleration[j] = 0.; } maxAcceleration[j] = 0.9 * maxAcceleration[j]; if (pVar->buildMode == 0) { distance = pVar->motorTrajectory[j][0]; } else { distance = pVar->motorTrajectory[j][1] - pVar->motorTrajectory[j][0]; } preVelocity[j] = distance/pVar->timeTrajectory[0]; time = fabs(preVelocity[j]) / maxAcceleration[j]; if (time > preTimeMax) preTimeMax = time; if (pVar->buildMode == 0) { distance = pVar->motorTrajectory[j][pVar->buildElements-1]; } else { distance = pVar->motorTrajectory[j][pVar->buildElements-1] - pVar->motorTrajectory[j][pVar->buildElements-2]; } postVelocity[j] = distance/pVar->timeTrajectory[pVar->buildElements-1]; time = fabs(postVelocity[j]) / maxAcceleration[j]; if (time > postTimeMax) postTimeMax = time; } for (j=0; j<pVar->buildAxes; j++) { pVar->preDistance[j] = 0.5 * preVelocity[j] * preTimeMax; pVar->postDistance[j] = 0.5 * postVelocity[j] * postTimeMax; } trajFile = fopen (pVar->trajectoryFile, "w"); if (trajFile == NULL) { printMessage("Error calling fopen, file=%s\n", pVar->trajectoryFile); return; } for (j=0; j<pVar->buildAxes; j++) { if (pVar->epicsMotorDir[j] == 0) dir[j]=1; else dir[j]=-1; } fprintf(trajFile,"%f", preTimeMax); for (j=0; j<pVar->buildAxes; j++) fprintf(trajFile,", %f, %f", pVar->preDistance[j]*dir[j], preVelocity[j]*dir[j]); fprintf(trajFile,"\n"); if (pVar->buildMode == 0) npoints = pVar->buildElements; else npoints = pVar->buildElements-1; for (i=0; i<npoints; i++) { T0 = pVar->timeTrajectory[i]; if (i < npoints-1) T1 = pVar->timeTrajectory[i+1]; else T1 = T0; for (j=0; j<pVar->buildAxes; j++) { if (pVar->buildMode == 0) { D0 = pVar->motorTrajectory[j][i] * dir[j]; if (i < npoints-1) D1 = pVar->motorTrajectory[j][i+1] * dir[j]; else D1 = D0; } else { D0 = pVar->motorTrajectory[j][i+1] *dir[j] - pVar->motorTrajectory[j][i] * dir[j]; if (i < npoints-1) D1 = pVar->motorTrajectory[j][i+2] * dir[j] - pVar->motorTrajectory[j][i+1] * dir[j]; else D1 = D0; } trajVel = ((D0 + D1) / (T0 + T1)); if (!(pVar->buildMoveAxis[j])) { D0 = 0.0; trajVel = 0.0; } if (j == 0) fprintf(trajFile,"%f", pVar->timeTrajectory[i]); fprintf(trajFile,", %f, %f",D0,trajVel); if (j == (pVar->buildAxes-1)) fprintf(trajFile,"\n"); } } fprintf(trajFile,"%f", postTimeMax); for (j=0; j<pVar->buildAxes; j++) fprintf(trajFile,", %f, %f", pVar->postDistance[j]*dir[j], 0.); fprintf(trajFile,"\n"); fclose (trajFile); status = ftpConnect(pVar->xpsAddress, pVar->userName, pVar->password, &ftpSocket); if (status != 0) { printMessage("Error calling ftpConnect, status=%d\n", status); return; } status = ftpChangeDir(ftpSocket, "/Admin/public/Trajectories"); if (status != 0) { printMessage("Error calling ftpChangeDir, status=%d\n", status); return; } status = ftpStoreFile(ftpSocket, pVar->trajectoryFile); if (status != 0) { printMessage("Error calling ftpStoreFile, status=%d\n", status); return; } status = ftpDisconnect(ftpSocket); if (status != 0) { printMessage("Error calling ftpDisconnect, status=%d\n", status); return; } if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: buildAndVerify:" " calling MultipleAxesPVTVerification(%d, %s, %s)\n", pVar->pollSocket, pVar->groupName, pVar->trajectoryFile); } status = MultipleAxesPVTVerification(pVar->pollSocket, pVar->groupName, pVar->trajectoryFile); pVar->buildStatus = 2; if (status == 0) { strcpy(pVar->buildMessage, " "); pVar->buildStatus = 1; } else if (status == -69) strcpy(pVar->buildMessage, "Acceleration Too High"); else if (status == -68) strcpy(pVar->buildMessage, "Velocity Too High"); else if (status == -70) strcpy(pVar->buildMessage, "Final Velocity Non Zero"); else if (status == -75) strcpy(pVar->buildMessage, "Negative or Null Delta Time"); else sprintf(pVar->buildMessage, "Unknown trajectory verify error=%d", status); if (status == 0){ pVar->buildStatus = 1; } if (1) { for (j=0; j<pVar->buildAxes; j++) { status = MultipleAxesPVTVerificationResultGet(pVar->pollSocket, pVar->axisName[j], fileName, &pVar->motorMinPos[j], &pVar->motorMaxPos[j], &pVar->motorMVA[j], &pVar->motorMAA[j]); if (status != 0) { printMessage("Error performing MultipleAxesPVTVerificationResultGet for axis %s, status=%d\n", pVar->axisName[j], status); } } } else { for (j=0; j<pVar->buildAxes; j++) { pVar->motorMVA[j] = 0; pVar->motorMAA[j] = 0; } } return; } static int currentElement(SS_ID ssId, struct UserVar *pVar) { int status; int number=0; char fileName[100]; status = MultipleAxesPVTParametersGet(pVar->pollSocket, pVar->groupName, fileName, &number); if (status != 0) printMessage("Error performing MultipleAxesPVTParametersGet, status=%d\n", status); return (number); } static int getGroupStatus(SS_ID ssId, struct UserVar *pVar) { int status; int groupStatus=0; status = GroupStatusGet(pVar->pollSocket,pVar->groupName,&groupStatus); if (status != 0) printMessage("Error performing GroupStatusGet, status=%d\n", status); return(groupStatus); } static void readGathering(SS_ID ssId, struct UserVar *pVar) { char *buffer, *bptr, *tptr; int currentSamples, maxSamples; double setpointPosition, actualPosition; int status; int dir; int i, j; int nitems; int numRead, numInBuffer, numChars; int naxes = axesInUse(pVar); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: readGathering:" " entry\n"); } status = GatheringCurrentNumberGet(pVar->pollSocket, &currentSamples, &maxSamples); if (status != 0) { printMessage("Error calling GatherCurrentNumberGet, status=%d\n", status); return; } if (currentSamples != pVar->npulses) { printMessage("readGathering: error, npulses=%d, currentSamples=%d\n", pVar->npulses, currentSamples); return; } if (currentSamples > 2000) currentSamples = 2000; buffer = (char *)calloc(65536, sizeof(char)); numInBuffer = 0; for (numRead=0; numRead<currentSamples;) { status = -1; numInBuffer = currentSamples - numRead; while (status && (numInBuffer > 0)) { status = GatheringDataMultipleLinesGet(pVar->pollSocket, numRead, numInBuffer, buffer); if (pVar->debugLevel > 0) { printMessage("readGathering: GatheringDataMultipleLinesGet, status=%d, numInBuffer=%d\n", status, numInBuffer); } if (status) numInBuffer /= 2; } if (numInBuffer == 0) { printMessage("Error reading gathering data, numInBuffer = 0\n"); goto done; } bptr = buffer; for (i=0; i<numInBuffer; i++) { tptr = strstr(bptr, "\n"); if (tptr) *tptr = 0; for (j=0; j<naxes; j++) { nitems = sscanf(bptr, "%lf;%lf%n", &setpointPosition, &actualPosition, &numChars); bptr += numChars+1; if (nitems != 2) { printMessage("Error reading Gathering.dat file, nitems=%d, should be %d\n", nitems, 2); goto done; } pVar->motorError[j][numRead] = actualPosition - setpointPosition; if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1; pVar->motorReadbacks[j][numRead] = actualPosition * dir + pVar->epicsMotorOff[j]; } numRead++; pVar->nactual = numRead; bptr = tptr + 1; } } done: free(buffer); if (pVar->debugLevel > 0) { printMessage("XPS_trajectoryScan: readGathering:" " exit\n"); } return; } static int trajectoryAbort(SS_ID ssId, struct UserVar *pVar) { int status; status = GroupMoveAbort(pVar->abortSocket,pVar->groupName); if (status != 0) printMessage("Error performing GroupMoveAbort, status=%d\n", status); return (0); } static void printMessage(const char *pformat, ...) { va_list pvar; FILE *fp = stdout; epicsTimeStamp now; char nowText[40]; epicsTimeGetCurrent(&now); nowText[0] = 0; epicsTimeToStrftime(nowText,sizeof(nowText), "%Y/%m/%d %H:%M:%S.%03f",&now); fprintf(fp,"%s ",nowText); va_start(pvar, pformat); vfprintf(fp,pformat,pvar); va_end(pvar); fflush(fp); }"#) => {};
     ($env:ident, r#"pVar->pollSocket = getSocket(ssId, pVar, 1.0);"#) => {
         $env.var().pollSocket.set(get_socket($env, 1.0))
     };
@@ -859,6 +871,8 @@ mod tests {
         v.driveSocket.set(base + 1);
         v.positionSocket.set(base + 2);
         v.numAxes.set(1);
+        v.initAxes.set(1);
+        v.buildAxes.set(1);
         strcpy(&v.groupName, "G9");
         v.axisName.at(0).set(malloc(100));
         strcpy(v.axisName.at(0).get(), "G9.P1");
@@ -1102,9 +1116,9 @@ mod tests {
 
         const DB: &str = include_str!("../../../../../iocs/motor/xps-ioc/db/trajectoryScan.db");
 
-        /// m1 on a simulated axis at dial 0, user offset `$(OFF)`.
-        const MOTOR: &str = r#"record(motor, "T:m1") { field(DTYP, "asynMotor")
-            field(OUT, "@asyn($(PORT)m1,0)") field(MRES, "0.001") field(VELO, "1")
+        /// `$(M)` on a simulated axis at dial 0, user offset `$(OFF)`.
+        const MOTOR: &str = r#"record(motor, "T:$(M)") { field(DTYP, "asynMotor")
+            field(OUT, "@asyn($(PORT)$(M),0)") field(MRES, "0.001") field(VELO, "1")
             field(VMAX, "1") field(ACCL, "0.2") field(DHLM, "100") field(DLLM, "-100")
             field(OFF, "$(OFF)") }"#;
 
@@ -1119,6 +1133,8 @@ mod tests {
             released: bool,
             /// The lines gathering holds.
             gathered: usize,
+            /// The last GatheringConfigurationSet.
+            gathering: String,
         }
 
         type Shared = Arc<(Mutex<Xps>, Condvar)>;
@@ -1128,6 +1144,9 @@ mod tests {
             let name = cmd.split(" (").next().unwrap_or_default().to_string();
             let mut x = state.lock().unwrap();
             x.log.push(name.clone());
+            if name == "GatheringConfigurationSet" {
+                x.gathering = cmd.to_string();
+            }
             let lines;
             let values = match name.as_str() {
                 "GroupStatusGet" if x.running => "0,45",
@@ -1193,11 +1212,11 @@ mod tests {
             (port, shared)
         }
 
-        /// `port`'s axis m1 of one simulated motor.
-        fn sim_axis(port: &str) {
+        /// `port`'s axis `m` of one simulated motor.
+        fn sim_axis(port: &str, m: &str) {
             let motor: Arc<Mutex<dyn AsynMotor>> =
                 Arc::new(Mutex::new(SimMotor::new().with_limits(-1e9, 1e9)));
-            let name = format!("{port}m1");
+            let name = format!("{port}{m}");
             let AxisSetup {
                 axis, poll_loop, ..
             } = MotorBuilder::new(motor)
@@ -1218,10 +1237,10 @@ mod tests {
             poll_loop.start();
         }
 
-        /// The trajectory database on NumAxes 1 and T:m1 on the simulated
-        /// axis of asyn port `port`, its user offset 0, unless `set` says.
+        /// The trajectory database on NumAxes 1, and T:m1 and T:m2 on
+        /// simulated axes of asyn port `port`, their user offset 0, unless
+        /// `set` says.
         async fn ioc(port: &str, set: &[(&str, &str)]) -> (Arc<PvDatabase>, ScanOwner) {
-            sim_axis(port);
             let mut macros: HashMap<String, String> = [
                 ("P", "T:"),
                 ("R", "traj1:"),
@@ -1235,7 +1254,7 @@ mod tests {
             .into();
             macros.extend(set.iter().map(|&(k, v)| (k.to_string(), v.to_string())));
             let (motor, factory) = epics_rs::motor::motor_record_factory();
-            let (db, _) = IocBuilder::new()
+            let mut ioc = IocBuilder::new()
                 .register_record_type(motor, factory)
                 .register_dynamic_device_support(
                     &epics_rs::motor::devices::devices(),
@@ -1243,12 +1262,13 @@ mod tests {
                 )
                 .register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()))
                 .db_string(DB, &macros)
-                .unwrap()
-                .db_string(MOTOR, &macros)
-                .unwrap()
-                .build_served()
-                .await
                 .unwrap();
+            for m in ["m1", "m2"] {
+                sim_axis(port, m);
+                macros.insert("M".to_string(), m.to_string());
+                ioc = ioc.db_string(MOTOR, &macros).unwrap();
+            }
+            let (db, _) = ioc.build_served().await.unwrap();
             // seq holds each state set in its first state until PINI is done.
             let scan = ScanOwner::start(db.clone());
             (db, scan)
@@ -1265,10 +1285,10 @@ mod tests {
             panic!("the XPS never saw {what}: {:?}", xps.0.lock().unwrap().log);
         }
 
-        /// The program's macros for one axis on the XPS at `port`.
+        /// The program's macros for two axes on the XPS at `port`.
         fn macros(port: u16) -> String {
             format!(
-                "P=T:,R=traj1:,M1=m1,IPADDR=127.0.0.1,PORT={port},GROUP=G1,P1=P1,\
+                "P=T:,R=traj1:,M1=m1,M2=m2,IPADDR=127.0.0.1,PORT={port},GROUP=G1,P1=P1,P2=P2,\
                  USERNAME=Administrator,PASSWORD=pw"
             )
         }
@@ -1401,10 +1421,17 @@ mod tests {
             boot("xpsNumAxes", &[("NAXES", "9")]).await;
         }
 
-        /// ss xpsTrajectoryScan state init reads NumAxes once, so a put past
-        /// MAX_AXES after it leaves a build as it was.
+        /// The axes of the trajectory file a build wrote: its first line is
+        /// the time, then each axis's distance and velocity.
+        fn file_axes(p: &Program) -> usize {
+            let file = std::fs::read_to_string(&p.file).unwrap();
+            (file.lines().next().unwrap().split(", ").count() - 1) / 2
+        }
+
+        /// ss xpsTrajectoryScan states build and execute: a NumAxes put
+        /// past the axes init set up builds and executes those.
         #[epics_rs::base::epics_test]
-        async fn a_num_axes_put_after_init_leaves_the_build_alone() {
+        async fn a_num_axes_put_past_init_s_axes_runs_init_s() {
             let p = boot("xpsNumAxesPut", &[]).await;
             put(&p.db, "T:traj1:NumAxes", EpicsValue::Long(9)).await;
             put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
@@ -1413,6 +1440,43 @@ mod tests {
                 &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)],
             )
             .await;
+            assert_eq!(file_axes(&p), 1);
+            execute_to_the_end(&p).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Execute", 0.0), ("T:traj1:ExecStatus", 1.0)],
+            )
+            .await;
+            assert_eq!(
+                p.xps.0.lock().unwrap().gathering,
+                "GatheringConfigurationSet (G1.P1.SetpointPosition,G1.P1.CurrentPosition)"
+            );
+        }
+
+        /// ss xpsTrajectoryScan states build and execute: NumAxes lowered
+        /// after init builds and executes that many axes, as upstream's
+        /// monitored numAxes does.
+        #[epics_rs::base::epics_test]
+        async fn num_axes_lowered_after_init_runs_that_many() {
+            let p = boot("xpsNumAxesLow", &[("NAXES", "2")]).await;
+            put(&p.db, "T:traj1:NumAxes", EpicsValue::Long(1)).await;
+            put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)],
+            )
+            .await;
+            assert_eq!(file_axes(&p), 1);
+            execute_to_the_end(&p).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Execute", 0.0), ("T:traj1:ExecStatus", 1.0)],
+            )
+            .await;
+            assert_eq!(
+                p.xps.0.lock().unwrap().gathering,
+                "GatheringConfigurationSet (G1.P1.SetpointPosition,G1.P1.CurrentPosition)"
+            );
         }
 
         /// ss xpsTrajectoryScan state build: Nelements past MAX_ELEMENTS

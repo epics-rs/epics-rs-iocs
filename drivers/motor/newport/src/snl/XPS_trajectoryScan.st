@@ -85,11 +85,16 @@ int anyMoving;
 int ncomplete;
 int nextra;
 int npoints;
+/* The axes init set up, at most MAX_AXES.  Upstream ran every per-axis loop to
+ * numAxes as last put: past these after a NumAxes put above them, and past the
+ * arrays above MAX_AXES.  Each runs to the lesser of numAxes and initAxes. */
+int initAxes;
 /* State build's one bounded read of nelements and moveMode, and its one read
- * of moveAxis */
+ * of moveAxis and of the axes */
 int buildElements;
 int buildMode;
 int buildMoveAxis[MAX_AXES];
+int buildAxes;
 int dir;
 int pollSocket;
 int driveSocket;
@@ -164,11 +169,11 @@ ss xpsTrajectoryScan {
                        " xpsAddress=%s groupName=%s\n",
                        xpsAddress, groupName);
             }
-            /* Force numAxes to be <= MAX_AXES.
-             * Upstream clamped it after this loop had assigned NumAxes motors. */
-            pvGet(numAxes);
-            if (numAxes > MAX_AXES) numAxes = MAX_AXES;
-            for (i=0; i<numAxes; i++) {
+            /* Upstream clamped numAxes to MAX_AXES after this loop had assigned
+             * NumAxes motors. */
+            initAxes = numAxes;
+            if (initAxes > MAX_AXES) initAxes = MAX_AXES;
+            for (i=0; i<initAxes; i++) {
                 axisName[i] = malloc(NAME_LEN);
                 sprintf(macroBuf, "P%d", i+1);
                 sprintf(axisName[i], "%s.%s", groupName, macValueGet(macroBuf));
@@ -200,7 +205,7 @@ ss xpsTrajectoryScan {
              * the first one the IOC opened, to whichever XPS it went. */
             %%pVar->positionSocket = getSocket(ssId, pVar, POLL_TIMEOUT);
         
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<initAxes; j++) {
                 motorCurrentIndex[j]   =  pvIndex(motorCurrent[j]);
                 epicsMotorDoneIndex[j] =  pvIndex(epicsMotorDone[j]);
             }
@@ -271,12 +276,15 @@ ss xpsTrajectoryScan {
              * or 2.  One that moves none reads nothing, and Nelements below 1 builds
              * no elements, as upstream.  Upstream's buildAndVerify re-read the
              * monitored moveAxis too, so an axis moved after this bound was built past
-             * it; buildMoveAxis is the one read the bound and buildAndVerify share. */
+             * it; buildMoveAxis is the one read the bound and buildAndVerify share,
+             * and buildAxes the one of numAxes, which upstream re-read as well. */
             buildMode = moveMode;
-            for (j=0; j<numAxes; j++) buildMoveAxis[j] = moveAxis[j];
+            buildAxes = numAxes;
+            if (buildAxes > initAxes) buildAxes = initAxes;
+            for (j=0; j<buildAxes; j++) buildMoveAxis[j] = moveAxis[j];
             buildElements = nelements;
             if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<buildAxes; j++) {
                 if (buildMoveAxis[j]) {
                     if (buildMode == MOVE_MODE_RELATIVE) {
                         if (buildElements < 1) buildElements = 1;
@@ -309,7 +317,7 @@ ss xpsTrajectoryScan {
             %%buildAndVerify(ssId, pVar);
          
             /* Export values to PVs */
-            for (j=0; j<numAxes; j++) {       
+            for (j=0; j<buildAxes; j++) {       
                 pvPut(motorMVA[j]);
                 pvPut(motorMAA[j]);
             } 
@@ -340,11 +348,11 @@ ss xpsTrajectoryScan {
             %%waitMotors(ssId, pVar);
         
             /* Get the initial positions of the motors */
-            for (j=0; j<numAxes; j++) initialPos[j] = epicsMotorPos[j];
+            for (j=0; j<numAxes && j<initAxes; j++) initialPos[j] = epicsMotorPos[j];
             /* Move to start position if required.
              * Subtract distance of initial acceleration element */
             if (moveMode == MOVE_MODE_ABSOLUTE) {
-                for (j=0; j<numAxes; j++) {
+                for (j=0; j<numAxes && j<initAxes; j++) {
                     if (moveAxis[j]) {
                         epicsMotorPos[j] = motorTrajectory[j][0] - preDistance[j];
                         pvPut(epicsMotorPos[j]);
@@ -352,7 +360,7 @@ ss xpsTrajectoryScan {
                 }
             } else {
                 /* Backup by distance of initial acceleration element */
-                for (j=0; j<numAxes; j++) {
+                for (j=0; j<numAxes && j<initAxes; j++) {
                     if (moveAxis[j]) {
                         epicsMotorPos[j] = epicsMotorPos[j] - preDistance[j];
                         pvPut(epicsMotorPos[j]);
@@ -391,7 +399,7 @@ ss xpsTrajectoryScan {
             }
 
             /* Check that the trajectory won't exceed the software limits */
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<numAxes && j<initAxes; j++) {
                 if (moveAxis[j]) {
                     status = PositionerUserTravelLimitsGet(pollSocket,
                                                            axisName[j],
@@ -504,7 +512,7 @@ ss xpsTrajectoryScan {
         when (delay(0.1) && execState==EXECUTE_STATE_EXECUTING) {
             /* Get the current motor positions, post them */
             %%getMotorPositions(ssId, pVar, pVar->motorCurrent);
-            for (j=0; j<numAxes; j++) pvPut(motorCurrent[j]);
+            for (j=0; j<numAxes && j<initAxes; j++) pvPut(motorCurrent[j]);
 
             %%pVar->xpsStatus = getGroupStatus(ssId, pVar);
             if (xpsStatus == 45) {
@@ -550,8 +558,8 @@ ss xpsTrajectoryScan {
             
                 /* Get the current motor positions, post them */
                 %%getMotorPositions(ssId, pVar, pVar->motorCurrent);
-                for (j=0; j<numAxes; j++) pvPut(motorCurrent[j]);
-                for (j=0; j<numAxes; j++) {
+                for (j=0; j<numAxes && j<initAxes; j++) pvPut(motorCurrent[j]);
+                for (j=0; j<numAxes && j<initAxes; j++) {
                     epicsMotorPos[j] = motorCurrent[j];
                     pvPut(epicsMotorPos[j]);
                 }
@@ -583,7 +591,7 @@ ss xpsTrajectoryScan {
             readStatus=STATUS_UNDEFINED;
             pvPut(readStatus);
             /* Erase the readback and error arrays */
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<numAxes && j<initAxes; j++) {
                 for (i=0; i<MAX_PULSES; i++) {
                     motorReadbacks[j][i] = 0.;
                     motorError[j][i] = 0.;
@@ -596,7 +604,7 @@ ss xpsTrajectoryScan {
             pvPut(nactual);
  
             /* Post the readback and error arrays */
-            for (j=0; j<numAxes; j++) {
+            for (j=0; j<numAxes && j<initAxes; j++) {
                 pvPut(motorReadbacks[j]);
                 pvPut(motorError[j]);
             }
@@ -679,7 +687,7 @@ ss xpsTrajectoryPosition {
     state positionUpdate {
         when (delay (1) && (execState == EXECUTE_STATE_DONE)) {
             %%getMotorPositions(ssId, pVar, pVar->motorCurrent);
-            for (j=0; j<numAxes; j++) pvPut(motorCurrent[j]);
+            for (j=0; j<numAxes && j<initAxes; j++) pvPut(motorCurrent[j]);
         } state positionUpdate
     }
 }
@@ -687,6 +695,12 @@ ss xpsTrajectoryPosition {
 
 /*  C functions  */
 %{
+
+/* The axes a function runs over: numAxes as last put, up to initAxes. */
+static int axesInUse(struct UserVar *pVar)
+{
+    return pVar->numAxes < pVar->initAxes ? pVar->numAxes : pVar->initAxes;
+}
 
 /* getMotorPositions returns the positions of each motor.
  * It reads the positions from the controller, and then converts to 
@@ -696,11 +710,12 @@ static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos)
     int status;
     int j;
     int dir;
+    int naxes = axesInUse(pVar);
 
     /* Read the current positions of all the axes */
     
     status = GroupPositionCurrentGet(pVar->positionSocket,
-                                     pVar->groupName,pVar->numAxes,pos);
+                                     pVar->groupName,naxes,pos);
     if (status != 0) {
         printMessage("Error performing GroupPositionCurrentGet%i\n", status);
         /* Upstream converted pos after a failed read too: the user positions it
@@ -708,7 +723,7 @@ static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos)
         return(status);
     }
     /* Convert from XPS units (which are EPICS motor dial units) to user units */
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<naxes; j++) {
         if (pVar->epicsMotorDir[j] == 0) dir=1; else dir=-1;
         pos[j] = pos[j]*dir + pVar->epicsMotorOff[j];
     }
@@ -742,9 +757,10 @@ static int getMotorMoving(SS_ID ssId, struct UserVar *pVar)
 static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar)
 {
     int j;
+    int naxes = axesInUse(pVar);
     int result=0, mask=0x01;
 
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<naxes; j++) {
 		seq_pvGet(ssId, pVar->epicsMotorDoneIndex[j], 0);
         if (pVar->epicsMotorDone[j] == 0) result |= mask;
         mask = mask << 1;
@@ -757,19 +773,20 @@ static int getEpicsMotorMoving(SS_ID ssId, struct UserVar *pVar)
 static int waitMotors(SS_ID ssId, struct UserVar *pVar)
 {
     int j;
+    int naxes = axesInUse(pVar);
 
     /* Logic is that we always want to post position motor positions 
      * after the end of move is detected. */
     while(getMotorMoving(ssId, pVar)) {
         /* Get the current motor positions, post them */
         getMotorPositions(ssId, pVar, pVar->motorCurrent);
-        for (j=0; j<pVar->numAxes; j++) {
+        for (j=0; j<naxes; j++) {
 			seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0);
 		}
         epicsThreadSleep(POLL_INTERVAL);
     }
     getMotorPositions(ssId, pVar, pVar->motorCurrent);
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<naxes; j++) {
 		seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0);
 	}
     return(0);
@@ -780,18 +797,19 @@ static int waitMotors(SS_ID ssId, struct UserVar *pVar)
 static int waitEpicsMotors(SS_ID ssId, struct UserVar *pVar)
 {
     int j;
+    int naxes = axesInUse(pVar);
 
     /* Logic is that we always want to post position motor positions 
      * after the end of move is detected. */
     while(getEpicsMotorMoving(ssId, pVar)) {
         /* Get the current motor positions, post them */
-        for (j=0; j<pVar->numAxes; j++) {
+        for (j=0; j<naxes; j++) {
             pVar->motorCurrent[j] = pVar->epicsMotorPos[j];
 			seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0);
         }
         epicsThreadSleep(POLL_INTERVAL);
     }
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<naxes; j++) {
         pVar->motorCurrent[j] = pVar->epicsMotorPos[j];
 		seq_pvPut(ssId, pVar->motorCurrentIndex[j], 0);
     }
@@ -817,6 +835,7 @@ static void trajectoryExecute(SS_ID ssId, struct UserVar *pVar)
     int j;
     char buffer[MAX_GATHERING_STRING];
     int eventId;
+    int naxes = axesInUse(pVar);
     
     if (pVar->debugLevel > 0) {
         printMessage("XPS_trajectoryScan: trajectoryExecute:"
@@ -838,7 +857,7 @@ static void trajectoryExecute(SS_ID ssId, struct UserVar *pVar)
     /* Write list of gathering parameters.
      * Note that there must be NUM_GATHERING_ITEMS per axis in this list. */
     strcpy(buffer, "");
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<naxes; j++) {
         strcat (buffer, pVar->axisName[j]);
         strcat (buffer, ".SetpointPosition;");
         strcat (buffer, pVar->axisName[j]);
@@ -850,10 +869,10 @@ static void trajectoryExecute(SS_ID ssId, struct UserVar *pVar)
     if (pVar->debugLevel > 0) {
         printMessage("XPS_trajectoryScan: trajectoryExecute:"
                " calling GatheringConfigurationSet(%d, %d, %s)\n",
-               pVar->pollSocket, pVar->numAxes*NUM_GATHERING_ITEMS, buffer);
+               pVar->pollSocket, naxes*NUM_GATHERING_ITEMS, buffer);
     }
     status = GatheringConfigurationSet(pVar->pollSocket, 
-                                       pVar->numAxes*NUM_GATHERING_ITEMS, buffer);
+                                       naxes*NUM_GATHERING_ITEMS, buffer);
     if (status != 0)
             printMessage("Error performing GatheringConfigurationSet, status=%d, buffer=%p\n",
                    status, buffer);
@@ -997,11 +1016,11 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
     preTimeMax = 0.;
     postTimeMax = 0.;
     /* Zero values since axes may not be used */
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<pVar->buildAxes; j++) {
         preVelocity[j] = 0.;
         postVelocity[j] = 0.;
     }
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<pVar->buildAxes; j++) {
         if (!pVar->buildMoveAxis[j]) continue;
         status = PositionerSGammaParametersGet(pVar->pollSocket, pVar->axisName[j], 
                                                &maxVelocity[j], &maxAcceleration[j],
@@ -1039,7 +1058,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
 
     /* Compute the distance that each motor moves during its acceleration phase.
      * Only move it this far. */
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<pVar->buildAxes; j++) {
         pVar->preDistance[j] =  0.5 * preVelocity[j] *  preTimeMax; 
         pVar->postDistance[j] = 0.5 * postVelocity[j] * postTimeMax;
     }
@@ -1054,12 +1073,12 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
 
     /* Compute the sign relationship of user coordinates to XPS coordinates for
      * each axis */
-    for (j=0; j<pVar->numAxes; j++) {
+    for (j=0; j<pVar->buildAxes; j++) {
         if (pVar->epicsMotorDir[j] == 0) dir[j]=1; else dir[j]=-1;
     }
     /* Create the initial acceleration element */
     fprintf(trajFile,"%f", preTimeMax);
-    for (j=0; j<pVar->numAxes; j++) 
+    for (j=0; j<pVar->buildAxes; j++) 
         fprintf(trajFile,", %f, %f", pVar->preDistance[j]*dir[j], preVelocity[j]*dir[j]);
     fprintf(trajFile,"\n");
  
@@ -1075,7 +1094,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
             T1 = pVar->timeTrajectory[i+1];
         else
             T1 = T0;
-        for (j=0; j<pVar->numAxes; j++) {
+        for (j=0; j<pVar->buildAxes; j++) {
             if (pVar->buildMode == MOVE_MODE_RELATIVE) {
                 D0 = pVar->motorTrajectory[j][i] * dir[j];
                 if (i < npoints-1) 
@@ -1101,13 +1120,13 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
         
             if (j == 0) fprintf(trajFile,"%f", pVar->timeTrajectory[i]);
             fprintf(trajFile,", %f, %f",D0,trajVel);
-            if (j == (pVar->numAxes-1)) fprintf(trajFile,"\n");
+            if (j == (pVar->buildAxes-1)) fprintf(trajFile,"\n");
         }    
     }
 
     /* Create the final acceleration element. Final velocity must be 0. */
     fprintf(trajFile,"%f", postTimeMax);
-    for (j=0; j<pVar->numAxes; j++) 
+    for (j=0; j<pVar->buildAxes; j++) 
         fprintf(trajFile,", %f, %f", pVar->postDistance[j]*dir[j], 0.);
     fprintf(trajFile,"\n");
     fclose (trajFile);
@@ -1165,7 +1184,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
         pVar->buildStatus = STATUS_SUCCESS;
     }    
     if (1) {  /* We may need to test for status here */
-        for (j=0; j<pVar->numAxes; j++) {
+        for (j=0; j<pVar->buildAxes; j++) {
             status = MultipleAxesPVTVerificationResultGet(pVar->pollSocket,
                          pVar->axisName[j], fileName, &pVar->motorMinPos[j], &pVar->motorMaxPos[j], 
                          &pVar->motorMVA[j], &pVar->motorMAA[j]);
@@ -1175,7 +1194,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
             }
         }
     } else {
-        for (j=0; j<pVar->numAxes; j++) {
+        for (j=0; j<pVar->buildAxes; j++) {
             pVar->motorMVA[j] = 0;
             pVar->motorMAA[j] = 0;     
         }
@@ -1227,6 +1246,7 @@ static void readGathering(SS_ID ssId, struct UserVar *pVar)
     int i, j;
     int nitems;
     int numRead, numInBuffer, numChars;
+    int naxes = axesInUse(pVar);
 
     
     if (pVar->debugLevel > 0) {
@@ -1270,7 +1290,7 @@ static void readGathering(SS_ID ssId, struct UserVar *pVar)
             /* Find the next \n and replace with null */
             tptr = strstr(bptr, "\n");
             if (tptr) *tptr = 0;
-            for (j=0; j<pVar->numAxes; j++) {
+            for (j=0; j<naxes; j++) {
                 nitems = sscanf(bptr, "%lf;%lf%n", 
                                 &setpointPosition, &actualPosition, &numChars);
                 bptr += numChars+1;
