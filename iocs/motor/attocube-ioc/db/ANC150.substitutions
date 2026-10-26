@@ -1,0 +1,15 @@
+# C's iocAttocube ANC150.substitutions, P and PORT from st.cmd. PORT is
+# drvAsynMotorConfigure's port: C's rows name the serial octet port serial1,
+# and its ANC150.cmd configures no motor port, so its records have no
+# asynMotor to bind.
+#
+# The record's velocity/acceleration have no effect; the step rate is a
+# controller setting read with 'getf'.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{N, M,       DTYP,        ADDR, DESC,         EGU, DIR, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES,    PREC, DHLM, DLLM, INIT}
+{1, "m$(N)", "asynMotor", 0,    "motor $(N)", deg, Pos, 10,   0,    .2,   0,    1,    2,    0.01,    5,    0,    0,    ""}
+{2, "m$(N)", "asynMotor", 1,    "motor $(N)", mm,  Pos, 1,    0,    .2,   0,    1,    2,    0.00006, 5,    0,    0,    ""}
+{3, "m$(N)", "asynMotor", 2,    "motor $(N)", mm,  Pos, 1,    0,    .2,   0,    1,    2,    0.00007, 5,    0,    0,    ""}
+}

@@ -11,7 +11,7 @@
 
 epicsEnvSet("P",      "ANC150:")
 epicsEnvSet("CTRL",   "ANC150")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -28,20 +28,18 @@ ANC150AsynSetup(1)
 
 # ANC150AsynConfig(card, portName, numAxes, movingPollPeriod, idlePollPeriod),
 # periods in ms; then the axes of card 0 become asyn port $(CTRL).
-ANC150AsynConfig(0, "$(SERIAL)", 3, 100, 1000)
+ANC150AsynConfig(0, "$(SERIAL)", 3, 250, 2000)
+# C's ANC150.cmd lacks this line, so its records have no motor port.
 drvAsynMotorConfigure("$(CTRL)", "motorANC150", 0, 3)
 
-# One motor record per axis, ADDR the 0-based axis index.
-# The ANC150 is an open-loop stepper: positions travel the driver boundary in
-# steps (EGU = steps), so MRES is 1. The record's velocity/acceleration have no
-# effect — the step rate is a controller setting read with 'getf'.
-dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
-dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
-dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m3,PORT=$(CTRL),ADDR=2")
+# motorUtil's records and one asyn_motor.db per axis, ADDR the 0-based axis
+# index, as C's st.cmd and ANC150.cmd load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(ATTOCUBE_IOC)/db/ANC150.substitutions", "P=$(P),PORT=$(CTRL)")
 
 iocInit()
 
 # Example:
 #   dbl
 #   camonitor ANC150:m1 ANC150:m1.RBV
-#   caput ANC150:m1 1000
+#   caput ANC150:m1 10

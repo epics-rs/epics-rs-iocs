@@ -621,6 +621,7 @@ name = "attocube-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-attocube",
  "motor-common",
 ]

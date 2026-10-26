@@ -1,0 +1,27 @@
+# dbl of motor R7-4-5 motorAttocube iocBoot/iocAttocube st.cmd
+attocube:alldone
+attocube:alldoneBlink
+attocube:allstop
+attocube:m1
+attocube:m1Direction
+attocube:m1Offset
+attocube:m1Resolution
+attocube:m1_able
+attocube:m1_twCh
+attocube:m1_vCh
+attocube:m2
+attocube:m2Direction
+attocube:m2Offset
+attocube:m2Resolution
+attocube:m2_able
+attocube:m2_twCh
+attocube:m2_vCh
+attocube:m3
+attocube:m3Direction
+attocube:m3Offset
+attocube:m3Resolution
+attocube:m3_able
+attocube:m3_twCh
+attocube:m3_vCh
+attocube:moving
+attocube:movingDiff
