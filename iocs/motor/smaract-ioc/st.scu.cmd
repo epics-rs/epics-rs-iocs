@@ -48,6 +48,10 @@ smarActSCUCreateAxis("$(CTRL2)", 0, 0)
 smarActSCUCreateAxis("$(CTRL2)", 1, 1)
 smarActSCUCreateAxis("$(CTRL2)", 2, 2)
 
+# The first axis poll comes an idle period after CreateController; motor
+# init before it reads position 0 and loads an autosaved DVAL in its place.
+epicsThreadSleep(1.0)
+
 # One motor per axis with the rows of C's motor.substitutions.smaractscu.
 dbLoadRecords("$(MOTOR)/db/asyn_motor.db", "P=$(P),M=m1,DTYP=asynMotor,PORT=$(CTRL),ADDR=0,DESC=motor 1,EGU=mm,DIR=Pos,VELO=1,VBAS=0,ACCL=0.2,BDST=0,BVEL=1,BACC=0.2,MRES=1e-3,PREC=3,DHLM=20000,DLLM=-20000,INIT=")
 dbLoadRecords("$(MOTOR)/db/asyn_motor.db", "P=$(P),M=m2,DTYP=asynMotor,PORT=$(CTRL),ADDR=1,DESC=motor 2,EGU=mm,DIR=Pos,VELO=1,VBAS=0,ACCL=0.2,BDST=0,BVEL=1,BACC=0.2,MRES=1e-3,PREC=3,DHLM=20000,DLLM=-20000,INIT=")
