@@ -1,11 +1,12 @@
-# C's iocPIGCS2 PI_GCS2.substitutions, P and PORT from st.cmd, on the axis
-# this IOC configures. The driver converts steps by the axis counts-per-unit
-# (SPA? CPU Z/N) as C. C names $(MOTOR)/motorApp/Db, the source tree; this
-# is the installed db.
+# C's iocPIGCS2 PI_GCS2.substitutions, P and PORT from st.cmd. The driver
+# converts steps by the axis counts-per-unit (SPA? CPU Z/N) as C. C names
+# $(MOTOR)/motorApp/Db, the source tree; this is the installed db.
 file "$(MOTOR)/db/asyn_motor.db"
 {
 pattern
 {M,     DTYP,         ADDR,  DESC,       EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,    PREC,  DHLM,  DLLM,  INIT}
 # U-651.03
 {"m1",  "asynMotor",  0,     "Motor 1",  deg,  Pos,  5,     0,     .2,    0,     1,     .2,    0.0005,  4,     0.0,   0.0,   ""}
+# U-624.03
+{"m2",  "asynMotor",  1,     "Motor 2",  deg,  Pos,  5,     0,     .2,    0,     1,     .2,    0.0020,  4,     0.0,   0.0,   ""}
 }

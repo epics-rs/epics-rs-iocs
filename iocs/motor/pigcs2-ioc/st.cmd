@@ -13,7 +13,6 @@ epicsEnvSet("P",       "pi:")
 epicsEnvSet("CTRL",    "C867")
 epicsEnvSet("PORT",    "C867_ETH")
 epicsEnvSet("TTY",     "/dev/ttyUSB0")
-epicsEnvSet("NUMAXES", "1")
 
 # ---- asyn octet port ----
 drvAsynSerialPortConfigure("$(PORT)", "$(TTY)", 0, 0, 0)
@@ -25,10 +24,9 @@ asynSetOption("$(PORT)", -1, "baud", "115200")
 #                          movingPollingRate, idlePollingRate), rates in ms.
 # Axes are auto-discovered via SAI? — the first numAxes of them (in
 # controller-reported order) are attached.
-PI_GCS2_CreateController("$(CTRL)", "$(PORT)", $(NUMAXES), 0, 0, 100, 1000)
+PI_GCS2_CreateController("$(CTRL)", "$(PORT)", 2, 0, 0, 100, 1000)
 
-# The asyn_motor.db of axis 0 (the first discovered GCS axis), as C's
-# PI_GCS2.cmd loads it.
+# The asyn_motor.db rows of axes 0 and 1, as C's PI_GCS2.cmd loads them.
 dbLoadTemplate("$(PIGCS2_IOC)/db/PI_GCS2.substitutions", "P=$(P),PORT=$(CTRL)")
 
 # motorUtil's records, as C's st.cmd loads them.
