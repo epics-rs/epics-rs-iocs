@@ -2630,6 +2630,7 @@ name = "mcb4b-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-acs",
  "motor-common",
 ]

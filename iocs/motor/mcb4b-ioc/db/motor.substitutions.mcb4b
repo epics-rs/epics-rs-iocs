@@ -1,0 +1,10 @@
+# C's iocAcs motor.substitutions.mcb4b, P and PORT from st.cmd.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{N, M,       DTYP,        ADDR, DESC,       EGU, DIR, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES,  PREC, DHLM, DLLM, INIT}
+{1, "m$(N)", "asynMotor", 0,    "Bottom",   mm,  Pos, 2.0,  0.1,  .2,   0,    1,    .2,   -.001, 3,    16,   0,    ""}
+{2, "m$(N)", "asynMotor", 1,    "Top",      mm,  Pos, 2.0,  0.1,  .2,   0,    1,    .2,   -.001, 3,    16,   0,    ""}
+{3, "m$(N)", "asynMotor", 2,    "Inboard",  mm,  Pos, 2.0,  0.1,  .2,   0,    1,    .2,   -.001, 3,    16,   0,    ""}
+{4, "m$(N)", "asynMotor", 3,    "Outboard", mm,  Pos, 2.0,  0.1,  .2,   0,    1,    .2,   -.001, 3,    16,   0,    ""}
+}
