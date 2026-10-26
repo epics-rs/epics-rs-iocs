@@ -85,6 +85,9 @@ int anyMoving;
 int ncomplete;
 int nextra;
 int npoints;
+/* State build's one bounded read of nelements and moveMode */
+int buildElements;
+int buildMode;
 int dir;
 int pollSocket;
 int driveSocket;
@@ -258,15 +261,29 @@ ss xpsTrajectoryScan {
             buildStatus=STATUS_UNDEFINED;
             pvPut(buildStatus);
             
-            if (moveMode == MOVE_MODE_RELATIVE)
-                npoints = nelements;
+            /* Upstream built from nelements and moveMode as put: nelements unbounded by
+             * the arrays, and both monitored, so buildAndVerify and execute re-read them
+             * after a later put.  buildElements and buildMode are the one bounded read;
+             * a relative trajectory needs 1 element, any other 2. */
+            buildMode = moveMode;
+            buildElements = nelements;
+            if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
+            if (buildMode == MOVE_MODE_RELATIVE) {
+                if (buildElements < 1) buildElements = 1;
+            } else if (buildElements < 2) buildElements = 2;
+            if (buildElements != nelements) {
+                nelements = buildElements;
+                pvPut(nelements);
+            }
+            if (buildMode == MOVE_MODE_RELATIVE)
+                npoints = buildElements;
             else
-                npoints = nelements-1;
+                npoints = buildElements-1;
             /* If total time mode, calc time per element and write,
                else use the array timeTraj  */
             if (timeMode == TIME_MODE_TOTAL) {
                 dtime = time_PV/npoints;
-                for (i=0; i<nelements; i++) timeTrajectory[i] = dtime;
+                for (i=0; i<buildElements; i++) timeTrajectory[i] = dtime;
                 pvPut(timeTrajectory);
             }
         
@@ -335,10 +352,10 @@ ss xpsTrajectoryScan {
             if (npulses > 0) {
                 /* Check validity, modify values if necessary */
                 if (startPulses < 1) startPulses = 1;
-                if (startPulses > nelements) startPulses = nelements;
+                if (startPulses > buildElements) startPulses = buildElements;
                 pvPut(startPulses);
                 if (endPulses < startPulses) endPulses = startPulses;
-                if (endPulses > nelements) endPulses = nelements;
+                if (endPulses > buildElements) endPulses = buildElements;
                 pvPut(endPulses);
 
                 /* The XPS can only output pulses at a fixed period, not a fixed
@@ -979,7 +996,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
         /* Note: the preDistance and postDistance numbers computed here are
          * in user coordinates, not XPS coordinates, because they are used for 
          * EPICS moves at the start and end of the scan */
-        if (pVar->moveMode == MOVE_MODE_RELATIVE) {
+        if (pVar->buildMode == MOVE_MODE_RELATIVE) {
             distance = pVar->motorTrajectory[j][0];
         } else {
             distance = pVar->motorTrajectory[j][1] - pVar->motorTrajectory[j][0];
@@ -987,13 +1004,13 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
         preVelocity[j] = distance/pVar->timeTrajectory[0];
         time = fabs(preVelocity[j]) / maxAcceleration[j];
         if (time > preTimeMax) preTimeMax = time;
-        if (pVar->moveMode == MOVE_MODE_RELATIVE) {
-            distance = pVar->motorTrajectory[j][pVar->nelements-1];
+        if (pVar->buildMode == MOVE_MODE_RELATIVE) {
+            distance = pVar->motorTrajectory[j][pVar->buildElements-1];
         } else {
-            distance = pVar->motorTrajectory[j][pVar->nelements-1] - 
-                       pVar->motorTrajectory[j][pVar->nelements-2];
+            distance = pVar->motorTrajectory[j][pVar->buildElements-1] - 
+                       pVar->motorTrajectory[j][pVar->buildElements-2];
         }
-        postVelocity[j] = distance/pVar->timeTrajectory[pVar->nelements-1];
+        postVelocity[j] = distance/pVar->timeTrajectory[pVar->buildElements-1];
         time = fabs(postVelocity[j]) / maxAcceleration[j];
         if (time > postTimeMax) postTimeMax = time;
     }
@@ -1021,10 +1038,10 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
  
     /* The number of points in the file is nelements for MOVE_MODE_RELATIVE and
      * nelements-1 for other modes */
-    if (pVar->moveMode == MOVE_MODE_RELATIVE) 
-        npoints = pVar->nelements;
+    if (pVar->buildMode == MOVE_MODE_RELATIVE) 
+        npoints = pVar->buildElements;
     else 
-        npoints = pVar->nelements-1;
+        npoints = pVar->buildElements-1;
     for (i=0; i<npoints; i++) {
         T0 = pVar->timeTrajectory[i];
         if (i < npoints-1)
@@ -1032,7 +1049,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
         else
             T1 = T0;
         for (j=0; j<pVar->numAxes; j++) {
-            if (pVar->moveMode == MOVE_MODE_RELATIVE) {
+            if (pVar->buildMode == MOVE_MODE_RELATIVE) {
                 D0 = pVar->motorTrajectory[j][i] * dir[j];
                 if (i < npoints-1) 
                     D1 = pVar->motorTrajectory[j][i+1] * dir[j];
