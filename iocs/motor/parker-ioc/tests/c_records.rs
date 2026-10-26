@@ -18,3 +18,15 @@ fn st_cmd_loads_the_c_oem_records() {
     );
     assert_same_records(&script_records(&dir().join("st.cmd")), &c);
 }
+
+#[test]
+fn st_acr_cmd_loads_the_c_acr_records() {
+    // C's asyn2 sits on ARIES1 beside asyn1, its ARIES2 port's records on
+    // the second controller this IOC does not configure.
+    let c = renamed(
+        &read_dbl(&dir().join("tests/st.cmd.acr.dbl")),
+        &[("IOC:ACR1:", "ACR:PARKER1:"), ("IOC:", "ACR:")],
+        &["IOC:m2", "IOC:ACR2:", "IOC:asyn2"],
+    );
+    assert_same_records(&script_records(&dir().join("st.acr.cmd")), &c);
+}

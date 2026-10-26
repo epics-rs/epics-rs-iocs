@@ -24,8 +24,10 @@ asynOctetSetOutputEos("$(IPPORT)", 0, "\r")
 # ACRCreateController(portName, ACRPortName, numAxes, movingPollPeriod, idlePollPeriod).
 ACRCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 20, 1000)
 
-# One motor record per axis (OUT @asyn($(CTRL),axis)).
-dbLoadRecords("$(PARKER_IOC)/db/acr.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+# The axis's basic_asyn_motor.db and ACRAux*.template records, and the
+# octet port's asynRecord, as C's st.cmd.acr loads them.
+dbLoadTemplate("$(PARKER_IOC)/db/motor.substitutions.acr", "P=$(P),PORT=$(CTRL)")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=asyn1,PORT=$(IPPORT),ADDR=0,OMAX=256,IMAX=256")
 
 iocInit()
 
