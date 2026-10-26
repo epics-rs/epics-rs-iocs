@@ -22,10 +22,11 @@ modbusInterposeConfig("$(PORT1)_IP", 0, 2000, 0)
 modbusInterposeConfig("$(PORT2)_IP", 0, 2000, 0)
 
 # drvModbusAsynConfigure(port, octetPort, slave, function, startAddr, length, dataType, pollMsec, plcType)
-drvModbusAsynConfigure("$(PORT1)_In",  "$(PORT1)_IP", 0, 4,  0,    120, "INT16",       100, "ANF2_stepper")
-drvModbusAsynConfigure("$(PORT2)_In",  "$(PORT2)_IP", 0, 4,  0,    60,  "INT16",       100, "ANF2_stepper")
-drvModbusAsynConfigure("$(PORT1)_Out", "$(PORT1)_IP", 0, 16, 1024, 120, "INT32_LE_BS", 1,   "ANF2_stepper")
-drvModbusAsynConfigure("$(PORT2)_Out", "$(PORT2)_IP", 0, 16, 1024, 60,  "INT32_LE_BS", 1,   "ANF2_stepper")
+# dataType is C's enum index: 0 INT16, 6 INT32_LE_BS.
+drvModbusAsynConfigure("$(PORT1)_In",  "$(PORT1)_IP", 0, 4,  0,    120, 0, 100, "ANF2_stepper")
+drvModbusAsynConfigure("$(PORT2)_In",  "$(PORT2)_IP", 0, 4,  0,    60,  0, 100, "ANF2_stepper")
+drvModbusAsynConfigure("$(PORT1)_Out", "$(PORT1)_IP", 0, 16, 1024, 120, 6, 1,   "ANF2_stepper")
+drvModbusAsynConfigure("$(PORT2)_Out", "$(PORT2)_IP", 0, 16, 1024, 60,  6, 1,   "ANF2_stepper")
 
 # motorUtil's records, then each axis's asyn_motor.db and ANF2Aux.template,
 # as C's st.cmd and motor.cmd.ANF2 load them.

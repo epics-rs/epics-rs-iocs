@@ -17,10 +17,11 @@ modbusInterposeConfig("ang1_1", 0, 2000, 0)
 # Per axis, an In port reading its input registers and an Out port writing
 # single registers (the ANG1 can't be configured for a multi-register write).
 # drvModbusAsynConfigure(port, octetPort, slave, function, startAddr, length, dataType, pollMsec, plcType)
-drvModbusAsynConfigure("ANG1_1_1_In_Word",  "ang1_1", 0, 4, 0,    10, "INT16", 100, "ANG1_stepper")
-drvModbusAsynConfigure("ANG1_1_2_In_Word",  "ang1_1", 0, 4, 10,   10, "INT16", 100, "ANG1_stepper")
-drvModbusAsynConfigure("ANG1_1_1_Out_Word", "ang1_1", 0, 6, 1024, 10, "INT16", 1,   "ANG1_stepper")
-drvModbusAsynConfigure("ANG1_1_2_Out_Word", "ang1_1", 0, 6, 1034, 10, "INT16", 1,   "ANG1_stepper")
+# dataType is C's enum index: 0 INT16.
+drvModbusAsynConfigure("ANG1_1_1_In_Word",  "ang1_1", 0, 4, 0,    10, 0, 100, "ANG1_stepper")
+drvModbusAsynConfigure("ANG1_1_2_In_Word",  "ang1_1", 0, 4, 10,   10, 0, 100, "ANG1_stepper")
+drvModbusAsynConfigure("ANG1_1_1_Out_Word", "ang1_1", 0, 6, 1024, 10, 0, 1,   "ANG1_stepper")
+drvModbusAsynConfigure("ANG1_1_2_Out_Word", "ang1_1", 0, 6, 1034, 10, 0, 1,   "ANG1_stepper")
 
 # motorUtil's records and each axis's basic_asyn_motor.db, as C's st.cmd and
 # st.cmd.ANG1 load them. C's st.cmd.ANG1 loads ANG1_motors.substitutions, a
