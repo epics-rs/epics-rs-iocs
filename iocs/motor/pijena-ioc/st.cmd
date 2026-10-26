@@ -24,8 +24,10 @@ asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # ---- PIJEDS controller ----
-# PIJEDSSetup(num_cards, scan_rate in Hz)
-PIJEDSSetup(1, 10)
+# PIJEDSSetup(num_cards, scan_rate in Hz). C's PIJEDS.cmd passes
+# (1, 2, 60), a "drives per controller" arg the 2-arg command lacks, so C
+# polls at 2 Hz; this passes the 60 Hz its comment means.
+PIJEDSSetup(1, 60)
 
 # PIJEDSConfig(card, asyn port, GPIB address) - axis count
 # auto-detected.
