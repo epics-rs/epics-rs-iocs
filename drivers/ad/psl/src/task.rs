@@ -300,9 +300,14 @@ async fn publish_frame(
 
     // C dereferences a refused alloc unchecked (PSL.cpp:573); here the frame
     // is dropped after the pool's limit line.
-    let Ok(mut array) = ctx.pool.alloc_with(dims, data) else {
+    let Ok(mut array) = ctx.pool.alloc(dims, data.data_type()) else {
         return;
     };
+    array
+        .fill()
+        .data_mut()
+        .as_u8_slice_mut()
+        .copy_from_slice(data.as_u8_slice());
     array.unique_id = unique_id;
     array.timestamp = ts;
     array.time_stamp = now.as_f64();

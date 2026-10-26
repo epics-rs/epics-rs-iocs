@@ -29,7 +29,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ndarray_driver::{
     ArrayOwner, NDArrayDriverBase, handle_write_int32,
 };
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
@@ -1244,16 +1244,25 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
 
     // Address 11: the whole [QE_MAX_DATA, numRead] array, sample-major on disk
     // exactly as the C++ ring layout.
-    let mut flat = Vec::with_capacity(num_read * QE_MAX_DATA);
-    for s in &samples {
-        flat.extend_from_slice(s);
-    }
     // C dereferences a refused alloc unchecked (drvQuadEM.cpp:333, :351); here
     // that array is dropped after the pool's limit line.
-    if let Ok(mut all) = ctx.pool.alloc_with(
+    if let Ok(mut all) = ctx.pool.alloc(
         vec![NDDimension::new(QE_MAX_DATA), NDDimension::new(num_read)],
-        NDDataBuffer::from_vec(flat),
+        NDDataType::Float64,
     ) {
+        let mut frame = all.fill();
+        let flat = frame
+            .data_mut()
+            .as_mut_slice::<f64>()
+            .expect("allocated as NDFloat64");
+        for (row, s) in flat
+            .as_chunks_mut::<QE_MAX_DATA>()
+            .0
+            .iter_mut()
+            .zip(&samples)
+        {
+            row.copy_from_slice(s);
+        }
         all.unique_id = counter;
         all.time_stamp = time_stamp;
         ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
@@ -1263,13 +1272,20 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
 
     // Addresses 0-10: one [numRead] array per data item.
     for item in 0..QE_MAX_DATA {
-        let column: Vec<f64> = samples.iter().map(|s| s[item]).collect();
-        let Ok(mut single) = ctx.pool.alloc_with(
-            vec![NDDimension::new(num_read)],
-            NDDataBuffer::from_vec(column),
-        ) else {
+        let Ok(mut single) = ctx
+            .pool
+            .alloc(vec![NDDimension::new(num_read)], NDDataType::Float64)
+        else {
             continue;
         };
+        let mut frame = single.fill();
+        let column = frame
+            .data_mut()
+            .as_mut_slice::<f64>()
+            .expect("allocated as NDFloat64");
+        for (v, s) in column.iter_mut().zip(&samples) {
+            *v = s[item];
+        }
         single.unique_id = counter;
         single.time_stamp = time_stamp;
         ArrayPublisher::new(ctx.outputs[item].clone())

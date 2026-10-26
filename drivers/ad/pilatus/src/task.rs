@@ -12,7 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::error::ADResult;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataView, NDDataViewMut, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDataView, NDDataViewMut, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PersistentArray, PublishedArray};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -328,12 +328,20 @@ fn build_array(
     data: Vec<i32>,
     description: Option<String>,
 ) -> ADResult<DriverArray> {
-    let buffer = NDDataBuffer::from_vec(data);
     let mut attributes = NDAttributeList::new();
     if let Some(d) = description {
         attributes.add(tiff_description(d));
     }
-    let mut array = pool.alloc_with(vec![NDDimension::new(nx), NDDimension::new(ny)], buffer)?;
+    let mut array = pool.alloc(
+        vec![NDDimension::new(nx), NDDimension::new(ny)],
+        NDDataType::Int32,
+    )?;
+    array
+        .fill()
+        .data_mut()
+        .as_mut_slice::<i32>()
+        .expect("allocated as NDInt32")
+        .copy_from_slice(&data);
     array.unique_id = unique_id;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();

@@ -9,7 +9,9 @@ use std::time::{Duration, SystemTime};
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataView, NDDataViewMut, NDDimension};
+use epics_rs::ad_core::ndarray::{
+    NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension,
+};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -3024,7 +3026,12 @@ async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: S
         output,
     )
     .await;
-    if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
+    if let Ok(mut array) = ctx.pool.alloc(dims(), data.data_type()) {
+        array
+            .fill()
+            .data_mut()
+            .as_u8_slice_mut()
+            .copy_from_slice(data.as_u8_slice());
         ctx.attributes_as(locking, &mut array).await;
         add_time_attributes(&mut array, &a.time_ms);
         let saturated = Accum::PrvHst.saturated(&ctx.shared);
@@ -3032,17 +3039,26 @@ async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: S
         ctx.publish_at(5, array, time_stamp).await;
     }
 
-    if let Ok(mut array) = ctx
-        .pool
-        .alloc_with(dims(), NDDataBuffer::from_vec(a.time_ms.clone()))
-    {
+    if let Ok(mut array) = ctx.pool.alloc(dims(), NDDataType::Float64) {
+        array
+            .fill()
+            .data_mut()
+            .as_mut_slice::<f64>()
+            .expect("allocated as NDFloat64")
+            .copy_from_slice(&a.time_ms);
         ctx.attributes_as(locking, &mut array).await;
         ctx.publish_at(7, array, time_stamp).await;
     }
 
     if let Some(current) = a.current.filter(|c| c.len() == bins)
-        && let Ok(mut array) = ctx.pool.alloc_with(dims(), NDDataBuffer::from_vec(current))
+        && let Ok(mut array) = ctx.pool.alloc(dims(), NDDataType::UInt32)
     {
+        array
+            .fill()
+            .data_mut()
+            .as_mut_slice::<u32>()
+            .expect("allocated as NDUInt32")
+            .copy_from_slice(&current);
         ctx.attributes_as(locking, &mut array).await;
         add_range_attributes(&mut array, "uint32", "counts", false);
         ctx.publish_at(6, array, time_stamp).await;
@@ -3058,7 +3074,12 @@ async fn publish_hst_arrays(ctx: &Ctx, locking: Locking, a: HstArrays, output: S
             output,
         )
         .await;
-        if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
+        if let Ok(mut array) = ctx.pool.alloc(dims(), data.data_type()) {
+            array
+                .fill()
+                .data_mut()
+                .as_u8_slice_mut()
+                .copy_from_slice(data.as_u8_slice());
             ctx.attributes_as(locking, &mut array).await;
             add_time_attributes(&mut array, &a.time_ms);
             let saturated = Accum::PrvHst.saturated(&ctx.shared);
@@ -3115,12 +3136,18 @@ async fn publish_img_sum(
     sum: Vec<u64>,
     unique_id: i32,
 ) {
-    let Ok(mut array) = ctx.pool.alloc_with(
+    let Ok(mut array) = ctx.pool.alloc(
         vec![NDDimension::new(width), NDDimension::new(height)],
-        NDDataBuffer::from_vec(sum),
+        NDDataType::UInt64,
     ) else {
         return;
     };
+    array
+        .fill()
+        .data_mut()
+        .as_mut_slice::<u64>()
+        .expect("allocated as NDUInt64")
+        .copy_from_slice(&sum);
     array.unique_id = unique_id;
     // serval_stream.cpp:1271-1275, :1301-1305: stamped before getAttributes.
     array.time_stamp = EpicsTimestamp::now().as_f64();
@@ -3170,7 +3197,12 @@ async fn push_processed_img(ctx: &Ctx) {
         output,
     )
     .await;
-    if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
+    if let Ok(mut array) = ctx.pool.alloc(dims(), data.data_type()) {
+        array
+            .fill()
+            .data_mut()
+            .as_u8_slice_mut()
+            .copy_from_slice(data.as_u8_slice());
         wall_clock_stamp(&mut array);
         let _ = ctx.pool.owner().get_attributes(&mut array).await;
         let saturated = Accum::Img.saturated(&ctx.shared);
@@ -3188,7 +3220,12 @@ async fn push_processed_img(ctx: &Ctx) {
             output,
         )
         .await;
-        if let Ok(mut array) = ctx.pool.alloc_with(dims(), data) {
+        if let Ok(mut array) = ctx.pool.alloc(dims(), data.data_type()) {
+            array
+                .fill()
+                .data_mut()
+                .as_u8_slice_mut()
+                .copy_from_slice(data.as_u8_slice());
             wall_clock_stamp(&mut array);
             let _ = ctx.pool.owner().get_attributes(&mut array).await;
             let saturated = Accum::Img.saturated(&ctx.shared);
@@ -3247,21 +3284,28 @@ fn image_array(
     use crate::stream::PixelFormat;
     // C allocates the NDArray in the header's storage type
     // (serval_stream.cpp:157-159, :793-795).
-    let data = match f.format {
-        PixelFormat::UInt8 => NDDataBuffer::from_vec(pixels.into_iter().map(|p| p as u8).collect()),
-        PixelFormat::UInt16 => {
-            NDDataBuffer::from_vec(pixels.into_iter().map(|p| p as u16).collect())
-        }
-        PixelFormat::UInt32 => NDDataBuffer::from_vec(pixels),
+    let data_type = match f.format {
+        PixelFormat::UInt8 => NDDataType::UInt8,
+        PixelFormat::UInt16 => NDDataType::UInt16,
+        PixelFormat::UInt32 => NDDataType::UInt32,
     };
-    let array = ctx.pool.alloc_with(
+    let Ok(mut array) = ctx.pool.alloc(
         vec![NDDimension::new(f.width), NDDimension::new(f.height)],
-        data,
-    );
-    if array.is_err() {
+        data_type,
+    ) else {
         ctx.trace(TraceMask::ERROR, refused);
+        return None;
+    };
+    match array.fill().data_mut().view_mut() {
+        NDDataViewMut::U8(out) => out.iter_mut().zip(&pixels).for_each(|(o, &p)| *o = p as u8),
+        NDDataViewMut::U16(out) => out
+            .iter_mut()
+            .zip(&pixels)
+            .for_each(|(o, &p)| *o = p as u16),
+        NDDataViewMut::U32(out) => out.copy_from_slice(&pixels),
+        _ => unreachable!("allocated as the frame's storage type"),
     }
-    array.ok()
+    Some(array)
 }
 
 /// C hands the frame the getAttributes set plus ThresholdID, and no
@@ -6222,19 +6266,13 @@ mod tests {
             header: serde_json::Value::Null,
         };
         let dims = || vec![NDDimension::new(1)];
-        let mut array = ctx
-            .pool
-            .alloc_with(dims(), NDDataBuffer::from_vec::<u32>(vec![1]))
-            .unwrap();
+        let mut array = ctx.pool.alloc(dims(), NDDataType::UInt32).unwrap();
         frame_stamps(&ctx, &frame).await(&mut array);
         assert_eq!(array.timestamp, EpicsTimestamp::from(fixed));
 
         let (tx, mut rx) = epics_rs::ad_core::plugin::channel::ndarray_channel("TPX_TS_SINK", 4);
         ctx.outputs[4].lock().add(tx);
-        let array = ctx
-            .pool
-            .alloc_with(dims(), NDDataBuffer::from_vec::<u32>(vec![1]))
-            .unwrap();
+        let array = ctx.pool.alloc(dims(), NDDataType::UInt32).unwrap();
         ctx.publish_at(4, array, 1.0).await;
         let posted = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await

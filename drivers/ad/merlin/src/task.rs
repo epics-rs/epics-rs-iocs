@@ -17,7 +17,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDDataView, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDataView, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -318,12 +318,12 @@ async fn publish_image(
         }
     };
 
-    let Ok(mut array) = ctx.pool.alloc_with(
+    let Ok(mut array) = ctx.pool.alloc(
         vec![
             NDDimension::new(header.x_size),
             NDDimension::new(header.y_size),
         ],
-        data,
+        data.data_type(),
     ) else {
         // merlinDetector.cpp:436-442 (copyToNDArray8, and its 16/32 twins).
         trace(
@@ -340,6 +340,11 @@ async fn publish_image(
         );
         return false;
     };
+    array
+        .fill()
+        .data_mut()
+        .as_u8_slice_mut()
+        .copy_from_slice(data.as_u8_slice());
     array.unique_id = array_counter;
     // C never calls updateTimeStamp, so epicsTS stays zero
     // (merlinDetector.cpp:255-258).
@@ -397,9 +402,9 @@ async fn publish_profiles(
     };
     // C fills the profile waveforms only once the array is allocated
     // (merlinDetector.cpp:384-391).
-    let Ok(mut array) = ctx.pool.alloc_with(
+    let Ok(mut array) = ctx.pool.alloc(
         vec![NDDimension::new(stride), NDDimension::new(2)],
-        profiles.image,
+        NDDataType::UInt32,
     ) else {
         ctx.data
             .trace("merlinDetector:copyProfileToNDArray32: unable to allocate NDArray from pool\n");
@@ -410,6 +415,11 @@ async fn publish_profiles(
         );
         return false;
     };
+    array
+        .fill()
+        .data_mut()
+        .as_u8_slice_mut()
+        .copy_from_slice(profiles.image.as_u8_slice());
 
     // doCallbacksInt32Array, Y then X (merlinDetector.cpp:415-416).
     let (x, y) = (ctx.params.profile_x, ctx.params.profile_y);

@@ -412,12 +412,17 @@ async fn publish_frame(
         .into();
     // C dereferences a refused alloc unchecked (PhotonII.cpp:416); here the frame
     // is dropped after the pool's limit line.
-    let Ok(mut array) = ctx.pool.alloc_with(
+    let Ok(mut array) = ctx.pool.alloc(
         vec![NDDimension::new(PII_SIZE_X), NDDimension::new(PII_SIZE_Y)],
-        data,
+        data.data_type(),
     ) else {
         return Ok(());
     };
+    array
+        .fill()
+        .data_mut()
+        .as_u8_slice_mut()
+        .copy_from_slice(data.as_u8_slice());
     array.unique_id = array_counter;
     array.timestamp = ts;
     // C stamped every frame of an acquisition with the acquisition's start

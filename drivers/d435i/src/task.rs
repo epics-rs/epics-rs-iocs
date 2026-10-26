@@ -8,7 +8,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -524,7 +524,6 @@ async fn process_color_frame(
         let ptr = unsafe { frame.get_data() as *const std::os::raw::c_void as *const u8 };
         let bytes = copy_frame_data(ptr, stride, row_bytes, h);
 
-        let data = NDDataBuffer::from_vec(bytes);
         // RGB1 layout: [3, width, height]
         let dims = vec![
             NDDimension::new(3),
@@ -535,9 +534,14 @@ async fn process_color_frame(
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
         // No C driver to follow: a refused frame is dropped after the pool's
         // limit line.
-        let Ok(mut array) = ctx.color_pool.alloc_with(dims, data) else {
+        let Ok(mut array) = ctx.color_pool.alloc(dims, NDDataType::UInt8) else {
             return;
         };
+        array
+            .fill()
+            .data_mut()
+            .as_u8_slice_mut()
+            .copy_from_slice(&bytes);
         array.unique_id = array_counter;
         array.timestamp = ts;
         array.time_stamp = ts.as_f64();
@@ -582,14 +586,19 @@ async fn process_depth_frame(
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
 
-    let data = NDDataBuffer::from_vec(pixels);
     // Mono layout: [width, height]
     let dims = vec![NDDimension::new(w), NDDimension::new(h)];
 
     let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-    let Ok(mut array) = ctx.depth_pool.alloc_with(dims, data) else {
+    let Ok(mut array) = ctx.depth_pool.alloc(dims, NDDataType::UInt16) else {
         return;
     };
+    array
+        .fill()
+        .data_mut()
+        .as_mut_slice::<u16>()
+        .expect("allocated as NDUInt16")
+        .copy_from_slice(&pixels);
     array.unique_id = array_counter;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();
@@ -630,16 +639,22 @@ async fn process_pointcloud(
             .collect();
 
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-        let Ok(mut array) = ctx.color_pool.alloc_with(
+        let Ok(mut array) = ctx.color_pool.alloc(
             vec![
                 NDDimension::new(3),
                 NDDimension::new(w),
                 NDDimension::new(h),
             ],
-            NDDataBuffer::from_vec(data),
+            NDDataType::Float32,
         ) else {
             return;
         };
+        array
+            .fill()
+            .data_mut()
+            .as_mut_slice::<f32>()
+            .expect("allocated as NDFloat32")
+            .copy_from_slice(&data);
         array.unique_id = array_counter;
         array.timestamp = ts;
         array.time_stamp = ts.as_f64();

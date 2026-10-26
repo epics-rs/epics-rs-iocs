@@ -181,7 +181,15 @@ async fn acquire_one_image(
     // dereferences a refused alloc unchecked; here the frame is dropped after
     // the pool's limit line.
     let Some(array) = ctx.pool.owner().replace_array(0, || {
-        let mut array = ctx.pool.alloc_with(decoded.dims, decoded.data).ok()?;
+        let mut array = ctx
+            .pool
+            .alloc(decoded.dims, decoded.data.data_type())
+            .ok()?;
+        array
+            .fill()
+            .data_mut()
+            .as_u8_slice_mut()
+            .copy_from_slice(decoded.data.as_u8_slice());
         array.unique_id = image_counter;
         array.timestamp = end_ts;
         array.time_stamp = start_time.as_f64();

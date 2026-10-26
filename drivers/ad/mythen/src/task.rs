@@ -8,7 +8,7 @@ use std::time::Duration;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
@@ -185,12 +185,18 @@ async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> 
 
     // C allocates before it counts (mythen.cpp:973, :993) and dereferences a
     // refused alloc; the frame is dropped after the pool's reached-limit line.
-    let Ok(mut array) = s.pool.alloc_with(
+    let Ok(mut array) = s.pool.alloc(
         vec![NDDimension::new(width), NDDimension::new(1)],
-        NDDataBuffer::from_vec(channels),
+        NDDataType::UInt32,
     ) else {
         return true;
     };
+    array
+        .fill()
+        .data_mut()
+        .as_mut_slice::<u32>()
+        .expect("allocated as NDUInt32")
+        .copy_from_slice(&channels);
 
     let mut attributes = NDAttributeList::new();
     attributes.add(NDAttribute::new_static(

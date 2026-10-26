@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -581,11 +581,17 @@ impl Task {
         // C dereferences a refused alloc unchecked (specsAnalyser.cpp:454, :493);
         // here the frame is dropped after the pool's limit line.
         if array_callbacks != 0
-            && let Ok(mut array) = self.w.pool.alloc_with(
+            && let Ok(mut array) = self.w.pool.alloc(
                 vec![NDDimension::new(nx), NDDimension::new(ny)],
-                NDDataBuffer::from_vec(image),
+                NDDataType::Float64,
             )
         {
+            array
+                .fill()
+                .data_mut()
+                .as_mut_slice::<f64>()
+                .expect("allocated as NDFloat64")
+                .copy_from_slice(&image);
             array.unique_id = array_counter;
             array.time_stamp = acq_start_epoch;
             array.timestamp = EpicsTimestamp::now();

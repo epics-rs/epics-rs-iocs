@@ -20,7 +20,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -318,12 +318,20 @@ async fn publish_frame(
     // C dereferences a refused alloc unchecked (BISDetector.cpp:588); here the frame
     // is dropped after the pool's limit line. C allocates NDInt32 there, though
     // DataType says UInt32, and readSFRM stores the unsigned pixels in it.
-    let Ok(mut array) = ctx.pool.alloc_with(
+    let Ok(mut array) = ctx.pool.alloc(
         vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
-        NDDataBuffer::from_vec(image.data.into_iter().map(|v| v as i32).collect()),
+        NDDataType::Int32,
     ) else {
         return Ok(());
     };
+    let mut frame = array.fill();
+    let pixels = frame
+        .data_mut()
+        .as_mut_slice::<i32>()
+        .expect("allocated as NDInt32");
+    for (p, v) in pixels.iter_mut().zip(image.data) {
+        *p = v as i32;
+    }
     array.unique_id = unique_id;
     array.time_stamp = exposure.start_time.as_f64();
     array.timestamp = ctx

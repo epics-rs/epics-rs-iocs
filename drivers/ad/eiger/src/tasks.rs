@@ -1485,10 +1485,17 @@ fn build_array(
     unique_id: i32,
     timestamp: EpicsTimestamp,
 ) -> ADResult<DriverArray> {
-    let mut array = pool.alloc_with(
+    // A compressed frame holds its payload bytes, which its dims do not size.
+    let mut array = pool.alloc_sized(
         vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
-        data,
+        data.data_type(),
+        data.total_bytes(),
     )?;
+    array
+        .fill()
+        .data_mut()
+        .as_u8_slice_mut()
+        .copy_from_slice(data.as_u8_slice());
     array.unique_id = unique_id;
     // C sets `timeStamp = ts.secPastEpoch + ts.nsec/1.e9` (stream2Api.cpp:337),
     // as updateTimeStamps does.

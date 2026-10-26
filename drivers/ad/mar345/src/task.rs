@@ -14,7 +14,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
 use epics_rs::ad_core::driver::{ADDriver, ImageMode};
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -389,12 +389,20 @@ impl Worker {
 
         // C dereferences a refused alloc (mar345.cpp:194); the frame is
         // dropped after the pool's reached-limit line.
-        let Ok(mut array) = self.pool.alloc_with(
+        let Ok(mut array) = self.pool.alloc(
             vec![NDDimension::new(nx), NDDimension::new(ny)],
-            NDDataBuffer::from_vec(pixels.iter().map(|&v| v as u16).collect()),
+            NDDataType::UInt16,
         ) else {
             return;
         };
+        let mut frame = array.fill();
+        let out = frame
+            .data_mut()
+            .as_mut_slice::<u16>()
+            .expect("allocated as NDUInt16");
+        for (o, &v) in out.iter_mut().zip(&pixels) {
+            *o = v as u16;
+        }
         array.unique_id = image_counter;
         // C sets the double timeStamp from acqStartTime and the epicsTS from the
         // port's updateTimeStamp (mar345.cpp:212-213).

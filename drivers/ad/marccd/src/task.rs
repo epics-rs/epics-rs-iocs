@@ -17,7 +17,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
 use epics_rs::ad_core::driver::{ADDriver, ADStatus};
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -202,11 +202,17 @@ impl Worker {
         // C dereferences a refused alloc (marCCD.cpp:314); the frame is
         // dropped after the pool's reached-limit line.
         if array_callbacks != 0
-            && let Ok(mut array) = self.pool.alloc_with(
+            && let Ok(mut array) = self.pool.alloc(
                 vec![NDDimension::new(nx), NDDimension::new(ny)],
-                NDDataBuffer::from_vec(data),
+                NDDataType::UInt16,
             )
         {
+            array
+                .fill()
+                .data_mut()
+                .as_mut_slice::<u16>()
+                .expect("allocated as NDUInt16")
+                .copy_from_slice(&data);
             array.unique_id = image_counter;
             // C uses `acqStartTime` for the double timestamp, and the port's
             // `updateTimeStamp` for the epicsTS (marCCD.cpp:323-325).

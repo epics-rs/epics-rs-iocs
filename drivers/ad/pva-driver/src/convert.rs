@@ -333,9 +333,16 @@ pub fn decode_nt_nd_array(pool: &DriverPool, value: &PvField) -> Result<DriverAr
     let (dts_sec, dts_nsec) = read_time_t(s, "dataTimeStamp")?;
     let time_stamp = (dts_sec as f64 + dts_nsec as f64 * 1e-9) - EPICS_EPOCH_OFFSET as f64;
 
+    // C's alloc of `totalBytes` under the dims (pvaDriver.cpp:270), which a
+    // compressed frame's dims do not size.
     let mut array = pool
-        .alloc_with(dims, data)
+        .alloc_sized(dims, data.data_type(), data.total_bytes())
         .map_err(|_| ConvertError::PoolExhausted)?;
+    array
+        .fill()
+        .data_mut()
+        .as_u8_slice_mut()
+        .copy_from_slice(data.as_u8_slice());
     array.unique_id = unique_id;
     array.timestamp = timestamp;
     array.time_stamp = time_stamp;
