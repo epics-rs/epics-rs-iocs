@@ -1,4 +1,4 @@
-# C's iocNewFocus PMNC87xx.substitutions on this IOC's axis, P from st.cmd.
+# C's iocNewFocus PMNC87xx.substitutions, P from st.cmd.
 # The driver maps signal S onto the discovered (driver module, channel) and
 # clamps velocity to 2000 steps/sec and acceleration to 16..32000
 # steps/sec^2.
@@ -7,4 +7,9 @@ file "$(MOTOR)/db/motor.db"
 pattern
 {N,  M,        DTYP,        C,  S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,    PREC,  DHLM,  DLLM,  INIT}
 {1,  "m$(N)",  "PMNC87xx",  0,  0,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4,  5,     100,   -100,  ""}
+{2,  "m$(N)",  "PMNC87xx",  0,  1,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4,  5,     100,   -100,  ""}
+{3,  "m$(N)",  "PMNC87xx",  0,  2,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4,  5,     100,   -100,  ""}
+{4,  "m$(N)",  "PMNC87xx",  0,  3,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4,  5,     100,   -100,  ""}
+{5,  "m$(N)",  "PMNC87xx",  0,  4,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4,  5,     100,   -100,  ""}
+{6,  "m$(N)",  "PMNC87xx",  0,  5,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4,  5,     100,   -100,  ""}
 }
