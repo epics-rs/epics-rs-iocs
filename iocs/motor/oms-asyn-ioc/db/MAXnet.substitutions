@@ -1,0 +1,9 @@
+# C's iocOmsAsyn MAXnet.substitutions, P and PORT from st.cmd; the values
+# are the motor record this IOC had before. The driver reports positions in
+# controller-native steps, so MRES = 1 and EGU = steps.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{N,  M,       DTYP,         ADDR,  DESC,  EGU,    DIR,  VELO,   VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,     DLLM,      INIT}
+{1,  "m$(N)", "asynMotor",  0,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+}

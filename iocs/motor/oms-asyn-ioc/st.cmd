@@ -27,7 +27,11 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 # controller reports, up to numAxes; initString is sent verbatim at boot.
 omsMAXnetConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "")
 
-dbLoadRecords("$(OMS_ASYN_IOC)/db/oms.template", "P=$(P),M=m1,PORT=$(PORT),ADDR=0")
+# The axis's asyn_motor.db, as C's MAXnet.cmd loads it.
+dbLoadTemplate("$(OMS_ASYN_IOC)/db/MAXnet.substitutions", "P=$(P),PORT=$(PORT)")
+
+# motorUtil's records, as C's st.cmd loads them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
