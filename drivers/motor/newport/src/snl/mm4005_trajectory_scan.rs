@@ -416,6 +416,10 @@ mod tests {
             refuse_verify: bool,
             /// Whether `VC` was the last write.
             verifying: bool,
+            /// Whether `XC1` takes 300 ms to answer.
+            slow_xc: bool,
+            /// Whether `AB` was written, which stops the axes.
+            aborted: bool,
         }
 
         type Shared = Arc<Mutex<Mm4005>>;
@@ -426,8 +430,13 @@ mod tests {
             match cmd {
                 "TB" => m.tb.clone(),
                 "TP" => format!("1TP{}", m.position),
+                "XC1" if m.slow_xc => {
+                    drop(m);
+                    std::thread::sleep(Duration::from_millis(300));
+                    "XC4".into()
+                }
                 "XC1" => "XC4".into(),
-                "MS" if m.moving > 0 => {
+                "MS" if m.moving > 0 && !m.aborted => {
                     m.moving -= 1;
                     "1MSA".into()
                 }
@@ -458,9 +467,10 @@ mod tests {
             }
         }
 
-        /// Whether the write of `cmd` is refused.
-        fn refused(mm: &Shared, cmd: &str) -> bool {
+        /// The fake's side of the write of `cmd`: whether it is refused.
+        fn written(mm: &Shared, cmd: &str) -> bool {
             let mut m = mm.lock().unwrap();
+            m.aborted |= cmd == "AB\r";
             let verify = std::mem::replace(&mut m.verifying, cmd == "VC\r");
             m.refuse_verify && verify && cmd == "TB\r"
         }
@@ -587,12 +597,14 @@ mod tests {
                 short: false,
                 refuse_verify: false,
                 verifying: false,
+                slow_xc: false,
+                aborted: false,
             }));
             let (shared, writes) = (mm.clone(), mm.clone());
             let (rig, _) = LineRig::failing(
                 port,
                 move |cmd| reply(&shared, cmd),
-                move |cmd| refused(&writes, cmd),
+                move |cmd| written(&writes, cmd),
             );
             sim_axis(port);
             let mut macros: HashMap<String, String> = [
@@ -797,6 +809,32 @@ mod tests {
             assert_eq!(value(&p.db, "T:m1"), 0.5);
             assert_eq!(value(&p.db, "T:traj1:M1Current"), 0.5);
             assert_eq!(string(&p.db, "T:traj1:ExecMessage"), " ");
+        }
+
+        /// ss trajectoryScan state wait_execute: an abort while an EXECUTING
+        /// pass polls ends the run aborted, though that pass then finds the
+        /// axes stopped.
+        #[epics_rs::base::epics_test]
+        async fn an_abort_during_a_poll_ends_the_run_aborted() {
+            let p = boot("mm4005AbortPoll", &[]).await;
+            p.build().await;
+            expect(&p.db, &[("T:traj1:BuildStatus", 1.0)]).await;
+            {
+                let mut m = p.mm.lock().unwrap();
+                m.moving = u32::MAX;
+                m.slow_xc = true;
+            }
+            p.sent();
+            put(&p.db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
+            p.until("XC1").await;
+            put(&p.db, "T:traj1:Abort", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Execute", 0.0), ("T:traj1:ExecState", 0.0)],
+            )
+            .await;
+            assert_eq!(value(&p.db, "T:traj1:ExecStatus"), 3.0);
+            assert_eq!(string(&p.db, "T:traj1:ExecMessage"), "Motion aborted");
         }
 
         /// ss trajectoryScan state readback: each traced point's actual

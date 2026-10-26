@@ -98,6 +98,9 @@ int epicsMotorDoneIndex[MAX_AXES];
  * the defininition in vxWorks. */
 unsigned long startTime;  
 
+/* Set by trajectoryAbort on an abort, cleared as each execute starts */
+evflag abortFlag;
+
 /* Define escaped C functions at end of file */
 %% static int writeOnly(SS_ID ssId, struct UserVar *pVar, char *command);
 %% static int writeRead(SS_ID ssId, struct UserVar *pVar, char *command);
@@ -388,6 +391,7 @@ ss trajectoryScan {
 
     state execute {
         when () {
+            efClear(abortFlag);
             /* Set busy flag */
             execState = EXECUTE_STATE_MOVE_START;
             pvPut(execState);
@@ -421,10 +425,18 @@ ss trajectoryScan {
 
     /* Wait for trajectory to complete */
     state wait_execute {
-        when (execStatus == STATUS_ABORT) {
+        when (efTest(abortFlag)) {
             /* The trajectory_abort state set has detected an abort. It has
              * already posted the status and message.  Don't execute flyback
              * return to top */
+            /* Upstream tested execStatus == STATUS_ABORT, which an EXECUTING
+             * pass the abort landed in overwrote with the axes it had stopped:
+             * the run then flew back as a success.  abortFlag is the abort,
+             * and its status and message are posted again over that pass's. */
+            execStatus = STATUS_ABORT;
+            pvPut(execStatus);
+            strcpy(execMessage, "Motion aborted");
+            pvPut(execMessage);
             execState = EXECUTE_STATE_DONE;
             pvPut(execState);
             /* Clear execute command, post.  This is a "busy" record, don't
@@ -568,6 +580,7 @@ ss trajectoryScan {
 ss trajectoryAbort {
     state monitorAbort {
         when (efTestAndClear(abortMon) && (abort==1)) {
+            efSet(abortFlag);
             /* Send AB command */
             strcpy(stringOut,"AB");
             %%writeOnly(ssId, pVar, pVar->stringOut);
