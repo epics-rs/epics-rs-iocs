@@ -31,8 +31,8 @@ EMC18011Setup(1, 60)
 # EMC18011Config(card, asyn port) - fixed 3 axes.
 EMC18011Config(0, "$(SERIAL)")
 
-# Each axis's motor.db, as C's EMC18011.cmd loads it, and motorUtil's
-# records, as C's st.cmd loads them.
+# The motor.db row C's EMC18011.cmd loads, and motorUtil's records, as
+# C's st.cmd loads them.
 dbLoadTemplate("$(ORIEL_IOC)/db/EMC18011.substitutions", "P=$(P),C=$(CARD)")
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 

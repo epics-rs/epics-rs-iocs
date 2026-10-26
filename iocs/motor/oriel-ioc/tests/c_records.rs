@@ -1,5 +1,5 @@
 //! st.cmd boots with the records C's iocOriel st.cmd loads, on this IOC's
-//! prefix and axes.
+//! prefix.
 
 use std::path::Path;
 
@@ -14,18 +14,12 @@ const RENAMES: &[(&str, &str)] = &[("oriel:", "ORIEL:")];
 fn st_cmd_loads_the_c_records() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let c = read_dbl(&dir.join("tests/st.cmd.dbl"));
-    let mut want = renamed(&c, RENAMES, &[]);
-    // C's EMC18011.substitutions loads one axis; the controller's other two
-    // take its records.
-    for m in ["ORIEL:m2", "ORIEL:m3"] {
-        want.extend(renamed(&c, &[("oriel:m1", m)], &["oriel:"]));
-    }
+    let want = renamed(&c, RENAMES, &[]);
     let ioc = Path::new(env!("CARGO_BIN_EXE_oriel-ioc"));
     assert_same_records(&booted_records(ioc, &dir.join("st.cmd")), &want);
 }
 
-/// st.cmd's loads and dbpf lines leave every field of C's axis as C's
-/// leave it; the axes that take its records have no C row.
+/// st.cmd's loads and dbpf lines leave every field as C's leave it.
 #[test]
 fn st_cmd_sets_the_c_fields() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
