@@ -110,14 +110,18 @@ int elapsedTimeIndex;
 #define ABORT_STATE_DONE 3
 int abortState;
 
-%%epicsTimeStamp startTime;
-%%epicsTimeStamp currTime;
-%%epicsTimeStamp lastPollTime;
+/* Upstream kept these as file-scope epicsTimeStamp globals, which every instance of
+ * this +r program shares, so one controller's execute moved another's start and poll
+ * times, and with them its 2*expectedTime timeout.  Seconds from timeNow(). */
+double startTime;
+double currTime;
+double lastPollTime;
 
 %%epicsTimeStamp pvtTime;
 %%epicsTimeStamp lastPvtTime;
 
 /* Define escaped C functions at end of file */
+%% static double timeNow(void);
 %% static int writeOnly(SS_ID ssId, struct UserVar *pVar, char *command);
 %% static int writeRead(SS_ID ssId, struct UserVar *pVar, char *command, char *reply);
 %% static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos);
@@ -171,7 +175,8 @@ int nAcqDataPoints;
 #define ReverseMotionDirection_PARM_NUM 1
 #define HomePositionSet_PARM_NUM 166
 
-%%int encoder_runs_backwards=0;
+/* Per instance, as the times above; upstream's file-scope int was shared the same way. */
+int encoder_runs_backwards;
 
 int pulsePositionsLoaded;
 int numPulsePositionsLoaded;
@@ -552,12 +557,12 @@ ss EnsembleTrajectoryScan {
 			if (execStatus != STATUS_ABORT) {
 
 				%%getMotorPositions(ssId, pVar, pVar->motorStart);
-				%%epicsTimeGetCurrent(&lastPollTime);
+				%%pVar->lastPollTime = timeNow();
 
 				/* Get start time of execute */
 				elapsedTime = 0.;
 				pvPut(elapsedTime);
-				%%epicsTimeGetCurrent(&startTime);
+				%%pVar->startTime = timeNow();
 				execState = EXECUTE_STATE_EXECUTING;
 				pvPut(execState);
 				for (j=0, movingMask = 0; j<numAxes; j++) {
@@ -593,12 +598,12 @@ ss EnsembleTrajectoryScan {
 		when ((execState==EXECUTE_STATE_EXECUTING) && delay(0.1)) {
 
 			/* Get the current motor positions, post them */
-			%%epicsTimeGetCurrent(&currTime);
-			%%pVar->dtime = epicsTimeDiffInSeconds(&currTime, &lastPollTime);
+			%%pVar->currTime = timeNow();
+			dtime = currTime - lastPollTime;
 			if (dtime > POLL_INTERVAL) {
-				%%pVar->elapsedTime = epicsTimeDiffInSeconds(&currTime, &startTime);
+				elapsedTime = currTime - startTime;
 				pvPut(elapsedTime);
-				%%epicsTimeGetCurrent(&lastPollTime);
+				%%pVar->lastPollTime = timeNow();
 				%%getMotorPositions(ssId, pVar, pVar->motorCurrent);
 				for (j=0; j<numAxes; j++) {
 					if (moveAxis[j]) {
@@ -699,7 +704,7 @@ ss EnsembleTrajectoryScan {
 						if (j==10) printf("abandoned read of point %d\n", i);
 					}
 					k = atoi(&stringIn[1]);
-					%%if (encoder_runs_backwards) pVar->k *= -1;
+					if (encoder_runs_backwards) k *= -1;
 					motorReadbacks[0][i] = k * epicsMotorMres[0] + motorPosOffset[0];
 					motorError[0][i] = motorReadbacks[0][i] - motorTrajectory[0][i];
 				}
@@ -785,6 +790,15 @@ ss trajectoryAbort {
 /***********************************************************************************************************/
 /* C functions */
 %{
+
+/* Seconds past the EPICS epoch. */
+static double timeNow(void)
+{
+	epicsTimeStamp now;
+
+	epicsTimeGetCurrent(&now);
+	return now.secPastEpoch + now.nsec/1e9;
+}
 
 /* writeOnly sends a command to the Ensemble controller */
 static int writeOnly(SS_ID ssId, struct UserVar *pVar, char *command)
@@ -1411,8 +1425,8 @@ static int loadTrajectory(SS_ID ssId, struct UserVar *pVar, int *pstatus) {
 	*pstatus = 0; /* assume success */
 	sprintf(stringOut, "getparm(@0,%d)", ReverseMotionDirection_PARM_NUM);
 	status = writeRead(ssId, pVar, stringOut, reply);
-	encoder_runs_backwards = atoi(&reply[1]);
-	if (pVar->debugLevel > 2) printf("loadTrajectory: encoder_runs_backwards=%d\n", encoder_runs_backwards);
+	pVar->encoder_runs_backwards = atoi(&reply[1]);
+	if (pVar->debugLevel > 2) printf("loadTrajectory: encoder_runs_backwards=%d\n", pVar->encoder_runs_backwards);
 
 	sprintf(stringOut, "getparm(@0,%d)", HomePositionSet_PARM_NUM);
 	status = writeRead(ssId, pVar, stringOut, reply);
@@ -1701,7 +1715,7 @@ static int executeTrajectory(SS_ID ssId, struct UserVar *pVar) {
 	status = sendReceiveCommand(ssId, pVar, "SCOPETRIG", reply, 0);
 #endif
 
-	epicsTimeGetCurrent(&startTime);
+	pVar->startTime = timeNow();
 
 	/* Set Ensemble's IGLOBAL(iarg1Var) to number of motor (argument for DOSTOREDTRAJ command). */
 	for (i=0; i<MAX_AXES; i++) {
