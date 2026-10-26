@@ -1,9 +1,9 @@
-//! st.cmd loads the records C's iocThorLabs st.cmd loads, on this IOC's
-//! prefix and channels.
+//! st.cmd boots with the records C's iocThorLabs st.cmd loads, on this
+//! IOC's prefix and channels.
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, read_dbl, renamed, script_records};
+use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
 
 #[test]
 fn st_cmd_loads_the_c_records() {
@@ -15,5 +15,6 @@ fn st_cmd_loads_the_c_records() {
     for m in ["THORLABS:x", "THORLABS:y", "THORLABS:z"] {
         want.extend(renamed(&c, &[("thorlabs:m1", m)], &["thorlabs:"]));
     }
-    assert_same_records(&script_records(&dir.join("st.cmd")), &want);
+    let ioc = Path::new(env!("CARGO_BIN_EXE_thorlabs-ioc"));
+    assert_same_records(&booted_records(ioc, &dir.join("st.cmd")), &want);
 }

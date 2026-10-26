@@ -1,9 +1,9 @@
-//! st.cmd loads the records C's iocOriel st.cmd loads, on this IOC's prefix
-//! and axes.
+//! st.cmd boots with the records C's iocOriel st.cmd loads, on this IOC's
+//! prefix and axes.
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, read_dbl, renamed, script_records};
+use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
 
 #[test]
 fn st_cmd_loads_the_c_records() {
@@ -15,5 +15,6 @@ fn st_cmd_loads_the_c_records() {
     for m in ["ORIEL:m2", "ORIEL:m3"] {
         want.extend(renamed(&c, &[("oriel:m1", m)], &["oriel:"]));
     }
-    assert_same_records(&script_records(&dir.join("st.cmd")), &want);
+    let ioc = Path::new(env!("CARGO_BIN_EXE_oriel-ioc"));
+    assert_same_records(&booted_records(ioc, &dir.join("st.cmd")), &want);
 }

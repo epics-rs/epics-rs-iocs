@@ -1,9 +1,9 @@
-//! st.cmd loads the records C's iocNewFocus st.cmd loads, on this IOC's
-//! prefix and PMNC87xx axis.
+//! st.cmd boots with the records C's iocNewFocus st.cmd loads, on this
+//! IOC's prefix and PMNC87xx axis.
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, read_dbl, renamed, script_records};
+use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
 
 #[test]
 fn st_cmd_loads_the_c_records() {
@@ -21,5 +21,6 @@ fn st_cmd_loads_the_c_records() {
             "newFocus:m6",
         ],
     );
-    assert_same_records(&script_records(&dir.join("st.cmd")), &c);
+    let ioc = Path::new(env!("CARGO_BIN_EXE_newfocus-ioc"));
+    assert_same_records(&booted_records(ioc, &dir.join("st.cmd")), &c);
 }

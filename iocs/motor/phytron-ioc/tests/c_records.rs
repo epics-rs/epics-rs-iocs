@@ -1,12 +1,16 @@
-//! Each startup script loads the records C's iocPhytron loads for its
+//! Each startup script boots with the records C's iocPhytron loads for its
 //! controller, on the script's prefix and axes.
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, read_dbl, renamed, script_records};
+use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
 
 fn dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn ioc() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_phytron-ioc"))
 }
 
 // C's I/O and controller rows carry no prefix; this IOC's are under its P.
@@ -27,7 +31,7 @@ fn st_cmd_loads_the_c_phymotion_records() {
         &RENAMES,
         &["TEST:m2"],
     );
-    assert_same_records(&script_records(&dir().join("st.cmd")), &c);
+    assert_same_records(&booted_records(ioc(), &dir().join("st.cmd")), &c);
 }
 
 #[test]
@@ -37,5 +41,5 @@ fn st_mcc_cmd_loads_the_c_mcc_records() {
         &RENAMES,
         &["TEST:m2"],
     );
-    assert_same_records(&script_records(&dir().join("st.mcc.cmd")), &c);
+    assert_same_records(&booted_records(ioc(), &dir().join("st.mcc.cmd")), &c);
 }

@@ -1,9 +1,10 @@
-//! st.cmd loads the records C's iocNewport st.cmd.xps5 loads, on this IOC's
-//! prefix and its one axis, less those whose parameters this driver lacks.
+//! st.cmd boots with the records C's iocNewport st.cmd.xps5 loads, on this
+//! IOC's prefix and its one axis, less those whose parameters this driver
+//! lacks.
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, read_dbl, renamed, script_records};
+use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
 
 /// XPS_extra.db's records (XPS_MIN_JERK, XPS_MAX_JERK, XPS_STATUS) and the
 /// profile-move records (XPS_PROFILE_*, and PROFILE_* with no XpsHead hook).
@@ -26,5 +27,6 @@ fn st_cmd_loads_the_c_records() {
         &[("IOC:", "XPS:"), ("IOC:m1", "XPS:m0")],
         &[&axes[..], UNSERVED].concat(),
     );
-    assert_same_records(&script_records(&dir.join("st.cmd")), &c);
+    let ioc = Path::new(env!("CARGO_BIN_EXE_xps-ioc"));
+    assert_same_records(&booted_records(ioc, &dir.join("st.cmd")), &c);
 }

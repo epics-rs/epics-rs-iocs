@@ -1,9 +1,9 @@
-//! st.cmd loads the records C's iocMotorSim st.cmd loads, on this IOC's
-//! prefix and its two axes.
+//! st.cmd boots with the records C's iocMotorSim st.cmd loads, on this
+//! IOC's prefix and its two axes.
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, read_dbl, renamed, script_records};
+use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
 
 #[test]
 fn st_cmd_loads_the_c_records() {
@@ -17,5 +17,6 @@ fn st_cmd_loads_the_c_records() {
     c.extend(
         ["allstop", "alldone", "moving", "alldoneBlink", "movingDiff"].map(|r| format!("SIM:{r}")),
     );
-    assert_same_records(&script_records(&dir.join("st.cmd")), &c);
+    let ioc = Path::new(env!("CARGO_BIN_EXE_motorsim-ioc"));
+    assert_same_records(&booted_records(ioc, &dir.join("st.cmd")), &c);
 }

@@ -1,12 +1,16 @@
-//! Each startup script loads the records C's iocParker loads for its
+//! Each startup script boots with the records C's iocParker loads for its
 //! controller, on the script's prefix and axes.
 
 use std::path::Path;
 
-use ioc_conventions::{assert_same_records, read_dbl, renamed, script_records};
+use ioc_conventions::{assert_same_records, booted_records, read_dbl, renamed};
 
 fn dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn ioc() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_parker-ioc"))
 }
 
 #[test]
@@ -16,7 +20,7 @@ fn st_cmd_loads_the_c_oem_records() {
         &[("IOC:", "OEM:")],
         &["IOC:m2", "IOC:m3"],
     );
-    assert_same_records(&script_records(&dir().join("st.cmd")), &c);
+    assert_same_records(&booted_records(ioc(), &dir().join("st.cmd")), &c);
 }
 
 #[test]
@@ -28,7 +32,7 @@ fn st_acr_cmd_loads_the_c_acr_records() {
         &[("IOC:ACR1:", "ACR:PARKER1:"), ("IOC:", "ACR:")],
         &["IOC:m2", "IOC:ACR2:", "IOC:asyn2"],
     );
-    assert_same_records(&script_records(&dir().join("st.acr.cmd")), &c);
+    assert_same_records(&booted_records(ioc(), &dir().join("st.acr.cmd")), &c);
 }
 
 #[test]
@@ -38,5 +42,5 @@ fn st_pc6k_cmd_loads_the_c_pc6k_records() {
         &[("parker:", "PC6K:")],
         &["parker:m2"],
     );
-    assert_same_records(&script_records(&dir().join("st-pc6k.cmd")), &c);
+    assert_same_records(&booted_records(ioc(), &dir().join("st-pc6k.cmd")), &c);
 }
