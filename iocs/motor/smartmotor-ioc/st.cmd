@@ -11,7 +11,7 @@
 
 epicsEnvSet("P",      "SM:")
 epicsEnvSet("CARD",   "0")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -32,8 +32,7 @@ SmartMotorSetup(1, 10)
 SmartMotorConfig(0, "$(SERIAL)")
 
 # Chain axis 0's motor.db, as C's SmartMotor.cmd loads it (a row per motor,
-# S=n), and motorUtil's records, as C's st.cmd loads them. The SmartMotor
-# works in encoder counts, so MRES = 1 and EGU = counts.
+# S=n), and motorUtil's records, as C's st.cmd loads them.
 dbLoadTemplate("$(SMARTMOTOR_IOC)/db/SmartMotor.substitutions", "P=$(P),C=$(CARD)")
 dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
@@ -45,4 +44,4 @@ motorUtilInit("$(P)")
 # Example:
 #   dbl
 #   camonitor SM:m1 SM:m1.RBV
-#   caput SM:m1 100000
+#   caput SM:m1 10

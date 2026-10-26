@@ -1,10 +1,8 @@
-# C's iocSmartMotor SmartMotor.substitutions on this IOC's axis, P from
-# st.cmd; the values are the motor record this IOC had before. Signal S is
-# chain axis S. The SmartMotor works in encoder counts, so MRES = 1 and
-# EGU = counts; VELO (counts/s) and ACCL feed V= and A=.
+# C's iocSmartMotor SmartMotor.substitutions, P and C from st.cmd. Signal S
+# is chain axis S; VELO and ACCL feed V= and A=.
 file "$(MOTOR)/db/motor.db"
 {
 pattern
-{N,  M,        DTYP,          S,  DESC,  EGU,     DIR,  VELO,    VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,       DLLM,        INIT}
-{1,  "m$(N)",  "SmartMotor",  0,  "",    counts,  Pos,  100000,  0,     .5,    0,     0,     .5,    1,     0,     100000000,  -100000000,  ""}
+{N,  M,        DTYP,          S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)",  "SmartMotor",  0,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
 }
