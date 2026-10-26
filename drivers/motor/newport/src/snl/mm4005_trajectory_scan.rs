@@ -421,6 +421,8 @@ mod tests {
             verifying: bool,
             /// Whether `XC1` takes 300 ms to answer.
             slow_xc: bool,
+            /// Whether `TB` takes 300 ms to answer.
+            slow_tb: bool,
             /// Whether `AB` was written, which stops the axes.
             aborted: bool,
         }
@@ -431,6 +433,12 @@ mod tests {
             let cmd = cmd.trim_end_matches('\r');
             let mut m = mm.lock().unwrap();
             match cmd {
+                "TB" if m.slow_tb => {
+                    let tb = m.tb.clone();
+                    drop(m);
+                    std::thread::sleep(Duration::from_millis(300));
+                    tb
+                }
                 "TB" => m.tb.clone(),
                 "TP" => format!("1TP{}", m.position),
                 "XC1" if m.slow_xc => {
@@ -601,6 +609,7 @@ mod tests {
                 refuse_verify: false,
                 verifying: false,
                 slow_xc: false,
+                slow_tb: false,
                 aborted: false,
             }));
             let (shared, writes) = (mm.clone(), mm.clone());
@@ -704,37 +713,95 @@ mod tests {
             p.sent().iter().filter(|c| c.contains("DT")).count()
         }
 
-        /// ss trajectoryScan state build bounds a relative trajectory to
-        /// MAX_ELEMENTS.
+        /// ss trajectoryScan state build bounds each build where its arrays
+        /// end: MAX_ELEMENTS relative, and absolute MAX_ELEMENTS-3 with a moved
+        /// axis, whose padding writes past the last element, else
+        /// MAX_ELEMENTS. An absolute build posts its padded count, as C.
         #[epics_rs::base::epics_test]
-        async fn a_relative_build_past_max_elements_builds_max_elements() {
-            let p = boot("mm4005RelativeMax", &[]).await;
-            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(2001)).await;
-            p.sent();
-            p.build().await;
-            expect(
-                &p.db,
-                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 2000.0)],
-            )
-            .await;
-            assert_eq!(elements(&p), 2000);
+        async fn each_build_is_bounded_where_its_arrays_end() {
+            let p = boot("mm4005Bounds", &[]).await;
+            // (M1Move, MoveMode, Nelements put, Nelements after, DT, DX)
+            for (axis, mode, n, after, dt, dx) in [
+                (1, 0, 2000, 2000.0, 2000, 2000),
+                (1, 0, 2001, 2000.0, 2000, 2000),
+                (0, 0, 2000, 2000.0, 2000, 0),
+                (0, 0, 2001, 2000.0, 2000, 0),
+                (1, 1, 1997, 1997.0, 1996, 1996),
+                (1, 1, 1998, 1997.0, 1996, 1996),
+                (0, 1, 2000, 2001.0, 2000, 0),
+                (0, 1, 2001, 2001.0, 2000, 0),
+            ] {
+                put(&p.db, "T:traj1:M1Move", EpicsValue::Enum(axis)).await;
+                put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(mode)).await;
+                put(&p.db, "T:traj1:Nelements", EpicsValue::Long(n)).await;
+                p.sent();
+                p.build().await;
+                expect(
+                    &p.db,
+                    &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", after)],
+                )
+                .await;
+                let sent = p.sent();
+                let count = |s: &str| sent.iter().filter(|c| c.contains(s)).count();
+                assert_eq!((count("DT"), count("DX")), (dt, dx), "{axis} {mode} {n}");
+            }
         }
 
-        /// ss trajectoryScan state build bounds an absolute trajectory to
-        /// MAX_ELEMENTS-3, the most its padding past the last element fits.
+        /// ss trajectoryScan state build sends an absolute trajectory of
+        /// 1998 elements with no axis moved as C does: padded to 2001, with
+        /// no motorTrajectory to fit.
         #[epics_rs::base::epics_test]
-        async fn an_absolute_build_leaves_room_for_its_padding() {
-            let p = boot("mm4005AbsoluteMax", &[]).await;
+        async fn an_absolute_build_with_no_moved_axis_is_sent_whole() {
+            let p = boot("mm4005AbsoluteNoAxis", &[]).await;
+            put(&p.db, "T:traj1:M1Move", EpicsValue::Enum(0)).await;
             put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(1)).await;
-            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(2000)).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(1998)).await;
+            expect(&p.db, &[("T:traj1:EndPulses", 1998.0)]).await;
             p.sent();
             p.build().await;
             expect(
                 &p.db,
-                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 1997.0)],
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", 2001.0)],
             )
             .await;
-            assert_eq!(elements(&p), 1996);
+            let mut want: Vec<String> = ["NC", "1DC0", "UC0.500000"].map(String::from).into();
+            for i in 1..=2000 {
+                let t = if i <= 1997 { 10.0 / 1998.0 } else { 0.1 };
+                want.push(format!("{i}DT{t:.6}"));
+                if i % 20 == 0 {
+                    want.push("TB".into());
+                }
+            }
+            want.extend(["MB1,ME1998,MN11", "VC", "TB"].map(String::from));
+            assert_eq!(p.sent(), want);
+        }
+
+        /// ss trajectoryScan state build declares, pads and moves the axes
+        /// moveAxis named when it began: an M1Move put while it waits on the
+        /// twentieth element's TB leaves its DX set as declared, either way.
+        /// The dynamic-parameter reads after VC read moveAxis live, as C.
+        #[epics_rs::base::epics_test]
+        async fn a_move_axis_put_mid_build_leaves_the_builds_axes() {
+            let p = boot("mm4005MoveAxisMidBuild", &[]).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(40)).await;
+            expect(&p.db, &[("T:traj1:EndPulses", 40.0)]).await;
+            p.mm.lock().unwrap().slow_tb = true;
+            for (declared, then, dx, rc) in [("1DC1", 0, 40, 0), ("1DC0", 1, 0, 6)] {
+                p.sent();
+                put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+                p.until("TB").await;
+                put(&p.db, "T:traj1:M1Move", EpicsValue::Enum(then)).await;
+                expect(
+                    &p.db,
+                    &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)],
+                )
+                .await;
+                let sent = p.sent();
+                assert!(sent.iter().any(|c| c == declared), "{sent:?}");
+                assert_eq!(sent.iter().filter(|c| c.contains("DT")).count(), 40);
+                assert_eq!(sent.iter().filter(|c| c.contains("DX")).count(), dx);
+                assert_eq!(sent.iter().filter(|c| c.contains("RC")).count(), rc);
+            }
         }
 
         /// ss trajectoryScan state build sends a relative trajectory of no

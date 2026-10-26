@@ -74,9 +74,11 @@ int anyMoving;
 int ncomplete;
 int nextra;
 int npoints;
-/* State build's one bounded read of nelements and moveMode */
+/* State build's one bounded read of nelements, moveMode and moveAxis */
 int buildElements;
 int buildMode;
+int buildMoveAxis[MAX_AXES];
+int buildMoved;
 int dir;
 double dtime;
 double dpos;
@@ -203,21 +205,32 @@ ss trajectoryScan {
             pvPut(buildState);
             buildStatus=STATUS_UNDEFINED;
             pvPut(buildStatus);
-            /* Upstream built from the monitored nelements and moveMode, re-read
-             * throughout and unbounded by the arrays.  buildElements and buildMode
+            /* Upstream built from the monitored nelements, moveMode and moveAxis,
+             * re-read throughout and nelements unbounded by the arrays:
+             * an absolute build of 1998-2000 elements writes motorTrajectory[j]
+             * past its end for an axis moveAxis sets during the build, and the
+             * build sends DX for an axis its DC never declared.  The build* copies
              * are the one bounded read.  Upstream's padding writes
              * timeTrajectory[npoints] on, moved axes or not, so a negative npoints
              * it pads (one not a multiple of 4) indexes before the arrays; any other
              * count below 1 point sends no element and is kept.  Above, an absolute
              * trajectory's padding past its last element needs it at most
-             * MAX_ELEMENTS-3. */
+             * MAX_ELEMENTS-3 when an axis moves; any other is held to the
+             * arrays' MAX_ELEMENTS. */
             buildMode = moveMode;
             buildElements = nelements;
+            buildMoved = 0;
+            for (j=0; j<numAxes; j++) {
+                buildMoveAxis[j] = moveAxis[j];
+                if (buildMoveAxis[j]) buildMoved = 1;
+            }
             if (buildMode == MOVE_MODE_RELATIVE) {
                 if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
                 if (buildElements < 0 && buildElements % 4 != 0) buildElements = 0;
             } else {
-                if (buildElements > MAX_ELEMENTS-3) buildElements = MAX_ELEMENTS-3;
+                if (buildMoved) {
+                    if (buildElements > MAX_ELEMENTS-3) buildElements = MAX_ELEMENTS-3;
+                } else if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
                 if (buildElements < 1 && (buildElements-1) % 4 != 0) buildElements = 1;
             }
             if (buildElements != nelements) {
@@ -229,7 +242,7 @@ ss trajectoryScan {
             %%writeOnly(ssId, pVar, pVar->stringOut);
             /* Define which motors are to be moved */
             for (i=0; i<numAxes; i++) {
-                sprintf(stringOut, "%dDC%d", i+1, moveAxis[i]);
+                sprintf(stringOut, "%dDC%d", i+1, buildMoveAxis[i]);
                 %%writeOnly(ssId, pVar, pVar->stringOut);
             }
             /* Set acceleration time */
@@ -260,7 +273,7 @@ ss trajectoryScan {
                 for (i=0; i<nextra; i++) {
                     timeTrajectory[npoints+i] = PAD_TIME;
                     for (j=0; j<numAxes; j++) {
-                        if (!moveAxis[j]) continue;
+                        if (!buildMoveAxis[j]) continue;
                         if (buildMode == MOVE_MODE_RELATIVE) {
                             motorTrajectory[j][buildElements+i] = 
                                         motorTrajectory[j][buildElements-1] *
@@ -296,7 +309,7 @@ ss trajectoryScan {
                 sprintf(stringOut, "%dDT%f", i+1, timeTrajectory[i]);
                 %%writeOnly(ssId, pVar, pVar->stringOut);
                 for (j=0; j<numAxes; j++) {
-                    if (!moveAxis[j]) continue;
+                    if (!buildMoveAxis[j]) continue;
                     if (buildMode == MOVE_MODE_RELATIVE) {
                         dpos = motorTrajectory[j][i];
                     } else {
