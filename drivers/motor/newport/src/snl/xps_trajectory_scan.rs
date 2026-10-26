@@ -1015,16 +1015,27 @@ mod tests {
         use std::sync::{Arc, Condvar, Mutex};
         use std::time::Duration;
 
+        use epics_rs::asyn::interfaces::motor::AsynMotor;
         use epics_rs::base::runtime::task::sleep;
         use epics_rs::base::server::database::PvDatabase;
         use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::scan::ScanOwner;
         use epics_rs::base::types::EpicsValue;
+        use epics_rs::motor::builder::{AxisSetup, MotorBuilder};
+        use epics_rs::motor::sim_motor::SimMotor;
+        use epics_rs::motor::trace::TraceUser;
         use epics_seq_rs::{seq, seq_stop};
 
         use super::*;
         use crate::xps::XpsSocket;
 
         const DB: &str = include_str!("../../../../../iocs/motor/xps-ioc/db/trajectoryScan.db");
+
+        /// m1 on a simulated axis at dial 0, user offset `$(OFF)`.
+        const MOTOR: &str = r#"record(motor, "T:m1") { field(DTYP, "asynMotor")
+            field(OUT, "@asyn($(PORT)m1,0)") field(MRES, "0.001") field(VELO, "1")
+            field(VMAX, "1") field(ACCL, "0.2") field(DHLM, "100") field(DLLM, "-100")
+            field(OFF, "$(OFF)") }"#;
 
         /// What the fake XPS has seen and holds.
         #[derive(Default)]
@@ -1046,6 +1057,7 @@ mod tests {
                 "GroupStatusGet" if x.running => "0,45",
                 "GroupStatusGet" => "0,12",
                 "GroupPositionCurrentGet" => "0,0",
+                "PositionerUserTravelLimitsGet" => "0,-5,5",
                 "PositionerSGammaParametersGet" => "0,10,40,0.02,0.02",
                 "MultipleAxesPVTVerificationResultGet" => "0,traj.trj,-0.5,2.5,1.2,3.4",
                 "MultipleAxesPVTParametersGet" => "0,traj.trj,1",
@@ -1095,30 +1107,64 @@ mod tests {
             (port, shared)
         }
 
-        async fn ioc() -> Arc<PvDatabase> {
+        /// `port`'s axis m1 of one simulated motor.
+        fn sim_axis(port: &str) {
+            let motor: Arc<Mutex<dyn AsynMotor>> =
+                Arc::new(Mutex::new(SimMotor::new().with_limits(-1e9, 1e9)));
+            let name = format!("{port}m1");
+            let AxisSetup {
+                axis, poll_loop, ..
+            } = MotorBuilder::new(motor)
+                .trace_user(TraceUser::Asyn {
+                    port: name.clone(),
+                    addr: 0,
+                })
+                .poll_interval(Duration::from_millis(10))
+                .build_axis();
+            epics_rs::motor::devices::register_controller_port(
+                &epics_rs::asyn::registry::open_owner(),
+                &name,
+                1,
+                (),
+            )
+            .unwrap();
+            epics_rs::motor::devices::register_axis(axis).unwrap();
+            poll_loop.start();
+        }
+
+        /// The trajectory database on NumAxes 1 and T:m1 on the simulated
+        /// axis of asyn port `port`, its user offset `off`.
+        async fn ioc(port: &str, off: &str) -> (Arc<PvDatabase>, ScanOwner) {
+            sim_axis(port);
             let macros: HashMap<String, String> = [
                 ("P", "T:"),
                 ("R", "traj1:"),
                 ("NAXES", "1"),
                 ("NELM", "2000"),
                 ("NPULSE", "2000"),
+                ("PORT", port),
+                ("OFF", off),
             ]
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .into();
             let (motor, factory) = epics_rs::motor::motor_record_factory();
             let (db, _) = IocBuilder::new()
                 .register_record_type(motor, factory)
+                .register_dynamic_device_support(
+                    &epics_rs::motor::devices::devices(),
+                    epics_rs::motor::devices::device_support_factory(),
+                )
                 .register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()))
                 .db_string(DB, &macros)
                 .unwrap()
-                .db_string("record(motor, \"T:m1\") {}\n", &HashMap::new())
+                .db_string(MOTOR, &macros)
                 .unwrap()
                 .build_served()
                 .await
                 .unwrap();
             // seq holds each state set in its first state until PINI is done.
-            db.mark_pini_done();
-            db
+            let scan = ScanOwner::start(db.clone());
+            (db, scan)
         }
 
         /// Poll until `holds` holds of the fake XPS.
@@ -1167,7 +1213,7 @@ mod tests {
         async fn positions_are_read_from_its_own_xps() {
             let (decoy_port, decoy) = xps();
             let (port, xps) = xps();
-            let db = ioc().await;
+            let (db, _scan) = ioc("xpsPositions", "0").await;
             let (index, handle) =
                 crate::ioc::connect_to_server(&db, "127.0.0.1", decoy_port.into()).unwrap();
             let name = handle.port_name().to_string();
@@ -1203,7 +1249,7 @@ mod tests {
             let (port, xps) = xps();
             let (ftp_addr, _ftp_log) = ftp::tests::server("331 password\r\n");
             ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
-            let db = ioc().await;
+            let (db, _scan) = ioc("xpsAbort", "0").await;
             let file = std::env::temp_dir().join(format!("xpsa{}.trj", std::process::id()));
             let file = file.to_str().unwrap().to_string();
             put(
@@ -1213,8 +1259,6 @@ mod tests {
             )
             .await;
             put(&db, "T:traj1:Nelements", EpicsValue::Long(2)).await;
-            // An axis that does not move: T:m1 has no device to complete one.
-            put(&db, "T:traj1:M1Move", EpicsValue::Enum(0)).await;
             let tid =
                 seq(&XPS_trajectoryScan, &macros(port), 0, &db).expect("XPS_trajectoryScan starts");
             // init clears buildMon as it ends (:200); xpsTrajectoryPosition's
