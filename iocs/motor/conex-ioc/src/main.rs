@@ -34,10 +34,13 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(cmd);
     }
 
-    // Standard asyn iocsh commands — provides `drvAsynSerialPortConfigure`,
-    // which creates the serial octet port the CONEX driver connects to.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
+    // asyn.dbd, as C's IOC links it: the asyn record and devEpics, for
+    // basic_asyn_motor.db and asynRecord.db, and the iocsh commands
+    // (`drvAsynSerialPortConfigure`, which creates the serial octet port the
+    // CONEX driver connects to).
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, asyn_factory);
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Newport iocsh commands + motor device support.
     app = app.register_startup_command(ag_conex_create_controller_command());
