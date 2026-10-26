@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use ioc_conventions::{
-    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_records, booted_records, read_dbl,
-    renamed,
+    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_fields, assert_same_records,
+    booted_records, read_db, read_dbl, renamed, script_fields,
 };
 
 fn assert_boots_as_c(script: &str, dbl: &str) {
@@ -15,9 +15,21 @@ fn assert_boots_as_c(script: &str, dbl: &str) {
     assert_same_records(&booted_records(ioc, &dir.join(script)), &c);
 }
 
+/// `script`'s loads and dbpf lines leave every field as C's `db` leaves it.
+fn assert_sets_c_fields(script: &str, db: &str) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let c = read_db(&dir.join("tests").join(db));
+    assert_same_fields(&script_fields(&dir.join(script)), &c);
+}
+
 #[test]
 fn st_cmd_loads_the_c_corvus_records() {
     assert_boots_as_c("st.cmd", "iocMicos.corvus.dbl");
+}
+
+#[test]
+fn st_cmd_sets_the_c_corvus_fields() {
+    assert_sets_c_fields("st.cmd", "iocMicos.corvus.db");
 }
 
 #[test]
@@ -26,8 +38,18 @@ fn st_hydra_cmd_loads_the_c_hydra_records() {
 }
 
 #[test]
+fn st_hydra_cmd_sets_the_c_hydra_fields() {
+    assert_sets_c_fields("st.hydra.cmd", "iocMicos.hydra.db");
+}
+
+#[test]
 fn st_moco_cmd_loads_the_c_moco_records() {
     assert_boots_as_c("st.moco.cmd", "iocMicos.moco.dbl");
+}
+
+#[test]
+fn st_moco_cmd_sets_the_c_moco_fields() {
+    assert_sets_c_fields("st.moco.cmd", "iocMicos.moco.db");
 }
 
 /// motorMicos ships no Taurus example: st.taurus.cmd is corvus's layout for

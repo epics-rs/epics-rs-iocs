@@ -1,0 +1,305 @@
+# c-expansion of st.cmd over the C sources, the records of st.cmd.dbl:
+# dbl of motor R7-4-5 motorNewFocus iocBoot/iocNewFocus st.cmd
+# C refuses newfocus8742.cmd:23 (from st.cmd): asyn_motor.db, which does not parse
+# C refuses newfocus8742.cmd:25 (from st.cmd): asynRecord.db, which does not parse
+record(bi, "newFocus:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "newFocus:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "newFocus:alldone")
+    field(INPB, "newFocus:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "newFocus:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(motor, "newFocus:m1") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 1")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "PMNC87xx")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, "2.5e-4")
+    field(OUT, "#C0 S0 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "newFocus:m1_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bo, "newFocus:m1_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "newFocus:m1.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "newFocus:m1_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "newFocus:m1.TWV")
+    field(INPC, "newFocus:m1.MRES")
+    field(INPD, "newFocus:m1.HLM")
+    field(INPE, "newFocus:m1.LLM")
+    field(OUT, "newFocus:m1.TWV")
+}
+record(calcout, "newFocus:m1_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "newFocus:m1.S")
+    field(INPC, "newFocus:m1.SBAS")
+    field(INPD, "newFocus:m1.SMAX")
+    field(OUT, "newFocus:m1.S")
+}
+record(motor, "newFocus:m2") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 2")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "PMNC87xx")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, "2.5e-4")
+    field(OUT, "#C0 S1 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "newFocus:m2_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bo, "newFocus:m2_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "newFocus:m2.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "newFocus:m2_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "newFocus:m2.TWV")
+    field(INPC, "newFocus:m2.MRES")
+    field(INPD, "newFocus:m2.HLM")
+    field(INPE, "newFocus:m2.LLM")
+    field(OUT, "newFocus:m2.TWV")
+}
+record(calcout, "newFocus:m2_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "newFocus:m2.S")
+    field(INPC, "newFocus:m2.SBAS")
+    field(INPD, "newFocus:m2.SMAX")
+    field(OUT, "newFocus:m2.S")
+}
+record(motor, "newFocus:m3") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 3")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "PMNC87xx")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, "2.5e-4")
+    field(OUT, "#C0 S2 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "newFocus:m3_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bo, "newFocus:m3_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "newFocus:m3.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "newFocus:m3_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "newFocus:m3.TWV")
+    field(INPC, "newFocus:m3.MRES")
+    field(INPD, "newFocus:m3.HLM")
+    field(INPE, "newFocus:m3.LLM")
+    field(OUT, "newFocus:m3.TWV")
+}
+record(calcout, "newFocus:m3_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "newFocus:m3.S")
+    field(INPC, "newFocus:m3.SBAS")
+    field(INPD, "newFocus:m3.SMAX")
+    field(OUT, "newFocus:m3.S")
+}
+record(motor, "newFocus:m4") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 4")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "PMNC87xx")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, "2.5e-4")
+    field(OUT, "#C0 S3 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "newFocus:m4_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bo, "newFocus:m4_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "newFocus:m4.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "newFocus:m4_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "newFocus:m4.TWV")
+    field(INPC, "newFocus:m4.MRES")
+    field(INPD, "newFocus:m4.HLM")
+    field(INPE, "newFocus:m4.LLM")
+    field(OUT, "newFocus:m4.TWV")
+}
+record(calcout, "newFocus:m4_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "newFocus:m4.S")
+    field(INPC, "newFocus:m4.SBAS")
+    field(INPD, "newFocus:m4.SMAX")
+    field(OUT, "newFocus:m4.S")
+}
+record(motor, "newFocus:m5") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 5")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "PMNC87xx")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, "2.5e-4")
+    field(OUT, "#C0 S4 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "newFocus:m5_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bo, "newFocus:m5_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "newFocus:m5.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "newFocus:m5_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "newFocus:m5.TWV")
+    field(INPC, "newFocus:m5.MRES")
+    field(INPD, "newFocus:m5.HLM")
+    field(INPE, "newFocus:m5.LLM")
+    field(OUT, "newFocus:m5.TWV")
+}
+record(calcout, "newFocus:m5_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "newFocus:m5.S")
+    field(INPC, "newFocus:m5.SBAS")
+    field(INPD, "newFocus:m5.SMAX")
+    field(OUT, "newFocus:m5.S")
+}
+record(motor, "newFocus:m6") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 6")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "PMNC87xx")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, "2.5e-4")
+    field(OUT, "#C0 S5 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "newFocus:m6_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bo, "newFocus:m6_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "newFocus:m6.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "newFocus:m6_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "newFocus:m6.TWV")
+    field(INPC, "newFocus:m6.MRES")
+    field(INPD, "newFocus:m6.HLM")
+    field(INPE, "newFocus:m6.LLM")
+    field(OUT, "newFocus:m6.TWV")
+}
+record(calcout, "newFocus:m6_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "newFocus:m6.S")
+    field(INPC, "newFocus:m6.SBAS")
+    field(INPD, "newFocus:m6.SMAX")
+    field(OUT, "newFocus:m6.S")
+}
+record(longout, "newFocus:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "newFocus:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

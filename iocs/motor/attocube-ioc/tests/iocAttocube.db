@@ -1,0 +1,237 @@
+# c-expansion of st.cmd over the C sources, the records of iocAttocube.dbl:
+# dbl of motor R7-4-5 motorAttocube iocBoot/iocAttocube st.cmd
+record(bi, "attocube:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "attocube:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "attocube:alldone")
+    field(INPB, "attocube:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "attocube:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(motor, "attocube:m1") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, "2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 1")
+    field(DHLM, "0")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "asynMotor")
+    field(EGU, "deg")
+    field(INIT, "")
+    field(MRES, "0.01")
+    field(OUT, "@asyn(serial1,0)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "attocube:m1_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "10")
+}
+record(longout, "attocube:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "attocube:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(serial1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "attocube:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "attocube:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(serial1,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "attocube:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "attocube:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(serial1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "attocube:m1_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "attocube:m1.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "attocube:m1_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "attocube:m1.TWV")
+    field(INPC, "attocube:m1.MRES")
+    field(INPD, "attocube:m1.HLM")
+    field(INPE, "attocube:m1.LLM")
+    field(OUT, "attocube:m1.TWV")
+}
+record(calcout, "attocube:m1_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "attocube:m1.S")
+    field(INPC, "attocube:m1.SBAS")
+    field(INPD, "attocube:m1.SMAX")
+    field(OUT, "attocube:m1.S")
+}
+record(motor, "attocube:m2") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, "2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 2")
+    field(DHLM, "0")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.00006")
+    field(OUT, "@asyn(serial1,1)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "attocube:m2_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "1")
+}
+record(longout, "attocube:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "attocube:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(serial1,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "attocube:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "attocube:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(serial1,1)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "attocube:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "attocube:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(serial1,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "attocube:m2_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "attocube:m2.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "attocube:m2_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "attocube:m2.TWV")
+    field(INPC, "attocube:m2.MRES")
+    field(INPD, "attocube:m2.HLM")
+    field(INPE, "attocube:m2.LLM")
+    field(OUT, "attocube:m2.TWV")
+}
+record(calcout, "attocube:m2_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "attocube:m2.S")
+    field(INPC, "attocube:m2.SBAS")
+    field(INPD, "attocube:m2.SMAX")
+    field(OUT, "attocube:m2.S")
+}
+record(motor, "attocube:m3") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, "2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 3")
+    field(DHLM, "0")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.00007")
+    field(OUT, "@asyn(serial1,2)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "attocube:m3_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "1")
+}
+record(longout, "attocube:m3Direction") {
+    field(DESC, "m3 direction")
+    field(DOL, "attocube:m3.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(serial1,2)MOTOR_REC_DIRECTION")
+}
+record(ao, "attocube:m3Offset") {
+    field(DESC, "m3 offset")
+    field(DOL, "attocube:m3.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(serial1,2)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "attocube:m3Resolution") {
+    field(DESC, "m3 resolution")
+    field(DOL, "attocube:m3.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(serial1,2)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "attocube:m3_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "attocube:m3.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "attocube:m3_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "attocube:m3.TWV")
+    field(INPC, "attocube:m3.MRES")
+    field(INPD, "attocube:m3.HLM")
+    field(INPE, "attocube:m3.LLM")
+    field(OUT, "attocube:m3.TWV")
+}
+record(calcout, "attocube:m3_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "attocube:m3.S")
+    field(INPC, "attocube:m3.SBAS")
+    field(INPD, "attocube:m3.SMAX")
+    field(OUT, "attocube:m3.S")
+}
+record(longout, "attocube:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "attocube:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

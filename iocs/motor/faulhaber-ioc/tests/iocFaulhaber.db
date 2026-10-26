@@ -1,0 +1,73 @@
+# c-expansion of st.cmd over the C sources, the records of iocFaulhaber.dbl:
+# dbl of motor R7-4-5 motorFaulhaber iocBoot/iocFaulhaber st.cmd
+record(bi, "faulhaber:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "faulhaber:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "faulhaber:alldone")
+    field(INPB, "faulhaber:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "faulhaber:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(motor, "faulhaber:m1") {
+    field(ACCL, "1.")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 1")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "MCDC2805")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, "1e-3")
+    field(OUT, "#C0 S0 @")
+    field(PREC, "3")
+    field(RSTM, "NearZero")
+    field(SDIS, "faulhaber:m1_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0.")
+    field(VELO, "10")
+}
+record(bo, "faulhaber:m1_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "faulhaber:m1.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "faulhaber:m1_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "faulhaber:m1.TWV")
+    field(INPC, "faulhaber:m1.MRES")
+    field(INPD, "faulhaber:m1.HLM")
+    field(INPE, "faulhaber:m1.LLM")
+    field(OUT, "faulhaber:m1.TWV")
+}
+record(calcout, "faulhaber:m1_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "faulhaber:m1.S")
+    field(INPC, "faulhaber:m1.SBAS")
+    field(INPD, "faulhaber:m1.SMAX")
+    field(OUT, "faulhaber:m1.S")
+}
+record(longout, "faulhaber:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "faulhaber:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

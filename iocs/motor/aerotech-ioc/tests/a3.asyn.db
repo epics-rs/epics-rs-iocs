@@ -1,0 +1,113 @@
+# c-expansion of a3.asyn.st.cmd.linux-x86 over the C sources, the records of a3.asyn.dbl:
+# dbl of motor R7-4-5 motorAerotech iocBoot/iocAerotech a3.asyn.st.cmd.linux-x86
+record(motor, "aerotech:X") {
+    field(ACCL, "1")
+    field(ACCU, "0")
+    field(BACC, "50")
+    field(BDST, "0")
+    field(BVEL, "0")
+    field(DESC, "X")
+    field(DHLM, "380")
+    field(DIR, "Pos")
+    field(DLLM, "-10")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.0004")
+    field(OUT, "@asyn(L1,0)")
+    field(PREC, "5")
+    field(TWV, "1")
+    field(VBAS, "25")
+    field(VELO, "100")
+}
+record(longout, "aerotech:XDirection") {
+    field(DESC, "X direction")
+    field(DOL, "aerotech:X.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(L1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "aerotech:XOffset") {
+    field(DESC, "X offset")
+    field(DOL, "aerotech:X.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(L1,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "aerotech:XResolution") {
+    field(DESC, "X resolution")
+    field(DOL, "aerotech:X.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(L1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(motor, "aerotech:Y") {
+    field(ACCL, "1")
+    field(ACCU, "0")
+    field(BACC, "50")
+    field(BDST, "0")
+    field(BVEL, "0")
+    field(DESC, "Y")
+    field(DHLM, "380")
+    field(DIR, "Pos")
+    field(DLLM, "-10")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.0004")
+    field(OUT, "@asyn(L1,1)")
+    field(PREC, "5")
+    field(TWV, "1")
+    field(VBAS, "25")
+    field(VELO, "100")
+}
+record(longout, "aerotech:YDirection") {
+    field(DESC, "Y direction")
+    field(DOL, "aerotech:Y.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(L1,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "aerotech:YOffset") {
+    field(DESC, "Y offset")
+    field(DOL, "aerotech:Y.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(L1,1)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "aerotech:YResolution") {
+    field(DESC, "Y resolution")
+    field(DOL, "aerotech:Y.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(L1,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bi, "aerotech:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "aerotech:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "aerotech:alldone")
+    field(INPB, "aerotech:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "aerotech:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(longout, "aerotech:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "aerotech:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

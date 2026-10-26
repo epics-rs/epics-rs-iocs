@@ -1,0 +1,3116 @@
+# c-expansion of st.cmd over the C sources, the records of iocAcsMotion.dbl:
+# dbl of motor R7-4-5 motorAcsMotion iocBoot/iocAcsMotion st.cmd. cbMAcsMotion
+# links no busy record, so its records come from it with the
+# profileMoveController.template block cut from AcsMotion.substitutions, and
+# that block's from oracleBusyIoc loading the template with the block's macros.
+record(bi, "acsMotion:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "acsMotion:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "acsMotion:alldone")
+    field(INPB, "acsMotion:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "acsMotion:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(asyn, "acsMotion:asyn") {
+    field(ADDR, "0")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "256")
+    field(OMAX, "256")
+    field(PORT, "ACS1_ETH")
+}
+record(asyn, "acsMotion:io:asyn") {
+    field(ADDR, "0")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "256")
+    field(OMAX, "256")
+    field(PORT, "ACS1_IO_ETH")
+}
+record(motor, "acsMotion:m1") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 1")
+    field(DHLM, "10")
+    field(DIR, "Pos")
+    field(DLLM, "-10")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "1.240234375e-05")
+    field(OUT, "@asyn(ACS1,0)")
+    field(PREC, "6")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "acsMotion:m1_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bi, "acsMotion:m1:HOMED") {
+    field(DESC, "Homing Procedure Done")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0)SPIIPLUS_HOMING_DONE")
+    field(ONAM, "True")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "False")
+}
+record(longin, "acsMotion:m1:MFLAGS") {
+    field(DESC, "MFLAGS parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0)SPIIPLUS_MFLAGS")
+    field(SCAN, "I/O Intr")
+}
+record(longin, "acsMotion:m1:MFLAGSX") {
+    field(DESC, "MFLAGSX parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0)SPIIPLUS_MFLAGSX")
+    field(SCAN, "I/O Intr")
+}
+record(bi, "acsMotion:m1:STO") {
+    field(DESC, "Safe Torque Off")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0)SPIIPLUS_SAFE_TORQUE_OFF")
+    field(ONAM, "Fault")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "OK")
+}
+record(ao, "acsMotion:m1:homingCurrLimit") {
+    field(DESC, "Homing Current Limit")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,0)SPIIPLUS_HOMING_CURR_LIMIT")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m1:homingMaxDist") {
+    field(DESC, "Homing Max Distance")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,0)SPIIPLUS_HOMING_MAX_DIST")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(mbbo, "acsMotion:m1:homingMethod") {
+    field(DESC, "Homing Method")
+    field(DTYP, "asynInt32")
+    field(FRST, "CurrentPos")
+    field(FRVL, "4")
+    field(FVST, "HardStop+Index")
+    field(FVVL, "5")
+    field(ONST, "Limit+Index")
+    field(ONVL, "1")
+    field(OUT, "@asyn(ACS1,0,2.0)SPIIPLUS_HOMING_METHOD")
+    field(PINI, "YES")
+    field(SVST, "Custom")
+    field(SVVL, "7")
+    field(SXST, "HardStop")
+    field(SXVL, "6")
+    field(THST, "Index")
+    field(THVL, "3")
+    field(TWST, "Limit")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(ao, "acsMotion:m1:homingOffsetNeg") {
+    field(DESC, "Homing Offset Neg")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,0)SPIIPLUS_HOMING_OFFSET_NEG")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m1:homingOffsetPos") {
+    field(DESC, "Homing Offset Pos")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,0)SPIIPLUS_HOMING_OFFSET_POS")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(longout, "acsMotion:m1:jogDirection") {
+    field(DESC, "Jog Direction")
+    field(DTYP, "Soft Channel")
+}
+record(calcout, "acsMotion:m1:jogStatus") {
+    field(CALC, "(A>0)&&(B=0) ? 1 : ((A=0)&&(B=0) ? 0 : -1)")
+    field(DESC, "JogState Linkup")
+    field(INPA, "acsMotion:m1.JOGF CP")
+    field(INPB, "acsMotion:m1.JOGR CP")
+    field(OUT, "acsMotion:m1:jogDirection PP")
+}
+record(ao, "acsMotion:m1:maxAcceleration") {
+    field(DESC, "Max Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,0)SPIIPLUS_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(VAL, "20.0")
+}
+record(ai, "acsMotion:m1:maxAcceleration_RBV") {
+    field(DESC, "Max Acceleration RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,0)SPIIPLUS_MAX_ACCELERATION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "acsMotion:m1:maxVelocity") {
+    field(DESC, "Max Velocity")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,0)SPIIPLUS_MAX_VELOCITY")
+    field(PREC, "4")
+    field(VAL, "5.0")
+}
+record(ai, "acsMotion:m1:maxVelocity_RBV") {
+    field(DESC, "Max Velocity RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,0)SPIIPLUS_MAX_VELOCITY")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "acsMotion:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "acsMotion:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "acsMotion:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,0)MOTOR_REC_OFFSET")
+    field(PREC, "6")
+}
+record(ao, "acsMotion:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "acsMotion:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "6")
+}
+record(bo, "acsMotion:m1_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "acsMotion:m1.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "acsMotion:m1_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "acsMotion:m1.TWV")
+    field(INPC, "acsMotion:m1.MRES")
+    field(INPD, "acsMotion:m1.HLM")
+    field(INPE, "acsMotion:m1.LLM")
+    field(OUT, "acsMotion:m1.TWV")
+}
+record(calcout, "acsMotion:m1_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "acsMotion:m1.S")
+    field(INPC, "acsMotion:m1.SBAS")
+    field(INPD, "acsMotion:m1.SMAX")
+    field(OUT, "acsMotion:m1.S")
+}
+record(motor, "acsMotion:m2") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 2")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.0001")
+    field(OUT, "@asyn(ACS1,1)")
+    field(PREC, "4")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "acsMotion:m2_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bi, "acsMotion:m2:HOMED") {
+    field(DESC, "Homing Procedure Done")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,1)SPIIPLUS_HOMING_DONE")
+    field(ONAM, "True")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "False")
+}
+record(longin, "acsMotion:m2:MFLAGS") {
+    field(DESC, "MFLAGS parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,1)SPIIPLUS_MFLAGS")
+    field(SCAN, "I/O Intr")
+}
+record(longin, "acsMotion:m2:MFLAGSX") {
+    field(DESC, "MFLAGSX parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,1)SPIIPLUS_MFLAGSX")
+    field(SCAN, "I/O Intr")
+}
+record(bi, "acsMotion:m2:STO") {
+    field(DESC, "Safe Torque Off")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,1)SPIIPLUS_SAFE_TORQUE_OFF")
+    field(ONAM, "Fault")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "OK")
+}
+record(ao, "acsMotion:m2:homingCurrLimit") {
+    field(DESC, "Homing Current Limit")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,1)SPIIPLUS_HOMING_CURR_LIMIT")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m2:homingMaxDist") {
+    field(DESC, "Homing Max Distance")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,1)SPIIPLUS_HOMING_MAX_DIST")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(mbbo, "acsMotion:m2:homingMethod") {
+    field(DESC, "Homing Method")
+    field(DTYP, "asynInt32")
+    field(FRST, "CurrentPos")
+    field(FRVL, "4")
+    field(FVST, "HardStop+Index")
+    field(FVVL, "5")
+    field(ONST, "Limit+Index")
+    field(ONVL, "1")
+    field(OUT, "@asyn(ACS1,1,2.0)SPIIPLUS_HOMING_METHOD")
+    field(PINI, "YES")
+    field(SVST, "Custom")
+    field(SVVL, "7")
+    field(SXST, "HardStop")
+    field(SXVL, "6")
+    field(THST, "Index")
+    field(THVL, "3")
+    field(TWST, "Limit")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(ao, "acsMotion:m2:homingOffsetNeg") {
+    field(DESC, "Homing Offset Neg")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,1)SPIIPLUS_HOMING_OFFSET_NEG")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m2:homingOffsetPos") {
+    field(DESC, "Homing Offset Pos")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,1)SPIIPLUS_HOMING_OFFSET_POS")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(longout, "acsMotion:m2:jogDirection") {
+    field(DESC, "Jog Direction")
+    field(DTYP, "Soft Channel")
+}
+record(calcout, "acsMotion:m2:jogStatus") {
+    field(CALC, "(A>0)&&(B=0) ? 1 : ((A=0)&&(B=0) ? 0 : -1)")
+    field(DESC, "JogState Linkup")
+    field(INPA, "acsMotion:m2.JOGF CP")
+    field(INPB, "acsMotion:m2.JOGR CP")
+    field(OUT, "acsMotion:m2:jogDirection PP")
+}
+record(ao, "acsMotion:m2:maxAcceleration") {
+    field(DESC, "Max Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,1)SPIIPLUS_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(VAL, "1000.0")
+}
+record(ai, "acsMotion:m2:maxAcceleration_RBV") {
+    field(DESC, "Max Acceleration RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,1)SPIIPLUS_MAX_ACCELERATION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "acsMotion:m2:maxVelocity") {
+    field(DESC, "Max Velocity")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,1)SPIIPLUS_MAX_VELOCITY")
+    field(PREC, "4")
+    field(VAL, "200.0")
+}
+record(ai, "acsMotion:m2:maxVelocity_RBV") {
+    field(DESC, "Max Velocity RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,1)SPIIPLUS_MAX_VELOCITY")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "acsMotion:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "acsMotion:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "acsMotion:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,1)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "acsMotion:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "acsMotion:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(bo, "acsMotion:m2_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "acsMotion:m2.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "acsMotion:m2_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "acsMotion:m2.TWV")
+    field(INPC, "acsMotion:m2.MRES")
+    field(INPD, "acsMotion:m2.HLM")
+    field(INPE, "acsMotion:m2.LLM")
+    field(OUT, "acsMotion:m2.TWV")
+}
+record(calcout, "acsMotion:m2_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "acsMotion:m2.S")
+    field(INPC, "acsMotion:m2.SBAS")
+    field(INPD, "acsMotion:m2.SMAX")
+    field(OUT, "acsMotion:m2.S")
+}
+record(motor, "acsMotion:m3") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 3")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.0001")
+    field(OUT, "@asyn(ACS1,2)")
+    field(PREC, "4")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "acsMotion:m3_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bi, "acsMotion:m3:HOMED") {
+    field(DESC, "Homing Procedure Done")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,2)SPIIPLUS_HOMING_DONE")
+    field(ONAM, "True")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "False")
+}
+record(longin, "acsMotion:m3:MFLAGS") {
+    field(DESC, "MFLAGS parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,2)SPIIPLUS_MFLAGS")
+    field(SCAN, "I/O Intr")
+}
+record(longin, "acsMotion:m3:MFLAGSX") {
+    field(DESC, "MFLAGSX parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,2)SPIIPLUS_MFLAGSX")
+    field(SCAN, "I/O Intr")
+}
+record(bi, "acsMotion:m3:STO") {
+    field(DESC, "Safe Torque Off")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,2)SPIIPLUS_SAFE_TORQUE_OFF")
+    field(ONAM, "Fault")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "OK")
+}
+record(ao, "acsMotion:m3:homingCurrLimit") {
+    field(DESC, "Homing Current Limit")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,2)SPIIPLUS_HOMING_CURR_LIMIT")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m3:homingMaxDist") {
+    field(DESC, "Homing Max Distance")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,2)SPIIPLUS_HOMING_MAX_DIST")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(mbbo, "acsMotion:m3:homingMethod") {
+    field(DESC, "Homing Method")
+    field(DTYP, "asynInt32")
+    field(FRST, "CurrentPos")
+    field(FRVL, "4")
+    field(FVST, "HardStop+Index")
+    field(FVVL, "5")
+    field(ONST, "Limit+Index")
+    field(ONVL, "1")
+    field(OUT, "@asyn(ACS1,2,2.0)SPIIPLUS_HOMING_METHOD")
+    field(PINI, "YES")
+    field(SVST, "Custom")
+    field(SVVL, "7")
+    field(SXST, "HardStop")
+    field(SXVL, "6")
+    field(THST, "Index")
+    field(THVL, "3")
+    field(TWST, "Limit")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(ao, "acsMotion:m3:homingOffsetNeg") {
+    field(DESC, "Homing Offset Neg")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,2)SPIIPLUS_HOMING_OFFSET_NEG")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m3:homingOffsetPos") {
+    field(DESC, "Homing Offset Pos")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,2)SPIIPLUS_HOMING_OFFSET_POS")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(longout, "acsMotion:m3:jogDirection") {
+    field(DESC, "Jog Direction")
+    field(DTYP, "Soft Channel")
+}
+record(calcout, "acsMotion:m3:jogStatus") {
+    field(CALC, "(A>0)&&(B=0) ? 1 : ((A=0)&&(B=0) ? 0 : -1)")
+    field(DESC, "JogState Linkup")
+    field(INPA, "acsMotion:m3.JOGF CP")
+    field(INPB, "acsMotion:m3.JOGR CP")
+    field(OUT, "acsMotion:m3:jogDirection PP")
+}
+record(ao, "acsMotion:m3:maxAcceleration") {
+    field(DESC, "Max Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,2)SPIIPLUS_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(VAL, "1000.0")
+}
+record(ai, "acsMotion:m3:maxAcceleration_RBV") {
+    field(DESC, "Max Acceleration RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,2)SPIIPLUS_MAX_ACCELERATION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "acsMotion:m3:maxVelocity") {
+    field(DESC, "Max Velocity")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,2)SPIIPLUS_MAX_VELOCITY")
+    field(PREC, "4")
+    field(VAL, "200.0")
+}
+record(ai, "acsMotion:m3:maxVelocity_RBV") {
+    field(DESC, "Max Velocity RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,2)SPIIPLUS_MAX_VELOCITY")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:m3Direction") {
+    field(DESC, "m3 direction")
+    field(DOL, "acsMotion:m3.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,2)MOTOR_REC_DIRECTION")
+}
+record(ao, "acsMotion:m3Offset") {
+    field(DESC, "m3 offset")
+    field(DOL, "acsMotion:m3.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,2)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "acsMotion:m3Resolution") {
+    field(DESC, "m3 resolution")
+    field(DOL, "acsMotion:m3.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,2)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(bo, "acsMotion:m3_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "acsMotion:m3.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "acsMotion:m3_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "acsMotion:m3.TWV")
+    field(INPC, "acsMotion:m3.MRES")
+    field(INPD, "acsMotion:m3.HLM")
+    field(INPE, "acsMotion:m3.LLM")
+    field(OUT, "acsMotion:m3.TWV")
+}
+record(calcout, "acsMotion:m3_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "acsMotion:m3.S")
+    field(INPC, "acsMotion:m3.SBAS")
+    field(INPD, "acsMotion:m3.SMAX")
+    field(OUT, "acsMotion:m3.S")
+}
+record(motor, "acsMotion:m4") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 4")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.0001")
+    field(OUT, "@asyn(ACS1,3)")
+    field(PREC, "4")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "acsMotion:m4_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bi, "acsMotion:m4:HOMED") {
+    field(DESC, "Homing Procedure Done")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,3)SPIIPLUS_HOMING_DONE")
+    field(ONAM, "True")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "False")
+}
+record(longin, "acsMotion:m4:MFLAGS") {
+    field(DESC, "MFLAGS parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,3)SPIIPLUS_MFLAGS")
+    field(SCAN, "I/O Intr")
+}
+record(longin, "acsMotion:m4:MFLAGSX") {
+    field(DESC, "MFLAGSX parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,3)SPIIPLUS_MFLAGSX")
+    field(SCAN, "I/O Intr")
+}
+record(bi, "acsMotion:m4:STO") {
+    field(DESC, "Safe Torque Off")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,3)SPIIPLUS_SAFE_TORQUE_OFF")
+    field(ONAM, "Fault")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "OK")
+}
+record(ao, "acsMotion:m4:homingCurrLimit") {
+    field(DESC, "Homing Current Limit")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,3)SPIIPLUS_HOMING_CURR_LIMIT")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m4:homingMaxDist") {
+    field(DESC, "Homing Max Distance")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,3)SPIIPLUS_HOMING_MAX_DIST")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(mbbo, "acsMotion:m4:homingMethod") {
+    field(DESC, "Homing Method")
+    field(DTYP, "asynInt32")
+    field(FRST, "CurrentPos")
+    field(FRVL, "4")
+    field(FVST, "HardStop+Index")
+    field(FVVL, "5")
+    field(ONST, "Limit+Index")
+    field(ONVL, "1")
+    field(OUT, "@asyn(ACS1,3,2.0)SPIIPLUS_HOMING_METHOD")
+    field(PINI, "YES")
+    field(SVST, "Custom")
+    field(SVVL, "7")
+    field(SXST, "HardStop")
+    field(SXVL, "6")
+    field(THST, "Index")
+    field(THVL, "3")
+    field(TWST, "Limit")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(ao, "acsMotion:m4:homingOffsetNeg") {
+    field(DESC, "Homing Offset Neg")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,3)SPIIPLUS_HOMING_OFFSET_NEG")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m4:homingOffsetPos") {
+    field(DESC, "Homing Offset Pos")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,3)SPIIPLUS_HOMING_OFFSET_POS")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(longout, "acsMotion:m4:jogDirection") {
+    field(DESC, "Jog Direction")
+    field(DTYP, "Soft Channel")
+}
+record(calcout, "acsMotion:m4:jogStatus") {
+    field(CALC, "(A>0)&&(B=0) ? 1 : ((A=0)&&(B=0) ? 0 : -1)")
+    field(DESC, "JogState Linkup")
+    field(INPA, "acsMotion:m4.JOGF CP")
+    field(INPB, "acsMotion:m4.JOGR CP")
+    field(OUT, "acsMotion:m4:jogDirection PP")
+}
+record(ao, "acsMotion:m4:maxAcceleration") {
+    field(DESC, "Max Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,3)SPIIPLUS_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(VAL, "1000.0")
+}
+record(ai, "acsMotion:m4:maxAcceleration_RBV") {
+    field(DESC, "Max Acceleration RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,3)SPIIPLUS_MAX_ACCELERATION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "acsMotion:m4:maxVelocity") {
+    field(DESC, "Max Velocity")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,3)SPIIPLUS_MAX_VELOCITY")
+    field(PREC, "4")
+    field(VAL, "200.0")
+}
+record(ai, "acsMotion:m4:maxVelocity_RBV") {
+    field(DESC, "Max Velocity RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,3)SPIIPLUS_MAX_VELOCITY")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:m4Direction") {
+    field(DESC, "m4 direction")
+    field(DOL, "acsMotion:m4.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,3)MOTOR_REC_DIRECTION")
+}
+record(ao, "acsMotion:m4Offset") {
+    field(DESC, "m4 offset")
+    field(DOL, "acsMotion:m4.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,3)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "acsMotion:m4Resolution") {
+    field(DESC, "m4 resolution")
+    field(DOL, "acsMotion:m4.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,3)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(bo, "acsMotion:m4_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "acsMotion:m4.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "acsMotion:m4_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "acsMotion:m4.TWV")
+    field(INPC, "acsMotion:m4.MRES")
+    field(INPD, "acsMotion:m4.HLM")
+    field(INPE, "acsMotion:m4.LLM")
+    field(OUT, "acsMotion:m4.TWV")
+}
+record(calcout, "acsMotion:m4_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "acsMotion:m4.S")
+    field(INPC, "acsMotion:m4.SBAS")
+    field(INPD, "acsMotion:m4.SMAX")
+    field(OUT, "acsMotion:m4.S")
+}
+record(motor, "acsMotion:m5") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 5")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.0001")
+    field(OUT, "@asyn(ACS1,4)")
+    field(PREC, "4")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "acsMotion:m5_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bi, "acsMotion:m5:HOMED") {
+    field(DESC, "Homing Procedure Done")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,4)SPIIPLUS_HOMING_DONE")
+    field(ONAM, "True")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "False")
+}
+record(longin, "acsMotion:m5:MFLAGS") {
+    field(DESC, "MFLAGS parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,4)SPIIPLUS_MFLAGS")
+    field(SCAN, "I/O Intr")
+}
+record(longin, "acsMotion:m5:MFLAGSX") {
+    field(DESC, "MFLAGSX parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,4)SPIIPLUS_MFLAGSX")
+    field(SCAN, "I/O Intr")
+}
+record(bi, "acsMotion:m5:STO") {
+    field(DESC, "Safe Torque Off")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,4)SPIIPLUS_SAFE_TORQUE_OFF")
+    field(ONAM, "Fault")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "OK")
+}
+record(ao, "acsMotion:m5:homingCurrLimit") {
+    field(DESC, "Homing Current Limit")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,4)SPIIPLUS_HOMING_CURR_LIMIT")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m5:homingMaxDist") {
+    field(DESC, "Homing Max Distance")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,4)SPIIPLUS_HOMING_MAX_DIST")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(mbbo, "acsMotion:m5:homingMethod") {
+    field(DESC, "Homing Method")
+    field(DTYP, "asynInt32")
+    field(FRST, "CurrentPos")
+    field(FRVL, "4")
+    field(FVST, "HardStop+Index")
+    field(FVVL, "5")
+    field(ONST, "Limit+Index")
+    field(ONVL, "1")
+    field(OUT, "@asyn(ACS1,4,2.0)SPIIPLUS_HOMING_METHOD")
+    field(PINI, "YES")
+    field(SVST, "Custom")
+    field(SVVL, "7")
+    field(SXST, "HardStop")
+    field(SXVL, "6")
+    field(THST, "Index")
+    field(THVL, "3")
+    field(TWST, "Limit")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(ao, "acsMotion:m5:homingOffsetNeg") {
+    field(DESC, "Homing Offset Neg")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,4)SPIIPLUS_HOMING_OFFSET_NEG")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m5:homingOffsetPos") {
+    field(DESC, "Homing Offset Pos")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,4)SPIIPLUS_HOMING_OFFSET_POS")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(longout, "acsMotion:m5:jogDirection") {
+    field(DESC, "Jog Direction")
+    field(DTYP, "Soft Channel")
+}
+record(calcout, "acsMotion:m5:jogStatus") {
+    field(CALC, "(A>0)&&(B=0) ? 1 : ((A=0)&&(B=0) ? 0 : -1)")
+    field(DESC, "JogState Linkup")
+    field(INPA, "acsMotion:m5.JOGF CP")
+    field(INPB, "acsMotion:m5.JOGR CP")
+    field(OUT, "acsMotion:m5:jogDirection PP")
+}
+record(ao, "acsMotion:m5:maxAcceleration") {
+    field(DESC, "Max Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,4)SPIIPLUS_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(VAL, "1000.0")
+}
+record(ai, "acsMotion:m5:maxAcceleration_RBV") {
+    field(DESC, "Max Acceleration RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,4)SPIIPLUS_MAX_ACCELERATION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "acsMotion:m5:maxVelocity") {
+    field(DESC, "Max Velocity")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,4)SPIIPLUS_MAX_VELOCITY")
+    field(PREC, "4")
+    field(VAL, "200.0")
+}
+record(ai, "acsMotion:m5:maxVelocity_RBV") {
+    field(DESC, "Max Velocity RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,4)SPIIPLUS_MAX_VELOCITY")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:m5Direction") {
+    field(DESC, "m5 direction")
+    field(DOL, "acsMotion:m5.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,4)MOTOR_REC_DIRECTION")
+}
+record(ao, "acsMotion:m5Offset") {
+    field(DESC, "m5 offset")
+    field(DOL, "acsMotion:m5.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,4)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "acsMotion:m5Resolution") {
+    field(DESC, "m5 resolution")
+    field(DOL, "acsMotion:m5.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,4)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(bo, "acsMotion:m5_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "acsMotion:m5.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "acsMotion:m5_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "acsMotion:m5.TWV")
+    field(INPC, "acsMotion:m5.MRES")
+    field(INPD, "acsMotion:m5.HLM")
+    field(INPE, "acsMotion:m5.LLM")
+    field(OUT, "acsMotion:m5.TWV")
+}
+record(calcout, "acsMotion:m5_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "acsMotion:m5.S")
+    field(INPC, "acsMotion:m5.SBAS")
+    field(INPD, "acsMotion:m5.SMAX")
+    field(OUT, "acsMotion:m5.S")
+}
+record(motor, "acsMotion:m6") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 6")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.0001")
+    field(OUT, "@asyn(ACS1,5)")
+    field(PREC, "4")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "acsMotion:m6_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bi, "acsMotion:m6:HOMED") {
+    field(DESC, "Homing Procedure Done")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,5)SPIIPLUS_HOMING_DONE")
+    field(ONAM, "True")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "False")
+}
+record(longin, "acsMotion:m6:MFLAGS") {
+    field(DESC, "MFLAGS parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,5)SPIIPLUS_MFLAGS")
+    field(SCAN, "I/O Intr")
+}
+record(longin, "acsMotion:m6:MFLAGSX") {
+    field(DESC, "MFLAGSX parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,5)SPIIPLUS_MFLAGSX")
+    field(SCAN, "I/O Intr")
+}
+record(bi, "acsMotion:m6:STO") {
+    field(DESC, "Safe Torque Off")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,5)SPIIPLUS_SAFE_TORQUE_OFF")
+    field(ONAM, "Fault")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "OK")
+}
+record(ao, "acsMotion:m6:homingCurrLimit") {
+    field(DESC, "Homing Current Limit")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,5)SPIIPLUS_HOMING_CURR_LIMIT")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m6:homingMaxDist") {
+    field(DESC, "Homing Max Distance")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,5)SPIIPLUS_HOMING_MAX_DIST")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(mbbo, "acsMotion:m6:homingMethod") {
+    field(DESC, "Homing Method")
+    field(DTYP, "asynInt32")
+    field(FRST, "CurrentPos")
+    field(FRVL, "4")
+    field(FVST, "HardStop+Index")
+    field(FVVL, "5")
+    field(ONST, "Limit+Index")
+    field(ONVL, "1")
+    field(OUT, "@asyn(ACS1,5,2.0)SPIIPLUS_HOMING_METHOD")
+    field(PINI, "YES")
+    field(SVST, "Custom")
+    field(SVVL, "7")
+    field(SXST, "HardStop")
+    field(SXVL, "6")
+    field(THST, "Index")
+    field(THVL, "3")
+    field(TWST, "Limit")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(ao, "acsMotion:m6:homingOffsetNeg") {
+    field(DESC, "Homing Offset Neg")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,5)SPIIPLUS_HOMING_OFFSET_NEG")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m6:homingOffsetPos") {
+    field(DESC, "Homing Offset Pos")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,5)SPIIPLUS_HOMING_OFFSET_POS")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(longout, "acsMotion:m6:jogDirection") {
+    field(DESC, "Jog Direction")
+    field(DTYP, "Soft Channel")
+}
+record(calcout, "acsMotion:m6:jogStatus") {
+    field(CALC, "(A>0)&&(B=0) ? 1 : ((A=0)&&(B=0) ? 0 : -1)")
+    field(DESC, "JogState Linkup")
+    field(INPA, "acsMotion:m6.JOGF CP")
+    field(INPB, "acsMotion:m6.JOGR CP")
+    field(OUT, "acsMotion:m6:jogDirection PP")
+}
+record(ao, "acsMotion:m6:maxAcceleration") {
+    field(DESC, "Max Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,5)SPIIPLUS_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(VAL, "1000.0")
+}
+record(ai, "acsMotion:m6:maxAcceleration_RBV") {
+    field(DESC, "Max Acceleration RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,5)SPIIPLUS_MAX_ACCELERATION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "acsMotion:m6:maxVelocity") {
+    field(DESC, "Max Velocity")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,5)SPIIPLUS_MAX_VELOCITY")
+    field(PREC, "4")
+    field(VAL, "200.0")
+}
+record(ai, "acsMotion:m6:maxVelocity_RBV") {
+    field(DESC, "Max Velocity RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,5)SPIIPLUS_MAX_VELOCITY")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:m6Direction") {
+    field(DESC, "m6 direction")
+    field(DOL, "acsMotion:m6.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,5)MOTOR_REC_DIRECTION")
+}
+record(ao, "acsMotion:m6Offset") {
+    field(DESC, "m6 offset")
+    field(DOL, "acsMotion:m6.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,5)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "acsMotion:m6Resolution") {
+    field(DESC, "m6 resolution")
+    field(DOL, "acsMotion:m6.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,5)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(bo, "acsMotion:m6_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "acsMotion:m6.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "acsMotion:m6_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "acsMotion:m6.TWV")
+    field(INPC, "acsMotion:m6.MRES")
+    field(INPD, "acsMotion:m6.HLM")
+    field(INPE, "acsMotion:m6.LLM")
+    field(OUT, "acsMotion:m6.TWV")
+}
+record(calcout, "acsMotion:m6_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "acsMotion:m6.S")
+    field(INPC, "acsMotion:m6.SBAS")
+    field(INPD, "acsMotion:m6.SMAX")
+    field(OUT, "acsMotion:m6.S")
+}
+record(motor, "acsMotion:m7") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 7")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.0001")
+    field(OUT, "@asyn(ACS1,6)")
+    field(PREC, "4")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "acsMotion:m7_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bi, "acsMotion:m7:HOMED") {
+    field(DESC, "Homing Procedure Done")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,6)SPIIPLUS_HOMING_DONE")
+    field(ONAM, "True")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "False")
+}
+record(longin, "acsMotion:m7:MFLAGS") {
+    field(DESC, "MFLAGS parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,6)SPIIPLUS_MFLAGS")
+    field(SCAN, "I/O Intr")
+}
+record(longin, "acsMotion:m7:MFLAGSX") {
+    field(DESC, "MFLAGSX parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,6)SPIIPLUS_MFLAGSX")
+    field(SCAN, "I/O Intr")
+}
+record(bi, "acsMotion:m7:STO") {
+    field(DESC, "Safe Torque Off")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,6)SPIIPLUS_SAFE_TORQUE_OFF")
+    field(ONAM, "Fault")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "OK")
+}
+record(ao, "acsMotion:m7:homingCurrLimit") {
+    field(DESC, "Homing Current Limit")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,6)SPIIPLUS_HOMING_CURR_LIMIT")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m7:homingMaxDist") {
+    field(DESC, "Homing Max Distance")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,6)SPIIPLUS_HOMING_MAX_DIST")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(mbbo, "acsMotion:m7:homingMethod") {
+    field(DESC, "Homing Method")
+    field(DTYP, "asynInt32")
+    field(FRST, "CurrentPos")
+    field(FRVL, "4")
+    field(FVST, "HardStop+Index")
+    field(FVVL, "5")
+    field(ONST, "Limit+Index")
+    field(ONVL, "1")
+    field(OUT, "@asyn(ACS1,6,2.0)SPIIPLUS_HOMING_METHOD")
+    field(PINI, "YES")
+    field(SVST, "Custom")
+    field(SVVL, "7")
+    field(SXST, "HardStop")
+    field(SXVL, "6")
+    field(THST, "Index")
+    field(THVL, "3")
+    field(TWST, "Limit")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(ao, "acsMotion:m7:homingOffsetNeg") {
+    field(DESC, "Homing Offset Neg")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,6)SPIIPLUS_HOMING_OFFSET_NEG")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m7:homingOffsetPos") {
+    field(DESC, "Homing Offset Pos")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,6)SPIIPLUS_HOMING_OFFSET_POS")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(longout, "acsMotion:m7:jogDirection") {
+    field(DESC, "Jog Direction")
+    field(DTYP, "Soft Channel")
+}
+record(calcout, "acsMotion:m7:jogStatus") {
+    field(CALC, "(A>0)&&(B=0) ? 1 : ((A=0)&&(B=0) ? 0 : -1)")
+    field(DESC, "JogState Linkup")
+    field(INPA, "acsMotion:m7.JOGF CP")
+    field(INPB, "acsMotion:m7.JOGR CP")
+    field(OUT, "acsMotion:m7:jogDirection PP")
+}
+record(ao, "acsMotion:m7:maxAcceleration") {
+    field(DESC, "Max Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,6)SPIIPLUS_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(VAL, "1000.0")
+}
+record(ai, "acsMotion:m7:maxAcceleration_RBV") {
+    field(DESC, "Max Acceleration RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,6)SPIIPLUS_MAX_ACCELERATION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "acsMotion:m7:maxVelocity") {
+    field(DESC, "Max Velocity")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,6)SPIIPLUS_MAX_VELOCITY")
+    field(PREC, "4")
+    field(VAL, "200.0")
+}
+record(ai, "acsMotion:m7:maxVelocity_RBV") {
+    field(DESC, "Max Velocity RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,6)SPIIPLUS_MAX_VELOCITY")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:m7Direction") {
+    field(DESC, "m7 direction")
+    field(DOL, "acsMotion:m7.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,6)MOTOR_REC_DIRECTION")
+}
+record(ao, "acsMotion:m7Offset") {
+    field(DESC, "m7 offset")
+    field(DOL, "acsMotion:m7.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,6)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "acsMotion:m7Resolution") {
+    field(DESC, "m7 resolution")
+    field(DOL, "acsMotion:m7.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,6)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(bo, "acsMotion:m7_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "acsMotion:m7.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "acsMotion:m7_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "acsMotion:m7.TWV")
+    field(INPC, "acsMotion:m7.MRES")
+    field(INPD, "acsMotion:m7.HLM")
+    field(INPE, "acsMotion:m7.LLM")
+    field(OUT, "acsMotion:m7.TWV")
+}
+record(calcout, "acsMotion:m7_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "acsMotion:m7.S")
+    field(INPC, "acsMotion:m7.SBAS")
+    field(INPD, "acsMotion:m7.SMAX")
+    field(OUT, "acsMotion:m7.S")
+}
+record(motor, "acsMotion:m8") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 8")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "0.0001")
+    field(OUT, "@asyn(ACS1,7)")
+    field(PREC, "4")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "acsMotion:m8_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bi, "acsMotion:m8:HOMED") {
+    field(DESC, "Homing Procedure Done")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,7)SPIIPLUS_HOMING_DONE")
+    field(ONAM, "True")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "False")
+}
+record(longin, "acsMotion:m8:MFLAGS") {
+    field(DESC, "MFLAGS parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,7)SPIIPLUS_MFLAGS")
+    field(SCAN, "I/O Intr")
+}
+record(longin, "acsMotion:m8:MFLAGSX") {
+    field(DESC, "MFLAGSX parameter")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,7)SPIIPLUS_MFLAGSX")
+    field(SCAN, "I/O Intr")
+}
+record(bi, "acsMotion:m8:STO") {
+    field(DESC, "Safe Torque Off")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,7)SPIIPLUS_SAFE_TORQUE_OFF")
+    field(ONAM, "Fault")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "OK")
+}
+record(ao, "acsMotion:m8:homingCurrLimit") {
+    field(DESC, "Homing Current Limit")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,7)SPIIPLUS_HOMING_CURR_LIMIT")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m8:homingMaxDist") {
+    field(DESC, "Homing Max Distance")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,7)SPIIPLUS_HOMING_MAX_DIST")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(mbbo, "acsMotion:m8:homingMethod") {
+    field(DESC, "Homing Method")
+    field(DTYP, "asynInt32")
+    field(FRST, "CurrentPos")
+    field(FRVL, "4")
+    field(FVST, "HardStop+Index")
+    field(FVVL, "5")
+    field(ONST, "Limit+Index")
+    field(ONVL, "1")
+    field(OUT, "@asyn(ACS1,7,2.0)SPIIPLUS_HOMING_METHOD")
+    field(PINI, "YES")
+    field(SVST, "Custom")
+    field(SVVL, "7")
+    field(SXST, "HardStop")
+    field(SXVL, "6")
+    field(THST, "Index")
+    field(THVL, "3")
+    field(TWST, "Limit")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(ao, "acsMotion:m8:homingOffsetNeg") {
+    field(DESC, "Homing Offset Neg")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,7)SPIIPLUS_HOMING_OFFSET_NEG")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(ao, "acsMotion:m8:homingOffsetPos") {
+    field(DESC, "Homing Offset Pos")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,7)SPIIPLUS_HOMING_OFFSET_POS")
+    field(PINI, "YES")
+    field(PREC, "4")
+    field(VAL, "0.0")
+}
+record(longout, "acsMotion:m8:jogDirection") {
+    field(DESC, "Jog Direction")
+    field(DTYP, "Soft Channel")
+}
+record(calcout, "acsMotion:m8:jogStatus") {
+    field(CALC, "(A>0)&&(B=0) ? 1 : ((A=0)&&(B=0) ? 0 : -1)")
+    field(DESC, "JogState Linkup")
+    field(INPA, "acsMotion:m8.JOGF CP")
+    field(INPB, "acsMotion:m8.JOGR CP")
+    field(OUT, "acsMotion:m8:jogDirection PP")
+}
+record(ao, "acsMotion:m8:maxAcceleration") {
+    field(DESC, "Max Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,7)SPIIPLUS_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(VAL, "1000.0")
+}
+record(ai, "acsMotion:m8:maxAcceleration_RBV") {
+    field(DESC, "Max Acceleration RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,7)SPIIPLUS_MAX_ACCELERATION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "acsMotion:m8:maxVelocity") {
+    field(DESC, "Max Velocity")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,7)SPIIPLUS_MAX_VELOCITY")
+    field(PREC, "4")
+    field(VAL, "200.0")
+}
+record(ai, "acsMotion:m8:maxVelocity_RBV") {
+    field(DESC, "Max Velocity RBV")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,7)SPIIPLUS_MAX_VELOCITY")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:m8Direction") {
+    field(DESC, "m8 direction")
+    field(DOL, "acsMotion:m8.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,7)MOTOR_REC_DIRECTION")
+}
+record(ao, "acsMotion:m8Offset") {
+    field(DESC, "m8 offset")
+    field(DOL, "acsMotion:m8.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,7)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "acsMotion:m8Resolution") {
+    field(DESC, "m8 resolution")
+    field(DOL, "acsMotion:m8.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACS1,7)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(bo, "acsMotion:m8_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "acsMotion:m8.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "acsMotion:m8_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "acsMotion:m8.TWV")
+    field(INPC, "acsMotion:m8.MRES")
+    field(INPD, "acsMotion:m8.HLM")
+    field(INPE, "acsMotion:m8.LLM")
+    field(OUT, "acsMotion:m8.TWV")
+}
+record(calcout, "acsMotion:m8_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "acsMotion:m8.S")
+    field(INPC, "acsMotion:m8.SBAS")
+    field(INPD, "acsMotion:m8.SMAX")
+    field(OUT, "acsMotion:m8.S")
+}
+record(longout, "acsMotion:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "acsMotion:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}
+record(ai, "acsMotion:mp4u:ai0") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 0)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai1") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 1)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai10") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 10)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai11") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 11)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai12") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 12)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai13") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 13)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai14") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 14)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai15") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 15)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai2") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 2)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai3") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 3)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai4") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 4)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai5") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 5)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai6") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 6)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai7") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 7)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai8") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 8)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ai9") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 9)ANALOG_INPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao0") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 0)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao0_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 0)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao1") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 1)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ao, "acsMotion:mp4u:ao10") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 10)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao10_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 10)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao11") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 11)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao11_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 11)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao12") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 12)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao12_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 12)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao13") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 13)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao13_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 13)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao14") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 14)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao14_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 14)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao15") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 15)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao15_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 15)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao16") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 16)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao16_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 16)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao17") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 17)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao17_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 17)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao18") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 18)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao18_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 18)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao19") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 19)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao19_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 19)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ai, "acsMotion:mp4u:ao1_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 1)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao2") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 2)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao2_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 2)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao3") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 3)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao3_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 3)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao4") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 4)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao4_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 4)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao5") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 5)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao5_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 5)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao6") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 6)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao6_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 6)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao7") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 7)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao7_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 7)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao8") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 8)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao8_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 8)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(ao, "acsMotion:mp4u:ao9") {
+    field(ASLO, "0.1")
+    field(DRVH, "10")
+    field(DRVL, "-10")
+    field(DTYP, "asynFloat64")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(LOPR, "-10")
+    field(OUT, "@asyn(ACS1_IO 9)ANALOG_OUTPUT")
+    field(PREC, "3")
+}
+record(ai, "acsMotion:mp4u:ao9_RBV") {
+    field(ASLO, "0.1")
+    field(DTYP, "asynFloat64Average")
+    field(EGU, "V")
+    field(HOPR, "10")
+    field(INP, "@asyn(ACS1_IO 9)ANALOG_OUTPUT")
+    field(LOPR, "-10")
+    field(PREC, "3")
+    field(SCAN, "2")
+}
+record(bi, "acsMotion:mp4u:bi0:17") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 0 0x10000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi0:18") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 0 0x20000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi0:19") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 0 0x40000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi0:20") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 0 0x80000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi1:17") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 1 0x10000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi1:18") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 1 0x20000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi1:19") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 1 0x40000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi1:20") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 1 0x80000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi2:17") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 2 0x10000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi2:18") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 2 0x20000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi2:19") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 2 0x40000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi2:20") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 2 0x80000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi3:17") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 3 0x10000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi3:18") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 3 0x20000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi3:19") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 3 0x40000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bi3:20") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 3 0x80000)DIGITAL_INPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bo, "acsMotion:mp4u:bo0:8") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACS1_IO 0 0x100)DIGITAL_OUTPUT")
+    field(VAL, "0")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bo0:8_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 0 0x100)DIGITAL_OUTPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bo, "acsMotion:mp4u:bo0:9") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACS1_IO 0 0x200)DIGITAL_OUTPUT")
+    field(VAL, "0")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bo0:9_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 0 0x200)DIGITAL_OUTPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bo, "acsMotion:mp4u:bo1:8") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACS1_IO 1 0x100)DIGITAL_OUTPUT")
+    field(VAL, "0")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bo1:8_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 1 0x100)DIGITAL_OUTPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bo, "acsMotion:mp4u:bo1:9") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACS1_IO 1 0x200)DIGITAL_OUTPUT")
+    field(VAL, "0")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bo1:9_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 1 0x200)DIGITAL_OUTPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bo, "acsMotion:mp4u:bo2:8") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACS1_IO 2 0x100)DIGITAL_OUTPUT")
+    field(VAL, "0")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bo2:8_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 2 0x100)DIGITAL_OUTPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bo, "acsMotion:mp4u:bo2:9") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACS1_IO 2 0x200)DIGITAL_OUTPUT")
+    field(VAL, "0")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bo2:9_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 2 0x200)DIGITAL_OUTPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bo, "acsMotion:mp4u:bo3:8") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACS1_IO 3 0x100)DIGITAL_OUTPUT")
+    field(VAL, "0")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bo3:8_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 3 0x100)DIGITAL_OUTPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(bo, "acsMotion:mp4u:bo3:9") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACS1_IO 3 0x200)DIGITAL_OUTPUT")
+    field(VAL, "0")
+    field(ZNAM, "Low")
+}
+record(bi, "acsMotion:mp4u:bo3:9_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 3 0x200)DIGITAL_OUTPUT")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "2")
+    field(ZNAM, "Low")
+}
+record(longin, "acsMotion:mp4u:li0") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 0 0xffffffff)DIGITAL_INPUT")
+    field(PINI, "YES")
+    field(SCAN, "2")
+}
+record(longin, "acsMotion:mp4u:li1") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 1 0xffffffff)DIGITAL_INPUT")
+    field(PINI, "YES")
+    field(SCAN, "2")
+}
+record(longin, "acsMotion:mp4u:li2") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 2 0xffffffff)DIGITAL_INPUT")
+    field(PINI, "YES")
+    field(SCAN, "2")
+}
+record(longin, "acsMotion:mp4u:li3") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 3 0xffffffff)DIGITAL_INPUT")
+    field(PINI, "YES")
+    field(SCAN, "2")
+}
+record(longout, "acsMotion:mp4u:lo0") {
+    field(DTYP, "asynUInt32Digital")
+    field(OUT, "@asynMask(ACS1_IO 0 0xffffffff)DIGITAL_OUTPUT")
+}
+record(longin, "acsMotion:mp4u:lo0_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 0 0xffffffff)DIGITAL_OUTPUT")
+    field(PINI, "YES")
+    field(SCAN, "2")
+}
+record(longout, "acsMotion:mp4u:lo1") {
+    field(DTYP, "asynUInt32Digital")
+    field(OUT, "@asynMask(ACS1_IO 1 0xffffffff)DIGITAL_OUTPUT")
+}
+record(longin, "acsMotion:mp4u:lo1_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 1 0xffffffff)DIGITAL_OUTPUT")
+    field(PINI, "YES")
+    field(SCAN, "2")
+}
+record(longout, "acsMotion:mp4u:lo2") {
+    field(DTYP, "asynUInt32Digital")
+    field(OUT, "@asynMask(ACS1_IO 2 0xffffffff)DIGITAL_OUTPUT")
+}
+record(longin, "acsMotion:mp4u:lo2_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 2 0xffffffff)DIGITAL_OUTPUT")
+    field(PINI, "YES")
+    field(SCAN, "2")
+}
+record(longout, "acsMotion:mp4u:lo3") {
+    field(DTYP, "asynUInt32Digital")
+    field(OUT, "@asynMask(ACS1_IO 3 0xffffffff)DIGITAL_OUTPUT")
+}
+record(longin, "acsMotion:mp4u:lo3_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACS1_IO 3 0xffffffff)DIGITAL_OUTPUT")
+    field(PINI, "YES")
+    field(SCAN, "2")
+}
+record(bo, "acsMotion:pm1:Abort") {
+    field(DESC, "Abort profile motion")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Abort")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_ABORT")
+    field(ZNAM, "Done")
+}
+record(ao, "acsMotion:pm1:Acceleration") {
+    field(DESC, "Profile Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_ACCELERATION")
+    field(PINI, "YES")
+    field(PREC, "3")
+    field(VAL, "0.5")
+}
+record(busy, "acsMotion:pm1:Build") {
+    field(DESC, "Build and check profile")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Build")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_BUILD")
+    field(ZNAM, "Done")
+}
+record(waveform, "acsMotion:pm1:BuildMessage") {
+    field(DESC, "Profile build message")
+    field(DTYP, "asynOctetRead")
+    field(FTVL, "CHAR")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_BUILD_MESSAGE")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+record(mbbi, "acsMotion:pm1:BuildState") {
+    field(DESC, "Profile build state")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_BUILD_STATE")
+    field(ONST, "Busy")
+    field(ONSV, "MINOR")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(ZRST, "Done")
+    field(ZRSV, "NO_ALARM")
+    field(ZRVL, "0")
+}
+record(mbbi, "acsMotion:pm1:BuildStatus") {
+    field(DESC, "Profile build status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_BUILD_STATUS")
+    field(ONST, "Success")
+    field(ONSV, "NO_ALARM")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(TWST, "Failure")
+    field(TWSV, "MAJOR")
+    field(TWVL, "2")
+    field(ZRST, "Undefined")
+    field(ZRSV, "INVALID")
+    field(ZRVL, "0")
+}
+record(longin, "acsMotion:pm1:CurrentPoint") {
+    field(DESC, "Current point in profile")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_CURRENT_POINT")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:pm1:EndPulses") {
+    field(DESC, "Point # to end pulses")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_END_PULSES")
+    field(PINI, "YES")
+    field(VAL, "2000")
+}
+record(busy, "acsMotion:pm1:Execute") {
+    field(DESC, "Execute profile motion")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Execute")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_EXECUTE")
+    field(ZNAM, "Done")
+}
+record(waveform, "acsMotion:pm1:ExecuteMessage") {
+    field(DESC, "Profile execute message")
+    field(DTYP, "asynOctetRead")
+    field(FTVL, "CHAR")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_EXECUTE_MESSAGE")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+record(mbbi, "acsMotion:pm1:ExecuteState") {
+    field(DESC, "Profile execute state")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_EXECUTE_STATE")
+    field(ONST, "Move start")
+    field(ONSV, "MINOR")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(THST, "Flyback")
+    field(THSV, "MINOR")
+    field(THVL, "3")
+    field(TWST, "Executing")
+    field(TWSV, "MINOR")
+    field(TWVL, "2")
+    field(ZRST, "Done")
+    field(ZRSV, "NO_ALARM")
+    field(ZRVL, "0")
+}
+record(mbbi, "acsMotion:pm1:ExecuteStatus") {
+    field(DESC, "Profile execute status")
+    field(DTYP, "asynInt32")
+    field(FRST, "Timeout")
+    field(FRSV, "MAJOR")
+    field(FRVL, "4")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_EXECUTE_STATUS")
+    field(ONST, "Success")
+    field(ONSV, "NO_ALARM")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(THST, "Abort")
+    field(THSV, "MAJOR")
+    field(THVL, "3")
+    field(TWST, "Failure")
+    field(TWSV, "MAJOR")
+    field(TWVL, "2")
+    field(ZRST, "Undefined")
+    field(ZRSV, "INVALID")
+    field(ZRVL, "0")
+}
+record(ao, "acsMotion:pm1:FixedTime") {
+    field(DESC, "Profile fixed time per point")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_FIXED_TIME")
+    field(PINI, "YES")
+    field(PREC, "3")
+    field(VAL, "1.")
+}
+record(waveform, "acsMotion:pm1:M1FollowingErrors") {
+    field(DESC, "Axis 0 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "acsMotion:pm1:M1Positions") {
+    field(DESC, "Axis 0 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "acsMotion:pm1:M1Readbacks") {
+    field(DESC, "Axis 0 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "acsMotion:pm1:M1UseAxis") {
+    field(DESC, "Use axis 0?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "acsMotion:pm1:M2FollowingErrors") {
+    field(DESC, "Axis 1 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,1,2.0)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "acsMotion:pm1:M2Positions") {
+    field(DESC, "Axis 1 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,1,2.0)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "acsMotion:pm1:M2Readbacks") {
+    field(DESC, "Axis 1 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,1,2.0)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "acsMotion:pm1:M2UseAxis") {
+    field(DESC, "Use axis 1?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(ACS1,1,2.0)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "acsMotion:pm1:M3FollowingErrors") {
+    field(DESC, "Axis 2 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,2,2.0)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "acsMotion:pm1:M3Positions") {
+    field(DESC, "Axis 2 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,2,2.0)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "acsMotion:pm1:M3Readbacks") {
+    field(DESC, "Axis 2 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,2,2.0)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "acsMotion:pm1:M3UseAxis") {
+    field(DESC, "Use axis 2?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(ACS1,2,2.0)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "acsMotion:pm1:M4FollowingErrors") {
+    field(DESC, "Axis 3 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,3,2.0)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "acsMotion:pm1:M4Positions") {
+    field(DESC, "Axis 3 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,3,2.0)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "acsMotion:pm1:M4Readbacks") {
+    field(DESC, "Axis 3 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,3,2.0)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "acsMotion:pm1:M4UseAxis") {
+    field(DESC, "Use axis 3?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(ACS1,3,2.0)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "acsMotion:pm1:M5FollowingErrors") {
+    field(DESC, "Axis 4 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,4,2.0)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "acsMotion:pm1:M5Positions") {
+    field(DESC, "Axis 4 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,4,2.0)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "acsMotion:pm1:M5Readbacks") {
+    field(DESC, "Axis 4 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,4,2.0)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "acsMotion:pm1:M5UseAxis") {
+    field(DESC, "Use axis 4?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(ACS1,4,2.0)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "acsMotion:pm1:M6FollowingErrors") {
+    field(DESC, "Axis 5 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,5,2.0)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "acsMotion:pm1:M6Positions") {
+    field(DESC, "Axis 5 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,5,2.0)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "acsMotion:pm1:M6Readbacks") {
+    field(DESC, "Axis 5 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,5,2.0)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "acsMotion:pm1:M6UseAxis") {
+    field(DESC, "Use axis 5?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(ACS1,5,2.0)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "acsMotion:pm1:M7FollowingErrors") {
+    field(DESC, "Axis 6 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,6,2.0)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "acsMotion:pm1:M7Positions") {
+    field(DESC, "Axis 6 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,6,2.0)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "acsMotion:pm1:M7Readbacks") {
+    field(DESC, "Axis 6 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,6,2.0)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "acsMotion:pm1:M7UseAxis") {
+    field(DESC, "Use axis 6?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(ACS1,6,2.0)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "acsMotion:pm1:M8FollowingErrors") {
+    field(DESC, "Axis 7 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,7,2.0)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "acsMotion:pm1:M8Positions") {
+    field(DESC, "Axis 7 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,7,2.0)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "acsMotion:pm1:M8Readbacks") {
+    field(DESC, "Axis 7 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,7,2.0)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "acsMotion:pm1:M8UseAxis") {
+    field(DESC, "Use axis 7?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(ACS1,7,2.0)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(bo, "acsMotion:pm1:MoveMode") {
+    field(DESC, "Profile move mode")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Relative")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_MOVE_MODE")
+    field(PINI, "YES")
+    field(ZNAM, "Absolute")
+}
+record(ao, "acsMotion:pm1:NewPulsePositions") {
+    field(DESC, "New pulse positions loaded")
+    field(MDEL, "-1")
+    field(PREC, "3")
+}
+record(longin, "acsMotion:pm1:NumActualPulses") {
+    field(DESC, "Actual # of output pulses")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_ACTUAL_PULSES")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "acsMotion:pm1:NumAxes") {
+    field(DESC, "# of axes being used")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_NUM_AXES")
+    field(PINI, "YES")
+    field(VAL, "8")
+}
+record(longout, "acsMotion:pm1:NumPoints") {
+    field(DESC, "# of points in profile")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_NUM_POINTS")
+    field(PINI, "YES")
+    field(VAL, "2000")
+}
+record(longout, "acsMotion:pm1:NumPulsePositions") {
+    field(DESC, "Num pulse positions to load")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ACS1,0,2.0)SPIIPLUS_NUM_PULSES")
+}
+record(longout, "acsMotion:pm1:NumPulses") {
+    field(DESC, "Number of output pulses")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_NUM_PULSES")
+    field(PINI, "YES")
+    field(VAL, "2000")
+}
+record(mbbo, "acsMotion:pm1:PulseMode") {
+    field(DESC, "Pulse mode")
+    field(DTYP, "asynInt32")
+    field(ONST, "Array")
+    field(ONVL, "1")
+    field(OUT, "@asyn(ACS1,0,2.0)SPIIPLUS_PULSE_MODE")
+    field(PINI, "YES")
+    field(THST, "None")
+    field(THVL, "3")
+    field(TWST, "TrajPts")
+    field(TWVL, "2")
+    field(VAL, "0")
+    field(ZRST, "Fixed")
+    field(ZRVL, "0")
+}
+record(waveform, "acsMotion:pm1:PulsePositions") {
+    field(DESC, "Output-pulse positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FLNK, "acsMotion:pm1:NewPulsePositions")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,0,2.0)SPIIPLUS_PULSE_POS")
+    field(NELM, "2000")
+    field(PREC, "3")
+}
+record(busy, "acsMotion:pm1:Readback") {
+    field(DESC, "Read back actual positions")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Readback")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_READBACK")
+    field(ZNAM, "Done")
+}
+record(waveform, "acsMotion:pm1:ReadbackMessage") {
+    field(DESC, "Profile readback message")
+    field(DTYP, "asynOctetRead")
+    field(FTVL, "CHAR")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_READBACK_MESSAGE")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+record(mbbi, "acsMotion:pm1:ReadbackState") {
+    field(DESC, "Readback state")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_READBACK_STATE")
+    field(ONST, "Busy")
+    field(ONSV, "MINOR")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(ZRST, "Done")
+    field(ZRSV, "NO_ALARM")
+    field(ZRVL, "0")
+}
+record(mbbi, "acsMotion:pm1:ReadbackStatus") {
+    field(DESC, "Readback status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_READBACK_STATUS")
+    field(ONST, "Success")
+    field(ONSV, "NO_ALARM")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(TWST, "Failure")
+    field(TWSV, "MAJOR")
+    field(TWVL, "2")
+    field(ZRST, "Undefined")
+    field(ZRSV, "INVALID")
+    field(ZRVL, "0")
+}
+record(longout, "acsMotion:pm1:StartPulses") {
+    field(DESC, "Point # to start pulses")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_START_PULSES")
+    field(PINI, "YES")
+    field(VAL, "1")
+}
+record(bo, "acsMotion:pm1:TimeMode") {
+    field(DESC, "Profile time mode")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Array")
+    field(OUT, "@asyn(ACS1,0,2.0)PROFILE_TIME_MODE")
+    field(PINI, "YES")
+    field(ZNAM, "Fixed")
+}
+record(waveform, "acsMotion:pm1:Times") {
+    field(DESC, "Profile time at each point")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(ACS1,0,2.0)PROFILE_TIME_ARRAY")
+    field(NELM, "2000")
+    field(PREC, "3")
+}
+record(longout, "acsMotion:pm1:outputIndex") {
+    field(DTYP, "asynInt32")
+    field(FLNK, "acsMotion:pm1:outputIndex_RBV")
+    field(OUT, "@asyn(ACS1,0,2.0)SPIIPLUS_POUTS_OUTPUT_INDEX")
+    field(PINI, "YES")
+    field(VAL, "0")
+}
+record(longin, "acsMotion:pm1:outputIndex_RBV") {
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0,2.0)SPIIPLUS_POUTS_OUTPUT_INDEX")
+    field(SCAN, "Passive")
+}
+record(stringout, "acsMotion:pm1:pegEngEnc") {
+    field(DESC, "Engine-to-encoder mapping")
+    field(DTYP, "asynOctetWrite")
+    field(FLNK, "acsMotion:pm1:pegEngEnc_RBV")
+    field(OUT, "@asyn(ACS1,0,2.0)SPIIPLUS_PEG_ENG_ENC_CODE")
+    field(PINI, "YES")
+    field(VAL, "0b0")
+}
+record(stringin, "acsMotion:pm1:pegEngEnc_RBV") {
+    field(DESC, "Engine-to-encoder mapping")
+    field(DTYP, "asynOctetRead")
+    field(INP, "@asyn(ACS1,0,2.0)SPIIPLUS_PEG_ENG_ENC_CODE")
+    field(SCAN, "Passive")
+}
+record(stringout, "acsMotion:pm1:pegOutAssign") {
+    field(DESC, "GP output assignment")
+    field(DTYP, "asynOctetWrite")
+    field(FLNK, "acsMotion:pm1:pegOutAssign_RBV")
+    field(OUT, "@asyn(ACS1,0,2.0)SPIIPLUS_PEG_OUT_ASSIGN_CODE")
+    field(PINI, "YES")
+    field(VAL, "0b0")
+}
+record(stringin, "acsMotion:pm1:pegOutAssign_RBV") {
+    field(DESC, "GP output assignment")
+    field(DTYP, "asynOctetRead")
+    field(INP, "@asyn(ACS1,0,2.0)SPIIPLUS_PEG_OUT_ASSIGN_CODE")
+    field(SCAN, "Passive")
+}
+record(stringout, "acsMotion:pm1:poutsBitCode") {
+    field(DESC, "PEG pin config")
+    field(DTYP, "asynOctetWrite")
+    field(FLNK, "acsMotion:pm1:poutsBitCode_RBV")
+    field(OUT, "@asyn(ACS1,0,2.0)SPIIPLUS_POUTS_BIT_CODE")
+    field(PINI, "YES")
+    field(VAL, "0b0")
+}
+record(stringin, "acsMotion:pm1:poutsBitCode_RBV") {
+    field(DESC, "PEG pin config")
+    field(DTYP, "asynOctetRead")
+    field(INP, "@asyn(ACS1,0,2.0)SPIIPLUS_POUTS_BIT_CODE")
+    field(SCAN, "Passive")
+}
+record(longout, "acsMotion:pm1:pulseAxis") {
+    field(DTYP, "asynInt32")
+    field(FLNK, "acsMotion:pm1:pulseAxis_RBV")
+    field(OUT, "@asyn(ACS1,0,2.0)SPIIPLUS_PULSE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+}
+record(longin, "acsMotion:pm1:pulseAxis_RBV") {
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(ACS1,0,2.0)SPIIPLUS_PULSE_AXIS")
+    field(SCAN, "Passive")
+}
+record(ao, "acsMotion:pm1:pulseWidth") {
+    field(DESC, "Pulse Width (ms)")
+    field(DTYP, "asynFloat64")
+    field(FLNK, "acsMotion:pm1:pulseWidth_RBV")
+    field(OUT, "@asyn(ACS1,0,2.0)SPIIPLUS_PULSE_WIDTH")
+    field(PINI, "YES")
+    field(PREC, "3")
+    field(VAL, "0.5")
+}
+record(ai, "acsMotion:pm1:pulseWidth_RBV") {
+    field(DESC, "Pulse Width (ms)")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(ACS1,0,2.0)SPIIPLUS_PULSE_WIDTH")
+    field(PREC, "3")
+    field(SCAN, "Passive")
+}

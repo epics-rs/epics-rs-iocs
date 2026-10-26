@@ -1,0 +1,165 @@
+# c-expansion of st.cmd, PM500.cmd over the C sources, the records of st.cmd.dbl:
+# dbl of motor R7-4-5 motorNewport iocBoot/iocNewport st.cmd with its PM500.cmd
+record(bi, "newport:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "newport:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "newport:alldone")
+    field(INPB, "newport:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "newport:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(motor, "newport:m31") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 31")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "PM500")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "5e-5")
+    field(OUT, "#C0 S0 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "newport:m31_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bo, "newport:m31_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "newport:m31.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "newport:m31_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "newport:m31.TWV")
+    field(INPC, "newport:m31.MRES")
+    field(INPD, "newport:m31.HLM")
+    field(INPE, "newport:m31.LLM")
+    field(OUT, "newport:m31.TWV")
+}
+record(calcout, "newport:m31_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "newport:m31.S")
+    field(INPC, "newport:m31.SBAS")
+    field(INPD, "newport:m31.SMAX")
+    field(OUT, "newport:m31.S")
+}
+record(motor, "newport:m32") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 32")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "PM500")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "5e-5")
+    field(OUT, "#C0 S1 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "newport:m32_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bo, "newport:m32_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "newport:m32.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "newport:m32_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "newport:m32.TWV")
+    field(INPC, "newport:m32.MRES")
+    field(INPD, "newport:m32.HLM")
+    field(INPE, "newport:m32.LLM")
+    field(OUT, "newport:m32.TWV")
+}
+record(calcout, "newport:m32_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "newport:m32.S")
+    field(INPC, "newport:m32.SBAS")
+    field(INPD, "newport:m32.SMAX")
+    field(OUT, "newport:m32.S")
+}
+record(motor, "newport:m33") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 33")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "-100")
+    field(DTYP, "PM500")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "5e-5")
+    field(OUT, "#C0 S2 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "newport:m33_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(bo, "newport:m33_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "newport:m33.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "newport:m33_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "newport:m33.TWV")
+    field(INPC, "newport:m33.MRES")
+    field(INPD, "newport:m33.HLM")
+    field(INPE, "newport:m33.LLM")
+    field(OUT, "newport:m33.TWV")
+}
+record(calcout, "newport:m33_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "newport:m33.S")
+    field(INPC, "newport:m33.SBAS")
+    field(INPD, "newport:m33.SMAX")
+    field(OUT, "newport:m33.S")
+}
+record(longout, "newport:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "newport:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

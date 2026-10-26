@@ -1,0 +1,119 @@
+# c-expansion of st.cmd over the C sources, the records of st.cmd.dbl:
+# dbl of motor R7-4-5 motorPiJena iocBoot/iocPiJena st.cmd
+record(bi, "piJena:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "piJena:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "piJena:alldone")
+    field(INPB, "piJena:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "piJena:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(motor, "piJena:m1") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "0")
+    field(DESC, "motor 1")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "PIJEDS")
+    field(EGU, "um")
+    field(INIT, "")
+    field(MRES, ".001")
+    field(OUT, "#C0 S0 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "piJena:m1_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "2.")
+}
+record(bo, "piJena:m1_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "piJena:m1.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "piJena:m1_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "piJena:m1.TWV")
+    field(INPC, "piJena:m1.MRES")
+    field(INPD, "piJena:m1.HLM")
+    field(INPE, "piJena:m1.LLM")
+    field(OUT, "piJena:m1.TWV")
+}
+record(calcout, "piJena:m1_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "piJena:m1.S")
+    field(INPC, "piJena:m1.SBAS")
+    field(INPD, "piJena:m1.SMAX")
+    field(OUT, "piJena:m1.S")
+}
+record(motor, "piJena:m2") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "0")
+    field(DESC, "motor 2")
+    field(DHLM, "100")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "PIJEDS")
+    field(EGU, "um")
+    field(INIT, "")
+    field(MRES, ".001")
+    field(OUT, "#C0 S1 @")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(SDIS, "piJena:m2_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "2.")
+}
+record(bo, "piJena:m2_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "piJena:m2.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "piJena:m2_twCh") {
+    field(CALC, "min(max(a*b,abs(c)),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "piJena:m2.TWV")
+    field(INPC, "piJena:m2.MRES")
+    field(INPD, "piJena:m2.HLM")
+    field(INPE, "piJena:m2.LLM")
+    field(OUT, "piJena:m2.TWV")
+}
+record(calcout, "piJena:m2_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "piJena:m2.S")
+    field(INPC, "piJena:m2.SBAS")
+    field(INPD, "piJena:m2.SMAX")
+    field(OUT, "piJena:m2.S")
+}
+record(longout, "piJena:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "piJena:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

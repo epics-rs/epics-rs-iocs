@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use ioc_conventions::{
-    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_records, booted_records, read_dbl,
-    renamed,
+    assert_inits_motor_util, assert_links_asyn_dbd, assert_same_fields, assert_same_records,
+    booted_records, read_db, read_dbl, renamed, renamed_fields, script_fields,
 };
 
 fn dir() -> &'static Path {
@@ -16,25 +16,51 @@ fn ioc() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_oms-asyn-ioc"))
 }
 
+/// `script`'s loads and dbpf lines leave every field as C's `db` leaves it.
+fn assert_sets_c_fields(script: &str, db: &str, renames: &[(&str, &str)], drops: &[&str]) {
+    let c = renamed_fields(&read_db(&dir().join("tests").join(db)), renames, drops);
+    assert_same_fields(&script_fields(&dir().join(script)), &c);
+}
+
 /// C's st.cmd loads the MAXv's m1 beside the MAXnet's m2; there is no MAXv.
+const MAXNET_RENAMES: &[(&str, &str)] = &[("omsAsyn:", "oms:")];
+const MAXNET_DROPS: &[&str] = &["omsAsyn:m1"];
+const MXA_RENAMES: &[(&str, &str)] = &[("omsAsyn:", "oms:")];
+
 #[test]
 fn st_cmd_loads_the_c_maxnet_records() {
     let c = renamed(
         &read_dbl(&dir().join("tests/iocOmsAsyn.dbl")),
-        &[("omsAsyn:", "oms:")],
-        &["omsAsyn:m1"],
+        MAXNET_RENAMES,
+        MAXNET_DROPS,
     );
     assert_same_records(&booted_records(ioc(), &dir().join("st.cmd")), &c);
 }
 
 #[test]
-fn st_mxa_cmd_loads_the_c_mxa_records() {
-    let c = renamed(
-        &read_dbl(&dir().join("tests/MXA.dbl")),
-        &[("omsAsyn:", "oms:")],
-        &[],
+fn st_cmd_sets_the_c_maxnet_fields() {
+    let mut c = renamed_fields(
+        &read_db(&dir().join("tests/iocOmsAsyn.db")),
+        MAXNET_RENAMES,
+        MAXNET_DROPS,
     );
+    // C's row binds the axis to the octet port MAXNET, which has no
+    // asynMotor; st.cmd binds it to the omsMAXnetConfig port.
+    for value in c.values_mut().flat_map(|r| r.fields.values_mut()) {
+        *value = value.replace("@asyn(MAXNET,", "@asyn(MAXnet1,");
+    }
+    assert_same_fields(&script_fields(&dir().join("st.cmd")), &c);
+}
+
+#[test]
+fn st_mxa_cmd_loads_the_c_mxa_records() {
+    let c = renamed(&read_dbl(&dir().join("tests/MXA.dbl")), MXA_RENAMES, &[]);
     assert_same_records(&booted_records(ioc(), &dir().join("st.mxa.cmd")), &c);
+}
+
+#[test]
+fn st_mxa_cmd_sets_the_c_mxa_fields() {
+    assert_sets_c_fields("st.mxa.cmd", "MXA.db", MXA_RENAMES, &[]);
 }
 
 /// The binary links asyn.dbd, as C's iocOmsAsyn does.

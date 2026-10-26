@@ -1,0 +1,1575 @@
+# c-expansion of st.cmd over the C sources, the records of iocAMCI.dbl:
+# dbl of motor R7-4-5 motorAMCI iocBoot/iocAMCI st.cmd
+record(bi, "amci:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "amci:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "amci:alldone")
+    field(INPB, "amci:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "amci:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(motor, "amci:m1") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M1")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,0)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m1_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(motor, "amci:m10") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M10")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,9)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m10_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m10:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,9)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m10:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,9)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m10Direction") {
+    field(DESC, "m10 direction")
+    field(DOL, "amci:m10.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,9)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m10Offset") {
+    field(DESC, "m10 offset")
+    field(DOL, "amci:m10.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,9)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m10Resolution") {
+    field(DESC, "m10 resolution")
+    field(DOL, "amci:m10.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,9)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m10_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m10.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m10_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m10.TWV")
+    field(INPC, "amci:m10.MRES")
+    field(INPD, "amci:m10.HLM")
+    field(INPE, "amci:m10.LLM")
+    field(OUT, "amci:m10.TWV")
+}
+record(calcout, "amci:m10_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m10.S")
+    field(INPC, "amci:m10.SBAS")
+    field(INPD, "amci:m10.SMAX")
+    field(OUT, "amci:m10.S")
+}
+record(motor, "amci:m11") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M11")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,10)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m11_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m11:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,10)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m11:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,10)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m11Direction") {
+    field(DESC, "m11 direction")
+    field(DOL, "amci:m11.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,10)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m11Offset") {
+    field(DESC, "m11 offset")
+    field(DOL, "amci:m11.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,10)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m11Resolution") {
+    field(DESC, "m11 resolution")
+    field(DOL, "amci:m11.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,10)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m11_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m11.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m11_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m11.TWV")
+    field(INPC, "amci:m11.MRES")
+    field(INPD, "amci:m11.HLM")
+    field(INPE, "amci:m11.LLM")
+    field(OUT, "amci:m11.TWV")
+}
+record(calcout, "amci:m11_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m11.S")
+    field(INPC, "amci:m11.SBAS")
+    field(INPD, "amci:m11.SMAX")
+    field(OUT, "amci:m11.S")
+}
+record(motor, "amci:m12") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M12")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,11)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m12_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m12:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,11)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m12:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,11)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m12Direction") {
+    field(DESC, "m12 direction")
+    field(DOL, "amci:m12.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,11)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m12Offset") {
+    field(DESC, "m12 offset")
+    field(DOL, "amci:m12.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,11)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m12Resolution") {
+    field(DESC, "m12 resolution")
+    field(DOL, "amci:m12.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,11)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m12_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m12.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m12_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m12.TWV")
+    field(INPC, "amci:m12.MRES")
+    field(INPD, "amci:m12.HLM")
+    field(INPE, "amci:m12.LLM")
+    field(OUT, "amci:m12.TWV")
+}
+record(calcout, "amci:m12_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m12.S")
+    field(INPC, "amci:m12.SBAS")
+    field(INPD, "amci:m12.SMAX")
+    field(OUT, "amci:m12.S")
+}
+record(motor, "amci:m13") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C2 M1")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C2,0)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m13_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m13:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C2,0)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m13:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C2,0)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m13Direction") {
+    field(DESC, "m13 direction")
+    field(DOL, "amci:m13.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m13Offset") {
+    field(DESC, "m13 offset")
+    field(DOL, "amci:m13.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m13Resolution") {
+    field(DESC, "m13 resolution")
+    field(DOL, "amci:m13.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m13_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m13.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m13_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m13.TWV")
+    field(INPC, "amci:m13.MRES")
+    field(INPD, "amci:m13.HLM")
+    field(INPE, "amci:m13.LLM")
+    field(OUT, "amci:m13.TWV")
+}
+record(calcout, "amci:m13_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m13.S")
+    field(INPC, "amci:m13.SBAS")
+    field(INPD, "amci:m13.SMAX")
+    field(OUT, "amci:m13.S")
+}
+record(motor, "amci:m14") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C2 M2")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C2,1)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m14_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m14:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C2,1)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m14:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C2,1)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m14Direction") {
+    field(DESC, "m14 direction")
+    field(DOL, "amci:m14.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m14Offset") {
+    field(DESC, "m14 offset")
+    field(DOL, "amci:m14.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,1)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m14Resolution") {
+    field(DESC, "m14 resolution")
+    field(DOL, "amci:m14.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m14_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m14.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m14_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m14.TWV")
+    field(INPC, "amci:m14.MRES")
+    field(INPD, "amci:m14.HLM")
+    field(INPE, "amci:m14.LLM")
+    field(OUT, "amci:m14.TWV")
+}
+record(calcout, "amci:m14_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m14.S")
+    field(INPC, "amci:m14.SBAS")
+    field(INPD, "amci:m14.SMAX")
+    field(OUT, "amci:m14.S")
+}
+record(motor, "amci:m15") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C2 M3")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C2,2)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m15_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m15:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C2,2)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m15:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C2,2)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m15Direction") {
+    field(DESC, "m15 direction")
+    field(DOL, "amci:m15.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,2)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m15Offset") {
+    field(DESC, "m15 offset")
+    field(DOL, "amci:m15.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,2)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m15Resolution") {
+    field(DESC, "m15 resolution")
+    field(DOL, "amci:m15.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,2)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m15_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m15.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m15_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m15.TWV")
+    field(INPC, "amci:m15.MRES")
+    field(INPD, "amci:m15.HLM")
+    field(INPE, "amci:m15.LLM")
+    field(OUT, "amci:m15.TWV")
+}
+record(calcout, "amci:m15_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m15.S")
+    field(INPC, "amci:m15.SBAS")
+    field(INPD, "amci:m15.SMAX")
+    field(OUT, "amci:m15.S")
+}
+record(motor, "amci:m16") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C2 M4")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C2,3)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m16_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m16:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C2,3)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m16:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C2,3)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m16Direction") {
+    field(DESC, "m16 direction")
+    field(DOL, "amci:m16.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,3)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m16Offset") {
+    field(DESC, "m16 offset")
+    field(DOL, "amci:m16.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,3)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m16Resolution") {
+    field(DESC, "m16 resolution")
+    field(DOL, "amci:m16.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,3)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m16_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m16.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m16_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m16.TWV")
+    field(INPC, "amci:m16.MRES")
+    field(INPD, "amci:m16.HLM")
+    field(INPE, "amci:m16.LLM")
+    field(OUT, "amci:m16.TWV")
+}
+record(calcout, "amci:m16_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m16.S")
+    field(INPC, "amci:m16.SBAS")
+    field(INPD, "amci:m16.SMAX")
+    field(OUT, "amci:m16.S")
+}
+record(motor, "amci:m17") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C2 M5")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C2,4)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m17_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m17:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C2,4)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m17:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C2,4)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m17Direction") {
+    field(DESC, "m17 direction")
+    field(DOL, "amci:m17.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,4)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m17Offset") {
+    field(DESC, "m17 offset")
+    field(DOL, "amci:m17.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,4)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m17Resolution") {
+    field(DESC, "m17 resolution")
+    field(DOL, "amci:m17.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,4)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m17_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m17.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m17_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m17.TWV")
+    field(INPC, "amci:m17.MRES")
+    field(INPD, "amci:m17.HLM")
+    field(INPE, "amci:m17.LLM")
+    field(OUT, "amci:m17.TWV")
+}
+record(calcout, "amci:m17_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m17.S")
+    field(INPC, "amci:m17.SBAS")
+    field(INPD, "amci:m17.SMAX")
+    field(OUT, "amci:m17.S")
+}
+record(motor, "amci:m18") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C2 M6")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C2,5)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m18_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m18:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C2,5)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m18:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C2,5)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m18Direction") {
+    field(DESC, "m18 direction")
+    field(DOL, "amci:m18.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,5)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m18Offset") {
+    field(DESC, "m18 offset")
+    field(DOL, "amci:m18.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,5)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m18Resolution") {
+    field(DESC, "m18 resolution")
+    field(DOL, "amci:m18.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C2,5)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m18_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m18.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m18_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m18.TWV")
+    field(INPC, "amci:m18.MRES")
+    field(INPD, "amci:m18.HLM")
+    field(INPE, "amci:m18.LLM")
+    field(OUT, "amci:m18.TWV")
+}
+record(calcout, "amci:m18_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m18.S")
+    field(INPC, "amci:m18.SBAS")
+    field(INPD, "amci:m18.SMAX")
+    field(OUT, "amci:m18.S")
+}
+record(bo, "amci:m1:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,0)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m1:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,0)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "amci:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "amci:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "amci:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m1_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m1.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m1_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m1.TWV")
+    field(INPC, "amci:m1.MRES")
+    field(INPD, "amci:m1.HLM")
+    field(INPE, "amci:m1.LLM")
+    field(OUT, "amci:m1.TWV")
+}
+record(calcout, "amci:m1_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m1.S")
+    field(INPC, "amci:m1.SBAS")
+    field(INPD, "amci:m1.SMAX")
+    field(OUT, "amci:m1.S")
+}
+record(motor, "amci:m2") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M2")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,1)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m2_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m2:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,1)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m2:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,1)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "amci:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "amci:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,1)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "amci:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m2_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m2.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m2_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m2.TWV")
+    field(INPC, "amci:m2.MRES")
+    field(INPD, "amci:m2.HLM")
+    field(INPE, "amci:m2.LLM")
+    field(OUT, "amci:m2.TWV")
+}
+record(calcout, "amci:m2_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m2.S")
+    field(INPC, "amci:m2.SBAS")
+    field(INPD, "amci:m2.SMAX")
+    field(OUT, "amci:m2.S")
+}
+record(motor, "amci:m3") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M3")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,2)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m3_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m3:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,2)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m3:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,2)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m3Direction") {
+    field(DESC, "m3 direction")
+    field(DOL, "amci:m3.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,2)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m3Offset") {
+    field(DESC, "m3 offset")
+    field(DOL, "amci:m3.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,2)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m3Resolution") {
+    field(DESC, "m3 resolution")
+    field(DOL, "amci:m3.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,2)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m3_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m3.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m3_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m3.TWV")
+    field(INPC, "amci:m3.MRES")
+    field(INPD, "amci:m3.HLM")
+    field(INPE, "amci:m3.LLM")
+    field(OUT, "amci:m3.TWV")
+}
+record(calcout, "amci:m3_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m3.S")
+    field(INPC, "amci:m3.SBAS")
+    field(INPD, "amci:m3.SMAX")
+    field(OUT, "amci:m3.S")
+}
+record(motor, "amci:m4") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M4")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,3)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m4_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m4:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,3)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m4:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,3)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m4Direction") {
+    field(DESC, "m4 direction")
+    field(DOL, "amci:m4.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,3)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m4Offset") {
+    field(DESC, "m4 offset")
+    field(DOL, "amci:m4.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,3)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m4Resolution") {
+    field(DESC, "m4 resolution")
+    field(DOL, "amci:m4.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,3)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m4_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m4.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m4_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m4.TWV")
+    field(INPC, "amci:m4.MRES")
+    field(INPD, "amci:m4.HLM")
+    field(INPE, "amci:m4.LLM")
+    field(OUT, "amci:m4.TWV")
+}
+record(calcout, "amci:m4_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m4.S")
+    field(INPC, "amci:m4.SBAS")
+    field(INPD, "amci:m4.SMAX")
+    field(OUT, "amci:m4.S")
+}
+record(motor, "amci:m5") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M5")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,4)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m5_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m5:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,4)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m5:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,4)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m5Direction") {
+    field(DESC, "m5 direction")
+    field(DOL, "amci:m5.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,4)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m5Offset") {
+    field(DESC, "m5 offset")
+    field(DOL, "amci:m5.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,4)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m5Resolution") {
+    field(DESC, "m5 resolution")
+    field(DOL, "amci:m5.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,4)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m5_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m5.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m5_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m5.TWV")
+    field(INPC, "amci:m5.MRES")
+    field(INPD, "amci:m5.HLM")
+    field(INPE, "amci:m5.LLM")
+    field(OUT, "amci:m5.TWV")
+}
+record(calcout, "amci:m5_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m5.S")
+    field(INPC, "amci:m5.SBAS")
+    field(INPD, "amci:m5.SMAX")
+    field(OUT, "amci:m5.S")
+}
+record(motor, "amci:m6") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M6")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,5)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m6_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m6:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,5)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m6:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,5)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m6Direction") {
+    field(DESC, "m6 direction")
+    field(DOL, "amci:m6.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,5)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m6Offset") {
+    field(DESC, "m6 offset")
+    field(DOL, "amci:m6.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,5)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m6Resolution") {
+    field(DESC, "m6 resolution")
+    field(DOL, "amci:m6.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,5)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m6_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m6.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m6_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m6.TWV")
+    field(INPC, "amci:m6.MRES")
+    field(INPD, "amci:m6.HLM")
+    field(INPE, "amci:m6.LLM")
+    field(OUT, "amci:m6.TWV")
+}
+record(calcout, "amci:m6_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m6.S")
+    field(INPC, "amci:m6.SBAS")
+    field(INPD, "amci:m6.SMAX")
+    field(OUT, "amci:m6.S")
+}
+record(motor, "amci:m7") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M7")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,6)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m7_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m7:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,6)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m7:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,6)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m7Direction") {
+    field(DESC, "m7 direction")
+    field(DOL, "amci:m7.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,6)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m7Offset") {
+    field(DESC, "m7 offset")
+    field(DOL, "amci:m7.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,6)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m7Resolution") {
+    field(DESC, "m7 resolution")
+    field(DOL, "amci:m7.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,6)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m7_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m7.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m7_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m7.TWV")
+    field(INPC, "amci:m7.MRES")
+    field(INPD, "amci:m7.HLM")
+    field(INPE, "amci:m7.LLM")
+    field(OUT, "amci:m7.TWV")
+}
+record(calcout, "amci:m7_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m7.S")
+    field(INPC, "amci:m7.SBAS")
+    field(INPD, "amci:m7.SMAX")
+    field(OUT, "amci:m7.S")
+}
+record(motor, "amci:m8") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M8")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,7)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m8_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m8:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,7)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m8:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,7)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m8Direction") {
+    field(DESC, "m8 direction")
+    field(DOL, "amci:m8.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,7)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m8Offset") {
+    field(DESC, "m8 offset")
+    field(DOL, "amci:m8.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,7)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m8Resolution") {
+    field(DESC, "m8 resolution")
+    field(DOL, "amci:m8.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,7)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m8_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m8.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m8_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m8.TWV")
+    field(INPC, "amci:m8.MRES")
+    field(INPD, "amci:m8.HLM")
+    field(INPE, "amci:m8.LLM")
+    field(OUT, "amci:m8.TWV")
+}
+record(calcout, "amci:m8_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m8.S")
+    field(INPC, "amci:m8.SBAS")
+    field(INPD, "amci:m8.SMAX")
+    field(OUT, "amci:m8.S")
+}
+record(motor, "amci:m9") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "ANF2 C1 M9")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANF2_C1,8)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "amci:m9_able.VAL")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(bo, "amci:m9:GetInfo") {
+    field(DESC, "Get Info")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(ANF2_C1,8)ANF2_GET_INFO")
+    field(PINI, "0")
+    field(VAL, "0")
+}
+record(bo, "amci:m9:ResetErrors") {
+    field(DESC, "Reset Errors")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Reset")
+    field(OUT, "@asyn(ANF2_C1,8)ANF2_RESET_ERRORS")
+    field(PINI, "0")
+    field(VAL, "0")
+    field(ZNAM, "Done")
+}
+record(longout, "amci:m9Direction") {
+    field(DESC, "m9 direction")
+    field(DOL, "amci:m9.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,8)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m9Offset") {
+    field(DESC, "m9 offset")
+    field(DOL, "amci:m9.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,8)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m9Resolution") {
+    field(DESC, "m9 resolution")
+    field(DOL, "amci:m9.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANF2_C1,8)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "amci:m9_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "amci:m9.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "amci:m9_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "amci:m9.TWV")
+    field(INPC, "amci:m9.MRES")
+    field(INPD, "amci:m9.HLM")
+    field(INPE, "amci:m9.LLM")
+    field(OUT, "amci:m9.TWV")
+}
+record(calcout, "amci:m9_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "amci:m9.S")
+    field(INPC, "amci:m9.SBAS")
+    field(INPD, "amci:m9.SMAX")
+    field(OUT, "amci:m9.S")
+}
+record(longout, "amci:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "amci:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

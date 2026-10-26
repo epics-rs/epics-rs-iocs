@@ -1,0 +1,59 @@
+# c-expansion of st.cmd over the C sources, the records of iocIms.dbl:
+# dbl of motor R7-4-5 motorIms iocBoot/iocIms st.cmd, which runs MDrive-Eth.cmd
+# MDrive-Eth.cmd's dbLoadRecords("../../db/motor.db") has no macros and loads no record
+# C refuses MDrive-Eth.cmd:5 (from st.cmd): motor.db, which does not parse
+record(asyn, "Test-CT{MC:1}Asyn") {
+    field(ADDR, "80")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "100")
+    field(OMAX, "100")
+    field(PORT, "P1")
+}
+record(bo, "Test-CT{Slt:1-Ax:T}ClrLR-Cmd") {
+    field(DESC, "Clear LR Error")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(M1,0,1.0)IMS_CLEARLRERROR")
+}
+record(bi, "Test-CT{Slt:1-Ax:T}LockRotor-Sts") {
+    field(DESC, "Locked Rotor Sts")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(M1,0,1.0)IMS_LOCKEDROTOR")
+    field(ONAM, "Locked")
+    field(OSV, "MINOR")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Clear")
+}
+record(bo, "Test-CT{Slt:1-Ax:T}Sav-Cmd") {
+    field(DESC, "Ims Save to NVM")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(M1,0,1.0)IMS_SAVETONVM")
+    field(PINI, "NO")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(bi, "ims:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "ims:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "ims:alldone")
+    field(INPB, "ims:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "ims:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(longout, "ims:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "ims:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

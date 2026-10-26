@@ -1,0 +1,115 @@
+# c-expansion of st.cmd, motor.substitutions.ANG1 for ANG1_motors.substitutions, st.cmd.ANG1 for motor.cmd.ANF2 over the C sources, the records of iocAMCI.ANG1.dbl:
+# dbl of motor R7-4-5 motorAMCI iocBoot/iocAMCI st.cmd with st.cmd.ANG1 in
+# place of motor.cmd.ANF2, loading motor.substitutions.ANG1
+# C refuses st.cmd.ANG1:57 (from st.cmd): ANG1Aux.template, which no C Db directory holds
+record(bi, "amci:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "amci:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "amci:alldone")
+    field(INPB, "amci:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "amci:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(motor, "amci:m101") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "AMCI ANG1 1")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANG1_1_1,0)")
+    field(PREC, "5")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(longout, "amci:m101Direction") {
+    field(DESC, "m101 direction")
+    field(DOL, "amci:m101.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANG1_1_1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m101Offset") {
+    field(DESC, "m101 offset")
+    field(DOL, "amci:m101.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANG1_1_1,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m101Resolution") {
+    field(DESC, "m101 resolution")
+    field(DOL, "amci:m101.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANG1_1_1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(motor, "amci:m102") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "50")
+    field(DESC, "AMCI ANG1 2")
+    field(DHLM, "1e9")
+    field(DIR, "Pos")
+    field(DLLM, "-1e9")
+    field(DTYP, "asynMotor")
+    field(EGU, "steps")
+    field(INIT, "")
+    field(MRES, "1")
+    field(OUT, "@asyn(ANG1_1_2,0)")
+    field(PREC, "5")
+    field(TWV, "1")
+    field(VBAS, "0")
+    field(VELO, "100")
+}
+record(longout, "amci:m102Direction") {
+    field(DESC, "m102 direction")
+    field(DOL, "amci:m102.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANG1_1_2,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "amci:m102Offset") {
+    field(DESC, "m102 offset")
+    field(DOL, "amci:m102.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANG1_1_2,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "amci:m102Resolution") {
+    field(DESC, "m102 resolution")
+    field(DOL, "amci:m102.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ANG1_1_2,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(longout, "amci:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "amci:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

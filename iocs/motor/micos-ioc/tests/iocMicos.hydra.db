@@ -1,0 +1,214 @@
+# c-expansion of st.cmd, no MoCo.cmd, no motor.cmd.SMCcorvus over the C sources, the records of iocMicos.hydra.dbl:
+# dbl of motor R7-4-5 motorMicos iocBoot/iocMicos st.cmd with motor.cmd.SMChydra alone
+record(bi, "micos:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "micos:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "micos:alldone")
+    field(INPB, "micos:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "micos:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(asyn, "micos:hydraAsyn1") {
+    field(ADDR, "0")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "256")
+    field(OMAX, "256")
+    field(PORT, "Hydra1")
+}
+record(asyn, "micos:hydraAsyn2") {
+    field(ADDR, "1")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "256")
+    field(OMAX, "256")
+    field(PORT, "Hydra1")
+}
+record(asyn, "micos:hydraComm") {
+    field(ADDR, "0")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "256")
+    field(OMAX, "256")
+    field(PORT, "hydraPort")
+}
+record(motor, "micos:m3") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, "2")
+    field(BDST, "0")
+    field(BVEL, "1.0")
+    field(DESC, "m3")
+    field(DHLM, "175")
+    field(DIR, "Pos")
+    field(DLLM, "-175")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, "0.01")
+    field(OUT, "@asyn(Hydra1,0)")
+    field(PREC, "2")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "micos:m3_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".05")
+    field(VELO, "3.")
+}
+record(mbbo, "micos:m3:RegulatorMode") {
+    field(DESC, "Regulator Mode")
+    field(DTYP, "asynInt32")
+    field(ONST, "Standard")
+    field(ONVL, "1")
+    field(OUT, "@asyn(Hydra1,0)SMCHYDRA_REGULATOR_MODE")
+    field(PINI, "1")
+    field(TWST, "Adaptive")
+    field(TWVL, "2")
+    field(VAL, "1")
+    field(ZRST, "Open-Loop")
+    field(ZRVL, "0")
+}
+record(longout, "micos:m3Direction") {
+    field(DESC, "m3 direction")
+    field(DOL, "micos:m3.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Hydra1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "micos:m3Offset") {
+    field(DESC, "m3 offset")
+    field(DOL, "micos:m3.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Hydra1,0)MOTOR_REC_OFFSET")
+    field(PREC, "2")
+}
+record(ao, "micos:m3Resolution") {
+    field(DESC, "m3 resolution")
+    field(DOL, "micos:m3.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Hydra1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "2")
+}
+record(bo, "micos:m3_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "micos:m3.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "micos:m3_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "micos:m3.TWV")
+    field(INPC, "micos:m3.MRES")
+    field(INPD, "micos:m3.HLM")
+    field(INPE, "micos:m3.LLM")
+    field(OUT, "micos:m3.TWV")
+}
+record(calcout, "micos:m3_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "micos:m3.S")
+    field(INPC, "micos:m3.SBAS")
+    field(INPD, "micos:m3.SMAX")
+    field(OUT, "micos:m3.S")
+}
+record(motor, "micos:m4") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, "2")
+    field(BDST, "0")
+    field(BVEL, "1.0")
+    field(DESC, "m4")
+    field(DHLM, "175")
+    field(DIR, "Pos")
+    field(DLLM, "-175")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, "0.01")
+    field(OUT, "@asyn(Hydra1,1)")
+    field(PREC, "2")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "micos:m4_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".05")
+    field(VELO, "3.")
+}
+record(mbbo, "micos:m4:RegulatorMode") {
+    field(DESC, "Regulator Mode")
+    field(DTYP, "asynInt32")
+    field(ONST, "Standard")
+    field(ONVL, "1")
+    field(OUT, "@asyn(Hydra1,1)SMCHYDRA_REGULATOR_MODE")
+    field(PINI, "1")
+    field(TWST, "Adaptive")
+    field(TWVL, "2")
+    field(VAL, "1")
+    field(ZRST, "Open-Loop")
+    field(ZRVL, "0")
+}
+record(longout, "micos:m4Direction") {
+    field(DESC, "m4 direction")
+    field(DOL, "micos:m4.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Hydra1,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "micos:m4Offset") {
+    field(DESC, "m4 offset")
+    field(DOL, "micos:m4.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Hydra1,1)MOTOR_REC_OFFSET")
+    field(PREC, "2")
+}
+record(ao, "micos:m4Resolution") {
+    field(DESC, "m4 resolution")
+    field(DOL, "micos:m4.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Hydra1,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "2")
+}
+record(bo, "micos:m4_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "micos:m4.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "micos:m4_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "micos:m4.TWV")
+    field(INPC, "micos:m4.MRES")
+    field(INPD, "micos:m4.HLM")
+    field(INPE, "micos:m4.LLM")
+    field(OUT, "micos:m4.TWV")
+}
+record(calcout, "micos:m4_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "micos:m4.S")
+    field(INPC, "micos:m4.SBAS")
+    field(INPD, "micos:m4.SMAX")
+    field(OUT, "micos:m4.S")
+}
+record(longout, "micos:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "micos:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

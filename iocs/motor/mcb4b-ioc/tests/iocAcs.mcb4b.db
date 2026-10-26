@@ -1,0 +1,185 @@
+# c-expansion of st.cmd.mcb4b over the C sources, the records of iocAcs.mcb4b.dbl:
+# dbl of motor R7-4-5 motorAcs iocBoot/iocAcs st.cmd.mcb4b
+record(motor, "IOC:m1") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Bottom")
+    field(DHLM, "16")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "-.001")
+    field(OUT, "@asyn(MCB4B1,0)")
+    field(PREC, "3")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "2.0")
+}
+record(longout, "IOC:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "IOC:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "IOC:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,0)MOTOR_REC_OFFSET")
+    field(PREC, "3")
+}
+record(ao, "IOC:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "IOC:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "3")
+}
+record(motor, "IOC:m2") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Top")
+    field(DHLM, "16")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "-.001")
+    field(OUT, "@asyn(MCB4B1,1)")
+    field(PREC, "3")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "2.0")
+}
+record(longout, "IOC:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "IOC:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "IOC:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,1)MOTOR_REC_OFFSET")
+    field(PREC, "3")
+}
+record(ao, "IOC:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "IOC:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "3")
+}
+record(motor, "IOC:m3") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Inboard")
+    field(DHLM, "16")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "-.001")
+    field(OUT, "@asyn(MCB4B1,2)")
+    field(PREC, "3")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "2.0")
+}
+record(longout, "IOC:m3Direction") {
+    field(DESC, "m3 direction")
+    field(DOL, "IOC:m3.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,2)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m3Offset") {
+    field(DESC, "m3 offset")
+    field(DOL, "IOC:m3.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,2)MOTOR_REC_OFFSET")
+    field(PREC, "3")
+}
+record(ao, "IOC:m3Resolution") {
+    field(DESC, "m3 resolution")
+    field(DOL, "IOC:m3.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,2)MOTOR_REC_RESOLUTION")
+    field(PREC, "3")
+}
+record(motor, "IOC:m4") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Outboard")
+    field(DHLM, "16")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "-.001")
+    field(OUT, "@asyn(MCB4B1,3)")
+    field(PREC, "3")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "2.0")
+}
+record(longout, "IOC:m4Direction") {
+    field(DESC, "m4 direction")
+    field(DOL, "IOC:m4.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,3)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m4Offset") {
+    field(DESC, "m4 offset")
+    field(DOL, "IOC:m4.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,3)MOTOR_REC_OFFSET")
+    field(PREC, "3")
+}
+record(ao, "IOC:m4Resolution") {
+    field(DESC, "m4 resolution")
+    field(DOL, "IOC:m4.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(MCB4B1,3)MOTOR_REC_RESOLUTION")
+    field(PREC, "3")
+}
+record(asyn, "IOC:serial1") {
+    field(ADDR, "0")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "80")
+    field(OMAX, "80")
+    field(PORT, "serial1")
+}
