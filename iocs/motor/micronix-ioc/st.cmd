@@ -11,8 +11,8 @@
 #============================================================
 
 epicsEnvSet("P",      "MMC200:")
-epicsEnvSet("PORT",   "MOTOR1")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("PORT",   "mmc200_1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -32,14 +32,15 @@ asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 # ---- MMC-200 controller ----
 # MMC200CreateController(portName, MMC200PortName, numAxes,
 #                        movingPollPeriod, idlePollPeriod, ignoreLimits)
-MMC200CreateController("$(PORT)", "$(SERIAL)", 2, 500, 2000, 1)
+# An idle period of 0 polls only when a move wakes the poller, as C's.
+MMC200CreateController("$(PORT)", "$(SERIAL)", 2, 500, 0, 1)
 
-# One motor record per axis (OUT @asyn($(PORT),axis)).
-# The driver scales the record's steps by the axis resolution read from the
-# controller, as C; set MRES to that resolution for EGU = mm (the example
-# matches a 2.44140625e-6 mm/microstep stage).
-dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m1,PORT=$(PORT),ADDR=0,MRES=2.44140625e-6,EGU=mm")
-dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m2,PORT=$(PORT),ADDR=1,MRES=2.44140625e-6,EGU=mm")
+# motorUtil's records and one asyn_motor.db per axis, as C's st.cmd and
+# motor.cmd.mmc200 load them. The driver scales the record's steps by the
+# axis resolution read from the controller, as C; MRES in the rows is that
+# resolution, for EGU = mm.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(MICRONIX_IOC)/db/motor.substitutions.mmc200", "P=$(P),PORT=$(PORT)")
 
 iocInit()
 

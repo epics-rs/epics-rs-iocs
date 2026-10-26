@@ -1,0 +1,13 @@
+# C's iocMicronix motor.substitutions.mmc200, P and PORT from st.cmd. The
+# driver scales the record's steps by the axis resolution read from the
+# controller, as C; MRES set to it gives EGU in mm (the rows match a
+# 2.44140625e-6 mm/microstep stage). C's file loads
+# $(MOTOR)/motorApp/Db/asyn_motor.db, a source-tree path no installed MOTOR
+# has.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{M,  DTYP,        ADDR, DESC, EGU, DIR, VMAX, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES,          PREC, DHLM, DLLM, INIT}
+{m1, "asynMotor", 0,    "m1", mm,  Pos, 15.,  3.,   .05,  .5,   0,    1.0,  2,    2.44140625e-6, 5,    0,    0,    ""}
+{m2, "asynMotor", 1,    "m2", mm,  Pos, 15.,  3.,   .05,  .5,   0,    1.0,  2,    2.44140625e-6, 5,    0,    0,    ""}
+}

@@ -1,0 +1,20 @@
+# dbl of motor R7-4-5 motorMicronix iocBoot/iocMicronix st.cmd
+micronix:alldone
+micronix:alldoneBlink
+micronix:allstop
+micronix:m1
+micronix:m1Direction
+micronix:m1Offset
+micronix:m1Resolution
+micronix:m1_able
+micronix:m1_twCh
+micronix:m1_vCh
+micronix:m2
+micronix:m2Direction
+micronix:m2Offset
+micronix:m2Resolution
+micronix:m2_able
+micronix:m2_twCh
+micronix:m2_vCh
+micronix:moving
+micronix:movingDiff
