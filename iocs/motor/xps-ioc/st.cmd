@@ -86,40 +86,6 @@ dbpf("$(P)m6.TWV", "0.1")
 # Disable:
 #   XPSPositionCompare("$(PORT)", "GROUP.PHI", 0)
 
-# PVT trajectory profiles (driver-private). A profile is defined from a CSV
-# points file, built (trajectory-file generation + FTP upload to the XPS +
-# verification against dynamics and soft limits), then executed on a background
-# thread over a dedicated socket so polling continues.
-#
-# The CSV has one row per point: "time, pos_0, pos_1, ..." with one position
-# column per positioner in the group, in the order the axes were created
-# (device/positioner units and seconds). '#' comments and blank lines are
-# skipped. Example file db/scan.csv for group GROUP, moving PHI:
-#     # time, PHI, KAPPA, OMEGA, PSI, THETA, NU
-#     0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-#     0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0
-#     0.5, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0
-#     0.5, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0
-#
-# Execution runs on the profile socket XPSCreateController opened
-# (MultipleAxesPVTExecution blocks until the trajectory finishes). After iocInit:
-#     XPSDefineProfileFromFile("$(PORT)", "GROUP", "db/scan.csv", "absolute")
-#     XPSBuildProfile("$(PORT)", "TrajectoryScan.trj", "$(IP)")
-#     XPSExecuteProfile("$(PORT)", 1)
-# XPSBuildProfile FTP credentials default to the XPSCreateProfile login and the
-# directory to /Admin/Public/Trajectories; override with extra args if changed.
-# Only plain FTP (XPS-C/Q) is supported; XPS-D SFTP is not implemented.
-#
-# Gathering: every execution samples SetpointPosition + CurrentPosition of all
-# registered positioners on each trajectory pulse. The optional trailing args
-#     XPSExecuteProfile(motorPort, [executions],
-#                       [startPulses], [endPulses], [numPulses])
-# window the pulse train over 1-based trajectory elements (defaults: the whole
-# profile with one pulse per element). After the run completes, read the
-# samples back into a CSV file (actual position + following error per
-# positioner, device units):
-#     XPSReadbackProfile("$(PORT)", "readback.csv")
-
 # Example:
 #   dbl
 #   camonitor XPS:m1 XPS:m1.RBV

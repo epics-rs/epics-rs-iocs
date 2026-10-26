@@ -11,8 +11,8 @@
 //!   `<Drv>Config(card, port, addr)`; records reach the axes as
 //!   `DTYP "<Drv>"`, `OUT "#C card S signal"`.
 //!
-//! The XPS profile, position-compare and TCL commands are driver-private: C
-//! drives them from controller-level records this port does not serve.
+//! The XPS position-compare and TCL commands are driver-private: C drives
+//! them from controller-level records this port does not serve.
 
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
@@ -24,7 +24,6 @@ use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
-use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -42,8 +41,8 @@ use motor_common::connect::{
     EosConnectError, EosRefusal, connect_controller, connect_serial, connect_with_eos,
 };
 use motor_common::iocsh::{
-    arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_int,
-    opt_string, poll_intervals, req_string,
+    arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string,
+    poll_intervals, req_string,
 };
 use motor_common::model1::{CardInit, Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
@@ -64,13 +63,8 @@ use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::pmnc::{PmncAxis, PmncController};
 use crate::report::{AxisLines, ControllerHead, period_s};
 use crate::smc100::Smc100Axis;
-use crate::xps::profile_move::{
-    ProfileHost, XpsProfile, run_flow, start_gathering, stop_gathering, strerror, trajectory_upload,
-};
-use crate::xps::{
-    ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
-    XpsController, XpsError, XpsSocket, ftp, gathering, gpio, pco, sftp,
-};
+use crate::xps::profile_move::{ProfileHost, XpsProfile};
+use crate::xps::{PcoParams, SocketMode, XpsAxis, XpsController, XpsSocket, gpio, pco};
 
 /// `CONEX_TIMEOUT` of AG_CONEX.cpp:30 and AGAP_CONEX.cpp:31.
 const CONEX_TIMEOUT: Duration = Duration::from_secs(2);
@@ -112,11 +106,6 @@ const PM500_TIMEOUT: Duration = Duration::from_secs(2);
 /// PMNC (New Focus 8750/8752) command timeout (C drvPMNC87xx
 /// `PMNC_TIMEOUT` 3 s).
 const PMNC_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Default XPS FTP account: the factory `Administrator` login C's
-/// `XPSCreateProfile` is normally given.
-const XPS_FTP_USER: &str = "Administrator";
-const XPS_FTP_PASSWORD: &str = "Administrator";
 
 /// `MAX_SOCKETS` (asynOctetSocket.cpp:36).
 const MAX_SOCKETS: usize = 1000;
@@ -531,12 +520,8 @@ struct XpsRegistration {
     /// The controller's asyn port.
     handle: PortHandle,
     controller: Arc<Mutex<XpsController>>,
-    /// The controller's `moveSocket_`, which runs profiles.
-    profile_sock: Arc<XpsSocket>,
     /// The poller `XPSCreateController` starts; `XPSCreateAxis` joins it.
     poller: Arc<Controller>,
-    /// `XPSCreateProfile`'s FTP account.
-    ftp_login: Option<(String, String)>,
 }
 
 static XPS_CONTROLLERS: Mutex<Vec<XpsRegistration>> = Mutex::new(Vec::new());
@@ -769,11 +754,8 @@ pub fn xps_create_controller_command() -> CommandDef {
                 .start_move_to_home_thread()
                 .map_err(|e| format!("XPSCreateController: {e}"))?;
             // XPSController.cpp:206; C ignores epicsThreadCreate's answer.
-            let _ = profile_thread.spawn::<XpsHead>(
-                handle.clone(),
-                controller.clone(),
-                profile_sock.clone(),
-            );
+            let _ =
+                profile_thread.spawn::<XpsHead>(handle.clone(), controller.clone(), profile_sock);
             XPS_CONTROLLERS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -783,9 +765,7 @@ pub fn xps_create_controller_command() -> CommandDef {
                     ip_port,
                     handle,
                     controller,
-                    profile_sock,
                     poller,
-                    ftp_login: None,
                 });
             Ok(CommandOutcome::Continue)
         },
@@ -885,13 +865,10 @@ pub fn xps_create_profile_command() -> CommandDef {
                 opt_string(args, 2)?.unwrap_or_default(),
                 opt_string(args, 3)?.unwrap_or_default(),
             );
-            let login = (user.clone(), password.clone());
             // The port thread looks the registration up, so the call runs
             // after with_xps lets it go.
-            let Some(handle) = with_xps(&port_name, "XPSCreateProfile", |reg| {
-                reg.ftp_login = Some(login);
-                reg.handle.clone()
-            }) else {
+            let Some(handle) = with_xps(&port_name, "XPSCreateProfile", |reg| reg.handle.clone())
+            else {
                 return Ok(CommandOutcome::Continue);
             };
             let _ = handle.with_driver_blocking::<ControllerPort<XpsHead>, _>(move |d| {
@@ -1226,399 +1203,6 @@ pub fn xps_position_compare_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
-}
-
-/// Create the `XPSDefineProfileFromFile` iocsh command.
-///
-/// `XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode])`
-///
-/// Loads a PVT profile for `group` from a CSV points file: each row is
-/// `time, pos_0, pos_1, ...` with one position column per positioner in the
-/// group (controller registration order), in device units and seconds; `#`
-/// comments and blank lines are skipped. `moveMode` is `absolute` (default)
-/// or `relative`, selecting whether the execute-time move to the trajectory
-/// start is absolute or relative. Driver-private: the epics-rs motor
-/// framework has no profileMove record subsystem, so profiles are defined by
-/// this command instead of by the C `profileMove` database.
-pub fn xps_define_profile_command() -> CommandDef {
-    CommandDef::new(
-        "XPSDefineProfileFromFile",
-        vec![
-            arg_str_req("motorPort"),
-            arg_str_req("group"),
-            arg_str_req("csvFile"),
-            ArgDesc {
-                name: "moveMode",
-                arg_type: ArgType::String,
-            },
-        ],
-        "XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode]) - Load a PVT profile for an XPS group from a CSV points file (time + one position column per group positioner; moveMode absolute|relative, default absolute)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let group = req_string(args, 1, "group")?;
-            let csv_file = req_string(args, 2, "csvFile")?;
-            let move_mode = parse_move_mode(opt_string(args, 3)?)?;
-
-            let controller = xps_controller(&motor_port, "XPSDefineProfileFromFile")?;
-            let csv = std::fs::read_to_string(&csv_file)
-                .map_err(|e| format!("XPSDefineProfileFromFile: cannot read '{csv_file}': {e}"))?;
-
-            let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let positioners = ctrl.positioners_in_group(&group);
-            let num_axes = positioners.len();
-            let profile = Profile::from_csv(&group, move_mode, &positioners, &csv)
-                .map_err(|e| format!("XPSDefineProfileFromFile: {e}"))?;
-            let num_points = profile.num_points();
-            ctrl.define_profile(profile)
-                .map_err(|e| format!("XPSDefineProfileFromFile: {e}"))?;
-            drop(ctrl);
-            println!(
-                "XPSDefineProfileFromFile: motorPort={motor_port} group={group} points={num_points} axes={num_axes} mode={move_mode:?}"
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// Create the `XPSBuildProfile` iocsh command.
-///
-/// `XPSBuildProfile(motorPort, fileName, host, [ftpUser], [ftpPassword], [ftpDir])`
-///
-/// Generates the defined profile's trajectory file, FTP-uploads it to the
-/// XPS trajectory folder, then verifies it against the group dynamics and
-/// each axis's soft limits (C `buildProfile`). `fileName` is the bare
-/// trajectory file name the controller opens; `host` is the XPS IP/hostname
-/// (no port). Credentials default to the XPS factory `Administrator`
-/// account and the directory to the firmware's trajectory folder.
-pub fn xps_build_profile_command() -> CommandDef {
-    CommandDef::new(
-        "XPSBuildProfile",
-        vec![
-            arg_str_req("motorPort"),
-            arg_str_req("fileName"),
-            arg_str_req("host"),
-            ArgDesc {
-                name: "ftpUser",
-                arg_type: ArgType::String,
-            },
-            ArgDesc {
-                name: "ftpPassword",
-                arg_type: ArgType::String,
-            },
-            ArgDesc {
-                name: "ftpDir",
-                arg_type: ArgType::String,
-            },
-        ],
-        "XPSBuildProfile(motorPort, fileName, host, [ftpUser], [ftpPassword], [ftpDir]) - Generate the defined profile's trajectory file, FTP it to the XPS, and verify it against dynamics + soft limits",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let file_name = req_string(args, 1, "fileName")?;
-            let host = req_string(args, 2, "host")?;
-            let (default_user, default_pass) =
-                with_xps(&motor_port, "XPSBuildProfile", |reg| reg.ftp_login.clone())
-                    .flatten()
-                    .unwrap_or_else(|| (XPS_FTP_USER.into(), XPS_FTP_PASSWORD.into()));
-            let ftp_user = opt_string(args, 3)?.unwrap_or(default_user);
-            let ftp_pass = opt_string(args, 4)?.unwrap_or(default_pass);
-            let ftp_dir = opt_string(args, 5)?;
-
-            let controller = xps_controller(&motor_port, "XPSBuildProfile")?;
-
-            let upload = TrajectoryUpload {
-                motor_port: &motor_port,
-                host: &host,
-                file_name: &file_name,
-                user: &ftp_user,
-                password: &ftp_pass,
-            };
-            let build =
-                || xps_build_profile(&controller, &upload, ftp_dir.as_deref(), upload_trajectory);
-            let directory = match build() {
-                Ok(directory) => directory,
-                Err(message) => {
-                    xps_profile_failed(&motor_port, "buildProfile", &message);
-                    return Ok(CommandOutcome::Continue);
-                }
-            };
-            println!(
-                "XPSBuildProfile: motorPort={motor_port} file={file_name} uploaded to {host}:{directory} and verified"
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// Create the `XPSExecuteProfile` iocsh command.
-///
-/// `XPSExecuteProfile(motorPort, [executions], [startPulses], [endPulses],
-/// [numPulses])`
-///
-/// Moves the group to the trajectory start, configures gathering (each
-/// trajectory pulse samples every registered positioner's
-/// `SetpointPosition`+`CurrentPosition` via a `GatheringOneData` event),
-/// then runs the built PVT profile with `MultipleAxesPVTExecution` and
-/// moves each axis to the profile's end (C `runProfile` flyback). The
-/// moves and the execution block until the motion finishes, so everything
-/// runs on a background thread over the controller's move socket, as C's
-/// does — the shared poll socket keeps polling meanwhile (C configures
-/// gathering on the poll socket; same RPCs, the move socket keeps the poll
-/// socket uncontended). `executions` (default 1)
-/// repeats the trajectory. `startPulses`/`endPulses` (1-based trajectory
-/// elements, defaults: the whole profile) window the pulse output and
-/// `numPulses` (default one per element) spreads that many pulses over it,
-/// exactly as C `executeProfile`. Read the samples back afterwards with
-/// `XPSReadbackProfile`.
-pub fn xps_execute_profile_command() -> CommandDef {
-    CommandDef::new(
-        "XPSExecuteProfile",
-        vec![
-            arg_str_req("motorPort"),
-            arg_int_opt("executions"),
-            arg_int_opt("startPulses"),
-            arg_int_opt("endPulses"),
-            arg_int_opt("numPulses"),
-        ],
-        "XPSExecuteProfile(motorPort, [executions], [startPulses], [endPulses], [numPulses]) - Move the group to the trajectory start and run the built PVT profile with gathering on a background thread (executions default 1; pulse window defaults to one pulse per trajectory element)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let executions = match args.get(1) {
-                Some(ArgValue::Int(v)) if *v >= 1 => *v as i32,
-                None | Some(ArgValue::Missing) => 1,
-                Some(ArgValue::Int(_)) => return Err("executions must be >= 1".into()),
-                _ => return Err("executions must be an integer".into()),
-            };
-
-            let controller = xps_controller(&motor_port, "XPSExecuteProfile")?;
-            let plan = controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .execution_plan();
-            let Some(plan) = plan else {
-                xps_profile_failed(
-                    &motor_port,
-                    "runProfile",
-                    "no built profile (call XPSBuildProfile first)",
-                );
-                return Ok(CommandOutcome::Continue);
-            };
-
-            // Pulse window: default one pulse per trajectory element over
-            // the whole profile (C reads these from records).
-            let num_elements = plan.times.len().saturating_sub(1) as i64;
-            let start_pulses = opt_int(args, 2, 1, "startPulses")?;
-            let end_pulses = opt_int(args, 3, num_elements, "endPulses")?;
-            let num_pulses = opt_int(args, 4, num_elements, "numPulses")?;
-            let Some(exec_sock) = with_xps(&motor_port, "XPSExecuteProfile", |reg| {
-                reg.profile_sock.clone()
-            }) else {
-                return Ok(CommandOutcome::Continue);
-            };
-
-            println!(
-                "XPSExecuteProfile: motorPort={motor_port} group={} file={} executions={executions} pulses={num_pulses} over elements {start_pulses}..{end_pulses} (running on background thread)",
-                plan.group, plan.file_name
-            );
-            // C's XPSProfile thread (XPSController.cpp:206-209).
-            spawn_dedicated_thread(
-                "XPSProfile".into(),
-                ThreadPriority::Low,
-                StackSizeClass::Medium,
-                move || {
-                    match xps_run_profile(
-                        &MotorTrace::new(&motor_port, 0),
-                        &exec_sock,
-                        &plan,
-                        executions,
-                        (start_pulses as i32, end_pulses as i32, num_pulses as i32),
-                    ) {
-                        None => println!(
-                            "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
-                            plan.file_name
-                        ),
-                        Some(message) => xps_profile_failed(&motor_port, "runProfile", &message),
-                    }
-                },
-            )
-            .map_err(|e| format!("XPSExecuteProfile: cannot create XPSProfile thread: {e}"))?;
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// Run a built trajectory: move to the start, configure gathering, execute,
-/// remove the event, stop gathering and fly back to the end (C
-/// `runProfile`, XPSController.cpp:862-1145). `pulses` is
-/// `(startPulses, endPulses, numPulses)`. Returns C's message for the last
-/// failed step, which C prints once at the end.
-fn xps_run_profile(
-    trace: &MotorTrace,
-    sock: &XpsSocket,
-    plan: &ExecutionPlan,
-    executions: i32,
-    pulses: (i32, i32, i32),
-) -> Option<String> {
-    // C ignores both moves' status.
-    xps_profile_moves(sock, plan.move_mode, &plan.start_moves);
-    let message = xps_execute_gathered(trace, sock, plan, executions, pulses);
-    xps_profile_moves(sock, plan.move_mode, &plan.end_moves);
-    message
-}
-
-/// Move each axis in turn; a move on the blocking socket returns when the
-/// motion is done, as C's `waitMotors` waits after it.
-fn xps_profile_moves(sock: &XpsSocket, mode: MoveMode, moves: &[(String, f64)]) {
-    for (positioner, target) in moves {
-        let _ = match mode {
-            MoveMode::Absolute => sock.group_move_absolute(positioner, &[*target]),
-            MoveMode::Relative => sock.group_move_relative(positioner, *target),
-        };
-    }
-}
-
-/// The part of C `runProfile` between the start move and `done:`.
-fn xps_execute_gathered(
-    trace: &MotorTrace,
-    sock: &XpsSocket,
-    plan: &ExecutionPlan,
-    executions: i32,
-    pulses: (i32, i32, i32),
-) -> Option<String> {
-    let event_id = match start_gathering(
-        trace,
-        sock,
-        &plan.group,
-        &plan.gathering_positioners,
-        &plan.times,
-        pulses,
-    ) {
-        Ok(id) => id,
-        Err(message) => return Some(message),
-    };
-
-    run_flow(
-        trace,
-        format_args!(
-            "calling MultipleAxesPVTExecution({}, {}, {}, {executions})\n",
-            sock.index(),
-            plan.group,
-            plan.file_name
-        ),
-    );
-    let message = match sock.multiple_axes_pvt_execution(&plan.group, &plan.file_name, executions) {
-        Ok(()) => None,
-        // -27: the trajectory was aborted.
-        Err(XpsError::Api(-27)) => Some("MultipleAxesPVTExecution aborted".to_string()),
-        Err(e) => Some(format!(
-            "Error performing MultipleAxesPVTExecution, status={}",
-            e.code()
-        )),
-    };
-    // C removes the event and stops gathering whatever the run returned.
-    stop_gathering(trace, sock, event_id).or(message)
-}
-
-/// Create the `XPSReadbackProfile` iocsh command.
-///
-/// `XPSReadbackProfile(motorPort, outputFile)`
-///
-/// Reads the gathering samples collected during the last
-/// `XPSExecuteProfile` run over the shared poll socket
-/// (`GatheringCurrentNumberGet` + chunked `GatheringDataMultipleLinesGet`,
-/// halving the request on a controller error exactly as C
-/// `readbackProfile`) and writes them to `outputFile` as CSV — one row per
-/// trajectory pulse with `actual, following_error` per registered
-/// positioner, the file-based counterpart of C posting the readback
-/// waveforms (positions are device units, like the profile CSV).
-pub fn xps_readback_profile_command() -> CommandDef {
-    CommandDef::new(
-        "XPSReadbackProfile",
-        vec![arg_str_req("motorPort"), arg_str_req("outputFile")],
-        "XPSReadbackProfile(motorPort, outputFile) - Read the gathering samples from the last XPSExecuteProfile run and write them to outputFile as CSV (actual position + following error per registered positioner, device units)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let output_file = req_string(args, 1, "outputFile")?;
-
-            let controller = xps_controller(&motor_port, "XPSReadbackProfile")?;
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let positioners = ctrl.registered_positioners();
-            if positioners.is_empty() {
-                return Err("XPSReadbackProfile: no axes registered".into());
-            }
-            let trace = MotorTrace::new(&motor_port, 0);
-            let (readback, num_read) = match xps_readback(&trace, ctrl.poll_socket(), &positioners)
-            {
-                Ok(read) => read,
-                Err(message) => {
-                    xps_profile_failed(&motor_port, "readbackProfile", &message);
-                    return Ok(CommandOutcome::Continue);
-                }
-            };
-
-            let csv = gathering::readback_csv(&positioners, &readback);
-            std::fs::write(&output_file, csv)
-                .map_err(|e| format!("XPSReadbackProfile: writing {output_file}: {e}"))?;
-            println!(
-                "XPSReadbackProfile: wrote {num_read} samples x {} positioners to {output_file}",
-                positioners.len()
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// C `readbackProfile` up to its parse: the samples and how many were read.
-fn xps_readback(
-    trace: &MotorTrace,
-    sock: &XpsSocket,
-    positioners: &[String],
-) -> Result<(GatheringReadback, i32), String> {
-    let flow = |args: std::fmt::Arguments<'_>| {
-        trace.print_self(
-            TraceMask::FLOW,
-            format_args!("XPSController:readbackProfile: {args}"),
-        )
-    };
-    flow(format_args!("entry\n"));
-    let read = sock.gathering_current_number_get();
-    let (status, (current_samples, max_samples)) = match &read {
-        Ok(n) => (0, *n),
-        Err(e) => (e.code(), (0, 0)),
-    };
-    flow(format_args!(
-        "GatheringCurrentNumberGet, status={status}, currentSamples={current_samples}, maxSamples={max_samples}\n"
-    ));
-    if status != 0 {
-        return Err(format!(
-            "Error calling GatherCurrentNumberGet, status={status}"
-        ));
-    }
-
-    let mut readback = GatheringReadback::new(positioners.len());
-    let mut num_read = 0i32;
-    while num_read < current_samples {
-        // Ask for everything left; on a controller error halve the request
-        // until it fits (C readbackProfile).
-        let mut lines = current_samples - num_read;
-        let buffer = loop {
-            let got = sock.gathering_data_multiple_lines_get(num_read, lines);
-            let status = got.as_ref().map_or_else(|e| e.code(), |_| 0);
-            flow(format_args!(
-                "GatheringDataMultipleLinesGet, status={status}, numInBuffer={lines}\n"
-            ));
-            match got {
-                Ok(buf) => break buf,
-                Err(_) if lines > 1 => lines /= 2,
-                Err(_) => return Err("Error reading gathering data, numInBuffer = 0".into()),
-            }
-        };
-        let parsed = gathering::parse_gathering_buffer(&buffer, positioners.len(), &mut readback)?;
-        if parsed == 0 {
-            return Err("gathering returned no lines".into());
-        }
-        num_read += parsed as i32;
-    }
-    Ok((readback, num_read))
 }
 
 /// `HXPCreateController(portName, IPAddress, IPPort, movingPollPeriod,
@@ -2202,69 +1786,6 @@ pub fn pmnc87xx_config_command() -> CommandDef {
     })
 }
 
-/// Parse the optional `moveMode` arg for the PVT commands: `absolute`/`abs`/`0`
-/// (default) or `relative`/`rel`/`1`.
-fn parse_move_mode(arg: Option<String>) -> Result<MoveMode, String> {
-    match arg.as_deref().map(str::to_ascii_lowercase).as_deref() {
-        None | Some("") | Some("absolute") | Some("abs") | Some("0") => Ok(MoveMode::Absolute),
-        Some("relative") | Some("rel") | Some("1") => Ok(MoveMode::Relative),
-        Some(other) => Err(format!(
-            "moveMode must be absolute or relative, got '{other}'"
-        )),
-    }
-}
-
-/// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "%s:%s: %s\n", driverName,
-/// functionName, message)` for a failed XPS profile build, run or readback.
-/// What one `XPSBuildProfile` uploads, besides its folder and contents.
-struct TrajectoryUpload<'a> {
-    motor_port: &'a str,
-    host: &'a str,
-    file_name: &'a str,
-    user: &'a str,
-    password: &'a str,
-}
-
-/// C `buildProfile` from the trajectory text to the verify: the text goes
-/// to `file_name` in the working directory, the firmware picks the folder
-/// (unless `ftp_dir` names one) and `useSFTP_` the transport, and `upload`
-/// sends it with the controller unlocked. Answers the folder.
-fn xps_build_profile(
-    controller: &Mutex<XpsController>,
-    target: &TrajectoryUpload<'_>,
-    ftp_dir: Option<&str>,
-    upload: impl Fn(&TrajectoryUpload<'_>, &str, &str, bool) -> Result<(), String>,
-) -> Result<String, String> {
-    let trace = MotorTrace::new(target.motor_port, 0);
-    trace.print_self(
-        TraceMask::FLOW,
-        format_args!("XPSController:buildProfile: entry\n"),
-    );
-    let (built, directory, use_sftp) = {
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        let built = ctrl.build_profile_text(&trace)?;
-        std::fs::write(target.file_name, &built.text).map_err(|e| {
-            format!(
-                "Error creating trajectory file {}, error={}\n",
-                target.file_name,
-                strerror(&e)
-            )
-        })?;
-        let (directory, sftp) = trajectory_upload(ctrl.firmware())?;
-        if sftp {
-            ctrl.set_use_sftp();
-        }
-        (built, directory, ctrl.use_sftp())
-    };
-    let directory = ftp_dir.unwrap_or(directory).to_string();
-    upload(target, &directory, &built.text, use_sftp)?;
-    controller
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .verify_profile(&trace, target.file_name, &built)?;
-    Ok(directory)
-}
-
 /// C `strtod(text, NULL)` for a step size, `None` where C's `errno` refuses
 /// it (XPSController.cpp:1371-1376, SMC100Driver.cpp:84-89). C builds a
 /// zero, infinite or NaN step and divides by it on every move or readback;
@@ -2272,65 +1793,6 @@ fn xps_build_profile(
 fn step_size(text: &str) -> Option<f64> {
     let read = strtod(text.as_bytes());
     (!read.erange && read.value.is_finite() && read.value != 0.0).then_some(read.value)
-}
-
-/// XPSController.cpp:709-747: SFTP when `useSFTP_`, else FTP.
-fn upload_trajectory(
-    target: &TrajectoryUpload<'_>,
-    directory: &str,
-    contents: &str,
-    use_sftp: bool,
-) -> Result<(), String> {
-    if use_sftp {
-        xps_sftp_upload_traced(target, directory)
-    } else {
-        ftp::upload_trajectory(
-            target.host,
-            directory,
-            target.file_name,
-            contents,
-            target.user,
-            target.password,
-        )
-    }
-}
-
-/// XPSController.cpp:710-720: `xpsSFTPUpload` between C's FLOW lines,
-/// verbose when the controller's own user traces IO_DRIVER.
-fn xps_sftp_upload_traced(target: &TrajectoryUpload<'_>, directory: &str) -> Result<(), String> {
-    let trace = MotorTrace::new(target.motor_port, 0);
-    let verbose = PortManager::global().trace_manager().is_enabled_device(
-        target.motor_port,
-        0,
-        TraceMask::IO_DRIVER,
-    );
-    trace.print_self(
-        TraceMask::FLOW,
-        format_args!("XPSController::buildProfile calling xpsSFTPUpload\n"),
-    );
-    let status = sftp::xps_sftp_upload(
-        target.host,
-        directory,
-        target.file_name,
-        target.user,
-        target.password,
-        verbose,
-    );
-    trace.print_self(
-        TraceMask::FLOW,
-        format_args!("XPSController::buildProfile xpsSFTPUpload returned {status}\n"),
-    );
-    if status != 0 {
-        return Err(format!("Error calling xpsSFTPUpload, status={status}\n"));
-    }
-    Ok(())
-}
-
-fn xps_profile_failed(motor_port: &str, function: &str, message: &str) {
-    MotorTrace::new(motor_port, 0).print_self(
-        TraceMask::ERROR,
-        format_args!("XPSController:{function}: {message}\n"),
-    );
 }
 
 #[cfg(test)]
@@ -2352,179 +1814,12 @@ mod tests {
         assert_eq!(step_size("abc"), None);
     }
 
-    /// XPSController.cpp:695-747: XPSBuildProfile uploads to the firmware's
-    /// folder, over SFTP once an XPS-D build sets `useSFTP_` and over FTP
-    /// otherwise; an ftpDir names the folder instead.
-    /// XPSController.cpp:642-648: the build writes the trajectory file under
-    /// its name in the working directory before the upload, and fails when
-    /// it cannot.
-    #[test]
-    fn the_build_writes_the_trajectory_file() {
-        let dir = std::env::temp_dir().join(format!("xps-traj-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("traj.trj");
-        let file = file.to_str().unwrap();
-        let (sent, _) = build_with("xpsBuildFile", "XPS-C8 V2", None, file);
-        assert_eq!(sent.len(), 1);
-        let text = std::fs::read_to_string(file).unwrap();
-        assert!(text.starts_with("0.") && text.ends_with('\n'), "{text}");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let missing = "/nonexistent-xps-dir/traj.trj";
-        assert_eq!(
-            build_result("xpsBuildNoFile", "XPS-C8 V2", missing),
-            Err(format!(
-                "Error creating trajectory file {missing}, error=No such file or directory\n"
-            ))
-        );
-    }
-
-    /// A controller over a fake XPS with one G1 axis and a three-point
-    /// profile.
-    fn profiled(port: &str, firmware: &'static str) -> Mutex<XpsController> {
-        profiled_at(port, firmware, vec![0.0, 1.0, 2.0])
-    }
-
-    /// [`profiled`] with the profile's `positions`.
-    fn profiled_at(
-        port: &str,
-        firmware: &'static str,
-        positions: Vec<f64>,
-    ) -> Mutex<XpsController> {
-        // The IP port's own FLOW lines stay off the motor port's trace.
-        let line = FakeLine::new(&format!("{port}_ip"), "");
-        *line.firmware.lock().unwrap() = firmware;
-        let mut ctrl =
-            XpsController::new(line.socket(SocketMode::Query), false, Duration::ZERO).unwrap();
-        ctrl.register_axis(
-            0,
-            "G1.P1",
-            "G1",
-            Arc::new(line.socket(SocketMode::Fire)),
-            Default::default(),
-            1.0,
-        );
-        ctrl.define_profile(Profile {
-            group: "G1".into(),
-            move_mode: MoveMode::Absolute,
-            times: vec![1.0, 1.0, 1.0],
-            axes: vec![crate::xps::ProfileAxis {
-                positioner: "G1.P1".into(),
-                positions,
-            }],
-        })
-        .unwrap();
-        Mutex::new(ctrl)
-    }
-
-    /// Run the build to `file_name` with a recording uploader; answer the
-    /// uploads and the controller's `useSFTP_`.
-    fn build_with(
-        port: &str,
-        firmware: &'static str,
-        ftp_dir: Option<&str>,
-        file_name: &str,
-    ) -> (Vec<(String, String, bool)>, bool) {
-        let controller = profiled(port, firmware);
-        let target = TrajectoryUpload {
-            motor_port: port,
-            host: "10.0.0.5",
-            file_name,
-            user: "u",
-            password: "p",
-        };
-        let sent = Mutex::new(Vec::new());
-        let _ = xps_build_profile(&controller, &target, ftp_dir, |t, dir, _text, sftp| {
-            sent.lock()
-                .unwrap()
-                .push((t.file_name.to_string(), dir.to_string(), sftp));
-            Ok(())
-        });
-        let use_sftp = controller.lock().unwrap().use_sftp();
-        (sent.into_inner().unwrap(), use_sftp)
-    }
-
-    /// The build's verdict, the upload always succeeding.
-    fn build_result(port: &str, firmware: &'static str, file_name: &str) -> Result<(), String> {
-        build_result_of(profiled(port, firmware), port, file_name)
-    }
-
-    fn build_result_of(
-        controller: Mutex<XpsController>,
-        port: &str,
-        file_name: &str,
-    ) -> Result<(), String> {
-        let target = TrajectoryUpload {
-            motor_port: port,
-            host: "10.0.0.5",
-            file_name,
-            user: "u",
-            password: "p",
-        };
-        xps_build_profile(&controller, &target, None, |_, _, _, _| Ok(())).map(|_| ())
-    }
-
-    #[test]
-    fn the_build_uploads_by_the_firmwares_transport() {
-        let dir = std::env::temp_dir().join(format!("xps-transport-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("traj.trj");
-        let file = file.to_str().unwrap().to_string();
-        let build = |port: &str, firmware: &'static str, ftp_dir: Option<&str>| {
-            build_with(port, firmware, ftp_dir, &file)
-        };
-        let upload = |d: &str, sftp| vec![(file.clone(), d.to_string(), sftp)];
-        assert_eq!(
-            build("xpsBuildC", "XPS-C8 V2", None),
-            (upload("/Admin/Public/Trajectories", false), false)
-        );
-        assert_eq!(
-            build("xpsBuildQ", "XPS-Q8 V1", None),
-            (upload("/Public/Trajectories", false), false)
-        );
-        assert_eq!(
-            build("xpsBuildD", "XPS-D8 V1", None),
-            (upload("/Admin/Public/Trajectories", true), true)
-        );
-        assert_eq!(
-            build("xpsBuildDir", "XPS-D8 V1", Some("/Mine")),
-            (upload("/Mine", true), true)
-        );
-        assert_eq!(build("xpsBuildNone", "0", None), (vec![], false));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// XPSController.cpp:801-817 checks the start plus the verified travel
-    /// (the fake XPS's -0.5..2.5) against the fake's -100..100 soft limits.
-    #[test]
-    fn the_build_checks_the_verified_travel_against_the_soft_limits() {
-        let dir = std::env::temp_dir().join(format!("xps-travel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("traj.trj");
-        let file = file.to_str().unwrap();
-        let build = |port: &str, start: f64| {
-            let controller = profiled_at(port, "XPS-C8 V2", vec![start, start + 0.5, start + 1.0]);
-            build_result_of(controller, port, file)
-        };
-        assert_eq!(build("xpsTravelIn", 0.0), Ok(()));
-        assert_eq!(
-            build("xpsTravelHigh", 98.0),
-            Err(
-                "High soft limit violation for axis G1.P1, position=100.500000, limit=100.000000\n"
-                    .into()
-            )
-        );
-        assert_eq!(
-            build("xpsTravelLow", -99.6),
-            Err("Low soft limit violation for axis G1.P1, position=-100.100000, limit=-100.000000\n".into())
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// XPSController.cpp:695-706: the trajectory folder and transport follow
     /// the firmware string, and any other firmware fails the build.
     #[test]
     fn the_firmware_picks_the_trajectory_folder() {
+        use crate::xps::profile_move::trajectory_upload;
+
         assert_eq!(
             trajectory_upload("XPS-C8 Firmware V2.6.x"),
             Ok(("/Admin/Public/Trajectories", false))
@@ -2543,71 +1838,9 @@ mod tests {
         );
     }
 
-    fn plan() -> ExecutionPlan {
-        ExecutionPlan {
-            file_name: "traj.trj".into(),
-            group: "G1".into(),
-            start_moves: vec![("G1.P1".into(), -0.25)],
-            end_moves: vec![("G1.P1".into(), 3.0)],
-            move_mode: MoveMode::Absolute,
-            times: vec![0.5, 0.5, 1.0],
-            gathering_positioners: vec!["G1.P1".into()],
-        }
-    }
-
-    fn run(line: &FakeLine, fail: &'static str) -> (Option<String>, Vec<String>) {
-        *line.fail.lock().unwrap() = fail;
-        let trace = MotorTrace::new("xps_run_profile", 0);
-        let message = xps_run_profile(
-            &trace,
-            &line.socket(SocketMode::Query),
-            &plan(),
-            1,
-            (1, 2, 2),
-        );
-        (message, line.take_log())
-    }
-
-    /// C `runProfile` (XPSController.cpp:905-1135): the start move, the pulse
-    /// output and the flyback are unchecked, a failed gathering step skips
-    /// to `done:` and the flyback, and the last failed step's message wins.
-    #[test]
-    fn run_profile_flies_back_and_keeps_the_last_message() {
-        let line = FakeLine::new("xps_run_profile", "");
-        let (message, log) = run(&line, "");
-        assert_eq!(message, None);
-        assert_eq!(log.first().unwrap(), "GroupMoveAbsolute (G1.P1,-0.25)");
-        assert_eq!(log.last().unwrap(), "GroupMoveAbsolute (G1.P1,3)");
-
-        for ignored in ["GroupMoveAbsolute", "MultipleAxesPVTPulseOutputSet"] {
-            let (message, log) = run(&line, ignored);
-            assert_eq!(message, None, "{ignored}");
-            assert!(
-                log.iter()
-                    .any(|c| c.starts_with("MultipleAxesPVTExecution "))
-            );
-        }
-
-        let (message, log) = run(&line, "GatheringReset");
-        assert_eq!(
-            message.as_deref(),
-            Some("Error performing GatheringReset, status=-3")
-        );
-        assert!(
-            !log.iter()
-                .any(|c| c.starts_with("MultipleAxesPVTExecution "))
-        );
-        assert_eq!(log.last().unwrap(), "GroupMoveAbsolute (G1.P1,3)");
-
-        let (message, _) = run(&line, "EventExtendedRemove");
-        assert_eq!(
-            message.as_deref(),
-            Some("Error performing ExtendedEventRemove, status=-3")
-        );
-    }
-
     /// FLOW on `port` addr 0 into a fresh file; returns its path.
-    fn trace_flow(port: &str) -> std::path::PathBuf {
+    pub(super) fn trace_flow(port: &str) -> std::path::PathBuf {
+        use epics_rs::asyn::manager::PortManager;
         use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
 
         let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
@@ -2620,101 +1853,10 @@ mod tests {
         path
     }
 
-    fn read_trace(path: &std::path::Path) -> String {
+    pub(super) fn read_trace(path: &std::path::Path) -> String {
         let text = std::fs::read_to_string(path).unwrap();
         let _ = std::fs::remove_file(path);
         text
-    }
-
-    /// XPSController.cpp:565, 624, 750: buildProfile's FLOW lines.
-    #[test]
-    fn the_build_traces_as_c() {
-        let port = "xpsBuildTrace";
-        let path = trace_flow(port);
-        let file = std::env::temp_dir().join(format!("xps-build-trace-{}", std::process::id()));
-        let file = file.to_str().unwrap().to_string();
-        assert_eq!(build_result(port, "XPS-C8 V2", &file), Ok(()));
-        let _ = std::fs::remove_file(&file);
-        assert_eq!(
-            read_trace(&path),
-            format!(
-                "XPSController:buildProfile: entry\n\
-                 XPSController:buildProfile: axis 0 profilePositions[0]=0.000000, profilePositions[2]=2.000000, maxAcceleration=36.000000, preTimeMax=0.027778, postTimeMax=0.027778\n\
-                 XPSController:buildProfile: calling MultipleAxesPVTVerification(0, G1, {file})\n"
-            )
-        );
-    }
-
-    /// XPSController.cpp:938-1093: runProfile's FLOW lines.
-    #[test]
-    fn the_run_traces_as_c() {
-        let port = "xps_run_trace";
-        let line = FakeLine::new(&format!("{port}_ip"), "");
-        let path = trace_flow(port);
-        let trace = MotorTrace::new(port, 0);
-        let message = xps_run_profile(
-            &trace,
-            &line.socket(SocketMode::Query),
-            &plan(),
-            1,
-            (1, 2, 2),
-        );
-        assert_eq!(message, None);
-        let text = read_trace(&path);
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 9, "{text}");
-        assert_eq!(
-            lines[..5],
-            [
-                "XPSController:runProfile: calling GatheringReset(0)",
-                "XPSController:runProfile: calling GatheringConfigurationSet(0, 2, G1.P1.SetpointPosition;G1.P1.CurrentPosition;)",
-                "XPSController:runProfile: calling MultipleAxesPVTPulseOutputSet(0, G1, 2, 3, 0.500000)",
-                "XPSController:runProfile: calling EventExtendedConfigurationTriggerSet(0, 2, Always;G1.PVT.TrajectoryPulse, , , . )",
-                "XPSController:runProfile: calling EventExtendedConfigurationActionSet(0, 1, GatheringOneData, , , , )",
-            ]
-        );
-        // C prints &eventId with %p.
-        assert!(
-            lines[5].starts_with("XPSController:runProfile: calling EventExtendedStart(0, 0x"),
-            "{text}"
-        );
-        assert_eq!(
-            lines[6..],
-            [
-                "XPSController:runProfile: calling MultipleAxesPVTExecution(0, G1, traj.trj, 1)",
-                "XPSController:runProfile: calling EventExtendedRemove(0, 0)",
-                "XPSController:runProfile: calling GatheringStop(0)",
-            ]
-        );
-    }
-
-    /// XPSController.cpp:1210, 1229, 1254: readbackProfile's FLOW lines,
-    /// the halving retry included.
-    #[test]
-    fn the_readback_traces_as_c() {
-        let port = "xps_readback_trace";
-        let line = FakeLine::new(&format!("{port}_ip"), "");
-        let path = trace_flow(port);
-        let trace = MotorTrace::new(port, 0);
-        let sock = line.socket(SocketMode::Query);
-        let positioners = ["G1.P1".to_string()];
-        let (_, num_read) = xps_readback(&trace, &sock, &positioners).unwrap();
-        assert_eq!(num_read, 2);
-        *line.fail.lock().unwrap() = "GatheringDataMultipleLinesGet";
-        assert_eq!(
-            xps_readback(&trace, &sock, &positioners).map(|(_, n)| n),
-            Err("Error reading gathering data, numInBuffer = 0".to_string())
-        );
-        assert_eq!(
-            read_trace(&path),
-            "XPSController:readbackProfile: entry\n\
-             XPSController:readbackProfile: GatheringCurrentNumberGet, status=0, currentSamples=2, maxSamples=100\n\
-             XPSController:readbackProfile: GatheringDataMultipleLinesGet, status=0, numInBuffer=2\n\
-             XPSController:readbackProfile: entry\n\
-             XPSController:readbackProfile: GatheringCurrentNumberGet, status=0, currentSamples=2, maxSamples=100\n\
-             XPSController:readbackProfile: GatheringDataMultipleLinesGet, status=-3, numInBuffer=2\n\
-             XPSController:readbackProfile: GatheringDataMultipleLinesGet, status=-3, numInBuffer=1\n"
-        );
     }
 
     /// XPSController.cpp:267: the TCL script's FLOW line, before the call.
@@ -3924,6 +3066,7 @@ mod xps_profile_tests {
     use super::*;
     use crate::xps::controller::verify_message;
     use crate::xps::fake::FakeLine;
+    use crate::xps::ftp;
 
     /// Two axes, G1.P1 and G1.P2, 0.5 user units a step and 0.25 XPS units
     /// a step, on an XPS-C whose FTP server is `ftp`; the profile is
@@ -3937,8 +3080,13 @@ mod xps_profile_tests {
     }
 
     fn rig(name: &str) -> Rig {
+        rig_on(name, "XPS-C8 Precision Platform")
+    }
+
+    /// [`rig`] on an XPS answering `firmware`.
+    fn rig_on(name: &str, firmware: &'static str) -> Rig {
         let line = FakeLine::new(&format!("{name}Line"), "");
-        *line.firmware.lock().unwrap() = "XPS-C8 Precision Platform";
+        *line.firmware.lock().unwrap() = firmware;
         let exec = line.twin(&format!("{name}Exec"));
         let (ftp_addr, ftp) = ftp::tests::server("331 password\r\n");
         ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
@@ -3958,7 +3106,7 @@ mod xps_profile_tests {
         let profile_sock = Arc::new(exec.socket_with(SocketMode::Query, Duration::from_secs(30)));
         let poll = Box::new(thread.poll(controller.clone()));
         thread
-            .spawn::<XpsHead>(port.clone(), controller.clone(), profile_sock.clone())
+            .spawn::<XpsHead>(port.clone(), controller.clone(), profile_sock)
             .unwrap();
         for (addr, positioner) in [(0, "G1.P1"), (1, "G1.P2")] {
             let axis = XpsAxis::new(
@@ -3985,9 +3133,7 @@ mod xps_profile_tests {
             ip_port: 5001,
             handle: port.clone(),
             controller,
-            profile_sock,
             poller: Arc::new(Controller::new()),
-            ftp_login: None,
         });
         let rig = Rig {
             port,
@@ -4048,26 +3194,31 @@ mod xps_profile_tests {
             self.int(index::PROFILE_START_PULSES, 0, 1);
             self.int(index::PROFILE_END_PULSES, 0, 3);
             self.int(index::PROFILE_NUM_PULSES, 0, 2);
-            let file = self.file.clone();
-            self.with(move |_, ctx| {
-                for (name, value) in [
-                    ("XPS_PROFILE_GROUP_NAME", "G1"),
-                    ("XPS_TRAJECTORY_FILE", &file),
-                ] {
-                    let reason = ctx.base.find_param(name).unwrap();
-                    ctx.base.set_string_param(reason, 0, value).unwrap();
-                }
-            });
+            self.set_string("XPS_PROFILE_GROUP_NAME", "G1");
+            self.set_string("XPS_TRAJECTORY_FILE", &self.file);
             for addr in 0..2 {
                 self.int(index::PROFILE_USE_AXIS, addr, 1);
-                self.port
-                    .with_driver_blocking::<ControllerPort<XpsHead>, _>(move |d| {
-                        let user = AsynUser::new(index::PROFILE_POSITIONS).with_addr(addr);
-                        d.write_float64_array(&user, &[0.0, 1.0, 2.0])
-                    })
-                    .unwrap()
-                    .unwrap();
+                self.positions(addr, [0.0, 1.0, 2.0]);
             }
+        }
+
+        /// The profile's user-unit positions at `addr`.
+        fn positions(&self, addr: i32, values: [f64; 3]) {
+            self.port
+                .with_driver_blocking::<ControllerPort<XpsHead>, _>(move |d| {
+                    let user = AsynUser::new(index::PROFILE_POSITIONS).with_addr(addr);
+                    d.write_float64_array(&user, &values)
+                })
+                .unwrap()
+                .unwrap();
+        }
+
+        fn set_string(&self, name: &'static str, value: &str) {
+            let value = value.to_string();
+            self.with(move |_, ctx| {
+                let reason = ctx.base.find_param(name).unwrap();
+                ctx.base.set_string_param(reason, 0, &value).unwrap();
+            });
         }
 
         fn build(&self) {
@@ -4322,6 +3473,225 @@ mod xps_profile_tests {
         assert_eq!(
             rig.message(index::PROFILE_READBACK_MESSAGE),
             "Error, numPulses=3, currentSamples=2"
+        );
+    }
+
+    /// XPSController.cpp:642-648: a trajectory file that cannot be created
+    /// fails the build with C's message.
+    #[test]
+    fn build_profile_reports_an_uncreatable_trajectory_file() {
+        let rig = rig("XpsProfNoFile");
+        rig.define();
+        let missing = "/nonexistent-xps-dir/traj.trj";
+        rig.set_string("XPS_TRAJECTORY_FILE", missing);
+        assert!(
+            rig.port
+                .write_int32_blocking(index::PROFILE_BUILD, 0, 1)
+                .is_err()
+        );
+        assert_eq!(
+            rig.message(index::PROFILE_BUILD_MESSAGE),
+            format!("Error creating trajectory file {missing}, error=No such file or directory\n")
+        );
+        assert!(rig.ftp.try_recv().is_err());
+    }
+
+    /// XPSController.cpp:695-706: an XPS-Q uploads to /Public/Trajectories.
+    #[test]
+    fn build_profile_uploads_to_the_firmwares_folder() {
+        let rig = rig_on("XpsProfQ", "XPS-Q8 Firmware V1.4.x");
+        rig.build();
+        let ftp: Vec<String> = rig.ftp.iter().collect();
+        assert_eq!(ftp[4], "CWD /Public/Trajectories", "{ftp:?}");
+    }
+
+    /// XPSController.cpp:801-817: the start plus the verified travel (the
+    /// fake's -0.5..2.5 XPS units) against the fake's -100..100 soft limits.
+    #[test]
+    fn build_profile_checks_the_verified_travel_against_the_soft_limits() {
+        // 0.25 XPS units a step and 0.5 user units a step: XPS = user / 2.
+        // The fake FTP server takes one session, so a rig per build.
+        for (name, start, message) in [
+            (
+                "XpsProfHigh",
+                196.0,
+                "High soft limit violation for axis G1.P1, position=100.500000, limit=100.000000\n",
+            ),
+            (
+                "XpsProfLow",
+                -199.2,
+                "Low soft limit violation for axis G1.P1, position=-100.100000, limit=-100.000000\n",
+            ),
+        ] {
+            let rig = rig(name);
+            rig.define();
+            for addr in 0..2 {
+                rig.positions(addr, [start, start + 1.0, start + 2.0]);
+            }
+            rig.int(index::PROFILE_BUILD, 0, 1);
+            assert_eq!(
+                rig.read_int(index::PROFILE_BUILD_STATUS),
+                epics_rs::motor::controller_port::PROFILE_STATUS_FAILURE
+            );
+            assert_eq!(rig.message(index::PROFILE_BUILD_MESSAGE), message);
+        }
+    }
+
+    /// C `runProfile` (XPSController.cpp:905-1135): the start move, the pulse
+    /// output and the flyback are unchecked, a failed gathering step skips
+    /// to `done:` and the flyback, and the last failed step's message wins.
+    #[test]
+    fn run_profile_flies_back_and_keeps_the_last_message() {
+        let rig = rig("XpsProfRunFail");
+        rig.build();
+        let run = |fail: &'static str| {
+            *rig.line.fail.lock().unwrap() = fail;
+            rig.int(index::PROFILE_EXECUTE, 0, 1);
+            rig.wait_executed();
+            let log = rig.line.take_log();
+            (rig.message(index::PROFILE_EXECUTE_MESSAGE), log)
+        };
+        for ignored in ["GroupMoveAbsolute", "MultipleAxesPVTPulseOutputSet"] {
+            let (message, log) = run(ignored);
+            assert_eq!(message, " ", "{ignored}");
+            assert_eq!(
+                Rig::count(&log, "MultipleAxesPVTExecution "),
+                1,
+                "{ignored}"
+            );
+        }
+
+        let (message, log) = run("GatheringReset");
+        assert_eq!(message, "Error performing GatheringReset, status=-3");
+        assert_eq!(
+            rig.read_int(index::PROFILE_EXECUTE_STATUS),
+            epics_rs::motor::controller_port::PROFILE_STATUS_FAILURE
+        );
+        assert_eq!(Rig::count(&log, "MultipleAxesPVTExecution "), 0);
+        let reset = log
+            .iter()
+            .position(|c| c.starts_with("GatheringReset"))
+            .unwrap();
+        assert_eq!(
+            Rig::count(&log[reset..], "GroupMoveAbsolute (G1.P1,1)"),
+            1,
+            "{log:?}"
+        );
+
+        let (message, _) = run("EventExtendedRemove");
+        assert_eq!(message, "Error performing ExtendedEventRemove, status=-3");
+    }
+
+    /// The trace's `XPSController` lines, without asynManager's own FLOW
+    /// lines for the port's queue.
+    fn controller_lines(path: &std::path::Path) -> String {
+        super::tests::read_trace(path)
+            .lines()
+            .filter(|l| l.starts_with("XPSController"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    /// XPSController.cpp:565, 624, 750: buildProfile's FLOW lines.
+    #[test]
+    fn build_profile_traces_as_c() {
+        let rig = rig("XpsProfBuildTrace");
+        let path = super::tests::trace_flow("XpsProfBuildTraceCtrl");
+        rig.build();
+        let axis = |n| {
+            format!(
+                "XPSController:buildProfile: axis {n} profilePositions[0]=0.000000, profilePositions[2]=1.000000, maxAcceleration=36.000000, preTimeMax=0.027778, postTimeMax=0.027778\n"
+            )
+        };
+        assert_eq!(
+            controller_lines(&path),
+            format!(
+                "XPSController:buildProfile: entry\n{}{}\
+                 XPSController:buildProfile: calling MultipleAxesPVTVerification(0, G1, {})\n",
+                axis(0),
+                axis(1),
+                rig.file
+            )
+        );
+    }
+
+    /// XPSController.cpp:938-1093: runProfile's FLOW lines.
+    #[test]
+    fn run_profile_traces_as_c() {
+        let rig = rig("XpsProfRunTrace");
+        rig.build();
+        let path = super::tests::trace_flow("XpsProfRunTraceCtrl");
+        rig.int(index::PROFILE_EXECUTE, 0, 1);
+        rig.wait_executed();
+        let text = controller_lines(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 9, "{text}");
+        assert_eq!(
+            lines[..5],
+            [
+                "XPSController:runProfile: calling GatheringReset(0)",
+                "XPSController:runProfile: calling GatheringConfigurationSet(0, 4, G1.P1.SetpointPosition;G1.P1.CurrentPosition;G1.P2.SetpointPosition;G1.P2.CurrentPosition;)",
+                "XPSController:runProfile: calling MultipleAxesPVTPulseOutputSet(0, G1, 2, 4, 0.500000)",
+                "XPSController:runProfile: calling EventExtendedConfigurationTriggerSet(0, 2, Always;G1.PVT.TrajectoryPulse, , , . )",
+                "XPSController:runProfile: calling EventExtendedConfigurationActionSet(0, 1, GatheringOneData, , , , )",
+            ]
+        );
+        // C prints &eventId with %p.
+        assert!(
+            lines[5].starts_with("XPSController:runProfile: calling EventExtendedStart(0, 0x"),
+            "{text}"
+        );
+        assert_eq!(
+            lines[6..],
+            [
+                format!(
+                    "XPSController:runProfile: calling MultipleAxesPVTExecution(0, G1, {}, 1)",
+                    rig.file
+                )
+                .as_str(),
+                "XPSController:runProfile: calling EventExtendedRemove(0, 0)",
+                "XPSController:runProfile: calling GatheringStop(0)",
+            ]
+        );
+    }
+
+    /// XPSController.cpp:1210, 1229, 1254: readbackProfile's FLOW lines,
+    /// the halving retry included.
+    #[test]
+    fn readback_profile_traces_as_c() {
+        let rig = rig("XpsProfReadTrace");
+        rig.int(index::PROFILE_NUM_PULSES, 0, 2);
+        rig.line.replies.lock().unwrap().insert(
+            "GatheringDataMultipleLinesGet",
+            "0,1;1.5;2;2.25\n2;2.5;3;3.5".into(),
+        );
+        let path = super::tests::trace_flow("XpsProfReadTraceCtrl");
+        rig.int(index::PROFILE_READBACK, 0, 1);
+        // A scripted reply answers before `fail`.
+        rig.line
+            .replies
+            .lock()
+            .unwrap()
+            .remove("GatheringDataMultipleLinesGet");
+        *rig.line.fail.lock().unwrap() = "GatheringDataMultipleLinesGet";
+        assert!(
+            rig.port
+                .write_int32_blocking(index::PROFILE_READBACK, 0, 1)
+                .is_err()
+        );
+        assert_eq!(
+            rig.message(index::PROFILE_READBACK_MESSAGE),
+            "Error reading gathering data, numInBuffer = 0"
+        );
+        assert_eq!(
+            controller_lines(&path),
+            "XPSController:readbackProfile: entry\n\
+             XPSController:readbackProfile: GatheringCurrentNumberGet, status=0, currentSamples=2, maxSamples=100\n\
+             XPSController:readbackProfile: GatheringDataMultipleLinesGet, status=0, numInBuffer=2\n\
+             XPSController:readbackProfile: entry\n\
+             XPSController:readbackProfile: GatheringCurrentNumberGet, status=0, currentSamples=2, maxSamples=100\n\
+             XPSController:readbackProfile: GatheringDataMultipleLinesGet, status=-3, numInBuffer=2\n\
+             XPSController:readbackProfile: GatheringDataMultipleLinesGet, status=-3, numInBuffer=1\n"
         );
     }
 }

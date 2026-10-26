@@ -5,49 +5,14 @@
 //! XPSController.cpp:709-747). Two transports there: plain FTP for XPS-C/Q, and
 //! SFTP (`xpsSFTPUpload`) for XPS-D.
 //!
-//! This is the plain-FTP path, with the blocking `suppaftp` client; the XPS-D
-//! upload is [`super::sftp`]. [`ftp_connect`] and the calls after it are
-//! xps_ftp.c itself, which the trajectory SNL programs call.
+//! This is the plain-FTP path, xps_ftp.c itself, which `buildProfile` and the
+//! trajectory SNL programs call; the XPS-D upload is [`super::sftp`].
 
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-
-use suppaftp::FtpStream;
 
 /// The XPS FTP control port.
 const XPS_FTP_PORT: u16 = 21;
-
-/// Upload `contents` as `file_name` into `directory` on the XPS at `host`,
-/// logging in with `user`/`password` (plain FTP, binary mode).
-///
-/// `host` is the controller IP or hostname without a port. On any FTP step
-/// failing, returns a message naming the step (mirrors C, which reports which
-/// of connect/cd/store/disconnect failed).
-pub fn upload_trajectory(
-    host: &str,
-    directory: &str,
-    file_name: &str,
-    contents: &str,
-    user: &str,
-    password: &str,
-) -> Result<(), String> {
-    let mut ftp = FtpStream::connect((host, XPS_FTP_PORT))
-        .map_err(|e| format!("FTP connect to {host}:{XPS_FTP_PORT} failed: {e}"))?;
-    ftp.login(user, password)
-        .map_err(|e| format!("FTP login failed: {e}"))?;
-    // XPS trajectory files are ASCII, but store binary so no CR/LF translation
-    // mangles the line endings the controller parses.
-    ftp.transfer_type(suppaftp::types::FileType::Binary)
-        .map_err(|e| format!("FTP set binary mode failed: {e}"))?;
-    ftp.cwd(directory)
-        .map_err(|e| format!("FTP change dir to {directory} failed: {e}"))?;
-    let mut reader = Cursor::new(contents.as_bytes());
-    ftp.put_file(file_name, &mut reader)
-        .map_err(|e| format!("FTP store {file_name} failed: {e}"))?;
-    ftp.quit()
-        .map_err(|e| format!("FTP disconnect failed: {e}"))?;
-    Ok(())
-}
 
 /// xps_ftp.h `RETURN_SIZE`: one `recv`.
 const RETURN_SIZE: usize = 1500;

@@ -18,10 +18,6 @@ epics-seq-rs = { workspace = true }
 # The holder stores poll-loop command senders (tokio mpsc) created by
 # motor-rs's MotorBuilder; only the `sync` channel type is needed here.
 tokio = { version = "1", features = ["sync"] }
-# Blocking FTP client for uploading XPS PVT trajectory files (XPS-C/Q). Default
-# (sync) features only — the iocsh command handler that calls it is synchronous.
-# Pure Rust, so the crate still builds/tests on any host.
-suppaftp = "10"
 # XPS-D trajectory upload over SFTP (C xpsSFTPUpload.cpp's HAVE_LIBSSH2 build).
 ssh2 = { workspace = true, optional = true }
 

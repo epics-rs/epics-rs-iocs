@@ -1,16 +1,10 @@
 //! XPS PVT (position-velocity-time) trajectory profiles.
 //!
-//! Driver-private port of the profile half of `XPSController` (`buildProfile` /
-//! `runProfile`, XPSController.cpp:532-1090). The epics-rs motor framework has
-//! no controller-level profile-array subsystem (the C `asynMotorController`
-//! base plus the motor module's `profileMove` record database), so the whole
-//! feature lives in the driver and is driven by iocsh commands rather than the
-//! C record interface.
-//!
-//! This module holds the parity-critical, I/O-free core: the [`Profile`] model
-//! and [`Profile::generate`], which builds the XPS trajectory-file text exactly
-//! as C `buildProfile` does. FTP upload, verification and execution live in the
-//! controller/ioc layers on top of this.
+//! The I/O-free core of C `buildProfile` (XPSController.cpp:578-693): the
+//! [`Profile`] model and [`Profile::generate`], which builds the XPS
+//! trajectory-file text exactly as C does. [`super::profile_move`] reads the
+//! profile from the motor-rs profile parameters, then uploads, verifies and
+//! runs it.
 
 use epics_libcom_rs::cfmt::CFloat;
 
@@ -25,14 +19,6 @@ const XPS_MIN_PROFILE_ACCEL_TIME: f64 = 0.25;
 /// (XPSController.cpp:611-614).
 const XPS_ACCEL_ROUNDOFF_MARGIN: f64 = 0.9;
 
-/// Whether execute-time moves to the trajectory start are absolute or relative
-/// (C `PROFILE_MOVE_MODE_ABSOLUTE` / `_RELATIVE`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MoveMode {
-    Absolute,
-    Relative,
-}
-
 /// One positioner's contribution to a profile: its name and the per-point
 /// position array (device/engineering units, `positions.len() == num_points`).
 #[derive(Clone, Debug)]
@@ -45,7 +31,6 @@ pub struct ProfileAxis {
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub group: String,
-    pub move_mode: MoveMode,
     /// Per-point time array (seconds), `num_points` entries. Indexed exactly as
     /// C `profileTimes_`: entry `i` times point `i`.
     pub times: Vec<f64>,
@@ -61,18 +46,6 @@ pub struct TrajectoryFile {
     pub text: String,
     pub pre_distance: Vec<f64>,
     pub post_distance: Vec<f64>,
-    /// Per axis, the reduced max acceleration and this axis's own ramp
-    /// times, before the running maximum and `XPS_MIN_PROFILE_ACCEL_TIME`;
-    /// none for an axis the profile does not use.
-    pub ramps: Vec<Option<Ramp>>,
-}
-
-/// One axis's ramp sizing in [`TrajectoryFile::ramps`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Ramp {
-    pub max_acceleration: f64,
-    pub pre_time: f64,
-    pub post_time: f64,
 }
 
 /// Why a profile could not be turned into a trajectory file.
@@ -102,72 +75,6 @@ impl Profile {
     /// Number of profile points.
     pub fn num_points(&self) -> usize {
         self.times.len()
-    }
-
-    /// Parse a profile from CSV text for the group's `positioners` (given in the
-    /// order the trajectory columns map to — the controller's registration
-    /// order). Each non-empty, non-`#`-comment line is one point:
-    /// `time, pos_0, pos_1, ...` with one position column per positioner, in
-    /// device (positioner) units and seconds. Blank lines and `#` comments are
-    /// skipped. At least two points are required.
-    pub fn from_csv(
-        group: &str,
-        move_mode: MoveMode,
-        positioners: &[String],
-        csv: &str,
-    ) -> Result<Profile, String> {
-        if positioners.is_empty() {
-            return Err(format!("group '{group}' has no positioners"));
-        }
-        let expected_cols = positioners.len() + 1;
-        let mut times = Vec::new();
-        let mut columns: Vec<Vec<f64>> = vec![Vec::new(); positioners.len()];
-        for (lineno, raw) in csv.lines().enumerate() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let fields: Vec<f64> = line
-                .split(',')
-                .map(|f| {
-                    f.trim()
-                        .parse::<f64>()
-                        .map_err(|_| format!("line {}: '{}' is not a number", lineno + 1, f.trim()))
-                })
-                .collect::<Result<_, _>>()?;
-            if fields.len() != expected_cols {
-                return Err(format!(
-                    "line {}: expected {expected_cols} columns (time + {} positioners), got {}",
-                    lineno + 1,
-                    positioners.len(),
-                    fields.len()
-                ));
-            }
-            times.push(fields[0]);
-            for (col, value) in columns.iter_mut().zip(&fields[1..]) {
-                col.push(*value);
-            }
-        }
-        if times.len() < 2 {
-            return Err(format!(
-                "profile needs at least 2 points, got {}",
-                times.len()
-            ));
-        }
-        let axes = positioners
-            .iter()
-            .zip(columns)
-            .map(|(positioner, positions)| ProfileAxis {
-                positioner: positioner.clone(),
-                positions,
-            })
-            .collect();
-        Ok(Profile {
-            group: group.to_string(),
-            move_mode,
-            times,
-            axes,
-        })
     }
 
     /// Build the XPS trajectory-file text (C `buildProfile`, XPSController.cpp:578-693).
@@ -229,10 +136,8 @@ impl Profile {
         let mut post_velocity = vec![0.0_f64; self.axes.len()];
         let mut pre_time_max = 0.0_f64;
         let mut post_time_max = 0.0_f64;
-        let mut ramps = Vec::with_capacity(self.axes.len());
         for (j, axis) in self.axes.iter().enumerate() {
             let Some(controller_accel) = max_acceleration[j] else {
-                ramps.push(None);
                 continue;
             };
             let max_accel = controller_accel * XPS_ACCEL_ROUNDOFF_MARGIN;
@@ -246,14 +151,8 @@ impl Profile {
             }
             pre_velocity[j] = (axis.positions[1] - axis.positions[0]) / self.times[0];
             post_velocity[j] = (axis.positions[n - 1] - axis.positions[n - 2]) / self.times[n - 1];
-            let ramp = Ramp {
-                max_acceleration: max_accel,
-                pre_time: pre_velocity[j].abs() / max_accel,
-                post_time: post_velocity[j].abs() / max_accel,
-            };
-            pre_time_max = pre_time_max.max(ramp.pre_time);
-            post_time_max = post_time_max.max(ramp.post_time);
-            ramps.push(Some(ramp));
+            pre_time_max = pre_time_max.max(pre_velocity[j].abs() / max_accel);
+            post_time_max = post_time_max.max(post_velocity[j].abs() / max_accel);
         }
         pre_time_max = pre_time_max.max(XPS_MIN_PROFILE_ACCEL_TIME);
         post_time_max = post_time_max.max(XPS_MIN_PROFILE_ACCEL_TIME);
@@ -328,7 +227,6 @@ impl Profile {
             text,
             pre_distance,
             post_distance,
-            ramps,
         })
     }
 }
@@ -384,7 +282,6 @@ mod tests {
     fn rejects_too_few_points() {
         let p = Profile {
             group: "GROUP1".into(),
-            move_mode: MoveMode::Absolute,
             times: vec![1.0],
             axes: one_axis(&[0.0]),
         };
@@ -398,7 +295,6 @@ mod tests {
     fn rejects_mismatched_position_len() {
         let p = Profile {
             group: "GROUP1".into(),
-            move_mode: MoveMode::Absolute,
             times: vec![1.0, 1.0, 1.0],
             axes: one_axis(&[0.0, 1.0]),
         };
@@ -412,7 +308,6 @@ mod tests {
     fn rejects_nonpositive_time_and_accel() {
         let p = Profile {
             group: "GROUP1".into(),
-            move_mode: MoveMode::Absolute,
             times: vec![1.0, 0.0, 1.0],
             axes: one_axis(&[0.0, 1.0, 2.0]),
         };
@@ -423,7 +318,6 @@ mod tests {
 
         let p = Profile {
             group: "GROUP1".into(),
-            move_mode: MoveMode::Absolute,
             times: vec![1.0, 1.0, 1.0],
             axes: one_axis(&[0.0, 1.0, 2.0]),
         };
@@ -442,7 +336,6 @@ mod tests {
         // preDistance = 0.5*1*0.25 = 0.125; postDistance = 0.5*1*0.25 = 0.125.
         let p = Profile {
             group: "GROUP1".into(),
-            move_mode: MoveMode::Absolute,
             times: vec![1.0, 1.0, 1.0],
             axes: one_axis(&[0.0, 1.0, 2.0]),
         };
@@ -467,7 +360,6 @@ mod tests {
         // trajVel=(2+1)/(1+1)=1.5. Element 1: D0=1, D1=1 -> trajVel=1.
         let p = Profile {
             group: "GROUP1".into(),
-            move_mode: MoveMode::Relative,
             times: vec![1.0, 1.0, 1.0],
             axes: one_axis(&[0.0, 2.0, 3.0]),
         };
@@ -479,48 +371,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_csv_skipping_comments_and_blanks() {
-        let csv = "\
-# a two-axis scan
-0.5, 0.0, 10.0
-
-0.5, 1.0, 12.0
-0.5, 2.0, 14.0
-";
-        let positioners = vec!["XY.X".to_string(), "XY.Y".to_string()];
-        let p = Profile::from_csv("XY", MoveMode::Absolute, &positioners, csv).unwrap();
-        assert_eq!(p.num_points(), 3);
-        assert_eq!(p.times, vec![0.5, 0.5, 0.5]);
-        assert_eq!(p.axes[0].positioner, "XY.X");
-        assert_eq!(p.axes[0].positions, vec![0.0, 1.0, 2.0]);
-        assert_eq!(p.axes[1].positions, vec![10.0, 12.0, 14.0]);
-    }
-
-    #[test]
-    fn csv_rejects_wrong_column_count_and_too_few_points() {
-        let positioners = vec!["XY.X".to_string()];
-        // Two columns for a one-positioner group (expects time + 1 = 2)? That is
-        // correct; make it wrong with three columns.
-        let bad = "0.5, 1.0, 2.0\n0.5, 3.0, 4.0\n";
-        assert!(Profile::from_csv("XY", MoveMode::Absolute, &positioners, bad).is_err());
-
-        let short = "0.5, 1.0\n";
-        let err = Profile::from_csv("XY", MoveMode::Absolute, &positioners, short).unwrap_err();
-        assert!(err.contains("at least 2 points"), "got: {err}");
-    }
-
-    #[test]
-    fn csv_rejects_non_numeric() {
-        let positioners = vec!["XY.X".to_string()];
-        let bad = "0.5, foo\n0.5, 1.0\n";
-        assert!(Profile::from_csv("XY", MoveMode::Absolute, &positioners, bad).is_err());
-    }
-
-    #[test]
     fn two_axes_emit_paired_columns() {
         let p = Profile {
             group: "XY".into(),
-            move_mode: MoveMode::Absolute,
             times: vec![1.0, 1.0],
             axes: vec![
                 ProfileAxis {
@@ -548,7 +401,6 @@ mod tests {
     fn an_unused_axis_writes_zero_columns() {
         let p = Profile {
             group: "XY".into(),
-            move_mode: MoveMode::Absolute,
             times: vec![1.0, 1.0, 1.0],
             axes: vec![
                 ProfileAxis {
@@ -570,7 +422,6 @@ mod tests {
              0.250000, 0.125000, 0.000000, 0.000000, 0.000000\n"
         );
         assert_eq!((out.pre_distance[1], out.post_distance[1]), (0.0, 0.0));
-        assert!(out.ramps[0].is_some() && out.ramps[1].is_none());
     }
 
     #[test]

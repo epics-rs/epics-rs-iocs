@@ -9,8 +9,6 @@
 //! can enumerate siblings sharing an XPS group — the single owner of that
 //! cross-axis state.
 
-use epics_libcom_rs::cfmt::CFloat;
-
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,7 +16,6 @@ use std::time::Duration;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::motor::trace::MotorTrace;
 
-use super::profile::{MoveMode, Profile, TrajectoryFile};
 use super::rpc::{XpsResult, XpsSocket};
 
 /// A registered axis's identity, kept by the controller for group enumeration.
@@ -56,41 +53,6 @@ pub struct MoveState {
 pub struct DeferredMove {
     pub position: f64,
     pub relative: bool,
-}
-
-/// A verified, ready-to-execute PVT trajectory. Produced by
-/// [`XpsController::verify_profile`] and consumed by the execute command.
-struct BuiltTrajectory {
-    /// Bare trajectory file name on the controller (RPC `file` argument).
-    file_name: String,
-    group: String,
-    /// Per-axis move to the true trajectory start, applied before execution:
-    /// `(positioner, target)`, already resolved to absolute or relative units
-    /// per the profile's move mode.
-    start_moves: Vec<(String, f64)>,
-    /// Per-axis flyback after the run, resolved the same way: the last point
-    /// (absolute) or back one post-ramp distance (relative).
-    end_moves: Vec<(String, f64)>,
-    move_mode: MoveMode,
-}
-
-/// A snapshot of a built trajectory for the execute command to run on its own
-/// socket without holding the controller lock.
-#[derive(Clone, Debug)]
-pub struct ExecutionPlan {
-    pub file_name: String,
-    pub group: String,
-    pub start_moves: Vec<(String, f64)>,
-    pub end_moves: Vec<(String, f64)>,
-    pub move_mode: MoveMode,
-    /// The profile's per-point times, for the pulse-output window
-    /// (C `profileTimes_`).
-    pub times: Vec<f64>,
-    /// Every registered positioner in registration order — the gathering
-    /// samples `SetpointPosition`+`CurrentPosition` for each (C
-    /// `executeProfile` builds the gathering list over all `numAxes_` axes,
-    /// not just the profile's).
-    pub gathering_positioners: Vec<String>,
 }
 
 /// The [`XpsController::set_position`] step that failed, with its XPS code.
@@ -196,10 +158,6 @@ pub struct XpsController {
     /// at once (`doMoveToHome`/`home`), so it is group-scoped state. While a
     /// group is here, poll reports its axes as not-homed/not-at-home.
     referencing_groups: HashSet<String>,
-    /// The PVT profile currently defined (C `pAxes_`/profile arrays), if any.
-    profile: Option<Profile>,
-    /// The last successfully built+verified trajectory, ready to execute.
-    built_trajectory: Option<BuiltTrajectory>,
 }
 
 impl XpsController {
@@ -225,8 +183,6 @@ impl XpsController {
             use_sftp: false,
             axes: Vec::new(),
             referencing_groups: HashSet::new(),
-            profile: None,
-            built_trajectory: None,
         })
     }
 
@@ -364,16 +320,6 @@ impl XpsController {
         self.axes.iter().filter(|a| a.group == group).count()
     }
 
-    /// Positioner names registered in `group`, in registration order. Used to
-    /// map PVT profile columns and to move each axis to the trajectory start.
-    pub fn positioners_in_group(&self, group: &str) -> Vec<String> {
-        self.axes
-            .iter()
-            .filter(|a| a.group == group)
-            .map(|a| a.positioner.clone())
-            .collect()
-    }
-
     /// Set or clear referencing (move-to-home) mode for `group`. `doMoveToHome`
     /// sets it on success; the normal `home` seek clears it.
     pub fn set_group_referencing(&mut self, group: &str, on: bool) {
@@ -461,218 +407,6 @@ impl XpsController {
     /// Whether `setPosition` is enabled (C `enableSetPosition_`).
     pub fn enable_set_position(&self) -> bool {
         self.enable_set_position
-    }
-
-    // --- PVT trajectory profiles ------------------------------------------
-
-    /// Store a PVT profile for `group`, replacing any previous one and
-    /// invalidating a previously built trajectory. Every profile axis must be a
-    /// positioner registered in the group.
-    pub fn define_profile(&mut self, profile: Profile) -> Result<(), String> {
-        let group_positioners = self.positioners_in_group(&profile.group);
-        if group_positioners.is_empty() {
-            return Err(format!(
-                "no axes registered in group '{}' (create the axes first)",
-                profile.group
-            ));
-        }
-        for ax in &profile.axes {
-            if !group_positioners.contains(&ax.positioner) {
-                return Err(format!(
-                    "positioner '{}' is not a registered axis in group '{}'",
-                    ax.positioner, profile.group
-                ));
-            }
-        }
-        self.built_trajectory = None;
-        self.profile = Some(profile);
-        Ok(())
-    }
-
-    /// Generate the trajectory-file text for the defined profile, reading each
-    /// axis's controller max acceleration via `PositionerSGammaParametersGet`
-    /// (C `buildProfile` uses these for the ramp times).
-    ///
-    /// C prints each axis's ramp line as it reads it, in axis order; here
-    /// the lines follow a successful generate, in axis order.
-    pub fn build_profile_text(&self, trace: &MotorTrace) -> Result<TrajectoryFile, String> {
-        let profile = self
-            .profile
-            .as_ref()
-            .ok_or("no profile defined (call XPSDefineProfileFromFile first)")?;
-        let mut max_accels = Vec::with_capacity(profile.axes.len());
-        for ax in &profile.axes {
-            // SGamma returns (velocity, acceleration, minJerk, maxJerk); field 1
-            // is the max acceleration used to size the ramp elements.
-            let (_vel, accel, _min_jerk, _max_jerk) = self
-                .poll
-                .positioner_sgamma_parameters_get(&ax.positioner)
-                .map_err(|e| {
-                    format!(
-                        "Error calling positionerSGammaParametersSet, status={}\n",
-                        e.code()
-                    )
-                })?;
-            max_accels.push(Some(accel));
-        }
-        let built = profile.generate(&max_accels).map_err(|e| e.to_string())?;
-        // XPSController.cpp:624: the running maxima, in controller axis order.
-        let mut order: Vec<(i32, usize)> = profile
-            .axes
-            .iter()
-            .enumerate()
-            .filter_map(|(k, ax)| {
-                let axis = self.axes.iter().find(|a| a.positioner == ax.positioner)?;
-                Some((axis.axis_no, k))
-            })
-            .collect();
-        order.sort();
-        let (mut pre_time_max, mut post_time_max) = (0.0_f64, 0.0_f64);
-        for (axis_no, k) in order {
-            let positions = &profile.axes[k].positions;
-            let Some(ramp) = built.ramps[k] else {
-                continue;
-            };
-            pre_time_max = pre_time_max.max(ramp.pre_time);
-            post_time_max = post_time_max.max(ramp.post_time);
-            trace.print_self(
-                TraceMask::FLOW,
-                format_args!(
-                    "XPSController:buildProfile: axis {axis_no} profilePositions[0]={:.6}, profilePositions[{}]={:.6}, maxAcceleration={:.6}, preTimeMax={:.6}, postTimeMax={:.6}\n",
-                    CFloat(positions[0]),
-                    positions.len() - 1,
-                    CFloat(positions[positions.len() - 1]),
-                    CFloat(ramp.max_acceleration),
-                    CFloat(pre_time_max),
-                    CFloat(post_time_max)
-                ),
-            );
-        }
-        Ok(built)
-    }
-
-    /// Verify an uploaded trajectory against the group's dynamics and each
-    /// axis's software travel limits, then latch it for execution.
-    ///
-    /// `file_name` is the bare trajectory file name already uploaded to the
-    /// controller; `built` is the [`TrajectoryFile`] from [`build_profile_text`]
-    /// (its pre-ramp distances resolve the execute-time start positions). C
-    /// `buildProfile` runs `MultipleAxesPVTVerification` then, per axis,
-    /// `MultipleAxesPVTVerificationResultGet` and checks the resulting
-    /// min/max travel against the soft limits.
-    ///
-    /// [`build_profile_text`]: XpsController::build_profile_text
-    pub fn verify_profile(
-        &mut self,
-        trace: &MotorTrace,
-        file_name: &str,
-        built: &TrajectoryFile,
-    ) -> Result<(), String> {
-        let profile = self
-            .profile
-            .as_ref()
-            .ok_or("no profile defined (call XPSDefineProfileFromFile first)")?;
-        if built.pre_distance.len() != profile.axes.len()
-            || built.post_distance.len() != profile.axes.len()
-        {
-            return Err("built trajectory does not match the defined profile".into());
-        }
-        let group = profile.group.clone();
-        let move_mode = profile.move_mode;
-
-        trace.print_self(
-            TraceMask::FLOW,
-            format_args!(
-                "XPSController:buildProfile: calling MultipleAxesPVTVerification({}, {group}, {file_name})\n",
-                self.poll.index()
-            ),
-        );
-        self.poll
-            .multiple_axes_pvt_verification(&group, file_name)
-            .map_err(|e| verify_message(e.code()))?;
-
-        let mut start_moves = Vec::with_capacity(profile.axes.len());
-        let mut end_moves = Vec::with_capacity(profile.axes.len());
-        for (j, ax) in profile.axes.iter().enumerate() {
-            let (_file, min_pos, max_pos, _max_vel, _max_accel) = self
-                .poll
-                .multiple_axes_pvt_verification_result_get(&ax.positioner)
-                .map_err(|e| {
-                    format!(
-                        "MultipleAxesPVTVerificationResultGet error for axis {}, status={}\n",
-                        ax.positioner,
-                        e.code()
-                    )
-                })?;
-            let (low, high) = self
-                .poll
-                .positioner_user_travel_limits_get(&ax.positioner)
-                .map_err(|e| format!("travel limits read for {}: {e}", ax.positioner))?;
-            // The verified min/max are relative to the trajectory start point.
-            let start = ax.positions[0];
-            if start + min_pos < low {
-                return Err(format!(
-                    "Low soft limit violation for axis {}, position={:.6}, limit={low:.6}\n",
-                    ax.positioner,
-                    CFloat(start + min_pos),
-                    low = CFloat(low)
-                ));
-            }
-            if start + max_pos > high {
-                return Err(format!(
-                    "High soft limit violation for axis {}, position={:.6}, limit={high:.6}\n",
-                    ax.positioner,
-                    CFloat(start + max_pos),
-                    high = CFloat(high)
-                ));
-            }
-            // The execute-time move places the motor one pre-ramp distance
-            // before the first point so it reaches full velocity at point 0.
-            let target = match move_mode {
-                MoveMode::Absolute => start - built.pre_distance[j],
-                MoveMode::Relative => -built.pre_distance[j],
-            };
-            start_moves.push((ax.positioner.clone(), target));
-            let end = match move_mode {
-                MoveMode::Absolute => ax.positions[ax.positions.len() - 1],
-                MoveMode::Relative => -built.post_distance[j],
-            };
-            end_moves.push((ax.positioner.clone(), end));
-        }
-
-        self.built_trajectory = Some(BuiltTrajectory {
-            file_name: file_name.to_string(),
-            group,
-            start_moves,
-            end_moves,
-            move_mode,
-        });
-        Ok(())
-    }
-
-    /// A snapshot of the latched trajectory for the execute command to run on
-    /// its own socket. `None` if nothing has been built+verified since the last
-    /// [`Self::define_profile`] (which also guarantees `profile` still matches the
-    /// built trajectory: defining a new profile clears it).
-    pub fn execution_plan(&self) -> Option<ExecutionPlan> {
-        let built = self.built_trajectory.as_ref()?;
-        let profile = self.profile.as_ref()?;
-        Some(ExecutionPlan {
-            file_name: built.file_name.clone(),
-            group: built.group.clone(),
-            start_moves: built.start_moves.clone(),
-            end_moves: built.end_moves.clone(),
-            move_mode: built.move_mode,
-            times: profile.times.clone(),
-            gathering_positioners: self.registered_positioners(),
-        })
-    }
-
-    /// The number of registered axes and their positioner names in registration
-    /// order — the shape of the gathering data (one
-    /// `SetpointPosition;CurrentPosition` pair per registered axis per sample).
-    pub fn registered_positioners(&self) -> Vec<String> {
-        self.axes.iter().map(|a| a.positioner.clone()).collect()
     }
 }
 

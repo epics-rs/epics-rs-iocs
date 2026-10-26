@@ -8,9 +8,7 @@
 //! command socket as lines of `;`-separated doubles — one line per sample,
 //! [`NUM_GATHERING_ITEMS`] values per axis. The readback keeps the actual
 //! position and derives the following error `actual - setpoint`; positions are
-//! device/positioner units, matching this driver's CSV profile convention.
-
-use epics_libcom_rs::cfmt::CFloat;
+//! device/positioner units.
 
 /// Gathering values sampled per axis (`SetpointPosition` + `CurrentPosition`,
 /// C `NUM_GATHERING_ITEMS`).
@@ -83,33 +81,6 @@ pub fn parse_gathering_buffer(
     Ok(lines_read)
 }
 
-/// Render a readback as CSV: a `#` header naming the columns, then one row per
-/// sample with `actual, following_error` per positioner — the file-based
-/// counterpart of C posting `profileReadbacks_`/`profileFollowingErrors_` to
-/// waveform records.
-pub fn readback_csv(positioners: &[String], readback: &GatheringReadback) -> String {
-    let mut out = String::from("# ");
-    let header: Vec<String> = positioners
-        .iter()
-        .flat_map(|p| [format!("{p}.actual"), format!("{p}.following_error")])
-        .collect();
-    out.push_str(&header.join(", "));
-    out.push('\n');
-    for sample in 0..readback.num_samples() {
-        let row: Vec<String> = (0..positioners.len())
-            .flat_map(|axis| {
-                [
-                    format!("{:.6}", CFloat(readback.actuals[axis][sample])),
-                    format!("{:.6}", CFloat(readback.following_errors[axis][sample])),
-                ]
-            })
-            .collect();
-        out.push_str(&row.join(", "));
-        out.push('\n');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,22 +135,5 @@ mod tests {
             parse_gathering_buffer("1.0;abc\n", 1, &mut rb).unwrap_err(),
             "Error reading Gathering.dat file, nitems=1, should be 2"
         );
-    }
-
-    #[test]
-    fn csv_round_trip_shape() {
-        let mut rb = GatheringReadback::new(2);
-        parse_gathering_buffer("1.0;1.5;10.0;10.25\n", 2, &mut rb).expect("parse");
-        let csv = readback_csv(&["G1.P".to_string(), "G1.Q".to_string()], &rb);
-        let mut lines = csv.lines();
-        assert_eq!(
-            lines.next(),
-            Some("# G1.P.actual, G1.P.following_error, G1.Q.actual, G1.Q.following_error")
-        );
-        assert_eq!(
-            lines.next(),
-            Some("1.500000, 0.500000, 10.250000, 0.250000")
-        );
-        assert_eq!(lines.next(), None);
     }
 }

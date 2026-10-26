@@ -29,7 +29,7 @@ use epics_rs::motor::trace::MotorTrace;
 
 use super::controller::{RegisteredAxis, XpsController, verify_message};
 use super::gathering::{GatheringReadback, parse_gathering_buffer};
-use super::profile::{self, MoveMode, Profile, ProfileAxis};
+use super::profile::{self, Profile, ProfileAxis};
 use super::rpc::{XpsError, XpsSocket};
 use super::{ftp, sftp};
 
@@ -397,7 +397,6 @@ impl XpsProfile {
 
         let profile = Profile {
             group: group.clone(),
-            move_mode: MoveMode::Absolute,
             times,
             axes: in_group
                 .iter()
