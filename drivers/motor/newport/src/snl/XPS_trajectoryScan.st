@@ -85,9 +85,11 @@ int anyMoving;
 int ncomplete;
 int nextra;
 int npoints;
-/* State build's one bounded read of nelements and moveMode */
+/* State build's one bounded read of nelements and moveMode, and its one read
+ * of moveAxis */
 int buildElements;
 int buildMode;
+int buildMoveAxis[MAX_AXES];
 int dir;
 int pollSocket;
 int driveSocket;
@@ -267,12 +269,15 @@ ss xpsTrajectoryScan {
              * buildAndVerify reads the last element of each axis moved, and the one
              * before it unless relative, so only a trajectory that moves one needs 1
              * or 2.  One that moves none reads nothing, and Nelements below 1 builds
-             * no elements, as upstream. */
+             * no elements, as upstream.  Upstream's buildAndVerify re-read the
+             * monitored moveAxis too, so an axis moved after this bound was built past
+             * it; buildMoveAxis is the one read the bound and buildAndVerify share. */
             buildMode = moveMode;
+            for (j=0; j<numAxes; j++) buildMoveAxis[j] = moveAxis[j];
             buildElements = nelements;
             if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
             for (j=0; j<numAxes; j++) {
-                if (moveAxis[j]) {
+                if (buildMoveAxis[j]) {
                     if (buildMode == MOVE_MODE_RELATIVE) {
                         if (buildElements < 1) buildElements = 1;
                     } else if (buildElements < 2) buildElements = 2;
@@ -997,7 +1002,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
         postVelocity[j] = 0.;
     }
     for (j=0; j<pVar->numAxes; j++) {
-        if (!pVar->moveAxis[j]) continue;
+        if (!pVar->buildMoveAxis[j]) continue;
         status = PositionerSGammaParametersGet(pVar->pollSocket, pVar->axisName[j], 
                                                &maxVelocity[j], &maxAcceleration[j],
                                                &minJerkTime[j], &maxJerkTime[j]);
@@ -1089,7 +1094,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
                 
             /* Average either side of the point? */
             trajVel = ((D0 + D1) / (T0 + T1));
-            if (!(pVar->moveAxis[j])) {
+            if (!(pVar->buildMoveAxis[j])) {
                 D0 = 0.0;    /* Axis turned off*/
                 trajVel = 0.0;
             }
