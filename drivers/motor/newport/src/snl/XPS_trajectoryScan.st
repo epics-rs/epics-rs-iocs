@@ -1217,6 +1217,9 @@ static void readGathering(SS_ID ssId, struct UserVar *pVar)
             pVar->npulses, currentSamples);
         return;
     }
+    /* Upstream read all currentSamples, npulses as put, into motorReadbacks and
+     * motorError, which hold MAX_PULSES. */
+    if (currentSamples > MAX_PULSES) currentSamples = MAX_PULSES;
     buffer = (char *)calloc(GATHERING_MAX_READ_LEN, sizeof(char));
     numInBuffer = 0;
     for (numRead=0; numRead<currentSamples;) {
