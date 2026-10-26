@@ -1,15 +1,10 @@
-# C's iocPI PI_C848.substitutions on this IOC's axes, P and C from
-# st.cmd; the values are the motor record this IOC had before.
+# C's iocPI PI_C848.substitutions, P and C from st.cmd.
 #
 # PI C-848: one motor record per axis. DTYP is "PIC848", OUT #C$(C) S$(S) ; the
 # wire letter is 'A'+$(S), i.e. A-D, placed at byte 5 of each command.
-#
-# Every wire value is the dial value scaled by POS_RES (1e-6) and printed with
-# 5 decimals, so MRES = 1 and EGU = counts (the record works in raw counts).
 file "$(MOTOR)/db/motor.db"
 {
 pattern
-{M,         DTYP,      S,  DESC,  EGU,     DIR,  VELO,     VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,      DLLM,       INIT}
-{"c848_1",  "PIC848",  0,  "",    counts,  Pos,  1000000,  0,     0.2,   0,     0,     .5,    1,     0,     10000000,  -10000000,  ""}
-{"c848_2",  "PIC848",  1,  "",    counts,  Pos,  1000000,  0,     0.2,   0,     0,     .5,    1,     0,     10000000,  -10000000,  ""}
+{N,  M,        DTYP,      S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{2,  "m$(N)",  "PIC848",  0,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
 }

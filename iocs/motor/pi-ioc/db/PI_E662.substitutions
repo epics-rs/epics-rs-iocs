@@ -1,16 +1,11 @@
-# C's iocPI PI_E662.substitutions on this IOC's axes, P and C from
-# st.cmd; the values are the motor record this IOC had before.
+# C's iocPI PI_E662.substitutions, P and C from st.cmd.
 #
 # PI E-662: one motor record for the controller's single axis, DTYP "PIC662"
-# with OUT #C$(C) S0.
-#
-# The record works in raw counts (the driver scales to/from micrometres by the
-# fixed drive resolution 0.001 at the wire), so MRES = 1 and EGU = counts. The
-# E-662 has no velocity/accel/jog/home wire commands; only absolute and
-# relative moves reach the controller.
+# with OUT #C$(C) S0. The E-662 has no velocity/accel/jog/home wire commands;
+# only absolute and relative moves reach the controller.
 file "$(MOTOR)/db/motor.db"
 {
 pattern
-{M,       DTYP,      S,  DESC,  EGU,     DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,    DLLM,     INIT}
-{"c662",  "PIC662",  0,  "",    counts,  Pos,  1000,  0,     0.2,   0,     0,     .5,    1,     0,     100000,  -100000,  ""}
+{N,  M,        DTYP,      S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{4,  "m$(N)",  "PIC662",  0,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
 }
