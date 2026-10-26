@@ -205,18 +205,20 @@ ss trajectoryScan {
             pvPut(buildStatus);
             /* Upstream built from the monitored nelements and moveMode, re-read
              * throughout and unbounded by the arrays.  buildElements and buildMode
-             * are the one bounded read.  Below 0 elements relative and 1 any other,
-             * upstream's padding indexes before the arrays; at those it sends no
-             * element, which is kept.  Above, an absolute trajectory's padding past
-             * its last element needs it at most MAX_ELEMENTS-3. */
+             * are the one bounded read.  Upstream's padding writes
+             * timeTrajectory[npoints] on, moved axes or not, so a negative npoints
+             * it pads (one not a multiple of 4) indexes before the arrays; any other
+             * count below 1 point sends no element and is kept.  Above, an absolute
+             * trajectory's padding past its last element needs it at most
+             * MAX_ELEMENTS-3. */
             buildMode = moveMode;
             buildElements = nelements;
             if (buildMode == MOVE_MODE_RELATIVE) {
                 if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
-                if (buildElements < 0) buildElements = 0;
+                if (buildElements < 0 && buildElements % 4 != 0) buildElements = 0;
             } else {
                 if (buildElements > MAX_ELEMENTS-3) buildElements = MAX_ELEMENTS-3;
-                if (buildElements < 1) buildElements = 1;
+                if (buildElements < 1 && (buildElements-1) % 4 != 0) buildElements = 1;
             }
             if (buildElements != nelements) {
                 nelements = buildElements;

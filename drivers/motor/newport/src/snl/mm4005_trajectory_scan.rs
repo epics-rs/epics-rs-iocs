@@ -775,8 +775,38 @@ mod tests {
             assert_eq!(elements(&p), 0);
         }
 
-        /// ss trajectoryScan state build raises a count below those, where C
-        /// indexes before the arrays, to them.
+        /// ss trajectoryScan state build keeps a count below those that C does
+        /// not pad, a point count that is a multiple of 4: no element.
+        #[epics_rs::base::epics_test]
+        async fn a_build_below_its_least_elements_c_does_not_pad_is_kept() {
+            let p = boot("mm4005BelowUnpadded", &[]).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(-4)).await;
+            p.sent();
+            p.build().await;
+            expect(
+                &p.db,
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", -4.0)],
+            )
+            .await;
+            let mut want: Vec<String> = ["NC", "1DC1", "UC0.500000", "MB-4,ME-4,MN11", "VC", "TB"]
+                .map(String::from)
+                .into();
+            want.extend((1..=6).map(|n| format!("1RC{n}")));
+            assert_eq!(p.sent(), want);
+            put(&p.db, "T:traj1:MoveMode", EpicsValue::Enum(1)).await;
+            put(&p.db, "T:traj1:Nelements", EpicsValue::Long(-3)).await;
+            p.sent();
+            p.build().await;
+            expect(
+                &p.db,
+                &[("T:traj1:BuildStatus", 1.0), ("T:traj1:Nelements", -3.0)],
+            )
+            .await;
+            assert_eq!(elements(&p), 0);
+        }
+
+        /// ss trajectoryScan state build raises a count below those that C
+        /// pads, from before the arrays, to them.
         #[epics_rs::base::epics_test]
         async fn a_build_below_its_least_elements_builds_the_least() {
             let p = boot("mm4005BelowLeast", &[]).await;
