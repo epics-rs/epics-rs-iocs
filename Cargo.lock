@@ -3457,6 +3457,7 @@ name = "phytron-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-phytron",
 ]

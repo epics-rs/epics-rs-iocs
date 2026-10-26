@@ -191,7 +191,7 @@ fn db_links_resolve(script: &Script, dangling: &[&str]) {
 fn st_cmd_loads_the_phymotion_aux_records() {
     let script = run("st.cmd");
     let want = [
-        "phytron.template",
+        "Phytron_motor.db",
         "Phytron_MCM01.db",
         "Phytron_I1AM01.db",
         "Phytron_AIO.db",
@@ -211,7 +211,7 @@ fn st_cmd_loads_the_phymotion_aux_records() {
 fn st_mcc_cmd_loads_the_mcc_aux_records() {
     let script = run("st.mcc.cmd");
     let want = [
-        "phytron.template",
+        "Phytron_motor.db",
         "Phytron_MCC.db",
         "Phytron_AIO_MCC.db",
         "Phytron_DIO.db",

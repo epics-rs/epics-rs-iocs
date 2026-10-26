@@ -36,7 +36,9 @@ phytronCreateAnalog("phyA1", "$(CTRL)", 1, 1, "")
 phytronCreateAnalog("phyA2", "$(CTRL)", 1, 2, "")
 phytronCreateDigital("phyD1", "$(CTRL)", 1, 1, "")
 
-dbLoadRecords("$(PHYTRON_IOC)/db/phytron.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=1")
+# The axis's Phytron_motor.db, as C's motor.substitutions.phytron loads it;
+# the values are the motor record this IOC had before, in controller steps.
+dbLoadRecords("$(PHYTRON_IOC)/db/Phytron_motor.db", "P=$(P),M=m1,PORT=$(CTRL),ADDR=1,DESC=,DIR=Pos,VELO=1000,VBAS=0,VMAX=0,ACCL=0.2,BDST=0,BVEL=0,BACC=0.5,MRES=1,ERES=0,UEIP=No,PREC=0,EGU=steps,DHLM=100000,DLLM=-100000,INIT=")
 
 # The module's aux records, with C's motor.substitutions.phytron values. Like
 # C's MCC example this loads no Phytron_MCM01.db, so the axis link to
