@@ -1,0 +1,10 @@
+# dbl of motor R7-4-5 motorOriel iocBoot/iocOriel st.cmd
+oriel:alldone
+oriel:alldoneBlink
+oriel:allstop
+oriel:m1
+oriel:m1_able
+oriel:m1_twCh
+oriel:m1_vCh
+oriel:moving
+oriel:movingDiff

@@ -31,11 +31,11 @@ EMC18011Setup(1, 10)
 # EMC18011Config(card, asyn port) - fixed 3 axes.
 EMC18011Config(0, "$(SERIAL)")
 
-# One motor record per axis (DTYP "EMC18011", OUT #C$(CARD) S0, S1, ...). The controller
-# works in millimetres (EGU = mm) at a 0.01 mm step (MRES).
-dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m1,C=$(CARD),S=0")
-dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m2,C=$(CARD),S=1")
-dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m3,C=$(CARD),S=2")
+# Each axis's motor.db, as C's EMC18011.cmd loads it, and motorUtil's
+# records, as C's st.cmd loads them. The controller works in millimetres
+# (EGU = mm) at a 0.01 mm step (MRES).
+dbLoadTemplate("$(ORIEL_IOC)/db/EMC18011.substitutions", "P=$(P),C=$(CARD)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
