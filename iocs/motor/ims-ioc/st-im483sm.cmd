@@ -17,6 +17,12 @@ asynSetOption("$(PORT)", -1, "baud", "9600")
 IM483SMSetup(1, 10)
 IM483SMConfig(0, "$(PORT)")
 
-dbLoadRecords("$(IMS_IOC)/db/im483-m1.template", "P=$(P),M=m0,DTYP=IM483SM,C=0,S=0")
+# motorUtil's records and the axis's motor.db, as C's st.cmd and IM483.cmd
+# load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(IMS_IOC)/db/IM483.substitutions", "P=$(P),C=0")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")

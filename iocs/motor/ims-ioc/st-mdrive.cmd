@@ -6,7 +6,7 @@
 #============================================================
 
 epicsEnvSet("P",    "ims:")
-epicsEnvSet("PORT", "serial1")
+epicsEnvSet("PORT", "serial2")
 epicsEnvSet("TTY",  "/dev/ttyUSB0")
 
 drvAsynSerialPortConfigure("$(PORT)", "$(TTY)", 0, 0, 0)
@@ -17,7 +17,12 @@ asynSetOption("$(PORT)", -1, "baud", "9600")
 MDriveSetup(1, 10)
 MDriveConfig(0, "$(PORT)")
 
-dbLoadRecords("$(IMS_IOC)/db/im483-m1.template", "P=$(P),M=m0,DTYP=MDrive,C=0,S=0")
-dbLoadRecords("$(IMS_IOC)/db/im483-m1.template", "P=$(P),M=m1,DTYP=MDrive,C=0,S=1")
+# motorUtil's records and the drive's motor.db, as C's st.cmd and
+# MDrive.cmd load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(IMS_IOC)/db/MDrive.substitutions", "P=$(P),C=0")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")

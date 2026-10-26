@@ -10,8 +10,8 @@
 #============================================================
 
 epicsEnvSet("P",      "ims:")
-epicsEnvSet("MPORT",  "M06")
-epicsEnvSet("IPPORT", "imsAsyn")
+epicsEnvSet("MPORT",  "M1")
+epicsEnvSet("IPPORT", "P1")
 epicsEnvSet("HOST",   "192.168.1.60:2101")
 epicsEnvSet("DEVNAME", "")
 
@@ -26,12 +26,19 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #                              One axis; empty devName = no party mode.
 ImsMDrivePlusCreateController("$(MPORT)", "$(IPPORT)", "$(DEVNAME)", 100, 1000)
 
-# The single motor record, axis 0 of the motor port.
-dbLoadRecords("$(IMS_IOC)/db/ims.template", "P=$(P),M=m1,PORT=$(MPORT),ADDR=0")
+# motorUtil's records, the single axis's basic_asyn_motor.db, IMS_extra.db
+# and the IP port's asyn record, as C's st.cmd and MDrive-Eth.cmd load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(IMS_IOC)/db/motor.substitutions.ims", "P=$(P),PORT=$(MPORT)")
+dbLoadRecords("$(IMS_IOC)/db/IMS_extra.db", "P=$(P),R={Slt:1-Ax:T},PORT=$(MPORT),ADDR=0,TIMEOUT=1.0")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R={MC:1}Asyn,PORT=$(IPPORT),ADDR=80,OMAX=100,IMAX=100")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
-#   camonitor ims:m1 ims:m1.RBV
-#   caput ims:m1 10000
+#   camonitor ims:1 ims:1.RBV
+#   caput ims:1 1

@@ -1,0 +1,10 @@
+# dbl of motor R7-4-5 motorIms iocBoot/iocIms st.cmd running IM483.cmd for MDrive-Eth.cmd
+ims:alldone
+ims:alldoneBlink
+ims:allstop
+ims:m1
+ims:m1_able
+ims:m1_twCh
+ims:m1_vCh
+ims:moving
+ims:movingDiff

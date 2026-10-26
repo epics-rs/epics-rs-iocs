@@ -1,0 +1,11 @@
+# dbl of motor R7-4-5 motorIms iocBoot/iocIms st.cmd, which runs MDrive-Eth.cmd
+# MDrive-Eth.cmd's dbLoadRecords("../../db/motor.db") has no macros and loads no record
+ims:alldone
+ims:alldoneBlink
+ims:allstop
+ims:moving
+ims:movingDiff
+Test-CT{MC:1}Asyn
+Test-CT{Slt:1-Ax:T}ClrLR-Cmd
+Test-CT{Slt:1-Ax:T}LockRotor-Sts
+Test-CT{Slt:1-Ax:T}Sav-Cmd
