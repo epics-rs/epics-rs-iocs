@@ -99,11 +99,13 @@ record(longin, "$(P)$(M)Freq:MCL-RB") {
     field(EGU, "Hz")
 }
 
+# motorSmarAct ccaf020 removed the MCS2 driver's REF parameter, so the
+# asynInt32 Ref-Sts failed init; read IS_REFERENCED (0x80) of the status word.
 record(bi, "$(P)$(M)Ref-Sts") {
     field(DESC,"Reference")
-    field(DTYP,"asynInt32")
-    field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))REF")
-    field(SCAN, "I/O Intr")
+    field(DTYP,"Raw Soft Channel")
+    field(INP, "$(P)$(M)positionerStatusRb CP")
+    field(MASK,"0x80")
     field(ZNAM, "Not Referenced")
     field(ONAM, "Referenced")
 }
