@@ -29,6 +29,7 @@ asynSetOption("$(SERPORT)", 0, "stop", "1")
 # the driver sends bare commands.
 asynOctetSetInputEos("$(SERPORT)", 0, "\n")
 asynOctetSetOutputEos("$(SERPORT)", 0, "\n")
+asynSetTraceIOMask("$(SERPORT)", 0, 2)
 
 # ---- SCU controller + axes ----
 # smarActSCUCreateController(motorPortName, ioPortName, numAxes,
