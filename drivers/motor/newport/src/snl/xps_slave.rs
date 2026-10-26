@@ -1,7 +1,7 @@
 //! `xpsSlave.st`, compiled by snc-rs from `build.rs` and run on
 //! `epics-seq-rs`.
 //!
-//! Its escaped C is XPS_C8_drivers.cpp, through [`super::xps_c8`]. The
+//! Its escaped C is XPS_C8_drivers.cpp, through `xps_c8`. The
 //! `%%` includes need no Rust.
 
 use std::ffi::c_char;
