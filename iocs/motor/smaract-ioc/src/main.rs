@@ -3,7 +3,7 @@
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` for the MCS2 or
 //! `drvAsynSerialPortConfigure` for the SCU), the SmarAct iocsh commands
 //! (`MCS2CreateController`; `smarActSCUCreateController` + `smarActSCUCreateAxis`),
-//! the motor record type, autosave, and the CA + PVA (QSRV) server.
+//! the motor record type, motorUtil, autosave, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p smaract-ioc -- st.cmd        # MCS2
@@ -38,6 +38,10 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(motor_name, motor_factory);
     // motorSupport.dbd's asynMotorControllerRegister.
     for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
+        app = app.register_startup_command(cmd);
+    }
+    // motorUtilRegister: motorUtilInit, printChIDlist, listMovingMotors.
+    for cmd in epics_rs::motor::motor_util::motor_util_commands() {
         app = app.register_startup_command(cmd);
     }
 

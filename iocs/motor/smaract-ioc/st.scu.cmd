@@ -15,6 +15,9 @@ epicsEnvSet("CTRL",    "SCU_1")
 epicsEnvSet("SERPORT", "serial1")
 epicsEnvSet("DEVICE",  "/dev/ttyUSB0")
 
+# ---- motorUtil (allstop & alldone) ----
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+
 # ---- asyn serial octet port (FTDI USB, 9600 8-N-1 typical) ----
 drvAsynSerialPortConfigure("$(SERPORT)", "$(DEVICE)", 0, 0, 0)
 asynSetOption("$(SERPORT)", 0, "baud", "9600")
@@ -55,6 +58,9 @@ save_restoreSet_status_prefix("$(P)")
 dbLoadRecords("$(AUTOSAVE)/db/save_restoreStatus.db", "P=$(P)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
 
 # save motor positions every five seconds
 create_monitor_set("auto_positions.req", 5, "P=$(P)")

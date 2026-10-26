@@ -15,6 +15,9 @@ epicsEnvSet("IPPORT", "MCS2")
 epicsEnvSet("HOST",   "192.168.1.200:55551")
 epicsEnvSet("NAXES",  "3")
 
+# ---- motorUtil (allstop & alldone) ----
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+
 # ---- asyn IP octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
@@ -44,6 +47,9 @@ save_restoreSet_status_prefix("$(P)")
 dbLoadRecords("$(AUTOSAVE)/db/save_restoreStatus.db", "P=$(P)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
 
 # save motor positions every five seconds
 create_monitor_set("auto_positions.req", 5, "P=$(P)")
