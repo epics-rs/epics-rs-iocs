@@ -19,3 +19,13 @@ fn st_cmd_loads_the_c_maxnet_records() {
     );
     assert_same_records(&script_records(&dir().join("st.cmd")), &c);
 }
+
+#[test]
+fn st_mxa_cmd_loads_the_c_mxa_records() {
+    let c = renamed(
+        &read_dbl(&dir().join("tests/MXA.dbl")),
+        &[("omsAsyn:", "oms:")],
+        &[],
+    );
+    assert_same_records(&script_records(&dir().join("st.mxa.cmd")), &c);
+}

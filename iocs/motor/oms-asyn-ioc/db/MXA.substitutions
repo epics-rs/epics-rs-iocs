@@ -1,0 +1,16 @@
+# C's iocOmsAsyn MXA.substitutions, P and PORT from st.mxa.cmd; the values
+# are the motor record this IOC had for m1, on each of the eight axes
+# omsMXAConfig configures. Positions are controller-native steps, so MRES = 1.
+file "$(MOTOR)/db/asyn_motor_model2.db"
+{
+pattern
+{N,  M,       DTYP,         ADDR,  DESC,  EGU,    DIR,  VELO,   VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,     DLLM,      INIT}
+{1,  "m$(N)", "asynMotor",  0,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{2,  "m$(N)", "asynMotor",  1,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{3,  "m$(N)", "asynMotor",  2,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{4,  "m$(N)", "asynMotor",  3,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{5,  "m$(N)", "asynMotor",  4,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{6,  "m$(N)", "asynMotor",  5,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{7,  "m$(N)", "asynMotor",  6,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+{8,  "m$(N)", "asynMotor",  7,     "",    steps,  Pos,  10000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+}
