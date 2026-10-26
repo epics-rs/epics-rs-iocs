@@ -4,14 +4,14 @@
 # Usage:
 #   cargo run -p faulhaber-ioc -- st.cmd
 #
-# Requires one or more Faulhaber MCDC2805 modules on the serial line below,
-# addressed by node number. MCDC2805Config probes each node (VER) and runs the
-# limit-switch/homing configuration, so they must be connected when it runs.
+# Requires a Faulhaber MCDC2805 module, node 0, on the serial line below.
+# MCDC2805Config probes it (VER) and runs the limit-switch/homing
+# configuration, so it must be connected when the command runs.
 #============================================================
 
 epicsEnvSet("P",      "MCDC:")
 epicsEnvSet("CARD",   "0")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -33,18 +33,17 @@ asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 MCDC2805Setup(1, 10)
 
 # MCDC2805Config(card, # modules on the port, asyn port)
-MCDC2805Config(0, 2, "$(SERIAL)")
+MCDC2805Config(0, 1, "$(SERIAL)")
 
-# One motor record per node (DTYP "MCDC2805", OUT #C$(CARD) S0, S1, ...).
-# The MCDC2805 is a DC servo working in encoder counts: positions travel the
-# driver boundary in counts, so MRES = 1 and EGU = counts. VELO/ACCL are
-# converted to the controller's rev/min and rev/s^2 using the record's SREV.
-dbLoadRecords("$(FAULHABER_IOC)/db/mcdc2805.template", "P=$(P),M=m1,C=$(CARD),S=0")
-dbLoadRecords("$(FAULHABER_IOC)/db/mcdc2805.template", "P=$(P),M=m2,C=$(CARD),S=1")
+# motorUtil's records and the node's motor.db, as C's st.cmd and
+# MCDC2805.cmd load them. VELO/ACCL are converted to the controller's rev/min
+# and rev/s^2 using the record's SREV.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(FAULHABER_IOC)/db/MCDC2805.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
 
 # Example:
 #   dbl
 #   camonitor MCDC:m1 MCDC:m1.RBV
-#   caput MCDC:m1 10000
+#   caput MCDC:m1 10

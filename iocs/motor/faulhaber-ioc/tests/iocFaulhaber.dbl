@@ -1,0 +1,10 @@
+# dbl of motor R7-4-5 motorFaulhaber iocBoot/iocFaulhaber st.cmd
+faulhaber:alldone
+faulhaber:alldoneBlink
+faulhaber:allstop
+faulhaber:m1
+faulhaber:m1_able
+faulhaber:m1_twCh
+faulhaber:m1_vCh
+faulhaber:moving
+faulhaber:movingDiff
