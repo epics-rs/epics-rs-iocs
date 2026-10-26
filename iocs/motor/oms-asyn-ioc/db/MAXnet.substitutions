@@ -1,6 +1,8 @@
 # C's iocOmsAsyn MAXnet.substitutions, P and PORT from st.cmd; the values
 # are the motor record this IOC had before. The driver reports positions in
-# controller-native steps, so MRES = 1 and EGU = steps.
+# controller-native steps, so MRES = 1 and EGU = steps. C's PORT is MAXNET,
+# the octet port, where devMotorAsyn finds no asynInt32 and the record fails
+# init; PORT here is the omsMAXnetConfig port.
 file "$(MOTOR)/db/asyn_motor.db"
 {
 pattern
