@@ -30,6 +30,11 @@ smarActMCSCreateController("$(CTRL)", "$(IPPORT)", 1, 0.020, 1.0, 0)
 # axisNumber as @asyn($(CTRL),axisNumber); channel is the controller channel.
 smarActMCSCreateAxis("$(CTRL)", 0, 0)
 
+# C's smaractmcs.iocsh lacks the sleep its smaractscu.iocsh has: the poller
+# starts before the axis, so whether motor init reads the axis position or
+# 0, and writes an autosaved DVAL to the controller, is a thread race.
+epicsThreadSleep(1.0)
+
 # The motor of C's motor.substitutions.smaractmcs.
 dbLoadRecords("$(MOTOR)/db/asyn_motor.db", "P=$(P),M=m1,DTYP=asynMotor,PORT=$(CTRL),ADDR=0,DESC=motor 1,EGU=mm,DIR=Pos,VELO=1,VBAS=0,ACCL=0.2,BDST=0,BVEL=1,BACC=0.2,MRES=1e-6,PREC=2,DHLM=3,DLLM=-3,INIT=")
 
