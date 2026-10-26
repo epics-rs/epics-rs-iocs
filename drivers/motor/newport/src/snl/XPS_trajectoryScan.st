@@ -705,7 +705,7 @@ static int getMotorMoving(SS_ID ssId, struct UserVar *pVar)
 {
     int status;
     int moving=0;
-    int groupStatus;
+    int groupStatus=0;  /* Upstream read it unset when GroupStatusGet failed */
 
     /* Read the current status of the group */
 
@@ -992,6 +992,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
         if (status != 0) {
             printMessage("Error calling positionerSGammaParametersSet, status=%d\n", 
                    status);
+            maxAcceleration[j] = 0.;  /* Upstream used it unset */
         }
         /* The calculation using maxAcceleration read from controller below
          * is "correct" but subject to roundoff errors when sending ASCII commands
@@ -1166,7 +1167,7 @@ static void buildAndVerify(SS_ID ssId, struct UserVar *pVar)
 static int currentElement(SS_ID ssId, struct UserVar *pVar)
 {
     int status;
-    int number;
+    int number=0;  /* Upstream returned it unset when the read failed */
     char fileName[100];
     
     status = MultipleAxesPVTParametersGet(pVar->pollSocket,
@@ -1180,7 +1181,7 @@ static int currentElement(SS_ID ssId, struct UserVar *pVar)
 static int getGroupStatus(SS_ID ssId, struct UserVar *pVar)
 {
     int status;
-    int groupStatus;
+    int groupStatus=0;  /* Upstream returned it unset when GroupStatusGet failed */
 
     /* Read the current status of the group */
 
