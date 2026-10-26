@@ -234,7 +234,6 @@ async fn st_mcs_cmd() {
         pinned(&lines),
         [
             r#"dbLoadRecords "$(MOTOR)/db/motorUtil.db" "P=MCS:""#,
-            r#"epicsThreadSleep "1.0""#,
             r#"set_requestfile_path "$(SMARACT_IOC)" """#,
             r#"set_requestfile_path "$(MOTOR)" "db""#,
             r#"set_savefile_path "$(SMARACT_IOC)" "autosave""#,

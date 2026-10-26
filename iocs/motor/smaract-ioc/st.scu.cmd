@@ -48,8 +48,7 @@ smarActSCUCreateAxis("$(CTRL2)", 0, 0)
 smarActSCUCreateAxis("$(CTRL2)", 1, 1)
 smarActSCUCreateAxis("$(CTRL2)", 2, 2)
 
-# The first axis poll comes an idle period after CreateController; motor
-# init before it reads position 0 and loads an autosaved DVAL in its place.
+# C's smaractscu.iocsh sleeps after its last CreateAxis.
 epicsThreadSleep(1.0)
 
 # One motor per axis with the rows of C's motor.substitutions.smaractscu.
