@@ -1,0 +1,8 @@
+# C's iocAerotech a3.asyn.motor.substitutions on this IOC's one axis, P and
+# PORT from st.a3200.cmd; the values are the motor record this IOC had before.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{N,  M,       DTYP,         ADDR,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,    PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "asynMotor",  0,     "",    mm,   Pos,  10,    0,     .2,    0,     0,     .5,    0.0004,  4,     100,   -100,  ""}
+}

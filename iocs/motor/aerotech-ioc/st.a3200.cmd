@@ -27,7 +27,10 @@ A3200AsynSetup(1)
 A3200AsynConfig(0, "$(IPPORT)", 0, 1, 100, 1000, 1, 1)
 drvAsynMotorConfigure("$(CTRL)", "motorA3200", 0, 1)
 
-dbLoadRecords("$(AEROTECH_IOC)/db/a3200.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+# The axis's basic_asyn_motor.db and motorUtil's records, as C's
+# a3.asyn.st.cmd.linux-x86 loads them.
+dbLoadTemplate("$(AEROTECH_IOC)/db/a3.asyn.motor.substitutions", "P=$(P),PORT=$(CTRL)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 

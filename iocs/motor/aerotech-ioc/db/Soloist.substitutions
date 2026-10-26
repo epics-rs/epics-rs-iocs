@@ -1,0 +1,8 @@
+# C's iocAerotech Soloist.substitutions, P from st-soloist.cmd; the values
+# are the motor record this IOC had before.
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{N,  M,       DTYP,       C,  S,  DESC,  EGU,    DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,     DLLM,      INIT}
+{1,  "m$(N)", "Soloist",  0,  0,  "",    steps,  Pos,  1000,  0,     .2,    0,     0,     .5,    1,     0,     1000000,  -1000000,  ""}
+}

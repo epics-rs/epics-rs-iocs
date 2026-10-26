@@ -1,0 +1,17 @@
+# dbl of motor R7-4-5 motorAerotech iocBoot/iocAerotech st.cmd
+aerotech:alldone
+aerotech:alldoneBlink
+aerotech:allstop
+aerotech:m1
+aerotech:m1_able
+aerotech:m1Direction
+aerotech:m1Offset
+aerotech:m1Resolution
+aerotech:m1_twCh
+aerotech:m1_vCh
+aerotech:m2
+aerotech:m2_able
+aerotech:m2_twCh
+aerotech:m2_vCh
+aerotech:moving
+aerotech:movingDiff

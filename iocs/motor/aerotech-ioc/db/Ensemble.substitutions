@@ -1,0 +1,8 @@
+# C's iocAerotech Ensemble.substitutions, P and PORT from st.cmd; the
+# values are the motor record this IOC had before.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{N,  M,       DTYP,         ADDR,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,     PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "asynMotor",  0,     "",    mm,   Pos,  10,    0,     .2,    0,     0,     .5,    1.25e-5,  4,     100,   -100,  ""}
+}

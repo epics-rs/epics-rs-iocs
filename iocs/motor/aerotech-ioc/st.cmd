@@ -29,7 +29,10 @@ EnsembleAsynSetup(1)
 EnsembleAsynConfig(0, "$(IPPORT)", 0, 1, 100, 1000)
 drvAsynMotorConfigure("$(CTRL)", "motorEnsemble", 0, 1)
 
-dbLoadRecords("$(AEROTECH_IOC)/db/aerotech.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+# The axis's asyn_motor.db and motorUtil's records, as C's st.cmd and
+# Ensemble.cmd load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(AEROTECH_IOC)/db/Ensemble.substitutions", "P=$(P),PORT=$(CTRL)")
 
 # EnsembleTrajectoryScan.st's records, for the seq line below (NELM at most
 # 1000, NPULSE at most 8000):

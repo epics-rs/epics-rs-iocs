@@ -17,6 +17,9 @@ asynOctetSetOutputEos("$(PORT)", 0, "\n")
 SoloistSetup(1, 10)
 SoloistConfig(0, "$(PORT)", 0)
 
-dbLoadRecords("$(AEROTECH_IOC)/db/soloist.template", "P=$(P),M=m1,C=0")
+# The axis's motor.db and motorUtil's records, as C's st.cmd and Soloist.cmd
+# load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(AEROTECH_IOC)/db/Soloist.substitutions", "P=$(P)")
 
 iocInit()
