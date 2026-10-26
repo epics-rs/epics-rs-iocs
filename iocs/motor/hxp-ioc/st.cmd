@@ -19,16 +19,15 @@ epicsEnvSet("IP",   "192.168.0.254")
 # HXPCreateController(portName, IPAddress, IPPort, movingPollPeriod, idlePollPeriod)
 HXPCreateController("$(PORT)", "$(IP)", 5001, 200, 1000)
 
-dbLoadRecords("$(HXP_IOC)/db/hxp.template", "P=$(P),MX=mX,MY=mY,MZ=mZ,MU=mU,MV=mV,MW=mW,PORT=$(PORT)")
-# Coordinate system for moves, group status/error, move-all targets.
-dbLoadRecords("$(HXP_IOC)/db/HXP_extra.db", "P=$(P),R=,PORT=$(PORT)")
-# Coordinate-system definitions: read back, set, then sync the motors.
-dbLoadRecords("$(HXP_IOC)/db/HXP_coords.db", "P=$(P),R=,PORT=$(PORT),M1=mX,M2=mY,M3=mZ,M4=mU,M5=mV,M6=mW")
+# motorUtil's records, then each axis's asyn_motor.db and the HXP's
+# HXP_extra.db and HXP_coords.db, as C's st.cmd and motor.cmd.hxp load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(HXP_IOC)/db/motor.substitutions.hxp", "P=$(P),PORT=$(PORT)")
 
 iocInit()
 
 # Example:
 #   dbl
-#   camonitor HXP:mZ HXP:mZ.RBV
-#   caput HXP:mZ 1.0
+#   camonitor HXP:m3 HXP:m3.RBV
+#   caput HXP:m3 1.0
 #   caput HXP:T3 1.5; caput HXP:MOVE_ALL 1
