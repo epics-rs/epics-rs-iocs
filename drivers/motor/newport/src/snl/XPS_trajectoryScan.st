@@ -161,6 +161,7 @@ ss xpsTrajectoryScan {
             }
             /* Force numAxes to be <= MAX_AXES.
              * Upstream clamped it after this loop had assigned NumAxes motors. */
+            pvGet(numAxes);
             if (numAxes > MAX_AXES) numAxes = MAX_AXES;
             for (i=0; i<numAxes; i++) {
                 axisName[i] = malloc(NAME_LEN);
