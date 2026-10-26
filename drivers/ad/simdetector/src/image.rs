@@ -18,7 +18,7 @@
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::error::ADResult;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDataViewMut, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDataViewMut, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 
 use crate::rng::Rng;
@@ -334,15 +334,11 @@ macro_rules! sim_buffers {
                 dims: &[NDDimension],
                 data_type: NDDataType,
             ) -> ADResult<Self> {
-                let n = dims.iter().map(|d| d.size).product();
-                let zeroed = || match data_type {
-                    $(NDDataType::$dt => NDDataBuffer::from_vec(vec![<$t as SimPixel>::ZERO; n])),*
-                };
                 // C allocates each with a NULL pData (simDetector.cpp:631-638),
                 // so each is held to the pool's limit; `wrap` is not.
                 let alloc = || -> ADResult<DriverArray> {
                     let mut a = pool.alloc(dims.to_vec(), data_type)?;
-                    a.data = zeroed();
+                    a.fill().data_mut().as_u8_slice_mut().fill(0);
                     Ok(a)
                 };
                 Ok(Self {
@@ -355,10 +351,10 @@ macro_rules! sim_buffers {
 
             fn compute(&mut self, cfg: &SimConfig, st: &mut DynState, reset: bool, rng: &mut Rng) {
                 match (
-                    self.raw.data.view_mut(),
-                    self.background.data.view_mut(),
-                    self.ramp.data.view_mut(),
-                    self.peak.data.view_mut(),
+                    self.raw.fill().data_mut().view_mut(),
+                    self.background.fill().data_mut().view_mut(),
+                    self.ramp.fill().data_mut().view_mut(),
+                    self.peak.fill().data_mut().view_mut(),
                 ) {
                     $((
                         NDDataViewMut::$buf(raw),
@@ -808,7 +804,7 @@ impl SimEngine {
             // C adds the ColorMode attribute inside the three pattern
             // generators; SimModeOffsetNoise is an empty case, so its arrays
             // carry no ColorMode attribute.
-            raw.attributes.add(NDAttribute {
+            raw.fill().attributes_mut().add(NDAttribute {
                 name: "ColorMode".into(),
                 description: "Color mode".into(),
                 source: NDAttrSource::Driver,

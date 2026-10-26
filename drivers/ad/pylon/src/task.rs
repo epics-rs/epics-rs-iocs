@@ -24,6 +24,7 @@ use ad_core_rs::ndarray_pool::{DriverArray, DriverPool};
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
 use ad_core_rs::runtime as rt;
+use ad_core_rs::timestamp::EpicsTimestamp;
 
 use ad_genicam::{FeatureIndex, FeatureValue};
 
@@ -235,17 +236,20 @@ impl GrabShared {
             return Err(NoArray::PoolExhausted);
         };
         // C's memcpy of dataSize bytes (ADPylon.cpp:696).
-        array.data.as_u8_slice_mut().copy_from_slice(bytes);
+        let mut out = array.fill();
+        out.data_mut().as_u8_slice_mut().copy_from_slice(bytes);
 
         let driver_id = self.unique_id.fetch_add(1, Ordering::Relaxed);
-        array.unique_id = if self.unique_id_mode.load(Ordering::Relaxed) == UNIQUE_ID_CAMERA {
-            frame.id as i32
-        } else {
-            driver_id
-        };
-        array.update_time_stamps_now();
+        out.set_unique_id(
+            if self.unique_id_mode.load(Ordering::Relaxed) == UNIQUE_ID_CAMERA {
+                frame.id as i32
+            } else {
+                driver_id
+            },
+        );
+        out.update_time_stamps(EpicsTimestamp::now());
         if self.time_stamp_mode.load(Ordering::Relaxed) == TIME_STAMP_CAMERA {
-            array.time_stamp = frame.timestamp as f64 / 1e9;
+            out.set_time_stamp(frame.timestamp as f64 / 1e9);
         }
 
         let nd = &self.ad.base;
@@ -269,7 +273,7 @@ impl GrabShared {
                 }
                 ChunkValue::String(v) => (NDAttrValue::String(v.clone()), FeatureValue::String(v)),
             };
-            array.attributes.add(NDAttribute::new_static(
+            out.attributes_mut().add(NDAttribute::new_static(
                 chunk.name.as_str(),
                 chunk.display_name,
                 NDAttrSource::Driver,
@@ -413,11 +417,12 @@ impl ImageTask {
                 let mut array = self
                     .port
                     .with_driver(move |driver: &mut ADPylon| {
-                        driver.ad.attach_attributes(&mut array);
+                        driver.ad.attach_attributes(array.fill().attributes_mut());
                         array
                     })
                     .await?;
-                let attributes = &mut array.attributes;
+                let mut frame = array.fill();
+                let attributes = frame.attributes_mut();
                 attributes.add(NDAttribute::new_static(
                     "ColorMode",
                     "Color mode",

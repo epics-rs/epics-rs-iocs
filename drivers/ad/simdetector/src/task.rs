@@ -303,7 +303,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
             .into();
         // simTask stamps pArrays[0] in place (simDetector.cpp:824-828).
         let Ok(image) = ctx.pool.owner().refill(0, image, |image| {
-            image.unique_id = image_counter;
+            image.set_unique_id(image_counter);
             image.update_time_stamps(stamp);
         }) else {
             continue;

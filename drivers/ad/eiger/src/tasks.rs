@@ -1491,18 +1491,18 @@ fn build_array(
         data.data_type(),
         data.total_bytes(),
     )?;
-    array
-        .fill()
+    let mut frame = array.fill();
+    frame
         .data_mut()
         .as_u8_slice_mut()
         .copy_from_slice(data.as_u8_slice());
-    array.unique_id = unique_id;
+    frame.set_unique_id(unique_id);
     // C sets `timeStamp = ts.secPastEpoch + ts.nsec/1.e9` (stream2Api.cpp:337),
     // as updateTimeStamps does.
-    array.timestamp = timestamp;
-    array.time_stamp = f64::from(timestamp.sec) + f64::from(timestamp.nsec) / 1.0e9;
-    array.attributes = attributes;
-    array.codec = codec;
+    frame.set_timestamp(timestamp);
+    frame.set_time_stamp(f64::from(timestamp.sec) + f64::from(timestamp.nsec) / 1.0e9);
+    *frame.attributes_mut() = attributes;
+    frame.set_codec(codec);
     Ok(array)
 }
 

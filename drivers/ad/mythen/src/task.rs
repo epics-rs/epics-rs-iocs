@@ -209,10 +209,10 @@ async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> 
     let counter = s.get_int(s.ad.base.array_counter).await + 1;
     s.set_int(s.ad.base.array_counter, counter).await;
 
-    array.unique_id = counter;
-    array.timestamp = EpicsTimestamp::now();
-    array.time_stamp = array.timestamp.as_f64();
-    array.attributes = attributes;
+    let mut frame = array.fill();
+    frame.set_unique_id(counter);
+    frame.update_time_stamps(EpicsTimestamp::now());
+    *frame.attributes_mut() = attributes;
 
     let array = array.share();
     if s.get_int(s.ad.base.array_callbacks).await != 0 {

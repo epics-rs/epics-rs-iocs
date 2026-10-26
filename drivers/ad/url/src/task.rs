@@ -185,15 +185,15 @@ async fn acquire_one_image(
             .pool
             .alloc(decoded.dims, decoded.data.data_type())
             .ok()?;
-        array
-            .fill()
+        let mut frame = array.fill();
+        frame
             .data_mut()
             .as_u8_slice_mut()
             .copy_from_slice(decoded.data.as_u8_slice());
-        array.unique_id = image_counter;
-        array.timestamp = end_ts;
-        array.time_stamp = start_time.as_f64();
-        array.attributes = attributes;
+        frame.set_unique_id(image_counter);
+        frame.set_timestamp(end_ts);
+        frame.set_time_stamp(start_time.as_f64());
+        *frame.attributes_mut() = attributes;
         Some(array)
     }) else {
         return Ok(());

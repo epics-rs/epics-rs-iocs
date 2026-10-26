@@ -332,14 +332,15 @@ async fn publish_frame(
     for (p, v) in pixels.iter_mut().zip(image.data) {
         *p = v as i32;
     }
-    array.unique_id = unique_id;
-    array.time_stamp = exposure.start_time.as_f64();
-    array.timestamp = ctx
-        .handle
-        .update_time_stamp()
-        .await
-        .unwrap_or_else(|_| SystemTime::now())
-        .into();
+    frame.set_unique_id(unique_id);
+    frame.set_time_stamp(exposure.start_time.as_f64());
+    frame.set_timestamp(
+        ctx.handle
+            .update_time_stamp()
+            .await
+            .unwrap_or_else(|_| SystemTime::now())
+            .into(),
+    );
 
     ctx.output.publish(array).await;
     Ok(())

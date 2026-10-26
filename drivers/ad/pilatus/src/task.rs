@@ -86,13 +86,13 @@ pub(crate) fn refill_flat_field(
     average: f64,
 ) -> Option<PublishedArray> {
     let flat = s.flat_field.as_mut()?;
-    let array = flat.refill();
-    let NDDataViewMut::I32(pixels) = array.data.view_mut() else {
+    let mut array = flat.refill();
+    let NDDataViewMut::I32(pixels) = array.data_mut().view_mut() else {
         unreachable!("allocated as NDInt32")
     };
     pixels.copy_from_slice(data);
     if let Some(d) = description {
-        array.attributes.add(tiff_description(d));
+        array.attributes_mut().add(tiff_description(d));
     }
     s.average_flat_field = average;
     Some(flat.published())
@@ -336,16 +336,15 @@ fn build_array(
         vec![NDDimension::new(nx), NDDimension::new(ny)],
         NDDataType::Int32,
     )?;
-    array
-        .fill()
+    let mut frame = array.fill();
+    frame
         .data_mut()
         .as_mut_slice::<i32>()
         .expect("allocated as NDInt32")
         .copy_from_slice(&data);
-    array.unique_id = unique_id;
-    array.timestamp = ts;
-    array.time_stamp = ts.as_f64();
-    array.attributes = attributes;
+    frame.set_unique_id(unique_id);
+    frame.update_time_stamps(ts);
+    *frame.attributes_mut() = attributes;
     Ok(array)
 }
 

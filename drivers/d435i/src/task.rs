@@ -429,7 +429,7 @@ async fn publish_array(
     // as Mono: NDColorConvert saw source == target and passed the frame through
     // unconverted, so `image1:ArraySize0_RBV` stayed 3 (the RGB component count)
     // where a viewer expects the image width.
-    array.attributes.add(NDAttribute::new_static(
+    array.fill().attributes_mut().add(NDAttribute::new_static(
         "ColorMode",
         "Color mode",
         NDAttrSource::Driver,
@@ -537,14 +537,10 @@ async fn process_color_frame(
         let Ok(mut array) = ctx.color_pool.alloc(dims, NDDataType::UInt8) else {
             return;
         };
-        array
-            .fill()
-            .data_mut()
-            .as_u8_slice_mut()
-            .copy_from_slice(&bytes);
-        array.unique_id = array_counter;
-        array.timestamp = ts;
-        array.time_stamp = ts.as_f64();
+        let mut out = array.fill();
+        out.data_mut().as_u8_slice_mut().copy_from_slice(&bytes);
+        out.set_unique_id(array_counter);
+        out.update_time_stamps(ts);
 
         publish_array(
             &ctx.color_handle,
@@ -593,15 +589,13 @@ async fn process_depth_frame(
     let Ok(mut array) = ctx.depth_pool.alloc(dims, NDDataType::UInt16) else {
         return;
     };
-    array
-        .fill()
-        .data_mut()
+    let mut out = array.fill();
+    out.data_mut()
         .as_mut_slice::<u16>()
         .expect("allocated as NDUInt16")
         .copy_from_slice(&pixels);
-    array.unique_id = array_counter;
-    array.timestamp = ts;
-    array.time_stamp = ts.as_f64();
+    out.set_unique_id(array_counter);
+    out.update_time_stamps(ts);
 
     publish_array(
         &ctx.depth_handle,
@@ -649,15 +643,14 @@ async fn process_pointcloud(
         ) else {
             return;
         };
-        array
-            .fill()
+        let mut frame = array.fill();
+        frame
             .data_mut()
             .as_mut_slice::<f32>()
             .expect("allocated as NDFloat32")
             .copy_from_slice(&data);
-        array.unique_id = array_counter;
-        array.timestamp = ts;
-        array.time_stamp = ts.as_f64();
+        frame.set_unique_id(array_counter);
+        frame.update_time_stamps(ts);
 
         publish_array(
             &ctx.color_handle,

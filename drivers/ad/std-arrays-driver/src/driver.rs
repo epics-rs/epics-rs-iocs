@@ -151,7 +151,7 @@ impl NdStdArraysDriver {
                 }
             };
             // pArray->pAttributeList->add("ColorMode", ...) (NDDriverStdArrays.cpp:167).
-            array.attributes.add(NDAttribute::new_static(
+            array.fill().attributes_mut().add(NDAttribute::new_static(
                 "ColorMode",
                 "Color Mode",
                 NDAttrSource::Driver,
@@ -160,7 +160,7 @@ impl NdStdArraysDriver {
             let info = array.info();
             // NDDriverStdArrays.cpp:184-214.
             if append_mode == 1 || (append_mode == 0 && info.num_elements < n_elements) {
-                convert::fill_buffer(array.data.view_mut(), fill);
+                convert::fill_buffer(array.fill().data_mut().view_mut(), fill);
             }
             made = Some(Ok(info));
             Some(array)
@@ -270,7 +270,7 @@ impl NdStdArraysDriver {
                     n = total.saturating_sub(next_element);
                 }
                 convert::copy_buffer(
-                    array.refill().data.view_mut(),
+                    array.refill().data_mut().view_mut(),
                     next_element,
                     stride,
                     &input[..n],
@@ -356,10 +356,10 @@ impl NdStdArraysDriver {
             .set_int32_param(self.ad.params.base.array_counter, 0, counter)?;
         let timestamp = self.ad.port_base.update_time_stamp().into();
         let published = owner.persistent(0, |current| {
-            let array = current.refill();
-            array.unique_id = counter;
-            array.time_stamp = EpicsTimestamp::now().as_f64();
-            array.timestamp = timestamp;
+            let mut array = current.refill();
+            array.set_unique_id(counter);
+            array.set_time_stamp(EpicsTimestamp::now().as_f64());
+            array.set_timestamp(timestamp);
             // DEVIATION: C calls getAttributes(pArray->pAttributeList) here;
             // the NDAttributesFile machinery is not wired for this driver, so
             // only the ColorMode attribute added at allocation is attached.

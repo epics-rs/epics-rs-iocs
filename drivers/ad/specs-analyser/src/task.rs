@@ -586,15 +586,15 @@ impl Task {
                 NDDataType::Float64,
             )
         {
-            array
-                .fill()
+            let mut frame = array.fill();
+            frame
                 .data_mut()
                 .as_mut_slice::<f64>()
                 .expect("allocated as NDFloat64")
                 .copy_from_slice(&image);
-            array.unique_id = array_counter;
-            array.time_stamp = acq_start_epoch;
-            array.timestamp = EpicsTimestamp::now();
+            frame.set_unique_id(array_counter);
+            frame.set_time_stamp(acq_start_epoch);
+            frame.set_timestamp(EpicsTimestamp::now());
             // C unlock() … lock() around doCallbacksGenericPointer
             // (specsAnalyser.cpp:664-667); the publish awaits, so the hold is
             // dropped and retaken rather than lent to a closure.

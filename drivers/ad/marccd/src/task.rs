@@ -207,17 +207,19 @@ impl Worker {
                 NDDataType::UInt16,
             )
         {
-            array
-                .fill()
+            let mut frame = array.fill();
+            frame
                 .data_mut()
                 .as_mut_slice::<u16>()
                 .expect("allocated as NDUInt16")
                 .copy_from_slice(&data);
-            array.unique_id = image_counter;
+            frame.set_unique_id(image_counter);
             // C uses `acqStartTime` for the double timestamp, and the port's
             // `updateTimeStamp` for the epicsTS (marCCD.cpp:323-325).
-            array.timestamp = l.step(|d| EpicsTimestamp::from(d.ad.port_base.update_time_stamp()));
-            array.time_stamp = self.load_acq_start();
+            frame.set_timestamp(
+                l.step(|d| EpicsTimestamp::from(d.ad.port_base.update_time_stamp())),
+            );
+            frame.set_time_stamp(self.load_acq_start());
             // C `getAttributes`, evaluated where its PARAM values live.
             let owner = self.owner.clone();
             let fresh = l.step(move |d| {
@@ -225,7 +227,7 @@ impl Worker {
                 (!attributes.list.is_empty()).then(|| attributes.update(d.base()))
             });
             if let Some(fresh) = fresh {
-                array.attributes.copy_from(&fresh);
+                frame.attributes_mut().copy_from(&fresh);
             }
             self.output.publish(array).await;
         }

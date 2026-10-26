@@ -338,16 +338,16 @@ pub fn decode_nt_nd_array(pool: &DriverPool, value: &PvField) -> Result<DriverAr
     let mut array = pool
         .alloc_sized(dims, data.data_type(), data.total_bytes())
         .map_err(|_| ConvertError::PoolExhausted)?;
-    array
-        .fill()
+    let mut frame = array.fill();
+    frame
         .data_mut()
         .as_u8_slice_mut()
         .copy_from_slice(data.as_u8_slice());
-    array.unique_id = unique_id;
-    array.timestamp = timestamp;
-    array.time_stamp = time_stamp;
-    array.attributes = attributes;
-    array.codec = codec;
+    frame.set_unique_id(unique_id);
+    frame.set_timestamp(timestamp);
+    frame.set_time_stamp(time_stamp);
+    *frame.attributes_mut() = attributes;
+    frame.set_codec(codec);
     Ok(array)
 }
 

@@ -403,11 +403,11 @@ impl Worker {
         for (o, &v) in out.iter_mut().zip(&pixels) {
             *o = v as u16;
         }
-        array.unique_id = image_counter;
+        frame.set_unique_id(image_counter);
         // C sets the double timeStamp from acqStartTime and the epicsTS from the
         // port's updateTimeStamp (mar345.cpp:212-213).
-        array.time_stamp = self.load_acq_start();
-        array.timestamp = l.step(|d| EpicsTimestamp::from(d.ad.port_base.update_time_stamp()));
+        frame.set_time_stamp(self.load_acq_start());
+        frame.set_timestamp(l.step(|d| EpicsTimestamp::from(d.ad.port_base.update_time_stamp())));
         // C `getAttributes`, evaluated where its PARAM values live.
         let owner = self.owner.clone();
         let fresh = l.step(move |d| {
@@ -415,7 +415,7 @@ impl Worker {
             (!attributes.list.is_empty()).then(|| attributes.update(d.base()))
         });
         if let Some(fresh) = fresh {
-            array.attributes.copy_from(&fresh);
+            frame.attributes_mut().copy_from(&fresh);
         }
         self.output.publish(array).await;
     }

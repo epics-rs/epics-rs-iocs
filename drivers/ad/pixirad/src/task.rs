@@ -217,7 +217,7 @@ async fn data_loop(ctx: DataContext) {
                 .alloc(image_dims(ctx.sensor, num_colors), NDDataType::UInt16)
                 .ok()
                 .map(|mut array| {
-                    array.timestamp = EpicsTimestamp::now();
+                    array.fill().set_timestamp(EpicsTimestamp::now());
                     Image {
                         array,
                         colors: num_colors,
@@ -225,7 +225,8 @@ async fn data_loop(ctx: DataContext) {
                 });
         }
         if let Some(building) = image.as_mut() {
-            let NDDataViewMut::U16(pixels) = building.array.data.view_mut() else {
+            let mut frame = building.array.fill();
+            let NDDataViewMut::U16(pixels) = frame.data_mut().view_mut() else {
                 unreachable!("allocated as NDUInt16")
             };
             let offset = if num_colors == 1 {
@@ -308,7 +309,8 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
         source_impl: None,
     });
 
-    array.unique_id = unique_id;
+    let mut frame = array.fill();
+    frame.set_unique_id(unique_id);
     // C: timeStamp is the first colour's startTime, epicsTS the port's
     // updateTimeStamp (pixirad.cpp:1063-1064).
     let epics_ts: EpicsTimestamp = ctx
@@ -317,9 +319,9 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
         .await
         .unwrap_or_else(|_| std::time::SystemTime::now())
         .into();
-    array.timestamp = epics_ts;
-    array.time_stamp = ts.as_f64();
-    array.attributes = attributes;
+    frame.set_timestamp(epics_ts);
+    frame.set_time_stamp(ts.as_f64());
+    *frame.attributes_mut() = attributes;
 
     // C stores no array size, dimension or time-stamp param per image; the
     // constructor's values stand (pixirad.cpp:1051-1079).

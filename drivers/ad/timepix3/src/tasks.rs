@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{
-    NDArray, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension,
+    NDArrayMut, NDDataBuffer, NDDataType, NDDataView, NDDataViewMut, NDDimension,
 };
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
@@ -233,8 +233,9 @@ impl Ctx {
     /// C `updateTimeStamp(&pArray->epicsTS)` and
     /// `doCallbacksGenericPointer(pArray, NDArrayData, addr)`.
     async fn publish_at(&self, addr: usize, mut array: DriverArray, time_stamp: f64) {
-        array.time_stamp = time_stamp;
-        array.timestamp = self.port_time_stamp().await;
+        let mut frame = array.fill();
+        frame.set_time_stamp(time_stamp);
+        frame.set_timestamp(self.port_time_stamp().await);
         self.publish_stamped(addr, array).await;
     }
 
@@ -310,7 +311,7 @@ impl Ctx {
     /// PARAM values live.
     async fn worker_attributes(&self, array: &mut DriverArray) {
         if let Some(fresh) = self.driver_attributes().await {
-            array.attributes.copy_from(&fresh);
+            array.fill().attributes_mut().copy_from(&fresh);
         }
     }
 
@@ -341,7 +342,11 @@ impl Ctx {
             Locking::Unlocked => self.worker_attributes(array).await,
             // C ignores the getAttributes status.
             Locking::Locked => {
-                let _ = self.pool.owner().get_attributes(array).await;
+                let _ = self
+                    .pool
+                    .owner()
+                    .get_attributes(array.fill().attributes_mut())
+                    .await;
             }
         }
     }
@@ -2707,7 +2712,8 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
             );
             return None;
         };
-        let NDDataViewMut::I32(out) = diff.data.view_mut() else {
+        let mut frame = diff.fill();
+        let NDDataViewMut::I32(out) = frame.data_mut().view_mut() else {
             unreachable!("an Int32 allocation")
         };
         match (t0.data().view(), t1.data().view()) {
@@ -2730,11 +2736,11 @@ async fn emit_preview_threshold_diff(ctx: &Ctx, s: Preview, frame_number: i32) {
                 return None;
             }
         }
-        diff.unique_id = t0_frame;
-        diff.time_stamp = t0.time_stamp;
-        diff.timestamp = t0.timestamp;
-        diff.attributes.copy_from(&t0.attributes);
-        diff.attributes.add(NDAttribute::new_static(
+        frame.set_unique_id(t0_frame);
+        frame.set_time_stamp(t0.time_stamp);
+        frame.set_timestamp(t0.timestamp);
+        frame.attributes_mut().copy_from(&t0.attributes);
+        frame.attributes_mut().add(NDAttribute::new_static(
             "ThresholdBandPass",
             "Preview threshold band-pass",
             NDAttrSource::Driver,
@@ -2926,7 +2932,7 @@ fn add_range_attributes(array: &mut DriverArray, range: &str, units: &str, satur
             NDAttrValue::Int32(i32::from(saturated)),
         ),
     ] {
-        array.attributes.add(NDAttribute::new_static(
+        array.fill().attributes_mut().add(NDAttribute::new_static(
             name,
             desc,
             NDAttrSource::Driver,
@@ -2960,7 +2966,7 @@ fn add_time_attributes(array: &mut DriverArray, time_ms: &[f64]) {
             NDAttrValue::Int32(i32::try_from(time_ms.len()).unwrap_or(i32::MAX)),
         ),
     ] {
-        array.attributes.add(NDAttribute::new_static(
+        array.fill().attributes_mut().add(NDAttribute::new_static(
             name,
             desc,
             NDAttrSource::Driver,
@@ -3142,16 +3148,16 @@ async fn publish_img_sum(
     ) else {
         return;
     };
-    array
-        .fill()
+    let mut frame = array.fill();
+    frame
         .data_mut()
         .as_mut_slice::<u64>()
         .expect("allocated as NDUInt64")
         .copy_from_slice(&sum);
-    array.unique_id = unique_id;
+    frame.set_unique_id(unique_id);
     // serval_stream.cpp:1271-1275, :1301-1305: stamped before getAttributes.
-    array.time_stamp = EpicsTimestamp::now().as_f64();
-    array.timestamp = ctx.port_time_stamp().await;
+    frame.set_time_stamp(EpicsTimestamp::now().as_f64());
+    frame.set_timestamp(ctx.port_time_stamp().await);
     ctx.worker_attributes(&mut array).await;
     let saturated = Accum::Img.saturated(&ctx.shared);
     add_range_attributes(&mut array, "uint64", "counts", saturated);
@@ -3204,7 +3210,11 @@ async fn push_processed_img(ctx: &Ctx) {
             .as_u8_slice_mut()
             .copy_from_slice(data.as_u8_slice());
         wall_clock_stamp(&mut array);
-        let _ = ctx.pool.owner().get_attributes(&mut array).await;
+        let _ = ctx
+            .pool
+            .owner()
+            .get_attributes(array.fill().attributes_mut())
+            .await;
         let saturated = Accum::Img.saturated(&ctx.shared);
         add_range_attributes(&mut array, range, units, saturated);
         ctx.publish_stamped(2, array).await;
@@ -3227,7 +3237,11 @@ async fn push_processed_img(ctx: &Ctx) {
                 .as_u8_slice_mut()
                 .copy_from_slice(data.as_u8_slice());
             wall_clock_stamp(&mut array);
-            let _ = ctx.pool.owner().get_attributes(&mut array).await;
+            let _ = ctx
+                .pool
+                .owner()
+                .get_attributes(array.fill().attributes_mut())
+                .await;
             let saturated = Accum::Img.saturated(&ctx.shared);
             add_range_attributes(&mut array, range, units, saturated);
             ctx.publish_stamped(3, array).await;
@@ -3238,8 +3252,7 @@ async fn push_processed_img(ctx: &Ctx) {
 /// pushProcessedImgToPlugins reads the clock into epicsTS itself, not
 /// through updateTimeStamp (serval_stream.cpp:1490-1491, :1525-1526).
 fn wall_clock_stamp(array: &mut DriverArray) {
-    array.timestamp = EpicsTimestamp::now();
-    array.time_stamp = array.timestamp.as_f64();
+    array.fill().update_time_stamps(EpicsTimestamp::now());
 }
 
 /// Push a preview frame down the plugin chain as an NDArray. C stamps it with
@@ -3312,7 +3325,10 @@ fn image_array(
 /// ColorMode attribute (serval_stream.cpp:236-240, :291-296, :886-890,
 /// :942-947); C ignores the getAttributes status. C sets them on the frame
 /// in pArrays[addr], so the change is for `ArrayOwner::refill`.
-async fn frame_stamps(ctx: &Ctx, f: &crate::stream::ImageFrame) -> impl FnOnce(&mut NDArray) {
+async fn frame_stamps(
+    ctx: &Ctx,
+    f: &crate::stream::ImageFrame,
+) -> impl FnOnce(&mut NDArrayMut<'_>) {
     let unique_id = f.frame_number;
     // serval_stream.cpp:237-240, :886-890: the clock for timeStamp, then the
     // port's stamp for epicsTS.
@@ -3321,13 +3337,13 @@ async fn frame_stamps(ctx: &Ctx, f: &crate::stream::ImageFrame) -> impl FnOnce(&
     let fresh = ctx.driver_attributes().await;
     let threshold_id = f.threshold_id;
     move |array| {
-        array.unique_id = unique_id;
-        array.time_stamp = time_stamp;
-        array.timestamp = timestamp;
+        array.set_unique_id(unique_id);
+        array.set_time_stamp(time_stamp);
+        array.set_timestamp(timestamp);
         if let Some(fresh) = fresh {
-            array.attributes.copy_from(&fresh);
+            array.attributes_mut().copy_from(&fresh);
         }
-        array.attributes.add(NDAttribute::new_static(
+        array.attributes_mut().add(NDAttribute::new_static(
             "ThresholdID",
             "Serval jsonimage thresholdID",
             NDAttrSource::Driver,
@@ -6267,7 +6283,7 @@ mod tests {
         };
         let dims = || vec![NDDimension::new(1)];
         let mut array = ctx.pool.alloc(dims(), NDDataType::UInt32).unwrap();
-        frame_stamps(&ctx, &frame).await(&mut array);
+        frame_stamps(&ctx, &frame).await(&mut array.fill());
         assert_eq!(array.timestamp, EpicsTimestamp::from(fixed));
 
         let (tx, mut rx) = epics_rs::ad_core::plugin::channel::ndarray_channel("TPX_TS_SINK", 4);

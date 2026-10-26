@@ -1263,8 +1263,8 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
         {
             row.copy_from_slice(s);
         }
-        all.unique_id = counter;
-        all.time_stamp = time_stamp;
+        frame.set_unique_id(counter);
+        frame.set_time_stamp(time_stamp);
         ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
             .publish(all)
             .await;
@@ -1286,8 +1286,8 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
         for (v, s) in column.iter_mut().zip(&samples) {
             *v = s[item];
         }
-        single.unique_id = counter;
-        single.time_stamp = time_stamp;
+        frame.set_unique_id(counter);
+        frame.set_time_stamp(time_stamp);
         ArrayPublisher::new(ctx.outputs[item].clone())
             .publish(single)
             .await;

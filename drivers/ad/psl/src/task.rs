@@ -303,15 +303,15 @@ async fn publish_frame(
     let Ok(mut array) = ctx.pool.alloc(dims, data.data_type()) else {
         return;
     };
-    array
-        .fill()
+    let mut frame = array.fill();
+    frame
         .data_mut()
         .as_u8_slice_mut()
         .copy_from_slice(data.as_u8_slice());
-    array.unique_id = unique_id;
-    array.timestamp = ts;
-    array.time_stamp = now.as_f64();
-    array.attributes = attributes;
+    frame.set_unique_id(unique_id);
+    frame.set_timestamp(ts);
+    frame.set_time_stamp(now.as_f64());
+    *frame.attributes_mut() = attributes;
 
     // C stores DataType and the sizes per frame, and no other array param
     // (PSL.cpp:555-577).

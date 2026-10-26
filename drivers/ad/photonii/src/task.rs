@@ -418,16 +418,16 @@ async fn publish_frame(
     ) else {
         return Ok(());
     };
-    array
-        .fill()
+    let mut frame = array.fill();
+    frame
         .data_mut()
         .as_u8_slice_mut()
         .copy_from_slice(data.as_u8_slice());
-    array.unique_id = array_counter;
-    array.timestamp = ts;
+    frame.set_unique_id(array_counter);
+    frame.set_timestamp(ts);
     // C stamped every frame of an acquisition with the acquisition's start
     // time, not the frame's; keep that, it is the exposure start.
-    array.time_stamp = start_ts.as_f64();
+    frame.set_time_stamp(start_ts.as_f64());
 
     // C stores no array size, type or time-stamp param per frame; the
     // constructor's values stand (PhotonII.cpp:398-440).

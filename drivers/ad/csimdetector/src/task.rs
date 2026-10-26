@@ -69,9 +69,10 @@ fn extract_signal(pool: &DriverPool, image: &NDArray, i: usize) -> ADResult<Driv
     let mut array = pool.convert(image, &dims_out, image.data().data_type())?;
     // `NDArrayPool::convert` copies the timestamps and attributes but not
     // `uniqueId`, which C's does (NDArrayPool.cpp:658-660).
-    array.unique_id = image.unique_id;
+    let mut frame = array.fill();
+    frame.set_unique_id(image.unique_id);
     // `pArray->ndims = 1; pArray->dims[0] = pArray->dims[1];`
-    array.dims = vec![array.dims[1].clone()];
+    frame.set_dims(vec![frame.dims[1].clone()]);
     Ok(array)
 }
 
@@ -126,7 +127,11 @@ async fn sim_task(mut ctx: CSimTaskContext) {
         // driver lock (ADCSimDetector.cpp:150-151).
         let Some(image) = ctx.pool.owner().replace_array(0, || {
             let mut image = ctx.pool.alloc(dims, cfg.data_type).ok()?;
-            image.data = result.data;
+            image
+                .fill()
+                .data_mut()
+                .as_u8_slice_mut()
+                .copy_from_slice(result.data.as_u8_slice());
             Some(image)
         }) else {
             continue;
@@ -156,9 +161,9 @@ async fn sim_task(mut ctx: CSimTaskContext) {
 
         // Stamped in place in pArrays[0] (ADCSimDetector.cpp:307-313).
         let Ok(image) = ctx.pool.owner().refill(0, image, |image| {
-            image.unique_id = id;
-            image.time_stamp = time_stamp;
-            image.timestamp = timestamp;
+            image.set_unique_id(id);
+            image.set_time_stamp(time_stamp);
+            image.set_timestamp(timestamp);
         }) else {
             continue;
         };
@@ -210,7 +215,7 @@ async fn sim_task(mut ctx: CSimTaskContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDataView};
+    use epics_rs::ad_core::ndarray::{NDDataType, NDDataView};
 
     /// A `[MAX_SIGNALS, n]` array whose element `(i, j)` is `100*i + j`, so a
     /// correct extraction of signal `j` is `[j, 100+j, 200+j, ...]`.
@@ -224,8 +229,13 @@ mod tests {
         let data: Vec<f64> = (0..n)
             .flat_map(|i| (0..MAX_SIGNALS).map(move |j| (100 * i + j) as f64))
             .collect();
-        image.data = NDDataBuffer::from_vec(data);
-        image.unique_id = 42;
+        let mut frame = image.fill();
+        frame
+            .data_mut()
+            .as_mut_slice::<f64>()
+            .unwrap()
+            .copy_from_slice(&data);
+        frame.set_unique_id(42);
         image
     }
 
@@ -265,8 +275,18 @@ mod tests {
     #[test]
     fn the_extracted_signal_keeps_the_source_data_type() {
         let pool = DriverPool::standalone(0);
-        let mut image = fixture(&pool, 3);
-        image.data = NDDataBuffer::from_vec::<i16>(vec![7; MAX_SIGNALS * 3]);
+        let mut image = pool
+            .alloc(
+                vec![NDDimension::new(MAX_SIGNALS), NDDimension::new(3)],
+                NDDataType::Int16,
+            )
+            .unwrap();
+        image
+            .fill()
+            .data_mut()
+            .as_mut_slice::<i16>()
+            .unwrap()
+            .fill(7);
         let array = extract_signal(&pool, &image, 2).unwrap();
         assert_eq!(array.data().data_type(), NDDataType::Int16);
     }
