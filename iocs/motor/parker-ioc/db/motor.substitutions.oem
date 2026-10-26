@@ -1,0 +1,16 @@
+# C's iocParker motor.substitutions.oem on this IOC's one axis, P and PORT
+# from st.cmd; the values are the motor record and RESOLUTION this IOC had
+# before.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{N,  M,       DTYP,         ADDR,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,           PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "asynMotor",  0,     "",    mm,   Pos,  5,     1,     5,     0,     0,     .5,    4.92125984e-5,  5,     20,    -20,   ""}
+}
+
+file "$(PARKER_IOC)/db/OEMSupport.template"
+{
+pattern
+{R,    RESOLUTION,  ADDR}
+{m1:,  50800,       0}
+}

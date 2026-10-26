@@ -20,8 +20,12 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 # OEMCreateController(portName, OEMPortName, numAxes, movingPollPeriod, idlePollPeriod).
 OEMCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000)
 
-# One motor record per axis (OUT @asyn($(CTRL),axis)) and its OEM_RESOLUTION.
-dbLoadRecords("$(PARKER_IOC)/db/oem.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+# The axis's basic_asyn_motor.db and OEMSupport.template, as C's st.cmd.oem
+# loads them.
+dbLoadTemplate("$(PARKER_IOC)/db/motor.substitutions.oem", "P=$(P),PORT=$(CTRL)")
+
+# The octet port's asyn record, as C's st.cmd.oem loads it.
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=asyn1,PORT=$(IPPORT),ADDR=0,OMAX=256,IMAX=256")
 
 iocInit()
 
