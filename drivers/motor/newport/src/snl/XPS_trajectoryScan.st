@@ -365,7 +365,9 @@ ss xpsTrajectoryScan {
                     /* Note that epicsMotorPos is in user coordinates, motorMinPos and motorLow/HighLimit
                      * are in XPS (dial) coordinates, need to do conversion */
                     if (epicsMotorDir[j] == 0) dir=1; else dir=-1;
-                    if (((epicsMotorPos[j]*dir + epicsMotorOff[j]) + motorMinPos[j]) < motorLowLimit[j]) {
+                    /* Upstream took the dial position as pos*dir + off, the dial-to-user
+                     * formula, which is 2*OFF high when DIR is Pos. */
+                    if (((epicsMotorPos[j] - epicsMotorOff[j])*dir + motorMinPos[j]) < motorLowLimit[j]) {
                         execStatus = STATUS_FAILURE;
                         pvPut(execStatus);
                         sprintf(execMessage, "Low soft limit violation on motor %d", j);
@@ -373,7 +375,7 @@ ss xpsTrajectoryScan {
                         printMessage("Low soft limit violation on motor %d, epicsMotorPos=%f, motorMinPos=%f, motorLowLimit=%f\n", 
                                 j, epicsMotorPos[j], motorMinPos[j], motorLowLimit[j]);
                     }
-                    if (((epicsMotorPos[j]*dir + epicsMotorOff[j]) + motorMaxPos[j]) > motorHighLimit[j]) {
+                    if (((epicsMotorPos[j] - epicsMotorOff[j])*dir + motorMaxPos[j]) > motorHighLimit[j]) {
                         execStatus = STATUS_FAILURE;
                         pvPut(execStatus);
                         sprintf(execMessage, "High soft limit violation on motor %d", j);

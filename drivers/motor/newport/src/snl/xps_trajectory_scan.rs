@@ -1044,6 +1044,8 @@ mod tests {
             /// A MultipleAxesPVTExecution is running.
             running: bool,
             aborted: bool,
+            /// The running trajectory is to end as done.
+            released: bool,
         }
 
         type Shared = Arc<(Mutex<Xps>, Condvar)>;
@@ -1068,11 +1070,11 @@ mod tests {
                     "0"
                 }
                 "MultipleAxesPVTExecution" => {
-                    // XPS error -27: the trajectory was aborted.
                     x.running = true;
-                    x = cv.wait_while(x, |x| !x.aborted).unwrap();
+                    x = cv.wait_while(x, |x| !x.aborted && !x.released).unwrap();
                     x.running = false;
-                    "-27"
+                    // XPS error -27: the trajectory was aborted.
+                    if x.aborted { "-27" } else { "0" }
                 }
                 _ => "0",
             };
@@ -1236,6 +1238,56 @@ mod tests {
             .await;
             assert_eq!(decoy.0.lock().unwrap().log, Vec::<String>::new());
             seq_stop(tid);
+        }
+
+        /// ss xpsTrajectoryScan state execute: T:m1 at user 10, dial 0, is
+        /// within the XPS's -5..5 once its offset of 10 is taken off.
+        #[epics_rs::base::epics_test]
+        async fn soft_limits_are_checked_in_dial() {
+            let (port, xps) = xps();
+            let (ftp_addr, _ftp_log) = ftp::tests::server("331 password\r\n");
+            ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
+            let (db, _scan) = ioc("xpsLimits", "10").await;
+            let file = std::env::temp_dir().join(format!("xpsl{}.trj", std::process::id()));
+            let file = file.to_str().unwrap().to_string();
+            put(
+                &db,
+                "T:traj1:TrajectoryFile",
+                EpicsValue::String(file.clone().into()),
+            )
+            .await;
+            put(&db, "T:traj1:Nelements", EpicsValue::Long(2)).await;
+            let tid =
+                seq(&XPS_trajectoryScan, &macros(port), 0, &db).expect("XPS_trajectoryScan starts");
+            until(&xps, "a position poll", |x| {
+                x.log.iter().any(|c| c == "GroupPositionCurrentGet")
+            })
+            .await;
+
+            put(&db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            expect(&db, &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)]).await;
+            put(&db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
+            // The run ends once wait_execute reads the element, as the start
+            // loop ends only on 45; a failed execute never gets that far.
+            for _ in 0..500 {
+                let started = {
+                    let x = xps.0.lock().unwrap();
+                    x.running && x.log.iter().any(|c| c == "MultipleAxesPVTParametersGet")
+                };
+                if started || value(&db, "T:traj1:ExecStatus") == 2.0 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            xps.0.lock().unwrap().released = true;
+            xps.1.notify_all();
+            expect(
+                &db,
+                &[("T:traj1:Execute", 0.0), ("T:traj1:ExecStatus", 1.0)],
+            )
+            .await;
+            seq_stop(tid);
+            let _ = std::fs::remove_file(file);
         }
 
         /// ss xpsTrajectoryAbort: an Abort while the trajectory runs sends
