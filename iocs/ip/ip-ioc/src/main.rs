@@ -184,7 +184,7 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("IP", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default("IP", ip_devices::IP_DIR);
 
     let mut app = IocApplication::new();
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
@@ -196,6 +196,9 @@ async fn main() -> CaResult<()> {
         Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
     });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+    // ipSupport.dbd's registrar() lines: the Federal, Keithley and Oxford
+    // programs and the shell's `seq` command.
+    ip_devices::register_ip_dbd();
     // devXxStrParm's rows come from this crate, ahead of the rest as
     // ipSupport.dbd lists them.
     app = app.register_dynamic_device_support(

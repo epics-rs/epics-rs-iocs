@@ -6,7 +6,7 @@ use std::path::Path;
 
 /// `(record type, DTYP, INP/OUT)` of every record in `file` that names a DTYP.
 fn device_records(file: &str) -> Vec<(String, String, String)> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("db").join(file);
+    let path = Path::new(ip_devices::IP_DB_DIR).join(file);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
     let text: String = text
         .lines()
@@ -94,4 +94,21 @@ fn st_cmd_tpg261_gauges_are_1_and_2() {
         .map(|l| l.split("ADDR=").nth(1).unwrap().trim_end_matches("\")"))
         .collect();
     assert_eq!(addrs, ["1", "2"]);
+}
+
+/// `$(IP)` is `ip_devices::IP_DIR`, so every template st.cmd loads must be in
+/// the one `db/` the SNL programs' templates share (ipApp/Db).
+#[test]
+fn st_cmd_templates_are_in_the_ip_db_dir() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("st.cmd");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let files: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("dbLoadRecords(\"$(IP)/db/"))
+        .map(|l| l.split('"').next().unwrap())
+        .collect();
+    assert!(!files.is_empty());
+    for f in files {
+        assert!(Path::new(ip_devices::IP_DB_DIR).join(f).is_file(), "{f}");
+    }
 }
