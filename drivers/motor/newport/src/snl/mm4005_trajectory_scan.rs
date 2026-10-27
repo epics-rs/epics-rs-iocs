@@ -1150,6 +1150,36 @@ mod tests {
             assert_eq!(string(&p.db, "T:traj1:ExecMessage"), " ");
         }
 
+        /// ss trajectoryScan state wait_execute: a MOVE_START landing on
+        /// ExecState while the run polls, as the late echo of the program's
+        /// own put could, leaves the run polling to its end.
+        #[epics_rs::base::epics_test]
+        async fn a_stale_exec_state_leaves_the_run_polling() {
+            let p = boot("mm4005StaleState", &[]).await;
+            p.build().await;
+            expect(&p.db, &[("T:traj1:BuildStatus", 1.0)]).await;
+            p.mm.lock().unwrap().moving = u32::MAX;
+            put(&p.db, "T:traj1:Execute", EpicsValue::Enum(1)).await;
+            expect(&p.db, &[("T:traj1:ExecState", 2.0)]).await;
+            put(&p.db, "T:traj1:ExecState", EpicsValue::Enum(1)).await;
+            // The pass after the next TB tests its when with the put's
+            // monitor taken in.
+            p.sent();
+            p.until("TB").await;
+            p.sent();
+            p.until("TP").await;
+            p.mm.lock().unwrap().moving = 0;
+            expect(
+                &p.db,
+                &[
+                    ("T:traj1:Execute", 0.0),
+                    ("T:traj1:ExecState", 0.0),
+                    ("T:traj1:ExecStatus", 1.0),
+                ],
+            )
+            .await;
+        }
+
         /// ss trajectoryScan state wait_execute: an abort while an EXECUTING
         /// pass polls ends the run aborted, though that pass then finds the
         /// axes stopped.

@@ -70,7 +70,10 @@ monitor simMode;
 int     execute;     assign execute      to "{P}{R}Execute.VAL";   
 monitor execute;
 int     execState;   assign execState    to "{P}{R}ExecState.VAL";  
-monitor execState; 
+/* Not monitored: upstream monitored execState, so the late echo of the
+ * program's own pvPut could land between a later assignment and its pvPut,
+ * posting and keeping the stale state, and a run stuck on MOVE_START.
+ * The program is ExecState's only writer. */
 int     execStatus;  assign execStatus   to "{P}{R}ExecStatus.VAL";   
 string  execMessage; assign execMessage  to "{P}{R}ExecMessage.VAL";
 int     abort;       assign abort        to "{P}{R}Abort.VAL";   
@@ -242,7 +245,6 @@ monitor epicsMotorDone;
 
 evflag buildMon;        sync build      buildMon;
 evflag executeMon;      sync execute    executeMon;
-evflag execStateMon;    sync execState  execStateMon;
 evflag abortMon;        sync abort      abortMon;
 evflag readbackMon;     sync readback   readbackMon;
 evflag nelementsMon;    sync nelements  nelementsMon;

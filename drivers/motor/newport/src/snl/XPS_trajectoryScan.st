@@ -136,6 +136,10 @@ int epicsMotorDoneIndex[MAX_AXES];
  * the defininition in vxWorks. */
 unsigned long startTime;  
 
+/* Set by state execute once it has posted MOVE_START: it wakes
+ * xpsTrajectoryRun, as the echo of that put did upstream (trajectoryScan.h) */
+evflag moveStartFlag;
+
 /* Define escaped C functions at end of file */
 %% static int getMotorPositions(SS_ID ssId, struct UserVar *pVar, double *pos);
 %% static int getMotorMoving(SS_ID ssId, struct UserVar *pVar);
@@ -452,6 +456,7 @@ ss xpsTrajectoryScan {
             }
             execState = EXECUTE_STATE_MOVE_START;
             pvPut(execState);
+            efSet(moveStartFlag);
             count = 0;
             while (execState != EXECUTE_STATE_EXECUTING && 
                    count < COUNT_TIMEOUT ) {
@@ -658,7 +663,7 @@ ss xpsTrajectoryAbort {
  * scan from a separate state set. */
 ss xpsTrajectoryRun {
     state asyncExecute {
-        when (efTestAndClear(execStateMon) && (execState == EXECUTE_STATE_MOVE_START)) {
+        when (efTestAndClear(moveStartFlag) && (execState == EXECUTE_STATE_MOVE_START)) {
             /*%%pVar->xpsStatus = getGroupStatus(ssId, pVar);*/
             if (debugLevel > 0) {
                 printMessage("XPS_trajectoryScan: ss xpsTrajectoryRun: state asyncExecute:"
