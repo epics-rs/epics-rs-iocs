@@ -7,4 +7,12 @@ publish = false
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn"] }
 epics-libcom-rs = { workspace = true }
-ip-rs = { workspace = true }
+asyn-rs = { workspace = true }
+epics-seq-rs = { workspace = true }
+
+[build-dependencies]
+epics-snc-rs = { workspace = true }
+
+[dev-dependencies]
+# The Oxford_CS800 template's command records are StreamDevice's.
+stream-rs = { workspace = true }

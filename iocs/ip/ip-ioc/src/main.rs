@@ -196,7 +196,7 @@ async fn main() -> CaResult<()> {
         Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
     });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
-    // devXxStrParm's rows come from ip-rs, ahead of the rest as
+    // devXxStrParm's rows come from this crate, ahead of the rest as
     // ipSupport.dbd lists them.
     app = app.register_dynamic_device_support(
         &ip_devices::strparm::DEVICE_ROWS,
