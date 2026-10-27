@@ -162,6 +162,15 @@ ss xpsTrajectoryScan {
     /* Initialize things when first starting */
     state init {
         when() {
+            /* Clear all event flags.  Upstream cleared them at the end of
+             * this action, dropping a request made while init opened its
+             * sockets.  Here they discard only the connection's first
+             * monitors, which +c lands before this state. */
+            efClear(buildMon);
+            efClear(executeMon);
+            efClear(abortMon);
+            efClear(readbackMon);
+            efClear(nelementsMon);
             /* Get the values from the macro parameteters */ 
             strcpy(groupName, macValueGet("GROUP"));
             strcpy(xpsAddress, macValueGet("IPADDR"));
@@ -213,13 +222,6 @@ ss xpsTrajectoryScan {
                 motorCurrentIndex[j]   =  pvIndex(motorCurrent[j]);
                 epicsMotorDoneIndex[j] =  pvIndex(epicsMotorDone[j]);
             }
-
-            /* Clear all event flags */
-            efClear(buildMon);
-            efClear(executeMon);
-            efClear(abortMon);
-            efClear(readbackMon);
-            efClear(nelementsMon);
         } state monitor_inputs
     }
 

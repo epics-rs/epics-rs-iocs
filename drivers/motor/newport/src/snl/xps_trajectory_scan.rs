@@ -1348,8 +1348,8 @@ mod tests {
             put(&db, "T:traj1:Nelements", EpicsValue::Long(2)).await;
             let tid = seq(&XPS_trajectoryScan, &macros(xps_port), 0, &db)
                 .expect("XPS_trajectoryScan starts");
-            // init clears buildMon as it ends; xpsTrajectoryPosition's
-            // first poll comes a second after.
+            // A poll reaches the fake only through a socket init opens
+            // after it clears buildMon.
             until(&xps, "a position poll", |x| {
                 x.log.iter().any(|c| c == "GroupPositionCurrentGet")
             })

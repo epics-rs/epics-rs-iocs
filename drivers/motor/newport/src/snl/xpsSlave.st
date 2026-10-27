@@ -46,6 +46,12 @@ ss slave_main
   {
     when ()
     {
+      /* Upstream cleared these after the connect below, dropping an On or
+         Init put made while it waited.  Here they discard only the
+         connection's first monitors, which +c lands before this state. */
+      efClear(init_pv_mon);
+      efClear(on_pv_mon);
+
       /* get macros */
       ip = macValueGet("IP");
       master = macValueGet("M");
@@ -56,9 +62,6 @@ ss slave_main
       %%pVar->xps_socket = TCP_ConnectToServer(pVar->ip, PORT, TIMEOUT);
       
       DEBUG_PRINT(2, "init -> update", 0, 0, 0, 0);
-      
-      efClear(init_pv_mon);
-      efClear(on_pv_mon);
     
     } state update
   }

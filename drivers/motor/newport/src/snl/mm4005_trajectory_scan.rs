@@ -450,6 +450,8 @@ mod tests {
             slow_tb: bool,
             /// Whether the next `NC` write takes 300 ms; cleared as it starts.
             slow_nc: bool,
+            /// Whether `GC?` takes 300 ms to answer.
+            slow_gc: bool,
             /// Whether `AB` was written, which stops the axes.
             aborted: bool,
         }
@@ -480,6 +482,11 @@ mod tests {
                 }
                 "MS" => "1MS@".into(),
                 "NQ" => format!("NQ{}", m.traced),
+                _ if cmd.ends_with("GC?") && m.slow_gc => {
+                    drop(m);
+                    std::thread::sleep(Duration::from_millis(300));
+                    format!("{}0.25", &cmd[..cmd.len() - 1])
+                }
                 _ if cmd.ends_with("GC?") => format!("{}0.25", &cmd[..cmd.len() - 1]),
                 _ => match cmd.split_once("RC") {
                     // 1RCn: element n of RC1, RC3, RC5, the value of the others
@@ -629,9 +636,8 @@ mod tests {
         }
 
         /// trajectoryScan.db on NumAxes 1, T:m1 and T:m2 on simulated axes,
-        /// and the program on a fake MM4005 port named `port`, once init has
-        /// read M1's MDVS and posted it.
-        async fn boot(port: &str, set: &[(&str, &str)]) -> Program {
+        /// and the program started on a fake MM4005 port named `port`.
+        async fn start(port: &str, set: &[(&str, &str)], slow_gc: bool) -> Program {
             let mm = Arc::new(Mutex::new(Mm4005 {
                 moving: 0,
                 tb: "TB@ no error".into(),
@@ -643,6 +649,7 @@ mod tests {
                 slow_xc: false,
                 slow_tb: false,
                 slow_nc: false,
+                slow_gc,
                 aborted: false,
             }));
             let (shared, writes) = (mm.clone(), mm.clone());
@@ -688,16 +695,26 @@ mod tests {
                 &db,
             )
             .expect("MM4005_trajectoryScan starts");
-            let p = Program {
+            Program {
                 db,
                 mm,
                 rig,
                 log: Mutex::default(),
                 tid,
                 _scan: scan,
-            };
-            p.until("1GC?").await;
-            expect(&p.db, &[("T:traj1:M1MDVS", 0.25)]).await;
+            }
+        }
+
+        /// [`start`], once monitor_inputs has written back the MDVS init read
+        /// for each axis, up to MAX_AXES.
+        async fn boot(port: &str, set: &[(&str, &str)]) -> Program {
+            let axes = set
+                .iter()
+                .find(|&&(k, _)| k == "NAXES")
+                .map_or(1, |&(_, n)| n.parse::<usize>().unwrap())
+                .min(8);
+            let p = start(port, set, false).await;
+            p.until(&format!("{axes}GC0.250000")).await;
             p
         }
 
@@ -797,6 +814,21 @@ mod tests {
             let mut want = vec!["1DC1".to_string()];
             want.extend((2..=8).map(|j| format!("{j}DC0")));
             assert_eq!(of("DC"), want);
+        }
+
+        /// ss trajectoryScan state init: a Build put while init reads the
+        /// MM4005 builds once init is done, where upstream's clear at the end
+        /// of init dropped it and left Build busy.
+        #[epics_rs::base::epics_test]
+        async fn a_build_put_during_init_builds_after_it() {
+            let p = start("mm4005BuildInInit", &[], true).await;
+            p.until("1GC?").await;
+            put(&p.db, "T:traj1:Build", EpicsValue::Enum(1)).await;
+            expect(
+                &p.db,
+                &[("T:traj1:Build", 0.0), ("T:traj1:BuildStatus", 1.0)],
+            )
+            .await;
         }
 
         /// The element times `DT` sent since the last [`Program::sent`].

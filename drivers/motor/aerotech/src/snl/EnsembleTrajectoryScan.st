@@ -186,6 +186,16 @@ ss EnsembleTrajectoryScan {
 	/* Initialize things when first starting */
 	state init {
 		when() {
+			/* Clear all event flags.  Upstream cleared them after init had
+			 * assigned the motor channels, dropping a request made
+			 * meanwhile.  Here they discard only the connection's first
+			 * monitors, which +c lands before this state. */
+			efClear(buildMon);
+			efClear(executeMon);
+			efClear(abortMon);
+			efClear(readbackMon);
+			efClear(nelementsMon);
+			efClear(motorMDVSMon); /* we don't use this */
 			pstatus = &status;
 			if (debugLevel) printf("EnsembleTrajectoryScan:init: entry\n");
 			initStatus = STATUS_UNDEFINED;
@@ -257,14 +267,6 @@ ss EnsembleTrajectoryScan {
 			}
 			elapsedTimeIndex = pvIndex(elapsedTime);
 			abortState = ABORT_STATE_NONE;
-
-			/* Clear all event flags */
-			efClear(buildMon);
-			efClear(executeMon);
-			efClear(abortMon);
-			efClear(readbackMon);
-			efClear(nelementsMon);
-			efClear(motorMDVSMon); /* we don't use this */
 
 			/* We don't want to upload pulse positions unless they have never been loaded,
 			 * or they have changed since they were loaded.

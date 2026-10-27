@@ -124,6 +124,18 @@ ss trajectoryScan {
     /* Initialize things when first starting */
     state init {
         when() {
+            /* Clear all event flags.  Upstream cleared them at the end of
+             * this action, dropping a request made while init read the
+             * MM4005, and racing the monitor of its pvPut(motorMDVS[j]), so
+             * whether monitor_inputs wrote the MDVS back hung on timing.
+             * Here they discard only the connection's first monitors, which
+             * +c lands before this state. */
+            efClear(buildMon);
+            efClear(executeMon);
+            efClear(abortMon);
+            efClear(readbackMon);
+            efClear(nelementsMon);
+            efClear(motorMDVSMon);
             /* Force initAxes to be <= MAX_AXES */
             initAxes = numAxes;
             if (initAxes > MAX_AXES) initAxes = MAX_AXES;
@@ -159,13 +171,6 @@ ss trajectoryScan {
                 motorMDVS[j] = atof(stringIn+3);
                 pvPut(motorMDVS[j]);
             }
-            /* Clear all event flags */
-            efClear(buildMon);
-            efClear(executeMon);
-            efClear(abortMon);
-            efClear(readbackMon);
-            efClear(nelementsMon);
-            efClear(motorMDVSMon);
         } state monitor_inputs
     }
 
