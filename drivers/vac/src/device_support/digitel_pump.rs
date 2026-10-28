@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
@@ -336,6 +337,10 @@ impl DeviceSupport for DigitelPump {
             );
             return Ok(DeviceInitOutcome::dead());
         };
+        if !port.handle.has_interface(InterfaceType::Octet) {
+            println!("{} driver not supported", InterfaceType::Octet);
+            return Ok(DeviceInitOutcome::dead());
+        }
         let job = Arc::new(Job {
             name: self.name.clone(),
             cfg,
@@ -591,6 +596,54 @@ mod tests {
     use epics_rs::base::server::record::RecordInstance;
 
     use super::*;
+
+    /// A published port with no asynOctet: C `findInterface(asynOctet)` misses.
+    fn publish_without_octet(name: &str) {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        struct NoOctet(PortDriverBase);
+        impl PortDriver for NoOctet {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+        let claim = epics_rs::asyn::registry::claim_port(name).unwrap();
+        let driver = NoOctet(PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::COMMON | InterfaceMask::INT32,
+            InterfaceMask::NONE,
+        ));
+        let (runtime, _actor) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &open_owner())
+            .unwrap();
+        std::mem::forget(runtime);
+    }
+
+    /// devDigitelPump.c:244: a port without asynOctet kills the record.
+    #[test]
+    fn a_port_without_asyn_octet_leaves_the_record_dead() {
+        let port = "DPNOOCTET";
+        publish_without_octet(port);
+        let mut dev = DigitelPump::new(AsynLink {
+            port_name: port.into(),
+            addr: 0,
+            timeout: None,
+            drv_info: "0".into(),
+        });
+        dev.set_record_info("V:IP0", ScanType::Passive);
+        let mut rec = d500();
+        assert!(matches!(dev.init(&mut rec), Ok(o) if o == DeviceInitOutcome::dead()));
+        assert!(dev.live.is_none());
+    }
 
     /// A D500 pump on an IP port that never connects, its trace in a file.
     fn pump(port: &str) -> (DigitelPump, PathBuf, PortRuntimeHandle) {
