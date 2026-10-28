@@ -33,6 +33,13 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 pub const DEMO_SOURCE_DATA: &str = "DATA";
 pub const DEMO_SOURCE_SCAN_PERIOD: &str = "SCAN_PERIOD";
 
+/// What `FastSweepDriver::connect` requires of its input port: int32Array
+/// and float64 with interrupts, and drvUser (`drvFastSweep.cpp:141-211`).
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32_ARRAY
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::DRV_USER);
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT32_ARRAY.or(InterfaceMask::FLOAT64);
+
 pub struct DemoSourceDriver {
     base: PortDriverBase,
 }
@@ -97,8 +104,8 @@ pub fn connect(
             can_block: false,
             destructible: true,
         },
-        InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
-        InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64,
+        INTERFACES,
+        INTERRUPTS,
     );
     let data_reason = base.create_param(DEMO_SOURCE_DATA, ParamType::Int32Array)?;
     let period_reason = base.create_param(DEMO_SOURCE_SCAN_PERIOD, ParamType::Float64)?;
@@ -139,8 +146,8 @@ mod tests {
             claim.name(),
             1,
             PortFlags::default(),
-            InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64,
+            INTERFACES,
+            INTERRUPTS,
         );
         let data = base
             .create_param(DEMO_SOURCE_DATA, ParamType::Int32Array)
@@ -162,6 +169,31 @@ mod tests {
             }
         };
         assert_eq!(first.iface, Some(InterfaceType::Int32Array));
+        std::mem::forget(runtime);
+    }
+
+    /// The sweep driver subscribes to both of the source's interrupts, which
+    /// it skips on a port lacking either interface.
+    #[test]
+    fn the_sweep_driver_subscribes_to_the_source() {
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        use mca::fastsweep::FastSweepDriver;
+
+        let claim = epics_rs::asyn::registry::claim_port("DEMO_SRC_SWEPT").unwrap();
+        let runtime = connect(&claim, 1, Duration::from_secs(3600)).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        let (_driver, subscriptions) = FastSweepDriver::connect(
+            "DEMO_SRC_SWEEP",
+            "DEMO_SRC_SWEPT",
+            1,
+            4,
+            DEMO_SOURCE_DATA,
+            DEMO_SOURCE_SCAN_PERIOD,
+        )
+        .unwrap();
+        assert_eq!(subscriptions.connected(), (true, true));
         std::mem::forget(runtime);
     }
 
