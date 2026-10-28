@@ -49,6 +49,7 @@ use epics_rs::asyn::error::{AsynResult, OctetStep};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
 };
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -209,6 +210,9 @@ pub struct C300Params {
 }
 
 impl ControllerParams for C300Params {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+
     /// C `C300Controller::report` (C300MotorDriver.cpp:108-132).
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
