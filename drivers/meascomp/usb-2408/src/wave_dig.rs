@@ -450,8 +450,23 @@ mod tests {
             "MFDIGERR",
             MAX_SIGNALS,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM,
         );
         let params = MultiFunctionParams::create(&mut base).unwrap();
         let mut state = WaveDigState::new(4);
@@ -496,8 +511,23 @@ mod tests {
             "MFWAVEDIG",
             MAX_SIGNALS,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM,
         );
         let params = MultiFunctionParams::create(&mut base).unwrap();
         let mut state = WaveDigState::new(4);
