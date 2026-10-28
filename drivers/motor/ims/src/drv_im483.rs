@@ -15,10 +15,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
-};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -263,15 +260,6 @@ impl DrvIm483Axis {
         ctrl.ask(self.line(&prem, last));
         Ok(())
     }
-
-    /// The record's `SET_VELOCITY` and `SET_VEL_BASE`; `SET_ACCEL` sends
-    /// nothing.
-    fn speeds(min_velocity: f64, velocity: f64) -> [String; 2] {
-        [
-            format!("V{:.2};", CFloat(velocity)),
-            format!("I{:.2};", CFloat(min_velocity)),
-        ]
-    }
 }
 
 impl Model1Motor for DrvIm483Axis {
@@ -279,64 +267,47 @@ impl Model1Motor for DrvIm483Axis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for DrvIm483Axis {
+    /// `update_delay` is 0 (`targs`, drvIM483SM.cc:139, drvIM483PL.cc:142).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send(&[format!("V{:.2};", CFloat(velocity))])
+    }
+
+    fn set_vel_base(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send(&[format!("I{:.2};", CFloat(velocity))])
+    }
+
+    /// SET_ACCEL: the IM483 sends nothing.
+    fn set_accel(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        let [v, i] = Self::speeds(min_velocity, velocity);
-        self.send_move(&[v, i, format!("R{:.2}", CFloat(position))])
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.send_move(&[format!("R{:.2}", CFloat(position))])
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        let [v, i] = Self::speeds(min_velocity, velocity);
-        self.send_move(&[v, i, format!("{:+.2}", CFloat(distance))])
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.send_move(&[format!("{:+.2}", CFloat(distance))])
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        self.send_move(&[
-            format!("I{:.2};", CFloat(min_velocity)),
-            format!("M{:.2};", CFloat(velocity)),
-        ])
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send_move(&[format!("M{:.2};", CFloat(velocity))])
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
-        let [v, i] = Self::speeds(min_velocity, velocity);
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let way = if forward { 0 } else { 1 };
-        self.send_move(&[v, i, format!("F1000 {way}")])
+        self.send_move(&[format!("F1000 {way}")])
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         self.send(&["@ 0".to_string()])
     }
 
@@ -443,6 +414,8 @@ fn from(reply: &str, i: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
+    use motor_common::testing::RecordWrites;
 
     fn ident_of(lines: &[&str]) -> Option<String> {
         let mut lines = lines.iter();
@@ -531,7 +504,7 @@ mod tests {
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
     /// An IM483 line: records each message and answers the last one, `^`
@@ -639,7 +612,7 @@ mod tests {
 
         fn move_to(&mut self, position: f64) {
             self.axis
-                .move_absolute(&self.user, position, 1.0, 2.0, 0.0)
+                .record_move_absolute(&self.user, position, 1.0, 2.0, 0.0)
                 .unwrap();
         }
 
@@ -685,10 +658,10 @@ mod tests {
     fn a_nan_target_goes_out_as_c_printf_spells_it() {
         let mut pl = Rig::new("im483_nan", true);
         pl.axis
-            .move_absolute(&pl.user, f64::NAN, f64::INFINITY, 2.0, 0.0)
+            .record_move_absolute(&pl.user, f64::NAN, f64::INFINITY, 2.0, 0.0)
             .unwrap();
         pl.axis
-            .move_relative(&pl.user, f64::NAN, 1.0, 2.0, 0.0)
+            .record_move_relative(&pl.user, f64::NAN, 1.0, 2.0, 0.0)
             .unwrap();
         assert_eq!(
             pl.sent(),

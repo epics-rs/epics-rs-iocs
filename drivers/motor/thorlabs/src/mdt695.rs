@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -56,7 +56,7 @@ pub const OUTPUT_EOS: &[u8] = b"\r";
 /// Axis letters by 0-based signal (C `MDT694_axis`).
 const AXIS_LETTERS: [char; 3] = ['X', 'Y', 'Z'];
 
-/// C `MOTION_DELAY` (drvMDT695.cc:67), slept on entering RETRY.
+/// C `MOTION_DELAY` (drvMDT695.cc:67): `update_delay`, and slept on entering RETRY.
 const MOTION_DELAY: Duration = Duration::from_millis(100);
 
 /// Map a 0-based axis index to its wire letter, clamped to the last channel.
@@ -192,7 +192,7 @@ impl BuildTrans for Mdt695Build {
     }
 }
 
-/// One MDT695 piezo channel sharing a controller. Implements [`AsynMotor`].
+/// One MDT695 piezo channel sharing a controller. Implements [`Model1Motor`].
 pub struct Mdt695Axis {
     controller: Arc<Mutex<Mdt695Controller>>,
     letter: char,
@@ -261,66 +261,55 @@ impl Model1Motor for Mdt695Axis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, MotorStatus::default(), self.poll_failure())
     }
-}
 
-impl AsynMotor for Mdt695Axis {
+    /// `MOTION_DELAY` in `thread_args` (drvMDT695.cc:140).
+    fn update_delay(&self) -> Duration {
+        MOTION_DELAY
+    }
+
+    /// The speed parts build no message (devMDT695.cc).
+    fn set_velocity(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_accel(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let prem = self.strings.arm();
         // Set the channel output voltage: "<axis>V<volts>" (C "#V%.1f").
         let command = format!("{}V{:.1}", self.letter, CFloat(position * DRIVE_RESOLUTION));
         self.send_message(&prem, command.as_bytes())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        _distance: f64,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_relative(&mut self, _user: &AsynUser, _distance: f64) -> AsynResult<()> {
         // C: MOVE_REL emits only PREM (no relative move on this controller).
         let prem = self.strings.arm();
         self.send_message(&prem, b"")
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_velocity(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
         // C: JOG emits only PREM.
         let prem = self.strings.arm();
         self.send_message(&prem, b"")
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C: HOME_FOR/HOME_REV emit only PREM.
         let prem = self.strings.arm();
         self.send_message(&prem, b"")
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C: STOP_AXIS emits no message.
         Ok(())
     }
@@ -441,7 +430,7 @@ mod tests {
     }
 
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::{Model1Polled, RecordWrites};
 
     fn rig(name: &str) -> (LineRig, Mdt695Axis) {
         let (line, io) = LineRig::queued(name, |last| match last {
@@ -525,7 +514,8 @@ mod tests {
     fn a_nan_voltage_goes_out_as_c_printf_spells_it() {
         let (line, mut axis) = rig("mdt695Nan");
         let user = AsynUser::default();
-        axis.move_absolute(&user, f64::NAN, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, f64::NAN, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent().last().map(String::as_str), Some("YVnan"));
     }
 
@@ -547,7 +537,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"#L", Some(post(b"#H")))
             .unwrap();
-        axis.move_absolute(&user, 10.0, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 10.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["YL\rYV1.0"]);
         axis.polled(&user).unwrap();
         assert_eq!(line.sent(), ["YR?", "#H"]);
@@ -598,14 +589,16 @@ mod tests {
         let (line, mut axis) = rig("mdt695Rel");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"P", None).unwrap();
-        axis.move_relative(&user, 1.0, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_relative(&user, 1.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["P\r"]);
         axis.set_move_strings(&user, b"Q", None).unwrap();
-        axis.home(&user, 0.0, 0.0, 0.0, true).unwrap();
+        axis.record_home(&user, 0.0, 0.0, 0.0, true).unwrap();
         axis.set_move_strings(&user, b"R", None).unwrap();
-        axis.move_velocity(&user, 0.0, 0.0, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, 0.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["Q\r", "R\r"]);
-        axis.move_relative(&user, 1.0, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_relative(&user, 1.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert!(line.sent().is_empty());
     }
 }

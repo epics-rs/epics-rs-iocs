@@ -18,7 +18,7 @@
 //! are converted with the axis's counts-per-rev, sent as `ENCRES` ahead of
 //! every `SP`/`AC`/`HOSP` as C does, from the record's `SREV`
 //! (devMCDC2805.cc:227), which arrives with
-//! [`set_record_fields`](AsynMotor::set_record_fields) ahead of each move.
+//! [`set_record_fields`](Model1Motor::set_record_fields) ahead of each move.
 //!
 //! ## Done detection
 //!
@@ -29,14 +29,14 @@
 //! ## Deviations from C (documented)
 //!
 //! - The C poller is a background thread; here the `GST`/`POS`/`GAST`/`GV`
-//!   reads and the limit-switch hold run inside [`poll`](AsynMotor::poll).
+//!   reads and the limit-switch hold run inside [`poll`](Model1Motor::poll).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -184,7 +184,7 @@ fn accel_to_rev(acceleration: f64, counts_per_rev: f64) -> i32 {
     }
 }
 
-/// One MCDC2805 axis sharing a controller. Implements [`AsynMotor`].
+/// One MCDC2805 axis sharing a controller. Implements [`Model1Motor`].
 pub struct FaulhaberAxis {
     controller: Arc<Mutex<FaulhaberController>>,
     /// 0-based node number prefixed to this axis's commands.
@@ -255,31 +255,6 @@ impl FaulhaberAxis {
         format!("ENCRES{}", self.record.srev)
     }
 
-    /// The record's SET_VELOCITY, then SET_ACCEL unless the acceleration is
-    /// zero (motorRecord.cc:938-942), each `ENCRES` then `SP` / `AC`
-    /// (devMCDC2805.cc:248-270). Like every message of a transaction, each
-    /// goes out whatever the one before it returned: `send_mess` ignores the
-    /// write (drvMCDC2805.cc), and so does motordrvCom (motordrvCom.cc:397-484).
-    fn program_motion(&self, velocity: f64, acceleration: f64) {
-        let ctrl = self.lock();
-        let _ = ctrl.write_cmd(self.node, &self.encres());
-        let _ = ctrl.write_cmd(
-            self.node,
-            &format!("SP {}", vel_to_rpm(velocity, self.counts_per_rev())),
-        );
-        if acceleration > 0.0 {
-            self.set_accel(&ctrl, acceleration);
-        }
-    }
-
-    fn set_accel(&self, ctrl: &FaulhaberController, acceleration: f64) {
-        let _ = ctrl.write_cmd(self.node, &self.encres());
-        let _ = ctrl.write_cmd(
-            self.node,
-            &format!("AC {}", accel_to_rev(acceleration, self.counts_per_rev())),
-        );
-    }
-
     /// PREM and a blank lead a move's first message, and its POST waits for
     /// the move to end. C HOME/JOG strcpy their first split message over
     /// PREM and replace the motion node holding POST; that defect is not
@@ -299,52 +274,61 @@ impl Model1Motor for FaulhaberAxis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for FaulhaberAxis {
+    /// `update_delay` is 0 (`targs`, drvMCDC2805.cc:125).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY: `ENCRES` then `SP` (devMCDC2805.cc:248-270). Like every
+    /// message of a transaction each goes out whatever the one before it
+    /// returned: `send_mess` ignores the write (drvMCDC2805.cc), and so does
+    /// motordrvCom (motordrvCom.cc:397-484).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let ctrl = self.lock();
+        let _ = ctrl.write_cmd(self.node, &self.encres());
+        let _ = ctrl.write_cmd(
+            self.node,
+            &format!("SP {}", vel_to_rpm(velocity, self.counts_per_rev())),
+        );
+        Ok(())
+    }
+
+    /// SET_VEL_BASE: the MCDC2805 does not use base velocity.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// SET_ACCEL: `ENCRES` then `AC`.
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        let ctrl = self.lock();
+        let _ = ctrl.write_cmd(self.node, &self.encres());
+        let _ = ctrl.write_cmd(
+            self.node,
+            &format!("AC {}", accel_to_rev(acceleration, self.counts_per_rev())),
+        );
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.program_motion(velocity, acceleration);
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let _ = self.lead_move(&format!("LA {}", nint(position)));
         self.lock().write_cmd(self.node, "M")
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.program_motion(velocity, acceleration);
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         let _ = self.lead_move(&format!("LR {}", nint(distance)));
         self.lock().write_cmd(self.node, "M")
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        // The record's unguarded SET_ACCEL (motorRecord.cc:2141), then C JOG:
-        // ENCRES, the speed, and velocity mode at the signed rate. C's SP is
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        // C JOG: ENCRES, the speed, and velocity mode at the signed rate. C's SP is
         // signed too; a maximum speed is not, so that is not copied.
         // C never sends that SP: its node keeps type UNDEFINED, which
         // motor_send (motordrvCom.cc:563-576) refuses; that defect is not copied.
-        self.set_accel(&self.lock(), acceleration);
         let rpm = vel_to_rpm(velocity, self.counts_per_rev());
         let _ = self.lead_move(&self.encres());
         let ctrl = self.lock();
@@ -352,20 +336,11 @@ impl AsynMotor for FaulhaberAxis {
         ctrl.write_cmd(self.node, &format!("V {rpm}"))
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
-        // The record's SET_VELOCITY/SET_ACCEL (motorRecord.cc:872-875), then C
-        // HOME_*: ENCRES, the homing speed signed by direction, the homing
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
+        // C HOME_*: ENCRES, the homing speed signed by direction, the homing
         // sequence, and GO's `M`.
         // C never sends HOSP: its node keeps type UNDEFINED, which motor_send
         // (motordrvCom.cc:563-576) refuses; that defect is not copied.
-        self.program_motion(velocity, acceleration);
         // HOSP runs at VELO, not HVEL (devMCDC2805.cc:224); C divides VELO's
         // EGU/s by SREV without MRES, a unit mix not copied.
         let mut rpm = vel_to_rpm(self.record.velocity, self.counts_per_rev());
@@ -384,7 +359,7 @@ impl AsynMotor for FaulhaberAxis {
         Ok(())
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C STOP_AXIS: velocity 0.
         let ctrl = self.lock();
         ctrl.write_cmd(self.node, "V 0")
@@ -522,9 +497,10 @@ impl AsynMotor for FaulhaberAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::RecordWrites;
 
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A record's fields with SREV 1000.
@@ -611,12 +587,18 @@ mod tests {
     fn prem_leads_the_target_message() {
         let mut r = Rig::new("mcdc_prem");
         r.axis.set_move_strings(&r.user, b"EN", None).unwrap();
-        r.axis.move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        r.axis
+            .record_move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(r.line.sent(), ["1ENCRES1000", "1SP 0", "1EN LA 100", "1M"]);
-        r.axis.move_relative(&r.user, -5.0, 0.0, 0.0, 0.0).unwrap();
+        r.axis
+            .record_move_relative(&r.user, -5.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(r.line.sent(), ["1ENCRES1000", "1SP 0", "1LR -5", "1M"]);
         r.axis.set_move_strings(&r.user, b"EN", None).unwrap();
-        r.axis.move_relative(&r.user, -5.0, 0.0, 0.0, 0.0).unwrap();
+        r.axis
+            .record_move_relative(&r.user, -5.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(r.line.sent(), ["1ENCRES1000", "1SP 0", "1EN LR -5", "1M"]);
     }
 
@@ -630,7 +612,9 @@ mod tests {
             .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
             .unwrap();
         r.axis.set_record_fields(&r.user, &fields(2000.0)).unwrap();
-        r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
+        r.axis
+            .record_home(&r.user, 0.0, 1000.0, 0.0, false)
+            .unwrap();
         assert_eq!(
             r.line.sent(),
             [
@@ -646,7 +630,7 @@ mod tests {
         r.axis
             .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
             .unwrap();
-        r.axis.move_velocity(&r.user, 0.0, -1000.0, 0.0).unwrap();
+        r.axis.record_jog(&r.user, 0.0, -1000.0, 0.0).unwrap();
         assert_eq!(
             r.line.sent(),
             ["1ENCRES1000", "1AC 0", "1EN ENCRES1000", "1SP 60", "1V -60"]
@@ -662,7 +646,9 @@ mod tests {
         r.axis
             .set_move_strings(&r.user, b"", Some(post(b"DI")))
             .unwrap();
-        r.axis.move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        r.axis
+            .record_move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0)
+            .unwrap();
         r.line.sent();
         r.moving.store(true, Ordering::SeqCst);
         assert!(r.poll_extra().is_empty());
@@ -680,7 +666,7 @@ mod tests {
             .set_move_strings(&r.user, b"", Some(post(b"DI")))
             .unwrap();
         r.axis
-            .move_absolute(&r.user, -100.0, 0.0, 0.0, 0.0)
+            .record_move_absolute(&r.user, -100.0, 0.0, 0.0, 0.0)
             .unwrap();
         r.line.sent();
         r.moving.store(true, Ordering::SeqCst);
@@ -697,9 +683,13 @@ mod tests {
             ["1ENCRES1000", "1GOHOSEQ", "1V -60"].contains(&cmd)
         });
         r.axis.set_record_fields(&r.user, &fields(2000.0)).unwrap();
-        r.axis.move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        r.axis
+            .record_move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(r.line.sent(), ["1ENCRES1000", "1SP 0", "1LA 100", "1M"]);
-        r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
+        r.axis
+            .record_home(&r.user, 0.0, 1000.0, 0.0, false)
+            .unwrap();
         assert_eq!(
             r.line.sent(),
             [
@@ -711,7 +701,7 @@ mod tests {
                 "1M"
             ]
         );
-        assert!(r.axis.move_velocity(&r.user, 0.0, -1000.0, 0.0).is_err());
+        assert!(r.axis.record_jog(&r.user, 0.0, -1000.0, 0.0).is_err());
         assert_eq!(
             r.line.sent(),
             ["1ENCRES1000", "1AC 0", "1ENCRES1000", "1SP 60", "1V -60"]
@@ -824,7 +814,7 @@ mod tests {
     fn a_move_sends_the_records_transactions() {
         let mut r = Rig::new("mcdc_move");
         r.axis
-            .move_absolute(&r.user, 100.0, 0.0, 2000.0, 3000.0)
+            .record_move_absolute(&r.user, 100.0, 0.0, 2000.0, 3000.0)
             .unwrap();
         assert_eq!(
             r.line.sent(),

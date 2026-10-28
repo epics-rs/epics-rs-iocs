@@ -30,7 +30,7 @@
 //! these three into `eventflgs`, and
 //! `RA_DONE = (eventflgs || cntrl->stop_status)`. There is no hardware
 //! done/limit feedback: the E-662 reports "done" via `OpComplete` (or a
-//! device/execution error), or when [`stop`](AsynMotor::stop) has requested a
+//! device/execution error), or when [`stop`](Model1Motor::stop) has requested a
 //! poll-side stop. `stop_status` is consumed (cleared) only on a successful
 //! `*ESR?`.
 //!
@@ -74,12 +74,11 @@
 //!   (`exchange`), a superset of C's error-path flush.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
-};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -226,7 +225,7 @@ struct PolledStatus {
     done: bool,
 }
 
-/// The single axis of an E-662 controller. Implements [`AsynMotor`].
+/// The single axis of an E-662 controller. Implements [`Model1Motor`].
 pub struct PIC662Axis {
     controller: Arc<Mutex<PIC662Controller>>,
     /// What the last failed poll raises: nothing on C `set_status`'s
@@ -316,60 +315,50 @@ impl Model1Motor for PIC662Axis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for PIC662Axis {
+    /// `update_delay` is 0 (`targs`, drvPIC662.cc:130).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY, SET_ACCEL and SET_VEL_BASE send nothing: a DC motor
+    /// (devPIC662.cc).
+    fn set_velocity(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_accel(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let um = position * DRIVE_RESOLUTION;
         self.no_motion_count = 0;
         self.write_move(&format!("DEV:CONT REM\nPOS {:.3}", CFloat(um)))
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         let um = distance * DRIVE_RESOLUTION;
         self.no_motion_count = 0;
         self.write_move(&format!("DEV:CONT REM\nPOS:REL {:.3}", CFloat(um)))
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_velocity(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
         // C-662 JOG: send = false, so only PREM goes out; POST follows the
         // next done poll (must override the trait default, which would jog
         // to ±1e9).
         self.write_move("")
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C-662 HOME_FOR/HOME_REV: send = false, so only PREM goes out;
         // POST follows the next done poll. Still a MOTION node, which
         // restarts the count.
@@ -377,7 +366,7 @@ impl AsynMotor for PIC662Axis {
         self.write_move("")
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // No HALT command; force the next poll to report done (C sets
         // cntrl->stop_status = true).
         self.lock().stop_status = true;
@@ -452,7 +441,8 @@ impl PIC662Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
@@ -468,8 +458,8 @@ mod tests {
             f(&mut axis);
             sent.extend(line.sent().into_iter().map(|w| w + "|"));
         };
-        run(&mut |a| drop(a.move_absolute(&user, nan, 0.0, 1.0, 1.0)));
-        run(&mut |a| drop(a.move_relative(&user, neg, 0.0, 1.0, 1.0)));
+        run(&mut |a| drop(a.record_move_absolute(&user, nan, 0.0, 1.0, 1.0)));
+        run(&mut |a| drop(a.record_move_relative(&user, neg, 0.0, 1.0, 1.0)));
         assert!(!sent.contains("NaN"), "{sent}");
         for want in ["POS nan", "POS:REL -nan"] {
             assert!(sent.contains(want), "{want}: {sent}");
@@ -563,15 +553,17 @@ mod tests {
         let (line, mut axis, _) = strings_rig("pic662Prem");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"VOLT 1", None).unwrap();
-        axis.move_absolute(&user, 5012.0, 0.0, 1.0, 1.0).unwrap();
+        axis.record_move_absolute(&user, 5012.0, 0.0, 1.0, 1.0)
+            .unwrap();
         assert_eq!(line.sent(), ["VOLT 1;DEV:CONT REM\nPOS 5.012"]);
-        axis.move_relative(&user, -1500.0, 0.0, 1.0, 1.0).unwrap();
+        axis.record_move_relative(&user, -1500.0, 0.0, 1.0, 1.0)
+            .unwrap();
         assert_eq!(line.sent(), ["DEV:CONT REM\nPOS:REL -1.500"]);
         axis.set_move_strings(&user, b"VOLT 1", None).unwrap();
-        axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
+        axis.record_home(&user, 0.0, 1.0, 1.0, true).unwrap();
         assert_eq!(line.sent(), ["VOLT 1;"]);
         axis.set_move_strings(&user, b"", None).unwrap();
-        axis.move_velocity(&user, 0.0, 1.0, 1.0).unwrap();
+        axis.record_jog(&user, 0.0, 1.0, 1.0).unwrap();
         assert!(line.sent().is_empty());
     }
 
@@ -583,7 +575,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"VOLT 0")))
             .unwrap();
-        axis.move_absolute(&user, 5012.0, 0.0, 1.0, 1.0).unwrap();
+        axis.record_move_absolute(&user, 5012.0, 0.0, 1.0, 1.0)
+            .unwrap();
         line.sent();
         esr.store(0, Ordering::SeqCst);
         assert!(poll_extra(&line, &mut axis).is_empty());
@@ -606,7 +599,8 @@ mod tests {
         }
         let mut cdir = true;
         for _ in 0..2 {
-            axis.move_absolute(&user, 0.0, 0.0, 1.0, 1.0).unwrap();
+            axis.record_move_absolute(&user, 0.0, 0.0, 1.0, 1.0)
+                .unwrap();
             let done: Vec<bool> = (0..4)
                 .map(|_| axis.polled_in_motion(&user, &mut cdir).unwrap().done)
                 .collect();

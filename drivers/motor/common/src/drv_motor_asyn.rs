@@ -564,7 +564,7 @@ impl PortDriver for DrvMotorAsyn {
             // back unchanged parameters too; the poller's poll is that one.
             UPDATE_STATUS => {
                 lock(&axis.motor).force_callback(user);
-                let _ = axis.poller.try_send(PollCommand::ForcePoll);
+                let _ = axis.poller.try_send(PollCommand::ForcePoll(None));
                 Ok(())
             }
             _ => axis.set_integer(user, command, value),

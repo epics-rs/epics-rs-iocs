@@ -23,7 +23,7 @@
 //! C polls per controller, not per axis: one `MS;` returns every axis's
 //! status byte (`1MSx,2MSy,...`) and one `TP;` every position
 //! (`1TP5.012,2TP1.123,...`), then each axis in turn asks `TE;`. The
-//! per-axis [`AsynMotor::poll`] calls share one cached pass with a TTL of
+//! per-axis [`Model1Motor::poll`] calls share one cached pass with a TTL of
 //! half the moving poll period, like the HXP driver.
 //!
 //! `MM4000Config` (model 1) instead runs drvMM4000.cc's cycle: `start_status`
@@ -604,7 +604,7 @@ impl Mm4000AxisReport {
     }
 }
 
-/// One MM4000 axis sharing a controller. Implements [`AsynMotor`].
+/// One MM4000 axis sharing a controller. Implements [`Model1Motor`].
 pub struct Mm4000Axis {
     controller: Arc<Mutex<Mm4000Controller>>,
     /// C `pAxis->card`.
@@ -634,15 +634,15 @@ pub struct Mm4000Axis {
     encoder_present: bool,
     /// The status drvMM4000.cc's `set_status` starts from and RETRY keeps.
     last: MotorStatus,
-    /// The axis follows devMM4000.cc (`MM4000Config`), whose commands are
-    /// the record transaction's, not drvMM4000Asyn.c's.
-    model1: bool,
     /// devMM4000.cc jogs to the record's DHLM/DLLM (controller units): the
     /// last limit the record wrote, the controller travel limit until then.
     jog_high: f64,
     jog_low: f64,
     /// The model-1 record's PREM and POST.
     strings: MoveStrings,
+    /// The model-1 record's SET_* parts of the transaction under way, which
+    /// the move's own command follows in one message.
+    parts: String,
     /// What the model-2 poll last read from `MS;`, for [`Mm4000AxisReport`].
     status: Arc<AtomicI32>,
     /// drvMM4000Asyn.c `pAxis->params`.
@@ -674,7 +674,7 @@ impl Mm4000Axis {
         axis: usize,
         poll_failure: PollFailure,
     ) -> Self {
-        let (model1, model, log, step_size, home_preset, low_limit, high_limit, encoder_present) = {
+        let (model, log, step_size, home_preset, low_limit, high_limit, encoder_present) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // C `&inputBuff[3]`: skip the echoed `nCC` prefix.
             let query = |cc: &str| {
@@ -687,7 +687,6 @@ impl Mm4000Axis {
             let low_limit = atof(&query("TL"));
             let high_limit = atof(&query("TR"));
             (
-                ctrl.is_model1(),
                 ctrl.model(),
                 ctrl.logs[axis - 1].clone(),
                 step_size,
@@ -711,7 +710,6 @@ impl Mm4000Axis {
             poll_failure,
             retry_failed: false,
             encoder_present,
-            model1,
             jog_high: high_limit,
             jog_low: low_limit,
             // drvMM4000.cc motor_init clears the status and sets
@@ -723,6 +721,7 @@ impl Mm4000Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            parts: String::new(),
             status: Arc::default(),
             params: {
                 // motorAxisInit's GAIN_SUPPORT (drvMM4000Asyn.c:242).
@@ -807,36 +806,21 @@ impl Mm4000Axis {
         Ok(())
     }
 
-    /// devMM4000.cc:196-206: a model-1 move's PREM and `;`, ahead of its
-    /// own command; its POST waits for the move to end.
-    fn model1_prem(&mut self) -> String {
+    /// devMM4000.cc:196-206: a model-1 move's SET_* parts of the record's
+    /// transaction, then its PREM and `;`, ahead of its own command; its
+    /// POST waits for the move to end.
+    fn model1_lead(&mut self) -> String {
+        let mut lead = std::mem::take(&mut self.parts);
         let prem = self.strings.arm();
-        match prem.is_empty() {
-            true => String::new(),
-            false => format!("{};", String::from_utf8_lossy(&prem)),
+        if !prem.is_empty() {
+            lead += &format!("{};", String::from_utf8_lossy(&prem));
         }
-    }
-
-    /// The record's SET_ACCEL part of a model-1 move or home, which it
-    /// leaves out for a zero rate (motorRecord.cc:874, 940).
-    fn model1_accel(&self, acceleration: f64) -> String {
-        let (a, d) = (self.axis, self.digits);
-        if acceleration > 0.0 {
-            format!(
-                "{a}AC{acceleration:.d$};",
-                acceleration = CFloat(acceleration)
-            )
-        } else {
-            String::new()
-        }
+        lead
     }
 
     /// drvMM4000Asyn.c:466: `motorAxisMove`'s FLOW line, 0-based axis, which
     /// a jog prints too (:532-535).
     fn print_move(&self, position: f64, min_velocity: f64, velocity: f64, acceleration: f64) {
-        if self.model1 {
-            return;
-        }
         self.log.print(
             TraceMask::FLOW,
             format_args!(
@@ -851,16 +835,13 @@ impl Mm4000Axis {
         );
     }
 
-    /// The drvMM4000Asyn.c refusal `PRINT`s, which model 1 does not have.
+    /// The drvMM4000Asyn.c refusal `PRINT`s.
     fn print_error(&self, args: std::fmt::Arguments<'_>) {
-        if !self.model1 {
-            self.log.print(TraceMask::ERROR, args);
-        }
+        self.log.print(TraceMask::ERROR, args);
     }
 
     /// C `motorAxisMove` transaction: `AC;VA;PA|PR;` (trailing `;` as C
-    /// sends it), steps scaled to wire units at this axis's precision. On
-    /// model 1 it is the record's SET_VELOCITY, SET_ACCEL, MOVE: `VA;AC;PA;`.
+    /// sends it), steps scaled to wire units at this axis's precision.
     fn move_command(
         &mut self,
         cmd: &str,
@@ -870,15 +851,6 @@ impl Mm4000Axis {
     ) -> AsynResult<String> {
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let (acceleration, velocity, value) = (acceleration * step, velocity * step, value * step);
-        if self.model1 {
-            return Ok(format!(
-                "{a}VA{velocity:.d$};{}{}{a}{cmd}{value:.d$};",
-                self.model1_accel(acceleration),
-                self.model1_prem(),
-                velocity = CFloat(velocity),
-                value = CFloat(value)
-            ));
-        }
         Ok(format!(
             "{a}AC{acceleration:.d$};{a}VA{velocity:.d$};{a}{cmd}{value:.d$};",
             acceleration = CFloat(acceleration),
@@ -891,16 +863,197 @@ impl Mm4000Axis {
 impl Model1Motor for Mm4000Axis {
     fn take_init_status(&mut self) -> MotorStatus {
         let read = self.init_status.take().expect("taken once");
-        init_read(read, self.last.clone(), self.poll_failure())
+        init_read(read, self.last.clone(), Model1Motor::poll_failure(self))
     }
-}
 
-impl AsynMotor for Mm4000Axis {
+    /// RETRY's failed poll raises nothing.
     fn poll_failure(&self) -> PollFailure {
         match self.retry_failed {
             true => PollFailure::NONE,
             false => self.poll_failure,
         }
+    }
+
+    /// `update_delay` is 0 (`targs`, drvMM4000.cc:193).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY joins the transaction's message, in controller units.
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let (a, d, step) = (self.axis, self.digits, self.step_size()?);
+        self.parts += &format!("{a}VA{:.d$};", CFloat(velocity * step));
+        Ok(())
+    }
+
+    /// SET_VEL_BASE: the MM4000 sends nothing.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        let (a, d, step) = (self.axis, self.digits, self.step_size()?);
+        self.parts += &format!("{a}AC{:.d$};", CFloat(acceleration * step));
+        Ok(())
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let (a, d, step) = (self.axis, self.digits, self.step_size()?);
+        let lead = self.model1_lead();
+        self.start_motion(&format!("{lead}{a}PA{:.d$};", CFloat(position * step)))
+    }
+
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        let (a, d, step) = (self.axis, self.digits, self.step_size()?);
+        let lead = self.model1_lead();
+        self.start_motion(&format!("{lead}{a}PR{:.d$};", CFloat(distance * step)))
+    }
+
+    /// devMM4000.cc JOG after the record's SET_ACCEL: `VA;PA` to the
+    /// record's DHLM/DLLM.
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let (a, d, step) = (self.axis, self.digits, self.step_size()?);
+        let speed = velocity.abs() * step;
+        let target = if velocity > 0.0 {
+            self.jog_high
+        } else {
+            self.jog_low
+        };
+        let lead = self.model1_lead();
+        self.start_motion(&format!(
+            "{lead}{a}VA{:.d$};{a}PA{:.d$};",
+            CFloat(speed),
+            CFloat(target)
+        ))
+    }
+
+    /// devMM4000.cc HOME after the record's SET_VELOCITY, SET_ACCEL.
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
+        let a = self.axis;
+        let lead = self.model1_lead();
+        self.start_motion(&format!("{lead}{a}OR;"))
+    }
+
+    /// devMM4000.cc STOP_AXIS is `ST;` alone.
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
+        let a = self.axis;
+        self.lock().write(&format!("{a}ST;"))
+    }
+
+    /// devMM4000.cc LOAD_POS sends `SH;DH;SH` to an MM4000 only.
+    fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        if self.model != Mm4000Model::Mm4000 {
+            return Ok(());
+        }
+        let (a, d, step) = (self.axis, self.digits, self.step_size()?);
+        let position = position * step;
+        let mut ctrl = self.lock();
+        ctrl.write(&format!(
+            "{a}SH{position:.d$};{a}DH;{a}SH{:.d$}",
+            CFloat(self.home_preset),
+            position = CFloat(position)
+        ))
+    }
+
+    /// devMM4000.cc ENABLE/DISABL_TORQUE: the MM4000 switches every motor,
+    /// the other models one axis.
+    fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
+        let (a, cc) = (self.axis, if enable { "MO" } else { "MF" });
+        let cmd = match self.model {
+            Mm4000Model::Mm4000 => format!("{cc};"),
+            _ => format!("{a}{cc};"),
+        };
+        self.lock().write(&cmd)
+    }
+
+    /// devMM4000.cc SET_[PID]GAIN: the record's gain, unscaled.
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
+        let a = self.axis;
+        let cc = match kind {
+            PidGainKind::Proportional => "KP",
+            PidGainKind::Integral => "KI",
+            PidGainKind::Derivative => "KD",
+        };
+        self.lock()
+            .write(&format!("{a}{cc}{gain:.6};{a}UF;", gain = CFloat(gain)))
+    }
+
+    /// devMM4000.cc SET_HIGH_LIMIT sends nothing; past the controller limit
+    /// it clamps DHLM to it and refuses.
+    fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let (a, step) = (self.axis, self.step_size()?);
+        let position = position * step;
+        if position > self.high_limit {
+            self.jog_high = self.high_limit;
+            return Err(mm_err(format!(
+                "MM4000 axis {a}: high limit {} beyond the controller's {}",
+                CFloat(position).g(),
+                CFloat(self.high_limit).g()
+            )));
+        }
+        self.jog_high = position;
+        Ok(())
+    }
+
+    fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let (a, step) = (self.axis, self.step_size()?);
+        let position = position * step;
+        if position < self.low_limit {
+            self.jog_low = self.low_limit;
+            return Err(mm_err(format!(
+                "MM4000 axis {a}: low limit {} beyond the controller's {}",
+                CFloat(position).g(),
+                CFloat(self.low_limit).g()
+            )));
+        }
+        self.jog_low = position;
+        Ok(())
+    }
+
+    /// devMM4000.cc:188-192: INIT and a CR.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let init = format!("{}\r", String::from_utf8_lossy(init));
+        self.lock().write(&init)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        self.retry_failed = false;
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let poll = ctrl.model1_poll().ok_or_else(|| {
+            mm_err(format!(
+                "MM4000 axis {}: not a model-1 controller",
+                self.axis
+            ))
+        })?;
+        let s = self.model1_status(&ctrl, &poll)?;
+        // drvMM4000.cc:495-501: POST once the move is done or stopped by
+        // the limit in its direction, past an answered MS; and TE;.
+        let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+        if !s.problem
+            && (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.write(&String::from_utf8_lossy(&post));
+        }
+        *status = s;
+        Ok(())
+    }
+}
+
+impl AsynMotor for Mm4000Axis {
+    fn poll_failure(&self) -> PollFailure {
+        self.poll_failure
     }
 
     fn move_absolute(
@@ -936,24 +1089,6 @@ impl AsynMotor for Mm4000Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        if self.model1 {
-            // devMM4000.cc JOG after the record's SET_ACCEL: `AC;VA;PA` to
-            // the record's DHLM/DLLM.
-            let (a, d, step) = (self.axis, self.digits, self.step_size()?);
-            let (speed, acceleration) = (velocity.abs() * step, acceleration * step);
-            let target = if velocity > 0.0 {
-                self.jog_high
-            } else {
-                self.jog_low
-            };
-            let prem = self.model1_prem();
-            return self.start_motion(&format!(
-                "{a}AC{acceleration:.d$};{prem}{a}VA{speed:.d$};{a}PA{target:.d$};",
-                acceleration = CFloat(acceleration),
-                speed = CFloat(speed),
-                target = CFloat(target)
-            ));
-        }
         // C `motorAxisVelocityMove`: no jog command — move absolute to the
         // controller travel limit captured at init, in the jog direction.
         let target = if velocity > 0.0 {
@@ -976,30 +1111,19 @@ impl AsynMotor for Mm4000Axis {
         acceleration: f64,
         _forward: bool,
     ) -> AsynResult<()> {
-        if !self.model1 {
-            self.log.print(
-                TraceMask::FLOW,
-                format_args!(
-                    "motorAxisHome: set card {}, axis {} to home\n",
-                    self.card,
-                    self.axis - 1
-                ),
-            );
-        }
+        self.log.print(
+            TraceMask::FLOW,
+            format_args!(
+                "motorAxisHome: set card {}, axis {} to home\n",
+                self.card,
+                self.axis - 1
+            ),
+        );
         // C `motorAxisHome` — direction is not parameterized; the stray
         // space after the first `;` is C's format string, kept for wire
         // parity.
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let (acceleration, velocity) = (acceleration * step, velocity * step);
-        if self.model1 {
-            // devMM4000.cc HOME after the record's SET_VELOCITY, SET_ACCEL.
-            let accel = self.model1_accel(acceleration);
-            let prem = self.model1_prem();
-            return self.start_motion(&format!(
-                "{a}VA{velocity:.d$};{accel}{prem}{a}OR;",
-                velocity = CFloat(velocity)
-            ));
-        }
         self.start_motion(&format!(
             "{a}AC{acceleration:.d$}; {a}VA{velocity:.d$};{a}OR;",
             acceleration = CFloat(acceleration),
@@ -1009,11 +1133,7 @@ impl AsynMotor for Mm4000Axis {
 
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
         let a = self.axis;
-        // devMM4000.cc STOP_AXIS is `ST;` alone; only drvMM4000Asyn.c
-        // motorAxisStop sets the deceleration first.
-        if self.model1 {
-            return self.lock().write(&format!("{a}ST;"));
-        }
+        // drvMM4000Asyn.c motorAxisStop sets the deceleration first.
         self.log.print(
             TraceMask::FLOW,
             format_args!(
@@ -1034,11 +1154,7 @@ impl AsynMotor for Mm4000Axis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         // C `motorAxisPosition`: set home to the value, define home, then
-        // restore the home preset (`SH;DH;SH`). devMM4000.cc LOAD_POS sends
-        // it only to an MM4000 and nothing to the other models.
-        if self.model1 && self.model != Mm4000Model::Mm4000 {
-            return Ok(());
-        }
+        // restore the home preset (`SH;DH;SH`).
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let position = position * step;
         let mut ctrl = self.lock();
@@ -1050,16 +1166,6 @@ impl AsynMotor for Mm4000Axis {
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
-        if self.model1 {
-            // devMM4000.cc ENABLE/DISABL_TORQUE: the MM4000 switches every
-            // motor, the other models one axis.
-            let (a, cc) = (self.axis, if enable { "MO" } else { "MF" });
-            let cmd = match self.model {
-                Mm4000Model::Mm4000 => format!("{cc};"),
-                _ => format!("{a}{cc};"),
-            };
-            return self.lock().write(&cmd);
-        }
         // C `motorAxisClosedLoop`: the MM4000 can only switch ALL motors
         // (MO/MF), so it is a no-op there; the MM4005 addresses one axis.
         if self.model == Mm4000Model::Mm4000 {
@@ -1090,20 +1196,6 @@ impl AsynMotor for Mm4000Axis {
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let position = position * step;
-        if self.model1 {
-            // devMM4000.cc SET_HIGH_LIMIT sends nothing; past the controller
-            // limit it clamps DHLM to it and refuses.
-            if position > self.high_limit {
-                self.jog_high = self.high_limit;
-                return Err(mm_err(format!(
-                    "MM4000 axis {a}: high limit {} beyond the controller's {}",
-                    CFloat(position).g(),
-                    CFloat(self.high_limit).g()
-                )));
-            }
-            self.jog_high = position;
-            return Ok(());
-        }
         let mut ctrl = self.lock();
         ctrl.write(&format!("{a}SR{position:.d$}", position = CFloat(position)))
     }
@@ -1111,35 +1203,11 @@ impl AsynMotor for Mm4000Axis {
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let (a, d, step) = (self.axis, self.digits, self.step_size()?);
         let position = position * step;
-        if self.model1 {
-            if position < self.low_limit {
-                self.jog_low = self.low_limit;
-                return Err(mm_err(format!(
-                    "MM4000 axis {a}: low limit {} beyond the controller's {}",
-                    CFloat(position).g(),
-                    CFloat(self.low_limit).g()
-                )));
-            }
-            self.jog_low = position;
-            return Ok(());
-        }
         let mut ctrl = self.lock();
         ctrl.write(&format!("{a}SL{position:.d$}", position = CFloat(position)))
     }
 
-    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
-        if self.model1 {
-            // devMM4000.cc SET_[PID]GAIN: the record's gain, unscaled.
-            let a = self.axis;
-            let cc = match kind {
-                PidGainKind::Proportional => "KP",
-                PidGainKind::Integral => "KI",
-                PidGainKind::Derivative => "KD",
-            };
-            return self
-                .lock()
-                .write(&format!("{a}{cc}{gain:.6};{a}UF;", gain = CFloat(gain)));
-        }
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, _gain: f64) -> AsynResult<()> {
         let what = match kind {
             PidGainKind::Proportional => "proportional",
             PidGainKind::Integral => "integral",
@@ -1156,36 +1224,12 @@ impl AsynMotor for Mm4000Axis {
     /// drvMM4000Asyn.c:344-348: model 2 refuses the ratio devMotorAsyn
     /// writes at init.
     fn set_encoder_ratio(&mut self, _user: &AsynUser, _ratio: f64) -> AsynResult<()> {
-        if self.model1 {
-            return Ok(());
-        }
         self.print_error(format_args!(
             "motorAxisSetDouble: MM4000 does not support setting encoder ratio\n"
         ));
         Err(mm_err(
             "MM4000 does not support setting encoder ratio".to_owned(),
         ))
-    }
-
-    /// devMM4000.cc:188-192: a model-1 INIT and a CR.
-    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
-        if !self.model1 {
-            return Ok(());
-        }
-        let init = format!("{}\r", String::from_utf8_lossy(init));
-        self.lock().write(&init)
-    }
-
-    fn set_move_strings(
-        &mut self,
-        _user: &AsynUser,
-        prem: &[u8],
-        post: Option<PostMessage>,
-    ) -> AsynResult<()> {
-        if self.model1 {
-            self.strings.set(prem, post);
-        }
-        Ok(())
     }
 
     /// drvMM4000Asyn.c `motorAxisforceCallback`; the poll that follows is
@@ -1203,23 +1247,8 @@ impl AsynMotor for Mm4000Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
-        self.retry_failed = false;
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(poll) = ctrl.model1_poll() {
-            let s = self.model1_status(&ctrl, &poll)?;
-            // drvMM4000.cc:495-501: POST once the move is done or stopped by
-            // the limit in its direction, past an answered MS; and TE;.
-            let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
-            if !s.problem
-                && (s.done || ls_active)
-                && let Some(post) = self.strings.post_due()
-            {
-                let _ = ctrl.write(&String::from_utf8_lossy(&post));
-            }
-            *status = s;
-            return Ok(());
-        }
         let idx = self.axis - 1;
         let turn = ctrl.axis_turn(idx);
         drop(ctrl);
@@ -1320,10 +1349,10 @@ impl DrvSet for Mm4000Axis {
 impl Mm4000Axis {
     fn set_double_only(&mut self, user: &AsynUser, function: i32, value: f64) -> AsynResult<()> {
         let kind = match function {
-            function::POSITION => return self.set_position(user, value),
-            function::ENCODER_RATIO => return self.set_encoder_ratio(user, value),
-            function::LOW_LIMIT => return self.set_low_limit(user, value),
-            function::HIGH_LIMIT => return self.set_high_limit(user, value),
+            function::POSITION => return AsynMotor::set_position(self, user, value),
+            function::ENCODER_RATIO => return AsynMotor::set_encoder_ratio(self, user, value),
+            function::LOW_LIMIT => return AsynMotor::set_low_limit(self, user, value),
+            function::HIGH_LIMIT => return AsynMotor::set_high_limit(self, user, value),
             function::P_GAIN => PidGainKind::Proportional,
             function::I_GAIN => PidGainKind::Integral,
             function::D_GAIN => PidGainKind::Derivative,
@@ -1344,12 +1373,12 @@ impl Mm4000Axis {
                 )));
             }
         };
-        self.set_pid_gain(user, kind, value)
+        AsynMotor::set_pid_gain(self, user, kind, value)
     }
 
     fn set_integer_only(&mut self, user: &AsynUser, function: i32, value: i32) -> AsynResult<()> {
         if function == function::CLOSED_LOOP {
-            return self.set_closed_loop(user, value != 0);
+            return AsynMotor::set_closed_loop(self, user, value != 0);
         }
         self.print_error(format_args!(
             "motorAxisSetInteger: unknown function {function}\n"
@@ -1363,7 +1392,9 @@ impl Mm4000Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::Polled;
+    use epics_rs::asyn::interfaces::InterfaceType;
+    use motor_common::testing::RecordWrites;
+    use motor_common::testing::{Model1Polled, Polled};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// One MM4000 axis parked at 5 mm whose line goes silent on `dead`.
@@ -1534,8 +1565,8 @@ mod tests {
         let mut axes = axes.unwrap();
         sent.lock().unwrap().clear();
         let user = AsynUser::default();
-        let one = axes[0].polled(&user).unwrap();
-        let two = axes[1].polled(&user).unwrap();
+        let one = Model1Polled::polled(&mut axes[0], &user).unwrap();
+        let two = Model1Polled::polled(&mut axes[1], &user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TH;", "TE;", "TE;"]);
 
         assert_eq!((one.position, one.encoder_position), (1500.0, 0.0));
@@ -1561,36 +1592,40 @@ mod tests {
         };
         assert_eq!(
             wire(&mut || axis
-                .move_absolute(&user, 2000.0, 0.0, 1000.0, 500.0)
+                .record_move_absolute(&user, 2000.0, 0.0, 1000.0, 500.0)
                 .unwrap()),
             ["1VA1.00000;1AC0.50000;1PA2.00000;"]
         );
         assert_eq!(
-            wire(&mut || axis.home(&user, 0.0, 1000.0, 500.0, true).unwrap()),
+            wire(&mut || axis.record_home(&user, 0.0, 1000.0, 500.0, true).unwrap()),
             ["1VA1.00000;1AC0.50000;1OR;"]
         );
         assert_eq!(
-            wire(&mut || axis.set_high_limit(&user, 0.5).unwrap()),
+            wire(&mut || Model1Motor::set_high_limit(&mut axis, &user, 0.5).unwrap()),
             [] as [&str; 0]
         );
-        assert!(axis.set_high_limit(&user, 2000.0).is_err());
-        axis.set_high_limit(&user, 0.5).unwrap();
+        assert!(Model1Motor::set_high_limit(&mut axis, &user, 2000.0).is_err());
+        Model1Motor::set_high_limit(&mut axis, &user, 0.5).unwrap();
         assert_eq!(
-            wire(&mut || axis.move_velocity(&user, 0.0, 1000.0, 500.0).unwrap()),
+            wire(&mut || axis.record_jog(&user, 0.0, 1000.0, 500.0).unwrap()),
             ["1AC0.50000;1VA1.00000;1PA0.00050;"]
         );
         assert_eq!(
-            wire(&mut || axis
-                .set_pid_gain(&user, PidGainKind::Proportional, 0.25)
-                .unwrap()),
+            wire(&mut || Model1Motor::set_pid_gain(
+                &mut axis,
+                &user,
+                PidGainKind::Proportional,
+                0.25
+            )
+            .unwrap()),
             ["1KP0.250000;1UF;"]
         );
         assert_eq!(
-            wire(&mut || axis.set_closed_loop(&user, false).unwrap()),
+            wire(&mut || Model1Motor::set_closed_loop(&mut axis, &user, false).unwrap()),
             ["1MF;"]
         );
         assert_eq!(
-            wire(&mut || axis.set_position(&user, 5.0).unwrap()),
+            wire(&mut || Model1Motor::set_position(&mut axis, &user, 5.0).unwrap()),
             [] as [&str; 0]
         );
     }
@@ -1618,15 +1653,17 @@ mod tests {
             .set_move_strings(&user, b"1XX", post(b"1YY"))
             .unwrap();
         axes[0]
-            .move_absolute(&user, 2000.0, 0.0, 1000.0, 500.0)
+            .record_move_absolute(&user, 2000.0, 0.0, 1000.0, 500.0)
             .unwrap();
         axes[0]
-            .move_relative(&user, 2000.0, 0.0, 1000.0, 0.0)
+            .record_move_relative(&user, 2000.0, 0.0, 1000.0, 0.0)
             .unwrap();
         axes[0].set_move_strings(&user, b"1XX", None).unwrap();
-        axes[0].home(&user, 0.0, 1000.0, 500.0, true).unwrap();
+        axes[0]
+            .record_home(&user, 0.0, 1000.0, 500.0, true)
+            .unwrap();
         axes[1].set_move_strings(&user, b"2XX", None).unwrap();
-        axes[1].move_velocity(&user, 0.0, 1000.0, 500.0).unwrap();
+        axes[1].record_jog(&user, 0.0, 1000.0, 500.0).unwrap();
         assert_eq!(
             std::mem::take(&mut *sent.lock().unwrap()),
             [
@@ -1638,21 +1675,21 @@ mod tests {
             ]
         );
         // The home armed no POST, so axis 1 has none due.
-        axes[0].polled(&user).unwrap();
+        Model1Polled::polled(&mut axes[0], &user).unwrap();
         assert!(posts(&sent).is_empty());
         axes[0].set_move_strings(&user, b"", post(b"1YY")).unwrap();
         axes[0]
-            .move_absolute(&user, 0.0, 0.0, 1000.0, 500.0)
+            .record_move_absolute(&user, 0.0, 0.0, 1000.0, 500.0)
             .unwrap();
-        axes[0].polled(&user).unwrap();
-        axes[0].polled(&user).unwrap();
+        Model1Polled::polled(&mut axes[0], &user).unwrap();
+        Model1Polled::polled(&mut axes[0], &user).unwrap();
         assert_eq!(posts(&sent), ["1YY"], "sent once");
         // Axis 2 is moving, but on its plus limit while moving plus.
         axes[1].set_move_strings(&user, b"", post(b"2YY")).unwrap();
         axes[1]
-            .move_absolute(&user, 0.0, 0.0, 1000.0, 500.0)
+            .record_move_absolute(&user, 0.0, 0.0, 1000.0, 500.0)
             .unwrap();
-        axes[1].polled(&user).unwrap();
+        Model1Polled::polled(&mut axes[1], &user).unwrap();
         assert_eq!(posts(&sent), ["2YY"]);
     }
 
@@ -1662,7 +1699,7 @@ mod tests {
         let (axes, sent, _) = model1_card("mm4000_m1_stop", &[], Duration::ZERO);
         let mut axes = axes.unwrap();
         sent.lock().unwrap().clear();
-        axes[0].stop(&AsynUser::default(), 0.0).unwrap();
+        Model1Motor::stop(&mut axes[0], &AsynUser::default()).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["1ST;"]);
     }
 
@@ -1674,7 +1711,7 @@ mod tests {
         let user = AsynUser::default();
         sent.lock().unwrap().clear();
         axes[0]
-            .move_absolute(&user, -f64::NAN, 0.0, f64::NAN, 0.0)
+            .record_move_absolute(&user, -f64::NAN, 0.0, f64::NAN, 0.0)
             .unwrap();
         assert_eq!(*sent.lock().unwrap(), ["1VAnan;1PA-nan;"]);
     }
@@ -1687,8 +1724,10 @@ mod tests {
         let mut axes = axes.unwrap();
         let user = AsynUser::default();
         sent.lock().unwrap().clear();
-        axes[0].move_absolute(&user, 100.0, 0.0, 10.0, 0.0).unwrap();
-        axes[0].home(&user, 0.0, 10.0, 0.0, true).unwrap();
+        axes[0]
+            .record_move_absolute(&user, 100.0, 0.0, 10.0, 0.0)
+            .unwrap();
+        axes[0].record_home(&user, 0.0, 10.0, 0.0, true).unwrap();
         let wire = sent.lock().unwrap().clone();
         assert!(wire.iter().all(|c| !c.contains("AC")), "{wire:?}");
     }
@@ -1725,8 +1764,8 @@ mod tests {
         assert_eq!(init.position, 0.0);
         sent.lock().unwrap().clear();
         let user = AsynUser::default();
-        let one = axes[0].polled(&user).unwrap();
-        let two = axes[1].polled(&user).unwrap();
+        let one = Model1Polled::polled(&mut axes[0], &user).unwrap();
+        let two = Model1Polled::polled(&mut axes[1], &user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TH;", "TE;", "TE;"]);
         assert!(one.done && one.powered && one.problem && !one.comms_error);
         assert_eq!((one.position, one.encoder_position), (0.0, 0.0));
@@ -1741,19 +1780,19 @@ mod tests {
         let (axes, sent, silent) = model1_card("mm4000_m1_retry", &[], Duration::ZERO);
         let mut axis = axes.unwrap().remove(1);
         let user = AsynUser::default();
-        let before = axis.polled(&user).unwrap();
+        let before = Model1Polled::polled(&mut axis, &user).unwrap();
 
         silent.lock().unwrap().push("MS;");
         sent.lock().unwrap().clear();
-        assert!(axis.polled(&user).is_err());
-        assert_eq!(axis.poll_failure(), PollFailure::NONE);
-        assert!(axis.polled(&user).is_err());
-        assert_eq!(axis.poll_failure(), MODEL1_POLL_FAILURE);
+        assert!(Model1Polled::polled(&mut axis, &user).is_err());
+        assert_eq!(Model1Motor::poll_failure(&axis), PollFailure::NONE);
+        assert!(Model1Polled::polled(&mut axis, &user).is_err());
+        assert_eq!(Model1Motor::poll_failure(&axis), MODEL1_POLL_FAILURE);
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TH;", "MS;", "TH;"]);
 
         silent.lock().unwrap().clear();
         sent.lock().unwrap().clear();
-        let back = axis.polled(&user).unwrap();
+        let back = Model1Polled::polled(&mut axis, &user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TH;", "TE;"]);
         assert_eq!(back, before);
     }
@@ -1840,11 +1879,11 @@ mod tests {
             .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
-        assert_eq!(axis.polled(&user).unwrap().position, 50000.0);
+        assert_eq!(Polled::polled(&mut axis, &user).unwrap().position, 50000.0);
 
         dead.store(true, Ordering::SeqCst);
         sent.lock().unwrap().clear();
-        let status = axis.polled(&user).unwrap();
+        let status = Polled::polled(&mut axis, &user).unwrap();
         // C sends `TP;` only after `MS;` succeeded.
         assert_eq!(*sent.lock().unwrap(), ["MS;"]);
         assert!(status.comms_error);
@@ -1894,7 +1933,7 @@ mod tests {
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         dead.store(true, Ordering::SeqCst);
         sent.lock().unwrap().clear();
-        let status = axis.polled(&AsynUser::default()).unwrap();
+        let status = Polled::polled(&mut axis, &AsynUser::default()).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;"]);
         assert!(status.comms_error);
         let params = axis.params();
@@ -1953,8 +1992,8 @@ mod tests {
     fn each_axis_of_the_pass_asks_te() {
         let (mut axes, sent) = scripted_pair("mm4000_te_each", &[], "1TP1.4990,2TP-2.2490");
         let user = AsynUser::default();
-        axes[0].polled(&user).unwrap();
-        axes[1].polled(&user).unwrap();
+        Polled::polled(&mut axes[0], &user).unwrap();
+        Polled::polled(&mut axes[1], &user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TE;", "TE;"]);
         for axis in &axes {
             let params = axis.params();
@@ -1970,8 +2009,8 @@ mod tests {
     fn a_failed_te_fails_every_later_axis_of_the_pass() {
         let (mut axes, sent) = scripted_pair("mm4000_te", &["TE;"], "1TP3.0000,2TP-2.2490");
         let user = AsynUser::default();
-        let first = axes[0].polled(&user).unwrap();
-        axes[1].polled(&user).unwrap();
+        let first = Polled::polled(&mut axes[0], &user).unwrap();
+        Polled::polled(&mut axes[1], &user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TE;"]);
         let params = axes[0].params();
         assert_eq!(params.get_integer(function::COMM_ERROR), Ok(Some(0)));
@@ -1993,8 +2032,8 @@ mod tests {
     fn a_zero_tu_reads_the_status_and_holds_the_position() {
         let (mut axes, sent) = scripted_pair("mm4000_tu0", &["1TU"], "1TP3.0000,2TP-2.2490");
         let user = AsynUser::default();
-        let first = axes[0].polled(&user).unwrap();
-        axes[1].polled(&user).unwrap();
+        let first = Polled::polled(&mut axes[0], &user).unwrap();
+        Polled::polled(&mut axes[1], &user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TE;", "TE;"]);
         let params = axes[0].params();
         assert_eq!(params.get_integer(function::COMM_ERROR), Ok(Some(0)));
@@ -2052,14 +2091,14 @@ mod tests {
             .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
-        assert!(axis.polled(&user).unwrap().done);
+        assert!(Polled::polled(&mut axis, &user).unwrap().done);
         sent.lock().unwrap().clear();
-        assert!(axis.polled(&user).unwrap().done);
+        assert!(Polled::polled(&mut axis, &user).unwrap().done);
         assert!(sent.lock().unwrap().is_empty(), "inside the TTL");
 
-        axis.move_absolute(&user, 1000.0, 0.0, 10.0, 20.0).unwrap();
+        AsynMotor::move_absolute(&mut axis, &user, 1000.0, 0.0, 10.0, 20.0).unwrap();
         assert_eq!(axis.params().get_integer(function::DONE), Ok(Some(0)));
-        let after = axis.polled(&user).unwrap();
+        let after = Polled::polled(&mut axis, &user).unwrap();
         assert_eq!(
             *sent.lock().unwrap(),
             ["1AC0.002000;1VA0.001000;1PA0.100000;", "MS;", "TP;", "TE;"]
@@ -2067,7 +2106,7 @@ mod tests {
         assert!(after.done, "the line's MS; reports the axis idle");
 
         sent.lock().unwrap().clear();
-        assert!(axis.polled(&user).unwrap().done);
+        assert!(Polled::polled(&mut axis, &user).unwrap().done);
         assert!(sent.lock().unwrap().is_empty());
     }
 
@@ -2336,7 +2375,7 @@ mod tests {
         .unwrap();
         assert_eq!(reads, (true, true, Some(-500.0), Some(0.0)));
         let mut axis = axes[1].lock().unwrap();
-        axis.polled(&AsynUser::default()).unwrap();
+        Polled::polled(&mut *axis, &AsynUser::default()).unwrap();
         let params = axis.params();
         // `E`: moving, plus direction.
         assert_eq!(params.get_integer(function::DIRECTION), Ok(Some(4)));
@@ -2353,8 +2392,8 @@ mod tests {
         let (axes, _path) = traced_axes("mm4kDone", TraceMask::ERROR, "TE@").await;
         let user = AsynUser::default();
         let mut axis = axes[0].lock().unwrap();
-        axis.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
-        let status = axis.polled(&user).unwrap();
+        AsynMotor::move_absolute(&mut *axis, &user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        let status = Polled::polled(&mut *axis, &user).unwrap();
         assert!(status.done);
         assert_eq!(axis.params().get_integer(function::DONE), Ok(Some(1)));
     }
@@ -2366,13 +2405,13 @@ mod tests {
         let (axes, path) = traced_axes("mm4kRefuse", TraceMask::ERROR, "TE@").await;
         let user = AsynUser::default();
         let mut axis = axes[1].lock().unwrap();
-        assert!(axis.set_encoder_ratio(&user, 2.0).is_err());
+        assert!(AsynMotor::set_encoder_ratio(&mut *axis, &user, 2.0).is_err());
         for kind in [
             PidGainKind::Proportional,
             PidGainKind::Integral,
             PidGainKind::Derivative,
         ] {
-            assert!(axis.set_pid_gain(&user, kind, 0.5).is_err());
+            assert!(AsynMotor::set_pid_gain(&mut *axis, &user, kind, 0.5).is_err());
         }
         assert_eq!(
             take_trace(&path),
@@ -2413,13 +2452,12 @@ mod tests {
         let (axes, path) = traced_axes("mm4kMotion", TraceMask::FLOW, "TE@").await;
         let user = AsynUser::default();
         let mut axis = axes[1].lock().unwrap();
-        axis.move_absolute(&user, 1500.0, 10.0, 200.0, 400.0)
-            .unwrap();
-        axis.move_relative(&user, -25.5, 0.0, 100.0, 50.0).unwrap();
-        axis.move_velocity(&user, 1.0, 300.0, 60.0).unwrap();
-        axis.move_velocity(&user, 1.0, -0.0, 60.0).unwrap();
-        axis.home(&user, 0.0, 100.0, 20.0, true).unwrap();
-        axis.stop(&user, 80.0).unwrap();
+        AsynMotor::move_absolute(&mut *axis, &user, 1500.0, 10.0, 200.0, 400.0).unwrap();
+        AsynMotor::move_relative(&mut *axis, &user, -25.5, 0.0, 100.0, 50.0).unwrap();
+        AsynMotor::move_velocity(&mut *axis, &user, 1.0, 300.0, 60.0).unwrap();
+        AsynMotor::move_velocity(&mut *axis, &user, 1.0, -0.0, 60.0).unwrap();
+        AsynMotor::home(&mut *axis, &user, 0.0, 100.0, 20.0, true).unwrap();
+        AsynMotor::stop(&mut *axis, &user, 80.0).unwrap();
         assert_eq!(
             take_trace(&path),
             "Set card 2, axis 1 move to 1500.000000, min vel=10.000000, max_vel=200.000000, accel=400.000000\n\
@@ -2436,11 +2474,7 @@ mod tests {
     #[epics_rs::base::epics_test]
     async fn the_poll_prints_the_c_iodriver_line() {
         let (axes, path) = traced_axes("mm4kPoll", TraceMask::IO_DRIVER, "TE@").await;
-        axes[1]
-            .lock()
-            .unwrap()
-            .polled(&AsynUser::default())
-            .unwrap();
+        Polled::polled(&mut *axes[1].lock().unwrap(), &AsynUser::default()).unwrap();
         // The poller's own startup poll may land in the file too.
         let text = take_trace(&path);
         assert!(!text.is_empty());
@@ -2457,11 +2491,7 @@ mod tests {
     #[epics_rs::base::epics_test]
     async fn the_poller_errors_print_on_the_axis_log() {
         let (axes, path) = traced_axes("mm4kTeErr", TraceMask::ERROR, "TEC").await;
-        axes[0]
-            .lock()
-            .unwrap()
-            .polled(&AsynUser::default())
-            .unwrap();
+        Polled::polled(&mut *axes[0].lock().unwrap(), &AsynUser::default()).unwrap();
         // The poller's own startup pass may land in the file too.
         let text = take_trace(&path);
         assert!(!text.is_empty());
@@ -2502,7 +2532,7 @@ mod tests {
             (report.step_size, report.low_limit, report.high_limit),
             (0.001, -10.0, 20.0)
         );
-        axis.set_closed_loop(&AsynUser::default(), false)
+        AsynMotor::set_closed_loop(&mut axis, &AsynUser::default(), false)
             .expect("a cut MS; still reads the power bit");
     }
 }

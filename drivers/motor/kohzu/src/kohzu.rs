@@ -30,7 +30,7 @@
 //! ## Deviations from C (documented)
 //!
 //! - The C poller is a background thread; here the `STR`/`RDP`/`RSY` reads run
-//!   inside [`poll`](AsynMotor::poll).
+//!   inside [`poll`](Model1Motor::poll).
 //! - The C move path chooses backlash vs slew acceleration from record fields
 //!   (`bvel`/`bacc`/`mres`) not visible at the asyn-rs boundary; this port uses
 //!   the acceleration passed with the move.
@@ -38,11 +38,10 @@
 //!   the requested home direction does not change the command.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
-};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -232,12 +231,25 @@ fn compute_speeds(min_velocity: f64, velocity: f64, acceleration: f64, prev_acce
     }
 }
 
-/// One SC-800 axis sharing a controller. Implements [`AsynMotor`].
+/// The record's speed writes, in the record's units, until the next move.
+#[derive(Clone, Copy, Default)]
+struct Written {
+    vbas: f64,
+    velo: f64,
+    accel: f64,
+}
+
+/// One SC-800 axis sharing a controller. Implements [`Model1Motor`].
 pub struct KohzuAxis {
     controller: Arc<Mutex<KohzuController>>,
     /// 1-based wire axis number.
     axis: u32,
     speeds: Speeds,
+    /// What the record's SET_VEL_BASE, SET_VELOCITY and SET_ACCEL wrote, which
+    /// C saves in `base_speed`, `slew_speed` and `accl_rate` without sending
+    /// (devSC800.cc:255-276). A move's SET_ACCEL is the one the record skips
+    /// for 0 (motorRecord.cc:2529-2530), so it is taken by the move.
+    written: Written,
     prev_position: i32,
     /// What the last failed poll raises: nothing on C `set_status`'s first
     /// bad `STR` (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next
@@ -257,6 +269,7 @@ impl KohzuAxis {
         let mut axis = Self {
             controller,
             axis: index as u32 + 1,
+            written: Written::default(),
             speeds: Speeds {
                 base: 0,
                 slew: 0,
@@ -279,10 +292,11 @@ impl KohzuAxis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Update the stored speeds from move parameters (keeping the previous
-    /// acceleration parameter when it cannot be derived).
-    fn set_speeds(&mut self, min_velocity: f64, velocity: f64, acceleration: f64) {
-        self.speeds = compute_speeds(min_velocity, velocity, acceleration, self.speeds.accel);
+    /// Update the stored speeds from the record's writes (keeping the
+    /// previous acceleration parameter when it cannot be derived).
+    fn set_speeds(&mut self) {
+        let w = std::mem::take(&mut self.written.accel);
+        self.speeds = compute_speeds(self.written.vbas, self.written.velo, w, self.speeds.accel);
     }
 
     /// A move: PREM as its own command, the axis speeds, then `command`. C puts
@@ -319,49 +333,49 @@ impl Model1Motor for KohzuAxis {
         // read stores back.
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for KohzuAxis {
+    /// `MOTION_DELAY` in `thread_args` (drvSC800.cc:139).
+    fn update_delay(&self) -> Duration {
+        Duration::from_millis(100)
+    }
+
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.written.velo = velocity;
+        Ok(())
+    }
+
+    fn set_vel_base(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.written.vbas = velocity;
+        Ok(())
+    }
+
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.written.accel = acceleration;
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.set_speeds(min_velocity, velocity, acceleration);
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.set_speeds();
         self.write_move(&format!("APS{}/2/0/0/{}/0/0/1", self.axis, nint(position)))
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.set_speeds(min_velocity, velocity, acceleration);
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.set_speeds();
         self.write_move(&format!("RPS{}/2/1/0/{}/0/0/1", self.axis, nint(distance)))
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         // C JOG: cap base speed to the slew speed, program, then FRP
         // with the direction polarity.
         // C takes the polarity from NINT(v), so |v| < 0.5 jogs reverse.
         let polarity = if nint(velocity) > 0 { '1' } else { '0' };
-        self.set_speeds(min_velocity, velocity.abs(), acceleration);
+        self.written.velo = velocity.abs();
+        let (min_velocity, acceleration) = (self.written.vbas, self.written.accel);
+        self.set_speeds();
         if self.speeds.base > self.speeds.slew {
             self.speeds.base = self.speeds.slew;
         }
@@ -374,21 +388,14 @@ impl AsynMotor for KohzuAxis {
         self.write_move(&format!("FRP{}/2/0/0/{}/1", self.axis, polarity))
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C HOME_FOR/HOME_REV both emit the same ORG sequence.
         // C sends SET_ACCEL's steps/s^2 as ASI's time (devSC800.cc:274); not copied.
-        self.set_speeds(min_velocity, velocity, acceleration);
+        self.set_speeds();
         self.write_move(&format!("ORG{}/2/0/0/3/1", self.axis))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let ctrl = self.lock();
         ctrl.command(&format!("STP{}/0", self.axis))?;
         Ok(())
@@ -525,7 +532,7 @@ impl KohzuAxis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::{Model1Polled, RecordWrites};
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// `STR` fields of the rig: moving, cw limit, ccw limit.
@@ -645,9 +652,10 @@ mod tests {
         let user = AsynUser::default();
         let asi = "ASI1/10/100/9/9/0/0/0/0/0/0/0/0/0";
         axis.set_move_strings(&user, b"COF1/0", None).unwrap();
-        axis.move_absolute(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
+        axis.record_move_absolute(&user, 5.0, 10.0, 100.0, 1000.0)
+            .unwrap();
         assert_eq!(sent(&line), ["COF1/0", asi, "APS1/2/0/0/5/0/0/1"]);
-        assert!(axis.home(&user, 10.0, 100.0, 1000.0, true).is_err());
+        assert!(axis.record_home(&user, 10.0, 100.0, 1000.0, true).is_err());
         assert_eq!(sent(&line), [asi, "ORG1/2/0/0/3/1"]);
     }
 
@@ -659,17 +667,19 @@ mod tests {
         let user = AsynUser::default();
         let asi = "ASI1/10/100/9/9/0/0/0/0/0/0/0/0/0";
         axis.set_move_strings(&user, b"COF1/0", None).unwrap();
-        axis.move_absolute(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
+        axis.record_move_absolute(&user, 5.0, 10.0, 100.0, 1000.0)
+            .unwrap();
         assert_eq!(sent(&line), ["COF1/0", asi, "APS1/2/0/0/5/0/0/1"]);
-        axis.move_relative(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
+        axis.record_move_relative(&user, 5.0, 10.0, 100.0, 1000.0)
+            .unwrap();
         assert_eq!(sent(&line), [asi, "RPS1/2/1/0/5/0/0/1"]);
         axis.set_move_strings(&user, b"COF1/0", None).unwrap();
-        axis.home(&user, 10.0, 100.0, 1000.0, true).unwrap();
+        axis.record_home(&user, 10.0, 100.0, 1000.0, true).unwrap();
         assert_eq!(sent(&line), ["COF1/0", asi, "ORG1/2/0/0/3/1"]);
         axis.set_move_strings(&user, b"COF1/0", None).unwrap();
-        axis.move_velocity(&user, 10.0, -100.0, 1000.0).unwrap();
+        axis.record_jog(&user, 10.0, -100.0, 1000.0).unwrap();
         assert_eq!(sent(&line), ["COF1/0", asi, "FRP1/2/0/0/0/1"]);
-        axis.move_velocity(&user, 0.0, 0.4, 1000.0).unwrap();
+        axis.record_jog(&user, 0.0, 0.4, 1000.0).unwrap();
         assert!(
             sent(&line).last().unwrap().ends_with("/0/1"),
             "NINT(0.4) = 0"
@@ -683,7 +693,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"COF1/1")))
             .unwrap();
-        axis.move_absolute(&user, 5.0, 10.0, 100.0, 1000.0).unwrap();
+        axis.record_move_absolute(&user, 5.0, 10.0, 100.0, 1000.0)
+            .unwrap();
         line.sent();
         state.store(MOVING, Ordering::SeqCst);
         assert!(poll_extra(&line, &mut axis).is_empty());
@@ -699,7 +710,7 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"COF1/1")))
             .unwrap();
-        axis.move_absolute(&user, -5.0, 10.0, 100.0, 1000.0)
+        axis.record_move_absolute(&user, -5.0, 10.0, 100.0, 1000.0)
             .unwrap();
         line.sent();
         state.store(MOVING | CCW, Ordering::SeqCst);

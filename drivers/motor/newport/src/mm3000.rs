@@ -3,7 +3,7 @@
 //! Ported from `motorNewport/newportApp/src/drvMM3000.cc` + `devMM3000.cc`
 //! (a model-1 dev/drv pair). Commands are `{axis}CC{value}` with a 1-based
 //! *unpadded* axis prefix and integer values; record transactions join
-//! commands with `;` into one write (a move is `[VB;]VA;AC;PA`). Commands go out
+//! commands with `;` into one write (a move is `VA;[VB;]AC;PA`). Commands go out
 //! bare and the port EOS `"\r"` both ways comes from the startup script, as in
 //! C's MM3000.cmd:17-20 (the C driver sets no EOS).
 //! Replies are not trimmed: the `MS` status reply is a raw binary byte.
@@ -25,14 +25,15 @@
 //!   empty string), so the `strcmp(buff, "E01")` check never matches. This
 //!   port still sends `TPE` per axis (wire parity, including the C re-read
 //!   timeout on encoderless axes) and sets `encoder_present = true`.
-//! - `SET_ENC_RATIO` (`{axis}ER{p}:{q}`, stepper only) has no [`AsynMotor`]
+//! - `SET_ENC_RATIO` (`{axis}ER{p}:{q}`, stepper only) has no [`Model1Motor`]
 //!   counterpart and is not ported.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -113,39 +114,6 @@ fn parse_rc_types(reply: &str) -> Vec<AxisType> {
         }
     }
     types
-}
-
-/// Build the velocity/acceleration preamble of a motion transaction (record
-/// `SET_VEL_BASE`/`SET_VELOCITY`/`SET_ACCEL` before the move), with the C
-/// clamps: steppers floor `VB`/`VA` at 100 and `AC` at 15000, DC axes floor
-/// `AC` at 250; `VB` is emitted for steppers only. Values are integer steps
-/// (C `NINT`). The record sends no SET_ACCEL for a zero rate
-/// (motorRecord.cc:874, 940), so there is no `AC` then.
-fn motion_preamble(
-    axis: usize,
-    axis_type: AxisType,
-    vel_base: f64,
-    velocity: f64,
-    accel: f64,
-) -> String {
-    let mut vb = nint(vel_base);
-    let mut va = nint(velocity);
-    let mut ac = nint(accel);
-    let mut out = String::new();
-    if axis_type == AxisType::Stepper {
-        vb = vb.max(100);
-        va = va.max(100);
-        ac = ac.max(15000);
-        out.push_str(&format!("{axis}VB{vb};"));
-    }
-    if axis_type == AxisType::Dc {
-        ac = ac.max(250);
-    }
-    out.push_str(&format!("{axis}VA{va}"));
-    if accel > 0.0 {
-        out.push_str(&format!(";{axis}AC{ac}"));
-    }
-    out
 }
 
 /// Controller communication state (C `cntrl->status`): one failed status
@@ -259,7 +227,7 @@ impl Mm3000Controller {
     }
 }
 
-/// One MM3000 axis sharing a controller. Implements [`AsynMotor`].
+/// One MM3000 axis sharing a controller. Implements [`Model1Motor`].
 pub struct Mm3000Axis {
     controller: Arc<Mutex<Mm3000Controller>>,
     /// 1-based controller axis number, sent unpadded (`%d`).
@@ -283,6 +251,9 @@ pub struct Mm3000Axis {
     /// leaves.
     left: Option<MotorStatus>,
     strings: MoveStrings,
+    /// The record's SET_* parts of the transaction under way, which the
+    /// move's own command follows in one message.
+    parts: Vec<String>,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
     init_status: Option<AsynResult<MotorStatus>>,
 }
@@ -316,6 +287,7 @@ impl Mm3000Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            parts: Vec::new(),
             init_status: None,
         };
         ax.init_status = Some(init_poll(&mut ax, &AsynUser::new(0)));
@@ -326,15 +298,16 @@ impl Mm3000Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn motion_preamble(&self, vel_base: f64, velocity: f64, accel: f64) -> String {
-        motion_preamble(self.axis, self.axis_type, vel_base, velocity, accel)
-    }
-
     /// One move transaction: the record's earlier parts, then PREM and a
     /// `;` ahead of the move's own command (devMM3000.cc:211-222), whose
     /// POST waits for the move to end.
-    fn write_move(&mut self, parts: &str, command: &str) -> AsynResult<()> {
-        let mut line = format!("{parts};").into_bytes();
+    fn write_move(&mut self, command: &str) -> AsynResult<()> {
+        let mut line = String::new();
+        for part in self.parts.drain(..) {
+            line.push_str(&part);
+            line.push(';');
+        }
+        let mut line = line.into_bytes();
         let prem = self.strings.arm();
         if !prem.is_empty() {
             line.extend_from_slice(&prem);
@@ -353,46 +326,58 @@ impl Model1Motor for Mm3000Axis {
         self.left = None;
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for Mm3000Axis {
+    /// `update_delay` is 0 (`targs`, drvMM3000.cc:168).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY: `VA`, floored at 100 on a stepper (devMM3000.cc:256).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let mut va = nint(velocity);
+        if self.axis_type == AxisType::Stepper {
+            va = va.max(100);
+        }
+        self.parts.push(format!("{}VA{va}", self.axis));
+        Ok(())
+    }
+
+    /// SET_VEL_BASE: `VB` on a stepper only, floored at 100.
+    fn set_vel_base(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        if self.axis_type == AxisType::Stepper {
+            self.parts
+                .push(format!("{}VB{}", self.axis, nint(velocity).max(100)));
+        }
+        Ok(())
+    }
+
+    /// SET_ACCEL: `AC`, floored at 15000 on a stepper and 250 on a DC axis.
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        let mut ac = nint(acceleration);
+        match self.axis_type {
+            AxisType::Stepper => ac = ac.max(15000),
+            AxisType::Dc => ac = ac.max(250),
+            AxisType::Unused => {}
+        }
+        self.parts.push(format!("{}AC{ac}", self.axis));
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        // One transaction: [VB;]VA;AC;PA (the MM3000 starts moving on PA;
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        // One transaction: VA;[VB;]AC;PA (the MM3000 starts moving on PA;
         // the record's GO is a no-op).
-        let parts = self.motion_preamble(min_velocity, velocity, acceleration);
-        self.write_move(&parts, &format!("{}PA{}", self.axis, nint(position)))
+        self.write_move(&format!("{}PA{}", self.axis, nint(position)))
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let parts = self.motion_preamble(min_velocity, velocity, acceleration);
-        self.write_move(&parts, &format!("{}PR{}", self.axis, nint(distance)))
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.write_move(&format!("{}PR{}", self.axis, nint(distance)))
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         // C `JOG`: no jog command on the MM3000 — set the jog speed and move
         // to the record soft limit in the jog direction (record sends
         // SET_ACCEL ahead of JOG in the same transaction).
@@ -408,33 +393,18 @@ impl AsynMotor for Mm3000Axis {
             ))
         })?;
         let a = self.axis;
-        let mut ac = nint(acceleration);
-        match self.axis_type {
-            AxisType::Stepper => ac = ac.max(15000),
-            AxisType::Dc => ac = ac.max(250),
-            AxisType::Unused => {}
-        }
         self.write_move(
-            &format!("{a}AC{ac}"),
             // C truncates the limit: `(int) (mr->dhlm / mr->mres)`.
             &format!("{a}VA{};{a}PA{}", nint(velocity).abs(), target as i32),
         )
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C sends the same `OR1` for HOME_FOR and HOME_REV.
-        let parts = self.motion_preamble(min_velocity, velocity, acceleration);
-        self.write_move(&parts, &format!("{}OR1", self.axis))
+        self.write_move(&format!("{}OR1", self.axis))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let ctrl = self.lock();
         ctrl.write(&format!("{}ST", self.axis))
     }
@@ -588,7 +558,6 @@ impl Mm3000Axis {
     /// MS bits when `ms_set`.
     fn missed(&mut self, comm_state: CommState, ms_set: bool) -> AsynError {
         self.failure = failure(comm_state);
-    use epics_rs::asyn::interfaces::InterfaceType;
         if comm_state == CommState::CommErr {
             self.last_status.comms_error = true;
             self.last_status.problem = true;
@@ -619,8 +588,10 @@ fn retry(axis: impl std::fmt::Display) -> AsynError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// Answers `VE` and the commands in `replies`, fails every other read,
@@ -873,8 +844,9 @@ mod tests {
         let (line, mut axis, _) = strings_rig("mm3000ZeroAc");
         let user = AsynUser::default();
         line.sent();
-        axis.move_absolute(&user, 15.0, 0.0, 400.0, 0.0).unwrap();
-        axis.home(&user, 0.0, 400.0, 0.0, true).unwrap();
+        axis.record_move_absolute(&user, 15.0, 0.0, 400.0, 0.0)
+            .unwrap();
+        axis.record_home(&user, 0.0, 400.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["1VA400;1PA15", "1VA400;1OR1"]);
     }
 
@@ -885,8 +857,8 @@ mod tests {
         axis.set_high_limit(&user, 900.7).unwrap();
         axis.set_low_limit(&user, -900.7).unwrap();
         line.sent();
-        axis.move_velocity(&user, 0.0, 400.0, 300.0).unwrap();
-        axis.move_velocity(&user, 0.0, -400.0, 300.0).unwrap();
+        axis.record_jog(&user, 0.0, 400.0, 300.0).unwrap();
+        axis.record_jog(&user, 0.0, -400.0, 300.0).unwrap();
         assert_eq!(
             line.sent(),
             ["1AC300;1VA400;1PA900", "1AC300;1VA400;1PA-900"]
@@ -900,15 +872,17 @@ mod tests {
         axis.set_high_limit(&user, 900.0).unwrap();
         line.sent();
         axis.set_move_strings(&user, b"MO", None).unwrap();
-        axis.move_absolute(&user, 15.0, 0.0, 400.0, 300.0).unwrap();
+        axis.record_move_absolute(&user, 15.0, 0.0, 400.0, 300.0)
+            .unwrap();
         assert_eq!(line.sent(), ["1VA400;1AC300;MO;1PA15"]);
-        axis.move_relative(&user, 15.0, 0.0, 400.0, 300.0).unwrap();
+        axis.record_move_relative(&user, 15.0, 0.0, 400.0, 300.0)
+            .unwrap();
         assert_eq!(line.sent(), ["1VA400;1AC300;1PR15"]);
         axis.set_move_strings(&user, b"MO", None).unwrap();
-        axis.home(&user, 0.0, 400.0, 300.0, true).unwrap();
+        axis.record_home(&user, 0.0, 400.0, 300.0, true).unwrap();
         assert_eq!(line.sent(), ["1VA400;1AC300;MO;1OR1"]);
         axis.set_move_strings(&user, b"MO", None).unwrap();
-        axis.move_velocity(&user, 0.0, 400.0, 300.0).unwrap();
+        axis.record_jog(&user, 0.0, 400.0, 300.0).unwrap();
         assert_eq!(line.sent(), ["1AC300;MO;1VA400;1PA900"]);
     }
 
@@ -919,7 +893,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"MF")))
             .unwrap();
-        axis.move_absolute(&user, 15.0, 0.0, 400.0, 300.0).unwrap();
+        axis.record_move_absolute(&user, 15.0, 0.0, 400.0, 300.0)
+            .unwrap();
         line.sent();
         ms.store(0x05, Ordering::SeqCst);
         assert!(poll_extra(&line, &mut axis).is_empty());
@@ -935,7 +910,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"MF")))
             .unwrap();
-        axis.move_absolute(&user, -15.0, 0.0, 400.0, 300.0).unwrap();
+        axis.record_move_absolute(&user, -15.0, 0.0, 400.0, 300.0)
+            .unwrap();
         line.sent();
         ms.store(0x11, Ordering::SeqCst);
         assert_eq!(poll_extra(&line, &mut axis), ["MF"]);
@@ -1000,24 +976,32 @@ mod tests {
 
     #[test]
     fn preamble_applies_c_clamps_per_axis_type() {
+        let user = AsynUser::default();
+        let preamble = |name, axis_type, vbas, velo, accel| {
+            let (line, mut axis, _) = strings_rig(name);
+            axis.axis_type = axis_type;
+            axis.record_speeds(&user, vbas, velo, accel).unwrap();
+            axis.write_move("PA0").unwrap();
+            line.sent().pop().unwrap()
+        };
         // Stepper: VB floored at 100, VA at 100, AC at 15000; VB emitted.
         assert_eq!(
-            motion_preamble(1, AxisType::Stepper, 10.0, 50.0, 200.0),
-            "1VB100;1VA100;1AC15000"
+            preamble("mm3000Clampsa", AxisType::Stepper, 10.0, 50.0, 200.0),
+            "1VA100;1VB100;1AC15000;PA0"
         );
         assert_eq!(
-            motion_preamble(2, AxisType::Stepper, 500.0, 2000.0, 20000.0),
-            "2VB500;2VA2000;2AC20000"
+            preamble("mm3000Clampsb", AxisType::Stepper, 500.0, 2000.0, 20000.0),
+            "1VA2000;1VB500;1AC20000;PA0"
         );
         // DC: no VB, VA unclamped, AC floored at 250.
         assert_eq!(
-            motion_preamble(3, AxisType::Dc, 10.0, 50.0, 200.0),
-            "3VA50;3AC250"
+            preamble("mm3000Clampsc", AxisType::Dc, 10.0, 50.0, 200.0),
+            "1VA50;1AC250;PA0"
         );
         // Unused: no clamps at all.
         assert_eq!(
-            motion_preamble(4, AxisType::Unused, 10.0, 50.0, 200.0),
-            "4VA50;4AC200"
+            preamble("mm3000Clampsd", AxisType::Unused, 10.0, 50.0, 200.0),
+            "1VA50;1AC200;PA0"
         );
     }
 

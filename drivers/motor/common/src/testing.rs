@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, Model1Motor, MotorStatus};
 use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -21,7 +21,6 @@ use epics_rs::asyn::user::AsynUser;
 /// One poll's status, polled into a fresh one.
 pub trait Polled {
     fn polled(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
-    fn polled_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus>;
     /// The status the constructor's sets leave, as the poller starts it.
     fn constructed(&mut self) -> MotorStatus;
 }
@@ -32,12 +31,6 @@ impl<M: AsynMotor + ?Sized> Polled for M {
         self.poll(user, &mut status).map(|()| status)
     }
 
-    fn polled_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
-        let mut status = MotorStatus::default();
-        self.poll_in_motion(user, cdir, &mut status)
-            .map(|()| status)
-    }
-
     fn constructed(&mut self) -> MotorStatus {
         let mut status = MotorStatus::default();
         for write in self.take_status_writes() {
@@ -46,6 +39,96 @@ impl<M: AsynMotor + ?Sized> Polled for M {
         status
     }
 }
+
+/// [`Polled`] for a model-1 axis.
+pub trait Model1Polled {
+    fn polled(&mut self, user: &AsynUser) -> AsynResult<MotorStatus>;
+    fn polled_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus>;
+}
+
+impl<M: Model1Motor + ?Sized> Model1Polled for M {
+    fn polled(&mut self, user: &AsynUser) -> AsynResult<MotorStatus> {
+        let mut status = MotorStatus::default();
+        self.poll(user, &mut status).map(|()| status)
+    }
+
+    fn polled_in_motion(&mut self, user: &AsynUser, cdir: &mut bool) -> AsynResult<MotorStatus> {
+        let mut status = MotorStatus::default();
+        self.poll_in_motion(user, cdir, &mut status)
+            .map(|()| status)
+    }
+}
+
+/// The writes motorRecord.cc makes for one command, in its order, then the
+/// command: a move or home is SET_VELOCITY, SET_VEL_BASE, SET_ACCEL (not
+/// when 0, :2529-2530) and the command (:2527-2534, :2052-2063); a jog is
+/// SET_VEL_BASE, SET_ACCEL (always) and JOG (:2140-2142).
+pub trait RecordWrites: Model1Motor {
+    fn record_move_absolute(
+        &mut self,
+        user: &AsynUser,
+        position: f64,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.record_speeds(user, min_velocity, velocity, acceleration)?;
+        self.move_absolute(user, position)
+    }
+
+    fn record_move_relative(
+        &mut self,
+        user: &AsynUser,
+        distance: f64,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.record_speeds(user, min_velocity, velocity, acceleration)?;
+        self.move_relative(user, distance)
+    }
+
+    fn record_home(
+        &mut self,
+        user: &AsynUser,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+        forward: bool,
+    ) -> AsynResult<()> {
+        self.record_speeds(user, min_velocity, velocity, acceleration)?;
+        self.home(user, forward)
+    }
+
+    fn record_jog(
+        &mut self,
+        user: &AsynUser,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.set_vel_base(user, min_velocity)?;
+        self.set_accel(user, acceleration)?;
+        self.move_velocity(user, velocity)
+    }
+
+    fn record_speeds(
+        &mut self,
+        user: &AsynUser,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.set_velocity(user, velocity)?;
+        self.set_vel_base(user, min_velocity)?;
+        if acceleration != 0.0 {
+            self.set_accel(user, acceleration)?;
+        }
+        Ok(())
+    }
+}
+
+impl<M: Model1Motor + ?Sized> RecordWrites for M {}
 
 type Reply = Box<dyn Fn(&str) -> String + Send + Sync>;
 type Lines = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;

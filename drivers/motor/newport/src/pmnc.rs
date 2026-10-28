@@ -46,7 +46,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -367,7 +367,7 @@ impl PmncController {
     }
 }
 
-/// One PMNC axis sharing a controller. Implements [`AsynMotor`]. Carries the
+/// One PMNC axis sharing a controller. Implements [`Model1Motor`]. Carries the
 /// per-axis software position state C keeps in `motor_info` +
 /// `cntrl->last_position`.
 pub struct PmncAxis {
@@ -389,6 +389,9 @@ pub struct PmncAxis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// The `VEL` written since the last motion command, which an 8753's
+    /// SET_VEL_BASE parks at max and then restores.
+    velocity_written: Option<i64>,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
     init_status: Option<AsynResult<MotorStatus>>,
 }
@@ -425,6 +428,7 @@ impl PmncAxis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            velocity_written: None,
             init_status: None,
         };
         axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
@@ -439,47 +443,10 @@ impl PmncAxis {
         self.def.driver_type == PmdModel::Pmd8753
     }
 
-    /// Velocity/acceleration preamble as separate prompt-framed messages,
-    /// matching the record's SET_VEL_BASE / SET_VELOCITY / SET_ACCEL parts.
-    /// C clamps velocity to `MAX_VELOCITY` and acceleration to
-    /// `[MIN_ACCEL, MAX_ACCEL]`; an 8753 additionally programs the minimum
-    /// profile velocity (`MPV`) after parking `VEL` at max to dodge an
-    /// out-of-range error. The record sends no SET_ACCEL for a zero rate
-    /// (motorRecord.cc:874, 940), so there is no `ACC` then. Each message is
-    /// sent whatever the one before returned (motordrvCom.cc:397-484); the
-    /// last one's status is returned.
-    fn send_speed(
-        &self,
-        ctrl: &PmncController,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let (d, m) = (self.def.driver_num, self.def.motor_num);
-        let vel = nint(velocity).unsigned_abs().min(MAX_VELOCITY as u32) as i64;
-        // The record writes SET_VELOCITY before SET_VEL_BASE, so on an 8753
-        // C's VEL-at-max lands last and every move runs at 2000 steps/sec.
-        // That C defect is not copied: the record's velocity goes last.
-        self.send_vel_base(ctrl, min_velocity);
-        let status = ctrl.command(&format!("VEL A{d} {m}={vel}"));
-        if acceleration > 0.0 {
-            let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
-            return ctrl.command(&format!("ACC A{d} {m}={accel}")).map(drop);
-        }
-        status.map(drop)
-    }
-
-    /// The record's SET_VEL_BASE: on an 8753, `VEL` parked at max then `MPV`;
-    /// an 8751 sends nothing.
-    fn send_vel_base(&self, ctrl: &PmncController, min_velocity: f64) {
-        if self.is_8753() {
-            let (d, m) = (self.def.driver_num, self.def.motor_num);
-            let mpv = nint(min_velocity)
-                .unsigned_abs()
-                .min((MAX_VELOCITY - 1) as u32) as i64;
-            let _ = ctrl.command(&format!("VEL A{d} {m}={MAX_VELOCITY}"));
-            let _ = ctrl.command(&format!("MPV A{d} {m}={mpv}"));
-        }
+    /// A motion command's PREM and POST: it ends the speed writes before it.
+    fn arm(&mut self) -> Vec<u8> {
+        self.velocity_written = None;
+        self.strings.arm()
     }
 
     /// PREM as its own message ahead of the move's commands
@@ -494,26 +461,63 @@ impl Model1Motor for PmncAxis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for PmncAxis {
+    /// `update_delay` is 0 (`targs`, drvPMNC87xx.cc:206).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY: `VEL`, clamped to `MAX_VELOCITY` (devPMNC87xx.cc:298).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let (d, m) = (self.def.driver_num, self.def.motor_num);
+        let vel = nint(velocity).unsigned_abs().min(MAX_VELOCITY as u32) as i64;
+        self.velocity_written = Some(vel);
+        self.lock()
+            .command(&format!("VEL A{d} {m}={vel}"))
+            .map(drop)
+    }
+
+    /// SET_VEL_BASE: on an 8753, `VEL` parked at max then `MPV`; an 8751
+    /// sends nothing. The record writes SET_VELOCITY first, so C's
+    /// VEL-at-max lands last and every 8753 move runs at 2000 steps/sec;
+    /// that defect is not copied: the velocity written is restored.
+    fn set_vel_base(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        if !self.is_8753() {
+            return Ok(());
+        }
+        let (d, m) = (self.def.driver_num, self.def.motor_num);
+        let mpv = nint(velocity).unsigned_abs().min((MAX_VELOCITY - 1) as u32) as i64;
+        let written = self.velocity_written.take();
+        let ctrl = self.lock();
+        // Each message goes out whatever the one before returned
+        // (motordrvCom.cc:397-484), and the base velocity's statuses are
+        // not the move's.
+        let _ = ctrl.command(&format!("VEL A{d} {m}={MAX_VELOCITY}"));
+        let _ = ctrl.command(&format!("MPV A{d} {m}={mpv}"));
+        if let Some(vel) = written {
+            let _ = ctrl.command(&format!("VEL A{d} {m}={vel}"));
+        }
+        Ok(())
+    }
+
+    /// SET_ACCEL: `ACC`, clamped to `[MIN_ACCEL, MAX_ACCEL]`.
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        let (d, m) = (self.def.driver_num, self.def.motor_num);
+        let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
+        self.lock()
+            .command(&format!("ACC A{d} {m}={accel}"))
+            .map(drop)
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let d = self.def.driver_num;
         let target = nint(position) as i64;
-        let prem = self.strings.arm();
+        let prem = self.arm();
         let ctrl = self.lock();
-        let _ = self.send_speed(&ctrl, min_velocity, velocity, acceleration);
         let _ = Self::send_prem(&ctrl, &prem);
         if self.is_8753() {
             // Open loop: no absolute command — move relative to the
@@ -526,43 +530,24 @@ impl AsynMotor for PmncAxis {
         ctrl.command(&format!("GO A{d}")).map(drop)
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         let d = self.def.driver_num;
         let rel = nint(distance) as i64;
-        let prem = self.strings.arm();
+        let prem = self.arm();
         let ctrl = self.lock();
-        let _ = self.send_speed(&ctrl, min_velocity, velocity, acceleration);
         let _ = Self::send_prem(&ctrl, &prem);
         let _ = ctrl.command(&format!("REL A{d}={rel}"));
         ctrl.command(&format!("GO A{d}")).map(drop)
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         let (d, m) = (self.def.driver_num, self.def.motor_num);
-        let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
         let velval = nint(velocity).unsigned_abs().min(MAX_VELOCITY as u32) as i64;
         let forward = velocity >= 0.0;
         // C hangs POST off the first jog message, and the GO message's
         // VELOCITY node replaces it, so C never sends it; not copied.
-        let prem = self.strings.arm();
+        let prem = self.arm();
         let ctrl = self.lock();
-        // The record's SET_VEL_BASE and SET_ACCEL ahead of JOG
-        // (motorRecord.cc:2140-2142).
-        self.send_vel_base(&ctrl, min_velocity);
-        let _ = ctrl.command(&format!("ACC A{d} {m}={accel}"));
         let _ = Self::send_prem(&ctrl, &prem);
         if self.is_8753() {
             // Native slew commands.
@@ -581,26 +566,18 @@ impl AsynMotor for PmncAxis {
         ctrl.command(&format!("GO A{d}")).map(drop)
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C sends no command for HOME_FOR/HOME_REV (the FIN/RIN paths are
         // commented out) — homing is a silent no-op (module Deviations) but
-        // for the record's speed parts and its PREM. C hangs POST off a
+        // for its PREM. C hangs POST off a
         // message it never sends; not copied, POST goes at the next poll
         // that sees the axis done.
-        let prem = self.strings.arm();
+        let prem = self.arm();
         let ctrl = self.lock();
-        let speed = self.send_speed(&ctrl, min_velocity, velocity, acceleration);
-        Self::send_prem(&ctrl, &prem).unwrap_or(speed)
+        Self::send_prem(&ctrl, &prem).unwrap_or(Ok(()))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C STOP_AXIS: HAL (smooth stop).
         let d = self.def.driver_num;
         let ctrl = self.lock();
@@ -841,7 +818,8 @@ impl AsynMotor for PmncAxis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// An 8752 with one 8751 module on a [`LineRig`] whose `STA` byte is
@@ -902,8 +880,10 @@ mod tests {
     fn a_zero_rate_move_has_no_acc() {
         let (line, mut axis, _) = strings_rig("pmncZeroAcc");
         let user = AsynUser::default();
-        axis.move_absolute(&user, 5.0, 0.0, 100.0, 0.0).unwrap();
-        axis.move_relative(&user, 5.0, 0.0, 100.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 0.0)
+            .unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 0.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             [
@@ -921,9 +901,10 @@ mod tests {
     fn record_steps_go_out_with_c_nint() {
         let (line, mut axis, _) = strings_rig("pmncSteps");
         let user = AsynUser::default();
-        axis.move_absolute(&user, 4000.5, 0.0, 4000.4, 200.0)
+        axis.record_move_absolute(&user, 4000.5, 0.0, 4000.4, 200.0)
             .unwrap();
-        axis.move_relative(&user, -2.5, 0.0, 100.0, 200.0).unwrap();
+        axis.record_move_relative(&user, -2.5, 0.0, 100.0, 200.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             [
@@ -949,7 +930,7 @@ mod tests {
         let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
         let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(1);
         line.sent();
-        axis.move_velocity(&AsynUser::default(), 50.0, -100.0, 200.0)
+        axis.record_jog(&AsynUser::default(), 50.0, -100.0, 200.0)
             .unwrap();
         assert_eq!(
             line.sent(),
@@ -982,11 +963,13 @@ mod tests {
         let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(1);
         line.sent();
         let user = AsynUser::default();
-        axis.move_relative(&user, 5.0, 50.0, 100.0, 200.0).unwrap();
-        axis.move_velocity(&user, 50.0, -100.0, 200.0).unwrap();
+        axis.record_move_relative(&user, 5.0, 50.0, 100.0, 200.0)
+            .unwrap();
+        axis.record_jog(&user, 50.0, -100.0, 200.0).unwrap();
         assert_eq!(
             line.sent(),
             [
+                "VEL A0 1=100",
                 "VEL A0 1=2000",
                 "MPV A0 1=50",
                 "VEL A0 1=100",
@@ -1025,7 +1008,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"MOF A0")))
             .unwrap();
-        axis.move_relative(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 200.0)
+            .unwrap();
         line.sent();
         axis.polled(&user).unwrap();
         let sent = line.sent();
@@ -1043,7 +1027,8 @@ mod tests {
         let (line, mut axis, _) = strings_rig("pmncPrem");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"SER A0", None).unwrap();
-        axis.move_absolute(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 200.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             [
@@ -1054,18 +1039,19 @@ mod tests {
                 "GO A0"
             ]
         );
-        axis.move_relative(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 200.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             ["VEL A0 0=100", "ACC A0 0=200", "REL A0=5", "GO A0"]
         );
         axis.set_move_strings(&user, b"SER A0", None).unwrap();
-        axis.home(&user, 0.0, 100.0, 200.0, true).unwrap();
+        axis.record_home(&user, 0.0, 100.0, 200.0, true).unwrap();
         assert_eq!(line.sent(), ["VEL A0 0=100", "ACC A0 0=200", "SER A0"]);
-        axis.home(&user, 0.0, 100.0, 0.0, true).unwrap();
+        axis.record_home(&user, 0.0, 100.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["VEL A0 0=100"]);
         axis.set_move_strings(&user, b"SER A0", None).unwrap();
-        axis.move_velocity(&user, 0.0, -100.0, 200.0).unwrap();
+        axis.record_jog(&user, 0.0, -100.0, 200.0).unwrap();
         assert_eq!(
             line.sent(),
             [
@@ -1088,9 +1074,10 @@ mod tests {
             axis.set_move_strings(&user, b"", Some(post(b"NOS A0")))
                 .unwrap();
             if jog {
-                axis.move_velocity(&user, 0.0, 100.0, 200.0).unwrap();
+                axis.record_jog(&user, 0.0, 100.0, 200.0).unwrap();
             } else {
-                axis.move_relative(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+                axis.record_move_relative(&user, 5.0, 0.0, 100.0, 200.0)
+                    .unwrap();
             }
             line.sent();
             sta.store(S8751_POWER_ON, Ordering::SeqCst);
@@ -1108,7 +1095,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"NOS A0")))
             .unwrap();
-        axis.move_relative(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 200.0)
+            .unwrap();
         line.sent();
         sta.store(S8751_POWER_ON | S8751_FOR_LIMIT, Ordering::SeqCst);
         assert_eq!(poll_extra(&line, &mut axis), ["NOS A0"]);

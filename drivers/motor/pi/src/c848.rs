@@ -90,11 +90,12 @@
 //!   query (`exchange`), a superset of C's error-path flush.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -285,7 +286,7 @@ struct PolledStatus {
     low_limit: bool,
 }
 
-/// One axis (`A`-`D`) of a C-848 controller. Implements [`AsynMotor`].
+/// One axis (`A`-`D`) of a C-848 controller. Implements [`Model1Motor`].
 pub struct PIC848Axis {
     controller: Arc<Mutex<PIC848Controller>>,
     /// The `PIC848Config` card, named in the motion-timeout message.
@@ -403,79 +404,66 @@ impl Model1Motor for PIC848Axis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for PIC848Axis {
+    /// `update_delay` is 0 (`targs`, drvPIC848.cc:129).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY: `VEL  L {v}`. motordrvCom sends each message whatever
+    /// the one before returned (motordrvCom.cc:397-484).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let l = self.letter;
+        let _ = self
+            .lock()
+            .send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
+        Ok(())
+    }
+
+    /// A DC-motor leftover: SET_VEL_BASE sends nothing.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// The PIC848 does not support acceleration commands.
+    fn set_accel(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let l = self.letter;
         self.no_motion_count = 0;
         let line = self.move_line(&format!("MOV  {l}{:.5}", CFloat(position * POS_RES)));
-        let ctrl = self.lock();
-        // SET_VELOCITY ("VEL  L {v}") then MOVE_ABS ("MOV  L{p}") — two writes;
-        // motordrvCom sends each whatever the one before returned
-        // (motordrvCom.cc:397-484).
-        let _ = ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
-        ctrl.send_bytes(&line)
+        self.lock().send_bytes(&line)
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         let l = self.letter;
         self.no_motion_count = 0;
         let line = self.move_line(&format!("MVR  {l}{:+.5}", CFloat(distance * POS_RES)));
-        let ctrl = self.lock();
-        let _ = ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
-        ctrl.send_bytes(&line)
+        self.lock().send_bytes(&line)
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         // JOG: "VEL  L{v}" (no space after L, signed value). No SET_VELOCITY.
         let l = self.letter;
         let line = self.move_line(&format!("VEL  {l}{:.5}", CFloat(velocity * POS_RES)));
         self.lock().send_bytes(&line)
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // Both HOME_FOR/HOME_REV send "REF  L" after SET_VELOCITY.
         let l = self.letter;
         self.no_motion_count = 0;
         let line = self.move_line(&format!("REF  {l}"));
-        let ctrl = self.lock();
-        let _ = ctrl.send(&format!("VEL  {l} {:.5}", CFloat(velocity * POS_RES)));
-        ctrl.send_bytes(&line)
+        self.lock().send_bytes(&line)
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let l = self.letter;
         self.lock().send(&format!("HLT  {l}"))
     }
@@ -608,7 +596,8 @@ impl PIC848Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
@@ -624,10 +613,10 @@ mod tests {
             f(&mut axis);
             sent.extend(line.sent().into_iter().map(|w| w + "|"));
         };
-        run(&mut |a| drop(a.move_absolute(&user, nan, 0.0, neg, 0.0)));
-        run(&mut |a| drop(a.move_relative(&user, nan, 0.0, 1.0, 0.0)));
-        run(&mut |a| drop(a.move_velocity(&user, 0.0, neg, 0.0)));
-        run(&mut |a| drop(a.home(&user, 0.0, nan, 0.0, true)));
+        run(&mut |a| drop(a.record_move_absolute(&user, nan, 0.0, neg, 0.0)));
+        run(&mut |a| drop(a.record_move_relative(&user, nan, 0.0, 1.0, 0.0)));
+        run(&mut |a| drop(a.record_jog(&user, 0.0, neg, 0.0)));
+        run(&mut |a| drop(a.record_home(&user, 0.0, nan, 0.0, true)));
         run(&mut |a| drop(a.set_position(&user, neg)));
         run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Proportional, nan)));
         run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Integral, neg)));
@@ -694,9 +683,11 @@ mod tests {
             cmd.starts_with("VEL  A ") || cmd == "CLR  A" || cmd == "REF  A"
         });
         let user = AsynUser::default();
-        axis.move_absolute(&user, 1.0, 0.0, 2.0, 0.0).unwrap();
-        axis.move_relative(&user, -1.0, 0.0, 2.0, 0.0).unwrap();
-        assert!(axis.home(&user, 0.0, 2.0, 0.0, true).is_err());
+        axis.record_move_absolute(&user, 1.0, 0.0, 2.0, 0.0)
+            .unwrap();
+        axis.record_move_relative(&user, -1.0, 0.0, 2.0, 0.0)
+            .unwrap();
+        assert!(axis.record_home(&user, 0.0, 2.0, 0.0, true).is_err());
         axis.last_status.powered = false;
         axis.set_closed_loop(&user, true).unwrap();
         let sent: Vec<String> = line.sent().iter().map(|c| c[..4].to_string()).collect();
@@ -741,15 +732,17 @@ mod tests {
         let (line, mut axis, _) = strings_rig("pic848Prem");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"SVO  #1", None).unwrap();
-        axis.move_absolute(&user, 1000.0, 0.0, 10.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 1000.0, 0.0, 10.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["VEL  A 0.00001", "SVO  A1;MOV  A0.00100"]);
-        axis.move_relative(&user, 1000.0, 0.0, 10.0, 0.0).unwrap();
+        axis.record_move_relative(&user, 1000.0, 0.0, 10.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["VEL  A 0.00001", "MVR  A+0.00100"]);
         axis.set_move_strings(&user, b"SVO  #1", None).unwrap();
-        axis.home(&user, 0.0, 10.0, 0.0, true).unwrap();
+        axis.record_home(&user, 0.0, 10.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["VEL  A 0.00001", "SVO  A1;REF  A"]);
         axis.set_move_strings(&user, b"SVO  #1", None).unwrap();
-        axis.move_velocity(&user, 0.0, -10.0, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, -10.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["SVO  A1;VEL  A-0.00001"]);
     }
 
@@ -761,7 +754,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"SVO A0")))
             .unwrap();
-        axis.move_absolute(&user, 1000.0, 0.0, 10.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 1000.0, 0.0, 10.0, 0.0)
+            .unwrap();
         line.sent();
         sta.store(MOVING, Ordering::SeqCst);
         assert!(poll_extra(&line, &mut axis).is_empty());
@@ -777,7 +771,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"SVO A0")))
             .unwrap();
-        axis.move_absolute(&user, -1000.0, 0.0, 10.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, -1000.0, 0.0, 10.0, 0.0)
+            .unwrap();
         line.sent();
         sta.store(MOVING_LOW_LS, Ordering::SeqCst);
         assert_eq!(poll_extra(&line, &mut axis), ["SVO A0"]);
@@ -872,7 +867,8 @@ mod tests {
         for _ in 0..20 {
             assert!(poll_extra(&line, &mut axis).is_empty());
         }
-        axis.move_absolute(&user, 0.0, 0.0, 1.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 0.0, 0.0, 1.0, 0.0)
+            .unwrap();
         line.sent();
         let mut cdir = true;
         for poll in 1..=11 {

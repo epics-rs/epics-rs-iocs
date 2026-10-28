@@ -76,11 +76,12 @@
 //!   primitive).
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -231,7 +232,7 @@ struct PolledStatus {
     low_limit: bool,
 }
 
-/// One axis (`1`-`4`) of a C-844 controller. Implements [`AsynMotor`].
+/// One axis (`1`-`4`) of a C-844 controller. Implements [`Model1Motor`].
 pub struct PIC844Axis {
     controller: Arc<Mutex<PIC844Controller>>,
     /// Wire axis number (`signal + 1`, i.e. `1`-`4`).
@@ -243,6 +244,9 @@ pub struct PIC844Axis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// The record's SET_VELOCITY/SET_ACCEL pieces of the transaction under
+    /// way (`build_trans` appends them), which the move command flushes.
+    parts: String,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
     init_status: Option<AsynResult<MotorStatus>>,
 }
@@ -263,6 +267,7 @@ impl PIC844Axis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            parts: String::new(),
             init_status: None,
         };
         axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
@@ -281,7 +286,8 @@ impl PIC844Axis {
     /// One move transaction: the axis prefix and the record's earlier parts,
     /// then PREM and a `;` ahead of the move's own command
     /// (devPIC844.cc:188-197), whose POST waits for the move to end.
-    fn write_move(&mut self, parts: &str, command: &str) -> AsynResult<()> {
+    fn write_move(&mut self, command: &str) -> AsynResult<()> {
+        let parts = std::mem::take(&mut self.parts);
         let mut line = format!("{}{parts}", self.prefix()).into_bytes();
         let prem = self.strings.arm();
         if !prem.is_empty() {
@@ -290,16 +296,6 @@ impl PIC844Axis {
         }
         line.extend_from_slice(command.as_bytes());
         self.lock().send_bytes(&line)
-    }
-
-    /// The `MVEL {v};[ACC {a};]` move/home preamble (C `SET_VELOCITY` +
-    /// `SET_ACCEL` when `acc > 0`).
-    fn move_preamble(velocity: f64, acceleration: f64) -> String {
-        let mut p = format!("MVEL {:.2};", CFloat(velocity));
-        if acceleration > 0.0 {
-            p.push_str(&format!("ACC {:.2};", CFloat(acceleration)));
-        }
-        p
     }
 
     fn apply(&mut self, polled: PolledStatus) {
@@ -335,65 +331,53 @@ impl Model1Motor for PIC844Axis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for PIC844Axis {
+    /// `update_delay` is 0 (`targs`, drvPIC844.cc:138).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let body = Self::move_preamble(velocity, acceleration);
-        self.write_move(&body, &format!("TARG {:.2}", CFloat(position)))
+    /// SET_VELOCITY: `MVEL` joins the transaction (devPIC844.cc).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.parts
+            .push_str(&format!("MVEL {:.2};", CFloat(velocity)));
+        Ok(())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let body = Self::move_preamble(velocity, acceleration);
-        self.write_move(&body, &format!("TARG:RPOS {:+.2}", CFloat(distance)))
+    /// The C-844 has no base velocity: SET_VEL_BASE builds nothing.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        // Jog: SET_ACCEL unconditional (motorRecord), then TARG:VEL (signed).
-        self.write_move(
-            &format!("ACC {:.2};", CFloat(acceleration)),
-            &format!("TARG:VEL {:.2}", CFloat(velocity)),
-        )
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.parts
+            .push_str(&format!("ACC {:.2};", CFloat(acceleration)));
+        Ok(())
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
-        let body = Self::move_preamble(velocity, acceleration);
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.write_move(&format!("TARG {:.2}", CFloat(position)))
+    }
+
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.write_move(&format!("TARG:RPOS {:+.2}", CFloat(distance)))
+    }
+
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        // Jog: the record's SET_ACCEL, then TARG:VEL (signed).
+        self.write_move(&format!("TARG:VEL {:.2}", CFloat(velocity)))
+    }
+
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let dir = if forward { "POS" } else { "NEG" };
-        self.write_move(&body, &format!("TARG:FIND {dir}"))
+        self.write_move(&format!("TARG:FIND {dir}"))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let pre = self.prefix();
         self.lock().send(&format!("{pre}HALT"))
     }
@@ -478,7 +462,8 @@ impl AsynMotor for PIC844Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
@@ -494,10 +479,10 @@ mod tests {
             f(&mut axis);
             sent.extend(line.sent().into_iter().map(|w| w + "|"));
         };
-        run(&mut |a| drop(a.move_absolute(&user, nan, 0.0, neg, 1.0)));
-        run(&mut |a| drop(a.move_relative(&user, nan, 0.0, 1.0, 1.0)));
-        run(&mut |a| drop(a.move_relative(&user, neg, 0.0, 1.0, 1.0)));
-        run(&mut |a| drop(a.move_velocity(&user, 0.0, neg, nan)));
+        run(&mut |a| drop(a.record_move_absolute(&user, nan, 0.0, neg, 1.0)));
+        run(&mut |a| drop(a.record_move_relative(&user, nan, 0.0, 1.0, 1.0)));
+        run(&mut |a| drop(a.record_move_relative(&user, neg, 0.0, 1.0, 1.0)));
+        run(&mut |a| drop(a.record_jog(&user, 0.0, neg, nan)));
         run(&mut |a| drop(a.set_position(&user, nan)));
         run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Proportional, nan)));
         run(&mut |a| drop(a.set_pid_gain(&user, PidGainKind::Integral, neg)));
@@ -573,21 +558,23 @@ mod tests {
         let (line, mut axis, _) = strings_rig("pic844Prem");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"AXIS:STAT ON", None).unwrap();
-        axis.move_absolute(&user, 5.0, 0.0, 1.0, 2.0).unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 1.0, 2.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             ["AXIS 1;MVEL 1.00;ACC 2.00;AXIS:STAT ON;TARG 5.00"]
         );
-        axis.move_relative(&user, 5.0, 0.0, 1.0, 2.0).unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 1.0, 2.0)
+            .unwrap();
         assert_eq!(line.sent(), ["AXIS 1;MVEL 1.00;ACC 2.00;TARG:RPOS +5.00"]);
         axis.set_move_strings(&user, b"AXIS:STAT ON", None).unwrap();
-        axis.home(&user, 0.0, 1.0, 2.0, false).unwrap();
+        axis.record_home(&user, 0.0, 1.0, 2.0, false).unwrap();
         assert_eq!(
             line.sent(),
             ["AXIS 1;MVEL 1.00;ACC 2.00;AXIS:STAT ON;TARG:FIND NEG"]
         );
         axis.set_move_strings(&user, b"AXIS:STAT ON", None).unwrap();
-        axis.move_velocity(&user, 0.0, -1.0, 2.0).unwrap();
+        axis.record_jog(&user, 0.0, -1.0, 2.0).unwrap();
         assert_eq!(line.sent(), ["AXIS 1;ACC 2.00;AXIS:STAT ON;TARG:VEL -1.00"]);
     }
 
@@ -599,7 +586,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"AXIS:STAT OFF")))
             .unwrap();
-        axis.move_absolute(&user, 5.0, 0.0, 1.0, 2.0).unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 1.0, 2.0)
+            .unwrap();
         line.sent();
         cond.store(MOVING, Ordering::SeqCst);
         assert!(poll_extra(&line, &mut axis).is_empty());
@@ -615,7 +603,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"AXIS:STAT OFF")))
             .unwrap();
-        axis.move_absolute(&user, -5.0, 0.0, 1.0, 2.0).unwrap();
+        axis.record_move_absolute(&user, -5.0, 0.0, 1.0, 2.0)
+            .unwrap();
         line.sent();
         cond.store(MOVING_LOW_LS, Ordering::SeqCst);
         assert_eq!(poll_extra(&line, &mut axis), ["AXIS:STAT OFF"]);
@@ -638,18 +627,15 @@ mod tests {
     #[test]
     fn move_message_is_one_prefixed_command() {
         // MVEL + ACC (accel>0) + TARG, all under one "AXIS n;".
-        let pre = "AXIS 2;";
-        let body = PIC844Axis::move_preamble(5.0, 2.0);
-        assert_eq!(
-            format!("{pre}{body}TARG {:.2}", 10.5),
-            "AXIS 2;MVEL 5.00;ACC 2.00;TARG 10.50"
-        );
+        let (line, mut axis, _) = strings_rig("c844OneMessage");
+        let user = AsynUser::default();
+        axis.record_move_absolute(&user, 10.5, 0.0, 5.0, 2.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["AXIS 1;MVEL 5.00;ACC 2.00;TARG 10.50"]);
         // accel <= 0 drops the ACC fragment (record guard).
-        let body0 = PIC844Axis::move_preamble(5.0, 0.0);
-        assert_eq!(
-            format!("{pre}{body0}TARG {:.2}", 10.5),
-            "AXIS 2;MVEL 5.00;TARG 10.50"
-        );
+        axis.record_move_absolute(&user, 10.5, 0.0, 5.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["AXIS 1;MVEL 5.00;TARG 10.50"]);
     }
 
     #[test]

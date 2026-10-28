@@ -89,11 +89,12 @@
 //! logic cover the same ground, as in the other PI ports.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -419,7 +420,7 @@ impl PIE710Controller {
     }
 }
 
-/// One axis of an E-710 controller. Implements [`AsynMotor`].
+/// One axis of an E-710 controller. Implements [`Model1Motor`].
 pub struct PIE710Axis {
     controller: Arc<Mutex<PIE710Controller>>,
     axis: usize,
@@ -495,74 +496,56 @@ impl Model1Motor for PIE710Axis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for PIE710Axis {
+    /// `update_delay` is 0 (`targs`, drvPIE710.cc:127).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY: `#SV` scaled by `POS_RES`. motordrvCom sends each
+    /// message whatever the one before returned (motordrvCom.cc:397-484).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let _ = self.lock().send(&sv_msg(self.label(), velocity * POS_RES));
+        Ok(())
+    }
+
+    /// A DC-motor leftover: SET_VEL_BASE sends nothing.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// The PIE710 does not support acceleration commands.
+    fn set_accel(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        let label = self.label();
-        let line = self.move_line(&ma_msg(label, position * POS_RES));
-        let ctrl = self.lock();
-        // motordrvCom sends each message whatever the one before returned
-        // (motordrvCom.cc:397-484).
-        let _ = ctrl.send(&sv_msg(label, velocity * POS_RES));
-        ctrl.send_bytes(&line)
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let line = self.move_line(&ma_msg(self.label(), position * POS_RES));
+        self.lock().send_bytes(&line)
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        let label = self.label();
-        let line = self.move_line(&mr_msg(label, distance * POS_RES));
-        let ctrl = self.lock();
-        let _ = ctrl.send(&sv_msg(label, velocity * POS_RES));
-        ctrl.send_bytes(&line)
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        let line = self.move_line(&mr_msg(self.label(), distance * POS_RES));
+        self.lock().send_bytes(&line)
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         // JOG: raw velocity, no `res` scaling, signed; single command.
         let line = self.move_line(&sv_msg(self.label(), velocity));
         self.lock().send_bytes(&line)
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C sends #GH regardless of direction, after the velocity.
-        let label = self.label();
-        let line = self.move_line(&substitute_axis("#GH,", label));
-        let ctrl = self.lock();
-        let _ = ctrl.send(&sv_msg(label, velocity * POS_RES));
-        ctrl.send_bytes(&line)
+        let line = self.move_line(&substitute_axis("#GH,", self.label()));
+        self.lock().send_bytes(&line)
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C STOP_AXIS → #MR0 (zero relative move; no stop command).
         let msg = substitute_axis("#MR0,", self.label());
         self.lock().send(&msg)
@@ -642,7 +625,8 @@ impl AsynMotor for PIE710Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
@@ -697,9 +681,11 @@ mod tests {
         let (line, mut axis, _) =
             refusing_rig("e710Refused", |cmd| cmd.starts_with("1SV") || cmd == "1GH,");
         let user = AsynUser::default();
-        axis.move_absolute(&user, 1.0, 0.0, 2.0, 0.0).unwrap();
-        axis.move_relative(&user, -1.0, 0.0, 2.0, 0.0).unwrap();
-        assert!(axis.home(&user, 0.0, 2.0, 0.0, true).is_err());
+        axis.record_move_absolute(&user, 1.0, 0.0, 2.0, 0.0)
+            .unwrap();
+        axis.record_move_relative(&user, -1.0, 0.0, 2.0, 0.0)
+            .unwrap();
+        assert!(axis.record_home(&user, 0.0, 2.0, 0.0, true).is_err());
         let sent: Vec<String> = line.sent().iter().map(|c| c[..3].to_string()).collect();
         assert_eq!(sent, ["1SV", "1MA", "1SV", "1MR", "1SV", "1GH"]);
     }
@@ -750,17 +736,17 @@ mod tests {
         let (line, mut axis, _) = rig("pie710Prem");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"#SL1", None).unwrap();
-        axis.move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
+        axis.record_move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
             .unwrap();
         assert_eq!(line.sent(), ["1SV0.50000,", "1SL1,1MA1.00000,"]);
-        axis.move_relative(&user, 10000.0, 0.0, 5000.0, 0.0)
+        axis.record_move_relative(&user, 10000.0, 0.0, 5000.0, 0.0)
             .unwrap();
         assert_eq!(line.sent(), ["1SV0.50000,", "1MR+1.00000,"]);
         axis.set_move_strings(&user, b"#SL1", None).unwrap();
-        axis.home(&user, 0.0, 3000.0, 0.0, true).unwrap();
+        axis.record_home(&user, 0.0, 3000.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["1SV0.30000,", "1SL1,1GH,"]);
         axis.set_move_strings(&user, b"#SL1", None).unwrap();
-        axis.move_velocity(&user, 0.0, -2.5, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, -2.5, 0.0).unwrap();
         assert_eq!(line.sent(), ["1SL1,1SV-2.50000,"]);
     }
 
@@ -772,7 +758,7 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"1SL0,")))
             .unwrap();
-        axis.move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
+        axis.record_move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
             .unwrap();
         line.sent();
         gi8.store(MOVING, Ordering::SeqCst);
@@ -788,13 +774,13 @@ mod tests {
     fn velocity_and_move_are_two_messages() {
         let (line, mut axis, _) = rig("pie710Split");
         let user = AsynUser::default();
-        axis.move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
+        axis.record_move_absolute(&user, 10000.0, 0.0, 5000.0, 0.0)
             .unwrap();
         assert_eq!(line.sent(), ["1SV0.50000,", "1MA1.00000,"]);
-        axis.move_relative(&user, -2500.0, 0.0, 1000.0, 0.0)
+        axis.record_move_relative(&user, -2500.0, 0.0, 1000.0, 0.0)
             .unwrap();
         assert_eq!(line.sent(), ["1SV0.10000,", "1MR-0.25000,"]);
-        axis.home(&user, 0.0, 3000.0, 0.0, false).unwrap();
+        axis.record_home(&user, 0.0, 3000.0, 0.0, false).unwrap();
         assert_eq!(line.sent(), ["1SV0.30000,", "1GH,"]);
     }
 

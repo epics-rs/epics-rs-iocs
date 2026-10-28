@@ -31,10 +31,10 @@
 //! ## Deviations from C (documented)
 //!
 //! - The C poller is a background thread; here the `R*` reads run inside
-//!   [`poll`](AsynMotor::poll).
+//!   [`poll`](Model1Motor::poll).
 //! - `HOME_FOR`/`HOME_REV` and the PID-gain commands are unsupported in C
-//!   (`build_trans` sends nothing and returns `ERROR`); [`home`](AsynMotor::home)
-//!   returns an error and [`set_pid_gain`](AsynMotor::set_pid_gain) is a no-op.
+//!   (`build_trans` sends nothing and returns `ERROR`); [`home`](Model1Motor::home)
+//!   returns an error and [`set_pid_gain`](Model1Motor::set_pid_gain) is a no-op.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -42,9 +42,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure,
-};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -233,7 +231,7 @@ impl SmartMotorController {
     }
 }
 
-/// One SmartMotor on the controller's port. Implements [`AsynMotor`].
+/// One SmartMotor on the controller's port. Implements [`Model1Motor`].
 pub struct SmartMotorAxis {
     controller: Arc<Mutex<SmartMotorController>>,
     axis: usize,
@@ -273,16 +271,6 @@ impl SmartMotorAxis {
     fn lock(&self) -> MutexGuard<'_, SmartMotorController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
-
-    /// Program speed/acceleration before a move (C sends `V=`/`A=` as separate
-    /// transactions ahead of the move command). The record skips SET_ACCEL
-    /// for a zero acceleration (motorRecord.cc:940); one sent is clamped.
-    fn program_speeds(ctrl: &SmartMotorController, axis: usize, velocity: f64, acceleration: f64) {
-        ctrl.send(axis, &format!("V={}", nint(velocity * VCONFAC)));
-        if acceleration > 0.0 {
-            ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
-        }
-    }
 }
 
 impl Model1Motor for SmartMotorAxis {
@@ -290,72 +278,62 @@ impl Model1Motor for SmartMotorAxis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for SmartMotorAxis {
+    /// `update_delay` is 0.1 s in `thread_args` (drvSmartMotor.cc:137).
+    fn update_delay(&self) -> Duration {
+        Duration::from_millis(100)
+    }
+
+    /// SET_VELOCITY: `V=` as its own message, ahead of a home's ERROR too.
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.lock()
+            .send(self.axis, &format!("V={}", nint(velocity * VCONFAC)));
+        Ok(())
+    }
+
+    /// SET_VEL_BASE: SmartMotor does not use base velocity.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// SET_ACCEL: `A=`, clamped.
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.lock()
+            .send(self.axis, &format!("A={}", clamped_accel(acceleration)));
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
         ctrl.send(self.axis, &format!("P={}", nint(position)));
         ctrl.send(self.axis, "G");
         Ok(())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
         ctrl.send(self.axis, &format!("D={}", nint(distance)));
         ctrl.send(self.axis, "G");
         Ok(())
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        // The record's unguarded SET_ACCEL (motorRecord.cc:2141), then C JOG:
-        // "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        // C JOG: "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
         let ctrl = self.lock();
-        ctrl.send(self.axis, &format!("A={}", clamped_accel(acceleration)));
         ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity * VCONFAC)));
         Ok(())
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C: Animatics SmartMotors do not use home positions (build_trans ERROR).
-        // C still sends the record's SET_VELOCITY V= ahead of that ERROR; not copied.
         Err(smartmotor_err("SmartMotor: homing is not supported"))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let ctrl = self.lock();
         ctrl.send(self.axis, "S");
         Ok(())
@@ -498,7 +476,8 @@ impl SmartMotorAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
 
     #[test]
     fn accel_clamps_to_minimum() {
@@ -694,7 +673,7 @@ mod tests {
 
         refuse.store(true, Ordering::Relaxed);
         let before = reads.load(Ordering::Relaxed);
-        axis.stop(&AsynUser::new(0), 0.0).unwrap();
+        axis.stop(&AsynUser::new(0)).unwrap();
         assert_eq!(reads.load(Ordering::Relaxed), before + 1, "the echo read");
     }
 
@@ -784,12 +763,13 @@ mod tests {
         let user = AsynUser::new(0);
         sent.lock().unwrap().clear();
 
-        axis.move_absolute(&user, 100.0, 0.0, 1000.0, 10_000.0)
+        axis.record_move_absolute(&user, 100.0, 0.0, 1000.0, 10_000.0)
             .unwrap();
-        axis.move_velocity(&user, 0.0, -1000.0, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, -1000.0, 0.0).unwrap();
         // devSmartMotor.cc:249-251: a zero velocity still goes out; the
         // record sends no zero acceleration.
-        axis.move_relative(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 0.0, 0.0)
+            .unwrap();
         let sent: Vec<_> = sent.lock().unwrap().drain(..).collect();
         assert_eq!(
             sent,

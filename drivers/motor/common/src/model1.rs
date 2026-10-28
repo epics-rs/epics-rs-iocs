@@ -8,9 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
-};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
@@ -352,7 +350,7 @@ impl Model1 {
 
 /// C `set_status` as `motor_init` calls it, into a fresh status, for
 /// [`init_read`] to take.
-pub fn init_poll(motor: &mut impl AsynMotor, user: &AsynUser) -> AsynResult<MotorStatus> {
+pub fn init_poll(motor: &mut impl Model1Motor, user: &AsynUser) -> AsynResult<MotorStatus> {
     let mut status = MotorStatus::default();
     motor.poll(user, &mut status).map(|()| status)
 }
@@ -385,7 +383,7 @@ pub struct MoveStrings {
 }
 
 impl MoveStrings {
-    /// `AsynMotor::set_move_strings`.
+    /// `Model1Motor::set_move_strings`.
     pub fn set(&mut self, prem: &[u8], post: Option<PostMessage>) {
         self.next = Some((prem.to_vec(), post));
     }
@@ -409,7 +407,7 @@ impl MoveStrings {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::error::AsynResult;
-    use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+    use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
     use epics_rs::asyn::user::AsynUser;
     use epics_rs::base::server::ioc_app::{InitHookState, init_hook_announce};
 
@@ -428,36 +426,28 @@ mod tests {
 
     /// At rest at 0 when its `motor_init` read it.
     impl Model1Motor for Card {
-        fn take_init_status(&mut self) -> MotorStatus {
-            MotorStatus::default()
-        }
-    }
-
-    impl AsynMotor for Card {
-        fn move_absolute(
-            &mut self,
-            _: &AsynUser,
-            _: f64,
-            _: f64,
-            _: f64,
-            _: f64,
-        ) -> AsynResult<()> {
+        fn set_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
             Ok(())
         }
-        fn move_relative(
-            &mut self,
-            _: &AsynUser,
-            _: f64,
-            _: f64,
-            _: f64,
-            _: f64,
-        ) -> AsynResult<()> {
+        fn set_vel_base(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
             Ok(())
         }
-        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+        fn set_accel(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
             Ok(())
         }
-        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+        fn move_absolute(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_relative(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn move_velocity(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            Ok(())
+        }
+        fn home(&mut self, _: &AsynUser, _: bool) -> AsynResult<()> {
+            Ok(())
+        }
+        fn stop(&mut self, _: &AsynUser) -> AsynResult<()> {
             Ok(())
         }
         fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
@@ -470,6 +460,12 @@ mod tests {
             self.log.lock().unwrap().push(self.card);
             *status = MotorStatus::default();
             Ok(())
+        }
+        fn take_init_status(&mut self) -> MotorStatus {
+            MotorStatus::default()
+        }
+        fn update_delay(&self) -> Duration {
+            Duration::ZERO
         }
     }
 

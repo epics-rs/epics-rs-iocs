@@ -41,15 +41,16 @@
 //! ## Deviations from C (documented)
 //!
 //! - The C poller is a background thread; here the per-mode query set runs
-//!   inside [`poll`](AsynMotor::poll).
+//!   inside [`poll`](Model1Motor::poll).
 //! - The C `set_status` velocity readback is marked `NEEDS WORK` and reports the
 //!   feedback velocity `?FVEL`; this port reports the same.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -118,12 +119,6 @@ impl CommandMode {
             _ => CommandMode::Buffer,
         }
     }
-}
-
-/// The SET_ACCEL the record sends ahead of a move or home: none unless the
-/// rate is positive (motorRecord.cc:874); a jog's goes at any (:2141).
-fn move_accel(acceleration: f64) -> Option<f64> {
-    (acceleration > 0.0).then_some(acceleration)
 }
 
 fn spiiplus_err(message: impl Into<String>) -> AsynError {
@@ -289,7 +284,7 @@ fn decode_status(
     }
 }
 
-/// One SPiiPlus axis sharing a controller. Implements [`AsynMotor`].
+/// One SPiiPlus axis sharing a controller. Implements [`Model1Motor`].
 pub struct SpiiPlusAxis {
     controller: Arc<Mutex<SpiiPlusController>>,
     /// 0-based axis index (used directly on the wire).
@@ -302,6 +297,9 @@ pub struct SpiiPlusAxis {
     failure: PollFailure,
     last_status: MotorStatus,
     strings: MoveStrings,
+    /// SET_VELOCITY and SET_ACCEL the record wrote since the last message,
+    /// which C `build_trans` appends ahead of PREM in the move's message.
+    speeds: (Option<f64>, Option<f64>),
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
     init_status: Option<AsynResult<MotorStatus>>,
 }
@@ -322,6 +320,7 @@ impl SpiiPlusAxis {
                 ..MotorStatus::default()
             },
             strings: MoveStrings::default(),
+            speeds: (None, None),
             init_status: None,
         };
         axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
@@ -337,14 +336,9 @@ impl SpiiPlusAxis {
     /// Buffer mode when the record sends it, PREM and `;`
     /// (devSPiiPlus.cc:187-203), then `body`. In Buffer mode `start` follows
     /// alone, as GO or JOG end the message there.
-    fn transaction(
-        &mut self,
-        velocity: Option<f64>,
-        acceleration: Option<f64>,
-        body: &str,
-        start: &str,
-    ) -> AsynResult<()> {
+    fn transaction(&mut self, body: &str, start: &str) -> AsynResult<()> {
         let prem = self.strings.arm();
+        let (velocity, acceleration) = std::mem::take(&mut self.speeds);
         let ctrl = self.lock();
         let a = self.axis;
         let buffer = matches!(ctrl.mode, CommandMode::Buffer);
@@ -375,21 +369,35 @@ impl Model1Motor for SpiiPlusAxis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for SpiiPlusAxis {
+    /// `update_delay` is 0.010 s in `thread_args` (drvSPiiPlus.cc).
+    fn update_delay(&self) -> Duration {
+        Duration::from_millis(10)
+    }
+
+    /// SET_VELOCITY: `VEL` leads the move's message (devSPiiPlus.cc:250).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.speeds.0 = Some(velocity);
+        Ok(())
+    }
+
+    /// SET_VEL_BASE: SPiiPlus does not use base velocity.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// SET_ACCEL: `ACC` in Buffer mode only, left to the controller MMI in
+    /// Direct mode (devSPiiPlus.cc:253-258).
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.speeds.1 = Some(acceleration);
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let a = self.axis;
         let p = nint(position);
         let body = match self.lock().mode {
@@ -398,22 +406,10 @@ impl AsynMotor for SpiiPlusAxis {
             }
             CommandMode::Connect | CommandMode::Direct => format!("ptp ({a}), {p};"),
         };
-        self.transaction(
-            Some(velocity),
-            move_accel(acceleration),
-            &body,
-            &format!("start {a}, 1"),
-        )
+        self.transaction(&body, &format!("start {a}, 1"))
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         let a = self.axis;
         let d = nint(distance);
         let body = match self.lock().mode {
@@ -422,22 +418,10 @@ impl AsynMotor for SpiiPlusAxis {
             }
             CommandMode::Connect | CommandMode::Direct => format!("ptp/r ({a}), {d};"),
         };
-        self.transaction(
-            Some(velocity),
-            move_accel(acceleration),
-            &body,
-            &format!("start {a}, 1"),
-        )
+        self.transaction(&body, &format!("start {a}, 1"))
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        // The record's jog sends SET_ACCEL and JOG, no SET_VELOCITY.
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         let a = self.axis;
         let v = nint(velocity);
         let body = match self.lock().mode {
@@ -446,17 +430,10 @@ impl AsynMotor for SpiiPlusAxis {
             }
             CommandMode::Connect | CommandMode::Direct => format!("jog/v ({a}), {v};"),
         };
-        self.transaction(None, Some(acceleration), &body, &format!("start {a},1"))
+        self.transaction(&body, &format!("start {a},1"))
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         // The record's home ends in GO: in Buffer mode it starts the axis
         // buffer; in Direct/Connect mode HOME adds nothing, so C sends only
         // VEL and PREM and the axis reports done in place.
@@ -468,15 +445,10 @@ impl AsynMotor for SpiiPlusAxis {
             }
             CommandMode::Connect | CommandMode::Direct => String::new(),
         };
-        self.transaction(
-            Some(velocity),
-            move_accel(acceleration),
-            &body,
-            &format!("start {a}, 1"),
-        )
+        self.transaction(&body, &format!("start {a}, 1"))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let ctrl = self.lock();
         let a = self.axis;
         match ctrl.mode {
@@ -612,6 +584,7 @@ impl AsynMotor for SpiiPlusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::RecordWrites;
 
     #[test]
     fn mode_parse_is_case_insensitive_and_defaults_to_buffer() {
@@ -772,7 +745,7 @@ mod tests {
     }
 
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
 
     /// Axis 0 of a controller in `mode` on a [`LineRig`].
     fn rig(name: &str, mode: CommandMode) -> (LineRig, SpiiPlusAxis) {
@@ -817,7 +790,7 @@ mod tests {
     #[test]
     fn a_buffer_home_programs_and_starts_the_axis_buffer() {
         let (line, mut axis) = rig("spiiHome", CommandMode::Buffer);
-        axis.home(&AsynUser::default(), 0.0, 100.0, 50.0, true)
+        axis.record_home(&AsynUser::default(), 0.0, 100.0, 50.0, true)
             .unwrap();
         assert_eq!(
             line.sent(),
@@ -834,7 +807,8 @@ mod tests {
             cmd.starts_with("VEL0=") || cmd == "start 0,1"
         });
         let user = AsynUser::default();
-        axis.move_absolute(&user, 7.0, 0.0, 100.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 7.0, 0.0, 100.0, 0.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             [
@@ -842,7 +816,7 @@ mod tests {
                 "start 0, 1"
             ]
         );
-        assert!(axis.move_velocity(&user, 0.0, 10.0, 0.0).is_err());
+        assert!(axis.record_jog(&user, 0.0, 10.0, 0.0).is_err());
         assert_eq!(
             line.sent(),
             ["ACC0=0;Done(0)=0;jog_vel(0)=10; opReq(0)=3;", "start 0,1"]
@@ -853,7 +827,7 @@ mod tests {
     #[test]
     fn a_zero_acceleration_sends_no_acc() {
         let (line, mut axis) = rig("spiiNoAcc", CommandMode::Buffer);
-        axis.move_absolute(&AsynUser::default(), 7.0, 0.0, 100.0, 0.0)
+        axis.record_move_absolute(&AsynUser::default(), 7.0, 0.0, 100.0, 0.0)
             .unwrap();
         assert_eq!(
             line.sent(),
@@ -868,14 +842,14 @@ mod tests {
     #[test]
     fn a_jog_carries_the_records_acc_in_buffer_mode_only() {
         let (line, mut axis) = rig("spiiJogBuf", CommandMode::Buffer);
-        axis.move_velocity(&AsynUser::default(), 0.0, -20.0, 5.0)
+        axis.record_jog(&AsynUser::default(), 0.0, -20.0, 5.0)
             .unwrap();
         assert_eq!(
             line.sent(),
             ["ACC0=5;Done(0)=0;jog_vel(0)=-20; opReq(0)=3;", "start 0,1"]
         );
         let (line, mut axis) = rig("spiiJogDir", CommandMode::Direct);
-        axis.move_velocity(&AsynUser::default(), 0.0, -20.0, 5.0)
+        axis.record_jog(&AsynUser::default(), 0.0, -20.0, 5.0)
             .unwrap();
         assert_eq!(line.sent(), ["jog/v (0), -20;"]);
     }
@@ -885,7 +859,7 @@ mod tests {
     #[test]
     fn a_jog_sends_acc_at_a_zero_rate() {
         let (line, mut axis) = rig("spiiJogZeroAcc", CommandMode::Buffer);
-        axis.move_velocity(&AsynUser::default(), 0.0, -20.0, 0.0)
+        axis.record_jog(&AsynUser::default(), 0.0, -20.0, 0.0)
             .unwrap();
         assert_eq!(
             line.sent(),
@@ -934,7 +908,8 @@ mod tests {
 
         axis.set_move_strings(&user, b"P=1", Some(post(b"P=0")))
             .unwrap();
-        axis.move_relative(&user, 5.0, 0.0, 100.0, 50.0).unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             [
@@ -1030,7 +1005,7 @@ mod tests {
         let (line, mut axis) = rig("spiiHomeDir", CommandMode::Direct);
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"P=1", None).unwrap();
-        axis.home(&user, 0.0, 100.0, 50.0, false).unwrap();
+        axis.record_home(&user, 0.0, 100.0, 50.0, false).unwrap();
         assert_eq!(line.sent(), ["VEL0=100;P=1;"]);
     }
 }

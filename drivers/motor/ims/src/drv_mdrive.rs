@@ -9,11 +9,10 @@
 //! is done or runs into a limit (devMDrive.cc:187-207, drvMDrive.cc:399-406).
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
-};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_printf;
@@ -258,32 +257,9 @@ impl DrvMDriveAxis {
         Ok(())
     }
 
-    /// `SET_ACCEL`, then `D=A`.
-    fn accel(commands: &mut Vec<String>, acceleration: f64) {
-        commands.push(format!("A={}", nint(acceleration)));
-        commands.push("D=A".to_string());
-    }
-
-    /// The record's `SET_VELOCITY`, `SET_VEL_BASE`, `SET_ACCEL`, then
-    /// `motion`.
-    fn motion(
-        &mut self,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        motion: String,
-    ) -> AsynResult<()> {
-        let mut commands = vec![
-            format!("VM={}", nint(velocity)),
-            format!("VI={}", nint(min_velocity)),
-        ];
-        // A move's or home's SET_ACCEL only at a positive rate
-        // (motorRecord.cc:874); a jog's at any (:2141).
-        if acceleration > 0.0 {
-            Self::accel(&mut commands, acceleration);
-        }
-        commands.push(motion);
-        self.send_move(&commands)
+    /// A motion command, led by its PREM.
+    fn motion(&mut self, motion: String) -> AsynResult<()> {
+        self.send_move(&[motion])
     }
 }
 
@@ -292,69 +268,48 @@ impl Model1Motor for DrvMDriveAxis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for DrvMDriveAxis {
+    /// `update_delay` is 0 (`targs`, drvMDrive.cc:156).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send(&[format!("VM={}", nint(velocity))])
+    }
+
+    fn set_vel_base(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send(&[format!("VI={}", nint(velocity))])
+    }
+
+    /// SET_ACCEL: `A=` then `D=A`.
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.send(&[format!("A={}", nint(acceleration)), "D=A".to_string()])
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let motion = format!("MA {}", nint(position));
-        self.motion(min_velocity, velocity, acceleration, motion)
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.motion(format!("MA {}", nint(position)))
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let motion = format!("MR {}", nint(distance));
-        self.motion(min_velocity, velocity, acceleration, motion)
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.motion(format!("MR {}", nint(distance)))
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let mut commands = vec![format!("VI={}", nint(min_velocity))];
-        Self::accel(&mut commands, acceleration);
-        commands.push(format!("SL={}", nint(velocity)));
-        self.send_move(&commands)
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.motion(format!("SL={}", nint(velocity)))
     }
 
     /// devMDrive.cc sends the IM483's home command, ` F1000 0|1`, as is.
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let way = if forward { 0 } else { 1 };
-        self.motion(
-            min_velocity,
-            velocity,
-            acceleration,
-            format!(" F1000 {way}"),
-        )
+        self.motion(format!(" F1000 {way}"))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         self.send(&["SL 0".to_string()])
     }
 
@@ -459,7 +414,8 @@ impl AsynMotor for DrvMDriveAxis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct Rig {
@@ -506,7 +462,7 @@ mod tests {
 
         fn move_to(&mut self, position: f64) {
             self.axis
-                .move_absolute(&self.user, position, 1.0, 2.0, 0.0)
+                .record_move_absolute(&self.user, position, 1.0, 2.0, 0.0)
                 .unwrap();
         }
 
@@ -546,10 +502,10 @@ mod tests {
         r.move_to(50.0);
         assert_eq!(r.line.sent(), ["1VM=2", "1VI=1", "1MA 50"]);
         r.axis.set_move_strings(&r.user, b"DE=1", None).unwrap();
-        r.axis.home(&r.user, 1.0, 2.0, 0.0, true).unwrap();
+        r.axis.record_home(&r.user, 1.0, 2.0, 0.0, true).unwrap();
         assert_eq!(r.line.sent(), ["1VM=2", "1VI=1", "1DE=1  F1000 0"]);
         r.axis.set_move_strings(&r.user, b"DE=1", None).unwrap();
-        r.axis.move_velocity(&r.user, 1.0, 3.0, 0.0).unwrap();
+        r.axis.record_jog(&r.user, 1.0, 3.0, 0.0).unwrap();
         assert_eq!(r.line.sent(), ["1VI=1", "1A=0", "1D=A", "1DE=1 SL=3"]);
     }
 
@@ -558,7 +514,7 @@ mod tests {
     #[test]
     fn a_jog_sends_set_accel_at_a_zero_rate() {
         let mut r = Rig::new("mdrive_jog_accel");
-        r.axis.move_velocity(&r.user, 1.0, 3.0, 0.0).unwrap();
+        r.axis.record_jog(&r.user, 1.0, 3.0, 0.0).unwrap();
         assert_eq!(r.line.sent(), ["1VI=1", "1A=0", "1D=A", "1SL=3"]);
         r.move_to(100.0);
         assert_eq!(r.line.sent(), ["1VM=2", "1VI=1", "1MA 100"]);

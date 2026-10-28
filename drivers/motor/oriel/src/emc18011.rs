@@ -17,7 +17,7 @@
 //! [`Selection`]: a record's JOG, LOAD_POS, SET_VELOCITY or GET_INFO claims
 //! a free controller in `build_trans`, every command of a motor that does
 //! not hold it is deferred to the record's retries ([`Emc18011Build`]), and
-//! [`poll`](AsynMotor::poll) releases it when the motor stops (or hits a
+//! [`poll`](Model1Motor::poll) releases it when the motor stops (or hits a
 //! limit) and a valid position has been read. The `M<n>` C sends at the
 //! claim goes out ahead of the poller's first command for that motor.
 //!
@@ -38,9 +38,9 @@
 //! ## Deviations from C (documented)
 //!
 //! - The C poller is a background thread; here the `Z`/`A` reads run inside
-//!   [`poll`](AsynMotor::poll).
+//!   [`poll`](Model1Motor::poll).
 //! - Homing, PID gains, torque enable/disable and travel-limit setting are
-//!   unsupported in C (`build_trans` returns `ERROR`); [`home`](AsynMotor::home)
+//!   unsupported in C (`build_trans` returns `ERROR`); [`home`](Model1Motor::home)
 //!   returns an error, [`Emc18011Build`] refuses the limits, and the others
 //!   are no-ops.
 //! - `set_position` only supports zeroing (`CA`), matching C `LOAD_POS`.
@@ -48,11 +48,11 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -71,7 +71,7 @@ pub const DRIVE_RESOLUTION: f64 = 0.01;
 const READ_BUF: usize = 120;
 
 /// C `MOTION_DELAY` (drvEMC18011.cc:72), slept on entering RETRY and the
-/// `update_delay` between a motion and its first status (:148).
+/// `update_delay` of `targs` (:148).
 const MOTION_DELAY: Duration = Duration::from_millis(100);
 
 /// C's sleep in an unselected motor's `set_status` (drvEMC18011.cc:291).
@@ -334,7 +334,7 @@ impl BuildTrans for Emc18011Build {
     }
 }
 
-/// One EMC18011 axis sharing a controller. Implements [`AsynMotor`].
+/// One EMC18011 axis sharing a controller. Implements [`Model1Motor`].
 pub struct Emc18011Axis {
     controller: Arc<Mutex<Emc18011Controller>>,
     /// 0-based motor index (wire selection is `index + 1`).
@@ -346,10 +346,6 @@ pub struct Emc18011Axis {
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
     strings: MoveStrings,
-    /// When the last motion was dequeued (before its commands went out, C's
-    /// `tick`): C's motor task reads no status until
-    /// `MOTION_DELAY` (its `update_delay`) after it.
-    started: Option<Instant>,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
     init_status: Option<AsynResult<MotorStatus>>,
 }
@@ -366,7 +362,6 @@ impl Emc18011Axis {
             prev_position: 0.0,
             failure: PollFailure::NONE,
             strings: MoveStrings::default(),
-            started: None,
             init_status: None,
         };
         {
@@ -405,20 +400,16 @@ impl Emc18011Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Program the velocity, then send PREM and `move_str`, then `A` (which
-    /// both starts motion and returns an acknowledgment), after selecting
-    /// this motor.
-    fn issue_move(&mut self, velocity: f64, move_str: &str) -> AsynResult<()> {
-        let tick = Instant::now();
+    /// Send PREM and `move_str`, then `A` (which both starts motion and
+    /// returns an acknowledgment), after selecting this motor; the velocity
+    /// was the record's SET_VELOCITY.
+    fn issue_move(&mut self, move_str: &str) -> AsynResult<()> {
         let prem = self.strings.arm();
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
-        ctrl.send(vel_cmd(velocity * DRIVE_RESOLUTION).as_bytes());
         send_prem(&ctrl, &prem);
         ctrl.send(move_str.as_bytes());
         ctrl.send(b"A");
-        drop(ctrl);
-        self.started = Some(tick);
         Ok(())
     }
 }
@@ -435,9 +426,12 @@ impl Model1Motor for Emc18011Axis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, MotorStatus::default(), self.poll_failure())
     }
-}
 
-impl AsynMotor for Emc18011Axis {
+    /// `update_delay` is `MOTION_DELAY` (`targs`, drvEMC18011.cc:148).
+    fn update_delay(&self) -> Duration {
+        MOTION_DELAY
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
@@ -447,38 +441,36 @@ impl AsynMotor for Emc18011Axis {
         false
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        self.issue_move(velocity, &move_cmd('G', position * DRIVE_RESOLUTION))
+    /// SET_VELOCITY claims a free controller (devEMC18011.cc:206-231) and
+    /// programs the velocity.
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let mut ctrl = self.lock();
+        ctrl.select(self.index)?;
+        ctrl.send(vel_cmd(velocity * DRIVE_RESOLUTION).as_bytes());
+        Ok(())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        self.issue_move(velocity, &move_cmd('T', distance * DRIVE_RESOLUTION))
+    /// The EMC18011 does not use base velocity (devEMC18011.cc:289-291).
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    /// SET_ACCEL sends nothing (devEMC18011.cc:330-332).
+    fn set_accel(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.issue_move(&move_cmd('G', position * DRIVE_RESOLUTION))
+    }
+
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.issue_move(&move_cmd('T', distance * DRIVE_RESOLUTION))
+    }
+
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         // C hangs POST off the `V` message, and the direction message's
         // VELOCITY node replaces it, so C never sends it; not copied.
-        let tick = Instant::now();
         let prem = self.strings.arm();
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
@@ -489,19 +481,10 @@ impl AsynMotor for Emc18011Axis {
         // Direction character: '>' unless C's NINT(steps/s) is negative.
         let dir = if nint(velocity) >= 0 { ">" } else { "<" };
         ctrl.send(dir.as_bytes());
-        drop(ctrl);
-        self.started = Some(tick);
         Ok(())
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C HOME_FOR/HOME_REV ERROR (devEMC18011.cc:298-301) leaves the
         // record DMOV=0 forever; not copied. Its SET_VELOCITY claimed the
         // controller, which C's GO poll releases; released here.
@@ -513,7 +496,7 @@ impl AsynMotor for Emc18011Axis {
         Err(oriel_err("EMC18011: homing is not supported"))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let mut ctrl = self.lock();
         // Only the selected (moving) motor can be stopped; otherwise no-op.
         if ctrl.selection.holds(self.index) {
@@ -572,9 +555,6 @@ impl AsynMotor for Emc18011Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
-        if let Some(started) = self.started.take() {
-            sleep(MOTION_DELAY.saturating_sub(started.elapsed()));
-        }
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -646,7 +626,8 @@ impl AsynMotor for Emc18011Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::Mutex as StdMutex;
 
     /// Motor 1 of a controller on a [`LineRig`] whose `Z` reply is `z`.
@@ -713,12 +694,14 @@ mod tests {
         let (line, mut axis, _) = strings_rig("emcPrem");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"CA", None).unwrap();
-        axis.move_absolute(&user, 150.0, 0.0, 200.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 150.0, 0.0, 200.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["M1", "V2.00", "CA", "G1.5", "A"]);
-        axis.move_relative(&user, 150.0, 0.0, 200.0, 0.0).unwrap();
+        axis.record_move_relative(&user, 150.0, 0.0, 200.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["V2.00", "T1.5", "A"]);
         axis.set_move_strings(&user, b"CA", None).unwrap();
-        axis.move_velocity(&user, 0.0, -200.0, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, -200.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["CA", "V2.00", "<"]);
     }
 
@@ -731,9 +714,10 @@ mod tests {
         for jog in [false, true] {
             axis.set_move_strings(&user, b"", Some(post(b"S"))).unwrap();
             if jog {
-                axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
+                axis.record_jog(&user, 0.0, 2.0, 0.0).unwrap();
             } else {
-                axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
+                axis.record_move_relative(&user, 1.5, 0.0, 2.0, 0.0)
+                    .unwrap();
             }
             line.sent();
             *z.lock().unwrap() = Z_RUNDOWN;
@@ -749,7 +733,8 @@ mod tests {
         let (line, mut axis, z) = strings_rig("emcPostLs");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"S"))).unwrap();
-        axis.move_relative(&user, -1.5, 0.0, 2.0, 0.0).unwrap();
+        axis.record_move_relative(&user, -1.5, 0.0, 2.0, 0.0)
+            .unwrap();
         line.sent();
         *z.lock().unwrap() = Z_LSDOWN;
         assert_eq!(poll_extra(&line, &mut axis), ["S"]);
@@ -762,10 +747,11 @@ mod tests {
     fn record_steps_scale_by_drive_resolution() {
         let (line, mut axis, _) = strings_rig("emcSteps");
         let user = AsynUser::default();
-        axis.move_absolute(&user, 1234.0, 0.0, 50.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 1234.0, 0.0, 50.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["M1", "V0.50", "G12.3", "A"]);
         assert_eq!(axis.polled(&user).unwrap().position, 100.0);
-        axis.move_velocity(&user, 0.0, -0.3, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, -0.3, 0.0).unwrap();
         assert_eq!(line.sent().last().unwrap(), ">");
     }
 
@@ -775,7 +761,8 @@ mod tests {
     fn a_zero_velocity_move_still_sends_v() {
         let (line, mut axis, _) = strings_rig("emcV0");
         let user = AsynUser::default();
-        axis.move_absolute(&user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 100.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["M1", "V0.00", "G1.0", "A"]);
     }
 
@@ -830,7 +817,8 @@ mod tests {
     fn a_bad_z_reply_is_retry_then_comm_error() {
         let (line, mut axis, z) = strings_rig("emcRetry");
         let user = AsynUser::default();
-        axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
+        axis.record_move_relative(&user, 1.5, 0.0, 2.0, 0.0)
+            .unwrap();
         line.sent();
         *z.lock().unwrap() = 'x';
         assert!(axis.polled(&user).is_err());
@@ -865,31 +853,17 @@ mod tests {
         (line, axes, z)
     }
 
+    /// drvEMC18011.cc:148: `targs` carries `MOTION_DELAY`, which the motor
+    /// task waits out before the first status of a motion.
+    #[test]
+    fn update_delay_is_motion_delay() {
+        let (_line, axis, _z) = strings_rig("emcDelay");
+        assert_eq!(axis.update_delay(), MOTION_DELAY);
+    }
+
     /// drvEMC18011.cc:286-297: an unselected motor reads as stopped off
     /// its limits at its last position, and resets the controller to
     /// NORMAL, so the selected motor's next bad `Z` is RETRY again.
-    /// motordrvCom.cc:444-448 with `update_delay` = MOTION_DELAY: no status
-    /// is read sooner than 0.1 s after a motion starts.
-    #[test]
-    fn the_first_status_waits_motion_delay_after_a_move() {
-        let (_line, mut axis, z) = strings_rig("emcDelay");
-        *z.lock().unwrap() = Z_RUNDOWN;
-        let user = AsynUser::default();
-        for jog in [false, true] {
-            let at = Instant::now();
-            if jog {
-                axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
-            } else {
-                axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
-            }
-            axis.polled(&user).unwrap();
-            assert!(at.elapsed() >= MOTION_DELAY);
-            let again = Instant::now();
-            axis.polled(&user).unwrap();
-            assert!(again.elapsed() < MOTION_DELAY);
-        }
-    }
-
     #[test]
     fn an_unselected_motor_reads_stopped_and_resets_the_comm_state() {
         let (_line, [mut a, mut b], z) = pair_rig("emcUnsel");
@@ -956,7 +930,8 @@ mod tests {
             !a.build_trans()
                 .defers(&MotorCommand::SetVelocity { velocity: 2.0 })
         );
-        a.move_absolute(&user, 150.0, 0.0, 200.0, 0.0).unwrap();
+        a.record_move_absolute(&user, 150.0, 0.0, 200.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["M1", "V2.00", "G1.5", "A"]);
     }
 

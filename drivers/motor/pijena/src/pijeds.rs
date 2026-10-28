@@ -32,24 +32,22 @@
 //! ## Deviations from C (documented)
 //!
 //! - The C poller is a background thread; here the settle detection and the
-//!   `mess`/`stat` reads run inside [`poll`](AsynMotor::poll).
+//!   `mess`/`stat` reads run inside [`poll`](Model1Motor::poll).
 //! - C `MOVE_REL` sends nothing (the E-516 has no relative command); this port
 //!   synthesizes it as an absolute move to `last position + distance`.
-//! - C sets velocity in a separate `SET_VELOCITY` transaction; asyn-rs bundles
-//!   the velocity into the move, so [`move_absolute`](AsynMotor::move_absolute)
-//!   emits `sr` before `set` whatever the rate.
+//! - C sets velocity in a separate `SET_VELOCITY` transaction, as
+//!   [`set_velocity`](Model1Motor::set_velocity) does: `sr` goes out before
+//!   `set` whatever the rate.
 //! - C `STOP_AXIS`, `HOME_*` and `LOAD_POS` send nothing (unsupported on this
 //!   absolute closed-loop stage); stop and set-position are no-ops, and a
 //!   home sends only the record's `sr` and the GO `stat`.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
-};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -197,7 +195,7 @@ fn value_field(reply: &str) -> Option<&str> {
     Some(reply[idx + 1..].trim())
 }
 
-/// One E-516 axis sharing a controller. Implements [`AsynMotor`].
+/// One E-516 axis sharing a controller. Implements [`Model1Motor`].
 pub struct PiJedsAxis {
     controller: Arc<Mutex<PiJedsController>>,
     /// 0-based axis index; the wire axis number is the same (E-516 axes 0..5).
@@ -268,19 +266,13 @@ impl PiJedsAxis {
         ctrl.write_cmd(&format!("stat,{}", self.axis))
     }
 
-    /// Send an absolute move to `position` (steps) after its slew velocity
-    /// (C `SET_VELOCITY` + `MOVE_ABS`); the record sends SET_VELOCITY
-    /// whatever the rate. Each message goes out whatever the one before it
-    /// returned, as `send_mess` ignores the write (drvPIJEDS.cc:449-453).
-    fn issue_move(&mut self, position: f64, velocity: f64) -> AsynResult<()> {
+    /// Send an absolute move to `position` (steps), after the PREM and the
+    /// slew velocity the record wrote (C `SET_VELOCITY` + `MOVE_ABS`). Each
+    /// message goes out whatever the one before it returned, as `send_mess`
+    /// ignores the write (drvPIJEDS.cc:449-453).
+    fn issue_move(&mut self, position: f64) -> AsynResult<()> {
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        let _ = ctrl.write_cmd(&format!(
-            "sr,{},{:.*}",
-            self.axis,
-            MAX_RES,
-            CFloat(velocity * DRIVE_RESOLUTION)
-        ));
         let _ = self.send_prem(&ctrl, &prem);
         let _ = ctrl.write_cmd(&format!(
             "set,{},{:.*}",
@@ -294,6 +286,16 @@ impl PiJedsAxis {
         self.no_motion_count = 0;
         status
     }
+
+    /// The slew rate `sr`, which C's SET_VELOCITY and JOG both build.
+    fn slew_rate(&self, velocity: f64) -> AsynResult<()> {
+        self.lock().write_cmd(&format!(
+            "sr,{},{:.*}",
+            self.axis,
+            MAX_RES,
+            CFloat(velocity * DRIVE_RESOLUTION)
+        ))
+    }
 }
 
 impl Model1Motor for PiJedsAxis {
@@ -301,9 +303,12 @@ impl Model1Motor for PiJedsAxis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.last_status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for PiJedsAxis {
+    /// `update_delay` is 0 (`targs`, drvPIJEDS.cc:206).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// drvPIJEDS.cc:292-306: a first unread status or position is RETRY,
     /// raising and posting nothing; the next is COMM_ERR, raising
     /// `CNTRL_COMM_ERR` and `RA_PROBLEM`.
@@ -311,74 +316,53 @@ impl AsynMotor for PiJedsAxis {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        self.issue_move(position, velocity)
+    /// SET_VELOCITY: the slew rate, ahead of the move's own messages; its
+    /// status is ignored as `send_mess` ignores the write.
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let _ = self.slew_rate(velocity);
+        Ok(())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    /// SET_VEL_BASE and SET_ACCEL send nothing.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_accel(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.issue_move(position)
+    }
+
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         // C sends nothing for MOVE_REL; synthesize from the last feedback
         // position (module Deviations).
-        self.issue_move(self.prev_position + distance, velocity)
+        self.issue_move(self.prev_position + distance)
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         // C JOG only sets the slew rate — the E-516 has no continuous jog.
         let prem = self.strings.arm();
         let ctrl = self.lock();
         let _ = self.send_prem(&ctrl, &prem);
-        ctrl.write_cmd(&format!(
-            "sr,{},{:.*}",
-            self.axis,
-            MAX_RES,
-            CFloat(velocity * DRIVE_RESOLUTION)
-        ))
+        drop(ctrl);
+        self.slew_rate(velocity)
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C HOME_* send nothing — no home on an absolute closed-loop stage —
         // but for the record's SET_VELOCITY of HVEL (motorRecord.cc:2052)
         // and PREM. C hangs POST off a message it never sends; not copied,
         // POST goes at the next poll that reports done.
         let prem = self.strings.arm();
         let ctrl = self.lock();
-        let _ = ctrl.write_cmd(&format!(
-            "sr,{},{:.*}",
-            self.axis,
-            MAX_RES,
-            CFloat(velocity * DRIVE_RESOLUTION)
-        ));
         let _ = self.send_prem(&ctrl, &prem);
         self.go(&ctrl)
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C STOP_AXIS sends nothing and leaves the motion node, so the stage
         // still travels to target and the settle test still owns `moving`.
         Ok(())
@@ -475,7 +459,6 @@ impl AsynMotor for PiJedsAxis {
             // E-516 has no limit or home switches (C set_status).
             high_limit: false,
             low_limit: false,
-    use epics_rs::asyn::interfaces::InterfaceType;
             home: done,
             powered,
             comms_error: false,
@@ -492,8 +475,10 @@ impl AsynMotor for PiJedsAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::atomic::{AtomicI32, Ordering};
 
     /// Axis 0 of an E-516 on a [`LineRig`] whose `mess` reads `pos` µm,
@@ -604,16 +589,17 @@ mod tests {
     fn go_sends_the_stat_query() {
         let (line, mut axis, _) = strings_rig("pijedsGo");
         let user = AsynUser::default();
-        axis.move_relative(&user, 1000.0, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_relative(&user, 1000.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["sr,0,0.000", "set,0,1.000", "stat,0"]);
-        axis.home(&user, 0.0, 500.0, 0.0, true).unwrap();
+        axis.record_home(&user, 0.0, 500.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["sr,0,0.500", "stat,0"]);
-        axis.move_velocity(&user, 0.0, 2000.0, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, 2000.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["sr,0,2.000"]);
-        axis.move_velocity(&user, 0.0, f64::NAN, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, f64::NAN, 0.0).unwrap();
         assert_eq!(line.sent(), ["sr,0,nan"]);
         // The jog's rate is signed, so -nan keeps its sign there.
-        axis.move_velocity(&user, 0.0, -f64::NAN, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, -f64::NAN, 0.0).unwrap();
         assert_eq!(line.sent(), ["sr,0,-nan"]);
     }
 
@@ -624,18 +610,20 @@ mod tests {
         let (line, mut axis, _) = strings_rig("pijedsPrem");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
-        axis.move_absolute(&user, 1500.0, 0.0, 2000.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 1500.0, 0.0, 2000.0, 0.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             ["sr,0,2.000", "cl,0,1", "set,0,1.500", "stat,0"]
         );
-        axis.move_absolute(&user, 1500.0, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 1500.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert_eq!(line.sent(), ["sr,0,0.000", "set,0,1.500", "stat,0"]);
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
-        axis.move_velocity(&user, 0.0, -2000.0, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, -2000.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["cl,0,1", "sr,0,-2.000"]);
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
-        axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
+        axis.record_home(&user, 0.0, 2000.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["sr,0,2.000", "cl,0,1", "stat,0"]);
     }
 
@@ -659,13 +647,14 @@ mod tests {
         line.sent();
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
-        axis.move_absolute(&user, 1500.0, 0.0, 2000.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 1500.0, 0.0, 2000.0, 0.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             ["sr,0,2.000", "cl,0,1", "set,0,1.500", "stat,0"]
         );
         axis.set_move_strings(&user, b"cl,#,1", None).unwrap();
-        axis.home(&user, 0.0, 2000.0, 0.0, true).unwrap();
+        axis.record_home(&user, 0.0, 2000.0, 0.0, true).unwrap();
         assert_eq!(line.sent(), ["sr,0,2.000", "cl,0,1", "stat,0"]);
         assert!(axis.set_closed_loop(&user, true).is_err());
         assert_eq!(line.sent(), ["cl,0,1"]);
@@ -679,7 +668,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"cl,#,0")))
             .unwrap();
-        axis.move_absolute(&user, 5000.0, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 5000.0, 0.0, 0.0, 0.0)
+            .unwrap();
         line.sent();
         pos.store(5, Ordering::SeqCst);
         assert!(poll_extra(&line, &mut axis).is_empty());
@@ -774,9 +764,10 @@ mod tests {
     fn a_stop_mid_travel_still_ends_in_done() {
         let mut axis = stage_axis("pijeds_stop");
         let user = AsynUser::default();
-        axis.move_absolute(&user, 5000.0, 0.0, 0.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 5000.0, 0.0, 0.0, 0.0)
+            .unwrap();
         assert!(!axis.polled(&user).unwrap().done);
-        axis.stop(&user, 0.0).unwrap();
+        axis.stop(&user).unwrap();
         let done = (0..20).any(|_| axis.polled(&user).unwrap().done);
         assert!(done, "the stage settled at 5 but never reported done");
         assert_eq!(axis.polled(&user).unwrap().position, 5000.0);

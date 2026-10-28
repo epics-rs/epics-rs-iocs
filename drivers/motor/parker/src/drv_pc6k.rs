@@ -7,11 +7,11 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -29,7 +29,7 @@ const MSG_SIZE: usize = 120;
 const BUFF_SIZE: usize = 120;
 /// `TIMEOUT`.
 pub const TIMEOUT: Duration = Duration::from_secs(1);
-/// `MOTION_DELAY`: no status is read this soon after a motion starts.
+/// `MOTION_DELAY`, the `update_delay` of `targs` and the RETRY sleep.
 const MOTION_DELAY: Duration = Duration::from_millis(50);
 /// `REPLY_CHAR`.
 const REPLY_CHAR: u8 = b'*';
@@ -202,9 +202,6 @@ pub struct DrvPc6kAxis {
     /// every `build_trans` restarts the transaction, which clears the
     /// pointer before the move is queued.
     post: Option<PostMessage>,
-    /// When the last motion started: C's motor task reads no status until
-    /// `MOTION_DELAY` after it, the GO's prompt read away by then.
-    started: Option<Instant>,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
     init_status: Option<AsynResult<MotorStatus>>,
 }
@@ -227,7 +224,6 @@ impl DrvPc6kAxis {
             position: 0,
             strings: None,
             post: None,
-            started: None,
             init_status: None,
         };
         axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
@@ -268,27 +264,22 @@ impl DrvPc6kAxis {
         self.lock().command(prem);
     }
 
-    /// `SET_VELOCITY`, `SET_ACCEL` unless zero, the PREM, `motion`, `GO`.
-    fn start(&mut self, velocity: f64, acceleration: f64, motion: &[String]) {
-        self.velocity(velocity);
-        if acceleration > 0.0 {
-            self.accel(acceleration);
-        }
+    /// The PREM, `motion`, `GO`, after the record's SET_* writes.
+    fn start(&mut self, motion: &[String]) {
         self.prem();
         for command in motion {
             self.send(command);
         }
         self.send("GO");
-        self.started = Some(Instant::now());
     }
 
-    fn move_to(&mut self, mode: u8, target: f64, velocity: f64, acceleration: f64) {
+    fn move_to(&mut self, mode: u8, target: f64) {
         let motion = [
             format!("MA{mode}"),
             "MC0".into(),
             format!("D{}", nint(target)),
         ];
-        self.start(velocity, acceleration, &motion);
+        self.start(&motion);
     }
 }
 
@@ -304,70 +295,60 @@ impl Model1Motor for DrvPc6kAxis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for DrvPc6kAxis {
+    /// `update_delay` is `MOTION_DELAY` (`targs`, drvPC6K.cc:155).
+    fn update_delay(&self) -> Duration {
+        MOTION_DELAY
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.move_to(1, position, velocity, acceleration);
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.velocity(velocity);
         Ok(())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.move_to(0, distance, velocity, acceleration);
+    /// The PC6K sends no base velocity.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
         Ok(())
     }
 
-    /// `SET_ACCEL` then `JOG`. C sends the signed speed, `V-500`, which the
-    /// 6K's unsigned `V` refuses; `D+`/`D-` carries the direction.
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
         self.accel(acceleration);
+        Ok(())
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.move_to(1, position);
+        Ok(())
+    }
+
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.move_to(0, distance);
+        Ok(())
+    }
+
+    /// The record's SET_ACCEL, then `JOG`. C sends the signed speed,
+    /// `V-500`, which the 6K's unsigned `V` refuses; `D+`/`D-` carries the
+    /// direction.
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         self.prem();
         self.send("MC1");
         self.velocity(velocity.abs());
         self.send(if velocity >= 0.0 { "D+" } else { "D-" });
         self.send("GO");
-        self.started = Some(Instant::now());
         Ok(())
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let motion = [if forward { "HOM0" } else { "HOM1" }.to_string()];
-        self.start(velocity, acceleration, &motion);
+        self.start(&motion);
         Ok(())
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         self.lock().command(format!("!{}S", self.axis));
         Ok(())
     }
@@ -433,9 +414,6 @@ impl AsynMotor for DrvPc6kAxis {
     /// once. A first failed round fails the poll raising nothing; a second
     /// raises the comms error.
     fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
-        if let Some(started) = self.started.take() {
-            sleep(MOTION_DELAY.saturating_sub(started.elapsed()));
-        }
         let card = self.card.clone();
         let mut ctrl = card.lock().unwrap_or_else(|e| e.into_inner());
         let mut replies = Vec::with_capacity(5);
@@ -502,7 +480,7 @@ impl AsynMotor for DrvPc6kAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
 
     #[test]
     fn upload_lines_are_fgets_chunks_with_unprintables_blanked() {

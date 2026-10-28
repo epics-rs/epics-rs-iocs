@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -258,24 +258,10 @@ impl DrvMvp2001Axis {
         })
     }
 
-    /// `SET_VELOCITY` and `SET_ACCEL` of a move. SET_ACCEL caps at the
-    /// record's VELO, not the move's speed (devMVP2001.cc:373), which
-    /// differs for a backlash or jog.
-    fn speed_and_accel(&self, velocity: f64, acceleration: f64) -> [String; 2] {
-        let sp = nint(self.record_velocity * 0.03);
-        let ac = nint(acceleration * 0.03 * f64::from(self.encoder_cpr()) * 0.0000625);
-        let ac = if ac < sp { ac.max(1) } else { sp };
-        [format!("SP {}", nint(velocity * 0.03)), format!("AC {ac}")]
-    }
-
-    /// A move or jog: its PREM, if any, goes between the set-up and the
-    /// motion commands, and its POST becomes the one `poll` sends.
-    fn send_move(&mut self, setup: &[String], motion: &[String]) {
+    /// A move or jog: its PREM, if any, goes ahead of the motion commands, and its POST becomes the one `poll` sends.
+    fn send_move(&mut self, motion: &[String]) {
         let (prem, post) = self.strings.take().unwrap_or_default();
         self.post = post;
-        for command in setup {
-            self.send(command);
-        }
         if !prem.is_empty() {
             if prem.starts_with(b"ANO") {
                 self.send(&format!("ANO {}", ano(self.max_current())));
@@ -303,9 +289,32 @@ impl Model1Motor for DrvMvp2001Axis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for DrvMvp2001Axis {
+    /// `update_delay` is 0 (drvMVP2001.cc:202).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send(&format!("SP {}", nint(velocity * 0.03)));
+        Ok(())
+    }
+
+    /// SET_VEL_BASE: the MVP 2001 does not use base velocity.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// SET_ACCEL caps at the record's VELO, not the move's speed
+    /// (devMVP2001.cc:373), which differs for a backlash or jog.
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        let sp = nint(self.record_velocity * 0.03);
+        let ac = nint(acceleration * 0.03 * f64::from(self.encoder_cpr()) * 0.0000625);
+        let ac = if ac < sp { ac.max(1) } else { sp };
+        self.send(&format!("AC {ac}"));
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
@@ -315,63 +324,32 @@ impl AsynMotor for DrvMvp2001Axis {
         Ok(())
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let setup = self.speed_and_accel(velocity, acceleration);
-        self.send_move(&setup, &[format!("LA {}", nint(position)), "M".into()]);
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.send_move(&[format!("LA {}", nint(position)), "M".into()]);
         Ok(())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let setup = self.speed_and_accel(velocity, acceleration);
-        self.send_move(&setup, &[format!("LR {}", nint(distance)), "M".into()]);
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.send_move(&[format!("LR {}", nint(distance)), "M".into()]);
         Ok(())
     }
 
-    /// `SET_ACCEL` then `JOG`, which starts the motion itself.
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let [_, accel] = self.speed_and_accel(velocity.abs(), acceleration);
-        self.send_move(&[accel], &[format!("V {}", nint(velocity * 0.03))]);
+    /// `JOG`, which starts the motion itself.
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send_move(&[format!("V {}", nint(velocity * 0.03))]);
         Ok(())
     }
 
     /// The MVP 2001 cannot home: HOME sends nothing, but the record's
-    /// SET_VELOCITY, SET_ACCEL and GO around it go out, and GO's `M` starts
+    /// SET_VELOCITY and SET_ACCEL before it go out, and GO's `M` starts
     /// the last loaded move again (devMVP2001.cc:323,332). No PREM or POST.
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         self.strings = None;
-        let setup = self.speed_and_accel(velocity, acceleration);
-        self.send_move(&setup, &["M".into()]);
+        self.send_move(&["M".into()]);
         Ok(())
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         self.send("AB");
         Ok(())
     }
@@ -477,7 +455,8 @@ impl AsynMotor for DrvMvp2001Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
 
     #[test]
     fn hex_fields_follow_the_address() {
@@ -585,11 +564,13 @@ mod tests {
             },
         )
         .unwrap();
-        axis.move_relative(&user, 10.0, 0.0, 2000.0, 1e6).unwrap();
+        axis.record_move_relative(&user, 10.0, 0.0, 2000.0, 1e6)
+            .unwrap();
         let sent = line.sent();
         let tail = &sent[sent.len() - 4..];
         assert_eq!(tail, ["1 SP 60", "1 AC 30", "1 LR 10", "1 M"]);
-        axis.move_relative(&user, 10.0, 0.0, 2000.0, 1e3).unwrap();
+        axis.record_move_relative(&user, 10.0, 0.0, 2000.0, 1e3)
+            .unwrap();
         let sent = line.sent();
         assert_eq!(sent[sent.len() - 3], "1 AC 8");
     }
@@ -620,7 +601,7 @@ mod tests {
         )
         .unwrap();
         line.sent();
-        axis.home(&user, 0.0, 1000.0, 1e3, true).unwrap();
+        axis.record_home(&user, 0.0, 1000.0, 1e3, true).unwrap();
         assert_eq!(line.sent(), ["1 SP 30", "1 AC 8", "1 M"]);
     }
 }

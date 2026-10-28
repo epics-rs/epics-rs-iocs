@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -217,26 +217,6 @@ impl DrvSoloistAxis {
         )
     }
 
-    /// `SET_VELOCITY`: the default speed and the home feed rate.
-    fn velocity(&self, velocity: f64) {
-        let v = self.units(velocity);
-        self.send(format!("SETPARM 102, {v}"));
-        self.send(format!("SETPARM 107, {v}"));
-    }
-
-    /// `SET_ACCEL`.
-    fn accel(&self, acceleration: f64) {
-        self.send(format!("SETPARM 103, {}", self.units(acceleration)));
-    }
-
-    /// A move's or home's SET_ACCEL, which the record sends only at a
-    /// positive rate (motorRecord.cc:874); a jog's goes at any (:2141).
-    fn move_accel(&self, acceleration: f64) {
-        if acceleration > 0.0 {
-            self.accel(acceleration);
-        }
-    }
-
     /// `motion` after the record's PREM line, its POST kept for `poll`.
     fn motion(&mut self, motion: &str) {
         let (prem, post) = self.strings.take().unwrap_or_default();
@@ -249,9 +229,7 @@ impl DrvSoloistAxis {
         self.send(msg);
     }
 
-    fn move_to(&mut self, command: &str, target: f64, velocity: f64, acceleration: f64) {
-        self.velocity(velocity);
-        self.move_accel(acceleration);
+    fn move_to(&mut self, command: &str, target: f64) {
         let motion = format!("{command} D{}", self.units(target));
         self.motion(&motion);
     }
@@ -262,45 +240,45 @@ impl Model1Motor for DrvSoloistAxis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, self.status.clone(), self.poll_failure())
     }
-}
 
-impl AsynMotor for DrvSoloistAxis {
+    /// `update_delay` is 0 (drvSoloist.cc:143).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY: the default speed and the home feed rate.
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let v = self.units(velocity);
+        self.send(format!("SETPARM 102, {v}"));
+        self.send(format!("SETPARM 107, {v}"));
+        Ok(())
+    }
+
+    /// SET_VEL_BASE: the Soloist does not use base velocity.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.send(format!("SETPARM 103, {}", self.units(acceleration)));
+        Ok(())
+    }
+
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.move_to("MOVEABS", position, velocity, acceleration);
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.move_to("MOVEABS", position);
         Ok(())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.move_to("MOVEINC", distance, velocity, acceleration);
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.move_to("MOVEINC", distance);
         Ok(())
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.accel(acceleration);
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         let motion = format!("FREERUN F {}", self.units(velocity));
         self.motion(&motion);
         Ok(())
@@ -310,16 +288,7 @@ impl AsynMotor for DrvSoloistAxis {
     /// devSoloist.cc:240 overwrites the PREM it has just queued for
     /// HOME_FOR/HOME_REV with `SETPARM 106` and hangs the POST on that
     /// message, an accident not copied: PREM and POST go with `HOME`.
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
-        self.velocity(velocity);
-        self.move_accel(acceleration);
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let hparam = if forward {
             self.setup.home_dparam | 1
         } else {
@@ -331,7 +300,7 @@ impl AsynMotor for DrvSoloistAxis {
         Ok(())
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         self.send("ABORT");
         Ok(())
     }
@@ -445,7 +414,8 @@ impl AsynMotor for DrvSoloistAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
 
     #[test]
     fn digits_follow_the_resolution() {
@@ -529,9 +499,10 @@ mod tests {
         let mut axis = DrvSoloistAxis::new(card, setup);
         let user = AsynUser::new(0);
         line.sent();
-        axis.move_velocity(&user, 0.0, 3.0, 0.0).unwrap();
+        axis.record_jog(&user, 0.0, 3.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["SETPARM 103, 0", "FREERUN F 3"]);
-        axis.move_absolute(&user, 5.0, 0.0, 3.0, 0.0).unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 3.0, 0.0)
+            .unwrap();
         assert_eq!(
             line.sent(),
             ["SETPARM 102, 3", "SETPARM 107, 3", "MOVEABS D5"]

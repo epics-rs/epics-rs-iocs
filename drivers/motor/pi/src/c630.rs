@@ -90,8 +90,8 @@
 //! - `JOG` (`move_velocity`) — the C-630 has no jog command: `{addr}SV{|v|}`
 //!   (clamped `[1, 200000]`) then `{addr}MA{limit}` to whichever record soft
 //!   limit (`DHLM`/`DLLM`, cached from
-//!   [`set_high_limit`](AsynMotor::set_high_limit) /
-//!   [`set_low_limit`](AsynMotor::set_low_limit); `MRES = 1` so dial EGU =
+//!   [`set_high_limit`](Model1Motor::set_high_limit) /
+//!   [`set_low_limit`](Model1Motor::set_low_limit); `MRES = 1` so dial EGU =
 //!   counts) the velocity sign selects, preceded by an unconditional
 //!   `{addr}SA{a}` (motorRecord jog issues `SET_ACCEL` with no `acc > 0`
 //!   guard).
@@ -121,11 +121,10 @@
 //!   `SyncIOHandle` equivalent.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{
-    AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
-};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -236,7 +235,7 @@ struct PolledStatus {
     low_limit: bool,
 }
 
-/// One addressed axis (`1`-`9`) of a C-630 chain. Implements [`AsynMotor`].
+/// One addressed axis (`1`-`9`) of a C-630 chain. Implements [`Model1Motor`].
 pub struct PIC630Axis {
     controller: Arc<Mutex<PIC630Controller>>,
     /// Wire address (`signal + 1`, i.e. `1`-`9`).
@@ -346,63 +345,55 @@ impl Model1Motor for PIC630Axis {
         let read = self.init_status.take().expect("taken once");
         init_read(read, MotorStatus::default(), self.poll_failure())
     }
-}
 
-impl AsynMotor for PIC630Axis {
+    /// `update_delay` is 0 (`targs`, drvPIC630.cc:109).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY (devPIC630.cc): `{addr}SV`, clamped to `[1, 200000]`.
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let addr = self.addr;
+        self.lock().send(&format!("{addr}SV{}", Self::sv(velocity)))
+    }
+
+    /// The C-630 does not use base velocity: SET_VEL_BASE sends nothing.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        let addr = self.addr;
+        self.lock()
+            .send(&format!("{addr}SA{}", Self::sa(acceleration)))
+    }
+
     /// C `set_status` ignores `recv_mess`'s result (drvPIC630.cc).
     fn poll_failure(&self) -> PollFailure {
         PollFailure::NONE
     }
 
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         // devPIC630.cc:194-212: PREM as its own message ahead of the move.
         let prem = self.strings.arm();
         let addr = self.addr;
         let ctrl = self.lock();
-        ctrl.send(&format!("{addr}SV{}", Self::sv(velocity)))?;
-        if acceleration > 0.0 {
-            ctrl.send(&format!("{addr}SA{}", Self::sa(acceleration)))?;
-        }
         ctrl.send_bytes(&prem)?;
         ctrl.send(&format!("{addr}MA{}", nint(position)))
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         // devPIC630.cc:194-212: PREM as its own message ahead of the move.
         let prem = self.strings.arm();
         let addr = self.addr;
         let ctrl = self.lock();
-        ctrl.send(&format!("{addr}SV{}", Self::sv(velocity)))?;
-        if acceleration > 0.0 {
-            ctrl.send(&format!("{addr}SA{}", Self::sa(acceleration)))?;
-        }
         ctrl.send_bytes(&prem)?;
         ctrl.send(&format!("{addr}MR{}", nint(distance)))
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        // No jog command: SET_ACCEL (unconditional, per motorRecord jog),
-        // then the C-630 JOG case's own SV + MA-to-soft-limit simulation.
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        // No jog command: the record's SET_ACCEL, then the C-630 JOG case's
+        // own SV + MA-to-soft-limit simulation.
         let target = if velocity > 0.0 {
             self.high_limit
         } else {
@@ -414,34 +405,22 @@ impl AsynMotor for PIC630Axis {
         let prem = self.strings.arm();
         let addr = self.addr;
         let ctrl = self.lock();
-        ctrl.send(&format!("{addr}SA{}", Self::sa(acceleration)))?;
         ctrl.send_bytes(&prem)?;
         ctrl.send(&format!("{addr}SV{}", Self::sv(velocity.abs())))?;
         ctrl.send(&format!("{addr}MA{}", nint(target)))
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // HOME_FOR and HOME_REV both map to "{addr}MA0" (home = move to 0).
         // devPIC630.cc:194-212: PREM as its own message ahead of the move.
         let prem = self.strings.arm();
         let addr = self.addr;
         let ctrl = self.lock();
-        ctrl.send(&format!("{addr}SV{}", Self::sv(velocity)))?;
-        if acceleration > 0.0 {
-            ctrl.send(&format!("{addr}SA{}", Self::sa(acceleration)))?;
-        }
         ctrl.send_bytes(&prem)?;
         ctrl.send(&format!("{addr}MA0"))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let addr = self.addr;
         self.lock().send(&format!("{addr}ST"))
     }
@@ -506,7 +485,8 @@ impl AsynMotor for PIC630Axis {
 mod tests {
     use super::*;
     use motor_common::testing::LineRig;
-    use motor_common::testing::Polled;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// `TS` status bytes: done with no limit, moving, and moving into the
@@ -598,15 +578,17 @@ mod tests {
         let (line, mut axis, _) = strings_rig("pic630Prem");
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"1DC5", None).unwrap();
-        axis.move_absolute(&user, 5.0, 0.0, 100.0, 50.0).unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
         assert_eq!(line.sent(), ["1SV100", "1SA50", "1DC5", "1MA5"]);
-        axis.move_relative(&user, 5.0, 0.0, 100.0, 50.0).unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
         assert_eq!(line.sent(), ["1SV100", "1SA50", "1MR5"]);
         axis.set_move_strings(&user, b"1DC5", None).unwrap();
-        axis.home(&user, 0.0, 100.0, 50.0, true).unwrap();
+        axis.record_home(&user, 0.0, 100.0, 50.0, true).unwrap();
         assert_eq!(line.sent(), ["1SV100", "1SA50", "1DC5", "1MA0"]);
         axis.set_move_strings(&user, b"1DC5", None).unwrap();
-        axis.move_velocity(&user, 0.0, -100.0, 50.0).unwrap();
+        axis.record_jog(&user, 0.0, -100.0, 50.0).unwrap();
         assert_eq!(line.sent(), ["1SA50", "1DC5", "1SV100", "1MA-100"]);
     }
 
@@ -618,7 +600,7 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"1DC0")))
             .unwrap();
-        axis.move_velocity(&user, 0.0, 100.0, 50.0).unwrap();
+        axis.record_jog(&user, 0.0, 100.0, 50.0).unwrap();
         line.sent();
         state.store(MOVING, Ordering::SeqCst);
         assert!(poll_extra(&line, &mut axis).is_empty());
@@ -634,7 +616,8 @@ mod tests {
         let user = AsynUser::default();
         axis.set_move_strings(&user, b"", Some(post(b"1DC0")))
             .unwrap();
-        axis.move_absolute(&user, -5.0, 0.0, 100.0, 50.0).unwrap();
+        axis.record_move_absolute(&user, -5.0, 0.0, 100.0, 50.0)
+            .unwrap();
         line.sent();
         state.store(MOVING_LOW_LS, Ordering::SeqCst);
         assert_eq!(poll_extra(&line, &mut axis), ["1DC0"]);
