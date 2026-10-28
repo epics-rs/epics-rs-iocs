@@ -34,6 +34,7 @@ use epics_rs::base::types::{EpicsValue, SharedArray};
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
 use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
@@ -189,6 +190,27 @@ impl DevMcaAsyn {
             addr: link.addr,
             reasons: [0; McaReason::COUNT],
         };
+        // C's four `findInterface` checks (`devMcaAsyn.c:139-173`), each a
+        // `goto bad` before any `findDrvInfo`.
+        for (iface, what) in [
+            (InterfaceType::Int32, "int32"),
+            (InterfaceType::Float64, "float64"),
+            (InterfaceType::Int32Array, "int32Array"),
+            (InterfaceType::DrvUser, "drvUser"),
+        ] {
+            if !port.handle.has_interface(iface) {
+                trace_error(
+                    Some(&link.port_name),
+                    port.addr,
+                    0,
+                    format_args!(
+                        "devMcaAsyn::init_record, {} find {what} interface failed\n",
+                        self.name
+                    ),
+                );
+                return Connect::Unresolved(port);
+            }
+        }
         // `pasynUser->reason` as the previous create left it.
         let mut reason = 0;
         for command in McaReason::ALL {
@@ -801,6 +823,22 @@ mod tests {
         gate: Option<Arc<Gate>>,
         down: Option<i32>,
     ) -> DriverPort {
+        driver_port_with(name, MCA_INTERFACES, can_block, refuse, gate, down)
+    }
+
+    const MCA_INTERFACES: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::INT32_ARRAY)
+        .or(InterfaceMask::DRV_USER);
+
+    fn driver_port_with(
+        name: &str,
+        interfaces: InterfaceMask,
+        can_block: bool,
+        refuse: Option<McaReason>,
+        gate: Option<Arc<Gate>>,
+        down: Option<i32>,
+    ) -> DriverPort {
         let mut base = PortDriverBase::new(
             name,
             2,
@@ -809,10 +847,7 @@ mod tests {
                 can_block,
                 destructible: false,
             },
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::INT32_ARRAY
-                | InterfaceMask::DRV_USER,
+            interfaces,
             InterfaceMask::NONE,
         );
         if let Some(addr) = down {
@@ -892,6 +927,33 @@ mod tests {
         McaReason::PresetSweeps,
         McaReason::AcquireMode,
     ];
+
+    /// devMcaAsyn.c:139-173: a port lacking asynInt32, asynFloat64,
+    /// asynInt32Array or asynDrvUser kills the record before any
+    /// `findDrvInfo`, so the setup commands go out with reason 0.
+    #[test]
+    fn a_port_missing_an_interface_leaves_the_record_dead() {
+        const I: InterfaceMask = InterfaceMask::INT32;
+        const F: InterfaceMask = InterfaceMask::FLOAT64;
+        const A: InterfaceMask = InterfaceMask::INT32_ARRAY;
+        const D: InterfaceMask = InterfaceMask::DRV_USER;
+        for (name, interfaces) in [
+            ("MCATESTNOINT32", F.or(A).or(D)),
+            ("MCATESTNOFLOAT64", I.or(A).or(D)),
+            ("MCATESTNOARRAY", I.or(F).or(D)),
+            ("MCATESTNODRVUSER", I.or(F).or(A)),
+        ] {
+            let (_runtime, writes, _reads, _reasons) =
+                driver_port_with(name, interfaces, false, None, None, None);
+            let (dev, _, outcome) = init_dev(&format!("@asyn({name})"));
+            assert!(
+                matches!(outcome, DeviceInitOutcome::Dead { alarm: None }),
+                "{name}"
+            );
+            assert!(dev.port.is_none(), "{name}");
+            assert_eq!(*writes.lock().unwrap(), [0; 8], "{name}");
+        }
+    }
 
     /// C's `goto bad` returns 0 (`devMcaAsyn.c:208-210`), so mca
     /// `init_record` still sends every setup command: with the reasons it
