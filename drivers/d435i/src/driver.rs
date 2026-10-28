@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::param::EnumEntry;
 use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -23,6 +24,19 @@ use crate::types::{AcqCommand, CameraCapabilities, DirtyFlags, StreamMode, defau
 // ============================================================================
 // Color Driver (main)
 // ============================================================================
+
+/// The `RSStreamMode` choices: one per mode, valued by its index.
+fn mode_choices(modes: &[StreamMode]) -> Arc<[EnumEntry]> {
+    modes
+        .iter()
+        .enumerate()
+        .map(|(i, m)| EnumEntry {
+            string: m.label(),
+            value: i as i32,
+            severity: 0,
+        })
+        .collect()
+}
 
 pub struct D435iColorDriver {
     pub ad: ADDriverBase,
@@ -67,19 +81,7 @@ impl D435iColorDriver {
         let stream_modes: Vec<StreamMode> = caps.modes.clone();
         let default_index = default_mode_index(&stream_modes);
         let default_mode = &stream_modes[default_index as usize];
-        base.set_enum_choices_param(
-            rs_params.rs_stream_mode,
-            0,
-            stream_modes
-                .iter()
-                .enumerate()
-                .map(|(i, m)| epics_rs::asyn::param::EnumEntry {
-                    string: m.label(),
-                    value: i as i32,
-                    severity: 0,
-                })
-                .collect(),
-        )?;
+        base.set_enum_choices_param(rs_params.rs_stream_mode, 0, mode_choices(&stream_modes))?;
         base.set_enum_index_param(rs_params.rs_stream_mode, 0, default_index as usize)?;
 
         // What this camera has, so the records that depend on it are not
@@ -160,6 +162,19 @@ impl PortDriver for D435iColorDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.ad.port_base
+    }
+
+    /// The camera's own modes for `RSStreamMode`, at the mode in use; any other
+    /// parameter has no enum (the base `readEnum` refuses it).
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        if user.reason != self.rs_params.rs_stream_mode {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "asynPortDriver:readEnum not implemented".into(),
+            });
+        }
+        let index = self.ad.port_base.get_int32_param(user.reason, user.addr)?;
+        Ok((index.max(0) as usize, mode_choices(&self.stream_modes)))
     }
 
     /// C inherits `ADDriver::writeOctet`.
@@ -550,4 +565,48 @@ pub fn create_d435i_detector(
     };
 
     Ok((color_runtime, depth_runtime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::FALLBACK_STREAM_MODES;
+
+    fn driver(port: &str) -> D435iColorDriver {
+        let (acq_tx, _acq_rx) = rt::command_channel::<AcqCommand>(16);
+        let caps = CameraCapabilities {
+            modes: FALLBACK_STREAM_MODES.to_vec(),
+            has_imu: true,
+            has_emitter: true,
+        };
+        D435iColorDriver::new(
+            port,
+            1280,
+            720,
+            0,
+            acq_tx,
+            Arc::new(parking_lot::Mutex::new(DirtyFlags::default())),
+            caps,
+        )
+        .unwrap()
+    }
+
+    /// The base `readEnum` refuses (asynPortDriver.cpp:3464-3469), so the
+    /// driver answers `RSStreamMode` itself, at the mode in use.
+    #[test]
+    fn rs_stream_mode_reads_the_cameras_modes() {
+        let mut d = driver("d435i_read_enum");
+        let mut user = AsynUser {
+            reason: d.rs_params.rs_stream_mode,
+            ..AsynUser::default()
+        };
+        let (index, choices) = d.read_enum(&user).unwrap();
+        assert_eq!(index, default_mode_index(&d.stream_modes) as usize);
+        let labels: Vec<_> = choices.iter().map(|c| c.string.clone()).collect();
+        let want: Vec<_> = FALLBACK_STREAM_MODES.iter().map(|m| m.label()).collect();
+        assert_eq!(labels, want);
+
+        user.reason = d.ad.params.acquire;
+        assert!(d.read_enum(&user).is_err());
+    }
 }
