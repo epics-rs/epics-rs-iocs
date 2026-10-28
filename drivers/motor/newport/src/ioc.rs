@@ -1812,23 +1812,37 @@ pub fn pmnc87xx_setup_command() -> CommandDef {
     )
 }
 
+/// C `pasynOctetSyncIO->connect` of `motor_init` (drvPMNC87xx.cc): `connectDevice`
+/// on an unknown port, `findInterface(asynCommon)` and `findInterface(asynOctet)`
+/// fail with one console line.
+fn pmnc_port(port: &str) -> Result<PortHandle, String> {
+    let refused = || {
+        format!(
+            "drvPMNC:motor_init(), error calling pasynOctetSyncIO->connect port={port} \
+             error={}",
+            AsynStatus::Error as i32
+        )
+    };
+    let entry = get_port(port).ok_or_else(refused)?;
+    if !entry.handle.has_interface(InterfaceType::Octet) {
+        return Err(refused());
+    }
+    Ok(entry.handle)
+}
+
 /// `PMNC87xxConfig(card, name, addr)`: one signal per channel of the driver
 /// modules found (`MPV` for the 8750, `DRT` for the 8752). The controller
 /// sets the port EOS itself, as C `motor_init` does.
 pub fn pmnc87xx_config_command() -> CommandDef {
     model1_config_command("PMNC87xxConfig", &PMNC87XX, |init, port, addr| {
-        let Some(asyn_port) = get_port(port) else {
-            // A missing port is the one connect refusal; connectDevice
-            // returns asynError for it.
-            println!(
-                "drvPMNC:motor_init(), error calling pasynOctetSyncIO->connect port={port} \
-                 error={}",
-                AsynStatus::Error as i32
-            );
-            return;
+        let handle = match pmnc_port(port) {
+            Ok(handle) => handle,
+            Err(line) => {
+                println!("{line}");
+                return;
+            }
         };
-        let Ok(controller) = PmncController::new(asyn_port.handle.clone(), addr, PMNC_TIMEOUT)
-        else {
+        let Ok(controller) = PmncController::new(handle, addr, PMNC_TIMEOUT) else {
             return;
         };
         let line = format!("{port}, address={addr}, id: {}", controller.ident());
@@ -2018,6 +2032,42 @@ mod one_poller {
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
         std::mem::forget(rt);
+    }
+
+    /// drvPMNC87xx.cc `motor_init`: a port without asynOctet fails the connect.
+    #[test]
+    fn pmnc_refuses_a_port_without_asyn_octet() {
+        struct NoOctet(PortDriverBase);
+        impl PortDriver for NoOctet {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+        let name = "pmncNoOctet";
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::COMMON | InterfaceMask::INT32,
+            InterfaceMask::NONE,
+        );
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, NoOctet(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        std::mem::forget(rt);
+        assert_eq!(
+            pmnc_port(name).err().unwrap(),
+            "drvPMNC:motor_init(), error calling pasynOctetSyncIO->connect \
+             port=pmncNoOctet error=3"
+        );
+        publish_line("pmncWithOctet", "");
+        assert!(pmnc_port("pmncWithOctet").is_ok());
     }
 
     /// HXPDriver.cpp:116: one startPoller for the six axes.
