@@ -113,7 +113,7 @@ use epics_rs::asyn::interfaces::motor::{
 };
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -1705,6 +1705,9 @@ fn axis_write(
 }
 
 impl ControllerParams for PIGCS2Params {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
+
     fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
         let params = *self.params.get()?;
         Some(Arc::new(PiWriteHook(params)))
