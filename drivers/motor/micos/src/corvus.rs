@@ -602,8 +602,8 @@ mod tests {
                 "corvusRefused",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
             written: written.clone(),
         };

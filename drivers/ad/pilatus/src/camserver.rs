@@ -480,8 +480,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )
         };
         let (cam, _) = create_port_runtime(
@@ -578,8 +578,8 @@ mod tests {
                         &name,
                         1,
                         PortFlags::default(),
-                        InterfaceMask::UNMIGRATED_ALL,
-                        InterfaceMask::UNMIGRATED_INTERRUPTS,
+                        InterfaceMask::OCTET_TRANSPORT,
+                        InterfaceMask::OCTET,
                     ),
                     status,
                 },
@@ -685,8 +685,8 @@ mod tests {
                     &cam_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET_TRANSPORT,
+                    InterfaceMask::OCTET,
                 ),
                 reads: reads.iter().copied().collect(),
             },

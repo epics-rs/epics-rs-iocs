@@ -1076,8 +1076,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
         };
         let love = love_on(serial, "LOVETESTTRCL");
@@ -1135,8 +1135,8 @@ mod tests {
             "LOVETESTBSY",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         let mut love = love_on(SlowSerial { base }, "LOVETESTBSYL");
         let serial = love.serial.clone();
@@ -1174,8 +1174,8 @@ mod tests {
                     can_block,
                     destructible: true,
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             );
             base.set_auto_connect(auto_connect);
             let love = love_on(TimeoutSerial { base }, &format!("{name}L"));
@@ -1202,8 +1202,8 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.set_auto_connect(false);
         base.init_connected(false);
@@ -1241,8 +1241,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
         };
         let mut love = love_on(serial, "LOVETESTERRL");
@@ -1274,8 +1274,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
         };
         let mut love = love_on(serial, "LOVETESTRPTL");
@@ -1301,8 +1301,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
         };
         let love = love_on(serial, "LOVETESTTMOL");
@@ -1342,8 +1342,8 @@ mod tests {
             &format!("{name}SER"),
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         love_on(ReplySerial { base, eom }, name)
     }
@@ -1411,8 +1411,8 @@ mod tests {
             "LOVETESTDEVSER",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         let serial = ReplySerial {
             base,
@@ -1482,8 +1482,8 @@ mod tests {
             "LOVETESTRAWSER",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         let serial = BadReplySerial {
             base,
@@ -1512,8 +1512,8 @@ mod tests {
             "LOVETESTERRSER",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         let serial = BadReplySerial {
             base,
@@ -1643,8 +1643,8 @@ mod tests {
                 "LOVETESTLCKSER",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
             log: log.clone(),
             writing,
@@ -1722,8 +1722,8 @@ mod tests {
                     can_block: true,
                     destructible: true,
                 },
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
             wrote: wrote.clone(),
         };
@@ -1810,8 +1810,8 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.set_auto_connect(false);
         let love = love_on(TimeoutSerial { base }, "LOVETESTBNDL");

@@ -302,8 +302,8 @@ pub(crate) mod tests {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         ));
         published_port(name, driver)
     }
@@ -365,8 +365,8 @@ pub(crate) mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
         );
         let trace = runtime.port_handle().trace();

@@ -618,8 +618,8 @@ mod tests {
             port,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.init_connected(true);
         let driver = Chunks {
@@ -666,8 +666,8 @@ mod tests {
                 port,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )

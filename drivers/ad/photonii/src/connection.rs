@@ -174,8 +174,8 @@ mod is_timeout_tests {
                 name,
                 1,
                 Default::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
             RuntimeConfig::default(),
         )

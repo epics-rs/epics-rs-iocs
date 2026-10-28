@@ -602,8 +602,8 @@ mod tests {
                 &name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             );
             let mut floats = [
                 ("-get tau", -1.0),
@@ -644,8 +644,8 @@ mod tests {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         let (runtime, _) = create_port_runtime(
             &claim_port(name).unwrap(),

@@ -65,8 +65,8 @@ async fn a_poll_s_digital_position_lands_in_the_parameter_library() {
             line,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         ),
         frame: Vec::new(),
     };

@@ -1148,8 +1148,8 @@ mod tests {
             &ip,
             1,
             Default::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.init_connected(true);
         let server = FakeServer {
@@ -1267,8 +1267,8 @@ mod tests {
             name,
             1,
             Default::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.init_connected(true);
         let server = Scripted {

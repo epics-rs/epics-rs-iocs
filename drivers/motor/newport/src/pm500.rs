@@ -549,8 +549,8 @@ mod tests {
             "pm500_silent",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         ));
         let (rt, _jh) = create_port_runtime(
             &claim_port("pm500_silent").unwrap(),
@@ -685,8 +685,8 @@ mod tests {
                 name,
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
             reply: Vec::new(),
             sent: sent.clone(),

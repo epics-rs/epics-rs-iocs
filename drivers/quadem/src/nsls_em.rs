@@ -819,8 +819,8 @@ mod tests {
                 "QE_NSLS_CUT_IP",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
         );
         let mut drv = NslsEmDriver {

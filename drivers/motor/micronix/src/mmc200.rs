@@ -832,8 +832,8 @@ mod tests {
                 "mmc200LateReply",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
             unread: ["#stale".to_owned()].into(),
         };

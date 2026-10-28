@@ -216,8 +216,8 @@ mod tests {
                 "QE_CUT_REPLY",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             )),
         );
         let mut last = StatusExchange::default();
@@ -272,8 +272,8 @@ mod tests {
                     "QE_DEAD_AFTER_ONE",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET_TRANSPORT,
+                    InterfaceMask::OCTET,
                 ),
                 0,
             ),

@@ -227,8 +227,8 @@ mod tests {
             "loveCfgS0",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         let (rt, _actor) =
             create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();

@@ -600,8 +600,8 @@ mod tests {
             ip,
             1,
             Default::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.init_connected(true);
         let fake = CutReply {
@@ -678,8 +678,8 @@ mod tests {
             ip,
             1,
             Default::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.init_connected(true);
         let fake = DeadAfterOne { base, writes: 0 };
@@ -757,8 +757,8 @@ mod tests {
             ip,
             1,
             Default::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.init_connected(true);
         let fake = Chatty {

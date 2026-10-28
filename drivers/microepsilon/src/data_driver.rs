@@ -836,8 +836,8 @@ mod tests {
                 "dummy_rbk_for_test",
                 1,
                 PortFlags::default(),
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
             ),
         };
         let claim = asyn_record::claim_port("dummy_rbk_for_test").unwrap();

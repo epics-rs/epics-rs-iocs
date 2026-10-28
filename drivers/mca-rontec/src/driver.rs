@@ -755,8 +755,8 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         let (serial_runtime, _serial_thread) = create_port_runtime(
             &PortRegistry::new().claim("TESTRONTECSERIAL").unwrap(),
@@ -932,8 +932,8 @@ mod tests {
                     &serial_name,
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET_TRANSPORT,
+                    InterfaceMask::OCTET,
                 ),
                 reply,
                 cut,
@@ -1452,8 +1452,8 @@ mod tests {
             "DOWNSER",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         base.set_auto_connect(false);
         base.init_connected(false);
@@ -1493,8 +1493,8 @@ mod tests {
                     "DUPSER",
                     1,
                     PortFlags::default(),
-                    InterfaceMask::UNMIGRATED_ALL,
-                    InterfaceMask::UNMIGRATED_INTERRUPTS,
+                    InterfaceMask::OCTET_TRANSPORT,
+                    InterfaceMask::OCTET,
                 ),
                 reply: rontec_reply,
                 cut: |_| false,

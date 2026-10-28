@@ -137,8 +137,8 @@ mod tests {
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         let claim = claim_port(name).unwrap();
         let (rt, _actor) =
@@ -210,8 +210,8 @@ mod tests {
                 multi_device: true,
                 ..PortFlags::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
         );
         let claim = claim_port("loveMultiSer").unwrap();
         let (rt, _actor) =
