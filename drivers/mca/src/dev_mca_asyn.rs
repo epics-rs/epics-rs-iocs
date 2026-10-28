@@ -809,8 +809,11 @@ mod tests {
                 can_block,
                 destructible: false,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::NONE,
         );
         if let Some(addr) = down {
             base.set_auto_connect_addr(addr, false);
