@@ -21,6 +21,14 @@ use crate::spdlog::{self, FmtDouble};
 /// Digital outputs 0..7 and analog outputs 0..1 are addressed by asyn address.
 pub const NUM_CHANNELS: usize = 8;
 
+/// The interfaces this port registers; its db binds records to them.
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interfaces that post interrupts: [`INTERFACES`] without `asynDrvUser`.
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
+
 #[derive(Clone, Copy)]
 pub struct IoParams {
     pub speed_slider: usize,
@@ -65,8 +73,8 @@ impl IoDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32 | InterfaceMask::FLOAT64,
+            INTERFACES,
+            INTERRUPTS,
         );
         let params = IoParams::create(&mut base)?;
         let mut me = Self {

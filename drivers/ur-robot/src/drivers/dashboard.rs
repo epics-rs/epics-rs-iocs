@@ -22,6 +22,14 @@ use crate::registry::{self, DashboardHandle, DashboardState};
 use crate::session::DEFAULT_TIMEOUT;
 use crate::spdlog;
 
+/// The interfaces this port registers; its db binds records to them.
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interfaces that post interrupts: [`INTERFACES`] without `asynDrvUser`.
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::OCTET);
+
 /// asyn parameter indices, one per `createParam` in the C++ constructor.
 #[derive(Clone, Copy)]
 pub struct DashboardParams {
@@ -154,8 +162,8 @@ impl DashboardDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32 | InterfaceMask::OCTET,
+            INTERFACES,
+            INTERRUPTS,
         );
         let params = DashboardParams::create(&mut base)?;
 
@@ -542,8 +550,8 @@ mod tests {
             "dash_is_command",
             1,
             PortFlags::default(),
-            InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32 | InterfaceMask::OCTET,
+            INTERFACES,
+            INTERRUPTS,
         );
         let p = DashboardParams::create(&mut base).expect("params create");
 
@@ -586,8 +594,8 @@ mod tests {
             "dash_alarm_set",
             1,
             PortFlags::default(),
-            InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32 | InterfaceMask::OCTET,
+            INTERFACES,
+            INTERRUPTS,
         );
         let p = DashboardParams::create(&mut base).expect("params create");
 

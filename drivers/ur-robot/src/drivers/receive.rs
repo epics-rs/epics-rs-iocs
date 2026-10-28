@@ -23,6 +23,20 @@ use crate::registry::{self, ReceiveHandle};
 use crate::stream::Snapshot;
 
 pub const NUM_JOINTS: usize = 6;
+
+/// The interfaces the receive port registers; `rtde_receive.db` binds records
+/// to each of them.
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::DRV_USER)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::INT32_ARRAY);
+
+/// The interfaces that post interrupts: [`INTERFACES`] without `asynDrvUser`.
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::INT32_ARRAY);
 /// Only the lower 11 bits of the safety status word are used
 /// (rtde_receive_driver.cpp:40).
 const SAFETY_STATUS_BITS_MASK: u32 = 0x7ff;
@@ -282,15 +296,8 @@ impl ReceiveDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::DRV_USER
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
+            INTERFACES,
+            INTERRUPTS,
         );
         let params = ReceiveParams::create(&mut base)?;
 
@@ -981,15 +988,8 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::DRV_USER
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
+            INTERFACES,
+            INTERRUPTS,
         );
         let params = ReceiveParams::create(&mut base).expect("params create");
         base.own_interrupts(InterruptGate::opened());
@@ -1127,15 +1127,8 @@ mod tests {
             "recv_gate",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::DRV_USER
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
+            INTERFACES,
+            INTERRUPTS,
         );
         let params = ReceiveParams::create(&mut base).expect("params create");
         let mut driver = ReceiveDriver {
@@ -1168,15 +1161,8 @@ mod tests {
             "recv_alarm_set",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::DRV_USER
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
+            INTERFACES,
+            INTERRUPTS,
         );
         let p = ReceiveParams::create(&mut base).expect("params create");
 
@@ -1243,15 +1229,8 @@ mod tests {
             "recv_is_command",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::DRV_USER
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::INT32_ARRAY,
+            INTERFACES,
+            INTERRUPTS,
         );
         let p = ReceiveParams::create(&mut base).expect("params create");
 

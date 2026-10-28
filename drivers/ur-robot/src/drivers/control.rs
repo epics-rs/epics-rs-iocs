@@ -51,6 +51,19 @@ pub enum MotionStatus {
     WaitingAction,
 }
 
+/// The interfaces this port registers; its db binds records to them.
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interfaces that post interrupts: [`INTERFACES`] without `asynDrvUser`.
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::FLOAT64_ARRAY);
+
 #[derive(Debug, Clone, Copy)]
 pub struct MotionTask {
     pub motion: MotionType,
@@ -371,15 +384,8 @@ impl ControlDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::OCTET
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::OCTET
-                | InterfaceMask::FLOAT64_ARRAY,
+            INTERFACES,
+            INTERRUPTS,
         );
         let params = ControlParams::create(&mut base)?;
 
@@ -1476,15 +1482,8 @@ mod tests {
             "ctrl_is_command",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::OCTET
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::OCTET
-                | InterfaceMask::FLOAT64_ARRAY,
+            INTERFACES,
+            INTERRUPTS,
         );
         let p = ControlParams::create(&mut base).expect("params create");
 
@@ -1528,15 +1527,8 @@ mod tests {
             "ctrl_alarm_set",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::OCTET
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::OCTET
-                | InterfaceMask::FLOAT64_ARRAY,
+            INTERFACES,
+            INTERRUPTS,
         );
         let p = ControlParams::create(&mut base).expect("params create");
 
