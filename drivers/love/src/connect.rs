@@ -8,6 +8,7 @@
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::exception::ExceptionCallbackGuard;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::trace::TraceMask;
 
@@ -29,6 +30,12 @@ pub fn init_serial_port(port_name: &str, addr: i32) -> Result<PortHandle, String
     if port.handle.is_multi_device() {
         return Err(format!(
             "initSerialPort::{port_name} cannot be configured as multi device"
+        ));
+    }
+    if !port.handle.has_interface(InterfaceType::Octet) {
+        return Err(format!(
+            "initSerialPort::failure to find interface {}",
+            InterfaceType::Octet
         ));
     }
     Ok(port.handle)
@@ -227,6 +234,28 @@ mod tests {
             e,
             "initSerialPort::loveMultiSer cannot be configured as multi device"
         );
+    }
+
+    #[test]
+    fn a_port_without_asyn_octet_is_refused() {
+        let base = PortDriverBase::new(
+            "loveNoOctetSer",
+            1,
+            PortFlags::default(),
+            InterfaceMask::COMMON | InterfaceMask::INT32,
+            InterfaceMask::NONE,
+        );
+        let claim = claim_port("loveNoOctetSer").unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        std::mem::forget(rt);
+        let Err(e) = init_serial_port("loveNoOctetSer", 0) else {
+            panic!("port without asynOctet accepted");
+        };
+        assert_eq!(e, "initSerialPort::failure to find interface asynOctet");
     }
 
     #[test]
