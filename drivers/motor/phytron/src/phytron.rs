@@ -55,7 +55,7 @@ use epics_rs::asyn::interfaces::motor::{
 };
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -527,6 +527,9 @@ impl PhytronParams {
 }
 
 impl ControllerParams for PhytronParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::OCTET.or(InterfaceMask::OPTION);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::OCTET;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let r = &mut self.reasons;
         r.controller_status = base.create_param("CONTROLLER_STATUS", ParamType::Int32)?;
