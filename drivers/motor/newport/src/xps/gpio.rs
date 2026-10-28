@@ -83,8 +83,11 @@ impl XpsGpio {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::COMMON
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::FLOAT64 | InterfaceMask::UINT32_DIGITAL,
         );
         for (name, kind) in COMMANDS {
             base.create_param(name, kind)?;
