@@ -41,6 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure,
 };
@@ -137,7 +138,11 @@ impl SmartMotorController {
     pub fn new(port: PortHandle, timeout: Duration) -> AsynResult<Self> {
         // C ignores every setInputEos/setOutputEos status
         // (drvSmartMotor.cc:449-454, 598-601).
-        let writer = SyncIOHandle::from_handle(port.clone(), 0, timeout);
+        // The connect (drvSmartMotor.cc:593) fails on a port without
+        // asynCommon or asynOctet, and C then skips the card.
+        let (writer, connected) =
+            SyncIOHandle::connect_port(port.port_name(), 0, timeout, InterfaceType::Octet);
+        connected?;
         let _ = writer.set_output_eos(0, OUTPUT_EOS);
         let _ = writer.set_input_eos(0, INPUT_EOS);
         let mut ctrl = Self {
@@ -534,6 +539,25 @@ mod tests {
         }
     }
 
+    /// Run `driver` as the published port `name`, as `*Config` finds it.
+    fn serve(
+        name: &str,
+        driver: impl epics_rs::asyn::port::PortDriver + 'static,
+    ) -> (
+        epics_rs::asyn::runtime::port::PortRuntimeHandle,
+        std::thread::JoinHandle<()>,
+    ) {
+        use epics_rs::asyn::registry::{claim_port, open_owner};
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let claim = claim_port(name).unwrap();
+        let (rt, actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        (rt, actor)
+    }
+
     impl epics_rs::asyn::port::PortDriver for Chain {
         fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
             &self.base
@@ -583,17 +607,34 @@ mod tests {
         }
     }
 
+    /// drvSmartMotor.cc:593: `pasynOctetSyncIO->connect` fails on a port
+    /// without asynOctet, and C skips the card.
+    #[test]
+    fn a_port_without_asyn_octet_is_refused() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+
+        let name = "smartNoOctet";
+        let mut driver = chain(name);
+        driver.base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::COMMON | InterfaceMask::INT32,
+            InterfaceMask::NONE,
+        );
+        let (rt, _actor) = serve(name, driver);
+        let e = SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1))
+            .err()
+            .unwrap();
+        assert!(
+            e.to_string().contains("asynOctet interface not supported"),
+            "{e}"
+        );
+    }
+
     #[test]
     fn a_port_refusing_every_eos_set_still_finds_the_chain() {
-        use epics_rs::asyn::registry::claim_port;
-        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
-
-        let (rt, _actor) = create_port_runtime(
-            &claim_port("smartEosRefused").unwrap(),
-            chain("smartEosRefused"),
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _actor) = serve("smartEosRefused", chain("smartEosRefused"));
         let port = rt.port_handle().clone();
         assert!(
             port.set_input_eos_blocking(AsynUser::new(0), INPUT_EOS)
@@ -608,16 +649,12 @@ mod tests {
     /// `pasynOctetSyncIO`'s, which prints its TRACEIO_DEVICE line.
     #[test]
     fn init_flushes_and_sets_the_eos_as_asyn_octet_sync_io() {
-        use epics_rs::asyn::registry::claim_port;
-        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
         use epics_rs::asyn::trace::{TraceFile, TraceMask};
 
         let name = "smartSyncIo";
         let mut chain = chain(name);
         chain.takes_eos = true;
-        let (rt, _actor) =
-            create_port_runtime(&claim_port(name).unwrap(), chain, RuntimeConfig::default())
-                .unwrap();
+        let (rt, _actor) = serve(name, chain);
         let trace = rt.port_handle().trace();
         let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
         trace.set_trace_file(
@@ -644,19 +681,12 @@ mod tests {
 
     #[test]
     fn a_refused_write_still_reads_the_echo_and_the_command_succeeds() {
-        use epics_rs::asyn::registry::claim_port;
-        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
         use std::sync::atomic::Ordering;
 
         let chain = chain("smartWriteRefused");
         let refuse = chain.refuse_writes.clone();
         let reads = chain.reads.clone();
-        let (rt, _actor) = create_port_runtime(
-            &claim_port("smartWriteRefused").unwrap(),
-            chain,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _actor) = serve("smartWriteRefused", chain);
         let ctrl =
             SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
         let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
@@ -669,17 +699,9 @@ mod tests {
 
     #[test]
     fn init_goes_out_addressed_after_a_space() {
-        use epics_rs::asyn::registry::claim_port;
-        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
-
         let chain = chain("smartInit");
         let sent = chain.sent.clone();
-        let (rt, _actor) = create_port_runtime(
-            &claim_port("smartInit").unwrap(),
-            chain,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _actor) = serve("smartInit", chain);
         let ctrl =
             SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
         let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
@@ -693,18 +715,11 @@ mod tests {
     /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
     #[test]
     fn a_missed_rbt_is_retry_then_comm_error() {
-        use epics_rs::asyn::registry::claim_port;
-        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
         use std::sync::atomic::Ordering;
 
         let chain = chain("smartRetry");
         let silent = chain.silent.clone();
-        let (rt, _actor) = create_port_runtime(
-            &claim_port("smartRetry").unwrap(),
-            chain,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _actor) = serve("smartRetry", chain);
         let ctrl =
             SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
         let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
@@ -728,18 +743,11 @@ mod tests {
     /// past RETRY.
     #[test]
     fn a_failed_init_read_keeps_the_encoder_bits() {
-        use epics_rs::asyn::registry::claim_port;
-        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
         use std::sync::atomic::Ordering;
 
         let chain = chain("smartInitFail");
         let silent = chain.silent.clone();
-        let (rt, _actor) = create_port_runtime(
-            &claim_port("smartInitFail").unwrap(),
-            chain,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _actor) = serve("smartInitFail", chain);
         let ctrl =
             SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
         let ctrl = Arc::new(Mutex::new(ctrl));
@@ -766,17 +774,9 @@ mod tests {
     /// counts/s² times ACONFAC; a jog's V= too.
     #[test]
     fn speeds_scale_per_pid_sample() {
-        use epics_rs::asyn::registry::claim_port;
-        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
-
         let chain = chain("smartScale");
         let sent = chain.sent.clone();
-        let (rt, _actor) = create_port_runtime(
-            &claim_port("smartScale").unwrap(),
-            chain,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _actor) = serve("smartScale", chain);
         let ctrl =
             SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
         let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
@@ -861,9 +861,6 @@ mod tests {
         Arc<std::sync::atomic::AtomicBool>,
         Box<dyn std::any::Any>,
     ) {
-        use epics_rs::asyn::registry::claim_port;
-        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
-
         let replies: Replies = Default::default();
         let quiet: Arc<std::sync::atomic::AtomicBool> = Default::default();
         let driver = Single {
@@ -878,9 +875,7 @@ mod tests {
             replies: replies.clone(),
             quiet: quiet.clone(),
         };
-        let (rt, actor) =
-            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
-                .unwrap();
+        let (rt, actor) = serve(name, driver);
         let ctrl =
             SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
         (
