@@ -340,6 +340,13 @@ impl Model1Motor for DrvMvp2001Axis {
         Ok(())
     }
 
+    /// JOG_VELOCITY is JOG's `V` alone: PREM and POST go with the moves
+    /// (devMVP2001.cc:406).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send(&format!("V {}", nint(velocity * 0.03)));
+        Ok(())
+    }
+
     /// The MVP 2001 cannot home: HOME sends nothing, but the record's
     /// SET_VELOCITY and SET_ACCEL before it go out, and GO's `M` starts
     /// the last loaded move again (devMVP2001.cc:323,332). No PREM or POST.

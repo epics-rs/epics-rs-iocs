@@ -351,6 +351,12 @@ impl Model1Motor for PiJedsAxis {
         self.slew_rate(velocity)
     }
 
+    /// JOG_VELOCITY is JOG's slew rate alone: PREM and POST go with the
+    /// moves (devPIJEDS.cc:276).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.slew_rate(velocity)
+    }
+
     fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C HOME_* send nothing — no home on an absolute closed-loop stage —
         // but for the record's SET_VELOCITY of HVEL (motorRecord.cc:2052)

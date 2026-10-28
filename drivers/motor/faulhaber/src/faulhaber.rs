@@ -336,6 +336,16 @@ impl Model1Motor for FaulhaberAxis {
         ctrl.write_cmd(self.node, &format!("V {rpm}"))
     }
 
+    /// JOG_VELOCITY is JOG's three messages without the PREM and POST that
+    /// go with the moves (devMCDC2805.cc:287).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let rpm = vel_to_rpm(velocity, self.counts_per_rev());
+        let ctrl = self.lock();
+        let _ = ctrl.write_cmd(self.node, &self.encres());
+        let _ = ctrl.write_cmd(self.node, &format!("SP {}", rpm.abs()));
+        ctrl.write_cmd(self.node, &format!("V {rpm}"))
+    }
+
     fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         // C HOME_*: ENCRES, the homing speed signed by direction, the homing
         // sequence, and GO's `M`.

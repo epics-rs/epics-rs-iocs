@@ -302,6 +302,12 @@ impl Model1Motor for DrvIm483Axis {
         self.send_move(&[format!("M{:.2};", CFloat(velocity))])
     }
 
+    /// JOG_VELOCITY is JOG's `M` alone: PREM and POST go with the moves
+    /// (devIM483SM.cc:267, devIM483PL.cc:270).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send(&[format!("M{:.2};", CFloat(velocity))])
+    }
+
     fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let way = if forward { 0 } else { 1 };
         self.send_move(&[format!("F1000 {way}")])

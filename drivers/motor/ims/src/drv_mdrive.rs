@@ -303,6 +303,12 @@ impl Model1Motor for DrvMDriveAxis {
         self.motion(format!("SL={}", nint(velocity)))
     }
 
+    /// JOG_VELOCITY is JOG's `SL` alone: PREM and POST go with the moves
+    /// (devMDrive.cc:281).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send(&[format!("SL={}", nint(velocity))])
+    }
+
     /// devMDrive.cc sends the IM483's home command, ` F1000 0|1`, as is.
     fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let way = if forward { 0 } else { 1 };

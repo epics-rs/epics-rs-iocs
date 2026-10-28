@@ -415,6 +415,17 @@ impl Model1Motor for PIC663Axis {
         self.write_move(&format!("SV{},MA{}", velocity.abs() as i32, target as i32))
     }
 
+    /// JOG_VELOCITY is SET_VELOCITY's `SV{v},` (devPIC663.cc:224), sent now with the
+    /// SET_ACCEL ahead of it and no PREM, and no move.
+    fn jog_velocity(&mut self, user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.set_velocity(user, velocity)?;
+        let mut line = std::mem::take(&mut self.parts).into_bytes();
+        if line.last() == Some(&b',') {
+            line.pop();
+        }
+        self.lock().send_bytes(&line)
+    }
+
     fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let cmd = if forward { "FE0" } else { "FE1" };
         self.write_move(cmd)
@@ -574,6 +585,21 @@ mod tests {
         axis.set_move_strings(&user, b"MN", None).unwrap();
         axis.record_jog(&user, 0.0, -100.0, 50.0).unwrap();
         assert_eq!(line.sent(), ["SA50,MN,SV100,MA-100"]);
+    }
+
+    /// devPIC663.cc JOG_VELOCITY: the pending `SA`/`SV` go out at once, minus
+    /// end_trans's trailing `,`, with PREM left armed for the next move.
+    #[test]
+    fn a_jvel_retune_sends_sv_and_leaves_prem_armed() {
+        let (line, mut axis, _) = strings_rig("pic663Jvel");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.set_accel(&user, 50.0).unwrap();
+        axis.jog_velocity(&user, 100.0).unwrap();
+        assert_eq!(line.sent(), ["SA50,SV100"]);
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MN,MA5"]);
     }
 
     /// drvPIC663.cc:307-314: POST once the move is done, not while it runs,

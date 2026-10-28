@@ -284,6 +284,13 @@ impl Model1Motor for DrvSoloistAxis {
         Ok(())
     }
 
+    /// JOG_VELOCITY is JOG's `FREERUN` alone: PREM and POST go with the
+    /// moves (devSoloist.cc:299).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.send(format!("FREERUN F {}", self.units(velocity)));
+        Ok(())
+    }
+
     /// `HomeDirection` set for `forward`, then the PREM line and `HOME`.
     /// devSoloist.cc:240 overwrites the PREM it has just queued for
     /// HOME_FOR/HOME_REV with `SETPARM 106` and hangs the POST on that
@@ -507,6 +514,30 @@ mod tests {
             line.sent(),
             ["SETPARM 102, 3", "SETPARM 107, 3", "MOVEABS D5"]
         );
+    }
+
+    /// devSoloist.cc:299: a JVEL retune sends the `FREERUN` alone; PREM stays
+    /// armed for the next move.
+    #[test]
+    fn a_jvel_retune_sends_freerun_without_prem() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::new("soloistJvel", |_| "%0".into());
+        let card = Arc::new(Mutex::new(SoloistCard::new(io)));
+        let setup = AxisSetup {
+            encoder: false,
+            gain: false,
+            resolution: 1.0,
+            digits: 0,
+            home_dparam: 0,
+        };
+        let mut axis = DrvSoloistAxis::new(card, setup);
+        let user = AsynUser::new(0);
+        axis.set_move_strings(&user, b"PRE", None).unwrap();
+        line.sent();
+        axis.jog_velocity(&user, 4.0).unwrap();
+        assert_eq!(line.sent(), ["FREERUN F 4"]);
+        axis.move_absolute(&user, 5.0).unwrap();
+        assert_eq!(line.sent(), ["PRE\nMOVEABS D5"]);
     }
 
     /// drvSoloist.cc's `%.*f` of a non-finite step value.

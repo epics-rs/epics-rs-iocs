@@ -397,6 +397,13 @@ impl Model1Motor for PIE816Axis {
         self.lock().send_bytes(&line)
     }
 
+    /// JOG_VELOCITY is JOG's `VEL` alone: PREM and POST go with the moves
+    /// (devPIE816.cc:276).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.lock()
+            .send_bytes(vel_cmd(self.label(), velocity).as_bytes())
+    }
+
     fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C `devPIE816_build_trans` HOME_FOR/HOME_REV → ERROR (no home
         // command), after the message already took PREM and its EOL,

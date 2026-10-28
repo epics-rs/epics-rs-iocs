@@ -539,6 +539,13 @@ impl Model1Motor for PIE710Axis {
         self.lock().send_bytes(&line)
     }
 
+    /// JOG_VELOCITY is JOG's `#SV` alone: PREM and POST go with the moves
+    /// (devPIE710.cc:269).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.lock()
+            .send_bytes(sv_msg(self.label(), velocity).as_bytes())
+    }
+
     fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C sends #GH regardless of direction, after the velocity.
         let line = self.move_line(&substitute_axis("#GH,", self.label()));

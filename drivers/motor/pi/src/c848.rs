@@ -455,6 +455,14 @@ impl Model1Motor for PIC848Axis {
         self.lock().send_bytes(&line)
     }
 
+    /// JOG_VELOCITY is JOG's `VEL` alone: PREM and POST go with the moves
+    /// (devPIC848.cc:288).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let l = self.letter;
+        let line = format!("VEL  {l}{:.5}", CFloat(velocity * POS_RES));
+        self.lock().send_bytes(line.as_bytes())
+    }
+
     fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // Both HOME_FOR/HOME_REV send "REF  L" after SET_VELOCITY.
         let l = self.letter;

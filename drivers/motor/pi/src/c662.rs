@@ -481,6 +481,14 @@ mod tests {
         (line, axis, esr)
     }
 
+    /// devPIC662.cc:258: JOG_VELOCITY sends nothing (`send = false`).
+    #[test]
+    fn a_jvel_retune_sends_nothing() {
+        let (line, mut axis, _) = strings_rig("pic662Jvel");
+        axis.jog_velocity(&AsynUser::default(), 5.0).unwrap();
+        assert!(line.sent().is_empty());
+    }
+
     /// drvPIC662.cc:292 has the encoder_position set commented out, so REP
     /// keeps motor_init's 0 (:567).
     #[test]

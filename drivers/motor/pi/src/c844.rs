@@ -372,6 +372,14 @@ impl Model1Motor for PIC844Axis {
         self.write_move(&format!("TARG:VEL {:.2}", CFloat(velocity)))
     }
 
+    /// JOG_VELOCITY is JOG's `TARG:VEL` with the SET_ACCEL ahead of it and
+    /// no PREM or POST (devPIC844.cc:254).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let parts = std::mem::take(&mut self.parts);
+        let line = format!("{}{parts}TARG:VEL {:.2}", self.prefix(), CFloat(velocity));
+        self.lock().send_bytes(line.as_bytes())
+    }
+
     fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let dir = if forward { "POS" } else { "NEG" };
         self.write_move(&format!("TARG:FIND {dir}"))
