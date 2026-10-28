@@ -50,7 +50,7 @@ pub use epics_rs::motor::device_support::AxisReport;
 use epics_rs::motor::device_support::MotorAxis;
 pub use epics_rs::motor::devices::{
     device_support_factory, devices, model1_device, register_controller_port,
-    register_drv_motor_asyn_port, register_model1_device,
+    register_drv_motor_asyn_port, register_model1_device, register_model1_device_disabling_ntm,
 };
 use epics_rs::motor::poll_loop::PollCommand;
 pub use epics_rs::motor::trace::TraceUser;

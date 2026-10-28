@@ -304,11 +304,6 @@ impl Model1Motor for PiJedsAxis {
 }
 
 impl AsynMotor for PiJedsAxis {
-    // devPIJEDS.cc:126 forces NTM to NO.
-    fn disables_ntm(&self) -> bool {
-        true
-    }
-
     /// drvPIJEDS.cc:292-306: a first unread status or position is RETRY,
     /// raising and posting nothing; the next is COMM_ERR, raising
     /// `CNTRL_COMM_ERR` and `RA_PROBLEM`.

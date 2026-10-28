@@ -31,7 +31,7 @@ use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::motor::builder::{ControllerAxis, MotorTaskBuilder};
 use epics_rs::motor::device_support::BuildTrans;
 
-use crate::{TraceUser, register_model1_device};
+use crate::{TraceUser, register_model1_device, register_model1_device_disabling_ntm};
 
 /// `SCAN_RATE`, the default polling rate in Hz (motor.h:127).
 pub const SCAN_RATE: i32 = 6;
@@ -40,6 +40,10 @@ pub const SCAN_RATE: i32 = 6;
 /// limit and its default scan rate, and what its `Setup` set.
 pub struct Model1 {
     row: &'static DevSup,
+    /// Whether the device support forces the record's NTM to NO at
+    /// init_record (devEMC18011.cc:127-129, devPIE816.cc:130,
+    /// devMDT695.cc:129).
+    disables_ntm: bool,
     max_cards: i32,
     default_scan_rate: i32,
     /// `(num_cards, scan_rate)` once `Setup` ran.
@@ -153,8 +157,28 @@ impl Model1 {
     /// `max_cards` and `default_scan_rate` are the driver's `<DRV>_NUM_CARDS`
     /// and `SCAN_RATE`.
     pub const fn new(row: &'static DevSup, max_cards: i32, default_scan_rate: i32) -> Self {
+        Self::build(row, false, max_cards, default_scan_rate)
+    }
+
+    /// [`Model1::new`] for a device whose `init_record` sets the record's NTM
+    /// to NO because the device does its own backlash.
+    pub const fn new_disabling_ntm(
+        row: &'static DevSup,
+        max_cards: i32,
+        default_scan_rate: i32,
+    ) -> Self {
+        Self::build(row, true, max_cards, default_scan_rate)
+    }
+
+    const fn build(
+        row: &'static DevSup,
+        disables_ntm: bool,
+        max_cards: i32,
+        default_scan_rate: i32,
+    ) -> Self {
         Self {
             row,
+            disables_ntm,
             max_cards,
             default_scan_rate,
             setup: Mutex::new(None),
@@ -211,7 +235,11 @@ impl Model1 {
     /// Add the driver's row to the motor DTYP menu, for a driver whose
     /// `Setup` takes more than [`Model1::setup_command`] parses.
     pub fn register_row(&self) {
-        register_model1_device(self.row);
+        if self.disables_ntm {
+            register_model1_device_disabling_ntm(self.row);
+        } else {
+            register_model1_device(self.row);
+        }
     }
 
     /// What every model-1 `Setup` does with its card count and scan rate,

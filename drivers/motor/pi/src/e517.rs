@@ -367,11 +367,6 @@ impl Model1Motor for PIE517Axis {
 }
 
 impl AsynMotor for PIE517Axis {
-    // devPIE517.cc:132 forces NTM to NO.
-    fn disables_ntm(&self) -> bool {
-        true
-    }
-
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }

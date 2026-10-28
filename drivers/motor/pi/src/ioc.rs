@@ -476,7 +476,7 @@ pub fn pic848_config_command() -> CommandDef {
 static DEV_PIE516: DevSup = model1_device("devPIE516", "PIE516");
 
 /// `PIE516_NUM_CARDS` (drvPIE516.cc:65).
-static PIE516: Model1 = Model1::new(&DEV_PIE516, 10, SCAN_RATE);
+static PIE516: Model1 = Model1::new_disabling_ntm(&DEV_PIE516, 10, SCAN_RATE);
 
 /// `PIE516Setup(num_cards, scan_rate)`.
 pub fn pie516_setup_command() -> CommandDef {
@@ -539,7 +539,7 @@ pub fn pie516_config_command() -> CommandDef {
 static DEV_PIE517: DevSup = model1_device("devPIE517", "PIE517");
 
 /// `PIE517_NUM_CARDS` (drvPIE517.cc:73).
-static PIE517: Model1 = Model1::new(&DEV_PIE517, 10, SCAN_RATE);
+static PIE517: Model1 = Model1::new_disabling_ntm(&DEV_PIE517, 10, SCAN_RATE);
 
 /// `PIE517Setup(num_cards, scan_rate)`.
 pub fn pie517_setup_command() -> CommandDef {
@@ -603,7 +603,7 @@ pub fn pie517_config_command() -> CommandDef {
 static DEV_PIE710: DevSup = model1_device("devPIE710", "PIE710");
 
 /// `PIE710_NUM_CARDS` (drvPIE710.cc:57).
-static PIE710: Model1 = Model1::new(&DEV_PIE710, 8, SCAN_RATE);
+static PIE710: Model1 = Model1::new_disabling_ntm(&DEV_PIE710, 8, SCAN_RATE);
 
 /// `PIE710Setup(num_cards, scan_rate)`.
 pub fn pie710_setup_command() -> CommandDef {
@@ -666,7 +666,7 @@ pub fn pie710_config_command() -> CommandDef {
 static DEV_PIE816: DevSup = model1_device("devPIE816", "PIE816");
 
 /// `PIE816_NUM_CARDS` (drvPIE816.cc:73).
-static PIE816: Model1 = Model1::new(&DEV_PIE816, 10, SCAN_RATE);
+static PIE816: Model1 = Model1::new_disabling_ntm(&DEV_PIE816, 10, SCAN_RATE);
 
 /// `PIE816Setup(num_cards, scan_rate)`.
 pub fn pie816_setup_command() -> CommandDef {

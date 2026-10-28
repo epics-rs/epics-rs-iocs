@@ -25,7 +25,7 @@ const PIJEDS_TIMEOUT: Duration = Duration::from_secs(2);
 static DEV_PIJEDS: DevSup = model1_device("devPIJEDS", "PIJEDS");
 
 /// `PIJEDS_NUM_CARDS` (drvPIJEDS.h:32).
-static PIJEDS: Model1 = Model1::new(&DEV_PIJEDS, 10, SCAN_RATE);
+static PIJEDS: Model1 = Model1::new_disabling_ntm(&DEV_PIJEDS, 10, SCAN_RATE);
 
 /// `PIJEDSSetup(num_cards, scan_rate)`.
 pub fn pijeds_setup_command() -> CommandDef {

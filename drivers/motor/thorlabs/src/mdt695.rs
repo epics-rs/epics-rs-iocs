@@ -264,11 +264,6 @@ impl Model1Motor for Mdt695Axis {
 }
 
 impl AsynMotor for Mdt695Axis {
-    // devMDT695.cc:129 forces NTM to NO.
-    fn disables_ntm(&self) -> bool {
-        true
-    }
-
     fn poll_failure(&self) -> PollFailure {
         self.failure
     }

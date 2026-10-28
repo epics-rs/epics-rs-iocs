@@ -26,7 +26,7 @@ const EMC18011_TIMEOUT: Duration = Duration::from_secs(1);
 static DEV_EMC18011: DevSup = model1_device("devEMC18011", "EMC18011");
 
 /// `EMC18011_NUM_CARDS` (drvEMC18011.cc:66).
-static EMC18011: Model1 = Model1::new(&DEV_EMC18011, 16, SCAN_RATE);
+static EMC18011: Model1 = Model1::new_disabling_ntm(&DEV_EMC18011, 16, SCAN_RATE);
 
 /// `EMC18011Setup(num_cards, scan_rate)`.
 pub fn emc18011_setup_command() -> CommandDef {

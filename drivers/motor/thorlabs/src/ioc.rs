@@ -25,7 +25,7 @@ const MDT695_TIMEOUT: Duration = Duration::from_secs(2);
 static DEV_MDT695: DevSup = model1_device("devMDT695", "MDT695");
 
 /// `MDT695_NUM_CARDS` (drvMDT695.cc:61).
-static MDT695: Model1 = Model1::new(&DEV_MDT695, 16, SCAN_RATE);
+static MDT695: Model1 = Model1::new_disabling_ntm(&DEV_MDT695, 16, SCAN_RATE);
 
 /// `MDT695Setup(num_cards, scan_rate)`.
 pub fn mdt695_setup_command() -> CommandDef {
