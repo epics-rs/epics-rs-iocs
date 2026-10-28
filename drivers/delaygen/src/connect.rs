@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::{TraceMask, TraceOut};
@@ -67,8 +68,12 @@ pub fn connect_octet(port_name: &str, addr: i32, timeout: Duration) -> Result<Oc
             "octet port '{port_name}' not found (call drvAsynSerialPortConfigure/drvAsynIPPortConfigure first)"
         )
     })?;
+    // asynOctetSyncIO.c:124-137: the connect fails on a port without
+    // asynCommon or asynOctet.
+    let (sync, status) = SyncIOHandle::connect_port(port_name, addr, timeout, InterfaceType::Octet);
+    status.map_err(|e| format!("octet port '{port_name}': {e}"))?;
     Ok(OctetLink {
-        sync: SyncIOHandle::from_handle(port.handle.clone(), addr, timeout),
+        sync,
         port: port.handle.clone(),
         addr,
     })
@@ -189,4 +194,49 @@ fn link_onto(io: &str, driver: impl epics_rs::asyn::port::PortDriver + 'static) 
         .publish(runtime.port_handle().clone(), &InterruptGate::opened())
         .unwrap();
     connect_octet(io, 0, Duration::from_millis(100)).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::asyn_record::claim_port;
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+    struct NoOctet(PortDriverBase);
+
+    impl PortDriver for NoOctet {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    /// asynOctetSyncIO.c:124-137 fails the connect of the DG645, Colby and
+    /// CoherentSDG drivers on a port that lacks asynOctet.
+    #[test]
+    fn a_port_without_asyn_octet_is_refused() {
+        let io = "delaygenNoOctet";
+        let claim = claim_port(io).unwrap();
+        let driver = NoOctet(PortDriverBase::new(
+            io,
+            1,
+            PortFlags::default(),
+            InterfaceMask::COMMON | InterfaceMask::INT32,
+            InterfaceMask::NONE,
+        ));
+        let (runtime, _actor) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        let e = connect_octet(io, 0, Duration::from_millis(100))
+            .err()
+            .unwrap();
+        assert!(e.contains("asynOctet interface not supported"), "{e}");
+    }
 }
