@@ -39,7 +39,7 @@ use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
 };
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{OctetReadOp, RequestOp};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -356,6 +356,13 @@ impl ImsParams {
 }
 
 impl ControllerParams for ImsParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::UINT32_DIGITAL);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::UINT32_DIGITAL);
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.save_to_nvm = Some(base.create_param("IMS_SAVETONVM", ParamType::Int32)?);
         // Created and stored, never acted on: "NOT SUPPORTED YET"
