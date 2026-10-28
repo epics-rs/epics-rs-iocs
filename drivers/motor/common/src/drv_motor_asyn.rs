@@ -339,8 +339,17 @@ impl DrvMotorAsyn {
                 can_block: true,
                 destructible: false,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::COMMON
+                | InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::GENERIC_POINTER
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::GENERIC_POINTER,
         );
         for (addr, axis) in axes.iter().enumerate() {
             let Some(Axis {
