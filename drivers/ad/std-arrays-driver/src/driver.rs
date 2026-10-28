@@ -556,6 +556,21 @@ mod tests {
     use super::*;
     use epics_rs::ad_core::ndarray::{NDArray, NDDataView};
 
+    /// NDDriverStdArrays.cpp:49: the five array interfaces ride on top of
+    /// ADDriver's, with no callbacks of their own.
+    #[test]
+    fn the_port_has_the_c_array_interfaces() {
+        let f = Fixture::new();
+        let port = &f.det.ad.port_base;
+        assert!(port.interface_mask().contains(
+            InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::INT16_ARRAY
+                | InterfaceMask::INT8_ARRAY
+        ));
+    }
+
     struct Fixture {
         det: NdStdArraysDriver,
         publish_rx: rt::CommandReceiver<PublishedArray>,
