@@ -107,6 +107,7 @@ fn phytron_err(message: impl Into<String>) -> AsynError {
 
 /// C `phyToAsyn`: the two phytron codes past the asyn ones
 /// (`phytronInvalidReturn` 6, `phytronInvalidCommand` 7) are an asyn error.
+/// C returns the bare `asynStatus`, so devAsyn has no message to append.
 fn phy_to_asyn(code: i32) -> AsynError {
     let status = match code {
         1 => AsynStatus::Timeout,
@@ -117,7 +118,7 @@ fn phy_to_asyn(code: i32) -> AsynError {
     };
     AsynError::Status {
         status,
-        message: format!("phytron: error code {code}"),
+        message: String::new(),
     }
 }
 
@@ -2114,6 +2115,30 @@ mod tests {
     use super::*;
     use epics_rs::asyn::interfaces::motor::PortSet;
     use motor_common::testing::Polled;
+
+    /// C `phyToAsyn` (phytronAxisMotor.cpp:1218) returns the bare status, so
+    /// devAsyn prints "process read error" with no text appended.
+    #[test]
+    fn phy_to_asyn_carries_a_status_and_no_message() {
+        for (code, status) in [
+            (1, AsynStatus::Timeout),
+            (2, AsynStatus::Overflow),
+            (4, AsynStatus::Disconnected),
+            (5, AsynStatus::Disabled),
+            (6, AsynStatus::Error),
+            (7, AsynStatus::Error),
+        ] {
+            match phy_to_asyn(code) {
+                AsynError::Status {
+                    status: got,
+                    message,
+                } => {
+                    assert_eq!((got, message.as_str()), (status, ""), "{code}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
 
     /// An MCC that ACKs every command, answering `P22R` with 1000 and the
     /// rest of a poll with an idle, fault-free axis; records each command
