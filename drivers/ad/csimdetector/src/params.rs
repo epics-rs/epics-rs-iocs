@@ -113,7 +113,9 @@ impl CSimParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::port::InterfaceMask;
+    use epics_rs::ad_core::driver::ndarray_driver::{
+        ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS,
+    };
     use epics_rs::asyn::port::PortFlags;
 
     fn fixture() -> (PortDriverBase, NDArrayDriverParams, CSimParams) {
@@ -125,8 +127,8 @@ mod tests {
                 multi_device: true,
                 ..Default::default()
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            ND_ARRAY_DRIVER_INTERFACES,
+            ND_ARRAY_DRIVER_INTERRUPTS,
         );
         let (nd, _) = NDArrayDriverParams::create(&mut base).unwrap();
         let sim = CSimParams::create(&mut base).unwrap();

@@ -89,8 +89,8 @@ impl CSimDetector {
                 multi_device: true,
                 ..Default::default()
             },
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )?;
         let sim = CSimParams::create(&mut port_base)?;
 
