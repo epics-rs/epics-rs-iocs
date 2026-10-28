@@ -37,7 +37,7 @@ use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PortSets,
 };
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -274,6 +274,9 @@ impl WriteHook for OemWriteHook {
 /// address with no axis (OEMMotorDriver.cpp:130-135, 171-175); rs refuses
 /// there as the base does.
 impl ControllerParams for OemParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+
     /// C `OEMController::report` (OEMMotorDriver.cpp:94-101); `OEMAxis::report`
     /// adds nothing.
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
