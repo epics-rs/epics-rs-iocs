@@ -605,8 +605,11 @@ impl LoveDriver {
                 can_block: serial.can_block(),
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::COMMON
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL,
+            InterfaceMask::NONE,
         );
         base.set_auto_connect(serial.connect_device(ser_addr).auto_connect());
 
