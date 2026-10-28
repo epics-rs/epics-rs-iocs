@@ -14,6 +14,7 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::motor::controller_port::index;
 use epics_rs::motor::devices::{
@@ -270,6 +271,9 @@ struct MotorSimReport {
 }
 
 impl ControllerParams for MotorSimReport {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
+
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let port = ctx.port_name();
         let _ = writeln!(
