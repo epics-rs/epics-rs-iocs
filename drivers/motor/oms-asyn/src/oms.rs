@@ -55,7 +55,7 @@ use epics_rs::base::runtime::log::errlog_vprintf;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::motor::controller_port::{
     AxisUser, FinishedWrite, ParamWrite, WriteHook, WriteOutcome, WriteValue, index,
 };
@@ -259,6 +259,13 @@ impl OmsParams {
 }
 
 impl ControllerParams for OmsParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::OCTET);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::OCTET);
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         // Address 0's list alone (omsBaseController.cpp:95-98).
         self.reasons = OmsReasons {
