@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
@@ -86,8 +85,11 @@ enum ConnectError {
 /// `lowLevelPortConnect` does (pmacController.cpp:233, pmacAsynCoord.c:280);
 /// every PMAC reply ends in ACK, so without it every read times out.
 fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, ConnectError> {
-    let entry = get_port(port).ok_or(ConnectError::NoPort)?;
-    let handle = SyncIOHandle::from_handle(entry.handle.clone(), addr, PMAC_TIMEOUT);
+    // pmacAsynCoord.c:284: a port without asynCommon or asynOctet is
+    // refused like a missing one.
+    let (handle, connected) =
+        SyncIOHandle::connect_port(port, addr, PMAC_TIMEOUT, InterfaceType::Octet);
+    connected.map_err(|_| ConnectError::NoPort)?;
     handle
         .set_input_eos(0, b"\x06")
         .map_err(ConnectError::InputEos)?;
@@ -1064,6 +1066,27 @@ mod tests {
             .collect();
         let pair = ["setInputEos eoslen 1", "setOutputEos eoslen 1"];
         assert_eq!(lines, [pair, pair].concat(), "{text}");
+    }
+
+    /// pmacAsynCoord.c:284: `pasynOctetSyncIO->connect` fails on a port
+    /// without asynOctet.
+    #[test]
+    fn the_coordinate_connect_refuses_a_port_without_asyn_octet() {
+        let name = "pmacCoordNoOctet";
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::COMMON | InterfaceMask::INT32,
+            InterfaceMask::NONE,
+        );
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        assert!(matches!(connect_octet(name, 0), Err(ConnectError::NoPort)));
     }
 
     #[test]
