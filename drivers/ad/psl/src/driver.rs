@@ -1141,6 +1141,24 @@ mod tests {
         }
     }
 
+    /// PSL.cpp:138: asynEnum is both implemented and posts callbacks.
+    #[test]
+    fn the_port_implements_enum_with_callbacks() {
+        let det = served_detector("PSLMASK", b"", false);
+        assert!(
+            det.ad
+                .port_base
+                .interface_mask()
+                .contains(InterfaceMask::ENUM)
+        );
+        assert!(
+            det.ad
+                .port_base
+                .interrupt_mask()
+                .contains(InterfaceMask::ENUM)
+        );
+    }
+
     /// A detector on a [`FakeServer`] answering `reply`.
     fn served_detector(name: &str, reply: &[u8], cut: bool) -> PslDetector {
         let ip = format!("{name}_IP");
