@@ -167,6 +167,9 @@ impl Reply {
 mod tests {
     use std::sync::Arc;
 
+    use epics_rs::ad_core::driver::ndarray_driver::{
+        ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS,
+    };
     use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortFlags};
     use epics_rs::asyn::registry::claim_port;
@@ -321,13 +324,15 @@ mod tests {
                     | InterfaceMask::FLOAT64_ARRAY
                     | InterfaceMask::ENUM
                     | InterfaceMask::GENERIC_POINTER
-                    | InterfaceMask::DRV_USER,
+                    | InterfaceMask::DRV_USER
+                    | ND_ARRAY_DRIVER_INTERFACES,
                 InterfaceMask::INT32
                     | InterfaceMask::INT32_ARRAY
                     | InterfaceMask::FLOAT64
                     | InterfaceMask::FLOAT64_ARRAY
                     | InterfaceMask::ENUM
-                    | InterfaceMask::GENERIC_POINTER,
+                    | InterfaceMask::GENERIC_POINTER
+                    | ND_ARRAY_DRIVER_INTERRUPTS,
             )),
             RuntimeConfig::default(),
         )
