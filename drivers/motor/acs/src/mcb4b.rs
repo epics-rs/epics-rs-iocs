@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -289,6 +290,9 @@ pub struct Mcb4bParams {
 }
 
 impl ControllerParams for Mcb4bParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     /// C `MCB4BController::report` (MCB4BDriver.cpp:95-102).
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
