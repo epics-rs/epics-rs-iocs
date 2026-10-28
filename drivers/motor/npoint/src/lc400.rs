@@ -898,6 +898,20 @@ mod tests {
     use super::*;
     use motor_common::testing::Polled;
 
+    /// LC400MotorDriver.cpp:101-102: asynUInt32Digital is added to both the
+    /// interfaces and the callback interfaces.
+    #[test]
+    fn the_port_adds_uint32_digital_to_both_masks() {
+        use epics_rs::motor::controller_port::ControllerPort;
+
+        let ctrl = Arc::new(Mutex::new(Lc400Controller::new(None, 1)));
+        let port = ControllerPort::new("lc400Mask", 1, Lc400ControllerParams::new(ctrl, 0.1, 1.0))
+            .unwrap();
+        let bit = InterfaceMask::UINT32_DIGITAL;
+        assert!(port.base().interface_mask().contains(bit));
+        assert!(port.base().interrupt_mask().contains(bit));
+    }
+
     #[test]
     fn the_constructor_calls_back() {
         let controller = Arc::new(Mutex::new(Lc400Controller::new(None, 1)));
