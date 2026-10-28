@@ -282,8 +282,15 @@ impl ReceiveDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
         );
         let params = ReceiveParams::create(&mut base)?;
 
@@ -974,8 +981,15 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
         );
         let params = ReceiveParams::create(&mut base).expect("params create");
         base.own_interrupts(InterruptGate::opened());
@@ -1113,8 +1127,15 @@ mod tests {
             "recv_gate",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
         );
         let params = ReceiveParams::create(&mut base).expect("params create");
         let mut driver = ReceiveDriver {
@@ -1147,8 +1168,15 @@ mod tests {
             "recv_alarm_set",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
         );
         let p = ReceiveParams::create(&mut base).expect("params create");
 
@@ -1215,8 +1243,15 @@ mod tests {
             "recv_is_command",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::INT32_ARRAY,
         );
         let p = ReceiveParams::create(&mut base).expect("params create");
 
