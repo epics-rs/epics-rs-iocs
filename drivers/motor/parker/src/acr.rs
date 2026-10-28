@@ -42,7 +42,7 @@ use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
 };
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -208,6 +208,9 @@ impl WriteHook for AcrWriteHook {
 }
 
 impl ControllerParams for AcrParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+
     /// C `ACRController::report` (ACRMotorDriver.cpp:108-120).
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
