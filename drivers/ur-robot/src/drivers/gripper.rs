@@ -167,8 +167,8 @@ impl GripperDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64,
         );
         let params = GripperParams::create(&mut base)?;
 
@@ -603,8 +603,8 @@ mod tests {
             "grip_is_command",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64,
         );
         let p = GripperParams::create(&mut base).expect("params create");
 
@@ -796,8 +796,8 @@ mod tests {
             "grip_alarm_set",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::FLOAT64,
         );
         let p = GripperParams::create(&mut base).expect("params create");
 
