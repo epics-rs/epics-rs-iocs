@@ -310,8 +310,24 @@ impl TimePix3Driver {
                 multi_device: true,
                 ..Default::default()
             },
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::INT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::ENUM
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::INT64_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32
+                | InterfaceMask::INT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::ENUM
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::INT64_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::DRV_USER,
         )?;
         let p = TimePixParams::create(&mut ad.port_base)?;
 
