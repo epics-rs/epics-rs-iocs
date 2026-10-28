@@ -845,7 +845,7 @@ mod tests {
         MerlinDetector::new(
             name,
             MpxConnection::new(
-                SyncIOHandle::from_handle(handle, 0, Duration::ZERO),
+                SyncIOHandle::from_handle(handle, 0, Duration::ZERO, InterfaceType::Octet).unwrap(),
                 MPX_MAXLINE,
             ),
             512,
@@ -899,7 +899,7 @@ mod tests {
         let mut det = MerlinDetector::new(
             "MERLIN_ATOI",
             MpxConnection::new(
-                SyncIOHandle::from_handle(handle, 0, Duration::ZERO),
+                SyncIOHandle::from_handle(handle, 0, Duration::ZERO, InterfaceType::Octet).unwrap(),
                 MPX_MAXLINE,
             ),
             512,
@@ -936,7 +936,13 @@ mod tests {
             1 << 20,
         )
         .expect("the detector port");
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         let p = rt.ad_params;
         sync.write_int32(p.num_images, 3).unwrap();
         assert_eq!(sync.read_int32(p.num_images).unwrap(), 3);
@@ -1095,7 +1101,13 @@ mod tests {
             1 << 20,
         )
         .unwrap();
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let (text, status) = sync
             .read_octet(rt.ad_params.string_to_server, 256)
             .into_parts();
@@ -1135,7 +1147,8 @@ mod tests {
         let mut det = MerlinDetector::new(
             "MERLIN_REPLY",
             MpxConnection::new(
-                SyncIOHandle::from_handle(handle, 0, Duration::from_secs(1)),
+                SyncIOHandle::from_handle(handle, 0, Duration::from_secs(1), InterfaceType::Octet)
+                    .unwrap(),
                 MPX_MAXLINE,
             ),
             512,
@@ -1242,7 +1255,8 @@ mod tests {
         std::mem::forget(runtime);
         AcquisitionContext {
             data: MpxConnection::new(
-                SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
+                SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO, InterfaceType::Octet)
+                    .unwrap(),
                 MPX_MAXLINE,
             ),
             handle: handle.clone(),
@@ -1705,7 +1719,13 @@ mod tests {
             create_port_runtime(&claim_port(ip).unwrap(), server, RuntimeConfig::default())
                 .unwrap();
         let cmd = MpxConnection::new(
-            SyncIOHandle::from_handle(runtime.port_handle().clone(), 0, Duration::ZERO),
+            SyncIOHandle::from_handle(
+                runtime.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
             MPX_MAXLINE,
         );
         let mut det = MerlinDetector::new(

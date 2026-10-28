@@ -158,6 +158,8 @@ impl std::fmt::Display for CStr<'_> {
 pub struct RontecDriver {
     base: PortDriverBase,
     serial: PortHandle,
+    /// C `pPvt->pasynUser`, connected once at `RontecConfig`.
+    io: SyncIOHandle,
     /// C `pPvt->serialPort`.
     serial_port: String,
     addr: i32,
@@ -246,9 +248,16 @@ impl RontecDriver {
         );
         let reasons = McaReason::create_params(&mut base)?;
 
+        let io = SyncIOHandle::from_handle(
+            serial.clone(),
+            serial_port_addr,
+            RONTEC_TIMEOUT,
+            InterfaceType::Octet,
+        )?;
         let mut driver = RontecDriver {
             base,
             serial,
+            io,
             serial_port: serial_port_name.to_owned(),
             addr: serial_port_addr,
             reasons,
@@ -281,7 +290,7 @@ impl RontecDriver {
 
     /// C `pPvt->pasynUser`, the `pasynOctetSyncIO` user on the serial port.
     fn sync_io(&self, timeout: Duration) -> SyncIOHandle {
-        SyncIOHandle::from_handle(self.serial.clone(), self.addr, timeout)
+        self.io.with_timeout(timeout)
     }
 
     /// Which [`McaReason`] (if any) `self.reasons` resolved `idx` to.
@@ -773,6 +782,13 @@ mod tests {
             base,
             serial: serial_runtime.port_handle().clone(),
             serial_port: "TESTRONTECSERIAL".to_owned(),
+            io: SyncIOHandle::from_handle(
+                serial_runtime.port_handle().clone(),
+                0,
+                RONTEC_TIMEOUT,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
             addr: 0,
             reasons: dummy_reasons(),
             nchans: RONTEC_MAXCHANS as i32,

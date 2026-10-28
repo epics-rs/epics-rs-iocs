@@ -896,6 +896,7 @@ mod tests {
     use epics_rs::motor::trace::TraceUser;
 
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use motor_common::testing::Polled;
 
     /// LC400MotorDriver.cpp:101-102: asynUInt32Digital is added to both the
@@ -1188,7 +1189,13 @@ mod tests {
             reply: Default::default(),
         };
         let (rt, _jh) = create_port_runtime(&claim, sim, RuntimeConfig::default()).unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = Arc::new(Mutex::new(Lc400Controller::new(Some(io), 1)));
         let params = Lc400ControllerParams::new(controller.clone(), 0.0, 0.0);
         let _port =

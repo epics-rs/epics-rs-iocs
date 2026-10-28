@@ -2445,10 +2445,17 @@ mod report {
         let port = epics_rs::asyn::manager::PortManager::global()
             .find_port_handle("hxpRep")
             .unwrap();
-        let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            port.clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         let reason = io.drv_user_create("HXP_MOVE_COORD_SYS").unwrap();
         io.write_int32(reason, 2).unwrap();
-        SyncIOHandle::from_handle(port, 1, Duration::from_secs(1))
+        SyncIOHandle::from_handle(port, 1, Duration::from_secs(1), InterfaceType::Octet)
+            .unwrap()
             .write_int32(reason, 1)
             .unwrap();
         let axes: String = "XYZUVW"

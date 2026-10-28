@@ -218,8 +218,13 @@ fn autocal_command(rt_slot: Arc<std::sync::Mutex<Option<PixiradRuntime>>>) -> Co
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            let sync =
-                SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(10));
+            // The connect status is dropped, as C's (pixirad.cpp:472).
+            let (sync, _) = SyncIOHandle::connect_port(
+                rt.port_handle().port_name(),
+                0,
+                Duration::from_secs(10),
+                InterfaceType::Octet,
+            );
             let _ = sync.write_octet(rt.params.autocal_conf, settings.as_bytes());
             Ok(CommandOutcome::Continue)
         },

@@ -727,7 +727,9 @@ mod tests {
         });
         PixiradDetector::new(
             name,
-            PixiradServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO)),
+            PixiradServer::new(
+                SyncIOHandle::from_handle(handle, 0, Duration::ZERO, InterfaceType::Octet).unwrap(),
+            ),
             476,
             512,
             max_memory,

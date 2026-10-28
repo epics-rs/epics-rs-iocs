@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 use epics_rs::asyn::error::AsynStatus;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -70,7 +71,13 @@ enum Abort {
 }
 
 async fn task_loop(mut ctx: AcquisitionContext) {
-    let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(10));
+    let sync = SyncIOHandle::from_handle(
+        ctx.handle.clone(),
+        0,
+        Duration::from_secs(10),
+        InterfaceType::Int32,
+    )
+    .expect("an areaDetector port registers asynInt32");
 
     loop {
         set_params(
@@ -513,7 +520,15 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let sync = || SyncIOHandle::from_handle(ip_rt.port_handle().clone(), 0, Duration::ZERO);
+        let sync = || {
+            SyncIOHandle::from_handle(
+                ip_rt.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap()
+        };
         let det = create_photonii_detector(&claim_port(name).unwrap(), sync(), 0).unwrap();
         let p2 = P2Util::new(sync());
         // Until the socket is up a read fails rather than times out.

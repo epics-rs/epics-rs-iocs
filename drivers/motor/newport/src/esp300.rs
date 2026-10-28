@@ -545,6 +545,7 @@ impl Esp300Axis {
         // with C precedence that is `limits & (0x1==0)`, always false, so the
         // PH limit query is dead code and the switch bits are always cleared.
         // Kept bug-for-bug: issue ZH? (wire parity), report no switches.
+    use epics_rs::asyn::interfaces::InterfaceType;
         read(&ctrl, &format!("{a:02}ZH?"));
 
         let powered = atoi(read(&ctrl, &format!("{a:02}MO?"))) != 0;
@@ -733,7 +734,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_millis(100),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Esp300Controller::new(io).unwrap();
         assert_eq!(ctrl.num_axes(), ESP300_MAX_AXES);
         let axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
@@ -779,7 +782,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_millis(100),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Esp300Controller::new(io).unwrap();
         let mut axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         assert!(axis.drive_resolution.is_infinite());
@@ -832,7 +837,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_millis(100),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Esp300Controller::new(io).unwrap();
         assert_eq!(ctrl.write_read("01TP?").unwrap(), "12.5");
         // The re-read's status is kept: nothing follows the limit error.
@@ -874,7 +881,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_millis(100),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Esp300Controller::new(io).unwrap();
         sent.lock().unwrap().clear();
         (ctrl, sent)

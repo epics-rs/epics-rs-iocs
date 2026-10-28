@@ -543,7 +543,13 @@ pub(crate) mod tests {
             )
             .unwrap();
             let links = DriverLinks {
-                server: SyncIOHandle::from_handle(server.port_handle().clone(), 0, Duration::ZERO),
+                server: SyncIOHandle::from_handle(
+                    server.port_handle().clone(),
+                    0,
+                    Duration::ZERO,
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
                 start: Arc::new(Event::new()),
                 stop: Arc::new(Event::new()),
             };
@@ -607,7 +613,13 @@ pub(crate) mod tests {
         )
         .unwrap();
         let links = DriverLinks {
-            server: SyncIOHandle::from_handle(server.port_handle().clone(), 0, Duration::ZERO),
+            server: SyncIOHandle::from_handle(
+                server.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
         };
@@ -672,7 +684,13 @@ pub(crate) mod tests {
         trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
         trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
         let links = DriverLinks {
-            server: SyncIOHandle::from_handle(server.port_handle().clone(), 0, Duration::ZERO),
+            server: SyncIOHandle::from_handle(
+                server.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
         };

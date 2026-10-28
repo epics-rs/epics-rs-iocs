@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -150,7 +151,13 @@ fn image_dims(sensor: Sensor, colors: usize) -> Vec<NDDimension> {
 }
 
 async fn data_loop(ctx: DataContext) {
-    let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(30));
+    let sync = SyncIOHandle::from_handle(
+        ctx.handle.clone(),
+        0,
+        Duration::from_secs(30),
+        InterfaceType::Int32,
+    )
+    .expect("an areaDetector port registers asynInt32");
     let mut decoder = Decoder::new(ctx.sensor);
     let pixels_per_color = ctx.sensor.image_pixels();
     // C allocates the NDArray only when ColorsCollected is 0 and memcpys into

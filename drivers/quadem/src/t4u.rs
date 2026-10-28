@@ -1786,7 +1786,7 @@ mod tests {
     #[test]
     fn a_read_that_times_out_after_bytes_keeps_them() {
         let runtime = partial_then_timeout_port("QE_PARTIAL_TIMEOUT");
-        let io = OctetIo::new(runtime.port_handle().clone(), Duration::from_millis(100));
+        let io = OctetIo::new(runtime.port_handle().clone(), Duration::from_millis(100)).unwrap();
         let mut reader = StreamReader::new(io);
         assert!(reader.fill().unwrap());
         assert_eq!(reader.buf.iter().copied().collect::<Vec<_>>(), b"abc");

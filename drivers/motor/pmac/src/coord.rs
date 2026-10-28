@@ -773,6 +773,7 @@ fn decode_cs_status(status: (u32, u32, u32), deferred: bool) -> CsFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use motor_common::testing::Polled;
 
     /// A coordinate system in position with no program running.
@@ -858,7 +859,13 @@ mod tests {
         let (rt, _jh) =
             create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
                 .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
             MotorTrace::new(name, 0),

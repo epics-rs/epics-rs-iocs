@@ -62,7 +62,7 @@ impl ModbusRegs {
     /// (`pasynUserInReg_`/`pasynUserOutReg_`).
     fn reg(&self, addr: i32) -> AsynResult<SyncIOHandle> {
         let port = self.handle.port()?.clone();
-        Ok(SyncIOHandle::from_handle(port, addr, self.timeout))
+        SyncIOHandle::from_handle(port, addr, self.timeout, InterfaceType::Int32)
     }
 
     /// Read one register (C `readReg16` / `pasynInt32SyncIO->read`).

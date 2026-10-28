@@ -1091,6 +1091,7 @@ impl AsynMotor for OmsAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::port_handle::PortHandle;
 
     /// omsBaseController.cpp:409-416 prints the value with `%f`.
@@ -1159,7 +1160,13 @@ mod tests {
     #[test]
     fn string_writes_go_to_the_controller() {
         let (port, rig) = params_port("omsStrings", 1, &[("AX RP", "1234")]);
-        let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            port.clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let send = reason(&port, "OMS_STRING_SEND");
         let send_receive = reason(&port, "OMS_STRING_SENDRECV");
         let receive = reason(&port, "OMS_STRING_RECV");
@@ -1172,7 +1179,8 @@ mod tests {
         let message = epics_rs::motor::controller_port::index::PROFILE_BUILD_MESSAGE;
         io.write_octet(message, b"dropped").unwrap();
         assert!(io.read_octet(message, 40).status().is_err());
-        let past = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1));
+        let past = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1), InterfaceType::Octet)
+            .unwrap();
         assert!(past.write_octet(send, b"AX ST;").is_err());
         assert_eq!(rig.written.lock().unwrap().len(), 2);
     }
@@ -1211,7 +1219,13 @@ mod tests {
         let poll = reason(&port, "OMS_POLL");
         assert!(port.write_int32_blocking(poll, 1, 1).is_err());
         assert!(shared.wait(Duration::ZERO));
-        let io = SyncIOHandle::from_handle(port.clone(), 1, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            port.clone(),
+            1,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let receive = reason(&port, "OMS_STRING_RECV");
         io.write_octet(reason(&port, "OMS_STRING_SEND"), b"AX ST;")
             .unwrap();
@@ -1219,7 +1233,8 @@ mod tests {
             .unwrap();
         assert_eq!(*rig.written.lock().unwrap(), ["AX ST;", "AX RP"]);
         assert!(io.read_octet(receive, 40).status().is_err());
-        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1), InterfaceType::Octet)
+            .unwrap();
         assert_eq!(io.read_octet(receive, 40).bytes_ok(), b"\0");
     }
 
@@ -1289,7 +1304,13 @@ mod tests {
         )
         .unwrap();
         let port = rt.port_handle().clone();
-        let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_millis(100));
+        let io = SyncIOHandle::from_handle(
+            port.clone(),
+            0,
+            Duration::from_millis(100),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut controller = OmsController::new(io, name, name, "MXA");
         controller.watch_connection().unwrap();
         assert!(controller.port_connected());
@@ -1388,7 +1409,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_secs(1),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = Arc::new(Mutex::new(OmsController::new(
             io,
             "omsEncoderRatio",
@@ -1428,7 +1451,13 @@ mod tests {
         let (rt, _actor) =
             create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
                 .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = Arc::new(Mutex::new(OmsController::new(io, name, name, "MAXnet")));
         let mut axis = OmsAxis::new(controller, 0).unwrap();
         written.lock().unwrap().clear();
@@ -1465,7 +1494,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = OmsController::new(io, "omsAxisCount", "omsAxisCount", "MAXnet");
         assert_eq!(controller.axis_count(), 3);
     }
@@ -1520,7 +1555,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_secs(1),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         OmsController::new(io, "omsDeadInit", "omsDeadInit", "MAXnet").init("AX LP0;");
         assert_eq!(*written.lock().unwrap(), ["IC;", "AM SA;", "AX LP0;"]);
     }
@@ -1625,7 +1662,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller =
             OmsController::new(io, "omsPartialAxisCount", "omsPartialAxisCount", "MAXnet");
         assert_eq!(controller.axis_count(), 2);
@@ -1654,7 +1697,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = OmsController::new(io, "omsDeadAxisCount", "omsDeadAxisCount", "MAXnet");
         assert_eq!(controller.axis_count(), 0);
     }

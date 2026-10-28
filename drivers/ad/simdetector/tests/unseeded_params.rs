@@ -8,6 +8,7 @@ use std::time::Duration;
 use epics_rs::ad_core::driver::ImageMode;
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::plugin::channel::ndarray_channel;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 
@@ -37,7 +38,13 @@ fn a_port_with_unseeded_sim_params_still_produces_a_frame() {
     });
 
     let ad = detector.ad_params;
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Int32,
+    )
+    .unwrap();
     // ArrayCallbacks keeps its PINI; only the sim params go unseeded here.
     sync.write_int32(ad.base.array_callbacks, 1)
         .expect("array callbacks");

@@ -816,7 +816,9 @@ mod tests {
         let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
         PslDetector::new(
             name,
-            PslServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO)),
+            PslServer::new(
+                SyncIOHandle::from_handle(handle, 0, Duration::ZERO, InterfaceType::Octet).unwrap(),
+            ),
             1 << 20,
             shared,
             tx,
@@ -848,7 +850,9 @@ mod tests {
                 .unwrap();
         let handle = runtime.port_handle().clone();
         std::mem::forget(runtime);
-        PslServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO))
+        PslServer::new(
+            SyncIOHandle::from_handle(handle, 0, Duration::ZERO, InterfaceType::Octet).unwrap(),
+        )
     }
 
     /// C getConfig sets NDColorModeMono on every successful GetMode, before
@@ -903,7 +907,13 @@ mod tests {
         let rt = create_psl_detector(&claim_port("PSL_NONE").unwrap(), server, 1 << 20)
             .expect("the detector port");
         assert!(rt.task.is_none());
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         assert_eq!(
             sync.read_int32(rt.ad_params.status).unwrap(),
             ADStatus::Idle as i32
@@ -1186,7 +1196,9 @@ mod tests {
         let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
         PslDetector::new(
             name,
-            PslServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO)),
+            PslServer::new(
+                SyncIOHandle::from_handle(handle, 0, Duration::ZERO, InterfaceType::Octet).unwrap(),
+            ),
             1 << 20,
             shared,
             tx,
@@ -1299,7 +1311,10 @@ mod tests {
                 .unwrap();
         let handle = runtime.port_handle().clone();
         std::mem::forget(runtime);
-        let server = PslServer::new(SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO));
+        let server = PslServer::new(
+            SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO, InterfaceType::Octet)
+                .unwrap(),
+        );
         (server, handle)
     }
 

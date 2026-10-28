@@ -358,11 +358,15 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let p2 = P2Util::new(SyncIOHandle::from_handle(
-            runtime.port_handle().clone(),
-            0,
-            Duration::ZERO,
-        ));
+        let p2 = P2Util::new(
+            SyncIOHandle::from_handle(
+                runtime.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
         std::mem::forget(runtime);
         let shared = Arc::new(SharedState {
             stop_requested: AtomicBool::new(false),
@@ -465,7 +469,13 @@ mod tests {
         assert!(status.is_err());
         let rt = create_photonii_detector(&claim_port("PII_NONE").unwrap(), cmd, 1 << 20)
             .expect("the detector port");
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let p = rt.ad_params;
         sync.write_int32(p.num_images, 3).unwrap();
         assert_eq!(sync.read_int32(p.num_images).unwrap(), 3);
@@ -525,11 +535,23 @@ mod tests {
             .port_handle()
             .set_output_eos_blocking(eos_user(), b"\n")
             .unwrap();
-        let cmd = SyncIOHandle::from_handle(ip_rt.port_handle().clone(), 0, Duration::from_secs(2));
+        let cmd = SyncIOHandle::from_handle(
+            ip_rt.port_handle().clone(),
+            0,
+            Duration::from_secs(2),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let rt = create_photonii_detector(&claim_port("PII_ADC0").unwrap(), cmd, 1 << 26).unwrap();
         let (tx, mut rx) = ndarray_channel("PII_ADC0_SINK", 4);
         rt.connect_downstream(tx);
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let p = rt.ad_params;
         sync.write_octet(p.base.file_path, dir.to_str().unwrap().as_bytes())
             .unwrap();
@@ -610,11 +632,15 @@ mod tests {
         };
         let (runtime, _) =
             create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
-        let p2 = P2Util::new(SyncIOHandle::from_handle(
-            runtime.port_handle().clone(),
-            0,
-            Duration::ZERO,
-        ));
+        let p2 = P2Util::new(
+            SyncIOHandle::from_handle(
+                runtime.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
         std::mem::forget(runtime);
         let shared = Arc::new(SharedState {
             stop_requested: AtomicBool::new(false),
@@ -685,11 +711,15 @@ mod tests {
         let fake = DeadAfterOne { base, writes: 0 };
         let (runtime, _) =
             create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
-        let p2 = P2Util::new(SyncIOHandle::from_handle(
-            runtime.port_handle().clone(),
-            0,
-            Duration::ZERO,
-        ));
+        let p2 = P2Util::new(
+            SyncIOHandle::from_handle(
+                runtime.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
         std::mem::forget(runtime);
         let shared = Arc::new(SharedState {
             stop_requested: AtomicBool::new(false),
@@ -767,10 +797,22 @@ mod tests {
         };
         let (fake_rt, _) =
             create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
-        let cmd = SyncIOHandle::from_handle(fake_rt.port_handle().clone(), 0, Duration::ZERO);
+        let cmd = SyncIOHandle::from_handle(
+            fake_rt.port_handle().clone(),
+            0,
+            Duration::ZERO,
+            InterfaceType::Octet,
+        )
+        .unwrap();
         std::mem::forget(fake_rt);
         let rt = create_photonii_detector(&claim_port("PII_CHAT").unwrap(), cmd, 1 << 20).unwrap();
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         let p = rt.ad_params;
         let from = || {
             rt.port_handle()

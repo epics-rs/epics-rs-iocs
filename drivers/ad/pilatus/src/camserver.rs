@@ -423,6 +423,7 @@ mod tests {
     use crate::task::Shared;
     use epics_rs::ad_core::runtime as rt;
     use epics_rs::asyn::error::{AsynError, AsynResult};
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -503,11 +504,15 @@ mod tests {
         let mut side = new_base("PILATUS_LINES_DET");
         let (ad, _) = ADBaseParams::create(&mut side).unwrap();
         let mut camserver = Camserver::new(
-            Arc::new(SyncIOHandle::from_handle(
-                cam.port_handle().clone(),
-                0,
-                std::time::Duration::ZERO,
-            )),
+            Arc::new(
+                SyncIOHandle::from_handle(
+                    cam.port_handle().clone(),
+                    0,
+                    std::time::Duration::ZERO,
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
+            ),
             ad,
             Arc::new(Event::new()),
         );
@@ -588,11 +593,15 @@ mod tests {
             .unwrap();
             let mut ctx = Ctx::new(
                 h.clone(),
-                Arc::new(SyncIOHandle::from_handle(
-                    cam.port_handle().clone(),
-                    0,
-                    std::time::Duration::ZERO,
-                )),
+                Arc::new(
+                    SyncIOHandle::from_handle(
+                        cam.port_handle().clone(),
+                        0,
+                        std::time::Duration::ZERO,
+                        InterfaceType::Octet,
+                    )
+                    .unwrap(),
+                ),
                 ad,
                 p,
                 stop.clone(),
@@ -695,11 +704,15 @@ mod tests {
         .unwrap();
         let mut ctx = Ctx::new(
             runtime.port_handle().clone(),
-            Arc::new(SyncIOHandle::from_handle(
-                cam.port_handle().clone(),
-                0,
-                std::time::Duration::ZERO,
-            )),
+            Arc::new(
+                SyncIOHandle::from_handle(
+                    cam.port_handle().clone(),
+                    0,
+                    std::time::Duration::ZERO,
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
+            ),
             ad,
             p,
             stop,

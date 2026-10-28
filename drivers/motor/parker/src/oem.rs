@@ -656,7 +656,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_secs(1),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = Arc::new(Mutex::new(OemController::new(handle, 1)));
         let _axis = OemAxis::new(controller, 0);
         assert_eq!(*written.lock().unwrap(), ["1E", "1SSA0", "1MPA", "1MR0"]);
@@ -748,7 +750,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_secs(1),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Arc::new(Mutex::new(OemController::new(handle, 1)));
         let port = register_controller_port(
             &open_owner(),
@@ -868,7 +872,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_secs(1),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Arc::new(Mutex::new(OemController::new(handle, 1)));
         let mut axis = OemAxis::new(ctrl, 0);
         let user = AsynUser::new(0);

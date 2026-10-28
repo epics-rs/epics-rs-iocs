@@ -825,7 +825,13 @@ mod tests {
     #[test]
     fn step_commands_set_step_size_as_c() {
         let rt = publish_bare("pmacCoordSteps");
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::ZERO);
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::ZERO,
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
             MotorTrace::default(),
@@ -1301,7 +1307,8 @@ mod tests {
             params,
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1), InterfaceType::Int32)
+            .unwrap();
         let reason = |name| io.drv_user_create(name).unwrap();
         let reasons = [
             reason("PMAC_C_GLOBALSTATUS"),
@@ -1408,7 +1415,13 @@ mod tests {
     #[test]
     fn cs_home_and_jog_print_c_refusals() {
         let (rt, _rig) = publish_scripted("pmacCsRefuse");
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let trace = MotorTrace::new("pmacCsRefuse", 0);
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
@@ -1436,7 +1449,13 @@ mod tests {
     #[test]
     fn a_failed_cs_transfer_prints_the_c_line() {
         let (rt, rig) = publish_scripted("pmacCsRw");
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let trace = MotorTrace::new("pmacCsRw", 0);
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
@@ -1749,7 +1768,13 @@ mod tests {
     #[test]
     fn a_cs_release_runs_after_a_failed_abort_and_succeeds() {
         let (rt, rig) = publish_scripted("pmacCsRel");
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
             MotorTrace::new("pmacCsRel", 0),
@@ -1772,7 +1797,13 @@ mod tests {
     #[test]
     fn a_bad_cs_status_read_prints_the_c_line() {
         let (rt, rig) = publish_scripted("pmacCsStat");
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let trace = MotorTrace::new("pmacCsStat", 0);
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
@@ -1821,7 +1852,13 @@ mod tests {
     #[test]
     fn cut_cs_reads_are_parsed_as_c() {
         let (rt, rig) = publish_scripted("pmacCsCut");
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let trace = MotorTrace::new("pmacCsCut", 0);
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
@@ -1866,7 +1903,13 @@ mod tests {
     #[test]
     fn a_short_cs_position_reply_reads_zero_for_the_rest() {
         let (rt, rig) = publish_scripted("pmacCsShort");
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let trace = MotorTrace::new("pmacCsShort", 0);
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
@@ -1887,7 +1930,13 @@ mod tests {
     #[test]
     fn cs_positions_are_successive_strtods() {
         let (rt, rig) = publish_scripted("pmacCsRange");
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let trace = MotorTrace::new("pmacCsRange", 0);
         let system = Arc::new(Mutex::new(PmacCoordSystem::new(
             io,
@@ -1934,7 +1983,8 @@ mod tests {
         Controller::new()
             .install(asyn_user("pmacInitCtl", 1), axis)
             .unwrap();
-        let io = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1), InterfaceType::Int32)
+            .unwrap();
         // The first call into the axis hands its sets to the owner.
         io.write_int32(epics_rs::motor::controller_port::index::UPDATE_STATUS, 1)
             .unwrap();
@@ -2121,7 +2171,8 @@ mod tests {
                 .unwrap();
         (
             controller,
-            SyncIOHandle::from_handle(port, 0, Duration::from_secs(1)),
+            SyncIOHandle::from_handle(port, 0, Duration::from_secs(1), InterfaceType::Octet)
+                .unwrap(),
         )
     }
 
@@ -2218,8 +2269,13 @@ mod tests {
         Controller::new()
             .install(asyn_user("pmacDeferCommsCtl", 1), axis)
             .unwrap();
-        let axis_io =
-            SyncIOHandle::from_handle(io.port().unwrap().clone(), 1, io.timeout().unwrap());
+        let axis_io = SyncIOHandle::from_handle(
+            io.port().unwrap().clone(),
+            1,
+            io.timeout().unwrap(),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         rig.silence("");
         axis_io
             .write_int32(index::DEFER_MOVES, DEFERRED_FAST_MOVES)

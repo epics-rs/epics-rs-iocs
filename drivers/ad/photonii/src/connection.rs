@@ -109,6 +109,7 @@ fn decode(data: Vec<u8>) -> String {
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::user::AsynUser;
 
     /// Trailing blanks and the `\r` of an EOS a timeout split stay in the
@@ -190,11 +191,15 @@ mod is_timeout_tests {
         );
         trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
         trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
-        let p2 = P2Util::new(SyncIOHandle::from_handle(
-            rt.port_handle().clone(),
-            0,
-            Duration::ZERO,
-        ));
+        let p2 = P2Util::new(
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
         assert!(p2.write_read("[cmd]", Duration::from_secs(1)).1.is_ok());
         assert!(p2.read(Duration::from_secs(1)).1.is_ok());
         let text = std::fs::read_to_string(&path).unwrap();

@@ -456,11 +456,15 @@ pub(crate) mod tests {
                     stop: Arc::new(Event::new()),
                     abort: Arc::new(Event::new()),
                     mode: Arc::new(AtomicI32::new(0)),
-                    server: Arc::new(SyncIOHandle::from_handle(
-                        server.port_handle().clone(),
-                        0,
-                        Duration::ZERO,
-                    )),
+                    server: Arc::new(
+                        SyncIOHandle::from_handle(
+                            server.port_handle().clone(),
+                            0,
+                            Duration::ZERO,
+                            InterfaceType::Octet,
+                        )
+                        .unwrap(),
+                    ),
                 },
             )
             .unwrap();
@@ -586,7 +590,13 @@ pub(crate) mod tests {
     fn a_detector_whose_server_port_is_missing_still_boots() {
         let rt = create_mar345_detector(&claim_port("MAR345_NONE").unwrap(), "MAR345_NONE_SRV", 0)
             .expect("the detector port");
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         sync.write_int32(rt.ad_params.num_images, 3).unwrap();
         assert_eq!(sync.read_int32(rt.ad_params.num_images).unwrap(), 3);
     }

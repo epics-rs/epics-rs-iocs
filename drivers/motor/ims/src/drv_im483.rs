@@ -15,6 +15,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
 };
@@ -609,7 +610,13 @@ mod tests {
             let (rt, _jh) =
                 create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
                     .unwrap();
-            let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+            let io = SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                Duration::from_secs(1),
+                InterfaceType::Octet,
+            )
+            .unwrap();
             let controller = Arc::new(Mutex::new(Im483Controller::new(io)));
             let axis = if party_line {
                 DrvIm483Axis::im483pl(controller, 0)

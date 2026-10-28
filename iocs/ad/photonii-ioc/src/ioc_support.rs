@@ -139,7 +139,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             let port = get_port(&port_name).ok_or_else(|| {
                 format!("port '{port_name}' not found (call PhotonIIConfig first)")
             })?;
-            let sync = SyncIOHandle::from_handle(port.handle.clone(), 0, Duration::from_secs(5));
+            let sync = SyncIOHandle::from_handle(
+                port.handle.clone(),
+                0,
+                Duration::from_secs(5),
+                InterfaceType::Octet,
+            )
+            .map_err(|e| format!("port '{port_name}' is not a PhotonII driver: {e}"))?;
             let reason = sync
                 .drv_user_create(PII_UTIL)
                 .map_err(|e| format!("port '{port_name}' is not a PhotonII driver: {e}"))?;

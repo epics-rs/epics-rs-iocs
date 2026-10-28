@@ -588,6 +588,7 @@ impl Mm3000Axis {
     /// MS bits when `ms_set`.
     fn missed(&mut self, comm_state: CommState, ms_set: bool) -> AsynError {
         self.failure = failure(comm_state);
+    use epics_rs::asyn::interfaces::InterfaceType;
         if comm_state == CommState::CommErr {
             self.last_status.comms_error = true;
             self.last_status.problem = true;
@@ -713,7 +714,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_millis(100),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Mm3000Controller::new(io).unwrap();
         assert!(ctrl.axis_types().is_empty());
     }
@@ -760,7 +763,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_millis(100),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Mm3000Controller::new(io).unwrap();
         let printed = Arc::new(Mutex::new(Vec::new()));
         let sink = printed.clone();
@@ -809,7 +814,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_millis(100),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Mm3000Controller::new(io).unwrap();
         assert_eq!(
             std::mem::take(&mut *sent.lock().unwrap()),

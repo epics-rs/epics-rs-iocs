@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceManager;
@@ -54,7 +55,8 @@ impl Transport {
         expect: usize,
         timeout: Duration,
     ) -> AsynResult<Vec<u8>> {
-        let io = SyncIOHandle::from_handle(self.handle.clone(), ADDR, timeout);
+        let io =
+            SyncIOHandle::from_handle(self.handle.clone(), ADDR, timeout, InterfaceType::Octet)?;
         let deadline = Instant::now() + timeout;
         let mut reply = Vec::with_capacity(expect);
         // C's writeRead flushes, writes and reads once; the later reads gather

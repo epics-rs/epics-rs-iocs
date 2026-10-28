@@ -177,6 +177,7 @@ impl PixiradServer {
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn a_timeout_maps_to_timeout() {
@@ -248,11 +249,15 @@ mod is_timeout_tests {
         );
         trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
         trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
-        let mut server = PixiradServer::new(SyncIOHandle::from_handle(
-            rt.port_handle().clone(),
-            0,
-            Duration::ZERO,
-        ));
+        let mut server = PixiradServer::new(
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
         assert!(server.command("DAQ:! X").result.is_ok());
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -275,6 +280,7 @@ mod is_timeout_tests {
 mod from_server_tests {
     use super::*;
     use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -353,11 +359,15 @@ mod from_server_tests {
         let (runtime, _) =
             create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
                 .unwrap();
-        let mut server = PixiradServer::new(SyncIOHandle::from_handle(
-            runtime.port_handle().clone(),
-            0,
-            Duration::ZERO,
-        ));
+        let mut server = PixiradServer::new(
+            SyncIOHandle::from_handle(
+                runtime.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
         let replies: Vec<Vec<u8>> = (0..4).map(|_| server.command("DAQ:! X").reply).collect();
         assert_eq!(replies, [&b"GOT: OK "[..], b"GOT: OK ", b"GO ", b""]);
     }
@@ -388,7 +398,9 @@ mod from_server_tests {
             Some(name),
             TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
         );
-        let mut server = PixiradServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO));
+        let mut server = PixiradServer::new(
+            SyncIOHandle::from_handle(handle, 0, Duration::ZERO, InterfaceType::Octet).unwrap(),
+        );
         for _ in 0..4 {
             server.command("DAQ:! X");
         }

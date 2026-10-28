@@ -417,7 +417,10 @@ mod extra_params {
         ];
         run_command(ims_create_controller_command(), args).await;
         let handle = PortManager::global().find_port_handle(port).unwrap();
-        (rig, SyncIOHandle::from_handle(handle, 0, IMS_TIMEOUT))
+        (
+            rig,
+            SyncIOHandle::from_handle(handle, 0, IMS_TIMEOUT, InterfaceType::Octet).unwrap(),
+        )
     }
 
     /// The commands among `sent` that the poller does not send.
@@ -449,7 +452,7 @@ mod extra_params {
     async fn an_ims_write_at_address_minus_one_is_axis_0() {
         let (line, io) = controller("imsNvmAny", "imsNvmAnyLine").await;
         let handle = PortManager::global().find_port_handle("imsNvmAny").unwrap();
-        let any = SyncIOHandle::from_handle(handle, -1, IMS_TIMEOUT);
+        let any = SyncIOHandle::from_handle(handle, -1, IMS_TIMEOUT, InterfaceType::Int32).unwrap();
         let save = any.drv_user_create("IMS_SAVETONVM").unwrap();
         line.sent();
         any.write_int32(save, 1).unwrap();
@@ -468,7 +471,7 @@ mod extra_params {
         let ims = ImsLine::new(handle, "A".into(), "imsNoAxis");
         let port =
             register_controller_port(&open_owner(), "imsNoAxis", 1, ImsParams::new(ims)).unwrap();
-        let io = SyncIOHandle::from_handle(port, 0, IMS_TIMEOUT);
+        let io = SyncIOHandle::from_handle(port, 0, IMS_TIMEOUT, InterfaceType::Int32).unwrap();
         let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
         let path = std::env::temp_dir().join(format!("imsNoAxis-{}", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));

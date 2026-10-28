@@ -250,6 +250,7 @@ impl ServerIo {
 mod reconnect_tests {
     use super::*;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -265,11 +266,15 @@ mod reconnect_tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let server = PslServer::new(SyncIOHandle::from_handle(
-            runtime.port_handle().clone(),
-            0,
-            Duration::ZERO,
-        ));
+        let server = PslServer::new(
+            SyncIOHandle::from_handle(
+                runtime.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
         let err = server.command("GetVersion").unwrap_err();
         assert_eq!(err.status(), AsynStatus::Disconnected as i32, "{err}");
     }
@@ -278,6 +283,7 @@ mod reconnect_tests {
 #[cfg(test)]
 mod sync_io_tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase};
     use epics_rs::asyn::registry::claim_port;
@@ -343,11 +349,15 @@ mod sync_io_tests {
         );
         trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
         trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
-        let server = PslServer::new(SyncIOHandle::from_handle(
-            rt.port_handle().clone(),
-            0,
-            Duration::ZERO,
-        ));
+        let server = PslServer::new(
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
         std::mem::forget(rt);
         (server, path, timeouts)
     }

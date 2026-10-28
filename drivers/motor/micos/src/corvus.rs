@@ -427,10 +427,10 @@ impl AsynMotor for CorvusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn the_constructor_calls_back() {
-        use epics_rs::asyn::interfaces::InterfaceType;
         let (handle, _) = SyncIOHandle::connect_port(
             "CORVUS_CALLBACK",
             0,
@@ -446,7 +446,6 @@ mod tests {
     /// a good poll sets Done (SMCcorvusDriver.cpp:431).
     #[test]
     fn an_unanswering_controller_s_axis_fails_its_poll_without_done() {
-        use epics_rs::asyn::interfaces::InterfaceType;
         let (handle, _) = SyncIOHandle::connect_port(
             "CORVUS_DEAD",
             0,
@@ -617,7 +616,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_secs(1),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut axis = CorvusAxis {
             controller: Arc::new(Mutex::new(CorvusController::new(handle, 2))),
             members: Arc::new(SmcMembers {

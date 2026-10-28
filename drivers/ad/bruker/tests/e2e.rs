@@ -104,7 +104,7 @@ fn fake_bis(command: TcpListener, status: TcpListener) {
 
 /// The asynUser C's `pasynOctetSyncIO->connect` hands the driver.
 fn user(handle: PortHandle) -> SyncIOHandle {
-    SyncIOHandle::from_handle(handle, 0, Duration::ZERO)
+    SyncIOHandle::from_handle(handle, 0, Duration::ZERO, InterfaceType::Octet).unwrap()
 }
 
 fn ip_port(name: &str, addr: &str, input_eos: &[u8], output_eos: &[u8]) -> PortHandle {
@@ -175,8 +175,13 @@ impl Fixture {
 
         // The test thread is a plain thread, so the blocking parameter API is
         // the right one here: it stands in for the IOC's record layer.
-        let sync =
-            SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            detector.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Octet,
+        )
+        .unwrap();
 
         let fixture = Fixture {
             detector,
@@ -441,7 +446,13 @@ fn a_binning_write_does_not_depend_on_bis() {
         0,
     )
     .expect("the detector port");
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Int32,
+    )
+    .unwrap();
     let ad = detector.ad_params;
 
     sync.write_int32(ad.bin_x, 2).expect("binning 2");
@@ -588,7 +599,13 @@ fn a_detector_whose_socket_ports_are_missing_still_boots() {
     assert!(status.is_err());
     let detector = create_bruker_detector(&claim_port("BISNONE").unwrap(), command, status_user, 0)
         .expect("the detector port");
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Octet,
+    )
+    .unwrap();
     let ad = detector.ad_params;
 
     sync.write_int32(ad.bin_x, 2).expect("binning 2");
@@ -601,7 +618,13 @@ fn a_detector_whose_socket_ports_are_missing_still_boots() {
 #[test]
 fn an_exchange_that_never_reads_keeps_the_last_reply() {
     let detector = dead_detector("BISSTALE");
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Octet,
+    )
+    .unwrap();
     let ad = detector.ad_params;
     sync.write_octet(ad.string_from_server, b"old").unwrap();
     sync.write_int32(ad.bin_x, 2).unwrap();
@@ -628,7 +651,13 @@ fn an_exchange_whose_read_times_out_publishes_what_it_read() {
         0,
     )
     .expect("the detector port");
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Octet,
+    )
+    .unwrap();
     let ad = detector.ad_params;
     sync.write_octet(ad.string_from_server, b"old").unwrap();
     sync.write_int32(ad.bin_x, 2).unwrap();
@@ -655,7 +684,13 @@ fn every_status_read_is_posted_as_read() {
         0,
     )
     .expect("the detector port");
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Octet,
+    )
+    .unwrap();
     let (reason, size_x) = (detector.params.status, detector.ad_params.size_x);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     // BIS_STATUS is undefined until statusTask's first post, as in C.
@@ -698,7 +733,13 @@ fn a_status_post_holds_the_driver_for_ten_milliseconds() {
         0,
     )
     .expect("the detector port");
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Octet,
+    )
+    .unwrap();
     let size_x = detector.ad_params.size_x;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while sync.read_int32(size_x).unwrap() != 2048 {
@@ -726,7 +767,13 @@ fn the_driver_version_is_left_to_adcore() {
         0,
     )
     .expect("the detector port");
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Octet,
+    )
+    .unwrap();
     let ad = detector.ad_params;
     assert_eq!(
         sync.read_octet(ad.base.driver_version, 64).bytes_ok(),
@@ -772,7 +819,13 @@ fn the_bis_sockets_print_their_sync_io_lines() {
         0,
     )
     .expect("the detector port");
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Int32,
+    )
+    .unwrap();
     sync.write_int32(detector.ad_params.bin_x, 2)
         .expect("binning 2");
 
@@ -829,7 +882,13 @@ fn a_bis_command_runs_on_its_callers_thread() {
         0,
     )
     .expect("the detector port");
-    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let sync = SyncIOHandle::from_handle(
+        detector.port_handle().clone(),
+        0,
+        Duration::from_secs(5),
+        InterfaceType::Int32,
+    )
+    .unwrap();
     let bin_x = detector.ad_params.bin_x;
     std::thread::Builder::new()
         .name("binx-writer".into())

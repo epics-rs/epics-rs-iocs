@@ -646,7 +646,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let handle = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut axis = TaurusAxis {
             controller: Arc::new(Mutex::new(TaurusController::new(handle))),
             members: Arc::new(SmcMembers {

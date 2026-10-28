@@ -1507,7 +1507,13 @@ mod tests {
         let (rt, _jh) =
             create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
                 .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_millis(100),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let Ok(ctrl) = Mm4000Controller::new_model1(io, name, cache_ttl) else {
             return (None, sent, silent);
         };
@@ -1822,7 +1828,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Mm4000Controller::new(io, "mm4000_dead", 1, Duration::ZERO)
             .ok()
             .unwrap();
@@ -1869,7 +1881,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Mm4000Controller::new(io, "mm4000_first", 1, Duration::ZERO)
             .ok()
             .unwrap();
@@ -1913,7 +1931,13 @@ mod tests {
         let (rt, _jh) =
             create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
                 .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_millis(100),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ttl = Duration::from_secs(3600);
         let ctrl = Mm4000Controller::new(io, name, 2, ttl).ok().unwrap();
         let ctrl = Arc::new(Mutex::new(ctrl));
@@ -2015,7 +2039,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ttl = Duration::from_secs(3600);
         let ctrl = Mm4000Controller::new(io, "mm4000_moved", 1, ttl)
             .ok()
@@ -2067,8 +2097,13 @@ mod tests {
             let (rt, _jh) =
                 create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
                     .unwrap();
-            let io =
-                SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+            let io = SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                Duration::from_millis(100),
+                InterfaceType::Octet,
+            )
+            .unwrap();
             assert!(
                 Mm4000Controller::new(io, name, num_axes, Duration::ZERO).is_err(),
                 "{name}"

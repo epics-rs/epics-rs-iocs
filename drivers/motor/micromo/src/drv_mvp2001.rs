@@ -81,10 +81,7 @@ impl Mvp2001Chain {
     /// but reads with `COMM_TIMEOUT` anyway, so every flush of an idle line
     /// waits 4 s; this reads with the zero timeout it asks for.
     fn flush(&self) {
-        let Ok(port) = self.handle.port() else {
-            return;
-        };
-        let quick = SyncIOHandle::from_handle(port.clone(), 0, Duration::ZERO);
+        let quick = self.handle.with_timeout(Duration::ZERO);
         while matches!(
             quick.read_octet(0, BUFF_SIZE).into_parts(),
             (raw, Ok(())) if !raw.is_empty()

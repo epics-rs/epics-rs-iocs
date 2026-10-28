@@ -787,7 +787,13 @@ mod tests {
         claim
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
-        let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::ZERO);
+        let handle = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::ZERO,
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = Arc::new(Mutex::new(AcrController::new(handle)));
         let _ = AcrAxis::new(controller, 0);
         assert_eq!(
@@ -873,7 +879,13 @@ mod tests {
         claim
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
-        let handle = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let handle = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Arc::new(Mutex::new(AcrController::new(handle)));
         let port = register_controller_port(
             &open_owner(),

@@ -46,6 +46,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, Model1Motor, MotorStatus, PollFailure, PostMessage,
 };
@@ -479,6 +480,7 @@ impl AsynMotor for PiJedsAxis {
             // E-516 has no limit or home switches (C set_status).
             high_limit: false,
             low_limit: false,
+    use epics_rs::asyn::interfaces::InterfaceType;
             home: done,
             powered,
             comms_error: false,
@@ -765,7 +767,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_secs(1),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         PiJedsAxis::new(Arc::new(Mutex::new(PiJedsController::new(io).unwrap())), 0)
     }
 

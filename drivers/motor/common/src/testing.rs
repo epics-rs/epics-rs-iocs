@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
 use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::port::InterfaceMask;
@@ -277,7 +278,13 @@ impl LineRig {
         claim
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         (
             Self {
                 sent,
@@ -540,7 +547,13 @@ mod tests {
     fn the_rig_s_port_is_found_by_name() {
         let (rig, _io) = LineRig::new("lineRigByName", |_| "ok".into());
         let port = epics_rs::asyn::asyn_record::get_port("lineRigByName").expect("published");
-        let io = SyncIOHandle::from_handle(port.handle.clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            port.handle.clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         io.write_octet(0, b"hello").unwrap();
         assert_eq!(rig.sent(), ["hello"]);
     }

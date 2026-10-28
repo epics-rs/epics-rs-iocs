@@ -2736,6 +2736,7 @@ impl AsynMotor for PIGCS2Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interfaces::motor::PortSet;
     use epics_rs::asyn::port_handle::PortHandle;
     use epics_rs::asyn::request::ParamSetValue;
@@ -2913,7 +2914,9 @@ mod tests {
                 rt.port_handle().clone(),
                 0,
                 std::time::Duration::from_secs(1),
-            ),
+                InterfaceType::Octet,
+            )
+            .unwrap(),
             "gcs2CharTimeout",
         );
         let mut status = None;
@@ -2957,7 +2960,9 @@ mod tests {
                 rt.port_handle().clone(),
                 0,
                 std::time::Duration::from_secs(1),
-            ),
+                InterfaceType::Octet,
+            )
+            .unwrap(),
             "gcs2SendOnly",
         );
         // C overwrites the refused command's status with the `\n` write's.
@@ -3030,7 +3035,9 @@ mod tests {
                 rt.port_handle().clone(),
                 0,
                 std::time::Duration::from_secs(1),
-            ),
+                InterfaceType::Octet,
+            )
+            .unwrap(),
             "gcs2StatusRefused",
         );
         let mut axis = PIGCS2Axis {
@@ -4667,7 +4674,9 @@ mod tests {
                 rt.port_handle().clone(),
                 0,
                 std::time::Duration::from_secs(1),
-            ),
+                InterfaceType::Octet,
+            )
+            .unwrap(),
             "gcs2RecvCut",
         );
         let mut failed = (false, false);
@@ -5881,7 +5890,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_millis(100),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut ctrl = PIGCS2Controller::new(handle, "gcs2Silent");
         assert_eq!(ctrl.read_idn(), "");
         ctrl.init();
@@ -5912,7 +5923,9 @@ mod tests {
             rt.port_handle().clone(),
             0,
             std::time::Duration::from_millis(100),
-        );
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = PIGCS2Controller::new(handle, "gcs2SilentAxis");
         let axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, "gcs2SilentAxis");
         assert!(!axis.servo_on);

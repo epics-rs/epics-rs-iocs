@@ -78,10 +78,10 @@ impl Clone for OctetIo {
 }
 
 impl OctetIo {
-    pub fn new(handle: PortHandle, timeout: Duration) -> Self {
-        Self {
-            io: SyncIOHandle::from_handle(handle, OCTET_ADDR, timeout),
-        }
+    pub fn new(handle: PortHandle, timeout: Duration) -> AsynResult<Self> {
+        Ok(Self {
+            io: SyncIOHandle::from_handle(handle, OCTET_ADDR, timeout, InterfaceType::Octet)?,
+        })
     }
 
     /// The user a failed connect leaves: `pasynOctetSyncIO->connect` to no
@@ -259,7 +259,7 @@ pub fn create_ip_port(
     }
     let (runtime, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default())?;
     claim.publish(runtime.port_handle().clone(), owner)?;
-    let io = OctetIo::new(runtime.port_handle().clone(), timeout);
+    let io = OctetIo::new(runtime.port_handle().clone(), timeout)?;
     Ok((io, runtime))
 }
 
@@ -319,7 +319,7 @@ pub(crate) mod tests {
         claim
             .publish(runtime.port_handle().clone(), &InterruptGate::opened())
             .unwrap();
-        let io = OctetIo::new(runtime.port_handle().clone(), Duration::from_millis(100));
+        let io = OctetIo::new(runtime.port_handle().clone(), Duration::from_millis(100)).unwrap();
         (io, runtime)
     }
 

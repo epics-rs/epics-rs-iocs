@@ -847,7 +847,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = Arc::new(Mutex::new(Mmc200Controller::new(io)));
         let axis = Mmc200Axis::new(controller, 0, false);
         let report = axis.report();

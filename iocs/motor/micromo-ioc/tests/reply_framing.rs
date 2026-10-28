@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
 use epics_rs::asyn::interpose::eos::EosInterpose;
 use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
@@ -93,7 +94,13 @@ fn line(name: &str, input_eos: &[u8]) -> SyncIOHandle {
     claim
         .publish(rt.port_handle().clone(), &open_owner())
         .unwrap();
-    let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+    let io = SyncIOHandle::from_handle(
+        rt.port_handle().clone(),
+        0,
+        Duration::from_secs(1),
+        InterfaceType::Octet,
+    )
+    .unwrap();
     io.set_input_eos(0, input_eos).unwrap();
     io.set_output_eos(0, &st_cmd_eos().1).unwrap();
     io

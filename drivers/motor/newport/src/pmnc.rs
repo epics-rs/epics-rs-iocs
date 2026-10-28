@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
 };
@@ -229,7 +230,7 @@ impl PmncController {
     pub fn new(port: PortHandle, addr: i32, timeout: Duration) -> AsynResult<Self> {
         // C ignores every setInputEos/setOutputEos status
         // (drvPMNC87xx.cc:586, 595, 720, 727, 873-874).
-        let handle = SyncIOHandle::from_handle(port, addr, timeout);
+        let handle = SyncIOHandle::from_handle(port, addr, timeout, InterfaceType::Octet)?;
         let _ = handle.set_input_eos(0, PROMPT_EOS);
         let _ = handle.set_output_eos(0, CMND_EOS);
         let mut ctrl = Self {

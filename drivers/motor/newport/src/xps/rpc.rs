@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -227,11 +228,14 @@ impl XpsSocket {
         mode: SocketMode,
         timeout: Duration,
     ) -> Self {
+        // The port is `ConnectToServer`'s own asynOctet IP port.
+        let io = SyncIOHandle::from_handle(handle, 0, timeout, InterfaceType::Octet)
+            .expect("an XPS socket port registers asynOctet");
         Self {
             index,
             link: Some(Link {
-                pending: SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
-                handle: SyncIOHandle::from_handle(handle, 0, timeout),
+                pending: io.with_timeout(Duration::ZERO),
+                handle: io.with_timeout(timeout),
             }),
             port: port.to_string(),
             mode,

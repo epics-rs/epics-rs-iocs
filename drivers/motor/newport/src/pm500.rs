@@ -558,7 +558,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_millis(100),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         assert!(Pm500Controller::new(io).is_none());
     }
 
@@ -695,7 +701,13 @@ mod tests {
         let (rt, _jh) =
             create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
                 .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_millis(100),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = Pm500Controller::new(io).unwrap();
         assert_eq!(ctrl.num_axes(), 1);
         (Pm500Axis::new(Arc::new(Mutex::new(ctrl)), 0), sent, xr)

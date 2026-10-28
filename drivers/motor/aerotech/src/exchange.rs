@@ -140,6 +140,7 @@ impl Exchange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::claim_port;
@@ -201,7 +202,13 @@ mod tests {
         let (rt, _jh) =
             create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
                 .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_millis(100),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         (Exchange::new(io, "drvTest", 64, None, name, name), reads)
     }
 

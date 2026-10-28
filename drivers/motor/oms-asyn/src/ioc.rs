@@ -191,7 +191,8 @@ fn connect_with_default_eos(
             InterfaceType::Octet
         ));
     }
-    let handle = SyncIOHandle::from_handle(port.handle.clone(), 0, timeout);
+    let handle = SyncIOHandle::from_handle(port.handle.clone(), 0, timeout, InterfaceType::Octet)
+        .map_err(|e| format!("{who}: {e}"))?;
     let _ = handle.flush(0);
     if handle.get_input_eos(0).is_ok_and(|eos| eos.is_empty())
         && let Err(e) = handle.set_input_eos(0, b"\n\r")

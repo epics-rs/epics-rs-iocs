@@ -930,18 +930,19 @@ mod tests {
 
     /// devMcaAsyn.c:139-173: a port lacking asynInt32, asynFloat64,
     /// asynInt32Array or asynDrvUser kills the record before any
-    /// `findDrvInfo`, so the setup commands go out with reason 0.
+    /// `findDrvInfo`, so the setup commands go out with reason 0 — but not to
+    /// a port without asynInt32, which has no interface to take them.
     #[test]
     fn a_port_missing_an_interface_leaves_the_record_dead() {
         const I: InterfaceMask = InterfaceMask::INT32;
         const F: InterfaceMask = InterfaceMask::FLOAT64;
         const A: InterfaceMask = InterfaceMask::INT32_ARRAY;
         const D: InterfaceMask = InterfaceMask::DRV_USER;
-        for (name, interfaces) in [
-            ("MCATESTNOINT32", F.or(A).or(D)),
-            ("MCATESTNOFLOAT64", I.or(A).or(D)),
-            ("MCATESTNOARRAY", I.or(F).or(D)),
-            ("MCATESTNODRVUSER", I.or(F).or(A)),
+        for (name, interfaces, setup) in [
+            ("MCATESTNOINT32", F.or(A).or(D), [0; 0].as_slice()),
+            ("MCATESTNOFLOAT64", I.or(A).or(D), [0; 8].as_slice()),
+            ("MCATESTNOARRAY", I.or(F).or(D), [0; 8].as_slice()),
+            ("MCATESTNODRVUSER", I.or(F).or(A), [0; 8].as_slice()),
         ] {
             let (_runtime, writes, _reads, _reasons) =
                 driver_port_with(name, interfaces, false, None, None, None);
@@ -951,7 +952,7 @@ mod tests {
                 "{name}"
             );
             assert!(dev.port.is_none(), "{name}");
-            assert_eq!(*writes.lock().unwrap(), [0; 8], "{name}");
+            assert_eq!(*writes.lock().unwrap(), setup, "{name}");
         }
     }
 

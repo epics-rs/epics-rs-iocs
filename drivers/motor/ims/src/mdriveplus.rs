@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
 };
@@ -493,7 +494,7 @@ impl ImsMDrivePlusAxis {
 
     /// Set IMS_LOCKEDROTOR on the controller port `port`.
     pub fn post_params_to(&mut self, port: PortHandle) -> AsynResult<()> {
-        let io = SyncIOHandle::from_handle(port, 0, IS_READ_TIMEOUT);
+        let io = SyncIOHandle::from_handle(port, 0, IS_READ_TIMEOUT, InterfaceType::Int32)?;
         self.locked_rotor = Some(io.drv_user_create("IMS_LOCKEDROTOR")?);
         Ok(())
     }

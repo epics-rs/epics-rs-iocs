@@ -89,6 +89,7 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
@@ -549,12 +550,15 @@ fn reader_thread(
             reader_state.pv_throttle = shared.lock().unwrap().pv_throttle;
 
             let want = READ_CHUNK_BUF_LEN - tread;
-            let sync_handle = SyncIOHandle::from_handle(
+            let read_result = match SyncIOHandle::from_handle(
                 rbk_port_handle.clone(),
                 0,
                 Duration::from_secs_f64(reader_state.read_timeout_secs),
-            );
-            let read_result = sync_handle.read_octet(TRANSPORT_REASON, want);
+                InterfaceType::Octet,
+            ) {
+                Ok(sync_handle) => sync_handle.read_octet(TRANSPORT_REASON, want),
+                Err(e) => OctetRead::failed(e),
+            };
             if shutdown_requested() {
                 return;
             }

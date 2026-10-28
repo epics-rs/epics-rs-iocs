@@ -577,6 +577,7 @@ pub(crate) mod tests {
     use std::collections::HashMap;
 
     use epics_rs::asyn::exception::AsynException;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interfaces::motor::AsynMotor;
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -695,7 +696,13 @@ pub(crate) mod tests {
             create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
                 .unwrap();
         let port = rt.port_handle().clone();
-        let io = SyncIOHandle::from_handle(port.clone(), 0, Duration::from_millis(100));
+        let io = SyncIOHandle::from_handle(
+            port.clone(),
+            0,
+            Duration::from_millis(100),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut controller = OmsController::new(io, name, name, "MAXnet");
         controller.watch_connection().unwrap();
         let controller = Arc::new(Mutex::new(controller));

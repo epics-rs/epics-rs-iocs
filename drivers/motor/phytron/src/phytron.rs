@@ -2116,6 +2116,7 @@ fn mcc_status_word(axis_digit: u8, perr: &str, sui: &str, moving: bool) -> AsynR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interfaces::motor::PortSet;
     use motor_common::testing::Polled;
 
@@ -2235,7 +2236,13 @@ mod tests {
         let (rt, _actor) =
             create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
                 .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = Arc::new(Mutex::new(PhytronController::new(
             io,
             name,
@@ -2340,7 +2347,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = Arc::new(Mutex::new(PhytronController::new(
             io,
             "phytronEncoderPoll",
@@ -2404,7 +2417,13 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let controller = Arc::new(Mutex::new(PhytronController::new(
             io,
             "phytronSlip",
@@ -2512,7 +2531,13 @@ mod tests {
         let (rt, _actor) =
             create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
                 .unwrap();
-        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(1),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let ctrl = PhytronController::new(io, name, CtrlType::Phymotion, 0);
         let ctrl = Arc::new(Mutex::new(ctrl));
         let axes = [1, 2].map(|i| PhytronAxis::new(ctrl.clone(), 1, i).unwrap());

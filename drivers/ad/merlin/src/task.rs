@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::{DriverHold, PortHandle};
@@ -72,7 +73,13 @@ async fn status_loop(handle: PortHandle, ad: ADBaseParams, init_param: usize) {
 
     // Run the startup sequence on the port actor: it owns the command channel,
     // so this is the only way to touch the device without a second owner.
-    let sync = SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_secs(60));
+    let sync = SyncIOHandle::from_handle(
+        handle.clone(),
+        0,
+        Duration::from_secs(60),
+        InterfaceType::Int32,
+    )
+    .expect("an areaDetector port registers asynInt32");
     let _ = sync.write_int32(init_param, 1);
 
     loop {

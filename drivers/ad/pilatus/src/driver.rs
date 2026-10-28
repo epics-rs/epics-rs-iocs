@@ -852,7 +852,13 @@ mod tests {
             0,
         )
         .expect("the detector port");
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         sync.write_int32(rt.ad_params.num_images, 3).unwrap();
         assert_eq!(sync.read_int32(rt.ad_params.num_images).unwrap(), 3);
     }
@@ -870,7 +876,13 @@ mod tests {
             0,
         )
         .expect("the detector port");
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         assert_eq!(sync.read_int32(rt.ad_params.max_size_x).unwrap(), 487);
         assert_eq!(sync.read_int32(rt.ad_params.max_size_y).unwrap(), 195);
     }
@@ -969,7 +981,13 @@ mod tests {
             tiff::encoder::TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
         enc.write_image::<tiff::encoder::colortype::Gray32>(2, 1, &[7, 9])
             .unwrap();
-        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Octet,
+        )
+        .unwrap();
         let mut late = 0;
         for _ in 0..200 {
             sync.write_octet(

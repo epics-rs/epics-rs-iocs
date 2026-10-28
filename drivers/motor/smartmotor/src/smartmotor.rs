@@ -145,9 +145,10 @@ impl SmartMotorController {
         connected?;
         let _ = writer.set_output_eos(0, OUTPUT_EOS);
         let _ = writer.set_input_eos(0, INPUT_EOS);
+        let reader = writer.with_timeout(RECV_TIMEOUT);
         let mut ctrl = Self {
             writer,
-            reader: SyncIOHandle::from_handle(port, 0, RECV_TIMEOUT),
+            reader,
             echo: false,
             num_axes: 0,
             comm_state: CommState::Normal,

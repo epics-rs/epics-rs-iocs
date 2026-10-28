@@ -85,7 +85,7 @@ impl FaulhaberController {
     /// that never answers. The first node's reply becomes the identification.
     /// Performs blocking serial I/O.
     pub fn new(handle: SyncIOHandle, num_motors: usize) -> AsynResult<Self> {
-        let reader = SyncIOHandle::from_handle(handle.port()?.clone(), 0, RECV_TIMEOUT);
+        let reader = handle.with_timeout(RECV_TIMEOUT);
         let mut ctrl = Self {
             handle,
             reader,

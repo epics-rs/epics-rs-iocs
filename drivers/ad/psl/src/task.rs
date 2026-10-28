@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -53,7 +54,13 @@ pub(crate) enum Abort {
 }
 
 async fn task_loop(mut ctx: AcquisitionContext) {
-    let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(30));
+    let sync = SyncIOHandle::from_handle(
+        ctx.handle.clone(),
+        0,
+        Duration::from_secs(30),
+        InterfaceType::Int32,
+    )
+    .expect("an areaDetector port registers asynInt32");
 
     loop {
         set_params(

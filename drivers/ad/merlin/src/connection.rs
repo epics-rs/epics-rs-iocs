@@ -318,6 +318,7 @@ pub fn default_timeout() -> Duration {
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::user::AsynUser;
 
     #[test]
@@ -404,7 +405,13 @@ mod is_timeout_tests {
         trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
         trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
         let conn = MpxConnection::new(
-            SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::ZERO),
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
             1 << 20,
         );
         let mut ad = ADDriverBase::new(

@@ -761,6 +761,7 @@ mod regulator_mode {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::sync_io::SyncIOHandle;
     use epics_rs::motor::controller_port::index;
@@ -781,7 +782,8 @@ mod regulator_mode {
         ];
         run_command(hydra_create_controller_command(), args).await;
         let port = PortManager::global().find_port_handle("hydraReg").unwrap();
-        let io = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(port, 1, Duration::from_secs(1), InterfaceType::Int32)
+            .unwrap();
         let mode = io.drv_user_create("SMCHYDRA_REGULATOR_MODE").unwrap();
         io.write_int32(mode, 2).unwrap();
         line.sent();
@@ -803,6 +805,7 @@ mod taurus_limit_type {
     use std::time::Duration;
 
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::sync_io::SyncIOHandle;
     use motor_common::testing::{LineRig, run_command};
@@ -829,7 +832,8 @@ mod taurus_limit_type {
         ];
         run_command(taurus_create_controller_command(), args).await;
         let port = PortManager::global().find_port_handle("taurusSw").unwrap();
-        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1));
+        let io = SyncIOHandle::from_handle(port, 0, Duration::from_secs(1), InterfaceType::Int32)
+            .unwrap();
         let reason = |name| io.drv_user_create(name).unwrap();
         let (set, low, high) = (
             reason("SMCTAURUS_SET_LIMIT_TYPE"),

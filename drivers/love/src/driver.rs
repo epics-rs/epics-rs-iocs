@@ -932,6 +932,7 @@ impl PortDriver for LoveDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interpose::OctetReadResult;
     use epics_rs::asyn::sync_io::SyncIOHandle;
 
@@ -1100,8 +1101,13 @@ mod tests {
             Some("LOVETESTTRCL"),
             TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
         );
-        let user =
-            SyncIOHandle::from_handle(runtime.port_handle().clone(), 1, Duration::from_secs(5));
+        let user = SyncIOHandle::from_handle(
+            runtime.port_handle().clone(),
+            1,
+            Duration::from_secs(5),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         assert!(user.read_int32(0).is_err());
 
         let out = std::fs::read_to_string(&path).unwrap();
@@ -1227,8 +1233,13 @@ mod tests {
             Some("LOVETESTDWNL"),
             TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
         );
-        let user =
-            SyncIOHandle::from_handle(runtime.port_handle().clone(), 1, Duration::from_secs(5));
+        let user = SyncIOHandle::from_handle(
+            runtime.port_handle().clone(),
+            1,
+            Duration::from_secs(5),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         let err = user.read_int32(0).expect_err("love port is down");
         assert_eq!(err.status(), AsynStatus::Disconnected, "{err:?}");
         assert!(!runtime.port_handle().is_connected_blocking(-1).unwrap());
@@ -1400,7 +1411,8 @@ mod tests {
         );
         trace.set_device_trace_file(name, 1, dev_file);
         (
-            SyncIOHandle::from_handle(handle, 1, Duration::from_secs(5)),
+            SyncIOHandle::from_handle(handle, 1, Duration::from_secs(5), InterfaceType::Int32)
+                .unwrap(),
             port_path,
             dev_path,
         )
@@ -1664,8 +1676,13 @@ mod tests {
         let claim = claim_port("LOVETESTLCK").expect("love port name");
         let (runtime, _thread) =
             create_port_runtime(&claim, love, RuntimeConfig::default()).expect("love port runtime");
-        let user =
-            SyncIOHandle::from_handle(runtime.port_handle().clone(), 1, Duration::from_secs(5));
+        let user = SyncIOHandle::from_handle(
+            runtime.port_handle().clone(),
+            1,
+            Duration::from_secs(5),
+            InterfaceType::Int32,
+        )
+        .unwrap();
         let read = std::thread::spawn(move || user.read_int32(0));
 
         love_writes.recv().unwrap();
@@ -1793,7 +1810,9 @@ mod tests {
         handle
             .trace()
             .set_device_trace_file("LOVETESTSHD", 1, dev_file);
-        let user = SyncIOHandle::from_handle(handle, 1, Duration::from_secs(5));
+        let user =
+            SyncIOHandle::from_handle(handle, 1, Duration::from_secs(5), InterfaceType::Int32)
+                .unwrap();
         assert!(user.read_int32(0).is_err());
         let dev = String::from_utf8(read_trace(&dev_path)).unwrap();
         let mut at = 0;
