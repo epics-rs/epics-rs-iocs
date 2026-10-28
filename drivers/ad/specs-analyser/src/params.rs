@@ -116,6 +116,10 @@ impl SpecsParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::driver::ad_driver::{AD_DRIVER_INTERFACES, AD_DRIVER_INTERRUPTS};
+    use epics_rs::ad_core::driver::ndarray_driver::{
+        ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS,
+    };
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::PortFlags;
 
@@ -125,8 +129,14 @@ mod tests {
             "test-specs-params",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::ENUM
+                | InterfaceMask::FLOAT64_ARRAY
+                | AD_DRIVER_INTERFACES
+                | ND_ARRAY_DRIVER_INTERFACES,
+            InterfaceMask::ENUM
+                | InterfaceMask::FLOAT64_ARRAY
+                | AD_DRIVER_INTERRUPTS
+                | ND_ARRAY_DRIVER_INTERRUPTS,
         );
         let p = SpecsParams::create(&mut base).unwrap();
         assert_eq!(base.find_param("SPECS_CONNECT"), Some(p.connect));
