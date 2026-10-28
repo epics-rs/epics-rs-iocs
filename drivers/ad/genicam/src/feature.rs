@@ -692,6 +692,10 @@ impl GenICamFeatureSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::driver::ad_driver::{AD_DRIVER_INTERFACES, AD_DRIVER_INTERRUPTS};
+    use ad_core_rs::driver::ndarray_driver::{
+        ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS,
+    };
     use asyn_rs::param::ParamValue;
     use asyn_rs::port::{InterfaceMask, PortFlags};
     use parking_lot::Mutex;
@@ -786,8 +790,14 @@ mod tests {
             "gc_enum_table",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT64
+                | InterfaceMask::ENUM
+                | AD_DRIVER_INTERFACES
+                | ND_ARRAY_DRIVER_INTERFACES,
+            InterfaceMask::INT64
+                | InterfaceMask::ENUM
+                | AD_DRIVER_INTERRUPTS
+                | ND_ARRAY_DRIVER_INTERRUPTS,
         );
         let index = base.create_param("GC_Mode", ParamType::Int32).unwrap();
         let mut tables = base.interrupts.subscribe_async(64, 1 << 16);
