@@ -201,6 +201,12 @@ impl XpsAxis {
         trace_error(&self.trace, function, args);
     }
 
+    /// `asynPrint(pasynUser_, ASYN_TRACE_ERROR, "%s:%s:. XPS ...", ...)`: the
+    /// `getPID`/`setPID` lines whose format has no space after the second colon.
+    fn error_tight(&self, function: &str, args: fmt::Arguments<'_>) {
+        trace_error_tight(&self.trace, function, args);
+    }
+
     /// The same with `ASYN_TRACE_FLOW`.
     fn flow(&self, function: &str, args: fmt::Arguments<'_>) {
         self.trace.print(
@@ -409,13 +415,13 @@ impl XpsAxis {
                     name(ct)
                 ),
             ),
-            PidFailure::Unsupported(CorrectorType::NoCorrector, type_name) => self.error(
+            PidFailure::Unsupported(CorrectorType::NoCorrector, type_name) => self.error_tight(
                 "setPID",
                 format_args!(
                     ". XPS {port} axis {axis} corrector type is {type_name}. Cannot set PID.\n"
                 ),
             ),
-            PidFailure::Unsupported(_, type_name) => self.error(
+            PidFailure::Unsupported(_, type_name) => self.error_tight(
                 "setPID",
                 format_args!(
                     ". XPS {port} axis {axis} not a valid corrector type: {type_name}. Cannot set PID.\n"
@@ -442,13 +448,13 @@ impl XpsAxis {
                     ct.short_name()
                 ),
             ),
-            PidFailure::Unsupported(CorrectorType::NoCorrector, type_name) => self.error(
+            PidFailure::Unsupported(CorrectorType::NoCorrector, type_name) => self.error_tight(
                 "getPID",
                 format_args!(
                     ". XPS {port} axis {axis} corrector type is {type_name}. Cannot get PID.\n"
                 ),
             ),
-            PidFailure::Unsupported(_, type_name) => self.error(
+            PidFailure::Unsupported(_, type_name) => self.error_tight(
                 "getPID",
                 format_args!(
                     ". XPS {port} axis {axis} not a valid corrector type: {type_name}. Cannot set PID.\n"
@@ -642,6 +648,15 @@ fn trace_error(trace: &MotorTrace, function: &str, args: fmt::Arguments<'_>) {
         TraceMask::ERROR,
         0,
         format_args!("{DRIVER_NAME}:{function}: {args}"),
+    );
+}
+
+/// [`trace_error`] for a C format with no space after the function name's colon.
+fn trace_error_tight(trace: &MotorTrace, function: &str, args: fmt::Arguments<'_>) {
+    trace.print(
+        TraceMask::ERROR,
+        0,
+        format_args!("{DRIVER_NAME}:{function}:{args}"),
     );
 }
 
@@ -2069,6 +2084,40 @@ mod tests {
              Executing deferred move on XPS: MOTOR_T, Group: G1\n\
              Error peforming GroupMoveAbsolute/Relative in processDeferredMovesInGroup. XPS Return code: -3\n\
              Processing deferred moves on XPS: MOTOR_T\n"
+        );
+    }
+
+    /// XPSAxis.cpp:1235, 1240, 1309, 1314: C's format is `%s:%s:. XPS`, no
+    /// space between the colon and the dot.
+    #[test]
+    fn the_corrector_type_lines_have_no_space_before_the_dot() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::{TraceFile, TraceInfoMask};
+
+        let (axis, _, _) = fake_axis("xps_pid_trace", "");
+        let path = std::env::temp_dir().join(format!("xps-pid-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_device_trace_mask("MOTOR_T", 0, TraceMask::ERROR);
+        trace.set_device_trace_info_mask("MOTOR_T", 0, TraceInfoMask::empty());
+        trace.set_device_trace_file("MOTOR_T", 0, TraceFile::File(file));
+
+        for failure in [
+            PidFailure::Unsupported(CorrectorType::NoCorrector, "NoCorrector".into()),
+            PidFailure::Unsupported(CorrectorType::Other, "x".into()),
+        ] {
+            axis.report_pid_failure(&failure);
+            axis.report_get_pid_failure(&failure);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text,
+            "XPSAxis:setPID:. XPS MOTOR_T axis 0 corrector type is NoCorrector. Cannot set PID.\n\
+             XPSAxis:getPID:. XPS MOTOR_T axis 0 corrector type is NoCorrector. Cannot get PID.\n\
+             XPSAxis:setPID:. XPS MOTOR_T axis 0 not a valid corrector type: x. Cannot set PID.\n\
+             XPSAxis:getPID:. XPS MOTOR_T axis 0 not a valid corrector type: x. Cannot set PID.\n"
         );
     }
 
