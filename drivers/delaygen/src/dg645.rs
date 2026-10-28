@@ -1000,6 +1000,38 @@ mod init_tests {
         assert!(dg.read_int32(&AsynUser::new(reason)).is_err());
     }
 
+    /// drvAsynDG645.cpp:542: `int32CanInterrupt` is the port's only
+    /// interrupt source, so only an asynInt32 interrupt user is accepted.
+    #[test]
+    fn only_an_int32_interrupt_user_is_accepted() {
+        use epics_rs::asyn::asyn_record::claim_port;
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let dg = Dg645Driver::new("DG645_INTR", mute_link("DG645_INTR_IO")).unwrap();
+        let claim = claim_port("DG645_INTR").unwrap();
+        let (runtime, _actor) = create_port_runtime(&claim, dg, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        for iface in [InterfaceType::Int32, InterfaceType::Float64] {
+            let filter = InterruptFilter {
+                iface: Some(iface),
+                ..Default::default()
+            };
+            let accepted = runtime
+                .port_handle()
+                .interrupts()
+                .register_interrupt_user(filter, 0)
+                .is_ok();
+            assert_eq!(accepted, iface == InterfaceType::Int32, "{iface}");
+        }
+        std::mem::forget(runtime);
+    }
+
     /// C's `epicsStrCaseCmp` tag scan; a miss is asynError with no text.
     #[test]
     fn a_tag_resolves_without_case_and_a_miss_carries_no_text() {
