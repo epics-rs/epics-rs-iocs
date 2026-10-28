@@ -8,7 +8,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-epics-rs = { workspace = true }
+epics-rs = { workspace = true, features = ["asyn"] }
 
 [dev-dependencies]
 cfloat-gate = { workspace = true }

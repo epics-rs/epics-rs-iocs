@@ -31,6 +31,8 @@
 //! through `EPICS_DB_INCLUDE_PATH`, and every template `include` through
 //! that path too.
 
+pub mod wiring;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
