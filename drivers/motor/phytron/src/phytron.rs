@@ -2119,6 +2119,17 @@ mod tests {
     use epics_rs::asyn::interfaces::motor::PortSet;
     use motor_common::testing::Polled;
 
+    /// phytronAxisMotor.cpp:106: asynOption is added to the controller
+    /// base's interfaces (asynOctet is already there).
+    #[test]
+    fn the_port_adds_option_to_the_c_interfaces() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::motor::controller_port::ControllerPort;
+
+        let port = ControllerPort::new("phytronMask", 1, PhytronParams::new(0.1, 1.0)).unwrap();
+        assert!(port.base().interface_mask().contains(InterfaceMask::OPTION));
+    }
+
     /// C `phyToAsyn` (phytronAxisMotor.cpp:1218) returns the bare status, so
     /// devAsyn prints "process read error" with no text appended.
     #[test]
