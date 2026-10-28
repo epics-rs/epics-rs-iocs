@@ -97,7 +97,6 @@ pub fn connect_octet(port: &str, addr: i32) -> Result<PortHandle, Unconnected> {
 /// A registered port without `asynOctet`, as `findInterface` sees it.
 #[cfg(test)]
 pub(crate) fn no_octet_port(name: &str) {
-    use epics_rs::asyn::interfaces::Capability;
     use epics_rs::asyn::manager::{PortManager, claim_port_driver};
     use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::open_owner;
@@ -110,16 +109,13 @@ pub(crate) fn no_octet_port(name: &str) {
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.0
         }
-        fn capabilities(&self) -> Vec<Capability> {
-            vec![Capability::Int32Read, Capability::Int32Write]
-        }
     }
     let driver = Int32Only(PortDriverBase::new(
         name,
         1,
         PortFlags::default(),
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32,
+        InterfaceMask::NONE,
     ));
     let runtime = PortManager::new()
         .register_port(claim_port_driver(name).unwrap(), driver, &open_owner())
