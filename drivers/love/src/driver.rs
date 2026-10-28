@@ -562,6 +562,16 @@ fn eval_error_to_asyn(e: EvalError) -> AsynError {
     }
 }
 
+/// The interfaces the love port registers (`drvLove.c:363-400`); its
+/// records bind `asynInt32` and `asynUInt32Digital` directly.
+pub const INTERFACES: InterfaceMask = InterfaceMask::COMMON
+    .or(InterfaceMask::DRV_USER)
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::UINT32_DIGITAL);
+
+/// The love port posts no interrupts.
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::NONE;
+
 /// Love port driver state (C `struct Port`, minus the `Serport`/asyn
 /// registration bookkeeping the Rust runtime already owns).
 pub struct LoveDriver {
@@ -605,11 +615,8 @@ impl LoveDriver {
                 can_block: serial.can_block(),
                 destructible: true,
             },
-            InterfaceMask::COMMON
-                | InterfaceMask::DRV_USER
-                | InterfaceMask::INT32
-                | InterfaceMask::UINT32_DIGITAL,
-            InterfaceMask::NONE,
+            INTERFACES,
+            INTERRUPTS,
         );
         base.set_auto_connect(serial.connect_device(ser_addr).auto_connect());
 
