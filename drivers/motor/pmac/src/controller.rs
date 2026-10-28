@@ -29,7 +29,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::PortSets;
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::motor::controller_port::{
@@ -816,6 +816,9 @@ fn lock(controller: &Mutex<PmacController>) -> std::sync::MutexGuard<'_, PmacCon
 }
 
 impl ControllerParams for PmacControllerParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let mut create = |name| base.create_param(name, ParamType::Int32);
         create("PMAC_C_FIRSTPARAM")?;
