@@ -71,8 +71,8 @@ impl PixiradDetector {
             1,
             max_memory,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )?;
         let params = PixiradParams::create(&mut ad.port_base)?;
         let p = ad.params;
