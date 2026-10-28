@@ -88,6 +88,9 @@ struct HydraParams {
 }
 
 impl ControllerParams for HydraParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.regulator_mode = Some(base.create_param("SMCHYDRA_REGULATOR_MODE", ParamType::Int32)?);
         Ok(())
