@@ -739,6 +739,20 @@ mod asyn_writes {
 #[cfg(all(test, feature = "testing", target_os = "linux"))]
 mod asyn_reads {
     use super::*;
+
+    /// drvMotorAsyn.c:339-358: asynFloat64Array is registered next to the
+    /// int32, uint32Digital, float64 and genericPointer interfaces.
+    #[test]
+    fn the_port_registers_float64_array() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriver};
+
+        let port = DrvMotorAsyn::new("maskPort", Vec::new());
+        assert!(
+            port.base()
+                .interface_mask()
+                .contains(InterfaceMask::FLOAT64_ARRAY)
+        );
+    }
     use crate::drv_motor_asyn::function;
     use crate::param_lib::Params;
     use crate::testing::run_command;
