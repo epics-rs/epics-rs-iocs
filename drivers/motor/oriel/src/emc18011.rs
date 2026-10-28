@@ -346,7 +346,8 @@ pub struct Emc18011Axis {
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
     strings: MoveStrings,
-    /// When the last motion started: C's motor task reads no status until
+    /// When the last motion was dequeued (before its commands went out, C's
+    /// `tick`): C's motor task reads no status until
     /// `MOTION_DELAY` (its `update_delay`) after it.
     started: Option<Instant>,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
@@ -408,6 +409,7 @@ impl Emc18011Axis {
     /// both starts motion and returns an acknowledgment), after selecting
     /// this motor.
     fn issue_move(&mut self, velocity: f64, move_str: &str) -> AsynResult<()> {
+        let tick = Instant::now();
         let prem = self.strings.arm();
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
@@ -416,7 +418,7 @@ impl Emc18011Axis {
         ctrl.send(move_str.as_bytes());
         ctrl.send(b"A");
         drop(ctrl);
-        self.started = Some(Instant::now());
+        self.started = Some(tick);
         Ok(())
     }
 }
@@ -481,6 +483,7 @@ impl AsynMotor for Emc18011Axis {
     ) -> AsynResult<()> {
         // C hangs POST off the `V` message, and the direction message's
         // VELOCITY node replaces it, so C never sends it; not copied.
+        let tick = Instant::now();
         let prem = self.strings.arm();
         let mut ctrl = self.lock();
         ctrl.select(self.index)?;
@@ -492,7 +495,7 @@ impl AsynMotor for Emc18011Axis {
         let dir = if nint(velocity) >= 0 { ">" } else { "<" };
         ctrl.send(dir.as_bytes());
         drop(ctrl);
-        self.started = Some(Instant::now());
+        self.started = Some(tick);
         Ok(())
     }
 
@@ -878,12 +881,12 @@ mod tests {
         *z.lock().unwrap() = Z_RUNDOWN;
         let user = AsynUser::default();
         for jog in [false, true] {
+            let at = Instant::now();
             if jog {
                 axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
             } else {
                 axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
             }
-            let at = Instant::now();
             axis.polled(&user).unwrap();
             assert!(at.elapsed() >= MOTION_DELAY);
             let again = Instant::now();
