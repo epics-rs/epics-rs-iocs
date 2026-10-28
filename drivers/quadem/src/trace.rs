@@ -315,8 +315,19 @@ mod tests {
                 name,
                 2,
                 flags,
-                InterfaceMask::UNMIGRATED_ALL,
-                InterfaceMask::UNMIGRATED_INTERRUPTS,
+                InterfaceMask::INT32
+                    | InterfaceMask::INT32_ARRAY
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::FLOAT64_ARRAY
+                    | InterfaceMask::ENUM
+                    | InterfaceMask::GENERIC_POINTER
+                    | InterfaceMask::DRV_USER,
+                InterfaceMask::INT32
+                    | InterfaceMask::INT32_ARRAY
+                    | InterfaceMask::FLOAT64
+                    | InterfaceMask::FLOAT64_ARRAY
+                    | InterfaceMask::ENUM
+                    | InterfaceMask::GENERIC_POINTER,
             )),
             RuntimeConfig::default(),
         )
