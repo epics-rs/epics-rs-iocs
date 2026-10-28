@@ -14,7 +14,7 @@ publish = false
 epics-rs = { workspace = true, features = ["asyn", "motor"] }
 epics-libcom-rs = { workspace = true }
 motor-common = { path = "../common" }
-epics-seq-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["runtime"] }
 # The holder stores poll-loop command senders (tokio mpsc) created by
 # motor-rs's MotorBuilder; only the `sync` channel type is needed here.
 tokio = { version = "1", features = ["sync"] }
@@ -22,7 +22,7 @@ tokio = { version = "1", features = ["sync"] }
 ssh2 = { workspace = true, optional = true }
 
 [build-dependencies]
-epics-snc-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["snc"] }
 
 [features]
 # C's HAVE_LIBSSH2, off by default as in CONFIG_SITE; without it an XPS-D

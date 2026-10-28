@@ -16,7 +16,7 @@
 //! | `devXxStrParm.c` | [`strparm`] | generic string-parameter serial I/O |
 //!
 //! `devXxStrParm.c` sits beside the ip SNL programs whose templates use it
-//! ([`snl`], compiled by epics-snc-rs from `src/snl` and run on
+//! ([`snl`], compiled by epics-seq-rs from `src/snl` and run on
 //! epics-seq-rs; templates in `db/`). [`strparm`] and the helpers it shares
 //! with the devices here ([`fmt`], [`user_param`], `connect_octet`,
 //! `unit_slope`) are defined in this crate.

@@ -25,16 +25,17 @@ dependencies = [
 [[package]]
 name = "ad-core-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "asyn-rs",
+ "bytemuck",
  "epics-base-rs",
  "epics-ca-rs",
  "epics-libcom-rs",
  "fearless_simd 1.1.0",
  "fearless_simd_macros",
- "futures-util",
  "parking_lot",
+ "smallvec",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -104,7 +105,7 @@ dependencies = [
 [[package]]
 name = "ad-plugins-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "ad-core-rs",
  "asyn-rs",
@@ -117,8 +118,8 @@ dependencies = [
  "fearless_simd_macros",
  "flate2",
  "image",
- "jpeg-decoder",
  "jpeg-encoder",
+ "libc",
  "lz4_flex",
  "parking_lot",
  "rayon",
@@ -129,6 +130,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -451,12 +453,13 @@ dependencies = [
 [[package]]
 name = "asyn-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "bitflags 2.11.1",
  "chrono",
  "epics-base-rs",
  "epics-libcom-rs",
+ "epics-seq-rs",
  "libc",
  "parking_lot",
  "serde",
@@ -725,6 +728,20 @@ name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
 
 [[package]]
 name = "byteorder"
@@ -1341,7 +1358,7 @@ dependencies = [
 [[package]]
 name = "epics-base-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1367,7 +1384,7 @@ dependencies = [
 [[package]]
 name = "epics-bridge-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1391,7 +1408,7 @@ dependencies = [
 [[package]]
 name = "epics-ca-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1415,10 +1432,9 @@ dependencies = [
 [[package]]
 name = "epics-libcom-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "chrono",
- "epics-rtems-boot",
  "hostname",
  "libc",
  "parking_lot",
@@ -1432,7 +1448,7 @@ dependencies = [
 [[package]]
 name = "epics-macros-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1443,7 +1459,7 @@ dependencies = [
 [[package]]
 name = "epics-modbus-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -1455,8 +1471,9 @@ dependencies = [
 [[package]]
 name = "epics-pva-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
+ "arc-swap",
  "bytes",
  "chrono",
  "clap",
@@ -1493,7 +1510,7 @@ dependencies = [
 [[package]]
 name = "epics-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -1509,7 +1526,7 @@ dependencies = [
 [[package]]
 name = "epics-rtems-boot"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "cc",
  "libc",
@@ -1518,26 +1535,18 @@ dependencies = [
 [[package]]
 name = "epics-seq-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
+ "chrono",
  "epics-base-rs",
  "epics-libcom-rs",
  "parking_lot",
 ]
 
 [[package]]
-name = "epics-snc-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
-dependencies = [
- "chrono",
- "epics-libcom-rs",
-]
-
-[[package]]
 name = "epics-stream-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "asyn-rs",
  "chrono",
@@ -2250,7 +2259,6 @@ dependencies = [
  "epics-libcom-rs",
  "epics-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "epics-stream-rs",
 ]
 
@@ -2310,15 +2318,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "jpeg-decoder"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
-dependencies = [
- "rayon",
 ]
 
 [[package]]
@@ -2587,11 +2586,12 @@ dependencies = [
 [[package]]
 name = "mca-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "chrono",
  "epics-base-rs",
  "epics-libcom-rs",
+ "epics-seq-rs",
 ]
 
 [[package]]
@@ -2794,7 +2794,6 @@ dependencies = [
  "epics-libcom-rs",
  "epics-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "motor-common",
 ]
 
@@ -2901,7 +2900,6 @@ dependencies = [
  "epics-libcom-rs",
  "epics-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "motor-common",
  "ssh2",
  "tokio",
@@ -2991,7 +2989,7 @@ dependencies = [
 [[package]]
 name = "motor-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "asyn-rs",
  "bitflags 2.11.1",
@@ -2999,6 +2997,7 @@ dependencies = [
  "epics-ca-rs",
  "epics-libcom-rs",
  "libc",
+ "parking_lot",
  "tokio",
 ]
 
@@ -3951,9 +3950,9 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.7.8"
+version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b144d58b258599f9f2c2e6f3d459eb74ba59ef7e33d338ec4bfc430bd3ccc63"
+checksum = "36e40088823964d69fc4f6012fcce5f6e7a9a83404301f937d6149b5984daf54"
 dependencies = [
  "bzip2",
  "fearless_simd 1.1.0",
@@ -4121,7 +4120,7 @@ dependencies = [
 [[package]]
 name = "scaler-rs"
 version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=505b4b63230e88e9ad57d7742166cd3bffa15736#505b4b63230e88e9ad57d7742166cd3bffa15736"
+source = "git+file:///home/stevek/work/epics-rs?rev=b7a0a660291f3c522f9fd0d67f1fe44037c6d3df#b7a0a660291f3c522f9fd0d67f1fe44037c6d3df"
 dependencies = [
  "epics-base-rs",
  "tokio",
@@ -5126,7 +5125,6 @@ dependencies = [
  "epics-libcom-rs",
  "epics-rs",
  "epics-seq-rs",
- "epics-snc-rs",
  "meascomp",
  "parking_lot",
  "uldaq-sys",

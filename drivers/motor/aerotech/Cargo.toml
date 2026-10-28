@@ -11,10 +11,10 @@ publish = false
 epics-libcom-rs = { workspace = true }
 epics-rs = { workspace = true, features = ["asyn", "motor"] }
 motor-common = { path = "../common" }
-epics-seq-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["runtime"] }
 
 [build-dependencies]
-epics-snc-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["snc"] }
 
 [dev-dependencies]
 motor-common = { path = "../common", features = ["testing"] }
