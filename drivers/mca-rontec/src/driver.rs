@@ -94,6 +94,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::OctetStep;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -196,14 +197,18 @@ impl RontecDriver {
         serial_port_name: &str,
         serial_port_addr: i32,
     ) -> AsynResult<Self> {
-        // C `pasynOctetSyncIO->connect` answers an unknown port with
-        // asynError (`drvMcaRontec.c:172-178`).
-        let entry = get_port(serial_port_name).ok_or_else(|| {
+        // C `pasynOctetSyncIO->connect` answers an unknown port, or one
+        // without asynOctet, with asynError (`drvMcaRontec.c:172-178`).
+        let refused = || {
             protocol_error(format!(
                 "RontecConfig: can't connect to serial port {serial_port_name}, status={}",
                 AsynStatus::Error as i32
             ))
-        })?;
+        };
+        let entry = get_port(serial_port_name).ok_or_else(refused)?;
+        if !entry.handle.has_interface(InterfaceType::Octet) {
+            return Err(refused());
+        }
         Self::on_serial(port_name, entry.handle, serial_port_name, serial_port_addr)
     }
 
@@ -1310,6 +1315,45 @@ mod tests {
              \x20             maxChans: 4096\n\
              \x20             nchans:   1024\n\
              \x20             binning:  4\n"
+        );
+    }
+
+    #[test]
+    fn connect_to_a_port_without_asyn_octet_fails_with_c_text() {
+        use epics_rs::asyn::registry::{claim_port, open_owner};
+
+        struct NoOctet(PortDriverBase);
+        impl PortDriver for NoOctet {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+        let name = "RONTECNOOCTET";
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(
+            &claim,
+            NoOctet(PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::COMMON | InterfaceMask::INT32,
+                InterfaceMask::NONE,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let err = RontecDriver::connect("RONTECNOOCTETD", name, 0)
+            .err()
+            .expect("no asynOctet");
+        assert_eq!(
+            err.message(),
+            "RontecConfig: can't connect to serial port RONTECNOOCTET, status=3"
         );
     }
 
