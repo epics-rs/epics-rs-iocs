@@ -124,3 +124,14 @@ fn every_tpx3_drv_info_is_one_the_driver_creates() {
     }
     assert!(unserved.is_empty(), "unserved drvInfo: {unserved:#?}");
 }
+
+/// Record init refuses a record whose DTYP interface the port does not
+/// register, and an I/O Intr one whose interface cannot post interrupts.
+#[test]
+fn every_record_binds_an_interface_the_port_registers() {
+    ioc_conventions::wiring::assert_wired(
+        &load_all(),
+        timepix3::driver::INTERFACES,
+        timepix3::driver::INTERRUPTS,
+    );
+}

@@ -210,6 +210,28 @@ const MPX3_TRIGGER_MSG: &str =
 const MPX3_PIXEL_DEPTH_MSG: &str =
     "MPX3: PixelDepth 24 incompatible with BothCounters (use 12-bit)";
 
+/// The interfaces the detector port registers (ADTimePix.cpp:1072-1076).
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::INT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::ENUM)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::INT64_ARRAY)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interfaces that post interrupts.
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::INT64)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::ENUM)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::INT64_ARRAY)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::DRV_USER);
+
 pub struct TimePix3Driver {
     pub ad: ADDriverBase,
     pub p: TimePixParams,
@@ -310,24 +332,8 @@ impl TimePix3Driver {
                 multi_device: true,
                 ..Default::default()
             },
-            InterfaceMask::INT32
-                | InterfaceMask::INT64
-                | InterfaceMask::OCTET
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::ENUM
-                | InterfaceMask::INT32_ARRAY
-                | InterfaceMask::INT64_ARRAY
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32
-                | InterfaceMask::INT64
-                | InterfaceMask::OCTET
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::ENUM
-                | InterfaceMask::INT32_ARRAY
-                | InterfaceMask::INT64_ARRAY
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::DRV_USER,
+            INTERFACES,
+            INTERRUPTS,
         )?;
         let p = TimePixParams::create(&mut ad.port_base)?;
 
