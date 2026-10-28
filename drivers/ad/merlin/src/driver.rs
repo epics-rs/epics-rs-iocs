@@ -91,8 +91,14 @@ impl MerlinDetector {
             1,
             max_memory,
             ASYN_CANBLOCK,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::GENERIC_POINTER
+                | InterfaceMask::INT16_ARRAY,
+            InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::GENERIC_POINTER
+                | InterfaceMask::INT16_ARRAY,
         )?;
         // C sends this once ADDriver exists but before its own parameters
         // do, so a restarted IOC never inherits a running acquisition.

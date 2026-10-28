@@ -412,8 +412,14 @@ mod is_timeout_tests {
             1,
             1 << 20,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::GENERIC_POINTER
+                | InterfaceMask::INT16_ARRAY,
+            InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::GENERIC_POINTER
+                | InterfaceMask::INT16_ARRAY,
         )
         .unwrap();
         assert_eq!(conn.get(&mut ad, "X", Duration::from_secs(1)).unwrap(), "1");
