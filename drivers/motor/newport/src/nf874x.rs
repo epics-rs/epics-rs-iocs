@@ -13,7 +13,7 @@ use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, MoveToHomeTask, PollFailure, PortSets, StatusWrite,
 };
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -497,6 +497,9 @@ impl WriteHook for Nf874xWriteHook {
 }
 
 impl ControllerParams for Nf874xControllerParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+
     /// C `nf874xController::report` (874xMotorDriver.cpp:115-122).
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
