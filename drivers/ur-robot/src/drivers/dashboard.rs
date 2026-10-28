@@ -154,8 +154,8 @@ impl DashboardDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::OCTET,
         );
         let params = DashboardParams::create(&mut base)?;
 
@@ -542,8 +542,8 @@ mod tests {
             "dash_is_command",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::OCTET,
         );
         let p = DashboardParams::create(&mut base).expect("params create");
 
@@ -586,8 +586,8 @@ mod tests {
             "dash_alarm_set",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32 | InterfaceMask::OCTET | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32 | InterfaceMask::OCTET,
         );
         let p = DashboardParams::create(&mut base).expect("params create");
 
