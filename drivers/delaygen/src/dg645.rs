@@ -478,8 +478,12 @@ impl Dg645Driver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::COMMON
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::OCTET
+                | InterfaceMask::INT32
+                | InterfaceMask::FLOAT64,
+            InterfaceMask::INT32,
         );
         for spec in COMMANDS {
             // Param index == COMMANDS index, the reason `drv_user_create`
