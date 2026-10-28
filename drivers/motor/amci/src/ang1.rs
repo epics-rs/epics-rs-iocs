@@ -30,7 +30,7 @@ use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
 };
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{AxisUser, ParamWrite, has_motor_axis};
@@ -158,6 +158,9 @@ impl Ang1Params {
 }
 
 impl ControllerParams for Ang1Params {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.jerk = Some(base.create_param("ANG1_JERK", ParamType::Int32)?);
         Ok(())
