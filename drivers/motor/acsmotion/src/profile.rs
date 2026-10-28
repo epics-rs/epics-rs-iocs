@@ -1348,14 +1348,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// getAddress maps an address past the axes to axis 0, so only one
-    /// below -1 has no axis (SPiiPlusDriver.cpp:342-357).
+    /// getAddress maps an address past the axes to axis 0
+    /// (SPiiPlusDriver.cpp:342-357) and getAddr every negative one to -1,
+    /// which is list 0 (asynManager.c:1351): no address has no axis.
     #[test]
-    fn pulse_positions_need_an_axis_at_the_address() {
+    fn pulse_positions_resolve_every_address_to_an_axis() {
         let rig = rig("spiiPAddr", 1, SERVOS);
         let pulse_pos = rig.param("SPIIPLUS_PULSE_POS");
         assert!(rig.array(pulse_pos, 1, &[1.0]).is_ok());
-        assert!(rig.array(pulse_pos, -2, &[1.0]).is_err());
+        assert!(rig.array(pulse_pos, -2, &[1.0]).is_ok());
     }
 
     #[test]
@@ -1425,12 +1426,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// SPiiPlusDriver.cpp:398-399, 471-472: at an address with no axis C
-    /// returns asynError before its own code, which indexes the axes. Its
-    /// getAddress maps one past the axes to axis 0 and getAddr a negative one
-    /// to -1, so only a driver call below -1 gets there.
+    /// SPiiPlusDriver.cpp:398-399, 471-472 refuse an address with no axis,
+    /// but getAddr gives a negative one -1, which is list 0 and axis 0
+    /// (asynManager.c:1351), so a write below -1 lands on axis 0.
     #[test]
-    fn a_write_with_no_axis_is_refused_before_the_driver_s_code() {
+    fn a_write_below_minus_one_lands_on_axis_zero() {
         use epics_rs::asyn::port::DrvUserRequest;
         let rig = rig("acsNoAxis", 2, &[]);
         let reason = |name| {
@@ -1441,7 +1441,7 @@ pub(crate) mod tests {
         };
         let method = reason("SPIIPLUS_HOMING_METHOD");
         let max_dist = reason("SPIIPLUS_HOMING_MAX_DIST");
-        let refused = rig
+        let written = rig
             .port
             .with_driver_blocking::<ControllerPort<AcsMotionParams>, _>(move |d| {
                 let mut user = AsynUser::new(method).with_addr(-2);
@@ -1450,10 +1450,8 @@ pub(crate) mod tests {
                 (int, d.write_float64(&mut user, 1.0))
             })
             .unwrap();
-        assert!(refused.0.is_err() && refused.1.is_err());
-        // Nothing indexed past the axes: the port still answers.
-        rig.int(method, 1, 3);
-        assert_eq!(rig.port.read_int32_blocking(method, 1).unwrap(), 3);
+        assert!(written.0.is_ok() && written.1.is_ok());
+        assert_eq!(rig.port.read_int32_blocking(method, 0).unwrap(), 1);
     }
 
     #[test]
