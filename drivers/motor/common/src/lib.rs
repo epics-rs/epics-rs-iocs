@@ -381,6 +381,7 @@ mod tests {
     use epics_rs::base::server::iocsh::registry::ArgValue;
 
     use super::*;
+    use epics_rs::asyn::port::InterfaceMask;
 
     type Log = Arc<Mutex<Vec<i32>>>;
 
@@ -513,6 +514,9 @@ mod tests {
     struct Reporting;
 
     impl ControllerParams for Reporting {
+        const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+        const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
         fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
             let _ = writeln!(out, "driver {} numAxes={}", ctx.port_name(), ctx.num_axes());
             ctx.report(out, level);
