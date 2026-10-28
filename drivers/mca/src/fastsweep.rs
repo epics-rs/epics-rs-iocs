@@ -434,6 +434,23 @@ fn connect_input(
     };
     let port = Some(input_port_name);
 
+    // C's `findInterface` refusals, each with `goto error`
+    // (`drvFastSweep.cpp:141-164`).
+    if !input.handle.has_interface(InterfaceType::DrvUser) {
+        trace_error(
+            port,
+            format_args!("find asynDrvUser interface failed for input {input_port_name}"),
+        );
+        return (None, None);
+    }
+    if !input.handle.has_interface(InterfaceType::Int32Array) {
+        trace_error(
+            port,
+            format_args!("find asynInt32Array interface failed for input {input_port_name}"),
+        );
+        return (None, None);
+    }
+
     let data_req = DrvUserRequest::new(data_drv_info, 0).with_iface(InterfaceType::Int32Array);
     let Ok(data_info) = input.handle.drv_user_create_blocking(&data_req) else {
         trace_error(port, format_args!("error in drvUser for {data_drv_info}"));
@@ -445,6 +462,7 @@ fn connect_input(
         .register_interrupt_user(
             InterruptFilter {
                 reason: Some(data_info.reason),
+                iface: Some(InterfaceType::Int32Array),
                 ..Default::default()
             },
             // Only the first `maxSignals` elements are read.
@@ -452,6 +470,13 @@ fn connect_input(
         )
         .ok();
 
+    if !input.handle.has_interface(InterfaceType::Float64) {
+        trace_error(
+            port,
+            format_args!("find asynFloat64 interface failed for input {input_port_name}"),
+        );
+        return (data, None);
+    }
     let interval_req = DrvUserRequest::new(interval_drv_info, 0).with_iface(InterfaceType::Float64);
     let Ok(interval_info) = input.handle.drv_user_create_blocking(&interval_req) else {
         trace_error(
@@ -466,6 +491,7 @@ fn connect_input(
         .register_interrupt_user(
             InterruptFilter {
                 reason: Some(interval_info.reason),
+                iface: Some(InterfaceType::Float64),
                 ..Default::default()
             },
             0,
@@ -828,6 +854,127 @@ mod tests {
         assert!(flags.multi_device && !flags.can_block && !flags.destructible);
         assert!(subscriptions.data.is_none());
         assert!(subscriptions.interval.is_none());
+    }
+
+    /// An input port with the `DATA` and `SCAN_PERIOD` parameters, its
+    /// interfaces and interrupt sources as given.
+    fn publish_input(name: &str, interfaces: InterfaceMask, sources: InterfaceMask) {
+        use epics_rs::asyn::asyn_record::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        struct Input(PortDriverBase);
+
+        impl PortDriver for Input {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let mut base = PortDriverBase::new(name, 1, PortFlags::default(), interfaces, sources);
+        base.create_param("DATA", ParamType::Int32Array).unwrap();
+        base.create_param("SCAN_PERIOD", ParamType::Float64)
+            .unwrap();
+        let claim = claim_port(name).unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, Input(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        std::mem::forget(runtime);
+    }
+
+    fn input_subscriptions(input: &str) -> (bool, bool) {
+        let (_driver, subscriptions) =
+            FastSweepDriver::connect(&format!("{input}Sweep"), input, 1, 4, "", "").unwrap();
+        (
+            subscriptions.data.is_some(),
+            subscriptions.interval.is_some(),
+        )
+    }
+
+    const INPUT: InterfaceMask = InterfaceMask::COMMON
+        .or(InterfaceMask::DRV_USER)
+        .or(InterfaceMask::INT32_ARRAY)
+        .or(InterfaceMask::FLOAT64);
+
+    #[test]
+    fn an_input_with_both_interfaces_and_interrupts_is_subscribed() {
+        publish_input(
+            "fsInputFull",
+            INPUT,
+            InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64,
+        );
+        assert_eq!(input_subscriptions("fsInputFull"), (true, true));
+    }
+
+    /// drvFastSweep.cpp:141-150: no asynDrvUser, no subscription at all.
+    #[test]
+    fn an_input_without_asyn_drv_user_is_refused() {
+        publish_input(
+            "fsInputNoDrvUser",
+            InterfaceMask::COMMON | InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64,
+            InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64,
+        );
+        assert_eq!(input_subscriptions("fsInputNoDrvUser"), (false, false));
+    }
+
+    /// drvFastSweep.cpp:154-163.
+    #[test]
+    fn an_input_without_asyn_int32_array_is_refused() {
+        publish_input(
+            "fsInputNoArray",
+            InterfaceMask::COMMON | InterfaceMask::DRV_USER | InterfaceMask::FLOAT64,
+            InterfaceMask::FLOAT64,
+        );
+        assert_eq!(input_subscriptions("fsInputNoArray"), (false, false));
+    }
+
+    /// drvFastSweep.cpp:180-189: the data subscription stands, the interval
+    /// one is not made.
+    #[test]
+    fn an_input_without_asyn_float64_keeps_only_its_data_subscription() {
+        publish_input(
+            "fsInputNoFloat",
+            InterfaceMask::COMMON | InterfaceMask::DRV_USER | InterfaceMask::INT32_ARRAY,
+            InterfaceMask::INT32_ARRAY,
+        );
+        let path = std::env::temp_dir().join(format!("fsInputNoFloat_{}", std::process::id()));
+        let services = PortServices::global();
+        let trace = services.trace();
+        trace.set_trace_file(
+            Some("fsInputNoFloat"),
+            epics_rs::asyn::trace::TraceFile::File(Arc::new(Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some("fsInputNoFloat"), TraceMask::ERROR);
+        assert_eq!(input_subscriptions("fsInputNoFloat"), (true, false));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains(
+                "drvFastSweep:drvFastSweep:, find asynFloat64 interface failed for input fsInputNoFloat\n"
+            ),
+            "{text}"
+        );
+    }
+
+    /// `registerInterruptUser` on an interface that is not an interrupt
+    /// source fails (asynManager.c:2482-2502), so the subscription is not
+    /// made. The data filter names asynInt32Array, the interval asynFloat64.
+    #[test]
+    fn subscriptions_name_their_interface() {
+        publish_input("fsInputNoSources", INPUT, InterfaceMask::NONE);
+        assert_eq!(input_subscriptions("fsInputNoSources"), (false, false));
+        publish_input("fsInputArraySource", INPUT, InterfaceMask::INT32_ARRAY);
+        assert_eq!(input_subscriptions("fsInputArraySource"), (true, false));
+        publish_input("fsInputFloatSource", INPUT, InterfaceMask::FLOAT64);
+        assert_eq!(input_subscriptions("fsInputFloatSource"), (false, true));
     }
 
     /// C `report`'s two lines (`drvFastSweep.cpp:362-367`).
