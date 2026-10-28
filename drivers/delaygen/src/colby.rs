@@ -224,8 +224,12 @@ impl ColbyDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::COMMON
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::OCTET,
+            InterfaceMask::NONE,
         );
         Self {
             base,
