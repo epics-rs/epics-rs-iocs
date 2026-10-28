@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::motor::controller_port::{
     AxisUser, ControllerParams, ControllerReport, ParamWrite, has_motor_axis,
 };
@@ -112,6 +112,9 @@ fn post_error(
 }
 
 impl ControllerParams for HxpControllerParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     /// C `HXPController::report` (HXPDriver.cpp:143-154).
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
