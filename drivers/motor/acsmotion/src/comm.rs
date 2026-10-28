@@ -492,6 +492,13 @@ impl PortDriver for CommPort {
     }
 }
 
+/// `SPiiPlusCommDriver.cpp:25-26`: the interfaces it implements, and the
+/// ones that do callbacks.
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::UINT32_DIGITAL)
+    .or(InterfaceMask::DRV_USER);
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+
 /// Register the comm's asyn port `name`, as C's constructor does.
 pub fn register_comm_port(
     owner: &std::sync::Arc<InterruptGate>,
@@ -506,8 +513,8 @@ pub fn register_comm_port(
             can_block: true,
             destructible: true,
         },
-        InterfaceMask::INT32 | InterfaceMask::UINT32_DIGITAL | InterfaceMask::DRV_USER,
-        InterfaceMask::UINT32_DIGITAL,
+        INTERFACES,
+        INTERRUPTS,
     );
     let claim = claim_port(name).map_err(|e| format!("{name}: {e}"))?;
     let (runtime, _actor) = create_port_runtime(&claim, CommPort(base), RuntimeConfig::default())
@@ -541,6 +548,44 @@ mod tests {
             port: port.into(),
         };
         (comm, path)
+    }
+
+    /// `SPiiPlusCommDriver.cpp:25-26`: the port implements asynInt32,
+    /// asynUInt32Digital and asynDrvUser, and posts asynUInt32Digital
+    /// callbacks.
+    #[test]
+    fn the_comm_port_registers_c_interfaces_and_interrupts() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let owner = Arc::new(InterruptGate::opened());
+        register_comm_port(&owner, "acsCommMasks", 1).unwrap();
+        let handle = epics_rs::asyn::asyn_record::get_port("acsCommMasks")
+            .unwrap()
+            .handle;
+        for iface in [
+            InterfaceType::Int32,
+            InterfaceType::UInt32Digital,
+            InterfaceType::DrvUser,
+        ] {
+            assert!(handle.has_interface(iface), "{iface}");
+        }
+        for iface in [
+            InterfaceType::Int32,
+            InterfaceType::UInt32Digital,
+            InterfaceType::Float64,
+        ] {
+            let filter = InterruptFilter {
+                iface: Some(iface),
+                ..Default::default()
+            };
+            let accepted = handle
+                .interrupts()
+                .register_interrupt_user(filter, 0)
+                .is_ok();
+            assert_eq!(accepted, iface == InterfaceType::UInt32Digital, "{iface}");
+        }
     }
 
     fn take(path: &std::path::Path) -> String {
