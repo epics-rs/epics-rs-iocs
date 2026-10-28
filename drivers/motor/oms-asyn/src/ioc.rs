@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::runtime::log::errlog_vprintf;
@@ -66,12 +67,12 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
             register_port_with(ctx, &port_name, num_axes, params)?;
             // On each early return C still runs startPoller on the half-built
             // controller and crashes (a C bug); the port keeps no axes here.
-            let Some(handle) = connect_with_default_eos(&serial_port, TIMEOUT, &who) else {
-                println!(
-                    "{who}: can't connect to port {serial_port}: asynManager:connectDevice port \
-                     {serial_port} not found"
-                );
-                return Ok(CommandOutcome::Continue);
+            let handle = match connect_with_default_eos(&serial_port, TIMEOUT, &who) {
+                Ok(handle) => handle,
+                Err(line) => {
+                    println!("{line}");
+                    return Ok(CommandOutcome::Continue);
+                }
             };
             let mut controller =
                 OmsController::new(handle, &port_name, &serial_port, controller_type);
@@ -170,8 +171,26 @@ fn unsupported_firmware(controller_type: &str, major: i32, minor: i32) -> String
 /// `omsMAXnet`/`omsMXA` do after `getInputEos`/`getOutputEos`. As there, a
 /// refused get skips that direction and a refused set is printed, never fatal
 /// (omsMAXnet.cpp:128-142, omsMXA.cpp:123-137).
-fn connect_with_default_eos(port_name: &str, timeout: Duration, who: &str) -> Option<SyncIOHandle> {
-    let port = get_port(port_name)?;
+///
+/// `Err` is C's console line for the refusal: `connectDevice` on an unknown
+/// port, then `findInterface(asynOctet)` (omsMAXnet.cpp:96-115).
+fn connect_with_default_eos(
+    port_name: &str,
+    timeout: Duration,
+    who: &str,
+) -> Result<SyncIOHandle, String> {
+    let port = get_port(port_name).ok_or_else(|| {
+        format!(
+            "{who}: can't connect to port {port_name}: asynManager:connectDevice port \
+             {port_name} not found"
+        )
+    })?;
+    if !port.handle.has_interface(InterfaceType::Octet) {
+        return Err(format!(
+            "{who}: {} driver not supported",
+            InterfaceType::Octet
+        ));
+    }
     let handle = SyncIOHandle::from_handle(port.handle.clone(), 0, timeout);
     let _ = handle.flush(0);
     if handle.get_input_eos(0).is_ok_and(|eos| eos.is_empty())
@@ -184,7 +203,7 @@ fn connect_with_default_eos(port_name: &str, timeout: Duration, who: &str) -> Op
     {
         println!("{who}: unable to set OutputEOS {port_name}: {e}");
     }
-    Some(handle)
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -227,7 +246,7 @@ mod tests {
             ))),
         );
         trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
-        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_some());
+        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_ok());
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let lines: Vec<_> = text
@@ -266,6 +285,30 @@ mod tests {
                 .is_err()
         );
         claim.publish(port, &open_owner()).unwrap();
-        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_some());
+        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_ok());
+    }
+
+    /// omsMAXnet.cpp:112-115 and omsMXA.cpp:108-111: a port without
+    /// asynOctet ends the configure with "asynOctet driver not supported".
+    #[test]
+    fn a_port_without_asyn_octet_is_refused() {
+        let name = "omsNoOctet";
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::COMMON | InterfaceMask::INT32,
+            InterfaceMask::NONE,
+        );
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let e = connect_with_default_eos(name, Duration::from_secs(1), "MXAConfig")
+            .err()
+            .unwrap();
+        assert_eq!(e, "MXAConfig: asynOctet driver not supported");
     }
 }
