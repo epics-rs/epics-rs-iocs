@@ -34,7 +34,7 @@ use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
 };
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{AxisUser, ParamWrite, has_motor_axis};
 
@@ -260,6 +260,9 @@ impl Anf2Params {
 }
 
 impl ControllerParams for Anf2Params {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.reset_errors = Some(base.create_param("ANF2_RESET_ERRORS", ParamType::Int32)?);
         self.get_info = Some(base.create_param("ANF2_GET_INFO", ParamType::Int32)?);
