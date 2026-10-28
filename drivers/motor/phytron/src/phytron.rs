@@ -122,6 +122,25 @@ fn phy_to_asyn(code: i32) -> AsynError {
     }
 }
 
+/// The text the base read left in the user's errorMessage. C drops the
+/// base status (phytronAxisMotor.cpp:293, :492) and returns phyToAsyn's
+/// bare status, so devAsyn prints that text for a failed command.
+fn under_base_text<T>(result: AsynResult<T>, base: &AsynResult<impl Sized>) -> AsynResult<T> {
+    match (result, base) {
+        (
+            Err(AsynError::Status {
+                status,
+                message: empty,
+            }),
+            Err(e),
+        ) if empty.is_empty() => Err(AsynError::Status {
+            status,
+            message: e.message(),
+        }),
+        (result, _) => result,
+    }
+}
+
 /// The axis parameters on a P register, in C's createParam order
 /// (phytronAxisMotor.cpp:144-165); the map of readInt32 (:331-350) and
 /// writeInt32 (:397-450).
@@ -724,7 +743,8 @@ impl ControllerParams for PhytronParams {
     /// C `phytronController::readInt32` (phytronAxisMotor.cpp:285-357): the
     /// base value, unless the reason is a P register, which is asked.
     fn read_int32(&mut self, base: &mut PortDriverBase, user: AxisUser<'_>) -> AsynResult<i32> {
-        let value = base.read_int32_param(user.asyn()).unwrap_or(0);
+        let read = base.read_int32_param(user.asyn());
+        let value = *read.as_ref().unwrap_or(&0);
         let port = base.port_name.clone();
         let r = &self.reasons;
         if user.reason == r.controller_reset || user.reason == r.controller_status_reset {
@@ -732,12 +752,15 @@ impl ControllerParams for PhytronParams {
         }
         if user.reason == r.controller_status {
             let mut ctrl = self.controller()?;
-            let reply = ctrl.ctrl_command(
-                &port,
-                "readInt32",
-                "Reading controller status",
-                user.reason,
-                "ST",
+            let reply = under_base_text(
+                ctrl.ctrl_command(
+                    &port,
+                    "readInt32",
+                    "Reading controller status",
+                    user.reason,
+                    "ST",
+                ),
+                &read,
             )?;
             return Ok(atoi(&reply));
         }
@@ -751,12 +774,15 @@ impl ControllerParams for PhytronParams {
         let Some(&p) = self.p_regs.get(&user.reason) else {
             return Ok(value);
         };
-        let reply = ctrl.axis_command(
-            &port,
-            "readInt32",
-            "Reading parameter",
-            addr,
-            &format!("{m}P{p}R"),
+        let reply = under_base_text(
+            ctrl.axis_command(
+                &port,
+                "readInt32",
+                "Reading parameter",
+                addr,
+                &format!("{m}P{p}R"),
+            ),
+            &read,
         )?;
         let value = atoi(&reply);
         Ok(if is_current(p) { value * 10 } else { value })
@@ -768,7 +794,8 @@ impl ControllerParams for PhytronParams {
         let port = base.port_name.clone();
         let (mut ctrl, addr, m) =
             self.axis_controller(base, user, "phytronController::readFloat64")?;
-        let value = base.read_float64_param(user.asyn()).unwrap_or(0.0);
+        let read = base.read_float64_param(user.asyn());
+        let value = *read.as_ref().unwrap_or(&0.0);
         let r = &self.reasons;
         if let Some(b) = ctrl.axis(addr).map(|a| a.brake) {
             for (reason, v) in [
@@ -784,12 +811,15 @@ impl ControllerParams for PhytronParams {
         let Some(&p) = self.temps.get(&user.reason) else {
             return Ok(value);
         };
-        let reply = ctrl.axis_command(
-            &port,
-            "readFloat64",
-            "Reading parameter",
-            addr,
-            &format!("{m}P{p}R"),
+        let reply = under_base_text(
+            ctrl.axis_command(
+                &port,
+                "readFloat64",
+                "Reading parameter",
+                addr,
+                &format!("{m}P{p}R"),
+            ),
+            &read,
         )?;
         Ok(atof(&reply) / 10.)
     }
@@ -2153,6 +2183,31 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    /// C `phytronController::readInt32` calls the base read and drops its
+    /// status (phytronAxisMotor.cpp:293), but the base has written its text
+    /// to the user's errorMessage, which devAsyn prints when the controller
+    /// command then fails.
+    #[test]
+    fn a_failed_command_keeps_the_base_read_s_text() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::motor::controller_port::ControllerPort;
+
+        let params = PhytronParams::new(0.1, 1.0);
+        let slot = params.controller_slot();
+        let mut port = ControllerPort::new("phyBaseText", 1, params).unwrap();
+        let (ctrl, _, _) = lines_with("phyBaseTextIo", |_| None);
+        assert!(slot.set(ctrl).is_ok());
+        let reason = port.base().find_param("CONTROLLER_STATUS").unwrap();
+
+        let err = port.read_int32(&AsynUser::new(reason)).unwrap_err();
+        assert_eq!(
+            err.message(),
+            format!(
+                "asynPortDriver:readInt32: status=10, function={reason}, name=CONTROLLER_STATUS, value=0"
+            )
+        );
     }
 
     /// An MCC that ACKs every command, answering `P22R` with 1000 and the
