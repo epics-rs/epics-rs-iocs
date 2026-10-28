@@ -1590,7 +1590,8 @@ fn create_each(
 }
 
 /// C `PIasynController::writeInt32`/`writeFloat64` with no
-/// `m_pGCSController`: asynError before anything is stored.
+/// `m_pGCSController`: a bare asynError, no `errorMessage`, before anything
+/// is stored.
 fn not_initialized(base: &PortDriverBase, user: &AxisUser<'_>, method: &str) -> ParamWrite {
     PortManager::global().trace_manager().print(
         Some(&base.port_name),
@@ -1599,7 +1600,7 @@ fn not_initialized(base: &PortDriverBase, user: &AxisUser<'_>, method: &str) -> 
         TraceMask::ERROR,
         format_args!("PIasynController::{method}() GCS controller not initialized!\n"),
     );
-    ParamWrite::Handled(Err(pigcs2_err("GCS controller not initialized")))
+    ParamWrite::Handled(Err(pigcs2_err("")))
 }
 
 /// What `PIasynController::writeInt32`/`writeFloat64` do around
@@ -3764,8 +3765,15 @@ mod tests {
         .unwrap();
         let p = *params.params.get().unwrap();
         let printed = traced(name, || {
-            assert!(port.write_int32_blocking(p.target_mode, 0, 2).is_err());
-            assert!(port.write_float64_blocking(p.pivot_x, 0, 1.5).is_err());
+            for err in [
+                port.write_int32_blocking(p.target_mode, 0, 2).unwrap_err(),
+                port.write_float64_blocking(p.pivot_x, 0, 1.5).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(&err, AsynError::Status { message, .. } if message.is_empty()),
+                    "{err:?}"
+                );
+            }
         });
         for line in [
             "PIasynController::writeInt32() GCS controller not initialized!\n",
