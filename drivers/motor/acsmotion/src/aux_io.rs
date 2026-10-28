@@ -273,8 +273,11 @@ pub fn config(
             can_block: true,
             destructible: true,
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32
+            | InterfaceMask::FLOAT64
+            | InterfaceMask::UINT32_DIGITAL
+            | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32 | InterfaceMask::FLOAT64 | InterfaceMask::UINT32_DIGITAL,
     );
     let created = |e: AsynError| format!("{port}: {e}");
     let params = AuxParams {
