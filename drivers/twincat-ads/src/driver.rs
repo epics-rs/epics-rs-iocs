@@ -1114,8 +1114,26 @@ impl AdsPortDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT64
+                | InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::OCTET
+                | InterfaceMask::INT8_ARRAY
+                | InterfaceMask::INT16_ARRAY
+                | InterfaceMask::INT32_ARRAY,
+            InterfaceMask::INT64
+                | InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::OCTET
+                | InterfaceMask::INT8_ARRAY
+                | InterfaceMask::INT16_ARRAY
+                | InterfaceMask::INT32_ARRAY,
         );
 
         // Reason 0 — the ASCII command channel (C constructor, :372).
