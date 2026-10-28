@@ -1031,6 +1031,22 @@ mod tests {
         assert!(axis.constructor_calls_param_callbacks());
     }
 
+    /// ImsMDrivePlusMotorController.cpp:53-54: asynUInt32Digital is added to
+    /// both the interfaces and the callback interfaces.
+    #[test]
+    fn the_port_adds_uint32_digital_to_both_masks() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::motor::controller_port::ControllerPort;
+
+        let (handle, _) =
+            SyncIOHandle::connect_port("IMS_MASK", 0, Duration::ZERO, InterfaceType::Octet);
+        let line = ImsLine::new(handle, String::new(), "IMS_MASK");
+        let port = ControllerPort::new("IMS_MASK_CTRL", 1, ImsParams::new(line)).unwrap();
+        let bit = InterfaceMask::UINT32_DIGITAL;
+        assert!(port.base().interface_mask().contains(bit));
+        assert!(port.base().interrupt_mask().contains(bit));
+    }
+
     /// The steps one call left on the controller port, in the order made.
     fn rendered(sets: PortSets) -> Vec<String> {
         sets.into_iter()
