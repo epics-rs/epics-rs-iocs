@@ -48,7 +48,7 @@ use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PortSets, StatusWrite,
 };
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::{DrvUserRequest, PortDriverBase};
+use epics_rs::asyn::port::{DrvUserRequest, InterfaceMask, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -351,6 +351,9 @@ impl WriteHook for McsWriteHook {
 }
 
 impl ControllerParams for McsParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let mut r = [0; 6];
         for (slot, name) in r.iter_mut().zip(CHANNEL_PARAMS) {
