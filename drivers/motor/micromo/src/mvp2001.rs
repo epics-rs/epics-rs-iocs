@@ -42,6 +42,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
 };
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -164,6 +165,9 @@ impl Mvp2001Params {
 }
 
 impl ControllerParams for Mvp2001Params {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     /// C `MVP2001Controller::report` (MVP2001Driver.cpp:85-92).
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
