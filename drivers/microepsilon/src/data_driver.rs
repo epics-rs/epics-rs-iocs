@@ -283,8 +283,8 @@ impl DataDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::COMMON | InterfaceMask::FLOAT64 | InterfaceMask::INT32,
+            InterfaceMask::FLOAT64,
         );
         let disp_reason = base.create_param("DispChan", ParamType::Float64)?;
         Ok(Self {
