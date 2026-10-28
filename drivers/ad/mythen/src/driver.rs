@@ -94,8 +94,8 @@ impl MythenDriver {
                 multi_device: true,
                 ..ASYN_CANBLOCK
             },
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )?;
         let p = MythenParams::create(&mut ad.port_base)?;
 
