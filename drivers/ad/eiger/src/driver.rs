@@ -62,8 +62,8 @@ impl EigerDriver {
                 multi_device: true,
                 ..ASYN_CANBLOCK
             },
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )?;
 
         let mut reg = ParamRegistry::new();
