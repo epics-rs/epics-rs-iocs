@@ -48,7 +48,7 @@
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
@@ -70,7 +70,8 @@ pub const DRIVE_RESOLUTION: f64 = 0.01;
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
 
-/// C `MOTION_DELAY` (drvEMC18011.cc:72), slept on entering RETRY.
+/// C `MOTION_DELAY` (drvEMC18011.cc:72), slept on entering RETRY and the
+/// `update_delay` between a motion and its first status (:148).
 const MOTION_DELAY: Duration = Duration::from_millis(100);
 
 /// C's sleep in an unselected motor's `set_status` (drvEMC18011.cc:291).
@@ -345,6 +346,9 @@ pub struct Emc18011Axis {
     /// controller's state can move on under another axis's poll.
     failure: PollFailure,
     strings: MoveStrings,
+    /// When the last motion started: C's motor task reads no status until
+    /// `MOTION_DELAY` (its `update_delay`) after it.
+    started: Option<Instant>,
     /// What `motor_init`'s `set_status` read, until the motor task takes it.
     init_status: Option<AsynResult<MotorStatus>>,
 }
@@ -361,6 +365,7 @@ impl Emc18011Axis {
             prev_position: 0.0,
             failure: PollFailure::NONE,
             strings: MoveStrings::default(),
+            started: None,
             init_status: None,
         };
         {
@@ -410,6 +415,8 @@ impl Emc18011Axis {
         send_prem(&ctrl, &prem);
         ctrl.send(move_str.as_bytes());
         ctrl.send(b"A");
+        drop(ctrl);
+        self.started = Some(Instant::now());
         Ok(())
     }
 }
@@ -484,6 +491,8 @@ impl AsynMotor for Emc18011Axis {
         // Direction character: '>' unless C's NINT(steps/s) is negative.
         let dir = if nint(velocity) >= 0 { ">" } else { "<" };
         ctrl.send(dir.as_bytes());
+        drop(ctrl);
+        self.started = Some(Instant::now());
         Ok(())
     }
 
@@ -565,6 +574,9 @@ impl AsynMotor for Emc18011Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        if let Some(started) = self.started.take() {
+            sleep(MOTION_DELAY.saturating_sub(started.elapsed()));
+        }
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -858,6 +870,28 @@ mod tests {
     /// drvEMC18011.cc:286-297: an unselected motor reads as stopped off
     /// its limits at its last position, and resets the controller to
     /// NORMAL, so the selected motor's next bad `Z` is RETRY again.
+    /// motordrvCom.cc:444-448 with `update_delay` = MOTION_DELAY: no status
+    /// is read sooner than 0.1 s after a motion starts.
+    #[test]
+    fn the_first_status_waits_motion_delay_after_a_move() {
+        let (_line, mut axis, z) = strings_rig("emcDelay");
+        *z.lock().unwrap() = Z_RUNDOWN;
+        let user = AsynUser::default();
+        for jog in [false, true] {
+            if jog {
+                axis.move_velocity(&user, 0.0, 2.0, 0.0).unwrap();
+            } else {
+                axis.move_relative(&user, 1.5, 0.0, 2.0, 0.0).unwrap();
+            }
+            let at = Instant::now();
+            axis.polled(&user).unwrap();
+            assert!(at.elapsed() >= MOTION_DELAY);
+            let again = Instant::now();
+            axis.polled(&user).unwrap();
+            assert!(again.elapsed() < MOTION_DELAY);
+        }
+    }
+
     #[test]
     fn an_unselected_motor_reads_stopped_and_resets_the_comm_state() {
         let (_line, [mut a, mut b], z) = pair_rig("emcUnsel");
