@@ -19,7 +19,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PortSets};
 use epics_rs::asyn::param::{ParamType, ParamValue};
-use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -755,6 +755,9 @@ impl WriteHook for Lc400WriteHook {
 }
 
 impl ControllerParams for Lc400ControllerParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::UINT32_DIGITAL;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let params = Lc400Params {
             range: base.create_param("LC400_RANGE", ParamType::Int32)?,
