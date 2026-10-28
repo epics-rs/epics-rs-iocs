@@ -44,7 +44,8 @@ use epics_rs::asyn::interfaces::motor::{
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{
-    AddressSpace, DrvUser, DrvUserInfo, DrvUserRequest, PortDriverBase, port_get_address,
+    AddressSpace, DrvUser, DrvUserInfo, DrvUserRequest, InterfaceMask, PortDriverBase,
+    port_get_address,
 };
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
@@ -1123,6 +1124,9 @@ impl AcsMotionParams {
 }
 
 impl ControllerParams for AcsMotionParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.params = Some(HomingParams {
             method: base.create_param("SPIIPLUS_HOMING_METHOD", ParamType::Int32)?,
