@@ -153,6 +153,9 @@ impl TaurusParams {
 }
 
 impl ControllerParams for TaurusParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         self.limit_type = Some(base.create_param("SMCTAURUS_SET_LIMIT_TYPE", ParamType::Int32)?);
         self.limit1_type = Some(base.create_param("SMCTAURUS_LIMIT1_TYPE", ParamType::Int32)?);
