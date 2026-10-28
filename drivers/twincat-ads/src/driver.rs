@@ -1103,6 +1103,30 @@ pub struct AdsPortDriver {
     shared: Arc<AdsShared>,
 }
 
+/// The interfaces the ADS port registers; its records bind them by DTYP.
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT64
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT32_ARRAY)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::DRV_USER)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::INT8_ARRAY)
+    .or(InterfaceMask::INT16_ARRAY)
+    .or(InterfaceMask::INT32_ARRAY);
+
+/// The interfaces that post interrupts (`I/O Intr` records).
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT64
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT32_ARRAY)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::DRV_USER)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::INT8_ARRAY)
+    .or(InterfaceMask::INT16_ARRAY)
+    .or(InterfaceMask::INT32_ARRAY);
+
 impl AdsPortDriver {
     pub fn new(cfg: AdsConfig) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
@@ -1114,26 +1138,8 @@ impl AdsPortDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::INT64
-                | InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::FLOAT32_ARRAY
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::DRV_USER
-                | InterfaceMask::OCTET
-                | InterfaceMask::INT8_ARRAY
-                | InterfaceMask::INT16_ARRAY
-                | InterfaceMask::INT32_ARRAY,
-            InterfaceMask::INT64
-                | InterfaceMask::INT32
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::FLOAT32_ARRAY
-                | InterfaceMask::FLOAT64_ARRAY
-                | InterfaceMask::DRV_USER
-                | InterfaceMask::OCTET
-                | InterfaceMask::INT8_ARRAY
-                | InterfaceMask::INT16_ARRAY
-                | InterfaceMask::INT32_ARRAY,
+            INTERFACES,
+            INTERRUPTS,
         );
 
         // Reason 0 — the ASCII command channel (C constructor, :372).
