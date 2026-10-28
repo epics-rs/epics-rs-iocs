@@ -955,6 +955,31 @@ mod tests {
         }
     }
 
+    /// The port `initFastSweep` creates registers every interface the record
+    /// checks for, so the record resolves on it.
+    #[test]
+    fn the_fastsweep_port_serves_the_record() {
+        let (driver, _subscriptions) = crate::fastsweep::FastSweepDriver::connect(
+            "MCATESTFSPORT",
+            "MCATESTFSINPUT",
+            1,
+            4,
+            "",
+            "",
+        )
+        .unwrap();
+        let claim = claim_port("MCATESTFSPORT").unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        let (dev, _, outcome) = init_dev("@asyn(MCATESTFSPORT)");
+        assert!(matches!(outcome, DeviceInitOutcome::Ok(_)));
+        assert!(dev.port.is_some());
+        std::mem::forget(runtime);
+    }
+
     /// C's `goto bad` returns 0 (`devMcaAsyn.c:208-210`), so mca
     /// `init_record` still sends every setup command: with the reasons it
     /// resolved, and reason 0 for the ones after the failing `findDrvInfo`.

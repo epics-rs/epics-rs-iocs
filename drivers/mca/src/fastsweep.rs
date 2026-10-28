@@ -286,6 +286,18 @@ struct Shared {
     current_channel_reason: usize,
 }
 
+/// The interfaces the sweep port registers, which `devMcaAsyn` requires
+/// (`devMcaAsyn.c:139-173`).
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interfaces that post interrupts.
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT64);
+
 /// C's `drvFastSweep` (`drvFastSweep.h`).
 pub struct FastSweepDriver {
     base: PortDriverBase,
@@ -316,6 +328,14 @@ pub struct FastSweepSubscriptions {
     data: Option<(InterruptSubscription, InterruptReceiver)>,
     interval: Option<(InterruptSubscription, InterruptReceiver)>,
     shared: Arc<Shared>,
+}
+
+impl FastSweepSubscriptions {
+    /// Whether the data and the interval subscriptions were made, as C
+    /// leaves them connected or not (`drvFastSweep.cpp:141-211`).
+    pub fn connected(&self) -> (bool, bool) {
+        (self.data.is_some(), self.interval.is_some())
+    }
 }
 
 impl FastSweepDriver {
@@ -362,11 +382,8 @@ impl FastSweepDriver {
                 can_block: false,
                 destructible: false,
             },
-            InterfaceMask::INT32
-                | InterfaceMask::INT32_ARRAY
-                | InterfaceMask::FLOAT64
-                | InterfaceMask::DRV_USER,
-            InterfaceMask::INT32 | InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64,
+            INTERFACES,
+            INTERRUPTS,
         );
         let reasons = McaReason::create_params(&mut base)?;
         let max_channels_idx = base.create_param(FAST_SWEEP_MAX_CHANNELS, ParamType::Int32)?;
@@ -856,6 +873,41 @@ mod tests {
         assert!(subscriptions.interval.is_none());
     }
 
+    /// The sweep port is itself a source of int32, int32Array and float64
+    /// interrupts: `getInterruptPvt` on each of them must succeed.
+    #[test]
+    fn the_sweep_port_accepts_an_interrupt_user_on_each_interface_it_posts() {
+        use epics_rs::asyn::asyn_record::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let (driver, _) =
+            FastSweepDriver::connect("FSTESTSELF", "FSTESTSELFINPUT", 1, 4, "", "").unwrap();
+        let claim = claim_port("FSTESTSELF").unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        for iface in [
+            InterfaceType::Int32,
+            InterfaceType::Int32Array,
+            InterfaceType::Float64,
+        ] {
+            let filter = InterruptFilter {
+                iface: Some(iface),
+                ..Default::default()
+            };
+            let user = runtime
+                .port_handle()
+                .interrupts()
+                .register_interrupt_user(filter, 0);
+            assert!(user.is_ok(), "{iface}");
+        }
+        std::mem::forget(runtime);
+    }
+
     /// An input port with the `DATA` and `SCAN_PERIOD` parameters, its
     /// interfaces and interrupt sources as given.
     fn publish_input(name: &str, interfaces: InterfaceMask, sources: InterfaceMask) {
@@ -891,10 +943,7 @@ mod tests {
     fn input_subscriptions(input: &str) -> (bool, bool) {
         let (_driver, subscriptions) =
             FastSweepDriver::connect(&format!("{input}Sweep"), input, 1, 4, "", "").unwrap();
-        (
-            subscriptions.data.is_some(),
-            subscriptions.interval.is_some(),
-        )
+        subscriptions.connected()
     }
 
     const INPUT: InterfaceMask = InterfaceMask::COMMON
