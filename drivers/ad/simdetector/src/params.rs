@@ -236,8 +236,8 @@ mod tests {
             1,
             0,
             ASYN_NONE,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )
         .unwrap();
         let sim = SimParams::create(&mut ad.port_base).unwrap();

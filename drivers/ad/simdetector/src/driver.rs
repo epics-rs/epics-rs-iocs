@@ -65,8 +65,8 @@ impl SimDetector {
             1,
             max_memory,
             ASYN_NONE,
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         )?;
         let sim = SimParams::create(&mut ad.port_base)?;
 
