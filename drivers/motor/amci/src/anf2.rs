@@ -677,6 +677,28 @@ mod tests {
     use super::*;
     use motor_common::testing::Polled;
 
+    /// ANF2Driver.cpp:40-41: asynInt32Array is added to both the interfaces
+    /// and the callback interfaces of the motor controller base.
+    #[test]
+    fn the_port_adds_int32_array_to_both_masks() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::motor::controller_port::ControllerPort;
+
+        let (ctrl, _) = Anf2Controller::new("anf2MaskIn", "anf2MaskOut", 1);
+        let port = ControllerPort::new("anf2Mask", 1, Anf2Params::new(Arc::new(Mutex::new(ctrl))))
+            .unwrap();
+        assert!(
+            port.base()
+                .interface_mask()
+                .contains(InterfaceMask::INT32_ARRAY)
+        );
+        assert!(
+            port.base()
+                .interrupt_mask()
+                .contains(InterfaceMask::INT32_ARRAY)
+        );
+    }
+
     #[test]
     fn axes_of_missing_ports_are_built_and_counted() {
         let (ctrl, out_status) = Anf2Controller::new("anf2MissingIn", "anf2MissingOut", 1);
