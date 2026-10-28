@@ -25,27 +25,32 @@ pub fn connect_serial(
     addr: i32,
     timeout: Duration,
 ) -> Result<SyncIOHandle, String> {
-    let port = get_port(serial_port).ok_or_else(|| {
-        format!("serial port '{serial_port}' not found (call drvAsynSerialPortConfigure first)")
-    })?;
-    Ok(SyncIOHandle::from_handle(
-        port.handle.clone(),
-        addr,
-        timeout,
-    ))
+    if get_port(serial_port).is_none() {
+        return Err(format!(
+            "serial port '{serial_port}' not found (call drvAsynSerialPortConfigure first)"
+        ));
+    }
+    connect_octet(serial_port, addr, timeout)
 }
 
 /// [`connect_serial`] on a TCP octet port (created by
 /// `drvAsynIPPortConfigure`), separate only for its error message.
 pub fn connect_ip(ip_port: &str, addr: i32, timeout: Duration) -> Result<SyncIOHandle, String> {
-    let port = get_port(ip_port).ok_or_else(|| {
-        format!("IP port '{ip_port}' not found (call drvAsynIPPortConfigure first)")
-    })?;
-    Ok(SyncIOHandle::from_handle(
-        port.handle.clone(),
-        addr,
-        timeout,
-    ))
+    if get_port(ip_port).is_none() {
+        return Err(format!(
+            "IP port '{ip_port}' not found (call drvAsynIPPortConfigure first)"
+        ));
+    }
+    connect_octet(ip_port, addr, timeout)
+}
+
+/// `pasynOctetSyncIO->connect` on a port known to exist, whose refusal of a
+/// missing `asynCommon` or `asynOctet` (asynOctetSyncIO.c:124-137) fails the
+/// create.
+fn connect_octet(port: &str, addr: i32, timeout: Duration) -> Result<SyncIOHandle, String> {
+    let (io, status) = SyncIOHandle::connect_port(port, addr, timeout, InterfaceType::Octet);
+    status.map_err(|e| format!("{port}: {e}"))?;
+    Ok(io)
 }
 
 /// A model-3 `asynMotorController` constructor's
@@ -97,6 +102,8 @@ pub enum EosRefusal {
 #[derive(Debug)]
 pub enum EosConnectError {
     PortNotFound(String),
+    /// The port lacks `asynCommon` or `asynOctet`.
+    Refused(String),
     InputEos(String, AsynError),
     OutputEos(String, AsynError),
 }
@@ -108,6 +115,7 @@ impl std::fmt::Display for EosConnectError {
                 f,
                 "octet port '{port}' not found (call drvAsynSerialPortConfigure or drvAsynIPPortConfigure first)"
             ),
+            Self::Refused(message) => f.write_str(message),
             Self::InputEos(port, e) => write!(f, "unable to set input EOS on {port}: {e}"),
             Self::OutputEos(port, e) => write!(f, "unable to set output EOS on {port}: {e}"),
         }
@@ -131,9 +139,10 @@ pub fn connect_with_eos(
     output_eos: &[u8],
     refusal: EosRefusal,
 ) -> Result<SyncIOHandle, EosConnectError> {
-    let port =
-        get_port(port_name).ok_or_else(|| EosConnectError::PortNotFound(port_name.to_string()))?;
-    let handle = SyncIOHandle::from_handle(port.handle.clone(), addr, timeout);
+    if get_port(port_name).is_none() {
+        return Err(EosConnectError::PortNotFound(port_name.to_string()));
+    }
+    let handle = connect_octet(port_name, addr, timeout).map_err(EosConnectError::Refused)?;
     let set_input = || {
         handle
             .set_input_eos(0, input_eos)
@@ -217,12 +226,24 @@ mod tests {
     }
 
     fn publish<D: PortDriver>(name: &str, driver: impl FnOnce(PortDriverBase) -> D) {
+        publish_masked(name, InterfaceMask::OCTET_TRANSPORT, driver);
+    }
+
+    fn publish_masked<D: PortDriver>(
+        name: &str,
+        interfaces: InterfaceMask,
+        driver: impl FnOnce(PortDriverBase) -> D,
+    ) {
         let base = PortDriverBase::new(
             name,
             1,
             PortFlags::default(),
-            InterfaceMask::OCTET_TRANSPORT,
-            InterfaceMask::OCTET,
+            interfaces,
+            if interfaces.contains(InterfaceMask::OCTET) {
+                InterfaceMask::OCTET
+            } else {
+                InterfaceMask::NONE
+            },
         );
         let claim = claim_port(name).unwrap();
         let (rt, _actor) =
@@ -320,5 +341,24 @@ mod tests {
             e.starts_with("unable to set output EOS on eosGpibBothFatal"),
             "{e}"
         );
+    }
+
+    /// asynOctetSyncIO.c:124-137: a port without `asynOctet` fails the
+    /// connect, whichever helper a create goes through.
+    #[test]
+    fn a_port_without_asyn_octet_is_refused_by_every_octet_connect() {
+        publish_masked(
+            "eosNoOctet",
+            InterfaceMask::COMMON | InterfaceMask::INT32,
+            Bare,
+        );
+        let timeout = Duration::from_secs(1);
+        for e in [
+            connect_serial("eosNoOctet", 0, timeout).err().unwrap(),
+            connect_ip("eosNoOctet", 0, timeout).err().unwrap(),
+            connect("eosNoOctet", EosRefusal::Ignored).unwrap_err(),
+        ] {
+            assert!(e.contains("asynOctet interface not supported"), "{e}");
+        }
     }
 }

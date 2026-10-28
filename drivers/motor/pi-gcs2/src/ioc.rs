@@ -127,6 +127,14 @@ fn connect(asyn_port: &str) -> Option<SyncIOHandle> {
             TraceMask::ERROR,
             format_args!("echoHandler: unable to connect to port {asyn_port}\n"),
         ),
+        // The connect found the port, so its user prints on the port.
+        EosConnectError::Refused(_) => trace.print(
+            Some(asyn_port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            format_args!("echoHandler: unable to connect to port {asyn_port}\n"),
+        ),
         EosConnectError::InputEos(_, e) => trace.print(
             Some(asyn_port),
             Some(0),
