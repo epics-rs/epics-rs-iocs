@@ -744,8 +744,8 @@ mod tests {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            RONTEC_INTERFACES,
+            InterfaceMask::NONE,
         );
         let serial_base = PortDriverBase::new(
             "TESTRONTECSERIAL",
