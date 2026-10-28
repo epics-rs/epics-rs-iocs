@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, StatusWrite};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -157,6 +158,9 @@ pub struct Mmc200Params {
 }
 
 impl ControllerParams for Mmc200Params {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
     /// C `MMC200Controller::report` (MMC200Driver.cpp:90-101).
     fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = write!(
