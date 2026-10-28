@@ -58,8 +58,8 @@ pub fn created_param_names() -> Vec<(&'static str, Vec<String>)> {
             "wiring-check",
             max_addr,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
         );
         create(&mut base).expect("a fresh parameter table accepts every create_param");
         (0..base.params.len())
