@@ -97,8 +97,8 @@ pub fn connect(
             can_block: false,
             destructible: true,
         },
-        InterfaceMask::UNMIGRATED_ALL,
-        InterfaceMask::UNMIGRATED_INTERRUPTS,
+        InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+        InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64,
     );
     let data_reason = base.create_param(DEMO_SOURCE_DATA, ParamType::Int32Array)?;
     let period_reason = base.create_param(DEMO_SOURCE_SCAN_PERIOD, ParamType::Float64)?;
@@ -139,8 +139,8 @@ mod tests {
             claim.name(),
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64 | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32_ARRAY | InterfaceMask::FLOAT64,
         );
         let data = base
             .create_param(DEMO_SOURCE_DATA, ParamType::Int32Array)
