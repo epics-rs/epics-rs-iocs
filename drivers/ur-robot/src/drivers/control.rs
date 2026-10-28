@@ -371,8 +371,15 @@ impl ControlDriver {
                 can_block: true,
                 destructible: true,
             },
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::FLOAT64_ARRAY,
         );
         let params = ControlParams::create(&mut base)?;
 
@@ -1469,8 +1476,15 @@ mod tests {
             "ctrl_is_command",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::FLOAT64_ARRAY,
         );
         let p = ControlParams::create(&mut base).expect("params create");
 
@@ -1514,8 +1528,15 @@ mod tests {
             "ctrl_alarm_set",
             NUM_JOINTS,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::OCTET
+                | InterfaceMask::FLOAT64_ARRAY,
         );
         let p = ControlParams::create(&mut base).expect("params create");
 
