@@ -70,6 +70,10 @@ impl NdsaParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::driver::ad_driver::{AD_DRIVER_INTERFACES, AD_DRIVER_INTERRUPTS};
+    use epics_rs::ad_core::driver::ndarray_driver::{
+        ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS,
+    };
     use epics_rs::ad_core::params::ad_driver::ADDriverParams;
     use epics_rs::asyn::port::InterfaceMask;
     use epics_rs::asyn::port::PortFlags;
@@ -79,8 +83,14 @@ mod tests {
             "NDSATEST",
             1,
             PortFlags::default(),
-            InterfaceMask::UNMIGRATED_ALL,
-            InterfaceMask::UNMIGRATED_INTERRUPTS,
+            InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::INT16_ARRAY
+                | InterfaceMask::INT8_ARRAY
+                | AD_DRIVER_INTERFACES
+                | ND_ARRAY_DRIVER_INTERFACES,
+            AD_DRIVER_INTERRUPTS | ND_ARRAY_DRIVER_INTERRUPTS,
         );
         let (ad, _) = ADDriverParams::create(&mut base).unwrap();
         let ndsa = NdsaParams::create(&mut base).unwrap();

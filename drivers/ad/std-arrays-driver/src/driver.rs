@@ -77,8 +77,12 @@ impl NdStdArraysDriver {
                 multi_device: false,
                 ..Default::default()
             },
-            InterfaceMask::UNMIGRATED_SUBCLASS,
-            InterfaceMask::UNMIGRATED_SUBCLASS_INTERRUPTS,
+            InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::INT16_ARRAY
+                | InterfaceMask::INT8_ARRAY,
+            InterfaceMask::NONE,
         )?;
         let port_base = &mut ad.port_base;
         let params = ad.params;
