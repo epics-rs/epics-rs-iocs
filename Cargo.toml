@@ -341,9 +341,10 @@ ad-core-rs = "0.33.0"
 ad-plugins-rs = "0.33.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
 modbus-rs = { version = "0.33.0", package = "epics-modbus-rs" }
-# mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
-# epics-rs "mca" feature exists yet, so drivers/mca depends on this
-# standalone published crate directly.
+# mcaRecord + soft device support (epics-modules/mca's mcaRecord.c).
+# epics-rs's "mca" feature is `pub use mca_rs as mca` over this same
+# published crate, so drivers/mca keeps the direct dependency and the
+# version keeps being pinned in one place.
 mca-rs = "0.33.0"
 # StreamDevice port (syringepump-ioc's Teledyne D/H).
 stream-rs = { version = "0.33.0", package = "epics-stream-rs" }

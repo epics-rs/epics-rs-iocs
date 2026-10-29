@@ -8,7 +8,7 @@ IOC applications — Rust ports of the EPICS device-driver modules. Each
 device driver is an independent library crate under `drivers/`, and each
 IOC binary lives under `iocs/`. The workspace currently holds **69 driver
 crates** and **83 IOC crates**, all consuming a single pinned epics-rs
-version (**0.32.0**) declared once in the root `Cargo.toml`.
+version (**0.33.0**) declared once in the root `Cargo.toml`.
 
 > **Platform**: Linux is the primary, fully-supported target — every
 > crate builds and is tested there. CI additionally builds and tests the
@@ -44,7 +44,7 @@ same layout under `iocs/`.
 
 ```
 epics-rs-iocs/
-├── Cargo.toml                  # Workspace root — pins epics-rs 0.32.0 for all crates
+├── Cargo.toml                  # Workspace root — pins epics-rs 0.33.0 for all crates
 ├── drivers/
 │   ├── motor/                  # 27 motor-controller drivers + shared `common` crate
 │   │                           #   acs, acsmotion, acstech80, aerotech, amci, attocube,
@@ -146,7 +146,7 @@ at `$(P)$(M)` (or an axis-letter macro variant such as `$(P)$(MX)`, `$(P)$(MU)`,
 multi-axis controllers) — confirmed by grepping `record(` across all 54 `db/*.template` files in
 `iocs/motor/*/db/`: every single one is `record(motor, ...)`, with no other record type anywhere
 in the MOTOR family. Field definitions below are taken directly from the vendored
-`motorRecord.dbd` (`~/.cargo/registry/.../motor-rs-0.32.0/dbd/motorRecord.dbd`, mirrored at
+`motorRecord.dbd` (`~/.cargo/registry/.../motor-rs-0.33.0/dbd/motorRecord.dbd`, mirrored at
 `crates/motor-rs/dbd/motorRecord.dbd` in `epics-rs`):
 
 | Field | Type | Purpose |
@@ -771,7 +771,7 @@ Ports from [`epics-modules/mca`](https://github.com/epics-modules/mca):
 - `drivers/mca-rontec` — Rontec detector driver, ported from `mcaApp/RontecSrc/drvMcaRontec.c`.
 - `drivers/mca-amptek` — Amptek DP5/PX5/DP5G/MCA8000D/TB5/DP5-X driver, ported from `mcaApp/AmptekSrc/drvAmptek.cpp`. USB (`DppLibUsb.cpp`) is feasibility-gated out (no USB crate in the workspace); serial is unported because it's an empty no-op in the upstream C driver too.
 
-The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.31.0"` — 0.31.0 does add an `epics-rs` "mca" feature, but it is only `pub use mca_rs as mca` over this same published crate). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
+The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.33.0"` — `epics-rs` has an "mca" feature, but it is only `pub use mca_rs as mca` over this same published crate). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
 
 #### Shared MCA record set
 
@@ -808,7 +808,7 @@ Ports from [`epics-modules/scaler`](https://github.com/epics-modules/scaler) —
 
 #### scaler974 records
 
-Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at the `scaler-rs` crate dir (its bundled `db/` is re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.31.0` per `Cargo.lock`) and loads `$(SCALER)/db/scaler.db`. That file instantiates one real `scalerRecord`:
+Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at the `scaler-rs` crate dir (its bundled `db/` is re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.33.0` per `Cargo.lock`) and loads `$(SCALER)/db/scaler.db`. That file instantiates one real `scalerRecord`:
 
 ```
 grecord(scaler,"$(P)$(S)") {
@@ -1335,7 +1335,7 @@ caput USB2408:WaveDigRun 1
 
 # D435i RealSense areaDetector IOC
 
-An epics-rs 0.31.0 based areaDetector IOC for the Intel RealSense D435i
+An epics-rs 0.33.0 based areaDetector IOC for the Intel RealSense D435i
 camera. A single pipeline produces three NDArray outputs simultaneously
 (Color RGB8, Depth Z16, optional XYZ Pointcloud) and publishes IMU data
 as PVs.
