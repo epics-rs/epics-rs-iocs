@@ -901,9 +901,18 @@ mod tests {
             let claim = claim_port(name).unwrap();
             let (runtime, _) = create_port_runtime(&claim, det, RuntimeConfig::default()).unwrap();
             let handle = runtime.port_handle().clone();
-            claim
-                .publish(handle.clone(), &epics_rs::asyn::registry::open_owner())
-                .unwrap();
+            let gate = epics_rs::asyn::registry::open_owner();
+            claim.publish(handle.clone(), &gate).unwrap();
+            // The open's flush runs on its own thread. A status pass ahead of
+            // it would post everything the port has set, in the order it was
+            // first set.
+            let flushed = handle.clone();
+            epics_rs::ad_core::runtime::run_thread(move || async move {
+                gate.jobs_settled().await;
+                flushed.interrupts().edge_sweeps().cleared().await;
+            })
+            .join()
+            .unwrap();
             std::mem::forget(runtime);
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             let port = socket.local_addr().unwrap().port();
@@ -978,15 +987,9 @@ mod tests {
         while let Ok(v) = posts.try_recv() {
             reasons.push(v.reason);
         }
-        // The open flush can still be delivering when the subscription starts;
-        // the status pass is what follows its last reading.
-        let pass = reasons
-            .iter()
-            .rposition(|&r| r == st.ad.temperature_actual)
-            .map_or(&[][..], |at| &reasons[at..]);
         let p = st.params;
         assert_eq!(
-            pass,
+            reasons,
             [
                 st.ad.temperature_actual,
                 p.hot_temperature,
