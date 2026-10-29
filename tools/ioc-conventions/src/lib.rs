@@ -968,7 +968,10 @@ pub fn booted_records(binary: &Path, script: &Path) -> BTreeSet<String> {
     let tmp = scratch_dir();
     let (cmd, dbl) = (tmp.path().join("booted.cmd"), tmp.path().join("booted.dbl"));
     let mut lines = run.lines.unwrap_or_default();
-    lines.push(format!("dbl > {}\n", dbl.display()));
+    // iocsh takes an unquoted backslash as an escape, as C does, so a
+    // Windows path goes in with forward slashes.
+    let dbl_token = dbl.display().to_string().replace('\\', "/");
+    lines.push(format!("dbl > {dbl_token}\n"));
     std::fs::write(&cmd, lines.join("\n")).expect("write the booted script");
     boot(binary, &cmd, script);
     let records = dbl.is_file().then(|| read_dbl(&dbl));
