@@ -58,18 +58,6 @@ pub(crate) fn trajectory_upload(firmware: &str) -> Result<(&'static str, bool), 
     }
 }
 
-/// C `strerror(errno)`: the OS text without Rust's ` (os error N)`.
-pub(crate) fn strerror(e: &std::io::Error) -> String {
-    let text = e.to_string();
-    match e.raw_os_error() {
-        Some(code) => text
-            .strip_suffix(&format!(" (os error {code})"))
-            .unwrap_or(&text)
-            .to_string(),
-        None => text,
-    }
-}
-
 /// The parameters C creates at XPSController.cpp:167-172, in its order.
 #[derive(Clone, Copy)]
 struct Params {
@@ -431,7 +419,7 @@ impl XpsProfile {
             done.status = -1;
             done.message = format!(
                 "Error creating trajectory file {file_name}, error={}\n",
-                strerror(&e)
+                epics_libcom_rs::runtime::crt_errno::strerror(&e)
             );
             return done;
         }
