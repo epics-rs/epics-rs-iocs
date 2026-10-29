@@ -1249,9 +1249,17 @@ mod tests {
         let (runtime, _) = create_port_runtime(&claim, det, RuntimeConfig::default()).unwrap();
         let handle = runtime.port_handle().clone();
         // Published open, so its callbacks post.
-        claim
-            .publish(handle.clone(), &epics_rs::asyn::registry::open_owner())
-            .unwrap();
+        let gate = epics_rs::asyn::registry::open_owner();
+        claim.publish(handle.clone(), &gate).unwrap();
+        // The open's flush runs on its own thread. A frame ahead of it would
+        // post everything the port has set, in the order it was first set.
+        let flushed = handle.clone();
+        epics_rs::ad_core::runtime::run_thread(move || async move {
+            gate.jobs_settled().await;
+            flushed.interrupts().edge_sweeps().cleared().await;
+        })
+        .join()
+        .unwrap();
         std::mem::forget(runtime);
         AcquisitionContext {
             data: MpxConnection::new(
@@ -1345,14 +1353,12 @@ mod tests {
         let mut watched = || {
             handle.read_int32_blocking(counter, 0).unwrap();
             let mut seen = Vec::new();
-            // Only what the frame sets: the open flush's zero and empty
-            // message can still be arriving.
             while let Ok(v) = posts.try_recv() {
                 match v.value {
-                    ParamValue::Int32(n) if v.reason == counter && n != 0 => {
+                    ParamValue::Int32(n) if v.reason == counter => {
                         seen.push(format!("counter {n}"))
                     }
-                    ParamValue::Octet(text) if v.reason == message && !text.is_empty() => {
+                    ParamValue::Octet(text) if v.reason == message => {
                         seen.push(format!("message {}", String::from_utf8_lossy(&text)))
                     }
                     _ => {}
