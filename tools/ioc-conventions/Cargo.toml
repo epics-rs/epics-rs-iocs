@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn"] }
+tempfile = "3"
 
 [dev-dependencies]
 cfloat-gate = { workspace = true }

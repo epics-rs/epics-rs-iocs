@@ -37,7 +37,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use epics_rs::base::runtime::mac_lib::macro_defn_pairs_bytes;
 use epics_rs::base::server::db_loader::{
@@ -967,13 +966,12 @@ pub fn booted_records(binary: &Path, script: &Path) -> BTreeSet<String> {
     run.lines = Some(Vec::new());
     run_script(&mut run, script);
     let tmp = scratch_dir();
-    let (cmd, dbl) = (tmp.join("booted.cmd"), tmp.join("booted.dbl"));
+    let (cmd, dbl) = (tmp.path().join("booted.cmd"), tmp.path().join("booted.dbl"));
     let mut lines = run.lines.unwrap_or_default();
     lines.push(format!("dbl > {}\n", dbl.display()));
     std::fs::write(&cmd, lines.join("\n")).expect("write the booted script");
     boot(binary, &cmd, script);
     let records = dbl.is_file().then(|| read_dbl(&dbl));
-    std::fs::remove_dir_all(&tmp).expect("remove the temp dir");
     records.unwrap_or_else(|| panic!("{} wrote no dbl", binary.display()))
 }
 
@@ -1039,10 +1037,9 @@ pub fn assert_inits_motor_util(binary: &Path, script: &Path) {
         script.display()
     );
     let dir = scratch_dir();
-    let cmd = dir.join("help.cmd");
+    let cmd = dir.path().join("help.cmd");
     std::fs::write(&cmd, "help motorUtilInit\n").expect("write the help script");
     let stdout = boot(binary, &cmd, script);
-    std::fs::remove_dir_all(&dir).expect("remove the temp dir");
     assert!(
         stdout
             .lines()
@@ -1052,23 +1049,21 @@ pub fn assert_inits_motor_util(binary: &Path, script: &Path) {
     );
 }
 
-/// A new directory of this process's own under the system temp dir.
-fn scratch_dir() -> PathBuf {
-    static RUNS: AtomicUsize = AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ioc-conventions-{}-{}",
-        std::process::id(),
-        RUNS.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    dir
+/// A new, empty directory under the system temp dir, removed on drop. A
+/// pid-named one is not new: Windows reuses pids within one test run.
+fn scratch_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("ioc-conventions-")
+        .tempdir()
+        .expect("temp dir")
 }
 
 /// Panics unless `binary` links asyn.dbd, as every C motor IOC lists it
 /// beside motorSupport.dbd: booted, it loads asynRecord.db from `$(ASYN)`
 /// and a devEpics `asynInt32` longin.
 pub fn assert_links_asyn_dbd(binary: &Path) {
-    let dir = scratch_dir();
+    let tmp = scratch_dir();
+    let dir = tmp.path();
     std::fs::create_dir(dir.join("db")).expect("temp db dir");
     std::fs::write(
         dir.join("db/devEpics.db"),
@@ -1086,7 +1081,6 @@ pub fn assert_links_asyn_dbd(binary: &Path) {
     )
     .expect("write the script");
     let records = booted_records(binary, &dir.join("asyn.cmd"));
-    std::fs::remove_dir_all(&dir).expect("remove the temp dir");
     assert_eq!(records, BTreeSet::from(["A:asyn".into(), "A:li".into()]));
 }
 
@@ -1357,7 +1351,8 @@ mod tests {
 
     #[test]
     fn a_booted_script_keeps_the_record_and_macro_lines_in_order() {
-        let dir = std::env::temp_dir().join(format!("ioc-conv-lines-{}", std::process::id()));
+        let tmp = scratch_dir();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("db")).unwrap();
         std::fs::write(dir.join("db/m.db"), "record(ao, \"$(P)x\") {}\n").unwrap();
         std::fs::write(
@@ -1378,7 +1373,6 @@ mod tests {
         run.lines = Some(Vec::new());
         let mut env = HashMap::from([("TOP".to_string(), dir.to_str().unwrap().to_string())]);
         run.script(&dir.join("st.cmd"), &dir, &mut env, 0);
-        std::fs::remove_dir_all(&dir).unwrap();
         assert!(run.failures.is_empty(), "{:?}", run.failures);
         assert_eq!(
             run.lines.unwrap(),
@@ -1391,7 +1385,8 @@ mod tests {
 
     #[test]
     fn a_template_row_overrides_globals_over_the_commands_macros() {
-        let dir = std::env::temp_dir().join(format!("ioc-conv-{}", std::process::id()));
+        let tmp = scratch_dir();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("db")).unwrap();
         std::fs::write(
             dir.join("db/m.db"),
@@ -1419,7 +1414,6 @@ mod tests {
         run.records = Some(BTreeSet::new());
         let mut env = HashMap::from([("TOP".to_string(), dir.to_str().unwrap().to_string())]);
         run.script(&dir.join("st.cmd"), &dir, &mut env, 0);
-        std::fs::remove_dir_all(&dir).unwrap();
         assert!(run.failures.is_empty(), "{:?}", run.failures);
         assert_eq!(
             run.records.unwrap(),
@@ -1441,7 +1435,8 @@ mod tests {
 
     #[test]
     fn an_iocsh_load_runs_its_file_under_its_macros_only() {
-        let dir = std::env::temp_dir().join(format!("ioc-conv-load-{}", std::process::id()));
+        let tmp = scratch_dir();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("ctl.iocsh"),
@@ -1460,7 +1455,6 @@ mod tests {
         let mut run = Run::new(&root);
         run.calls = Some(Vec::new());
         run.script(&dir.join("st.cmd"), &dir, &mut HashMap::new(), 0);
-        std::fs::remove_dir_all(&dir).unwrap();
         assert!(run.failures.is_empty(), "{:?}", run.failures);
         let calls: Vec<String> = controller_calls(run.calls.unwrap())
             .iter()

@@ -85,7 +85,8 @@ fn both_setters_default_a_macro() {
 
 #[test]
 fn a_bare_name_opens_through_the_include_path_only() {
-    let dir = std::env::temp_dir().join(format!("db-paths-{}", std::process::id()));
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
     std::fs::create_dir_all(dir.join("db")).unwrap();
     std::fs::write(dir.join("db/a.template"), "include \"b.template\"\n").unwrap();
     let mut env = HashMap::new();
@@ -99,5 +100,4 @@ fn a_bare_name_opens_through_the_include_path_only() {
     missing.clear();
     check_includes(&found, &dir, &env, &mut HashSet::new(), &mut missing);
     assert!(missing.is_empty(), "{missing:?}");
-    std::fs::remove_dir_all(&dir).unwrap();
 }
