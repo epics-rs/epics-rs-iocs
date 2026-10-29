@@ -812,19 +812,20 @@ impl Drop for Connection {
 mod tests {
     use super::*;
 
-    /// A 0 EIP_timeout: C's loopback connect is complete at its zero poll,
-    /// its ListServices goes out, and the reply it does not wait for fails
-    /// the startup.
+    /// A 0 EIP_timeout: C's connect is a zero poll (ether_ip.c:2010-2012),
+    /// which a Linux loopback handshake always beats and a macOS one need
+    /// not. Once connected, its ListServices goes out, and the reply it does
+    /// not wait for fails the startup.
     #[test]
     fn a_zero_timeout_connects_and_polls_for_the_reply() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let plc = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
+            let (mut s, _) = listener.accept().ok()?;
             let mut header = [0u8; encap::HEADER_SIZE];
-            s.read_exact(&mut header).unwrap();
+            s.read_exact(&mut header).ok()?;
             // Open until joined, so the poll finds no data rather than EOF.
-            (u16::from_le_bytes([header[0], header[1]]), s)
+            Some((u16::from_le_bytes([header[0], header[1]]), s))
         });
         let started = Connection::startup(
             "127.0.0.1",
@@ -834,10 +835,14 @@ mod tests {
             encap::DEFAULT_BUFFER_LIMIT,
         );
         let Err(EipError::Io(e)) = started else {
-            panic!("startup did not fail on its read");
+            panic!("startup did not fail");
         };
+        if e.kind() == io::ErrorKind::NotConnected {
+            // The poll found the handshake in flight, and C fails it there too.
+            return;
+        }
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(plc.join().unwrap().0, encap::EC_LIST_SERVICES);
+        assert_eq!(plc.join().unwrap().unwrap().0, encap::EC_LIST_SERVICES);
     }
 }
 
