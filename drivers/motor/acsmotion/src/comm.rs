@@ -24,9 +24,9 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
-use motor_common::DEFAULT_CONTROLLER_TIMEOUT;
 use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::util::{atof, atoi};
+use motor_common::{DEFAULT_CONTROLLER_TIMEOUT, controller_status};
 
 use crate::bincomm::{
     ACKNOWLEDGE, Element, MAX_MESSAGE_LEN, REPLY_END, REPLY_START, SLICE_AVAILABLE, Span,
@@ -43,7 +43,8 @@ const ARRAY_TIMEOUT: Duration = Duration::from_secs(10);
 /// `MAX_CONTROLLER_STRING_SIZE`.
 const READ_BUF: usize = 256;
 
-/// One controller's comm: C `SPiiPlusComm`.
+/// One controller's comm: C `SPiiPlusComm`. Its public exchanges return
+/// the bare status, as C's do.
 pub struct SpiiPlusComm {
     /// C's comm `lock()`: held across one ASCII exchange or a whole binary
     /// one, so no other exchange lands between a binary write and its read.
@@ -121,8 +122,9 @@ impl SpiiPlusComm {
     /// printed as `func`'s failure, with the error's text, and refused.
     fn query(&self, func: &str, cmd: &str) -> AsynResult<String> {
         let (reply, status) = self.exchange(func, cmd);
-        status?;
-        self.refuse_error(func, cmd, &reply)?;
+        status
+            .and_then(|()| self.refuse_error(func, cmd, &reply))
+            .map_err(controller_status)?;
         Ok(reply)
     }
 
@@ -169,8 +171,9 @@ impl SpiiPlusComm {
     /// (SPiiPlusCommDriver.cpp:241-249).
     pub fn write_read_ack(&self, cmd: &str) -> AsynResult<()> {
         let (reply, status) = self.exchange("writeReadAck", cmd);
-        self.refuse_error("writeReadAck", cmd, &reply)?;
-        status
+        self.refuse_error("writeReadAck", cmd, &reply)
+            .and(status)
+            .map_err(controller_status)
     }
 
     /// `writeReadErrorMessage`: `?` + the `?<errno>` reply asks for the
@@ -207,7 +210,7 @@ impl SpiiPlusComm {
     /// a C defect, not copied.
     pub fn is_variable_defined(&self, var: &str) -> AsynResult<bool> {
         let (reply, status) = self.exchange("isVariableDefined", &format!("?{var}"));
-        status?;
+        status.map_err(controller_status)?;
         Ok(!reply.starts_with('?'))
     }
 
@@ -327,7 +330,9 @@ impl SpiiPlusComm {
 
     /// `getDoubleArray`: `var` over `span`, slice by slice.
     pub fn get_double_array(&self, var: &str, span: Span) -> AsynResult<Vec<f64>> {
-        let bytes = self.get_array(Element::Float64, var, span)?;
+        let bytes = self
+            .get_array(Element::Float64, var, span)
+            .map_err(controller_status)?;
         Ok(bytes
             .as_chunks::<8>()
             .0
@@ -338,7 +343,9 @@ impl SpiiPlusComm {
 
     /// `getIntegerArray`.
     pub fn get_integer_array(&self, var: &str, span: Span) -> AsynResult<Vec<i32>> {
-        let bytes = self.get_array(Element::Int32, var, span)?;
+        let bytes = self
+            .get_array(Element::Int32, var, span)
+            .map_err(controller_status)?;
         Ok(bytes
             .as_chunks::<4>()
             .0
@@ -366,6 +373,10 @@ impl SpiiPlusComm {
     /// every packet and returns the last one's status, so a failed packet
     /// in the middle reads as success; this stops at the first failure.
     pub fn put_double_array(&self, data: &[f64], var: &str, span: Span) -> AsynResult<()> {
+        self.put_slices(data, var, span).map_err(controller_status)
+    }
+
+    fn put_slices(&self, data: &[f64], var: &str, span: Span) -> AsynResult<()> {
         let count = span.elements();
         if data.len() < count {
             return Err(comm_error(format!(
@@ -714,6 +725,45 @@ mod tests {
             });
         });
         assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// SPiiPlusCommDriver.cpp returns the bare status from every exchange,
+    /// a `?` reply's asynError and a failed binary one alike; the SyncIO
+    /// errorMessage stays on the controller's asynUser.
+    #[test]
+    fn a_failed_controller_exchange_carries_no_message() {
+        use motor_common::testing::assert_bare;
+        let (_rig, io) = LineRig::failing("acsBareIo", answer, |cmd| cmd.starts_with("?Z"));
+        let (comm, path) = traced_comm("acsBareComm", io);
+        assert_bare(comm.write_read_int("?Z").unwrap_err(), AsynStatus::Error);
+        assert_bare(
+            comm.is_variable_defined("Z").unwrap_err(),
+            AsynStatus::Error,
+        );
+        assert_bare(
+            comm.write_read_ack("ENABLE 9").unwrap_err(),
+            AsynStatus::Error,
+        );
+        let _ = take(&path);
+
+        let line = crate::fake::line("acsBareBin");
+        line.lock().unwrap().set("V", &[1.0]);
+        let comm = SpiiPlusComm::connect("acsBareBinComm", "acsBareBin").unwrap();
+        line.lock().unwrap().down = true;
+        comm.io().port().unwrap().disconnect_blocking().unwrap();
+        let span = Span::one(0, 0);
+        assert_bare(
+            comm.get_double_array("V", span).unwrap_err(),
+            AsynStatus::Disconnected,
+        );
+        assert_bare(
+            comm.get_integer_array("V", span).unwrap_err(),
+            AsynStatus::Disconnected,
+        );
+        assert_bare(
+            comm.put_double_array(&[1.0], "V", span).unwrap_err(),
+            AsynStatus::Disconnected,
+        );
     }
 
     #[test]
