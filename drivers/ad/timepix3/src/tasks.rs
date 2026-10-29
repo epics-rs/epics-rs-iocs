@@ -4788,7 +4788,7 @@ mod tests {
         fail: &'static [&'static str],
         body_for: fn(&str) -> &'static str,
     ) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::{BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let log: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
@@ -4796,15 +4796,8 @@ mod tests {
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
                 let mut reader = BufReader::new(conn);
-                let mut request = String::new();
-                let _ = reader.read_line(&mut request);
-                request = crate::http::without_serval_params(&request);
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                }
+                let (request, _) = crate::http::read_request(&mut reader);
+                let request = crate::http::without_serval_params(&request);
                 let path = request.split(' ').nth(1).unwrap_or("").to_string();
                 seen.lock().push(request.trim_end().to_string());
                 let (status, body) = if fail.contains(&path.as_str()) {

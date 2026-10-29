@@ -190,6 +190,29 @@ pub(crate) fn without_serval_params(request_line: &str) -> String {
     request_line.replacen("?anon=true&key=value", "", 1)
 }
 
+/// A test Serval's read of one request: its request line and header lines,
+/// with the body consumed. A socket closed with the body unread resets the
+/// connection, and Windows then drops the reply the client has not read.
+#[cfg(test)]
+pub(crate) fn read_request(reader: &mut impl std::io::BufRead) -> (String, Vec<String>) {
+    let mut request = String::new();
+    let _ = reader.read_line(&mut request);
+    let (mut headers, mut length) = (Vec::new(), 0);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = v.trim().parse().unwrap_or(0);
+        }
+        headers.push(line);
+    }
+    let mut body = vec![0; length];
+    let _ = reader.read_exact(&mut body);
+    (request, headers)
+}
+
 /// C `servalCredentials` (serval_http_client.cpp:21-35): read once from
 /// `ADTIMEPIX_SERVAL_USERNAME`/`ADTIMEPIX_SERVAL_PASSWORD`, and configured
 /// only when both are set and non-empty.
@@ -289,23 +312,19 @@ mod tests {
     /// on none otherwise (serval_http_client.cpp:44-95).
     #[test]
     fn auth_is_sent_only_when_configured() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::{BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut reader = BufReader::new(stream);
-                let mut auth = None;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    if line.to_ascii_lowercase().starts_with("authorization:") {
-                        auth = Some(line["authorization:".len()..].trim().to_owned());
-                    }
-                }
+                let (_, headers) = read_request(&mut reader);
+                let auth = headers.iter().find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .starts_with("authorization:")
+                        .then(|| line["authorization:".len()..].trim().to_owned())
+                });
                 let _ = tx.send(auth);
                 let _ = reader.get_mut().write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
@@ -328,17 +347,14 @@ mod tests {
     /// does (serval_http_client.cpp:44-95).
     #[test]
     fn each_helper_gives_up_at_its_timeout() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::{BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stream);
-                    let mut line = String::new();
-                    while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
-                        line.clear();
-                    }
+                    read_request(&mut reader);
                     std::thread::sleep(Duration::from_millis(500));
                     let _ = reader.get_mut().write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
