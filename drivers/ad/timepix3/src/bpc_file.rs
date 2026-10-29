@@ -228,15 +228,21 @@ mod tests {
         assert!(!file.exists());
         assert_eq!(write_exact(&file, &[1, 2, 3], 3), Status::Ok);
         assert_eq!(std::fs::read(&file).unwrap(), [1, 2, 3]);
+        // Windows has no permission bits to carry over.
+        #[cfg(unix)]
+        let mode = |f: &Path| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(f).unwrap().permissions().mode() & 0o777
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = |f: &Path| std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(&file), 0o640);
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o604)).unwrap();
-            assert_eq!(write_exact(&file, &[4, 5, 6], 3), Status::Ok);
-            assert_eq!(mode(&file), 0o604);
         }
+        assert_eq!(write_exact(&file, &[4, 5, 6], 3), Status::Ok);
+        #[cfg(unix)]
+        assert_eq!(mode(&file), 0o604);
         assert_eq!(std::fs::read(&file).unwrap(), [4, 5, 6]);
 
         // Renaming over a directory fails, and the staged file is removed.
