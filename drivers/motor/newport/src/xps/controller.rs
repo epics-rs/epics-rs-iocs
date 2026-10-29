@@ -16,6 +16,7 @@ use std::time::Duration;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::motor::trace::MotorTrace;
 
+use super::pco::PcoParams;
 use super::rpc::{XpsResult, XpsSocket};
 
 /// A registered axis's identity, kept by the controller for group enumeration.
@@ -62,6 +63,7 @@ pub struct XpsParams {
     /// `XPS_MIN_JERK`, `XPS_MAX_JERK`.
     pub min_jerk: usize,
     pub max_jerk: usize,
+    pub pco: PcoParams,
     /// `XPS_STATUS`, `XPS_STATUS_STRING`.
     pub status: usize,
     pub status_string: usize,

@@ -330,6 +330,43 @@ impl XpsSocket {
         Ok(())
     }
 
+    /// `PositionerPositionComparePulseParametersGet(positioner)` → (pulse
+    /// width, settling time).
+    pub fn positioner_position_compare_pulse_parameters_get(
+        &self,
+        positioner: &str,
+    ) -> XpsResult<(f64, f64)> {
+        let cmd =
+            format!("PositionerPositionComparePulseParametersGet ({positioner},double *,double *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok((r.double(1), r.double(2)))
+    }
+
+    /// `PositionerPositionCompareGet(positioner)` → (min, max, step, enable).
+    pub fn positioner_position_compare_get(
+        &self,
+        positioner: &str,
+    ) -> XpsResult<(f64, f64, f64, bool)> {
+        let cmd = format!(
+            "PositionerPositionCompareGet ({positioner},double *,double *,double *,bool *)"
+        );
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok((r.double(1), r.double(2), r.double(3), r.int(4) != 0))
+    }
+
+    /// `PositionerPositionCompareAquadBWindowedGet(positioner)` → (min, max,
+    /// enable).
+    pub fn positioner_position_compare_aquadb_windowed_get(
+        &self,
+        positioner: &str,
+    ) -> XpsResult<(f64, f64, bool)> {
+        let cmd = format!(
+            "PositionerPositionCompareAquadBWindowedGet ({positioner},double *,double *,bool *)"
+        );
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok((r.double(1), r.double(2), r.int(3) != 0))
+    }
+
     /// `PositionerPositionCompareSet(positioner, min, max, step)`.
     pub fn positioner_position_compare_set(
         &self,

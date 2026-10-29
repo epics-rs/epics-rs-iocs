@@ -24,7 +24,7 @@ use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
-use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -36,15 +36,16 @@ use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedica
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
-use epics_rs::motor::controller_port::{AxisUser, ControllerCtx, ControllerPort, ParamWrite};
+use epics_rs::motor::controller_port::{
+    AxisUser, ControllerCtx, ControllerPort, ParamWrite, has_motor_axis, index,
+};
 use epics_rs::motor::flags::{DriverCall, MotorCommand};
 use epics_rs::motor::trace::MotorTrace;
 use motor_common::connect::{
     EosConnectError, EosRefusal, connect_controller, connect_serial, connect_with_eos,
 };
 use motor_common::iocsh::{
-    arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string,
-    poll_intervals, req_string,
+    arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_string, poll_intervals, req_string,
 };
 use motor_common::model1::{CardInit, Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
@@ -66,7 +67,10 @@ use crate::pmnc::{PmncAxis, PmncController};
 use crate::report::{AxisLines, ControllerHead, period_s};
 use crate::smc100::Smc100Axis;
 use crate::xps::profile_move::{ProfileHost, XpsProfile};
-use crate::xps::{PcoParams, SocketMode, XpsAxis, XpsController, XpsParams, XpsSocket, gpio, pco};
+use crate::xps::{
+    PcoParams, PcoSettings, RecordUnits, SocketMode, XpsAxis, XpsController, XpsParams, XpsSocket,
+    gpio,
+};
 
 /// `CONEX_TIMEOUT` of AG_CONEX.cpp:30 and AGAP_CONEX.cpp:31.
 const CONEX_TIMEOUT: Duration = Duration::from_secs(2);
@@ -595,6 +599,48 @@ impl XpsHead {
     }
 }
 
+/// A write of an `XPS_POSITION_COMPARE_*` parameter: C stores it, applies
+/// and reads back the axis's position compare, and calls back without the
+/// base (XPSController.cpp:262-266, :316-320).
+fn write_position_compare(
+    base: &mut PortDriverBase,
+    user: AxisUser<'_>,
+    value: ParamValue,
+    pco: PcoParams,
+) -> ParamWrite {
+    if !has_motor_axis(base, user) {
+        return ParamWrite::PassToBase(Ok(()));
+    }
+    let addr = user.addr;
+    let _ = base.set_param_value(user.reason, addr, value);
+    // C leaves its local unset for an undefined parameter; 0 is read here.
+    let int = |reason| base.get_int32_param(reason, addr).unwrap_or(0);
+    let float = |reason| base.get_float64_param(reason, addr).unwrap_or(0.0);
+    let settings = PcoSettings {
+        mode: int(pco.mode),
+        min_position: float(pco.min_position),
+        max_position: float(pco.max_position),
+        step_size: float(pco.step_size),
+        pulse_width: int(pco.pulse_width),
+        settling_time: int(pco.settling_time),
+        units: RecordUnits {
+            resolution: float(index::REC_RESOLUTION),
+            offset: float(index::REC_OFFSET),
+            direction: int(index::REC_DIRECTION),
+        },
+    };
+    let call = DriverCall::new(move |motor, _| {
+        let any: &mut dyn std::any::Any = motor;
+        match any.downcast_mut::<XpsAxis>() {
+            Some(axis) => axis.write_position_compare(&settings),
+            None => Ok(()),
+        }
+    });
+    let status = user.run(base, MotorCommand::Driver(call));
+    let _ = base.call_param_callbacks(addr);
+    ParamWrite::Handled(status)
+}
+
 /// The port's [`XpsParams`], for the controller its axes read them from.
 fn xps_params(port: &PortHandle) -> AsynResult<XpsParams> {
     port.with_driver_blocking::<ControllerPort<XpsHead>, _>(|d| {
@@ -617,26 +663,45 @@ impl ControllerParams for XpsHead {
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let min_jerk = base.create_param("XPS_MIN_JERK", ParamType::Float64)?;
         let max_jerk = base.create_param("XPS_MAX_JERK", ParamType::Float64)?;
-        for (name, kind) in [
-            ("XPS_POSITION_COMPARE_MODE", ParamType::Int32),
-            ("XPS_POSITION_COMPARE_MIN_POSITION", ParamType::Float64),
-            ("XPS_POSITION_COMPARE_MAX_POSITION", ParamType::Float64),
-            ("XPS_POSITION_COMPARE_STEP_SIZE", ParamType::Float64),
-            ("XPS_POSITION_COMPARE_PULSE_WIDTH", ParamType::Int32),
-            ("XPS_POSITION_COMPARE_SETTLING_TIME", ParamType::Int32),
-        ] {
-            base.create_param(name, kind)?;
-        }
+        let pco = PcoParams {
+            mode: base.create_param("XPS_POSITION_COMPARE_MODE", ParamType::Int32)?,
+            min_position: base
+                .create_param("XPS_POSITION_COMPARE_MIN_POSITION", ParamType::Float64)?,
+            max_position: base
+                .create_param("XPS_POSITION_COMPARE_MAX_POSITION", ParamType::Float64)?,
+            step_size: base.create_param("XPS_POSITION_COMPARE_STEP_SIZE", ParamType::Float64)?,
+            pulse_width: base.create_param("XPS_POSITION_COMPARE_PULSE_WIDTH", ParamType::Int32)?,
+            settling_time: base
+                .create_param("XPS_POSITION_COMPARE_SETTLING_TIME", ParamType::Int32)?,
+        };
         self.profile.create_params(base)?;
         self.params = Some(XpsParams {
             min_jerk,
             max_jerk,
+            pco,
             status: base.create_param("XPS_STATUS", ParamType::Int32)?,
             status_string: base.create_param("XPS_STATUS_STRING", ParamType::Octet)?,
         });
         base.create_param("XPS_TCL_SCRIPT", ParamType::Octet)?;
         base.create_param("XPS_TCL_SCRIPT_EXECUTE", ParamType::Int32)?;
         Ok(())
+    }
+
+    /// C `writeInt32` (XPSController.cpp:248-298). C tests
+    /// `XPSPositionCompareStepSize_`, a Float64, where it means the settling
+    /// time, so a settling time write never reached the XPS; it is
+    /// dispatched here with the pulse width.
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: i32,
+    ) -> ParamWrite {
+        let pco = self.params().pco;
+        if [pco.mode, pco.pulse_width, pco.settling_time].contains(&user.reason) {
+            return write_position_compare(base, user, ParamValue::Int32(value), pco);
+        }
+        ParamWrite::PassToBase(Ok(()))
     }
 
     /// C `writeFloat64` stores every value before the base; the axis's next
@@ -649,6 +714,10 @@ impl ControllerParams for XpsHead {
     ) -> ParamWrite {
         let p = self.params();
         let reason = user.reason;
+        let pco = p.pco;
+        if [pco.min_position, pco.max_position, pco.step_size].contains(&reason) {
+            return write_position_compare(base, user, ParamValue::Float64(value), pco);
+        }
         if reason != p.min_jerk && reason != p.max_jerk {
             return ParamWrite::PassToBase(Ok(()));
         }
@@ -1197,80 +1266,6 @@ fn tclcall(socket: Option<&XpsSocket>, name: &str, task_name: &str, args: &str) 
         println!("Error Name called {name}, Task Name {task_name}, Args {args}");
     }
     status
-}
-
-/// Create the `XPSPositionCompare` iocsh command.
-///
-/// `XPSPositionCompare(motorPort, positionerName, mode, [minPosition],
-/// [maxPosition], [positionStep], [pulseWidth], [settlingTime])`
-///
-/// Applies a position-compare-output configuration to one positioner
-/// (C `XPSAxis::setPositionCompare`): mode 0=Disable, 1=Pulse,
-/// 2=AquadB-windowed, 3=AquadB-always. Positions/step are device units;
-/// `pulseWidth`/`settlingTime` are µs (valid widths {0.2,1,2.5,10}, valid
-/// settling {0.075,1,4,12}), defaulting to the smallest table entries.
-/// Driver-private: the C base-class PCO API (05b25c1d, motor PR #248) is an
-/// open, unmerged PR, so PCO is not part of the motor framework.
-pub fn xps_position_compare_command() -> CommandDef {
-    CommandDef::new(
-        "XPSPositionCompare",
-        vec![
-            arg_str_req("motorPort"),
-            arg_str_req("positionerName"),
-            ArgDesc {
-                name: "mode",
-                arg_type: ArgType::Int,
-            },
-            arg_double_opt("minPosition"),
-            arg_double_opt("maxPosition"),
-            arg_double_opt("positionStep"),
-            arg_double_opt("pulseWidth"),
-            arg_double_opt("settlingTime"),
-        ],
-        "XPSPositionCompare(motorPort, positionerName, mode, [minPosition], [maxPosition], [positionStep], [pulseWidth], [settlingTime]) - Configure position-compare output on an XPS positioner (mode 0=Disable 1=Pulse 2=AquadB-windowed 3=AquadB-always; positions in device units, widths/settling in us)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let positioner = req_string(args, 1, "positionerName")?;
-            let mode = match args.get(2) {
-                Some(ArgValue::Int(v)) => *v as i32,
-                _ => return Err("mode must be an integer".into()),
-            };
-            let params = PcoParams {
-                mode,
-                min_position: opt_double(args, 3, 0.0, "minPosition")?,
-                max_position: opt_double(args, 4, 0.0, "maxPosition")?,
-                position_step: opt_double(args, 5, 0.0, "positionStep")?,
-                pulse_width_us: opt_double(
-                    args,
-                    6,
-                    pco::XPS_PCO_DEFAULT_PULSE_WIDTH,
-                    "pulseWidth",
-                )?,
-                settling_time_us: opt_double(
-                    args,
-                    7,
-                    pco::XPS_PCO_DEFAULT_SETTLING_TIME,
-                    "settlingTime",
-                )?,
-            };
-
-            let controller = xps_controller(&motor_port, "XPSPositionCompare")?;
-            {
-                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                pco::set_position_compare(ctrl.poll_socket(), &positioner, &params)
-                    .map_err(|e| format!("XPSPositionCompare: {e}"))?;
-            }
-            println!(
-                "XPSPositionCompare: motorPort={motor_port} positioner={positioner} mode={mode} min={} max={} step={} pw={}us settle={}us",
-                CFloat(params.min_position).g(),
-                CFloat(params.max_position).g(),
-                CFloat(params.position_step).g(),
-                CFloat(params.pulse_width_us).g(),
-                CFloat(params.settling_time_us).g(),
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
 }
 
 /// `HXPCreateController(portName, IPAddress, IPPort, movingPollPeriod,
@@ -3987,6 +3982,178 @@ mod xps_profile_tests {
                 "XPS_STATUS {:?}, READBACK {:?}",
                 val("XPS_STATUS"),
                 val("READBACK")
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// XPSPositionCompare.db on the driver: each record write applies the
+    /// settings to the positioner and reads them back (XPSController.cpp:
+    /// 262-266, :316-320; XPSAxis.cpp:939-1101), the settling time with
+    /// them.
+    #[epics_rs::base::epics_test]
+    async fn position_compare_records_drive_the_positioner() {
+        use std::collections::HashMap;
+
+        use epics_rs::asyn::adapter::register_asyn_device_support_for_builder;
+        use epics_rs::base::runtime::task::sleep;
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::{PiniMode, ProcessCompletion};
+        use epics_rs::base::types::EpicsValue;
+
+        let port_name = "XpsPcoRecCtrl";
+        let line = FakeLine::new("XpsPcoRecLine", "");
+        // An XPS that reads back what the test sets.
+        let replies = line.replies.clone();
+        let reply = move |function, reply: &str| {
+            replies.lock().unwrap().insert(function, reply.into());
+        };
+        reply("PositionerPositionComparePulseParametersGet", "0,1,4");
+        reply("PositionerPositionCompareGet", "0,0.5,1.5,0.25,1");
+        reply("PositionerPositionCompareAquadBWindowedGet", "0,0.5,1.5,1");
+        let owner = Arc::new(PvDatabase::new());
+        let gate = owner.scan_control().interrupt_gate().clone();
+        let shell = std::thread::spawn(move || {
+            let (profile, thread) = XpsProfile::new(port_name);
+            let head = XpsHead {
+                moving_s: 0.1,
+                idle_s: 0.1,
+                enable_set_position: false,
+                settling_s: 0.0,
+                profile,
+                params: None,
+            };
+            let port = register_controller_port(&gate, port_name, 1, head).unwrap();
+            let controller = Arc::new(Mutex::new(
+                XpsController::new(
+                    line.socket(SocketMode::Query),
+                    false,
+                    Duration::ZERO,
+                    xps_params(&port).unwrap(),
+                )
+                .unwrap(),
+            ));
+            let poller = Controller::new().controller_poll(thread.poll(controller.clone()));
+            poller.start(port_name, 100, 100, 10);
+            poller
+                .install_built(asyn_user(port_name, 0), || {
+                    let axis = XpsAxis::new(
+                        controller,
+                        line.socket(SocketMode::Fire),
+                        port_name,
+                        0,
+                        "G1.P1",
+                        0.25,
+                    );
+                    Ok((Arc::new(Mutex::new(axis)), None))
+                })
+                .unwrap();
+            // The motor record's MRES, OFF and DIR.
+            use epics_rs::motor::controller_port::index;
+            port.write_float64_blocking(index::REC_RESOLUTION, 0, 0.5)
+                .unwrap();
+            port.write_float64_blocking(index::REC_OFFSET, 0, 0.0)
+                .unwrap();
+            port.write_int32_blocking(index::REC_DIRECTION, 0, 0)
+                .unwrap();
+            (line, poller)
+        });
+        while !shell.is_finished() {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let (line, _poller) = shell.join().unwrap();
+
+        let macros: HashMap<String, String> = [
+            ("P", "xpsPco:"),
+            ("R", "m1:"),
+            ("PORT", port_name),
+            ("ADDR", "0"),
+            ("PREC", "4"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        let (db, _) = register_asyn_device_support_for_builder(IocBuilder::new())
+            .with_database(owner)
+            .db_string(
+                include_str!("../../../../iocs/motor/xps-ioc/db/XPSPositionCompare.db"),
+                &macros,
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.pini_process(PiniMode::Yes).await;
+        db.scan_control().run();
+        let put = async |name: &str, value: EpicsValue| {
+            let done = db
+                .put_record_field_from_ca(format!("xpsPco:m1:PositionCompare{name}"), "VAL", value)
+                .await
+                .unwrap();
+            if let ProcessCompletion::Async(done) = done {
+                let _ = done.await;
+            }
+        };
+        let gets = [
+            "PositionerPositionComparePulseParametersGet (G1.P1,double *,double *)",
+            "PositionerPositionCompareGet (G1.P1,double *,double *,double *,bool *)",
+            "PositionerPositionCompareAquadBWindowedGet (G1.P1,double *,double *,bool *)",
+        ];
+        let applied = |tail: &[&str]| {
+            let mut calls = vec![
+                "PositionerPositionCompareDisable (G1.P1)".to_string(),
+                "PositionerPositionComparePulseParametersSet (G1.P1,1,4)".to_string(),
+            ];
+            calls.extend(tail.iter().chain(&gets).map(|c| c.to_string()));
+            calls
+        };
+        let pco_log = || -> Vec<String> {
+            line.take_log()
+                .into_iter()
+                .filter(|c| c.starts_with("PositionerPositionCompare"))
+                .collect()
+        };
+
+        put("PulseWidth", EpicsValue::Enum(1)).await;
+        pco_log();
+        put("SettlingTime", EpicsValue::Enum(2)).await;
+        assert_eq!(pco_log(), applied(&[]));
+        put("MinPosition", EpicsValue::Double(1.0)).await;
+        put("MaxPosition", EpicsValue::Double(3.0)).await;
+        put("StepSize", EpicsValue::Double(0.5)).await;
+        pco_log();
+        put("Mode", EpicsValue::Enum(1)).await;
+        assert_eq!(
+            pco_log(),
+            applied(&[
+                "PositionerPositionCompareSet (G1.P1,0.5,1.5,0.25)",
+                "PositionerPositionCompareEnable (G1.P1)",
+            ])
+        );
+
+        // The XPS's own step and widths, back in record units and as the
+        // table indices.
+        reply("PositionerPositionComparePulseParametersGet", "0,2.5,1");
+        reply("PositionerPositionCompareGet", "0,0.5,1.5,0.125,1");
+        put("Mode", EpicsValue::Enum(1)).await;
+        let val = |name: &str| {
+            db.get_record(format!("xpsPco:m1:PositionCompare{name}_RBV"))
+                .unwrap()
+                .read()
+                .record
+                .get_field("VAL")
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while val("StepSize") != Some(EpicsValue::Double(0.25))
+            || val("PulseWidth") != Some(EpicsValue::Enum(2))
+            || val("SettlingTime") != Some(EpicsValue::Enum(1))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "StepSize {:?}, PulseWidth {:?}, SettlingTime {:?}",
+                val("StepSize"),
+                val("PulseWidth"),
+                val("SettlingTime")
             );
             sleep(Duration::from_millis(10)).await;
         }

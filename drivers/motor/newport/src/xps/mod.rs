@@ -27,6 +27,6 @@ pub use axis::XpsAxis;
 pub use controller::{SetPositionFailure, XpsController, XpsParams};
 pub use corrector::{CorrectorType, PidFailure, XpsCorrectorInfo};
 pub use gathering::{GatheringReadback, parse_gathering_buffer};
-pub use pco::PcoParams;
+pub use pco::{PcoParams, PcoSettings, RecordUnits};
 pub use profile::{Profile, ProfileAxis, ProfileError, TrajectoryFile, pulse_output_window};
 pub use rpc::{SocketMode, XPS_TERMINATOR, XpsError, XpsReply, XpsResult, XpsSocket};

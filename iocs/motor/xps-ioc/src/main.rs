@@ -14,8 +14,7 @@ use epics_rs::ca::server::ioc_app::IocApplication;
 use motor_newport::ioc::{
     tclcall_command, xps_aux_config_command, xps_create_axis_command,
     xps_create_controller_command, xps_create_profile_command, xps_disable_auto_enable_command,
-    xps_enable_moving_mode_command, xps_no_disable_error_command, xps_position_compare_command,
-    xps_tcl_script_execute_command,
+    xps_enable_moving_mode_command, xps_no_disable_error_command, xps_tcl_script_execute_command,
 };
 
 #[epics_rs::base::epics_main]
@@ -65,7 +64,6 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(tclcall_command());
     app = app.register_startup_command(xps_aux_config_command());
     app = app.register_startup_command(xps_tcl_script_execute_command());
-    app = app.register_startup_command(xps_position_compare_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),
