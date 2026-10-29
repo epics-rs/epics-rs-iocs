@@ -4120,20 +4120,21 @@ mod tests {
         )
         .unwrap();
         let p = det.p;
-        let tmp = crate::calibration::canonical(&std::env::temp_dir()).unwrap();
-        let tmp = tmp.to_str().unwrap();
         // C takes `file:/…` only; on Windows that is the path on the current
-        // drive, without its `C:` and with '/' separators.
-        let tmp = if cfg!(windows) {
-            tmp[2..].replace('\\', "/")
+        // drive, without its `C:` and with '/' separators. The temp dir may
+        // sit on another drive, the working directory cannot.
+        let dir = crate::calibration::canonical(&std::env::current_dir().unwrap()).unwrap();
+        let dir = dir.to_str().unwrap();
+        let dir = if cfg!(windows) {
+            dir[2..].replace('\\', "/")
         } else {
-            tmp.to_string()
+            dir.to_string()
         };
         let mut write = |reason, value: String| {
             det.write_octet(&mut AsynUser::new(reason), value.as_bytes())
                 .is_ok()
         };
-        assert!(write(p.raw_base, format!("file:{tmp}")));
+        assert!(write(p.raw_base, format!("file:{dir}")));
         assert!(!write(p.raw1_base, "file://tmp".into()));
         assert!(write(p.prv_hst_base, "tcp://localhost:8085".into()));
         assert!(!write(p.img1_base, "ftp://somewhere".into()));
@@ -4156,7 +4157,7 @@ mod tests {
         assert_eq!(det.int(p.img1_file_path_exists, 0), 0);
         assert_eq!(det.int(p.prv_img_file_path_exists, 0), 0);
         assert_eq!(det.int(p.img_file_path_exists, 0), 1);
-        assert_eq!(det.text(p.raw_base, 0), format!("file:{tmp}"));
+        assert_eq!(det.text(p.raw_base, 0), format!("file:{dir}"));
     }
 
     /// A calibration directory gains its trailing '/' and is refused outside
