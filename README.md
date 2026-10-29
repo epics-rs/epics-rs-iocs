@@ -6,7 +6,7 @@
 Cargo workspace of [epics-rs](https://github.com/epics-rs/epics-rs) based
 IOC applications — Rust ports of the EPICS device-driver modules. Each
 device driver is an independent library crate under `drivers/`, and each
-IOC binary lives under `iocs/`. The workspace currently holds **69 driver
+IOC binary lives under `iocs/`. The workspace currently holds **68 driver
 crates** and **83 IOC crates**, all consuming a single pinned epics-rs
 version (**0.33.0**) declared once in the root `Cargo.toml`.
 
