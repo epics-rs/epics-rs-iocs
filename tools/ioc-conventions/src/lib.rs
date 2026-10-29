@@ -968,14 +968,18 @@ pub fn booted_records(binary: &Path, script: &Path) -> BTreeSet<String> {
     let tmp = scratch_dir();
     let (cmd, dbl) = (tmp.path().join("booted.cmd"), tmp.path().join("booted.dbl"));
     let mut lines = run.lines.unwrap_or_default();
-    // iocsh takes an unquoted backslash as an escape, as C does, so a
-    // Windows path goes in with forward slashes.
-    let dbl_token = dbl.display().to_string().replace('\\', "/");
-    lines.push(format!("dbl > {dbl_token}\n"));
+    lines.push(format!("dbl > {}\n", script_path(&dbl)));
     std::fs::write(&cmd, lines.join("\n")).expect("write the booted script");
     boot(binary, &cmd, script);
     let records = dbl.is_file().then(|| read_dbl(&dbl));
     records.unwrap_or_else(|| panic!("{} wrote no dbl", binary.display()))
+}
+
+/// `path` as a script names it. iocsh takes an unquoted backslash as an
+/// escape, and macLib one in a macro's value, as C do, so a Windows path
+/// goes in with forward slashes.
+fn script_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 /// `binary` run on `cmd` from `script`'s directory, servers on loopback;
@@ -1079,7 +1083,7 @@ pub fn assert_links_asyn_dbd(binary: &Path) {
             "epicsEnvSet(\"PROBE\", \"{}\")\n\
              dbLoadRecords(\"$(ASYN)/db/asynRecord.db\", \"P=A:,R=asyn,PORT=none,ADDR=0,OMAX=0,IMAX=0\")\n\
              dbLoadRecords(\"$(PROBE)/db/devEpics.db\")\n",
-            dir.display()
+            script_path(dir)
         ),
     )
     .expect("write the script");
