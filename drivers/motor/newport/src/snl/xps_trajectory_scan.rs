@@ -995,8 +995,9 @@ mod tests {
             t
         });
         v.motorTrajectory[0].modify(|t| t[..2].copy_from_slice(&[1.0, 2.0]));
-        let file = std::env::temp_dir().join(format!("xps{}.trj", std::process::id()));
-        let file = file.to_str().unwrap();
+        // The PV is a 40-byte EPICS string: a temp_dir path would be cut.
+        let file = format!("xps{}.trj", std::process::id());
+        let file = file.as_str();
         strcpy(&v.trajectoryFile, file);
         strcpy(&v.xpsAddress, "127.0.0.1");
         strcpy(&v.userName, "Administrator");
@@ -1050,8 +1051,8 @@ mod tests {
         v.buildElements.set(0);
         v.buildMode.set(MOVE_MODE_RELATIVE);
         v.moveAxis[0].set(1);
-        let file = std::env::temp_dir().join(format!("xpsMoved{}.trj", std::process::id()));
-        let file = file.to_str().unwrap();
+        let file = format!("xpsMoved{}.trj", std::process::id());
+        let file = file.as_str();
         strcpy(&v.trajectoryFile, file);
         strcpy(&v.xpsAddress, "127.0.0.1");
         let (addr, _ftp_log) = ftp::tests::server("331 password\r\n");
@@ -1337,8 +1338,8 @@ mod tests {
             let (ftp_addr, ftp_log) = ftp::tests::server("331 password\r\n");
             ftp::FTP_PORT.store(ftp_addr.port(), Ordering::Relaxed);
             let (db, scan) = ioc(port, set).await;
-            let file = std::env::temp_dir().join(format!("{port}{}.trj", std::process::id()));
-            let file = file.to_str().unwrap().to_string();
+            // The PV is a 40-byte EPICS string: a temp_dir path would be cut.
+            let file = format!("{port}{}.trj", std::process::id());
             put(
                 &db,
                 "T:traj1:TrajectoryFile",
