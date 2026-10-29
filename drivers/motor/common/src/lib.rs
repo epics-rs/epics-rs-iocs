@@ -515,9 +515,14 @@ mod tests {
             set.handler.call(&args, &ctx).unwrap();
         }
         let before = passes.load(Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(300));
-        let passes = passes.load(Ordering::Relaxed) - before;
-        assert!(passes >= 10, "{passes} passes");
+        let since = || passes.load(Ordering::Relaxed) - before;
+        // Ten 10 ms passes, by a deadline: a macOS runner fit 8 in 300 ms,
+        // and the hour-long period they replace gives none at all.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while since() < 10 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(since() >= 10, "{} passes", since());
     }
 
     struct Reporting;
