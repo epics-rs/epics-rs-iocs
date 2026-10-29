@@ -1,9 +1,10 @@
-use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::param::ParamValue;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::param::{EnumEntry, ParamValue};
+use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
@@ -11,87 +12,193 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use meascomp::device::DaqDevice;
-use meascomp::digital_io::output_bits;
-use meascomp::error::MeasCompError;
+use meascomp::timer::PulseTiming;
+use uldaq_sys::UlError;
 
+use crate::board_enums::{self, AI_CHAN_TYPE_TC, AI_CHAN_TYPE_VOLTAGE, map_range};
 use crate::params::*;
 use crate::poller::{self, PollerState};
-use crate::trace::DRIVER;
-use crate::wave_dig::{self, WaveDigScan, WaveDigStartError, WaveDigState};
+use crate::trace::{self, DRIVER_NAME, SelfTrace};
+use crate::wave_dig::{self, WaveDigScan, WaveDigState};
 use crate::wave_gen::{self, WaveGenScan, WaveGenState};
 
 /// C `MultiFunction::writeInt32`/`writeFloat32Array` resolve the channel
 /// through `asynPortDriver::getAddress` (drvMultiFunction.cpp:1947, 2510),
 /// which maps the no-device addr -1 to 0 (asynPortDriver.cpp:1901-1913).
-/// Whether C `mapTriggerType` has a uldaq trigger for this Measurement
-/// Computing trigger number (drvMultiFunction.cpp:1384-1403, :1405-1435):
-/// all of 0..=19 but the two hysteresis gates.
-fn is_supported_trigger_mode(mode: i32) -> bool {
-    (0..=19).contains(&mode) && mode != 2 && mode != 3
-}
-
 fn device_addr(addr: i32) -> i32 {
     if addr == -1 { 0 } else { addr }
 }
 
-/// C's array handlers refuse a request they cannot serve with an
-/// ASYN_TRACE_ERROR line on the caller's asynUser and asynError
-/// (drvMultiFunction.cpp:2437-2459, :2481-2494, :2514-2524).
-fn array_error(user: &AsynUser, line: String) -> AsynError {
-    user.print(TraceMask::ERROR, file!(), line!(), format_args!("{line}"));
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message: line,
+/// C `mapTriggerType` (drvMultiFunction.cpp:1383-1435): the cbw trigger
+/// types 0..19 except the two hysteresis gates have a uldaq trigger.
+fn trigger_mode_maps(value: i32) -> bool {
+    matches!(value, 0 | 1 | 4..=19)
+}
+
+/// The element count of a waveform read: C's `*nIn > (size_t)numPoints` cap
+/// (drvMultiFunction.cpp:2463, :2496), where a negative count casts huge and
+/// caps nothing. The copy still stops at the data, which C reads past.
+fn read_count(requested: usize, num_points: i32, available: usize) -> usize {
+    requested
+        .min(usize::try_from(num_points).unwrap_or(usize::MAX))
+        .min(available)
+}
+
+/// C `MAX_IO_PORTS`.
+const MAX_IO_PORTS: u32 = 8;
+
+/// C `MAX_PULSE_GEN`.
+const MAX_PULSE_GEN: usize = 4;
+
+/// What C's constructor reads of the board (drvMultiFunction.cpp:845-850,
+/// :1033-1077) for `report` and `getBounds`.
+struct BoardInfo {
+    board_type: u32,
+    board_name: String,
+    num_analog_in: i32,
+    num_analog_out: i32,
+    resolution: Resolution,
+    num_temperature_in: i32,
+    io_ports: Vec<IoPort>,
+}
+
+/// One digital I/O port as C's ulDIOGetInfo loop records it
+/// (drvMultiFunction.cpp:1055-1077).
+struct IoPort {
+    port_type: i32,
+    io_type: i32,
+    num_bits: i32,
+}
+
+impl IoPort {
+    /// C `digitalIOBitConfigurable_` (drvMultiFunction.cpp:1071).
+    fn bit_configurable(&self) -> bool {
+        self.io_type == uldaq_sys::DPIOT_BITIO as i32
     }
 }
 
-/// A write step that failed, as C reports it. Made only by the reporting
-/// helpers of [`MultiFunctionDriver`], which print C's ERROR line as they
-/// make it, so no failure reaches a record unreported.
-enum Failure {
-    /// A step failed: the ERROR line C printed where it failed (`None`
-    /// where C prints none), and the status C's closing "ERROR writing"
-    /// line carries.
-    Step { line: Option<String>, status: i32 },
-    /// C refused the write outright: its line printed, and asynError
-    /// returned before any closing line (drvMultiFunction.cpp:2131-2135).
-    Refused(String),
-}
-
-/// C's closing trace line of a write (drvMultiFunction.cpp:2201-2209,
-/// :2318-2326, :2417-2421): what it `wrote`, or what it `failed` writing
-/// (the status is appended) -- `None` where C prints no failure line.
-struct WriteLine<'a> {
-    function: &'static str,
-    wrote: fmt::Arguments<'a>,
-    failed: Option<fmt::Arguments<'a>>,
-}
-
-/// What asyn-rs's default `PortDriver::report` prints, which an override
-/// cannot call (C `asynPortDriver::report`, asynPortDriver.cpp:3677-3710):
-/// the port, its timestamp and parameter library, and at level 3 its
-/// interrupt clients. This port has no octet interface, so no EOS lines.
-fn write_port_report(base: &PortDriverBase, out: &mut dyn std::fmt::Write, level: i32) {
-    let _ = writeln!(out, "Port: {}", base.port_name);
-    if level >= 1 {
-        let ts = chrono::DateTime::<chrono::Local>::from(base.current_timestamp());
-        let _ = writeln!(out, "  Timestamp: {}", ts.format("%Y/%m/%d %H:%M:%S%.3f"));
-        base.report_params(out, level);
-    }
-    if level >= 3 {
-        for f in base.interrupts.clients() {
-            let iface = f.iface.map_or("any", |i| i.interrupt_label());
-            let addr = f.addr.map_or("any".to_string(), |a| a.to_string());
-            let reason = f.reason.map_or("any".to_string(), |r| r.to_string());
-            let _ = write!(
-                out,
-                "    {iface} callback client addr={addr}, reason={reason}"
-            );
-            if let Some(mask) = f.uint32_mask {
-                let _ = write!(out, ", mask=0x{mask:x}");
-            }
-            let _ = writeln!(out);
+impl BoardInfo {
+    /// C ignores the status of every one of these queries; a query that
+    /// fails reads 0 here (for a width, a degenerate getBounds range device
+    /// support leaves alone).
+    fn read(device: &DaqDevice) -> Self {
+        let ai = |item, index| device.ai_get_info(item, index).map_or(0, |v| v as i32);
+        let ao = |item, index| device.ao_get_info(item, index).map_or(0, |v| v as i32);
+        let dio = |item, index| device.dio_get_info(item, index).map_or(0, |v| v as i32);
+        let num_ports = (dio(uldaq_sys::DIO_INFO_NUM_PORTS, 0) as u32).min(MAX_IO_PORTS);
+        Self {
+            board_type: device.product_id(),
+            board_name: device.product_name(),
+            num_analog_in: ai(
+                uldaq_sys::AI_INFO_NUM_CHANS_BY_TYPE,
+                uldaq_sys::AI_VOLTAGE as u32,
+            ),
+            num_analog_out: ao(uldaq_sys::AO_INFO_NUM_CHANS, 0),
+            resolution: Resolution {
+                adc_bits: ai(uldaq_sys::AI_INFO_RESOLUTION, 0),
+                dac_bits: ao(uldaq_sys::AO_INFO_RESOLUTION, 0),
+            },
+            num_temperature_in: ai(
+                uldaq_sys::AI_INFO_NUM_CHANS_BY_TYPE,
+                uldaq_sys::AI_TC as u32,
+            ),
+            io_ports: (0..num_ports)
+                .map(|i| IoPort {
+                    port_type: dio(uldaq_sys::DIO_INFO_PORT_TYPE, i),
+                    io_type: dio(uldaq_sys::DIO_INFO_PORT_IO_TYPE, i),
+                    num_bits: dio(uldaq_sys::DIO_INFO_NUM_BITS, i),
+                })
+                .collect(),
         }
+    }
+
+    /// C `numAnalogIn_` and `numTemperatureIn_`, the poller's channel
+    /// counts, held to the param arrays.
+    fn poll_channels(&self) -> (usize, usize) {
+        let n = |v: i32| (v.max(0) as usize).min(MAX_ANALOG_IN);
+        (n(self.num_analog_in), n(self.num_temperature_in))
+    }
+
+    /// C `MultiFunction::report` after `asynPortDriver::report`
+    /// (drvMultiFunction.cpp:2861-2892), for the USB-2408-2AO family: no
+    /// timers, `MAX_COUNTERS` counters from 0, and no port C marks
+    /// configurable (:1140-1146). `counts` is each counter's COUNTER_VALUE.
+    fn report(&self, out: &mut dyn std::fmt::Write, port_name: &str, level: i32, counts: &[i32]) {
+        let _ = writeln!(
+            out,
+            "  Port: {port_name}, board ID={}, board type={}",
+            self.board_type, self.board_name
+        );
+        if level < 1 {
+            return;
+        }
+        let _ = writeln!(out, "  analog inputs      = {}", self.num_analog_in);
+        let _ = writeln!(out, "  analog input bits  = {}", self.resolution.adc_bits);
+        let _ = writeln!(out, "  analog outputs     = {}", self.num_analog_out);
+        let _ = writeln!(out, "  analog output bits = {}", self.resolution.dac_bits);
+        let _ = writeln!(out, "  temperature inputs = {}", self.num_temperature_in);
+        let _ = writeln!(out, "  digital I/O ports  = {}", self.io_ports.len());
+        for (i, port) in self.io_ports.iter().enumerate() {
+            let mask = (0..port.num_bits).fold(0u32, |m, j| m | (1 << j));
+            let _ = writeln!(out, "  digital I/O port     {i}");
+            let _ = writeln!(out, "    I/O port              = {}", port.port_type);
+            let _ = writeln!(out, "    I/O bits              = {}", port.num_bits);
+            let _ = writeln!(
+                out,
+                "    I/O bit configurable  = {}",
+                i32::from(port.bit_configurable())
+            );
+            let _ = writeln!(out, "    I/O port configurable = 0");
+            let _ = writeln!(
+                out,
+                "    I/O port read only    = {}",
+                i32::from(port.io_type == uldaq_sys::DPIOT_IN as i32)
+            );
+            let _ = writeln!(
+                out,
+                "    I/O port write only   = {}",
+                i32::from(port.io_type == uldaq_sys::DPIOT_OUT as i32)
+            );
+            let _ = writeln!(out, "    I/O port mask         = 0x{mask:x}");
+        }
+        let _ = writeln!(out, "  timers             = 0");
+        // C prints the three counter fields with no newline between them.
+        let _ = write!(
+            out,
+            "  # counters         = {}  first counter      = 0  counterCounts = ",
+            counts.len()
+        );
+        for count in counts {
+            let _ = write!(out, " {count}");
+        }
+        let _ = writeln!(out);
+    }
+}
+
+/// The converter widths C reads once at connect
+/// (drvMultiFunction.cpp:1045-1048).
+#[derive(Clone, Copy)]
+struct Resolution {
+    adc_bits: i32,
+    dac_bits: i32,
+}
+
+impl Resolution {
+    /// C `MultiFunction::getBounds` (drvMultiFunction.cpp:1920-1936): an
+    /// analog value's raw range is the converter's; any other parameter is
+    /// asynError.
+    fn bounds(self, params: &MultiFunctionParams, reason: usize) -> AsynResult<(i32, i32)> {
+        let bits = if reason == params.analog_out_value {
+            self.dac_bits
+        } else if reason == params.analog_in_value {
+            self.adc_bits
+        } else {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            });
+        };
+        Ok((0, (1 << bits) - 1))
     }
 }
 
@@ -103,13 +210,22 @@ pub struct MultiFunctionDriver {
     pub state: Arc<Mutex<PollerState>>,
     pub max_input_points: usize,
     pub max_output_points: usize,
-    /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
-    /// `DPIOT_BITIO`). The USB-2408 reports `DPIOT_NONCONFIG`.
-    dio_configurable: bool,
-    /// C `ADCResolution_` / `DACResolution_`, from the device.
-    adc_resolution: i64,
-    dac_resolution: i64,
+    board: BoardInfo,
+    /// C `pulseGenRunning_`.
+    pulse_gen_running: [bool; MAX_PULSE_GEN],
 }
+
+/// drvMultiFunction.cpp:817-820.
+const MULTIFUNCTION_INTERRUPTS: InterfaceMask = InterfaceMask::UINT32_DIGITAL
+    .or(InterfaceMask::INT32)
+    .or(InterfaceMask::INT32_ARRAY)
+    .or(InterfaceMask::FLOAT32_ARRAY)
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::FLOAT64_ARRAY)
+    .or(InterfaceMask::OCTET)
+    .or(InterfaceMask::ENUM);
+const MULTIFUNCTION_INTERFACES: InterfaceMask =
+    MULTIFUNCTION_INTERRUPTS.or(InterfaceMask::DRV_USER);
 
 impl MultiFunctionDriver {
     pub fn new(
@@ -118,44 +234,33 @@ impl MultiFunctionDriver {
         max_input_points: usize,
         max_output_points: usize,
     ) -> AsynResult<Self> {
-        // ASYN_CANBLOCK, as C declares it (drvMultiFunction.cpp:821): every
-        // write does USB I/O behind the device mutex the poller holds for a
-        // whole sweep, so records must complete asynchronously instead of
-        // blocking the thread that processes them.
         let mut base = PortDriverBase::new(
             port_name,
             MAX_SIGNALS,
+            // ASYN_MULTIDEVICE | ASYN_CANBLOCK (drvMultiFunction.cpp:821).
             PortFlags {
                 multi_device: true,
                 can_block: true,
                 destructible: true,
             },
+            MULTIFUNCTION_INTERFACES,
+            MULTIFUNCTION_INTERRUPTS,
         );
         let params = MultiFunctionParams::create(&mut base)?;
 
-        // Defaults
+        // C's ctor defaults (drvMultiFunction.cpp:457-473) and no others:
+        // a param C leaves unset must not override its record's db value.
         base.set_float64_param(params.poll_sleep_ms, 0, 50.0)?;
-        base.set_int32_param(params.wave_dig_num_points, 0, max_input_points as i32)?;
-        base.set_int32_param(params.wave_gen_num_points, 0, max_output_points as i32)?;
-        base.set_int32_param(params.wave_gen_user_num_points, 0, max_output_points as i32)?;
-        base.set_int32_param(params.wave_gen_int_num_points, 0, max_output_points as i32)?;
-        base.set_float64_param(params.wave_gen_user_dwell, 0, 0.001)?;
-        base.set_float64_param(params.wave_gen_int_dwell, 0, 0.001)?;
-        for ch in 0..MAX_ANALOG_OUT {
-            base.set_int32_param(params.wave_gen_enable, ch as i32, 1)?;
+        base.set_int32_param(params.wave_gen_user_num_points, 0, 1)?;
+        base.set_int32_param(params.wave_gen_int_num_points, 0, 1)?;
+        base.set_int32_param(params.wave_dig_num_points, 0, 1)?;
+        base.set_int32_param(params.pulse_gen_run, 0, 0)?;
+        base.set_int32_param(params.wave_dig_run, 0, 0)?;
+        base.set_int32_param(params.wave_gen_run, 0, 0)?;
+        // The first output range of the model (:1284-1287).
+        for ch in 0..MAX_ANALOG_OUT as i32 {
+            base.set_int32_param(params.analog_out_range, ch, board_enums::OUTPUT_RANGE[0].1)?;
         }
-        // One channel, as the NumChans menu's first state.
-        base.set_int32_param(params.wave_dig_num_chans, 0, 1)?;
-        base.set_int32_param(params.analog_in_mode, 0, uldaq_sys::AI_DIFFERENTIAL)?;
-
-        for ch in 0..MAX_ANALOG_IN {
-            base.set_int32_param(params.analog_in_type, ch as i32, 0)?;
-            base.set_int32_param(params.analog_in_range, ch as i32, uldaq_sys::BIP10VOLTS)?;
-            base.set_int32_param(params.temperature_scale, ch as i32, uldaq_sys::TS_CELSIUS)?;
-            // Type J, as C's constructor and libuldaq default to.
-            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
-        }
-
         // Device info
         let product_name = device.product_name();
         let product_id = device.product_id();
@@ -168,24 +273,12 @@ impl MultiFunctionDriver {
         base.set_string_param(params.unique_id, 0, uid.clone())?;
         base.set_string_param(params.firmware_version, 0, fw.clone())?;
         base.set_string_param(params.ul_version, 0, ul_ver)?;
-        base.set_string_param(params.driver_version, 0, "0.1.0")?;
+        base.set_string_param(params.driver_version, 0, "4.4")?;
 
-        // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
-        // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
-        // the device instead of assuming. The directions themselves are left
-        // to the Bd records' PINI, as C's constructor leaves them: forcing
-        // the port to input here would float every output bit from here
-        // until iocInit.
-        let dio_configurable = matches!(
-            device.digital_port_io_type(0),
-            Ok(uldaq_sys::DPIOT_IO) | Ok(uldaq_sys::DPIOT_BITIO)
-        );
-        let adc_resolution = device
-            .ai_get_info(uldaq_sys::AI_INFO_RESOLUTION, 0)
-            .unwrap_or(0);
-        let dac_resolution = device
-            .ao_get_info(uldaq_sys::AO_INFO_RESOLUTION, 0)
-            .unwrap_or(0);
+        let board = BoardInfo::read(&device);
+        for ch in 0..board.poll_channels().1 {
+            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
+        }
 
         // Seed DIGITAL_INPUT so the bi records have a value to read at init.
         // The poller only pushes on a changed bit, and its one forced first
@@ -197,11 +290,9 @@ impl MultiFunctionDriver {
         let state = Arc::new(Mutex::new(PollerState {
             wave_dig: WaveDigState::new(max_input_points),
             wave_gen: WaveGenState::new(max_output_points),
+            trace: SelfTrace::default(),
+            ai_input_mode: uldaq_sys::AI_SINGLE_ENDED,
         }));
-
-        println!(
-            "MultiFunctionDriver: port={port_name}, model={product_name}, serial={uid}, fw={fw}"
-        );
 
         Ok(Self {
             base,
@@ -210,406 +301,215 @@ impl MultiFunctionDriver {
             state,
             max_input_points,
             max_output_points,
-            dio_configurable,
-            adc_resolution,
-            dac_resolution,
+            board,
+            pulse_gen_running: [false; MAX_PULSE_GEN],
         })
     }
 }
 
 impl MultiFunctionDriver {
-    /// Apply array (or scalar) updates built by the wave_dig/wave_gen helpers.
+    /// Apply the updates built by the wave_dig/wave_gen helpers in order:
+    /// each array posts as it is reached, each set waits for the flush.
     ///
-    /// The poller pushes the same list through
-    /// `set_params_and_notify_blocking`; on the actor thread that call would
-    /// be a self-deadlock, so the store is written directly instead.
-    fn apply_updates(&mut self, function: &str, updates: Vec<ParamSetValue>) -> Option<Failure> {
-        for update in updates {
-            let ParamSetValue::Value {
-                reason,
-                addr,
-                value,
-            } = update
-            else {
-                continue;
-            };
-            if let Err(e) = self.base.params.set_value(reason, addr, value) {
-                return Some(self.fail_with(function, &format!("waveform callback error: {e}")));
-            }
+    /// The poller applies the same list under `with_driver_blocking`; on the
+    /// actor thread that call would be a self-deadlock, so the base takes
+    /// them directly instead.
+    fn apply_updates(&mut self, updates: Vec<ParamSetValue>) -> AsynResult<()> {
+        for update in &updates {
+            self.base.set_param(update)?;
         }
-        None
+        Ok(())
     }
 
-    /// Common tail of every write: apply the collected array updates, run the
-    /// callbacks, then report the outcome the way C does -- its closing trace
-    /// line, and on failure `asynError` back to the record, so it alarms,
-    /// with the failure on LAST_ERROR_MESSAGE.
+    /// Common tail of `write_int32`: apply the collected array updates, run
+    /// the callbacks and print C's summary line for `status`.
     ///
     /// An early return in the middle of a write must still come through here,
-    /// or the failure it just reported would never reach the record.
+    /// or its array updates would never reach the records.
     fn finish_write(
         &mut self,
         user: &AsynUser,
-        addr: i32,
-        failure: Option<Failure>,
+        value: i32,
+        status: UlError,
         wave_arrays: Vec<ParamSetValue>,
-        line: WriteLine<'_>,
     ) -> AsynResult<()> {
-        let WriteLine {
-            function,
-            wrote,
-            failed,
-        } = line;
-        // C delivers each channel's arrays with that channel's callbacks, so
-        // every address an update names gets its callbacks now, not at the
-        // poller's next sweep.
-        let mut touched: Vec<i32> = wave_arrays
-            .iter()
-            .filter_map(|u| match u {
-                ParamSetValue::Value { addr: a, .. } if *a != addr => Some(*a),
-                _ => None,
-            })
-            .collect();
-        touched.sort_unstable();
-        touched.dedup();
-        let failure = self.apply_updates(function, wave_arrays).or(failure);
-        for a in touched {
-            self.base.call_param_callbacks(a)?;
-        }
-        let port = self.base.port_name.clone();
-        let Some(failure) = failure else {
-            self.base.call_param_callbacks(addr)?;
+        self.apply_updates(wave_arrays)?;
+        let addr = device_addr(user.addr);
+        self.base.call_param_callbacks(addr)?;
+        let port = &self.base.port_name;
+        if status == 0 {
             user.print(
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
-                format_args!("{DRIVER}:{function}, port {port}, {wrote}"),
+                format_args!(
+                    "{DRIVER_NAME}:writeInt32, port {port}, wrote {value} to address {addr}\n"
+                ),
             );
-            return Ok(());
-        };
-        let (line, status) = match failure {
-            Failure::Step { line, status } => (line, Some(status)),
-            Failure::Refused(line) => (Some(line), None),
-        };
-        // C's closing line, where C prints one: not after a refusal, nor
-        // after writeUInt32Digital.
-        let closing = status.zip(failed).map(|(status, failed)| {
-            format!("{DRIVER}:{function}, port {port}, {failed}, status={status}")
-        });
-        let message = line
-            .or_else(|| closing.clone())
-            .unwrap_or_else(|| format!("{DRIVER}:{function}, port {port}, write failed"));
-        self.set_last_error(message.clone());
-        self.base.call_param_callbacks(addr)?;
-        if let Some(closing) = &closing {
+        } else {
             user.print(
                 TraceMask::ERROR,
                 file!(),
                 line!(),
-                format_args!("{closing}"),
-            );
-        }
-        Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message,
-        })
-    }
-
-    /// C `reportError(0, functionName, message)` (drvMultiFunction.cpp:1298-
-    /// 1305): the TRACEIO_DRIVER line C prints after each libuldaq call that
-    /// succeeded.
-    fn info(&self, function: &str, message: &str) {
-        self.base.trace_print(
-            TraceMask::IO_DRIVER,
-            &format!("{DRIVER}::{function} Info: {message}"),
-        );
-    }
-
-    /// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`: the line through
-    /// the port's trace, and on LAST_ERROR_MESSAGE.
-    fn report_error(&mut self, line: String) {
-        self.base.trace_print(TraceMask::ERROR, &line);
-        self.set_last_error(line);
-    }
-
-    fn set_last_error(&mut self, message: String) {
-        let _ = self.base.params.set_value(
-            self.params.last_error_message,
-            0,
-            ParamValue::Octet(message.into_bytes()),
-        );
-    }
-
-    /// A failed write step, its C line (if C prints one) reported now.
-    fn fail(&mut self, line: Option<String>, status: i32) -> Failure {
-        if let Some(line) = &line {
-            self.report_error(line.clone());
-        }
-        Failure::Step { line, status }
-    }
-
-    /// C `reportError` (drvMultiFunction.cpp:1298-1323) on a libuldaq call's
-    /// result: the TRACEIO_DRIVER "Info" line when it succeeded, its ERROR
-    /// line when it failed -- which is then the step's failure, carrying the
-    /// call's status.
-    fn report<T>(
-        &mut self,
-        function: &str,
-        message: &str,
-        result: Result<T, MeasCompError>,
-    ) -> Result<T, Failure> {
-        result
-            .inspect(|_| self.info(function, message))
-            .map_err(|e| {
-                self.fail(
-                    Some(format!(
-                        "{DRIVER}::{function} Error: {message}, err={} {}",
-                        e.code, e.message
-                    )),
-                    e.code,
-                )
-            })
-    }
-
-    /// C `reportError(-1, functionName, message)`: a step C fails itself.
-    fn fail_with(&mut self, function: &str, message: &str) -> Failure {
-        self.fail(Some(format!("{DRIVER}::{function} Error: {message}")), -1)
-    }
-
-    /// C `reportError(-1, functionName, message)` and an immediate
-    /// asynError, before the write's closing line.
-    fn refuse(&mut self, function: &str, message: &str) -> Failure {
-        let line = format!("{DRIVER}::{function} Error: {message}");
-        self.report_error(line.clone());
-        Failure::Refused(line)
-    }
-
-    /// A parameter-library error inside `function`, which C cannot have,
-    /// reported in C's `reportError(-1)` form so it too reaches the trace.
-    fn param<T>(&mut self, function: &str, value: AsynResult<T>) -> Result<T, Failure> {
-        value.map_err(|e| self.fail_with(function, &e.to_string()))
-    }
-
-    /// Set a port-wide (address 0) parameter inside `function`.
-    fn set_param(
-        &mut self,
-        function: &str,
-        reason: usize,
-        value: ParamValue,
-    ) -> Result<(), Failure> {
-        let set = self.base.params.set_value(reason, 0, value);
-        self.param(function, set)
-    }
-
-    /// C `readWaveDig`'s FLOW line for each channel it hands out
-    /// (drvMultiFunction.cpp:1895-1898).
-    fn trace_wave_dig_callbacks(&self, dig: &WaveDigState) {
-        for ch in dig.first_chan..(dig.first_chan + dig.num_chans).min(MAX_ANALOG_IN) {
-            let first = dig.channel_buffers[ch].first().copied().unwrap_or(0.0);
-            self.base.trace_print(
-                TraceMask::FLOW,
-                &format!(
-                    "{DRIVER}:readWaveDig:, doing callbacks on input {ch}, first value={first:.6}"
+                format_args!(
+                    "{DRIVER_NAME}:writeInt32, port {port}, function={}, ERROR writing {value} to address {addr}, status={status}\n",
+                    user.reason
                 ),
             );
         }
+        trace::asyn_status(status)
     }
 
-    /// C `defineWaveform`: publish the point count, dwell and frequency the
-    /// channel's wave type uses and, for an internal waveform, compute it into
-    /// the channel's buffer and hand it out on WAVEGEN_INT_WF. A point count
-    /// beyond the buffers is refused, as C refuses it.
+    /// C `defineWaveform(channel)`: set NUM_POINTS/DWELL/FREQ from the
+    /// channel's wave type and, for an internal type, rebuild and post its
+    /// WAVEGEN_INT_WF. `Ok(false)` is C's -1.
     fn define_waveform(
         &mut self,
-        generator: &mut WaveGenState,
+        wave_gen_state: &mut WaveGenState,
         channel: i32,
+        trace: &SelfTrace,
         updates: &mut Vec<ParamSetValue>,
-    ) -> Result<(), Failure> {
-        const F: &str = "defineWaveform";
-        let wave_type = self.param(
-            F,
-            self.base
-                .get_int32_param(self.params.wave_gen_wave_type, channel),
-        )?;
+    ) -> AsynResult<bool> {
+        let p = self.params;
+        let wave_type = self.int(p.wave_gen_wave_type, channel);
         let user = wave_type == wave_gen::WAVE_TYPE_USER;
         let (points_param, dwell_param) = if user {
-            (
-                self.params.wave_gen_user_num_points,
-                self.params.wave_gen_user_dwell,
-            )
+            (p.wave_gen_user_num_points, p.wave_gen_user_dwell)
         } else {
-            (
-                self.params.wave_gen_int_num_points,
-                self.params.wave_gen_int_dwell,
-            )
+            (p.wave_gen_int_num_points, p.wave_gen_int_dwell)
         };
-        let num_points = self
-            .param(F, self.base.get_int32_param(points_param, 0))?
-            .max(0) as usize;
-        if num_points > self.max_output_points {
-            let line = format!(
-                "{DRIVER}:{F}: ERROR numPoints={num_points} must be less than maxOutputPoints={}",
-                self.max_output_points
+        let num_points = self.int(points_param, 0);
+        // C compares as size_t, so a negative count is too large as well.
+        if num_points < 0 || num_points as usize > self.max_output_points {
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{DRIVER_NAME}:defineWaveform: ERROR numPoints={num_points} must be less than maxOutputPoints={}\n",
+                    self.max_output_points
+                ),
             );
-            return Err(self.fail(Some(line), -1));
+            return Ok(false);
         }
-        let dwell = self.param(F, self.base.get_float64_param(dwell_param, 0))?;
-        self.set_param(
-            F,
-            self.params.wave_gen_num_points,
-            ParamValue::Int32(num_points as i32),
-        )?;
-        self.set_param(F, self.params.wave_gen_dwell, ParamValue::Float64(dwell))?;
-        self.set_param(
-            F,
-            self.params.wave_gen_freq,
-            ParamValue::Float64(1.0 / dwell / num_points as f64),
-        )?;
-        if user {
-            return Ok(());
-        }
-        let channel_f64 = |base: &PortDriverBase, reason| base.get_float64_param(reason, channel);
-        let shape = wave_gen::WaveShape {
+        let dwell = self.float(dwell_param, 0);
+        let wave = wave_gen::InternalWave {
             wave_type,
-            amplitude: self.param(F, channel_f64(&self.base, self.params.wave_gen_amplitude))?,
-            offset: self.param(F, channel_f64(&self.base, self.params.wave_gen_offset))?,
-            pulse_width: self
-                .param(F, channel_f64(&self.base, self.params.wave_gen_pulse_width))?,
-            pulse_delay: self
-                .param(F, channel_f64(&self.base, self.params.wave_gen_pulse_delay))?,
+            num_points: num_points as usize,
             dwell,
+            offset: self.float(p.wave_gen_offset, channel),
+            amplitude: self.float(p.wave_gen_amplitude, channel),
+            pulse_width: self.float(p.wave_gen_pulse_width, channel),
+            pulse_delay: self.float(p.wave_gen_pulse_delay, channel),
         };
-        let data = wave_gen::generate_waveform(&shape, num_points);
-        if let Some(buffer) = generator.int_buffers.get_mut(channel as usize) {
-            buffer[..num_points].copy_from_slice(&data);
+        self.base
+            .set_int32_param(p.wave_gen_num_points, 0, num_points)?;
+        self.base.set_float64_param(p.wave_gen_dwell, 0, dwell)?;
+        self.base
+            .set_float64_param(p.wave_gen_freq, 0, 1. / dwell / f64::from(num_points))?;
+        if user {
+            return Ok(true);
         }
-        updates.push(ParamSetValue::new(
-            self.params.wave_gen_int_wf,
+        let buffer = &mut wave_gen_state.int_waveforms[channel as usize];
+        wave_gen::define_internal(buffer, &wave);
+        updates.push(ParamSetValue::array(
+            p.wave_gen_int_wf,
             channel,
-            ParamValue::Float32Array(data.into()),
+            ParamValue::Float32Array(buffer[..wave.num_points].into()),
         ));
-        Ok(())
+        Ok(true)
     }
 
-    /// C `startWaveGen`: define every enabled channel, then play the span of
-    /// them from their buffers -- a user channel's stored volts scaled by its
-    /// Amplitude and Offset, an internal one's computed waveform.
-    fn start_generator(
+    /// C `startWaveGen` from the current WaveGen parameters; the result is
+    /// the uldaq status it reported, or -1 for a refused configuration.
+    fn start_wave_gen(
         &mut self,
         dev: &DaqDevice,
-        generator: &mut WaveGenState,
+        wave_gen_state: &mut WaveGenState,
+        trace: &SelfTrace,
         updates: &mut Vec<ParamSetValue>,
-    ) -> Result<(), Failure> {
-        const F: &str = "startWaveGen";
-        let flag = |base: &PortDriverBase, reason| base.get_int32_param(reason, 0).map(|v| v != 0);
-        let ext_trigger = self.param(F, flag(&self.base, self.params.wave_gen_ext_trigger))?;
-        let ext_clock = self.param(F, flag(&self.base, self.params.wave_gen_ext_clock))?;
-        let continuous = self.param(F, flag(&self.base, self.params.wave_gen_continuous))?;
-        let retrigger = self.param(F, flag(&self.base, self.params.wave_gen_retrigger))?;
+    ) -> AsynResult<UlError> {
+        let p = self.params;
+        // C returns -1 and leaves the 1 writeInt32 set in WAVEGEN_RUN.
+        let refuse = |msg: Option<&str>| -> AsynResult<UlError> {
+            if let Some(msg) = msg {
+                trace.print(
+                    TraceMask::ERROR,
+                    format_args!("{DRIVER_NAME}:startWaveGen: {msg}\n"),
+                );
+            }
+            Ok(-1)
+        };
+        let ext_trigger = self.int(p.wave_gen_ext_trigger, 0) != 0;
+        let ext_clock = self.int(p.wave_gen_ext_clock, 0) != 0;
+        let continuous = self.int(p.wave_gen_continuous, 0) != 0;
+        let retrigger = self.int(p.wave_gen_retrigger, 0) != 0;
 
         let mut span: Option<(i32, i32)> = None;
-        let mut first_is_user = false;
-        let mut saved = [None; MAX_ANALOG_OUT];
+        let mut first_type = -1;
+        let mut wave_type = -1;
+        let mut saved = [0.0f64; MAX_ANALOG_OUT];
         for ch in 0..MAX_ANALOG_OUT as i32 {
-            if self.param(
-                F,
-                self.base.get_int32_param(self.params.wave_gen_enable, ch),
-            )? == 0
-            {
+            saved[ch as usize] = f64::from(self.int(p.analog_out_value, ch));
+            if self.int(p.wave_gen_enable, ch) == 0 {
                 continue;
             }
-            let is_user = self.param(
-                F,
-                self.base
-                    .get_int32_param(self.params.wave_gen_wave_type, ch),
-            )? == wave_gen::WAVE_TYPE_USER;
-            match span {
-                None => {
-                    span = Some((ch, ch));
-                    first_is_user = is_user;
-                }
-                Some((first, _)) => span = Some((first, ch)),
+            wave_type = self.int(p.wave_gen_wave_type, ch);
+            let first = span.map_or(ch, |(first, _)| first);
+            if span.is_none() {
+                first_type = wave_type;
             }
-            // Saved to be put back when the scan ends, C waveGenSavedOutput.
-            saved[ch as usize] = Some(f64::from(self.param(
-                F,
-                self.base.get_int32_param(self.params.analog_out_value, ch),
-            )?));
-            // User-defined and internal waveforms take their dwell from
-            // different parameters, so they cannot share a scan.
-            if is_user != first_is_user {
-                let line = format!(
-                    "{DRIVER}:{F}: ERROR if any enabled waveform type is user-defined then all \
-                     must be."
-                );
-                return Err(self.fail(Some(line), -1));
+            // Internal types take their dwell from the frequency, so the two
+            // kinds cannot share a scan.
+            if (first_type == wave_gen::WAVE_TYPE_USER) != (wave_type == wave_gen::WAVE_TYPE_USER) {
+                return refuse(Some(
+                    "ERROR if any enabled waveform type is user-defined then all must be.",
+                ));
             }
-            self.define_waveform(generator, ch, updates)?;
+            span = Some((first, ch));
+            if !self.define_waveform(wave_gen_state, ch, trace, updates)? {
+                return refuse(None);
+            }
         }
         let Some((first_chan, last_chan)) = span else {
-            let line = format!("{DRIVER}:{F}: ERROR no enabled channels");
-            return Err(self.fail(Some(line), -1));
+            return refuse(Some("ERROR no enabled channels"));
         };
 
-        // defineWaveform above left the point count and dwell in use.
-        let num_points = (self
-            .param(
-                F,
-                self.base
-                    .get_int32_param(self.params.wave_gen_num_points, 0),
-            )?
-            .max(0) as usize)
-            .min(self.max_output_points);
-        let dwell = self.param(
-            F,
-            self.base.get_float64_param(self.params.wave_gen_dwell, 0),
-        )?;
-
-        // Interleave [ch0_pt0, ch1_pt0, ch0_pt1, ...] in volts, then convert
-        // to DAC counts (NOSCALEDATA mode).
-        let mut per_chan: Vec<Vec<f64>> = Vec::with_capacity(MAX_ANALOG_OUT);
-        for ch in first_chan..=last_chan {
-            let wave_type = self.param(
-                F,
-                self.base
-                    .get_int32_param(self.params.wave_gen_wave_type, ch),
-            )?;
-            let samples = if wave_type == wave_gen::WAVE_TYPE_USER {
-                let amplitude = self.param(
-                    F,
-                    self.base
-                        .get_float64_param(self.params.wave_gen_amplitude, ch),
-                )?;
-                let offset = self.param(
-                    F,
-                    self.base.get_float64_param(self.params.wave_gen_offset, ch),
-                )?;
-                generator.user_buffers[ch as usize][..num_points]
-                    .iter()
-                    .map(|v| f64::from(*v) * amplitude + offset)
-                    .collect()
+        // defineWaveform has set these.
+        let num_points = self.int(p.wave_gen_num_points, 0).max(0) as usize;
+        let dwell = self.float(p.wave_gen_dwell, 0);
+        let num_chans = (last_chan - first_chan + 1) as usize;
+        let mut waveform = vec![0.0f64; num_chans * num_points];
+        for i in 0..num_chans {
+            let k = first_chan as usize + i;
+            let input = if self.int(p.wave_gen_wave_type, k as i32) == wave_gen::WAVE_TYPE_USER {
+                &wave_gen_state.user_waveforms[k]
             } else {
-                generator.int_buffers[ch as usize][..num_points]
-                    .iter()
-                    .map(|v| f64::from(*v))
-                    .collect()
+                &wave_gen_state.int_waveforms[k]
             };
-            per_chan.push(samples);
+            // C reads the user scaling at the span index i, so a span that
+            // starts past channel 0 takes another channel's Amplitude and
+            // Offset (drvMultiFunction.cpp:1653-1654). C defect, not copied
+            // (upstream-c-defects #227).
+            let (amplitude, offset) = if wave_type == wave_gen::WAVE_TYPE_USER {
+                (
+                    self.float(p.wave_gen_amplitude, k as i32),
+                    self.float(p.wave_gen_offset, k as i32),
+                )
+            } else {
+                (1.0, 0.0)
+            };
+            for j in 0..num_points {
+                waveform[j * num_chans + i] = wave_gen::volts_to_dac(input[j], amplitude, offset);
+            }
         }
-        let mut waveform = Vec::with_capacity(per_chan.len() * num_points);
-        for pt in 0..num_points {
-            waveform.extend(per_chan.iter().map(|chan| chan[pt]));
-        }
-        wave_gen::volts_to_dac(&mut waveform);
 
-        let started = wave_gen::start_wave_gen(
+        let dwell = match wave_gen::start_wave_gen(
             dev,
-            generator,
+            wave_gen_state,
             &WaveGenScan {
                 first_chan,
                 last_chan,
                 num_points,
-                freq: 1.0 / (dwell * num_points as f64),
+                dwell,
                 range: uldaq_sys::BIP10VOLTS,
                 ext_trigger,
                 ext_clock,
@@ -617,317 +517,238 @@ impl MultiFunctionDriver {
                 retrigger,
             },
             &waveform,
-            saved,
-        );
-        let options = self.report(F, "Calling AOutScan", started)?;
-        // C startWaveGen: Run is 1 once the scan is running.
-        self.set_param(F, self.params.wave_gen_run, ParamValue::Int32(1))?;
-        self.base.trace_print(
-            TraceMask::FLOW,
-            &format!(
-                "{DRIVER}:{F}: called cbAOutScan, firstChan={first_chan}, \
-                 lastChan={last_chan}, numPoints*numWaveGenChans_={}, dwell={:.6}, \
-                 options=0x{options:x}",
-                (last_chan - first_chan + 1) as usize * num_points,
-                generator.dwell_actual
-            ),
-        );
-        // The axis of the waveform now playing follows the dwell it plays
-        // at, which the device may have rounded (upstream-c-defects #230).
-        let (time_buffer, time_wf) = if first_is_user {
-            (
-                &mut generator.user_time_buffer,
-                self.params.wave_gen_user_time_wf,
-            )
-        } else {
-            (
-                &mut generator.int_time_buffer,
-                self.params.wave_gen_int_time_wf,
-            )
+            &saved,
+            trace,
+        ) {
+            Ok(dwell) => dwell,
+            Err(code) => return Ok(code),
         };
-        updates.push(wave_dig::time_update(
-            time_buffer,
+        self.base
+            .set_float64_param(p.wave_gen_dwell_actual, 0, dwell)?;
+        self.base
+            .set_float64_param(p.wave_gen_total_time, 0, dwell * num_points as f64)?;
+        // C keeps the axis of the requested dwell after AOutScan returns the
+        // rate it runs (drvMultiFunction.cpp:1738-1757). C defect, not copied
+        // (upstream-c-defects #230).
+        let time_wf = if first_type == wave_gen::WAVE_TYPE_USER {
+            p.wave_gen_user_time_wf
+        } else {
+            p.wave_gen_int_time_wf
+        };
+        let times = wave_dig::time_axis(num_points as i32, dwell);
+        updates.push(ParamSetValue::array(
             time_wf,
-            num_points,
-            generator.dwell_actual,
-        ));
-        let dwell_actual = generator.dwell_actual;
-        self.set_param(
-            F,
-            self.params.wave_gen_dwell_actual,
-            ParamValue::Float64(dwell_actual),
-        )?;
-        self.set_param(
-            F,
-            self.params.wave_gen_total_time,
-            ParamValue::Float64(dwell_actual * num_points as f64),
-        )?;
-        Ok(())
-    }
-
-    /// C `stopWaveGen`: Run back to 0, the scan stopped, and the outputs it
-    /// drove put back, each reported. The scan stop's own failure is what C
-    /// returns, with no line of its own (drvMultiFunction.cpp:1712-1737).
-    fn stop_generator(&mut self, dev: &DaqDevice, generator: &mut WaveGenState) -> Option<Failure> {
-        let _ = self.base.params.set_int32(self.params.wave_gen_run, 0, 0);
-        let (stopped, restored) = wave_gen::stop_wave_gen(dev, generator);
-        for result in restored {
-            let _ = self.report("stopWaveGen", "calling AOut", result);
-        }
-        stopped.err().map(|e| self.fail(None, e.code))
-    }
-
-    /// A waveform parameter changed: redefine `channel`'s waveform and, if the
-    /// generator is running, restart it on the new one (C stopWaveGen +
-    /// startWaveGen).
-    fn redefine_waveform(
-        &mut self,
-        channel: i32,
-        updates: &mut Vec<ParamSetValue>,
-    ) -> Option<Failure> {
-        let (device, state) = (self.device.clone(), self.state.clone());
-        let dev = device.lock().unwrap();
-        let mut st = state.lock().unwrap();
-        let defined = self
-            .define_waveform(&mut st.wave_gen, channel, updates)
-            .err();
-        if !st.wave_gen.running {
-            return defined;
-        }
-        let stopped = self.stop_generator(&dev, &mut st.wave_gen);
-        let started = self.start_generator(&dev, &mut st.wave_gen, updates).err();
-        if started.is_some() {
-            let _ = self.base.params.set_int32(self.params.wave_gen_run, 0, 0);
-        }
-        started.or(stopped).or(defined)
-    }
-
-    /// C `startWaveDig`: read every digitizer setting and start the scan,
-    /// publishing the actual dwell and total time -- or, when the device
-    /// refuses, the dwell C reports for that (see [`wave_dig::start_wave_dig`]).
-    fn start_digitizer(
-        &mut self,
-        dev: &DaqDevice,
-        dig: &mut WaveDigState,
-        updates: &mut Vec<ParamSetValue>,
-    ) -> Result<(), Failure> {
-        const F: &str = "startWaveDig";
-        let get_i32 = |base: &PortDriverBase, reason| base.get_int32_param(reason, 0);
-        let flag = |base: &PortDriverBase, reason| get_i32(base, reason).map(|v| v != 0);
-        let first_chan = self
-            .param(F, get_i32(&self.base, self.params.wave_dig_first_chan))?
-            .max(0) as usize;
-        let num_chans = self
-            .param(F, get_i32(&self.base, self.params.wave_dig_num_chans))?
-            .max(0) as usize;
-        let num_points = self
-            .param(F, get_i32(&self.base, self.params.wave_dig_num_points))?
-            .max(0) as usize;
-        let dwell = self.param(
-            F,
-            self.base.get_float64_param(self.params.wave_dig_dwell, 0),
-        )?;
-        let input_mode = self.param(F, get_i32(&self.base, self.params.analog_in_mode))?;
-        let mut ranges = [uldaq_sys::BIP10VOLTS; MAX_ANALOG_IN];
-        for (ch, range) in ranges.iter_mut().enumerate() {
-            *range = self.param(
-                F,
-                self.base
-                    .get_int32_param(self.params.analog_in_range, ch as i32),
-            )?;
-        }
-        let scan = WaveDigScan {
-            first_chan,
-            num_chans,
-            num_points,
-            dwell,
-            input_mode,
-            ranges,
-            ext_trigger: self.param(F, flag(&self.base, self.params.wave_dig_ext_trigger))?,
-            ext_clock: self.param(F, flag(&self.base, self.params.wave_dig_ext_clock))?,
-            continuous: self.param(F, flag(&self.base, self.params.wave_dig_continuous))?,
-            retrigger: self.param(F, flag(&self.base, self.params.wave_dig_retrigger))?,
-            burst_mode: self.param(F, flag(&self.base, self.params.wave_dig_burst_mode))?,
-        };
-        self.set_param(F, self.params.wave_dig_current_point, ParamValue::Int32(0))?;
-        let scanned = match wave_dig::start_wave_dig(dev, dig, &scan) {
-            Ok(started) => Ok(started),
-            Err(WaveDigStartError::Queue(e)) => {
-                return self.report(F, "Calling ALoadQueue", Err(e));
-            }
-            Err(WaveDigStartError::Scan {
-                error,
-                dwell_actual,
-            }) => Err((error, dwell_actual)),
-        };
-        self.info(F, "Calling ALoadQueue");
-        // A dwell comes back from every start that got past the queue load.
-        let dwell_actual = match &scanned {
-            Ok(started) => started.dwell_actual,
-            Err((_, dwell_actual)) => *dwell_actual,
-        };
-        self.set_param(
-            F,
-            self.params.wave_dig_dwell_actual,
-            ParamValue::Float64(dwell_actual),
-        )?;
-        let started = self.report(F, "Calling AInScan", scanned.map_err(|(e, _)| e))?;
-        self.set_param(F, self.params.wave_dig_run, ParamValue::Int32(1))?;
-        self.base.trace_print(
-            TraceMask::FLOW,
-            &format!(
-                "{DRIVER}:{F}: called cbAInScan, firstChan={first_chan}, lastChan={}, \
-                 numPoints={num_points}, dwell={:.6}, options=0x{:x}",
-                first_chan + num_chans - 1,
-                started.dwell_actual,
-                started.options
-            ),
-        );
-        self.set_param(
-            F,
-            self.params.wave_dig_total_time,
-            ParamValue::Float64(started.dwell_actual * num_points as f64),
-        )?;
-        // The time axis of the samples this scan takes follows the dwell it
-        // runs at, not the one asked for (upstream-c-defects #230).
-        updates.push(wave_dig::time_update(
-            &mut dig.time_buffer,
-            self.params.wave_dig_time_wf,
-            num_points,
-            started.dwell_actual,
-        ));
-        Ok(())
-    }
-
-    /// C `stopWaveDig`, the single end of every digitizer scan -- a Stop, a
-    /// finished one-shot, a scan the device dropped: Run goes back to 0, the
-    /// points acquired go to the waveform records, the scan is stopped, and
-    /// with AutoRestart a new scan starts from the current settings. C
-    /// returns the stop's status OR'd with the restart's
-    /// (drvMultiFunction.cpp:1864-1881).
-    fn stop_digitizer(
-        &mut self,
-        dev: &DaqDevice,
-        dig: &mut WaveDigState,
-        updates: &mut Vec<ParamSetValue>,
-    ) -> Option<Failure> {
-        let _ = self.base.params.set_int32(self.params.wave_dig_run, 0, 0);
-        let _ = self.base.params.set_int32(
-            self.params.wave_dig_current_point,
             0,
-            dig.current_point as i32,
-        );
-        self.trace_wave_dig_callbacks(dig);
-        updates.extend(wave_dig::waveform_updates(&self.params, dig));
-        let stopped = wave_dig::stop_wave_dig(dev, dig).and_then(|result| {
-            self.report("stopWaveDig", "Stopping AIn scan", result)
-                .err()
-        });
-        let auto_restart = self
-            .base
-            .get_int32_param(self.params.wave_dig_auto_restart, 0)
-            .unwrap_or(0)
-            != 0;
-        let restarted = if auto_restart {
-            self.start_digitizer(dev, dig, updates).err()
-        } else {
-            None
+            ParamValue::Float32Array(times.into()),
+        ));
+        Ok(0)
+    }
+
+    /// The writes C answers with `defineWaveform` and, while the generator
+    /// runs, `stopWaveGen` + `startWaveGen` (`drvMultiFunction.cpp:2171-2183,
+    /// 2292-2305`).
+    fn wave_gen_settings(&self) -> [usize; 13] {
+        let p = &self.params;
+        [
+            p.wave_gen_wave_type,
+            p.wave_gen_user_num_points,
+            p.wave_gen_int_num_points,
+            p.wave_gen_enable,
+            p.wave_gen_ext_trigger,
+            p.wave_gen_ext_clock,
+            p.wave_gen_continuous,
+            p.wave_gen_user_dwell,
+            p.wave_gen_int_dwell,
+            p.wave_gen_pulse_width,
+            p.wave_gen_pulse_delay,
+            p.wave_gen_amplitude,
+            p.wave_gen_offset,
+        ]
+    }
+
+    /// C `computeWaveGenTimes`: both generator time axes, posted when a
+    /// point count or dwell is written.
+    fn compute_wave_gen_times(&self) -> [ParamSetValue; 2] {
+        let p = &self.params;
+        let axis = |points, dwell, wf| {
+            let times = wave_dig::time_axis(self.int(points, 0), self.float(dwell, 0));
+            ParamSetValue::array(wf, 0, ParamValue::Float32Array(times.into()))
         };
-        restarted.or(stopped)
-    }
-
-    /// C `computeWaveDigTimes`: the digitizer time base from the requested
-    /// WAVEDIG_DWELL over WAVEDIG_NUM_POINTS, as an array callback.
-    fn wave_dig_time_update(&self) -> ParamSetValue {
-        let num_points = self
-            .base
-            .get_int32_param(self.params.wave_dig_num_points, 0)
-            .unwrap_or(0)
-            .max(0) as usize;
-        let dwell = self
-            .base
-            .get_float64_param(self.params.wave_dig_dwell, 0)
-            .unwrap_or(0.0);
-        let mut st = self.state.lock().unwrap();
-        wave_dig::time_update(
-            &mut st.wave_dig.time_buffer,
-            self.params.wave_dig_time_wf,
-            num_points,
-            dwell,
-        )
-    }
-
-    /// C `computeWaveGenTimes`: both generator time bases, each from its own
-    /// point count and dwell, as array callbacks.
-    fn wave_gen_time_updates(&self) -> Vec<ParamSetValue> {
-        let get_points = |reason| self.base.get_int32_param(reason, 0).unwrap_or(0).max(0) as usize;
-        let get_dwell = |reason| self.base.get_float64_param(reason, 0).unwrap_or(0.0);
-        let user = (
-            get_points(self.params.wave_gen_user_num_points),
-            get_dwell(self.params.wave_gen_user_dwell),
-        );
-        let int = (
-            get_points(self.params.wave_gen_int_num_points),
-            get_dwell(self.params.wave_gen_int_dwell),
-        );
-        let mut st = self.state.lock().unwrap();
-        vec![
-            wave_dig::time_update(
-                &mut st.wave_gen.user_time_buffer,
-                self.params.wave_gen_user_time_wf,
-                user.0,
-                user.1,
+        [
+            axis(
+                p.wave_gen_user_num_points,
+                p.wave_gen_user_dwell,
+                p.wave_gen_user_time_wf,
             ),
-            wave_dig::time_update(
-                &mut st.wave_gen.int_time_buffer,
-                self.params.wave_gen_int_time_wf,
-                int.0,
-                int.1,
+            axis(
+                p.wave_gen_int_num_points,
+                p.wave_gen_int_dwell,
+                p.wave_gen_int_time_wf,
             ),
         ]
     }
 
-    /// C `isThermocouple`: `chan` is configured as a thermocouple input. The
-    /// thermocouple-type and open-detect writes need it: ulAISetConfig
-    /// rejects both with ERR_BAD_AI_CHAN_TYPE on a voltage channel.
+    fn wave_gen_restore(&self) -> Vec<(i32, i32)> {
+        wave_gen::restore_outputs(&self.params, |r, a| self.int(r, a))
+    }
+
+    /// C `getIntegerParam`, whose status every caller ignores: an unset
+    /// value reads as the 0 an untouched local would hold here.
+    fn int(&self, reason: usize, addr: i32) -> i32 {
+        self.base.get_int32_param(reason, addr).unwrap_or(0)
+    }
+
+    /// C `getDoubleParam`; see [`Self::int`].
+    fn float(&self, reason: usize, addr: i32) -> f64 {
+        self.base.get_float64_param(reason, addr).unwrap_or(0.0)
+    }
+
+    /// C `getUIntDigitalParam`; see [`Self::int`].
+    fn uint(&self, reason: usize, addr: i32) -> u32 {
+        self.base.get_uint32_param(reason, addr).unwrap_or(0)
+    }
+
+    /// A WaveGen setting write: `defineWaveform(addr)`, then
+    /// `stopWaveGen(); startWaveGen();` of a running generator, statuses or-ed.
+    fn wave_gen_setting_changed(
+        &mut self,
+        addr: i32,
+        trace: &SelfTrace,
+        updates: &mut Vec<ParamSetValue>,
+    ) -> AsynResult<UlError> {
+        let device = self.device.clone();
+        let dev = device.lock().unwrap();
+        let state = self.state.clone();
+        let mut st = state.lock().unwrap();
+        // C drops defineWaveform's -1 (drvMultiFunction.cpp:2178, :2300), so
+        // a refused point count still puts successfully. C defect, not copied
+        // (upstream-c-defects #231).
+        let refused: UlError = if (0..MAX_ANALOG_OUT as i32).contains(&addr)
+            && !self.define_waveform(&mut st.wave_gen, addr, trace, updates)?
+        {
+            -1
+        } else {
+            0
+        };
+        if !st.wave_gen.running {
+            return Ok(refused);
+        }
+        let restore = self.wave_gen_restore();
+        let stopped = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, &restore, trace);
+        Ok(refused | stopped | self.start_wave_gen(&dev, &mut st.wave_gen, trace, updates)?)
+    }
+
+    /// Whether `chan` is configured as a thermocouple input. ulAISetConfig
+    /// rejects the TC settings with ERR_BAD_AI_CHAN_TYPE otherwise, so C
+    /// writes them only then.
     fn is_thermocouple(&self, chan: i32) -> bool {
-        self.base
-            .get_int32_param(self.params.analog_in_type, chan)
-            .unwrap_or(0)
-            != 0
+        self.int(self.params.analog_in_type, chan) == AI_CHAN_TYPE_TC
     }
 
-    /// C's thermocouple-type write (drvMultiFunction.cpp:1972-1978,
-    /// :2004-2016): `chan`'s stored type to the device, reported under
-    /// `message` as C words each of the two call sites.
-    fn set_tc_type(&mut self, dev: &DaqDevice, chan: i32, message: &str) -> Option<Failure> {
-        let tc = self
-            .base
-            .get_int32_param(self.params.thermocouple_type, chan)
-            .ok()?;
-        let set = dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TC_TYPE, chan as u32, tc as i64);
-        self.report("writeInt32", message, set).err()
-    }
-
-    /// C `setOpenThermocoupleDetect` (drvMultiFunction.cpp:2214-2238):
-    /// `chan`'s stored open-thermocouple detection to the device.
-    fn set_open_detect(&mut self, dev: &DaqDevice, chan: i32) -> Option<Failure> {
-        let detect = self
-            .base
-            .get_int32_param(self.params.thermocouple_open_detect, chan)
-            .ok()?;
-        let otd = if detect != 0 {
+    /// C `setOpenThermocoupleDetect`.
+    fn set_open_tc_detect(&self, dev: &DaqDevice, chan: i32, value: i32) -> UlError {
+        let otd = if value != 0 {
             uldaq_sys::OTD_ENABLED
         } else {
             uldaq_sys::OTD_DISABLED
         };
-        let set = dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_OTD_MODE, chan as u32, otd);
-        self.report(
+        self.trace().report(
+            &dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_OTD_MODE, chan as u32, otd),
             "setOpenThermocoupleDetect",
             "Setting thermocouple open detect mode",
-            set,
         )
-        .err()
+    }
+
+    fn trace(&self) -> SelfTrace {
+        self.state.lock().unwrap().trace.clone()
+    }
+
+    /// C `startPulseGenerator`. C bounds the frequency and delay by limits
+    /// its constructor sets only for timer models; on the 2408 they are
+    /// uninitialized (drvMultiFunction.cpp:763-766, :1140), so only the duty
+    /// cycle is bounded here.
+    fn start_pulse_generator(
+        &mut self,
+        dev: &DaqDevice,
+        timer: i32,
+        trace: &SelfTrace,
+    ) -> AsynResult<UlError> {
+        const FUNCTION: &str = "startPulseGenerator";
+        let p = self.params;
+        let duty_cycle = self.float(p.pulse_gen_duty_cycle, timer);
+        let mut timing = PulseTiming {
+            frequency: 1. / self.float(p.pulse_gen_period, timer),
+            duty_cycle: if duty_cycle <= 0. {
+                0.0001
+            } else if duty_cycle >= 1. {
+                0.9999
+            } else {
+                duty_cycle
+            },
+            initial_delay: self.float(p.pulse_gen_delay, timer),
+        };
+        let idle = if self.int(p.pulse_gen_idle_state, timer) == 0 {
+            uldaq_sys::TMRIS_LOW
+        } else {
+            uldaq_sys::TMRIS_HIGH
+        };
+        let count = self.int(p.pulse_gen_count, timer) as u64;
+        let status = trace.report(
+            &dev.pulse_out_start(timer, &mut timing, count, idle, uldaq_sys::PO_DEFAULT),
+            FUNCTION,
+            "Calling PulseOutStart",
+        );
+        if status != 0 {
+            return Ok(status);
+        }
+        if let Some(running) = self.pulse_gen_running.get_mut(timer as usize) {
+            *running = true;
+        }
+        let period = 1. / timing.frequency;
+        trace.print(
+            TraceMask::FLOW,
+            format_args!(
+                "{DRIVER_NAME}:{FUNCTION}: started pulse generator {timer} actual frequency={:.6}, actual period={:.6}, actual duty cycle={:.6}, actual delay={:.6}\n",
+                CFloat(timing.frequency),
+                CFloat(period),
+                CFloat(timing.duty_cycle),
+                CFloat(timing.initial_delay)
+            ),
+        );
+        self.base
+            .set_float64_param(p.pulse_gen_period, timer, period)?;
+        self.base
+            .set_float64_param(p.pulse_gen_duty_cycle, timer, timing.duty_cycle)?;
+        self.base
+            .set_float64_param(p.pulse_gen_delay, timer, timing.initial_delay)?;
+        Ok(0)
+    }
+
+    /// C `stopPulseGenerator`, which does not report its status.
+    fn stop_pulse_generator(&mut self, dev: &DaqDevice, timer: i32) -> UlError {
+        if let Some(running) = self.pulse_gen_running.get_mut(timer as usize) {
+            *running = false;
+        }
+        trace::status_of(&dev.pulse_out_stop(timer))
+    }
+
+    fn is_pulse_gen_running(&self, timer: i32) -> bool {
+        self.pulse_gen_running
+            .get(timer as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// A pulse setting write: `stopPulseGenerator(); startPulseGenerator();`
+    /// of a running generator, statuses or-ed.
+    fn pulse_setting_changed(&mut self, timer: i32, trace: &SelfTrace) -> AsynResult<UlError> {
+        if !self.is_pulse_gen_running(timer) {
+            return Ok(0);
+        }
+        let device = self.device.clone();
+        let dev = device.lock().unwrap();
+        let stopped = self.stop_pulse_generator(&dev, timer);
+        Ok(stopped | self.start_pulse_generator(&dev, timer, trace)?)
     }
 }
 
@@ -940,497 +761,469 @@ impl PortDriver for MultiFunctionDriver {
         &mut self.base
     }
 
-    /// C `getBounds` (drvMultiFunction.cpp:1920-1937): the raw span of the
-    /// DAC and the ADC, so an ao/ai record with LINR=LINEAR converts volts to
-    /// counts and back.
     fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
-        let resolution = if user.reason == self.params.analog_out_value {
-            self.dac_resolution
-        } else if user.reason == self.params.analog_in_value {
-            self.adc_resolution
+        self.board.resolution.bounds(&self.params, user.reason)
+    }
+
+    /// C `readEnum` (drvMultiFunction.cpp:2531-2577) for the USB-2408-2AO;
+    /// a parameter without a table is asynError.
+    fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
+        let p = &self.params;
+        let reason = user.reason;
+        let table = if reason == p.analog_in_range || reason == p.voltage_in_range {
+            board_enums::INPUT_RANGE
+        } else if reason == p.analog_out_range {
+            board_enums::OUTPUT_RANGE
+        } else if reason == p.analog_in_type {
+            board_enums::INPUT_TYPE
+        } else if reason == p.temperature_sensor {
+            board_enums::TEMPERATURE_SENSOR
+        } else if reason == p.temperature_wiring {
+            board_enums::TEMPERATURE_WIRING
         } else {
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: "no bounds for this parameter".into(),
+                message: String::new(),
             });
         };
-        Ok((0, ((1i64 << resolution) - 1) as i32))
+        Ok((0, board_enums::entries(table).into()))
     }
 
-    /// C `MultiFunction::report`: the asynPortDriver report, then the board
-    /// and what this port drives on it.
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
-        write_port_report(&self.base, out, level);
-        let board_type = self
-            .base
-            .get_int32_param(self.params.model_number, 0)
-            .unwrap_or(0);
-        let board_name = self
-            .base
-            .get_string_param(self.params.model_name, 0)
-            .map(|name| String::from_utf8_lossy(name).into_owned())
-            .unwrap_or_default();
-        let _ = writeln!(
-            out,
-            "  Port: {}, board ID={board_type}, board type={board_name}",
-            self.base.port_name
-        );
-        if level >= 1 {
-            let _ = writeln!(out, "  analog inputs      = {MAX_ANALOG_IN}");
-            let _ = writeln!(out, "  analog input bits  = {}", self.adc_resolution);
-            let _ = writeln!(out, "  analog outputs     = {MAX_ANALOG_OUT}");
-            let _ = writeln!(out, "  analog output bits = {}", self.dac_resolution);
-            let _ = writeln!(out, "  temperature inputs = {MAX_ANALOG_IN}");
-            let _ = writeln!(out, "  digital I/O ports  = 1");
-            let _ = writeln!(out, "  digital I/O port     0");
-            let _ = writeln!(out, "    I/O port              = {}", uldaq_sys::AUXPORT);
-            let _ = writeln!(out, "    I/O bits              = {NUM_IO_BITS}");
-            let configurable = u8::from(self.dio_configurable);
-            let _ = writeln!(out, "    I/O bit configurable  = {configurable}");
-            let _ = writeln!(out, "    I/O port configurable = {configurable}");
-            let _ = writeln!(out, "    I/O port mask         = 0x{PORT_MASK:x}");
-            let _ = writeln!(out, "  timers             = 0");
-            let _ = write!(out, "  # counters         = {MAX_COUNTERS}");
-            let _ = write!(out, "  first counter      = 0");
-            let _ = write!(out, "  counterCounts = ");
-            for i in 0..MAX_COUNTERS as i32 {
-                let counts = self
-                    .base
-                    .get_int32_param(self.params.counter_value, i)
-                    .unwrap_or(0);
-                let _ = write!(out, " {counts}");
-            }
-            let _ = writeln!(out);
-        }
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
+        self.asyn_port_driver_report(out, level);
+        let counts: Vec<i32> = (0..MAX_COUNTERS as i32)
+            .map(|ch| {
+                self.base
+                    .get_int32_param(self.params.counter_value, ch)
+                    .unwrap_or(0)
+            })
+            .collect();
+        self.board.report(out, &self.base.port_name, level, &counts);
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        const F: &str = "writeInt32";
-        let mut failure: Option<Failure> = None;
+        const FUNCTION: &str = "writeInt32";
+        let mut status: UlError = 0;
+        let trace = self.trace();
         let reason = user.reason;
         let addr = device_addr(user.addr);
-        // What C's trace line reports: the value as written, before any clamp.
-        let written = value;
 
         // The scan buffers are sized once from maxInputPoints/maxOutputPoints,
         // so a point count above that capacity must never reach the store --
-        // wave_dig indexes its fixed per-channel buffers by it. The records
-        // carry the same bound in DRVL/DRVH; this gate is what makes the
-        // invariant hold no matter what the database says.
+        // wave_dig indexes its fixed per-channel buffers by it.
         let value = if reason == self.params.wave_dig_num_points {
-            value.clamp(1, self.max_input_points as i32)
+            if value > self.max_input_points as i32 {
+                trace.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}::{FUNCTION} error WaveDigNumPoints={value} must be less than MaxInputPoints={}\n",
+                        self.max_input_points
+                    ),
+                );
+            }
+            value.min(self.max_input_points as i32)
         } else if reason == self.params.wave_gen_num_points {
             value.clamp(1, self.max_output_points as i32)
-        } else if reason == self.params.analog_in_mode {
-            // The USB-2408 has only differential and single-ended inputs; C
-            // takes anything but differential as single-ended
-            // (drvMultiFunction.cpp:1989), so no other mode reaches ulAIn.
-            if value == uldaq_sys::AI_DIFFERENTIAL {
-                uldaq_sys::AI_DIFFERENTIAL
-            } else {
-                uldaq_sys::AI_SINGLE_ENDED
-            }
         } else {
             value
         };
 
-        self.base.params.set_int32(reason, addr, value)?;
+        self.base.set_int32_param(reason, addr, value)?;
 
         // Collected under the state lock, applied after it is dropped: both
         // helpers borrow the driver, and apply_updates needs it mutably.
         let mut wave_arrays: Vec<ParamSetValue> = Vec::new();
-        let mut time_wf: Option<ParamSetValue> = None;
-        // The helpers below report through the driver, so the device is held
-        // through a handle of its own.
-        let device = self.device.clone();
 
-        // Command params act on any written value, as C's do.
-        if reason == self.params.counter_reset {
-            let cleared = device.lock().unwrap().counter_clear(addr);
-            failure = self.report(F, "Resetting counter", cleared).err();
+        if reason == self.params.wave_dig_num_points {
+            let dwell = self.float(self.params.wave_dig_dwell, 0);
+            wave_arrays.push(wave_dig::compute_wave_dig_times(&self.params, value, dwell));
+        } else if reason == self.params.counter_reset {
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.counter_load(addr, uldaq_sys::CRT_LOAD, 0),
+                FUNCTION,
+                "Resetting counter",
+            );
         } else if reason == self.params.analog_out_value {
             // Only write immediately if sync mode is disabled
-            let sync_enable = self
-                .base
-                .get_int32_param(self.params.analog_out_sync_enable, 0)
-                .unwrap_or(0);
-            if sync_enable == 0 && self.state.lock().unwrap().wave_gen.running {
-                // C refuses before touching the DAC (drvMultiFunction.cpp:
-                // 2131-2135): the generator owns both outputs while it runs.
-                failure = Some(self.refuse(
-                    F,
-                    "cannot write analog outputs while waveform generator is running.",
-                ));
-            } else if sync_enable == 0 {
-                let range = self
-                    .base
-                    .get_int32_param(self.params.analog_out_range, addr)?;
-                let written = device.lock().unwrap().analog_out(
-                    addr,
-                    range,
-                    uldaq_sys::AOUT_FF_NOSCALEDATA,
-                    value as f64,
+            let sync_enable = self.int(self.params.analog_out_sync_enable, 0);
+            if sync_enable == 0 {
+                if self.state.lock().unwrap().wave_gen.running {
+                    trace.report_error(
+                        -1,
+                        FUNCTION,
+                        "cannot write analog outputs while waveform generator is running.",
+                    );
+                    // C returns before its callbacks and its summary line.
+                    return trace::asyn_status(-1);
+                }
+                let dev = self.device.lock().unwrap();
+                let range = map_range(&trace, self.int(self.params.analog_out_range, addr));
+                status = trace.report(
+                    &dev.analog_out(addr, range, uldaq_sys::AOUT_FF_NOSCALEDATA, value as f64),
+                    FUNCTION,
+                    "calling AOut",
                 );
-                failure = self.report(F, "calling AOut", written).err();
             }
+        } else if reason == self.params.analog_out_sync_master {
+            // The record's 0 is Master, 1 Slave.
+            let mode = if value != 0 {
+                uldaq_sys::AOSM_SLAVE
+            } else {
+                uldaq_sys::AOSM_MASTER
+            };
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ao_set_config(uldaq_sys::AO_CFG_SYNC_MODE, addr as u32, mode),
+                FUNCTION,
+                "Setting analog out master",
+            );
         } else if reason == self.params.analog_out_sync_write {
-            // Simultaneous write of all analog outputs
+            // C writes the outputs on any value, "Done" (0) included.
+            let dev = self.device.lock().unwrap();
             let mut values = vec![0.0f64; MAX_ANALOG_OUT];
             let mut ranges = vec![uldaq_sys::BIP10VOLTS; MAX_ANALOG_OUT];
             for ch in 0..MAX_ANALOG_OUT {
-                values[ch] = self
-                    .base
-                    .get_int32_param(self.params.analog_out_value, ch as i32)?
-                    as f64;
-                ranges[ch] = self
-                    .base
-                    .get_int32_param(self.params.analog_out_range, ch as i32)?;
+                values[ch] = self.int(self.params.analog_out_value, ch as i32) as f64;
+                ranges[ch] = map_range(&trace, self.int(self.params.analog_out_range, ch as i32));
             }
-            let written = device.lock().unwrap().analog_out_array(
+            // C `writeAnalogOutSync` does not print its status. Its
+            // AOUTARRAY_FF_SIMULTANEOUS (drvMultiFunction.cpp:2259) is a
+            // flag the 2408 refuses with ERR_BAD_FLAG (AoUsb24xx.cpp:18),
+            // so C's sync write never reaches the DACs. Not copied: the
+            // 2408 updates both DACs together without it.
+            status = trace::status_of(&dev.analog_out_array(
                 0,
                 (MAX_ANALOG_OUT - 1) as i32,
                 &ranges,
                 uldaq_sys::AOUTARRAY_FF_NOSCALEDATA,
                 &mut values,
-            );
-            // C writeAnalogOutSync prints no line of its own, only the closing
-            // one (drvMultiFunction.cpp:2241-2270).
-            if let Err(e) = written {
-                failure = Some(self.fail(None, e.code));
-            }
-        } else if reason == self.params.analog_in_type {
-            let dev = device.lock().unwrap();
-            let chan_type = if value != 0 {
-                uldaq_sys::AI_TC
+            ));
+        } else if reason == self.params.analog_in_mode {
+            // C's DIFFERENTIAL is the record's menu value 0 (:225, :1989).
+            self.state.lock().unwrap().ai_input_mode = if value == 0 {
+                uldaq_sys::AI_DIFFERENTIAL
             } else {
-                uldaq_sys::AI_VOLTAGE
+                uldaq_sys::AI_SINGLE_ENDED
             };
-            let set = dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TYPE, addr as u32, chan_type);
-            failure = self.report(F, "Setting analog input type", set).err();
-            if value != 0 {
-                // The channel has just become a thermocouple input; the TC type
-                // and open-detect settings the records already hold could not be
-                // pushed while it was a voltage channel, so push them now, both,
-                // as C does whatever the type write returned.
-                let tc_type = self.set_tc_type(&dev, addr, "Set thermocouple type");
-                let open_detect = self.set_open_detect(&dev, addr);
-                failure = failure.or(tc_type).or(open_detect);
+        } else if reason == self.params.analog_in_type {
+            let dev = self.device.lock().unwrap();
+            let chan_type = if value == AI_CHAN_TYPE_VOLTAGE {
+                uldaq_sys::AI_VOLTAGE
+            } else {
+                uldaq_sys::AI_TC
+            };
+            status = trace.report(
+                &dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TYPE, addr as u32, chan_type),
+                FUNCTION,
+                "Setting analog input type",
+            );
+            if value == AI_CHAN_TYPE_TC {
+                // The TC type and open-detect settings the records already
+                // hold could not be pushed while the channel read volts.
+                let tc = self.int(self.params.thermocouple_type, addr);
+                status = trace.report(
+                    &dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TC_TYPE, addr as u32, tc as i64),
+                    FUNCTION,
+                    "Set thermocouple type",
+                );
+                let detect = self.int(self.params.thermocouple_open_detect, addr);
+                // C drops this status (drvMultiFunction.cpp:1981, :2020). C
+                // defect, not copied (upstream-c-defects #231).
+                let otd = self.set_open_tc_detect(&dev, addr, detect);
+                if status == 0 {
+                    status = otd;
+                }
             }
         } else if reason == self.params.analog_in_rate {
-            // C: the per-channel ADC data rate (samples/s), which sets the
-            // conversion time and the 50/60 Hz rejection of every read on the
-            // channel, ulAIn, ulTIn and the scan queue alike.
-            let set = device.lock().unwrap().ai_set_config_dbl(
-                uldaq_sys::AI_CFG_CHAN_DATA_RATE,
-                addr as u32,
-                value as f64,
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ai_set_config_dbl(uldaq_sys::AI_CFG_CHAN_DATA_RATE, addr as u32, value as f64),
+                FUNCTION,
+                "Setting data rate",
             );
-            failure = self.report(F, "Setting data rate", set).err();
-        } else if reason == self.params.analog_in_mode {
-            // Kept in the parameter and applied at each ulAIn / scan, as C's
-            // Linux build keeps it in aiInputMode_ (drvMultiFunction.cpp:
-            // 1984-1991), which reports it set.
-            self.info(F, "Setting analog input mode");
         } else if reason == self.params.thermocouple_type && self.is_thermocouple(addr) {
-            let dev = device.lock().unwrap();
-            failure = self.set_tc_type(&dev, addr, "Setting thermocouple type");
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TC_TYPE, addr as u32, value as i64),
+                FUNCTION,
+                "Setting thermocouple type",
+            );
         } else if reason == self.params.thermocouple_open_detect && self.is_thermocouple(addr) {
-            let dev = device.lock().unwrap();
-            failure = self.set_open_detect(&dev, addr);
+            let dev = self.device.lock().unwrap();
+            status = self.set_open_tc_detect(&dev, addr, value);
+        } else if reason == self.params.temperature_sensor {
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TYPE, addr as u32, value as i64),
+                FUNCTION,
+                "Setting temperature sensor",
+            );
+        } else if reason == self.params.temperature_wiring {
+            let dev = self.device.lock().unwrap();
+            status = trace.report(
+                &dev.ai_set_config(
+                    uldaq_sys::AI_CFG_CHAN_SENSOR_CONNECTION_TYPE,
+                    addr as u32,
+                    value as i64,
+                ),
+                FUNCTION,
+                "Setting temperature wiring",
+            );
         } else if reason == self.params.trigger_mode {
-            // Cached for the scans, as C's Linux build caches it
-            // (drvMultiFunction.cpp:2073-2083); a mode mapTriggerType has no
-            // uldaq trigger for is refused as C refuses it, with
-            // mapTriggerType's line and then reportError's.
-            if is_supported_trigger_mode(value) {
-                self.info(F, "Setting trigger mode");
-            } else {
-                self.report_error(format!(
-                    "{DRIVER}::mapTriggerType unsupported cbwTriggerType={value}"
-                ));
-                failure = Some(self.fail_with(F, "Setting trigger mode"));
+            // C's Linux build only caches the mapped type, which no scan
+            // reads (drvMultiFunction.cpp:2074-2083).
+            if !trigger_mode_maps(value) {
+                trace.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}::mapTriggerType unsupported cbwTriggerType={value}\n"
+                    ),
+                );
+                status = -1;
             }
-        } else if reason == self.params.wave_dig_num_points {
-            // Clamped above; C reports a count beyond the buffers and keeps
-            // the write (drvMultiFunction.cpp:2097-2104).
-            if written > self.max_input_points as i32 {
-                self.report_error(format!(
-                    "{DRIVER}::{F} error WaveDigNumPoints={written} must be less than \
-                     MaxInputPoints={}",
-                    self.max_input_points
-                ));
+            trace.report_error(status, FUNCTION, "Setting trigger mode");
+        } else if reason == self.params.pulse_gen_run {
+            // C starts on any 1, running or not: a counted train ends unseen.
+            let device = self.device.clone();
+            let dev = device.lock().unwrap();
+            if value != 0 {
+                status = self.start_pulse_generator(&dev, addr, &trace)?;
+            } else if self.is_pulse_gen_running(addr) {
+                status = self.stop_pulse_generator(&dev, addr);
             }
-        } else if reason == self.params.wave_dig_trigger_count {
-            self.info(F, "Setting waveDig trigger count");
-        } else if reason == self.params.wave_gen_trigger_count {
-            self.info(F, "Setting waveGen trigger count");
+        } else if reason == self.params.pulse_gen_count
+            || reason == self.params.pulse_gen_idle_state
+        {
+            status = self.pulse_setting_changed(addr, &trace)?;
         } else if reason == self.params.wave_dig_run {
-            let state = self.state.clone();
-            let dev = device.lock().unwrap();
-            let mut st = state.lock().unwrap();
+            let dev = self.device.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
             // C parity (drvMultiFunction.cpp:2086-2091): start only when idle,
-            // stop only when running.
+            // stop only when running. The busy record echoes the driver's own
+            // value back, so an unguarded start would hit ERR_ALREADY_ACTIVE.
             if value != 0 && !st.wave_dig.running {
-                if let Err(f) = self.start_digitizer(&dev, &mut st.wave_dig, &mut wave_arrays) {
-                    failure = Some(f);
-                    self.base.params.set_int32(reason, addr, 0)?;
-                }
+                let scan = WaveDigScan::read(
+                    &self.params,
+                    st.ai_input_mode,
+                    |r, a| self.int(r, a),
+                    |r, a| self.float(r, a),
+                );
+                (status, wave_arrays) =
+                    wave_dig::start_wave_dig(&dev, &mut st.wave_dig, &self.params, &scan, &trace);
             } else if value == 0 && st.wave_dig.running {
-                failure = self.stop_digitizer(&dev, &mut st.wave_dig, &mut wave_arrays);
-            }
-        } else if reason == self.params.wave_dig_scan_end {
-            // The poller saw scan `value` go idle: end it here, the one owner
-            // of that transition. A report about an earlier scan is ignored.
-            // C's poller discards stopWaveDig's status: what failed is
-            // reported where it failed, and this internal write stays clean.
-            let state = self.state.clone();
-            let dev = device.lock().unwrap();
-            let mut st = state.lock().unwrap();
-            if st.wave_dig.running && st.wave_dig.generation as i32 == value {
-                let _ = self.stop_digitizer(&dev, &mut st.wave_dig, &mut wave_arrays);
+                let restart = WaveDigScan::read_restart(
+                    &self.params,
+                    st.ai_input_mode,
+                    |r, a| self.int(r, a),
+                    |r, a| self.float(r, a),
+                );
+                wave_arrays = wave_dig::stop_wave_dig(
+                    &dev,
+                    &mut st.wave_dig,
+                    &self.params,
+                    restart.as_ref(),
+                    &trace,
+                );
             }
         } else if reason == self.params.wave_dig_read_wf {
+            // On any value: the ReadWF busy record writes 0 every second
+            // while a scan runs.
             let st = self.state.lock().unwrap();
-            self.trace_wave_dig_callbacks(&st.wave_dig);
-            wave_arrays = wave_dig::waveform_updates(&self.params, &st.wave_dig);
+            wave_arrays = wave_dig::waveform_updates(&self.params, &st.wave_dig, &trace);
         } else if reason == self.params.wave_gen_run {
-            let state = self.state.clone();
+            let device = self.device.clone();
             let dev = device.lock().unwrap();
+            let state = self.state.clone();
             let mut st = state.lock().unwrap();
             // Same start/stop guard as the digitizer above.
             if value != 0 && !st.wave_gen.running {
-                if let Err(f) = self.start_generator(&dev, &mut st.wave_gen, &mut wave_arrays) {
-                    failure = Some(f);
-                    // The scan was refused, so the record must not be left
-                    // reading "Run" -- it follows this parameter back to Stop.
-                    self.base.params.set_int32(reason, addr, 0)?;
-                }
+                status = self.start_wave_gen(&dev, &mut st.wave_gen, &trace, &mut wave_arrays)?;
             } else if value == 0 && st.wave_gen.running {
-                failure = self.stop_generator(&dev, &mut st.wave_gen);
+                let restore = self.wave_gen_restore();
+                status = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, &restore, &trace);
             }
-        } else if reason == self.params.wave_gen_scan_end {
-            // The poller saw generator scan `value` go idle: end it here, the
-            // one owner of that transition. A report about an earlier scan is
-            // ignored. C's poller discards stopWaveGen's status, so this
-            // internal write stays clean.
-            let state = self.state.clone();
-            let dev = device.lock().unwrap();
-            let mut st = state.lock().unwrap();
-            if st.wave_gen.running && st.wave_gen.generation as i32 == value {
-                let _ = self.stop_generator(&dev, &mut st.wave_gen);
-            }
-        }
-
-        // C writeInt32 (drvMultiFunction.cpp:2171-2183): these redefine the
-        // channel's waveform, and a running generator restarts with it.
-        if [
-            self.params.wave_gen_wave_type,
-            self.params.wave_gen_user_num_points,
-            self.params.wave_gen_int_num_points,
-            self.params.wave_gen_enable,
-            self.params.wave_gen_ext_trigger,
-            self.params.wave_gen_ext_clock,
-            self.params.wave_gen_continuous,
-        ]
-        .contains(&reason)
-            && let Some(f) = self.redefine_waveform(addr, &mut wave_arrays)
-        {
-            failure = Some(f);
-        }
-
-        // C recomputes the time bases on a point-count write
-        // (drvMultiFunction.cpp:2104, :2195-2198), not only when a scan starts.
-        if reason == self.params.wave_dig_num_points {
-            time_wf = Some(self.wave_dig_time_update());
+        } else if self.wave_gen_settings().contains(&reason) {
+            status = self.wave_gen_setting_changed(addr, &trace, &mut wave_arrays)?;
         }
         if reason == self.params.wave_gen_user_num_points
             || reason == self.params.wave_gen_int_num_points
         {
-            wave_arrays.extend(self.wave_gen_time_updates());
+            wave_arrays.extend(self.compute_wave_gen_times());
         }
-        wave_arrays.extend(time_wf);
 
-        self.finish_write(
-            user,
-            addr,
-            failure,
-            wave_arrays,
-            WriteLine {
-                function: F,
-                wrote: format_args!("wrote {written} to address {addr}"),
-                failed: Some(format_args!(
-                    "function={reason}, ERROR writing {written} to address {addr}"
-                )),
-            },
-        )
+        self.finish_write(user, value, status, wave_arrays)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
         let addr = user.addr;
-        self.base.params.set_float64(reason, addr, value)?;
+        self.base.set_float64_param(reason, addr, value)?;
 
-        // Frequency change → update dwell
-        if reason == self.params.wave_gen_freq && value > 0.0 {
-            let num_points =
-                self.base
-                    .get_int32_param(self.params.wave_gen_num_points, 0)? as f64;
-            let dwell = 1.0 / (value * num_points);
-            self.base
-                .params
-                .set_float64(self.params.wave_gen_dwell, 0, dwell)?;
-        }
-
-        // C recomputes the time bases on a dwell write (drvMultiFunction.cpp:
-        // 2308-2316).
-        let mut wave_arrays = Vec::new();
-        let mut time_wf = None;
-        if reason == self.params.wave_dig_dwell {
-            time_wf = Some(self.wave_dig_time_update());
-        }
-        if reason == self.params.wave_gen_user_dwell || reason == self.params.wave_gen_int_dwell {
-            wave_arrays.extend(self.wave_gen_time_updates());
-        }
-
-        // C writeFloat64 (drvMultiFunction.cpp:2294-2305): these redefine the
-        // channel's waveform, and a running generator restarts with it.
-        let mut failure = None;
+        let mut status: UlError = 0;
+        let p = self.params;
         if [
-            self.params.wave_gen_user_dwell,
-            self.params.wave_gen_int_dwell,
-            self.params.wave_gen_pulse_width,
-            self.params.wave_gen_pulse_delay,
-            self.params.wave_gen_amplitude,
-            self.params.wave_gen_offset,
+            p.pulse_gen_period,
+            p.pulse_gen_duty_cycle,
+            p.pulse_gen_delay,
         ]
         .contains(&reason)
         {
-            failure = self.redefine_waveform(device_addr(addr), &mut wave_arrays);
+            status = self.pulse_setting_changed(device_addr(addr), &self.trace())?;
+        } else if self.wave_gen_settings().contains(&reason) {
+            let mut updates = Vec::new();
+            status =
+                self.wave_gen_setting_changed(device_addr(addr), &self.trace(), &mut updates)?;
+            self.apply_updates(updates)?;
+        } else if reason == self.params.wave_dig_dwell {
+            let num_points = self.int(self.params.wave_dig_num_points, 0);
+            let times = wave_dig::compute_wave_dig_times(&self.params, num_points, value);
+            self.apply_updates(vec![times])?;
         }
-        wave_arrays.extend(time_wf);
+        if reason == self.params.wave_gen_user_dwell || reason == self.params.wave_gen_int_dwell {
+            let times = self.compute_wave_gen_times();
+            self.apply_updates(times.into())?;
+        }
 
-        let chan = device_addr(addr);
-        self.finish_write(
-            user,
-            addr,
-            failure,
-            wave_arrays,
-            WriteLine {
-                function: "writeFloat64",
-                wrote: format_args!("wrote {value:.6} to address {chan}"),
-                failed: Some(format_args!("ERROR writing {value:.6} to address {chan}")),
-            },
-        )
+        self.base.call_param_callbacks(addr)?;
+        let port = &self.base.port_name;
+        let addr = device_addr(addr);
+        if status == 0 {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!(
+                    "{DRIVER_NAME}:writeFloat64, port {port}, wrote {value:.6} to address {addr}\n",
+                    value = CFloat(value)
+                ),
+            );
+        } else {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "{DRIVER_NAME}:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}\n",
+                    value = CFloat(value)
+                ),
+            );
+        }
+        trace::asyn_status(status)
     }
 
-    /// C `readFloat32Array`: the generator arrays run to WAVEGEN_NUM_POINTS,
-    /// the digitizer time base to WAVEDIG_NUM_POINTS.
+    /// Generator time bases: WAVEGEN_USER_TIME_WF and WAVEGEN_INT_TIME_WF,
+    /// each `i * dwell` over its own point count. C computeWaveGenTimes.
+    /// C `readFloat32Array`: at most WAVEGEN_NUM_POINTS (WAVEDIG_NUM_POINTS
+    /// for the digitizer time axis) of the selected buffer.
     fn read_float32_array(&mut self, user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
-        const F: &str = "readFloat32Array";
-        let reason = user.reason;
+        const FUNCTION: &str = "readFloat32Array";
+        let p = self.params;
         let addr = device_addr(user.addr);
-        if !(0..MAX_ANALOG_OUT as i32).contains(&addr) {
-            return Err(array_error(
-                user,
-                format!(
-                    "{DRIVER}:{F}: ERROR: addr={addr} max={}",
-                    MAX_ANALOG_OUT - 1
-                ),
-            ));
+        let error = |msg: std::fmt::Arguments<'_>| {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("{DRIVER_NAME}:{FUNCTION}: ERROR: {msg}\n"),
+            );
+            trace::asyn_status(-1).map(|()| 0)
+        };
+        if addr >= MAX_ANALOG_OUT as i32 {
+            return error(format_args!("addr={addr} max={}", MAX_ANALOG_OUT - 1));
         }
-        let points_param = if reason == self.params.wave_dig_time_wf {
-            self.params.wave_dig_num_points
-        } else {
-            self.params.wave_gen_num_points
-        };
-        let num_points = self
-            .base
-            .get_int32_param(points_param, 0)
-            .unwrap_or(0)
-            .max(0) as usize;
+        let reason = user.reason;
+        let mut num_points = self.int(p.wave_gen_num_points, 0);
+        let time_axis =
+            |points, dwell| wave_dig::time_axis(self.int(points, 0), self.float(dwell, 0));
         let st = self.state.lock().unwrap();
-        let src: &[f32] = if reason == self.params.wave_gen_user_time_wf {
-            &st.wave_gen.user_time_buffer
-        } else if reason == self.params.wave_gen_int_time_wf {
-            &st.wave_gen.int_time_buffer
-        } else if reason == self.params.wave_dig_time_wf {
-            &st.wave_dig.time_buffer
-        } else if reason == self.params.wave_gen_user_wf || reason == self.params.wave_gen_int_wf {
-            let buffers = if reason == self.params.wave_gen_user_wf {
-                &st.wave_gen.user_buffers
-            } else {
-                &st.wave_gen.int_buffers
-            };
-            &buffers[addr as usize]
+        let data: std::borrow::Cow<'_, [f32]> = if reason == p.wave_gen_user_wf {
+            st.wave_gen.user_waveforms[addr as usize].as_slice().into()
+        } else if reason == p.wave_gen_int_wf {
+            st.wave_gen.int_waveforms[addr as usize].as_slice().into()
+        } else if reason == p.wave_gen_user_time_wf {
+            time_axis(p.wave_gen_user_num_points, p.wave_gen_user_dwell).into()
+        } else if reason == p.wave_gen_int_time_wf {
+            time_axis(p.wave_gen_int_num_points, p.wave_gen_int_dwell).into()
+        } else if reason == p.wave_dig_time_wf {
+            num_points = self.int(p.wave_dig_num_points, 0);
+            time_axis(p.wave_dig_num_points, p.wave_dig_dwell).into()
         } else {
-            return Err(array_error(
-                user,
-                format!("{DRIVER}:{F}: ERROR: unknown function={reason}"),
-            ));
+            return error(format_args!("unknown function={reason}"));
         };
-        let n = buf.len().min(num_points).min(src.len());
-        buf[..n].copy_from_slice(&src[..n]);
+        // C copies past a time axis' last computed point from its zeroed
+        // buffer; here the copy stops at the data.
+        let n = read_count(buf.len(), num_points, data.len());
+        buf[..n].copy_from_slice(&data[..n]);
         Ok(n)
     }
 
-    /// C `readFloat64Array`: a digitized channel or the absolute time base,
-    /// up to WAVEDIG_NUM_POINTS.
+    /// C `readFloat64Array`: at most WAVEDIG_NUM_POINTS of a digitizer
+    /// buffer.
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
-        const F: &str = "readFloat64Array";
-        let num_points = self
-            .base
-            .get_int32_param(self.params.wave_dig_num_points, 0)
-            .unwrap_or(0)
-            .max(0) as usize;
+        const FUNCTION: &str = "readFloat64Array";
+        let p = self.params;
+        let addr = device_addr(user.addr);
+        let error = |msg: std::fmt::Arguments<'_>| {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("{DRIVER_NAME}:{FUNCTION}: ERROR: {msg}\n"),
+            );
+            trace::asyn_status(-1).map(|()| 0)
+        };
+        let reason = user.reason;
+        let num_points = self.int(p.wave_dig_num_points, 0);
         let st = self.state.lock().unwrap();
-        let src: &[f64] = if user.reason == self.params.wave_dig_volt_wf {
-            let addr = device_addr(user.addr);
-            if !(0..MAX_ANALOG_IN as i32).contains(&addr) {
-                return Err(array_error(
-                    user,
-                    format!("{DRIVER}:{F}: ERROR: addr={addr} max={}", MAX_ANALOG_IN - 1),
-                ));
+        let data: &[f64] = if reason == p.wave_dig_volt_wf {
+            let max = self.board.num_analog_in;
+            match st.wave_dig.channel_buffers.get(addr as usize) {
+                Some(data) if addr < max => data,
+                _ => return error(format_args!("addr={addr} max={}", max - 1)),
             }
-            &st.wave_dig.channel_buffers[addr as usize]
-        } else if user.reason == self.params.wave_dig_abs_time_wf {
+        } else if reason == p.wave_dig_abs_time_wf {
             &st.wave_dig.abs_time_buffer
         } else {
-            return Err(array_error(
-                user,
-                format!("{DRIVER}:{F}: ERROR: unknown function={}", user.reason),
-            ));
+            return error(format_args!("unknown function={reason}"));
         };
-        let n = buf.len().min(num_points).min(src.len());
-        buf[..n].copy_from_slice(&src[..n]);
+        let n = read_count(buf.len(), num_points, data.len());
+        buf[..n].copy_from_slice(&data[..n]);
         Ok(n)
     }
 
-    /// Load a user-defined generator waveform (volts) for one channel, C
-    /// `writeFloat32Array` (drvMultiFunction.cpp:2504-2529): the points
-    /// written replace the head of the buffer, and more than it holds is
-    /// refused rather than cut short.
+    /// Load a user-defined generator waveform (volts) for one channel.
     fn write_float32_array(&mut self, user: &AsynUser, data: &[f32]) -> AsynResult<()> {
-        const F: &str = "writeFloat32Array";
+        const FUNCTION: &str = "writeFloat32Array";
         if user.reason != self.params.wave_gen_user_wf {
-            return Err(array_error(
-                user,
-                format!("{DRIVER}:{F}: ERROR: unknown function={}", user.reason),
-            ));
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "{DRIVER_NAME}:{FUNCTION}: ERROR: unknown function={}\n",
+                    user.reason
+                ),
+            );
+            return trace::asyn_status(-1);
         }
         let addr = device_addr(user.addr);
-        if !(0..MAX_ANALOG_OUT as i32).contains(&addr) || data.len() > self.max_output_points {
-            return Err(array_error(
-                user,
-                format!(
-                    "{DRIVER}:{F}: ERROR: addr={addr} max={}, nElements={} max={}",
-                    MAX_ANALOG_OUT - 1,
-                    data.len(),
-                    self.max_output_points
-                ),
-            ));
-        }
         let mut st = self.state.lock().unwrap();
-        st.wave_gen.user_buffers[addr as usize][..data.len()].copy_from_slice(data);
+        let max_points = st.wave_gen.max_points;
+        if addr as usize >= MAX_ANALOG_OUT || data.len() > max_points {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "{DRIVER_NAME}:{FUNCTION}: ERROR: addr={addr} max={}, nElements={} max={max_points}\n",
+                    MAX_ANALOG_OUT - 1,
+                    data.len()
+                ),
+            );
+            return trace::asyn_status(-1);
+        }
+        st.wave_gen.user_waveforms[addr as usize][..data.len()].copy_from_slice(data);
         Ok(())
     }
 
@@ -1440,86 +1233,88 @@ impl PortDriver for MultiFunctionDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
-        const F: &str = "writeUInt32Digital";
-        let mut failure: Option<Failure> = None;
+        const FUNCTION: &str = "writeUInt32Digital";
+        let mut status: UlError = 0;
+        let trace = self.trace();
         let reason = user.reason;
         let addr = user.addr;
-        let direction = self
-            .base
-            .get_uint32_param(self.params.digital_direction, 0)?;
-        let device = self.device.clone();
+        // C's local `direction`: read only on the output path.
+        let mut direction = 0;
 
         if reason == self.params.digital_output {
-            let dev = device.lock().unwrap();
-            if mask & direction == PORT_MASK {
-                // Every bit is an output and every bit is written: one word
-                // write, as C does.
-                let written = dev.digital_out(uldaq_sys::AUXPORT, (value & mask) as u64);
-                failure = self.report(F, "Calling DOut", written).err();
+            direction = self.uint(self.params.digital_direction, 0);
+            let dev = self.device.lock().unwrap();
+            let io_mask = (1u32 << NUM_IO_BITS) - 1;
+            if mask & direction == io_mask {
+                // Every bit is an output and being written: one word write.
+                status = trace.report(
+                    &dev.digital_out(uldaq_sys::AUXPORT, (value & mask) as u64),
+                    FUNCTION,
+                    "Calling DOut",
+                );
             } else {
-                for (bit, level) in output_bits(value, mask, direction, NUM_IO_BITS) {
-                    let written = dev.digital_bit_out(uldaq_sys::AUXPORT, bit, level);
-                    if let Err(f) = self.report(F, "Calling DBitOut", written) {
-                        failure = Some(f);
+                // Otherwise only the masked bits configured as outputs.
+                for bit in 0..NUM_IO_BITS {
+                    if mask & direction & (1 << bit) != 0 {
+                        let bit_val = (value >> bit) & 1;
+                        status = trace.report(
+                            &dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0),
+                            FUNCTION,
+                            "Calling DBitOut",
+                        );
                     }
                 }
             }
         } else if reason == self.params.digital_direction {
-            let dev = device.lock().unwrap();
-            if !self.dio_configurable {
-                // The USB-2408 AUXPORT is open-collector with no direction
-                // control. C "Cannot program direction. Set open collector
-                // output to 0" (drvMultiFunction.cpp:2369-2376): each masked
-                // bit is released, and the stored mask is what the
-                // DIGITAL_OUTPUT gate then honours.
-                for bit in (0..NUM_IO_BITS).filter(|bit| mask & (1 << bit) != 0) {
-                    let written = dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, false);
-                    if let Err(f) = self.report(F, "Calling BitOut", written) {
-                        failure = Some(f);
-                    }
+            // C's digitalIOPortConfigurable_ is 0 on Linux: no ConfigPort path.
+            let bit_configurable = self
+                .board
+                .io_ports
+                .first()
+                .is_some_and(IoPort::bit_configurable);
+            let dev = self.device.lock().unwrap();
+            for bit in 0..NUM_IO_BITS {
+                if mask & (1 << bit) == 0 {
+                    continue;
                 }
-            } else {
-                for bit in 0..NUM_IO_BITS {
-                    if mask & (1 << bit) != 0 {
-                        let dir = if (value >> bit) & 1 != 0 {
-                            uldaq_sys::DD_OUTPUT
-                        } else {
-                            uldaq_sys::DD_INPUT
-                        };
-                        let configured =
-                            dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir);
-                        if let Err(f) = self.report(F, "Calling ConfigBit", configured) {
-                            failure = Some(f);
-                        }
-                    }
+                if bit_configurable {
+                    let dir = if (value >> bit) & 1 != 0 {
+                        uldaq_sys::DD_OUTPUT
+                    } else {
+                        uldaq_sys::DD_INPUT
+                    };
+                    status = trace.report(
+                        &dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir),
+                        FUNCTION,
+                        "Calling ConfigBit",
+                    );
+                } else {
+                    // C: the direction cannot be programmed, so the
+                    // open-collector output is set to 0.
+                    status = trace.report(
+                        &dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, false),
+                        FUNCTION,
+                        "Calling BitOut",
+                    );
                 }
             }
         }
 
-        self.base.params.set_uint32(reason, addr, value, mask, 0)?;
+        self.base.set_uint32_param(reason, addr, value, mask, 0)?;
 
-        // C reads the direction only for an output write; a direction write
-        // prints the 0 it was initialised to (drvMultiFunction.cpp:2337, :2384).
-        let printed_direction = if reason == self.params.digital_output {
-            direction
-        } else {
-            0
-        };
-        self.finish_write(
-            user,
-            addr,
-            failure,
-            Vec::new(),
-            WriteLine {
-                function: F,
-                wrote: format_args!(
-                    "function={reason}, wrote value=0x{value:x}, mask=0x{mask:x}, \
-                     direction=0x{printed_direction:x}"
+        self.base.call_param_callbacks(addr)?;
+        if status == 0 {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!(
+                    "{DRIVER_NAME}:{FUNCTION}, port {}, function={reason}, wrote value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}\n",
+                    self.base.port_name
                 ),
-                // C prints no closing line for a failed digital write.
-                failed: None,
-            },
-        )
+            );
+        }
+        trace::asyn_status(status)
     }
 }
 
@@ -1538,8 +1333,10 @@ impl MultiFunctionRuntime {
 }
 
 /// Create a USB-2408-2AO driver, start the port runtime actor and polling thread.
+/// `claim` is the port name taken before the device is opened, as C's
+/// `asynPortDriver` base registers it first.
 pub fn create_usb_2408(
-    port_name: &str,
+    claim: &PortClaim,
     unique_id: &str,
     max_input_points: usize,
     max_output_points: usize,
@@ -1547,21 +1344,30 @@ pub fn create_usb_2408(
     let device = DaqDevice::connect(unique_id)
         .map_err(|e| format!("failed to connect to USB-2408 device: {e}"))?;
 
-    let driver = MultiFunctionDriver::new(port_name, device, max_input_points, max_output_points)
-        .map_err(|e| format!("failed to create MultiFunctionDriver: {e}"))?;
+    let driver =
+        MultiFunctionDriver::new(claim.name(), device, max_input_points, max_output_points)
+            .map_err(|e| format!("failed to create MultiFunctionDriver: {e}"))?;
 
     let params = driver.params;
     let device = driver.device.clone();
     let state = driver.state.clone();
+    let (ai_chans, tc_chans) = driver.board.poll_channels();
 
-    let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, _actor_jh) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the USB-2408 port runtime: {e}"))?;
 
+    state
+        .lock()
+        .unwrap()
+        .trace
+        .bind(runtime_handle.port_handle().clone());
     let poller_handle = poller::start_poller(
         runtime_handle.port_handle().clone(),
         params,
         device.clone(),
         state,
+        ai_chans,
+        tc_chans,
     );
 
     Ok(MultiFunctionRuntime {
@@ -1577,12 +1383,634 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_hysteresis_gates_lack_a_uldaq_trigger() {
-        for mode in [0, 1, 4, 12, 19] {
-            assert!(is_supported_trigger_mode(mode), "{mode}");
+    fn trigger_mode_refuses_the_hysteresis_gates_and_out_of_range() {
+        let mapped: Vec<i32> = (-1..=20).filter(|&v| trigger_mode_maps(v)).collect();
+        assert_eq!(
+            mapped,
+            [
+                0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            ]
+        );
+    }
+
+    #[test]
+    fn get_bounds_is_the_converter_range_of_an_analog_value() {
+        let mut base = PortDriverBase::new(
+            "MFBOUNDS",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let usb_2408 = Resolution {
+            adc_bits: 24,
+            dac_bits: 16,
+        };
+        assert_eq!(
+            usb_2408.bounds(&params, params.analog_out_value).unwrap(),
+            (0, 65535)
+        );
+        assert_eq!(
+            usb_2408.bounds(&params, params.analog_in_value).unwrap(),
+            (0, 16_777_215)
+        );
+        assert!(usb_2408.bounds(&params, params.counter_reset).is_err());
+    }
+
+    /// A driver with interrupts open, the constructor's posts made, and a
+    /// subscriber to everything after them.
+    fn posting_driver(
+        name: &str,
+    ) -> (
+        MultiFunctionDriver,
+        epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+    ) {
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        let mut drv = MultiFunctionDriver::new(name, DaqDevice::unconnected(), 16, 16).unwrap();
+        drv.base.own_interrupts(InterruptGate::opened());
+        for addr in 0..MAX_SIGNALS as i32 {
+            drv.base.call_param_callbacks(addr).unwrap();
         }
-        for mode in [-1, 2, 3, 20] {
-            assert!(!is_supported_trigger_mode(mode), "{mode}");
+        let rx = drv.base.interrupts.subscribe_async(1024, 1 << 16);
+        (drv, rx)
+    }
+
+    /// Each post of `reasons`, in order: (reason, addr, typed).
+    fn posts(
+        rx: &mut epics_rs::asyn::interrupt::AsyncInterruptReceiver,
+        reasons: &[usize],
+    ) -> Vec<(usize, i32, bool)> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|v| reasons.contains(&v.reason))
+            .map(|v| (v.reason, v.addr, v.iface.is_some()))
+            .collect()
+    }
+
+    /// defineWaveform's doCallbacksFloat32Array of the internal wave and
+    /// computeWaveGenTimes' two time axes post at once, typed, ahead of
+    /// writeFloat64's callParamCallbacks (drvMultiFunction.cpp:1573,
+    /// 1748, 1755).
+    #[test]
+    fn a_wave_gen_dwell_write_posts_its_arrays_ahead_of_the_flush() {
+        let (mut drv, mut rx) = posting_driver("MFGENARR");
+        let p = drv.params;
+        drv.base
+            .set_int32_param(p.wave_gen_wave_type, 0, wave_gen::WAVE_TYPE_SIN)
+            .unwrap();
+        drv.base
+            .set_int32_param(p.wave_gen_int_num_points, 0, 4)
+            .unwrap();
+        drv.write_float64(&mut AsynUser::new(p.wave_gen_int_dwell), 0.5)
+            .unwrap();
+        let watched = [
+            p.wave_gen_int_wf,
+            p.wave_gen_user_time_wf,
+            p.wave_gen_int_time_wf,
+            p.wave_gen_int_dwell,
+        ];
+        assert_eq!(
+            posts(&mut rx, &watched),
+            [
+                (p.wave_gen_int_wf, 0, true),
+                (p.wave_gen_user_time_wf, 0, true),
+                (p.wave_gen_int_time_wf, 0, true),
+                (p.wave_gen_int_dwell, 0, false),
+            ]
+        );
+    }
+
+    /// computeWaveDigTimes' doCallbacksFloat32Array (drvMultiFunction.cpp:1915).
+    #[test]
+    fn a_wave_dig_dwell_write_posts_the_time_axis_ahead_of_the_flush() {
+        let (mut drv, mut rx) = posting_driver("MFDIGTIME");
+        let p = drv.params;
+        drv.write_float64(&mut AsynUser::new(p.wave_dig_dwell), 0.5)
+            .unwrap();
+        assert_eq!(
+            posts(&mut rx, &[p.wave_dig_time_wf, p.wave_dig_dwell]),
+            [(p.wave_dig_time_wf, 0, true), (p.wave_dig_dwell, 0, false)]
+        );
+    }
+
+    /// readWaveDig's doCallbacksFloat64Array of each channel and of the
+    /// absolute time base (drvMultiFunction.cpp:1897-1901).
+    #[test]
+    fn a_read_wf_write_posts_the_digitizer_arrays_ahead_of_the_flush() {
+        let (mut drv, mut rx) = posting_driver("MFDIGREAD");
+        let p = drv.params;
+        drv.write_int32(&mut AsynUser::new(p.wave_dig_read_wf), 1)
+            .unwrap();
+        let mut want: Vec<_> = (0..MAX_ANALOG_IN as i32)
+            .map(|ch| (p.wave_dig_volt_wf, ch, true))
+            .collect();
+        want.push((p.wave_dig_abs_time_wf, 0, true));
+        want.push((p.wave_dig_read_wf, 0, false));
+        let watched = [
+            p.wave_dig_volt_wf,
+            p.wave_dig_abs_time_wf,
+            p.wave_dig_read_wf,
+        ];
+        assert_eq!(posts(&mut rx, &watched), want);
+    }
+
+    #[test]
+    fn read_enum_serves_the_usb_2408_tables_c_does() {
+        let mut drv = MultiFunctionDriver::new("MFENUM", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        let mut menu = |reason| -> Vec<(String, i32)> {
+            let (_, entries) = drv.read_enum(&AsynUser::new(reason)).unwrap();
+            entries
+                .iter()
+                .map(|e| (e.string.clone(), e.value))
+                .collect()
+        };
+        let input_range: Vec<_> = [
+            ("+= 10V", 1),
+            ("+= 5V", 0),
+            ("+= 2.5V", 2),
+            ("+= 1.25V", 3),
+            ("+= 0.625V", 5),
+            ("+= 0.312V", 17),
+            ("+= 0.156V", 18),
+            ("+= 0.078V", 19),
+        ]
+        .map(|(s, v)| (s.to_owned(), v))
+        .into();
+        assert_eq!(menu(p.analog_in_range), input_range);
+        assert_eq!(menu(p.voltage_in_range), input_range);
+        assert_eq!(menu(p.analog_out_range), [("+= 10V".to_owned(), 1)]);
+        assert_eq!(
+            menu(p.analog_in_type),
+            [("Volts".to_owned(), 1), ("TC deg.".to_owned(), 2)]
+        );
+        let sensor: Vec<_> = [
+            ("RTD", 4),
+            ("Thermistor", 8),
+            ("Thermocouple", 2),
+            ("Semiconductor", 16),
+            ("Disabled", 1 << 30),
+        ]
+        .map(|(s, v)| (s.to_owned(), v))
+        .into();
+        assert_eq!(menu(p.temperature_sensor), sensor);
+        let wiring: Vec<_> = [
+            ("2 wire 1 sensor", 1),
+            ("2 wire 2 sensors", 2),
+            ("3 wire", 3),
+            ("4 wire", 4),
+        ]
+        .map(|(s, v)| (s.to_owned(), v))
+        .into();
+        assert_eq!(menu(p.temperature_wiring), wiring);
+        assert!(drv.read_enum(&AsynUser::new(p.analog_in_mode)).is_err());
+        // C's ctor writes the first output range's gain code.
+        assert_eq!(drv.base.get_int32_param(p.analog_out_range, 1).unwrap(), 1);
+    }
+
+    /// C declares WAVEDIG_VOLT_WF Float32Array (drvMultiFunction.cpp:916)
+    /// and readWaveDig fires its double buffers with doCallbacksFloat64Array
+    /// (:1899), which a template's asynFloat64ArrayIn waveform receives.
+    #[epics_rs::base::epics_test]
+    async fn the_volt_waveform_reaches_a_float64_waveform_record() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use epics_rs::asyn::param::ParamType;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::server::database::PvDatabase;
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::types::EpicsValue;
+
+        let port = "MFVOLTWF";
+        let drv = MultiFunctionDriver::new(port, DaqDevice::unconnected(), 4, 4).unwrap();
+        let p = drv.params;
+        assert_eq!(
+            drv.base.params.param_type(p.wave_dig_volt_wf),
+            Some(ParamType::Float32Array)
+        );
+        {
+            let mut st = drv.state.lock().unwrap();
+            let wd = &mut st.wave_dig;
+            wd.first_chan = 3;
+            wd.num_chans = 1;
+            wd.num_points = 4;
+            wd.current_point = 2;
+            wd.channel_buffers[3][..2].copy_from_slice(&[1.5, 2.5]);
         }
+        let db = Arc::new(PvDatabase::new());
+        let claim = claim_port(port).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, drv, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), db.scan_control().interrupt_gate())
+            .unwrap();
+        let record = format!(
+            "record(waveform, \"T:Volt3\") {{ field(DTYP, \"asynFloat64ArrayIn\") \
+             field(INP, \"@asyn({port},3,1)WAVEDIG_VOLT_WF\") field(SCAN, \"I/O Intr\") \
+             field(FTVL, \"DOUBLE\") field(NELM, \"4\") }}\n"
+        );
+        let (db, _) =
+            epics_rs::asyn::adapter::register_asyn_device_support_for_builder(IocBuilder::new())
+                .with_database(db)
+                .db_string(&record, &HashMap::new())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+        db.scan_control().run();
+
+        rt.port_handle()
+            .write_int32(p.wave_dig_read_wf, 0, 1)
+            .await
+            .unwrap();
+        let want = EpicsValue::DoubleArray(vec![1.5, 2.5].into());
+        for _ in 0..400 {
+            if db.get_pv("T:Volt3").unwrap() == want {
+                return;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("T:Volt3 = {:?}", db.get_pv("T:Volt3").unwrap());
+    }
+
+    /// C `readFloat64Array` (drvMultiFunction.cpp:2469-2503).
+    #[test]
+    fn read_float64_array_serves_the_digitizer_buffers() {
+        let mut drv = MultiFunctionDriver::new("MFRDF64", DaqDevice::unconnected(), 4, 4).unwrap();
+        let p = drv.params;
+        drv.board.num_analog_in = 8;
+        {
+            let mut st = drv.state.lock().unwrap();
+            st.wave_dig.channel_buffers[7] = vec![1.5, 2.5, 3.5, 4.5];
+            st.wave_dig.abs_time_buffer = vec![0.25, 0.5, 0.75, 1.0];
+        }
+        drv.base
+            .set_int32_param(p.wave_dig_num_points, 0, 3)
+            .unwrap();
+        let mut buf = [0f64; 4];
+        let volt = AsynUser::new(p.wave_dig_volt_wf).with_addr(7);
+        assert_eq!(drv.read_float64_array(&volt, &mut buf).unwrap(), 3);
+        assert_eq!(buf, [1.5, 2.5, 3.5, 0.0]);
+        let abs_time = AsynUser::new(p.wave_dig_abs_time_wf);
+        assert_eq!(drv.read_float64_array(&abs_time, &mut buf[..2]).unwrap(), 2);
+        assert_eq!(buf[..2], [0.25, 0.5]);
+        let past = AsynUser::new(p.wave_dig_volt_wf).with_addr(8);
+        assert!(drv.read_float64_array(&past, &mut buf).is_err());
+        let other = AsynUser::new(p.wave_gen_user_wf);
+        assert!(drv.read_float64_array(&other, &mut buf).is_err());
+    }
+
+    /// C caps a waveform read with `*nIn > (size_t)numPoints`
+    /// (drvMultiFunction.cpp:2463, :2496): a negative count casts huge and
+    /// caps nothing.
+    #[test]
+    fn a_negative_point_count_caps_no_waveform_read() {
+        let mut drv = MultiFunctionDriver::new("MFNEGPTS", DaqDevice::unconnected(), 4, 4).unwrap();
+        let p = drv.params;
+        drv.board.num_analog_in = 8;
+        {
+            let mut st = drv.state.lock().unwrap();
+            st.wave_dig.channel_buffers[7] = vec![1.5, 2.5, 3.5, 4.5];
+            st.wave_gen.user_waveforms[1] = vec![0.5, 1.5, 2.5, 3.5];
+        }
+        drv.base
+            .set_int32_param(p.wave_dig_num_points, 0, -1)
+            .unwrap();
+        drv.base
+            .set_int32_param(p.wave_gen_num_points, 0, -1)
+            .unwrap();
+        let mut buf = [0f64; 3];
+        let volt = AsynUser::new(p.wave_dig_volt_wf).with_addr(7);
+        assert_eq!(drv.read_float64_array(&volt, &mut buf).unwrap(), 3);
+        assert_eq!(buf, [1.5, 2.5, 3.5]);
+        let mut buf = [0f32; 3];
+        let user_wf = AsynUser::new(p.wave_gen_user_wf).with_addr(1);
+        assert_eq!(drv.read_float32_array(&user_wf, &mut buf).unwrap(), 3);
+        assert_eq!(buf, [0.5, 1.5, 2.5]);
+    }
+
+    /// A user span starting at channel 1 scales by channel 1's Amplitude
+    /// and Offset (upstream-c-defects #227).
+    #[test]
+    fn a_user_waveform_takes_its_own_channels_scaling() {
+        let mut drv =
+            MultiFunctionDriver::new("MFUSERK", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        drv.state.lock().unwrap().wave_gen.user_waveforms[1][..2].copy_from_slice(&[0.5, 1.0]);
+        for (reason, addr, value) in [
+            (p.wave_gen_user_num_points, 0, 2),
+            (p.wave_gen_enable, 1, 1),
+            (p.wave_gen_wave_type, 1, wave_gen::WAVE_TYPE_USER),
+        ] {
+            drv.base.set_int32_param(reason, addr, value).unwrap();
+        }
+        for (reason, addr, value) in [
+            (p.wave_gen_user_dwell, 0, 0.001),
+            (p.wave_gen_amplitude, 0, 1.0),
+            (p.wave_gen_offset, 0, 0.0),
+            (p.wave_gen_amplitude, 1, 2.0),
+            (p.wave_gen_offset, 1, 0.25),
+        ] {
+            drv.base.set_float64_param(reason, addr, value).unwrap();
+        }
+        // ulAOutScan fails on the null handle after the buffer is built.
+        let _ = drv.write_int32(&mut AsynUser::new(p.wave_gen_run), 1);
+        assert_eq!(
+            drv.state.lock().unwrap().wave_gen.scan_buffer,
+            [
+                wave_gen::volts_to_dac(0.5, 2.0, 0.25),
+                wave_gen::volts_to_dac(1.0, 2.0, 0.25)
+            ]
+        );
+    }
+
+    /// A refused point count and a refused open-detect fail the write
+    /// (upstream-c-defects #231).
+    #[test]
+    fn refused_generator_and_open_detect_settings_fail_the_write() {
+        let mut drv =
+            MultiFunctionDriver::new("MFREFUSE", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        let mut points = AsynUser::new(p.wave_gen_user_num_points);
+        assert!(drv.write_int32(&mut points, 16).is_ok());
+        assert!(drv.write_int32(&mut points, 17).is_err());
+        drv.base
+            .set_int32_param(p.analog_in_type, 1, AI_CHAN_TYPE_TC)
+            .unwrap();
+        // ulAISetConfig(OTD_MODE) fails on the null handle.
+        let mut detect = AsynUser::new(p.thermocouple_open_detect).with_addr(1);
+        assert!(drv.write_int32(&mut detect, 1).is_err());
+    }
+
+    #[test]
+    fn temperature_sensor_and_wiring_are_written_to_the_device() {
+        let mut drv = MultiFunctionDriver::new("MFTEMP", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        // Only a write that reaches ulAISetConfig fails on the null handle.
+        for reason in [p.temperature_sensor, p.temperature_wiring] {
+            let mut user = AsynUser::new(reason).with_addr(1);
+            assert!(drv.write_int32(&mut user, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn analog_in_rate_is_written_to_the_device() {
+        let mut drv = MultiFunctionDriver::new("MFRATE", DaqDevice::unconnected(), 16, 16).unwrap();
+        let mut user = AsynUser::new(drv.params.analog_in_rate).with_addr(2);
+        // uldaq refuses every call on the null handle, so only a write that
+        // reaches ulAISetConfigDbl fails.
+        assert!(drv.write_int32(&mut user, 60).is_err());
+    }
+
+    #[test]
+    fn analog_out_sync_master_is_written_to_the_device() {
+        let mut drv =
+            MultiFunctionDriver::new("MFSYNCM", DaqDevice::unconnected(), 16, 16).unwrap();
+        let mut user = AsynUser::new(drv.params.analog_out_sync_master).with_addr(1);
+        // A 2408 refuses AO_CFG_SYNC_MODE as the null handle does
+        // (uldaq AoDevice::setCfg_SyncMode), so the record takes WRITE/INVALID.
+        assert!(drv.write_int32(&mut user, 0).is_err());
+    }
+
+    /// The Ao*SyncMaster PINI write that a 2408 refuses at boot prints the
+    /// param's index in C's constructor (drvMultiFunction.cpp:921).
+    #[test]
+    fn a_refused_sync_master_write_prints_cs_function_number() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MFSYNCFN";
+        let mut drv = MultiFunctionDriver::new(port, DaqDevice::unconnected(), 16, 16).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("usb-2408-fn-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let mut user = AsynUser::new(drv.params.analog_out_sync_master).with_addr(1);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        assert!(drv.write_int32(&mut user, 0).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(
+                "MultiFunction:writeInt32, port MFSYNCFN, function=52, ERROR writing 0 to address 1, status="
+            ),
+            "{text}"
+        );
+    }
+
+    /// writeFloat64's trace is C's %f (drvMultiFunction.cpp:2321).
+    #[test]
+    fn a_written_nan_prints_as_cs_percent_f() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MFNANF";
+        let mut drv = MultiFunctionDriver::new(port, DaqDevice::unconnected(), 16, 16).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("usb-2408-nan-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let mut user = AsynUser::new(drv.params.poll_sleep_ms);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        drv.write_float64(&mut user, f64::NAN).unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains("MultiFunction:writeFloat64, port MFNANF, wrote nan to address 0\n"),
+            "{text}"
+        );
+    }
+
+    /// C writeFloat64 only stores WAVEGEN_FREQ (drvMultiFunction.cpp:2273-2330).
+    #[test]
+    fn a_frequency_write_leaves_the_dwell_alone() {
+        let mut drv = MultiFunctionDriver::new("MFFREQ", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        let dwell = drv.float(p.wave_gen_dwell, 0);
+        drv.write_float64(&mut AsynUser::new(p.wave_gen_freq), 50.0)
+            .unwrap();
+        assert_eq!(
+            (
+                drv.float(p.wave_gen_freq, 0),
+                drv.float(p.wave_gen_dwell, 0)
+            ),
+            (50.0, dwell)
+        );
+    }
+
+    /// C writeInt32/writeFloat64 pulse branches (drvMultiFunction.cpp:2044-2059,
+    /// :2286-2293).
+    #[test]
+    fn pulse_writes_start_and_restart_the_pulse_generator() {
+        let mut drv =
+            MultiFunctionDriver::new("MFPULSE", DaqDevice::unconnected(), 16, 16).unwrap();
+        let p = drv.params;
+        // Only a write that reaches ulTmrPulseOut* fails on the null handle.
+        assert!(
+            drv.write_int32(&mut AsynUser::new(p.pulse_gen_run), 1)
+                .is_err()
+        );
+        assert!(
+            drv.write_int32(&mut AsynUser::new(p.pulse_gen_run), 0)
+                .is_ok()
+        );
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.pulse_gen_period), 0.5)
+                .is_ok()
+        );
+        drv.pulse_gen_running[0] = true;
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.pulse_gen_period), 0.5)
+                .is_err()
+        );
+        drv.pulse_gen_running[0] = true;
+        assert!(
+            drv.write_int32(&mut AsynUser::new(p.pulse_gen_count), 3)
+                .is_err()
+        );
+        assert!(!drv.pulse_gen_running[0]);
+    }
+
+    #[test]
+    fn a_sync_write_of_done_still_writes_the_outputs() {
+        let mut drv =
+            MultiFunctionDriver::new("MFSYNCW", DaqDevice::unconnected(), 16, 16).unwrap();
+        let mut user = AsynUser::new(drv.params.analog_out_sync_write);
+        // Only a write that reaches ulAOutArray fails on the null handle.
+        assert!(drv.write_int32(&mut user, 0).is_err());
+    }
+
+    #[test]
+    fn a_read_request_of_zero_posts_the_waveforms() {
+        let (mut drv, mut rx) = posting_driver("MFREADWF");
+        let abs_time_wf = drv.params.wave_dig_abs_time_wf;
+        let mut user = AsynUser::new(drv.params.wave_dig_read_wf);
+        drv.write_int32(&mut user, 0).unwrap();
+        assert_eq!(posts(&mut rx, &[abs_time_wf]), [(abs_time_wf, 0, true)]);
+    }
+
+    #[test]
+    fn a_direction_write_on_a_fixed_port_zeroes_the_output_bit() {
+        let mut drv = MultiFunctionDriver::new("MFDIR", DaqDevice::unconnected(), 16, 16).unwrap();
+        assert!(drv.board.io_ports.is_empty());
+        let mut user = AsynUser::new(drv.params.digital_direction);
+        // Only a write that reaches ulDBitOut fails on the null handle.
+        assert!(drv.write_uint32_digital(&mut user, 0, 0x01).is_err());
+    }
+
+    #[test]
+    fn only_a_bitio_port_is_bit_configurable() {
+        let port = |io_type: i64| IoPort {
+            port_type: 1,
+            io_type: io_type as i32,
+            num_bits: 8,
+        };
+        assert!(port(uldaq_sys::DPIOT_BITIO).bit_configurable());
+        assert!(!port(uldaq_sys::DPIOT_NONCONFIG).bit_configurable());
+    }
+
+    #[test]
+    fn the_port_can_block_as_cs_does() {
+        let drv = MultiFunctionDriver::new("MFFLAGS", DaqDevice::unconnected(), 16, 16).unwrap();
+        assert!(drv.base.flags.multi_device);
+        assert!(drv.base.flags.can_block);
+    }
+
+    #[test]
+    fn the_port_carries_cs_interface_and_interrupt_masks() {
+        use InterfaceMask as I;
+        let drv = MultiFunctionDriver::new("MFMASKS", DaqDevice::unconnected(), 16, 16).unwrap();
+        let interrupts = I::UINT32_DIGITAL
+            | I::INT32
+            | I::INT32_ARRAY
+            | I::FLOAT32_ARRAY
+            | I::FLOAT64
+            | I::FLOAT64_ARRAY
+            | I::OCTET
+            | I::ENUM;
+        assert_eq!(drv.base.interrupt_mask(), interrupts);
+        assert_eq!(
+            drv.base.interface_mask(),
+            interrupts | I::DRV_USER | I::COMMON
+        );
+    }
+
+    #[test]
+    fn report_prints_the_board_as_c_does() {
+        let board = BoardInfo {
+            board_type: 254,
+            board_name: "USB-2408-2AO".into(),
+            num_analog_in: 16,
+            num_analog_out: 2,
+            resolution: Resolution {
+                adc_bits: 24,
+                dac_bits: 16,
+            },
+            num_temperature_in: 8,
+            io_ports: vec![IoPort {
+                port_type: 1,
+                io_type: uldaq_sys::DPIOT_NONCONFIG as i32,
+                num_bits: 8,
+            }],
+        };
+        let mut brief = String::new();
+        board.report(&mut brief, "MF1", 0, &[5, 7]);
+        assert_eq!(
+            brief,
+            "  Port: MF1, board ID=254, board type=USB-2408-2AO\n"
+        );
+
+        let mut out = String::new();
+        board.report(&mut out, "MF1", 1, &[5, 7]);
+        assert_eq!(
+            out,
+            "  Port: MF1, board ID=254, board type=USB-2408-2AO\n\
+             \x20 analog inputs      = 16\n\
+             \x20 analog input bits  = 24\n\
+             \x20 analog outputs     = 2\n\
+             \x20 analog output bits = 16\n\
+             \x20 temperature inputs = 8\n\
+             \x20 digital I/O ports  = 1\n\
+             \x20 digital I/O port     0\n\
+             \x20   I/O port              = 1\n\
+             \x20   I/O bits              = 8\n\
+             \x20   I/O bit configurable  = 0\n\
+             \x20   I/O port configurable = 0\n\
+             \x20   I/O port read only    = 0\n\
+             \x20   I/O port write only   = 0\n\
+             \x20   I/O port mask         = 0xff\n\
+             \x20 timers             = 0\n\
+             \x20 # counters         = 2  first counter      = 0  counterCounts =  5 7\n"
+        );
     }
 }

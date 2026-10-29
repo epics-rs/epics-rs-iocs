@@ -42,35 +42,9 @@ pub fn atof(s: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Mimic C `atoi`: parse the leading integer prefix, `0` on junk.
-pub fn atoi(s: &str) -> i32 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i32>().ok()).unwrap_or(0)
-}
-
-/// Mimic C `atol`/`strtol` into `i64`: parse the leading integer prefix, `0`
-/// on junk. Used by controllers whose positions overflow `i32` (picomotor
-/// step counts, encoder counts).
-pub fn atol(s: &str) -> i64 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i64>().ok()).unwrap_or(0)
-}
+/// C `strtol`, `atoi` (`(int) strtol(s, NULL, 10)`) and `atol` at this
+/// platform's `long`, as glibc reads them under `_GNU_SOURCE`.
+pub use epics_rs::base::types::c_parse::{atoi, atol, long_to_int, strtol};
 
 /// Parse leading hex digits as `u32` (C `sscanf` `%x`); `None` if there is no
 /// hex digit (C `sscanf` count `!= 1`).
@@ -100,12 +74,18 @@ pub fn nint(f: f64) -> i32 {
 /// Command decimal precision from a drive resolution, `(int)(-log10(res)) + 2`,
 /// floored at 1 (C `maxDigits`/`res_decpts`).
 pub fn max_digits(step_size: f64) -> usize {
-    let digits = (-step_size.log10()) as i32 + 2;
-    digits.max(1) as usize
+    let x = -step_size.log10();
+    // C `(int)` on x86-64 turns NaN/inf (res <= 0) into INT_MIN, hence the floor.
+    if !x.is_finite() {
+        return 1;
+    }
+    (x as i32 + 2).max(1) as usize
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_long;
+
     use super::*;
 
     #[test]
@@ -126,9 +106,47 @@ mod tests {
 
     #[test]
     fn atol_parses_wide_integers() {
-        assert_eq!(atol("10000000000x"), 10_000_000_000);
+        let wide = c_long::try_from(10_000_000_000_i128).unwrap_or(c_long::MAX);
+        assert_eq!(atol("10000000000x"), wide);
         assert_eq!(atol("-2"), -2);
         assert_eq!(atol("junk"), 0);
+    }
+
+    /// glibc on LP64 gives -1294967296, -1 and 0 here; a 32-bit `long`
+    /// saturates the first at `INT_MAX`.
+    #[test]
+    fn atoi_wraps_after_strtol_saturates() {
+        let wrapped = if c_long::BITS == 64 {
+            -1_294_967_296
+        } else {
+            i32::MAX
+        };
+        assert_eq!(atoi("3000000000"), wrapped);
+        assert_eq!(atoi("99999999999999999999"), long_to_int(c_long::MAX));
+        assert_eq!(atoi("-99999999999999999999"), long_to_int(c_long::MIN));
+        assert_eq!(atoi("\x0b\x0c 12"), 12);
+    }
+
+    #[test]
+    fn atol_saturates_as_strtol() {
+        assert_eq!(atol("99999999999999999999"), c_long::MAX);
+        assert_eq!(atol("-99999999999999999999"), c_long::MIN);
+    }
+
+    /// Offsets as glibc's `end`: `0x` without a hex digit stops at the `x`.
+    #[test]
+    fn strtol_reads_c_prefixes() {
+        assert_eq!(strtol(b" \x0b-0x1Fz", 16), (-31, 7));
+        assert_eq!(strtol(b"0X1f", 0), (31, 4));
+        assert_eq!(strtol(b"017", 0), (15, 3));
+        assert_eq!(strtol(b"09", 0), (0, 1));
+        assert_eq!(strtol(b" -0xg", 16), (0, 3));
+        // g++ defines `_GNU_SOURCE`, so glibc 2.39 reads the C23 `0b` prefix.
+        assert_eq!(strtol(b"0b101", 0), (5, 5));
+        assert_eq!(strtol(b"  +", 10), (0, 0));
+        assert_eq!(strtol(b"", 10), (0, 0));
+        let min = c_long::MIN.to_string();
+        assert_eq!(strtol(min.as_bytes(), 10), (c_long::MIN, min.len()));
     }
 
     #[test]
@@ -155,6 +173,8 @@ mod tests {
         assert_eq!(max_digits(0.1), 3);
         assert_eq!(max_digits(1.0), 2);
         assert_eq!(max_digits(100.0), 1);
+        assert_eq!(max_digits(0.0), 1); // C x86: (int)inf = INT_MIN → floored
+        assert_eq!(max_digits(-1.0), 1); // log10 NaN
     }
 
     #[test]

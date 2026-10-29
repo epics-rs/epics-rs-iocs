@@ -1,285 +1,720 @@
-//! MKS 937 vacuum gauge controller (`ipApp/src/devAiMKS.c`).
+//! `devAiMKS.c` — the `HPS SensaVac 937` ai device support for the MKS 937
+//! vacuum gauge controller.
 //!
-//! Read-only port, one asyn address per gauge (address 0 = gauge 1). The C read
-//! the units and the gauge types once during `init_record` and used them to set
-//! each ai record's EGU / LOPR / HOPR; a port driver cannot write those fields,
-//! so the units, the gauge type and its range are published as parameters and
-//! the database wires them where it wants them.
+//! One record per gauge, as in C: `init` reads the controller's units (`SU`)
+//! and gauge types (`SG`) for that record and sets its EGU / PREC / LOPR /
+//! HOPR, and every process queues one `Rn` exchange on the octet port named in
+//! `INP` (`@asyn(port gauge)`, gauge 1..5) and writes VAL directly.
 //!
-//! Two deviations from `devAiMKS.c`, both deliberate:
-//!
-//! * The C set `pai->val = 0.` before decoding every reply, so a reply it could
-//!   not turn into a pressure left the record reading 0 Torr. On `SYNTAX!` /
-//!   `NotCMD!` — which it says the 937 emits spuriously — it then suppressed the
-//!   alarm as well (`devAiMKS.c:338-347`), publishing that 0 as *good* data.
-//!   Suppressing the alarm was intended; publishing a false perfect vacuum was
-//!   not. Here a reply that is not a pressure never touches `MKS_PRESSURE`; the
-//!   gauge keeps its last good reading and `MKS_STATUS` says why it did not
-//!   move.
-//! * The C rejected any reply whose length was not exactly 7 bytes. Replies are
-//!   classified by content here, so a short or padded reply lands in
-//!   [`Reading::Unknown`] instead of being rejected on length.
+//! One deliberate deviation: C sets `pai->val = 0.` before decoding every
+//! reply and then suppresses the alarm on the 937's spurious `SYNTAX!` /
+//! `NotCMD!` (`devAiMKS.c:317-347`), publishing 0 Torr as good data. Here
+//! those replies leave VAL alone.
 
 pub mod protocol;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::param::ParamValue;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::asyn::adapter::parse_asyn_link;
+use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
-use epics_rs::asyn::runtime::config::RuntimeConfig;
-use epics_rs::asyn::runtime::port::create_port_runtime;
+use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
+use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::runtime::task::CallbackPriority;
+use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
+use epics_rs::base::server::device_support::{
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
+};
+use epics_rs::base::server::ioc_app::DeviceSupportContext;
+use epics_rs::base::server::recgbl::alarm_status::READ_ALARM;
+use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
+use epics_rs::base::types::EpicsValue;
 
-use crate::connect::connect_octet;
-use crate::runtime::IpPortRuntime;
-use crate::worker::{self, DeviceWorker, Transport};
-use protocol::{GaugeType, MAX_GAUGES, Reading};
+use crate::Unconnected;
+use protocol::{GaugeType, Reading};
 
-/// Command timeout (`TIMEOUT`, `devAiMKS.c:65`).
-pub const MKS_TIMEOUT: Duration = Duration::from_secs(2);
+/// `device(ai,INST_IO,devAiMKS,"HPS SensaVac 937")` (`ipSupport.dbd`).
+pub const DTYP: &str = "HPS SensaVac 937";
 
-/// The MKS port is read-only, so the worker takes no commands.
-pub enum MksCommand {}
+/// `TIMEOUT` (`devAiMKS.c:65`).
+const TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Reading status published alongside the pressure. The C encoded these as
-/// record alarms from inside device support; the database attaches the
-/// severities now.
-pub mod status {
-    pub const OK: i32 = 0;
-    pub const ABOVE_RANGE: i32 = 1;
-    pub const BELOW_RANGE: i32 = 2;
-    pub const NO_GAUGE: i32 = 3;
-    pub const UNKNOWN: i32 = 4;
-}
+/// `MAX_RESPONSE_LEN` (`devAiMKS.c:66`).
+const MAX_RESPONSE_LEN: usize = 10;
 
-#[derive(Clone, Copy)]
-pub struct MksParams {
-    pub pressure: usize,
-    pub status: usize,
-    pub units: usize,
-    pub gauge_type: usize,
-    pub low_limit: usize,
-    pub high_limit: usize,
-}
+/// The reply length C accepts from every 937 query (`nread != 7`).
+const REPLY_LEN: usize = 7;
 
-impl MksParams {
-    fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
-        Ok(Self {
-            pressure: base.create_param("MKS_PRESSURE", ParamType::Float64)?,
-            status: base.create_param("MKS_STATUS", ParamType::Int32)?,
-            units: base.create_param("MKS_UNITS", ParamType::Octet)?,
-            gauge_type: base.create_param("MKS_GAUGE_TYPE", ParamType::Octet)?,
-            low_limit: base.create_param("MKS_LOW_LIMIT", ParamType::Float64)?,
-            high_limit: base.create_param("MKS_HIGH_LIMIT", ParamType::Float64)?,
-        })
+/// The address C's `connectDevice(pasynUser, port, 0)` binds.
+const ADDR: i32 = 0;
+
+/// Dynamic device-support factory for `HPS SensaVac 937`. The link is parsed
+/// in `init`, where C's `initAi` parses it and reports a bad one.
+pub fn device_support_factory()
+-> impl Fn(&DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> + Send + Sync + 'static {
+    |ctx: &DeviceSupportContext| {
+        (ctx.dtyp == DTYP).then(|| Box::new(DevAiMks::new(ctx.inp)) as Box<dyn DeviceSupport>)
     }
 }
 
-pub struct MksDriver {
-    base: PortDriverBase,
-    params: MksParams,
-    /// Keeps the worker's receiver open for the life of the port; the MKS port
-    /// has no writable parameters.
-    _commands: std::sync::mpsc::Sender<MksCommand>,
+/// `asynPrint` on the record's asynUser, connected to `port` at address 0.
+fn print(handle: &PortHandle, mask: TraceMask, args: std::fmt::Arguments<'_>) {
+    handle
+        .trace()
+        .print(Some(handle.port_name()), Some(ADDR), 0, mask, args);
 }
 
-impl MksDriver {
-    pub fn new(port_name: &str, commands: std::sync::mpsc::Sender<MksCommand>) -> AsynResult<Self> {
-        let mut base = PortDriverBase::new(
-            port_name,
-            MAX_GAUGES,
-            PortFlags {
-                multi_device: true,
-                can_block: true,
-                destructible: true,
-            },
+/// `pasynOctetSyncIO->writeReadOnce(port, 0, data, ..., TIMEOUT, ...)`,
+/// with its own failure line: the bytes read beside whether it succeeded.
+fn write_read_once(port: &str, data: &[u8]) -> (Vec<u8>, bool) {
+    let (io, connected) = SyncIOHandle::connect_port(port, ADDR, TIMEOUT, InterfaceType::Octet);
+    if let Err(e) = connected {
+        io.print(
+            0,
+            TraceMask::ERROR,
+            format_args!("asynOctetSyncIO connect failed {}\n", e.message()),
         );
-        let params = MksParams::create(&mut base)?;
-        Ok(Self {
-            base,
-            params,
-            _commands: commands,
-        })
+        return (Vec::new(), false);
+    }
+    let (reply, status) = io.write_read(0, data, MAX_RESPONSE_LEN).into_parts();
+    if let Err(e) = &status {
+        io.print(
+            0,
+            TraceMask::ERROR,
+            format_args!("asynOctetSyncIO writeReadOnce failed {}\n", e.message()),
+        );
+    }
+    (reply, status.is_ok())
+}
+
+/// The pass a queued request's callback re-enters — C's `dbScanLock(pai);
+/// prset->process(pai)` at the end of `callbackAi`.
+#[derive(Default)]
+struct Reentry(Mutex<Option<(DeviceDone, CallbackPriority)>>);
+
+impl Reentry {
+    fn arm(&self, done: &DeviceDoneSource<'_>) {
+        let mut slot = self.0.lock().unwrap();
+        match &mut *slot {
+            Some((_, prio)) => *prio = done.priority(),
+            None => *slot = Some((done.device_done(), done.priority())),
+        }
     }
 
-    pub fn params(&self) -> MksParams {
-        self.params
+    fn reprocess(&self) {
+        let armed = self.0.lock().unwrap().clone();
+        if let Some((done, prio)) = armed {
+            let _ = done.reprocess(prio);
+        }
     }
 }
 
-impl PortDriver for MksDriver {
-    fn base(&self) -> &PortDriverBase {
-        &self.base
+/// The queued request's body — C `callbackAi`'s I/O half.
+struct Job {
+    name: String,
+    handle: PortHandle,
+    /// `pPvt->readCommand`, `R<gauge>`.
+    command: Vec<u8>,
+    /// The read's bytes, `None` when its status was not success.
+    reply: Mutex<Option<Vec<u8>>>,
+    reentry: Reentry,
+}
+
+impl CellBody for Job {
+    fn process(&self, port: &mut dyn PortCalls) {
+        let user = || AsynUser::new(0).with_addr(ADDR).with_timeout(TIMEOUT);
+        // C discards the write's status; the read's decides.
+        let _ = port.call(
+            &RequestOp::OctetWrite {
+                data: self.command.clone(),
+            },
+            user(),
+        );
+        let (data, status) = port
+            .octet_read(
+                OctetReadOp::Read {
+                    buf_size: MAX_RESPONSE_LEN,
+                },
+                user(),
+            )
+            .into_parts();
+        let ok = status.is_ok();
+        print(
+            &self.handle,
+            TraceMask::IO_DEVICE,
+            format_args!(
+                "devAiMKS record={}, len={}, response=\n{}\n",
+                self.name,
+                data.len(),
+                String::from_utf8_lossy(&data)
+            ),
+        );
+        *self.reply.lock().unwrap() = ok.then_some(data);
     }
 
-    fn base_mut(&mut self) -> &mut PortDriverBase {
-        &mut self.base
+    /// No `timeoutUser`, so only a port shutting down with the request queued
+    /// lands here; the pass reads it as a failed read.
+    fn unrun(&self, _why: Unrun) {
+        *self.reply.lock().unwrap() = None;
+    }
+
+    fn done(self: Arc<Self>) {
+        self.reentry.reprocess();
+    }
+
+    /// `createAsynUser(callbackAi, 0)` (`devAiMKS.c:118`).
+    fn timeout_user(&self) -> bool {
+        false
     }
 }
 
-/// What the controller said about a gauge when the port started.
-#[derive(Clone, Copy)]
-struct GaugeConfig {
+struct Live {
+    job: Arc<Job>,
+    cell: Arc<RequestCell>,
+    /// Whether this cycle's request was queued, so `read` has a reply.
+    queued: bool,
+}
+
+pub struct DevAiMks {
+    inp: String,
+    /// C `pai->name`.
+    name: String,
+    /// `gaugeLow` / `gaugeHigh`, in the controller's units.
     low: f64,
     high: f64,
+    live: Option<Live>,
+    /// `initAi`'s unknown-gauge-type `recGblSetSevr`, which C leaves pending
+    /// until the first completed process resets the alarms.
+    init_alarm: bool,
+    /// The alarm the last completed read raised.
+    alarm: Option<AlarmSeverity>,
 }
 
-pub struct MksWorker {
-    transport: Transport,
-    handle: PortHandle,
-    params: MksParams,
-    gauges: u8,
-    /// Filled by the first successful poll (the C did this in `init_record`,
-    /// which meant a controller that was offline at iocInit left the record
-    /// dead for the life of the IOC).
-    config: Option<Vec<Option<GaugeConfig>>>,
-}
-
-impl MksWorker {
-    fn transact(&self, command: &str) -> Result<String, String> {
-        self.transport.write_read(command.as_bytes())
-    }
-
-    fn publish(&self, addr: i32, values: Vec<ParamSetValue>) {
-        if !values.is_empty()
-            && let Err(e) = self.handle.set_params_and_notify_blocking(addr, values)
-        {
-            log::error!("MKS: publishing address {addr} failed: {e}");
+impl DevAiMks {
+    pub fn new(inp: &str) -> Self {
+        Self {
+            inp: inp.to_owned(),
+            name: String::new(),
+            low: 0.0,
+            high: 0.0,
+            live: None,
+            init_alarm: false,
+            alarm: None,
         }
     }
 
-    /// Read `SU` and `SG` and publish the units, gauge type and range of every
-    /// gauge (`devAiMKS.c::initAi`).
-    fn configure(&mut self) -> Result<Vec<Option<GaugeConfig>>, String> {
-        let units = self.transact(protocol::READ_UNITS)?.trim().to_string();
-        let types = self.transact(protocol::READ_GAUGE_TYPES)?;
-        let multiplier = protocol::unit_multiplier(&units);
-        let p = self.params;
+    /// `recGblSetSevr(pai, READ_ALARM, sevr)`.
+    fn raise(&mut self, sevr: AlarmSeverity) {
+        if self.alarm.is_none_or(|old| sevr > old) {
+            self.alarm = Some(sevr);
+        }
+    }
 
-        let mut config = Vec::with_capacity(usize::from(self.gauges));
-        for gauge in 1..=self.gauges {
-            let addr = i32::from(gauge) - 1;
-            let code = protocol::gauge_type_field(&types, gauge).unwrap_or("");
-            let gauge_type = GaugeType::from_code(code);
-            let mut values = vec![
-                ParamSetValue::new(p.units, addr, ParamValue::Octet(units.clone().into_bytes())),
-                ParamSetValue::new(
-                    p.gauge_type,
-                    addr,
-                    ParamValue::Octet(code.as_bytes().to_vec()),
+    /// One of `initAi`'s `writeReadOnce` queries, refused unless it succeeds
+    /// with the 7 characters C requires. The refusal prints what a failed
+    /// read delivered (devAiMKS.c:172-175).
+    fn query(&self, handle: &PortHandle, port: &str, command: &str) -> Option<String> {
+        let (reply, ok) = write_read_once(port, command.as_bytes());
+        let text = String::from_utf8_lossy(&reply).into_owned();
+        if !ok || reply.len() != REPLY_LEN {
+            print(
+                handle,
+                TraceMask::ERROR,
+                format_args!(
+                    "devAiMKS ERROR, record={}, nread={}, response=\n{text}\n",
+                    self.name,
+                    reply.len()
                 ),
-            ];
-            match gauge_type {
-                Some(gauge_type) => {
-                    let (low, high) = gauge_type.limits();
-                    let (low, high) = (low * multiplier, high * multiplier);
-                    values.push(ParamSetValue::new(
-                        p.low_limit,
-                        addr,
-                        ParamValue::Float64(low),
-                    ));
-                    values.push(ParamSetValue::new(
-                        p.high_limit,
-                        addr,
-                        ParamValue::Float64(high),
-                    ));
-                    config.push(Some(GaugeConfig { low, high }));
-                }
-                None => {
-                    log::error!("MKS: gauge {gauge} reports an unknown type {code:?}");
-                    config.push(None);
-                }
-            }
-            self.publish(addr, values);
+            );
+            return None;
         }
-        Ok(config)
+        print(
+            handle,
+            TraceMask::IO_DEVICE,
+            format_args!(
+                "devAiMKS::initAi record={}, nread={}, response=\n{text}\n",
+                self.name,
+                reply.len()
+            ),
+        );
+        Some(text)
     }
 }
 
-impl DeviceWorker for MksWorker {
-    type Command = MksCommand;
+fn double(record: &dyn Record, field: &str) -> f64 {
+    match record.get_field(field) {
+        Some(EpicsValue::Double(v)) => v,
+        _ => 0.0,
+    }
+}
 
-    fn poll(&mut self) {
-        if self.config.is_none() {
-            match self.configure() {
-                Ok(config) => self.config = Some(config),
-                Err(e) => {
-                    log::error!("MKS: reading the controller configuration failed: {e}");
-                    return;
-                }
-            }
-        }
-        let config = self.config.clone().unwrap_or_default();
-        let p = self.params;
+impl DeviceSupport for DevAiMks {
+    fn dtyp(&self) -> &str {
+        DTYP
+    }
 
-        for gauge in 1..=self.gauges {
-            let addr = i32::from(gauge) - 1;
-            let raw = match self.transact(&protocol::read_pressure(gauge)) {
-                Ok(raw) => raw,
-                Err(e) => {
-                    log::error!("MKS: read gauge {gauge} failed: {e}");
-                    continue;
-                }
-            };
-            let limits = config.get(usize::from(gauge - 1)).copied().flatten();
-            let (value, code) = match protocol::parse_reading(&raw) {
-                Reading::Pressure(value) => (Some(value), status::OK),
-                Reading::AboveRange => (limits.map(|c| c.high), status::ABOVE_RANGE),
-                Reading::BelowRange => (limits.map(|c| c.low), status::BELOW_RANGE),
-                Reading::NoGauge => (None, status::NO_GAUGE),
-                // The 937 emits SYNTAX! / NotCMD! spuriously; the C neither
-                // alarms nor logs, and leaves the record's value alone.
-                Reading::Spurious => continue,
-                Reading::Unknown => {
-                    log::error!("MKS: gauge {gauge} sent an unknown reply {raw:?}");
-                    (None, status::UNKNOWN)
-                }
-            };
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.name = name.to_owned();
+    }
 
-            let mut values = vec![ParamSetValue::new(p.status, addr, ParamValue::Int32(code))];
-            if let Some(value) = value {
-                values.push(ParamSetValue::new(
-                    p.pressure,
-                    addr,
-                    ParamValue::Float64(value),
+    /// C `initAi`. Every refusal is its `bad:` arm, `pai->pact = 1`.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        let name = self.name.clone();
+        let link = match parse_asyn_link(&self.inp) {
+            Ok(link) => link,
+            Err(e) => {
+                let message = match e {
+                    AsynError::InvalidLinkSyntax(m) => m,
+                    other => other.to_string(),
+                };
+                errlog_vprintf(format_args!(
+                    "devAiMKS::initAi {name} bad link {message} \n"
                 ));
+                return Ok(DeviceInitOutcome::dead());
             }
-            self.publish(addr, values);
+        };
+        let gauge = match u8::try_from(link.addr) {
+            Ok(g @ 1..=5) => g,
+            _ => {
+                errlog_vprintf(format_args!(
+                    "devAiMKS::init_record invalid gauge {}\n",
+                    link.addr
+                ));
+                return Ok(DeviceInitOutcome::dead());
+            }
+        };
+        let port_name = link.port_name;
+        let handle = match crate::connect_octet(&port_name, 0) {
+            Ok(handle) => handle,
+            Err(Unconnected::Device(_)) => {
+                errlog_vprintf(format_args!(
+                    "devAiMKS::initAi {name} cannot connect to device {port_name}\n"
+                ));
+                return Ok(DeviceInitOutcome::dead());
+            }
+            Err(Unconnected::NoOctet) => {
+                errlog_vprintf(format_args!(
+                    "devAiMKS::initAi {name} cannot find asynOctet interface\n"
+                ));
+                return Ok(DeviceInitOutcome::dead());
+            }
+        };
+
+        if record.get_field("PREC") == Some(EpicsValue::Short(0)) {
+            record.put_field("PREC", EpicsValue::Short(1))?;
+        }
+
+        let dead = || {
+            Ok(DeviceInitOutcome::dead_with_alarm(
+                READ_ALARM,
+                AlarmSeverity::Major,
+            ))
+        };
+        let Some(units) = self.query(&handle, &port_name, protocol::READ_UNITS) else {
+            return dead();
+        };
+        record.put_field("EGU", EpicsValue::String(units.as_str().into()))?;
+        let Some(types) = self.query(&handle, &port_name, protocol::READ_GAUGE_TYPES) else {
+            return dead();
+        };
+        let code = protocol::gauge_type_field(&types, gauge).unwrap_or("");
+        match GaugeType::from_code(code) {
+            Some(gauge_type) => (self.low, self.high) = gauge_type.limits(),
+            None => {
+                print(
+                    &handle,
+                    TraceMask::ERROR,
+                    format_args!("devAiMKS, unknown gauge type {code}\n"),
+                );
+                self.init_alarm = true;
+            }
+        }
+        let mult = protocol::unit_multiplier(&units);
+        self.low *= mult;
+        self.high *= mult;
+        if double(record, "LOPR") == 0.0 && double(record, "HOPR") == 0.0 {
+            record.put_field("LOPR", EpicsValue::Double(self.low))?;
+            record.put_field("HOPR", EpicsValue::Double(self.high))?;
+        }
+        print(
+            &handle,
+            TraceMask::IO_DEVICE,
+            format_args!(
+                "devAiMKS record={name}, gauge_str={code}, lopr={:.6}, hopr={:.6}\n",
+                CFloat(double(record, "LOPR")),
+                CFloat(double(record, "HOPR"))
+            ),
+        );
+
+        let job = Arc::new(Job {
+            name,
+            handle: handle.clone(),
+            command: protocol::read_pressure(gauge).into_bytes(),
+            reply: Mutex::new(None),
+            reentry: Reentry::default(),
+        });
+        let cell = handle.new_cell(job.clone());
+        self.live = Some(Live {
+            job,
+            cell,
+            queued: false,
+        });
+        Ok(DeviceInitOutcome::ok())
+    }
+
+    /// C `readAi` with `pact == 0`: queue the exchange.
+    fn read_begin(
+        &mut self,
+        _record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
+        let Some(live) = self.live.as_mut().filter(|_| !done.pact()) else {
+            return Ok(ReadStart::Synchronous);
+        };
+        live.job.reentry.arm(done);
+        let user = AsynUser::new(0)
+            .with_addr(ADDR)
+            .with_timeout(TIMEOUT)
+            .with_priority(QueuePriority::Low);
+        live.queued = live.job.handle.queue_request(&live.cell, &user).is_ok();
+        Ok(if live.queued {
+            ReadStart::Pending
+        } else {
+            ReadStart::Synchronous
+        })
+    }
+
+    /// `callbackAi`'s decode and `readAi` with `pact == 1`. C ignores a
+    /// refused `queueRequest` and leaves the record active forever; here the
+    /// refusal is read as the failed read it is.
+    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        let live = self
+            .live
+            .as_mut()
+            .ok_or_else(|| CaError::LinkError("devAiMKS not initialised".into()))?;
+        let reply = if std::mem::take(&mut live.queued) {
+            live.job.reply.lock().unwrap().take()
+        } else {
+            None
+        };
+        let (name, handle) = (live.job.name.clone(), live.job.handle.clone());
+        self.alarm = None;
+        if std::mem::take(&mut self.init_alarm) {
+            self.raise(AlarmSeverity::Major);
+        }
+        let raw = match reply {
+            Some(raw) if raw.len() == REPLY_LEN => raw,
+            _ => {
+                self.raise(AlarmSeverity::Major);
+                return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
+            }
+        };
+        let text = String::from_utf8_lossy(&raw);
+        let val = match protocol::parse_reading(&text) {
+            Reading::Pressure(value) => Some(value),
+            Reading::AboveRange => {
+                self.raise(AlarmSeverity::Minor);
+                Some(self.high)
+            }
+            Reading::BelowRange => {
+                self.raise(AlarmSeverity::Minor);
+                Some(self.low)
+            }
+            Reading::NoGauge => {
+                print(
+                    &handle,
+                    TraceMask::FLOW,
+                    format_args!("devAiMKS record={name}, no gauge, etc.\n"),
+                );
+                self.raise(AlarmSeverity::Major);
+                Some(0.0)
+            }
+            Reading::Spurious => {
+                print(
+                    &handle,
+                    TraceMask::FLOW,
+                    format_args!("devAiMKS record={name}, SYNTAX or NotCMD response.\n"),
+                );
+                None
+            }
+            Reading::Unknown => {
+                print(
+                    &handle,
+                    TraceMask::ERROR,
+                    format_args!(
+                        "devAiMKS record={name}, unknown response len={} response={text}\n",
+                        text.len()
+                    ),
+                );
+                self.raise(AlarmSeverity::Major);
+                Some(0.0)
+            }
+        };
+        if let Some(val) = val {
+            record.put_field("VAL", EpicsValue::Double(val))?;
+        }
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
+    }
+
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        self.alarm.map(|sevr| DeviceAlarm {
+            stat: READ_ALARM,
+            sevr: sevr as u16,
+            msg: "",
+        })
+    }
+
+    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+        Ok(())
+    }
+
+    /// C `convertAi` fills the slot and does nothing; the record still
+    /// rebases EOFF to EGUL around the call.
+    fn has_special_linconv(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::manager::{PortManager, claim_port_driver};
+    use epics_rs::asyn::port::PortDriver;
+    use epics_rs::asyn::registry::open_owner;
+    use epics_rs::asyn::runtime::port::PortRuntimeHandle;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::base::server::records::ai::AiRecord;
+
+    use super::*;
+
+    /// A registered octet port that never connects, its trace in a file.
+    fn refused_port(port: &str) -> (PortRuntimeHandle, PathBuf) {
+        let mut driver = DrvAsynIPPort::new(port, "127.0.0.1:1").unwrap();
+        driver.base_mut().init_auto_connect(false);
+        let runtime = PortManager::new()
+            .register_port(claim_port_driver(port).unwrap(), driver, &open_owner())
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("{port}-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        runtime
+            .port_handle()
+            .trace()
+            .set_trace_file(Some(port), TraceFile::File(Arc::new(Mutex::new(file))));
+        (runtime, path)
+    }
+
+    fn init(port: &str, record: &str, gauge: u8) -> (DevAiMks, DeviceInitOutcome) {
+        let mut dev = DevAiMks::new(&format!("@asyn({port} {gauge})"));
+        dev.set_record_info(record, ScanType::Passive);
+        let outcome = dev.init(&mut AiRecord::default()).unwrap();
+        (dev, outcome)
+    }
+
+    /// Each record runs C's `initAi` once, against a dead controller: the
+    /// SyncIO failure line, then the error line naming the record, and the
+    /// record is dead with READ/MAJOR.
+    #[test]
+    fn a_failed_units_read_names_the_record_and_kills_it() {
+        let port = "MKS_REFUSED";
+        let (_runtime, path) = refused_port(port);
+        let records = ["ipExample:cc1", "ipExample:pr2"];
+        for (record, gauge) in records.iter().zip([1, 5]) {
+            let (_, outcome) = init(port, record, gauge);
+            assert_eq!(
+                outcome,
+                DeviceInitOutcome::dead_with_alarm(READ_ALARM, AlarmSeverity::Major)
+            );
+        }
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = log.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 4, "{log}");
+        for (pair, record) in lines.chunks(2).zip(records) {
+            assert!(
+                pair[0].ends_with(&format!(
+                    "asynOctetSyncIO writeReadOnce failed asynManager::queueLockPort \
+                     queueRequest failed: port {port} not connected"
+                )),
+                "{log}"
+            );
+            assert!(
+                pair[1].ends_with(&format!(
+                    "devAiMKS ERROR, record={record}, nread=0, response="
+                )),
+                "{log}"
+            );
         }
     }
 
-    fn handle(&mut self, _command: Self::Command) {}
-}
+    /// devAiMKS.c:172-175 prints `nread` and the response of a failed
+    /// `SU` read, so a reply cut by a timeout shows what arrived.
+    #[test]
+    fn a_cut_units_read_prints_what_arrived() {
+        use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+        use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::user::AsynUser;
 
-/// `MKSConfig(port, octetPort, numGauges, [pollPeriod])`.
-pub fn create_mks(
-    port_name: &str,
-    octet_port: &str,
-    gauges: u8,
-    poll_period: Duration,
-) -> AsynResult<IpPortRuntime> {
-    if gauges == 0 || usize::from(gauges) > MAX_GAUGES {
-        return Err(crate::asyn_error(format!(
-            "MKS: numGauges must be 1..{MAX_GAUGES}, got {gauges}"
-        )));
+        /// Every read delivers `TORR` and then times out.
+        struct Cut(PortDriverBase);
+        impl PortDriver for Cut {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+                Ok(data.len())
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+                buf[..4].copy_from_slice(b"TORR");
+                OctetReadResult {
+                    status: Err(AsynError::Status {
+                        status: AsynStatus::Timeout,
+                        message: "read timeout".into(),
+                    }),
+                    ..OctetReadResult::ok(4, EomReason::empty())
+                }
+            }
+        }
+
+        let port = "MKS_CUT";
+        let claim = claim_port(port).unwrap();
+        let (runtime, _actor) = create_port_runtime(
+            &claim,
+            Cut(PortDriverBase::new(
+                port,
+                1,
+                PortFlags::default(),
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &open_owner())
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("{port}-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        runtime
+            .port_handle()
+            .trace()
+            .set_trace_file(Some(port), TraceFile::File(Arc::new(Mutex::new(file))));
+        let (_, outcome) = init(port, "ipExample:cut", 1);
+        assert_eq!(
+            outcome,
+            DeviceInitOutcome::dead_with_alarm(READ_ALARM, AlarmSeverity::Major)
+        );
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            log.contains("devAiMKS ERROR, record=ipExample:cut, nread=4, response=\nTORR\n"),
+            "{log}"
+        );
     }
 
-    let io = connect_octet(octet_port, MKS_TIMEOUT).map_err(crate::asyn_error)?;
-    let (commands, rx) = std::sync::mpsc::channel::<MksCommand>();
-    let driver = MksDriver::new(port_name, commands)?;
-    let params = driver.params();
+    /// `initAi`'s refusals before any I/O: no port, no gauge, no link.
+    #[test]
+    fn init_refuses_what_c_refuses_before_any_io() {
+        let (_, outcome) = init("MKS_NO_SUCH_PORT", "R:nop", 1);
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        let (_, outcome) = init("MKS_NO_SUCH_PORT", "R:g6", 6);
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        let mut dev = DevAiMks::new("not a link");
+        assert_eq!(
+            dev.init(&mut AiRecord::default()).unwrap(),
+            DeviceInitOutcome::dead()
+        );
+    }
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
-    let worker = MksWorker {
-        transport: Transport::new(io),
-        handle: runtime_handle.port_handle().clone(),
-        params,
-        gauges,
-        config: None,
-    };
-    let thread = worker::spawn(port_name, worker, rx, poll_period);
-    Ok(IpPortRuntime::new(runtime_handle, thread))
+    /// A port without asynOctet fails `findInterface`: C prints its line and
+    /// takes `bad:` before any I/O (devAiMKS.c:152-156).
+    #[test]
+    fn a_port_without_octet_kills_the_record_before_any_io() {
+        use epics_rs::base::runtime::log::{
+            errlog_add_listener, errlog_flush, errlog_remove_listener,
+        };
+
+        crate::no_octet_port("MKS_INT32_ONLY");
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let id = errlog_add_listener({
+            let lines = lines.clone();
+            move |line: &str| lines.lock().unwrap().push(line.to_string())
+        });
+        let (_, outcome) = init("MKS_INT32_ONLY", "R:i32", 1);
+        errlog_flush();
+        errlog_remove_listener(id);
+        assert_eq!(outcome, DeviceInitOutcome::dead());
+        let lines = lines.lock().unwrap();
+        let want = "devAiMKS::initAi R:i32 cannot find asynOctet interface\n";
+        assert!(lines.iter().any(|l| l == want), "{lines:#?}");
+    }
+
+    fn decode(dev: &mut DevAiMks, reply: Option<&[u8]>, val: f64) -> (f64, Option<u16>) {
+        let live = dev.live.as_mut().unwrap();
+        live.queued = true;
+        *live.job.reply.lock().unwrap() = reply.map(<[u8]>::to_vec);
+        let mut rec = AiRecord::default();
+        rec.val = val;
+        let outcome = dev.read(&mut rec).unwrap();
+        assert!(outcome.did_compute());
+        (rec.val, dev.last_alarm().map(|a| a.sevr))
+    }
+
+    /// `callbackAi`'s decode, one case per C arm.
+    #[test]
+    fn replies_decode_as_callback_ai_does() {
+        let port = "MKS_DECODE";
+        let (runtime, _path) = refused_port(port);
+        let handle = runtime.port_handle().clone();
+        let job = Arc::new(Job {
+            name: "R:cc1".into(),
+            handle: handle.clone(),
+            command: b"R1".to_vec(),
+            reply: Mutex::new(None),
+            reentry: Reentry::default(),
+        });
+        let mut dev = DevAiMks::new("");
+        (dev.low, dev.high) = (1e-11, 1e-2);
+        dev.live = Some(Live {
+            cell: handle.new_cell(job.clone()),
+            job,
+            queued: false,
+        });
+        let (major, minor) = (
+            Some(AlarmSeverity::Major as u16),
+            Some(AlarmSeverity::Minor as u16),
+        );
+
+        assert_eq!(decode(&mut dev, Some(b"1.2E-06"), 5.0), (1.2e-6, None));
+        assert_eq!(decode(&mut dev, Some(b"H 1.0E0"), 5.0), (1e-2, minor));
+        assert_eq!(decode(&mut dev, Some(b"L 1.0E0"), 5.0), (1e-11, minor));
+        assert_eq!(decode(&mut dev, Some(b"NO GAUG"), 5.0), (0.0, major));
+        assert_eq!(decode(&mut dev, Some(b"garbage"), 5.0), (0.0, major));
+        // A failed or short read alarms and leaves VAL alone.
+        assert_eq!(decode(&mut dev, None, 5.0), (5.0, major));
+        assert_eq!(decode(&mut dev, Some(b"1.2"), 5.0), (5.0, major));
+        // C writes 0 here with no alarm; VAL is left alone instead.
+        assert_eq!(decode(&mut dev, Some(b"SYNTAX!"), 5.0), (5.0, None));
+
+        // The unknown-gauge-type alarm from init lands on the first read.
+        dev.init_alarm = true;
+        assert_eq!(decode(&mut dev, Some(b"1.2E-06"), 5.0), (1.2e-6, major));
+        assert_eq!(decode(&mut dev, Some(b"1.2E-06"), 5.0), (1.2e-6, None));
+    }
 }

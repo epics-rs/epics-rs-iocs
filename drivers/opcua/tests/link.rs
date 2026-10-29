@@ -35,7 +35,7 @@ const ITEM: RecordKind = RecordKind {
 };
 
 fn parse(link: &str, kind: RecordKind) -> Result<LinkInfo, LinkError> {
-    parse_link(link, kind, &InfoDefaults::default(), &Names)
+    parse_link("rec", link, kind, &InfoDefaults::default(), &Names)
 }
 
 fn ok(link: &str, kind: RecordKind) -> LinkInfo {
@@ -116,6 +116,23 @@ fn numeric_identifier_accepts_decimal_and_hex() {
     );
 }
 
+/// `epicsParseUInt32`/`UInt16(optval, &v, 0, NULL)` (`linkParser.cpp:266-285`):
+/// glibc's base-0 `strtoul`, `0b` included, so a negative wraps and passes
+/// unless it lands in the `(MAX, ~MAX]` overflow band.
+#[test]
+fn a_numeric_option_is_epics_parse_uint() {
+    let id = |link: &str| ok(link, INPUT).identifier;
+    assert_eq!(id("subs i=0b101"), Some(NodeIdentifier::Numeric(5)));
+    assert_eq!(id("subs i=-1"), Some(NodeIdentifier::Numeric(u32::MAX)));
+    assert_eq!(id("subs i=-4294967295"), Some(NodeIdentifier::Numeric(1)));
+    assert_eq!(
+        message("subs i=-4294967296", INPUT),
+        "error converting '-4294967296' to UInt32"
+    );
+    assert_eq!(ok("subs ns=-1;i=1", INPUT).namespace_index, u16::MAX);
+    assert_eq!(ok("subs i=1 qsize=0b11", INPUT).queue_size, 3);
+}
+
 #[test]
 fn namespace_index_defaults_to_zero() {
     assert_eq!(ok("subs i=2258", INPUT).namespace_index, 0);
@@ -138,8 +155,8 @@ fn out_of_range_numbers_are_rejected() {
         "error converting '70000' to UInt16"
     );
     assert_eq!(
-        message("subs ns=1;i=-3", INPUT),
-        "error converting '-3' to UInt32"
+        message("subs ns=1;i=4294967296", INPUT),
+        "error converting '4294967296' to UInt32"
     );
 }
 
@@ -367,7 +384,7 @@ fn info_tags_set_defaults_that_link_options_then_override() {
     info.insert("opcua:ELEMENT".to_string(), "a.b".to_string());
     let info = InfoDefaults::from_info(&info);
 
-    let l = parse_link("sess i=1", INPUT, &info, &Names).expect("parse");
+    let l = parse_link("rec", "sess i=1", INPUT, &info, &Names).expect("parse");
     assert_eq!(l.sampling_interval, 50.0);
     assert_eq!(l.queue_size, 8);
     assert!(!l.discard_oldest);
@@ -376,6 +393,7 @@ fn info_tags_set_defaults_that_link_options_then_override() {
     assert_eq!(l.element_path, ["a", "b"]);
 
     let l = parse_link(
+        "rec",
         "subs i=1 sampling=10 qsize=2 monitor=y",
         INPUT,
         &info,
@@ -385,6 +403,42 @@ fn info_tags_set_defaults_that_link_options_then_override() {
     assert_eq!(l.sampling_interval, 10.0);
     assert_eq!(l.queue_size, 2);
     assert!(l.monitor);
+}
+
+/// Each tag's deprecation line comes just before the tag is parsed, so a bad
+/// tag stops the lines at its own (`linkParser.cpp:104-185`).
+#[cfg(unix)]
+#[test]
+fn a_bad_info_tag_stops_the_deprecation_lines() {
+    let mut info = HashMap::new();
+    info.insert("opcua:SAMPLING".to_string(), "bad".to_string());
+    info.insert("opcua:QSIZE".to_string(), "8".to_string());
+    let info = InfoDefaults::from_info(&info);
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 2 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(2);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 2);
+        saved
+    };
+    let parsed = parse_link("REC", "sess i=1", INPUT, &info, &Names);
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 2);
+        libc::close(saved);
+    }
+
+    assert_eq!(
+        parsed.unwrap_err().to_string(),
+        "error converting 'bad' to Double"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sink.path()).unwrap(),
+        "REC DEPRECATION WARNING: setting parameters through info items is deprecated; \
+         use link parameters instead.\n"
+    );
 }
 
 #[test]

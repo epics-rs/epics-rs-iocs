@@ -1,0 +1,22 @@
+# dbl of motor R7-4-5 motorNewport iocBoot/iocNewport st.cmd with its MM3000.cmd
+newport:alldone
+newport:alldoneBlink
+newport:allstop
+newport:m1
+newport:m1_able
+newport:m1_twCh
+newport:m1_vCh
+newport:m2
+newport:m2_able
+newport:m2_twCh
+newport:m2_vCh
+newport:m3
+newport:m3_able
+newport:m3_twCh
+newport:m3_vCh
+newport:m4
+newport:m4_able
+newport:m4_twCh
+newport:m4_vCh
+newport:moving
+newport:movingDiff

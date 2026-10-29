@@ -13,24 +13,38 @@
 //! Numeric fields use C `%f` formatting (fixed 6 decimals) so the wire bytes
 //! match the reference driver.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 /// `<axis>VA<velocity>` — set moving velocity (controller EGU/sec).
 pub fn cmd_set_velocity(axis: u8, velocity_egu: f64) -> String {
-    format!("{axis}VA{velocity_egu:.6}")
+    format!(
+        "{axis}VA{velocity_egu:.6}",
+        velocity_egu = CFloat(velocity_egu)
+    )
 }
 
 /// `<axis>AC<acceleration>` — set acceleration (controller EGU/sec²).
 pub fn cmd_set_acceleration(axis: u8, acceleration_egu: f64) -> String {
-    format!("{axis}AC{acceleration_egu:.6}")
+    format!(
+        "{axis}AC{acceleration_egu:.6}",
+        acceleration_egu = CFloat(acceleration_egu)
+    )
 }
 
 /// `<axis>PA<position>` — move to an absolute position (controller EGU).
 pub fn cmd_move_absolute(axis: u8, position_egu: f64) -> String {
-    format!("{axis}PA{position_egu:.6}")
+    format!(
+        "{axis}PA{position_egu:.6}",
+        position_egu = CFloat(position_egu)
+    )
 }
 
 /// `<axis>PR<distance>` — move a relative distance (controller EGU).
 pub fn cmd_move_relative(axis: u8, distance_egu: f64) -> String {
-    format!("{axis}PR{distance_egu:.6}")
+    format!(
+        "{axis}PR{distance_egu:.6}",
+        distance_egu = CFloat(distance_egu)
+    )
 }
 
 /// `<axis>OR` — execute the home search sequence.
@@ -96,6 +110,8 @@ pub struct TsStatus {
 /// response is too short to hold the full status field.
 pub fn parse_status(resp: &str) -> Option<TsStatus> {
     let b = resp.as_bytes();
+    // C reads [6..=8] past a short reply's NUL into the previous reply's
+    // bytes and posts a clean status (C defect, not copied).
     if b.len() < 9 {
         return None;
     }
@@ -155,6 +171,9 @@ mod tests {
     fn command_formatting_matches_c_sprintf() {
         // C: sprintf(outString_, "%1dPA%f", axisNo_+1, val)
         assert_eq!(cmd_move_absolute(1, 2.5), "1PA2.500000");
+        // glibc %f of a NaN, sign bit included.
+        assert_eq!(cmd_move_absolute(1, f64::NAN), "1PAnan");
+        assert_eq!(cmd_move_absolute(1, -f64::NAN), "1PA-nan");
         assert_eq!(cmd_move_relative(1, -0.25), "1PR-0.250000");
         assert_eq!(cmd_set_velocity(1, 1.0), "1VA1.000000");
         assert_eq!(cmd_set_acceleration(1, 10.0), "1AC10.000000");

@@ -7,5 +7,9 @@ publish = false
 [dependencies]
 ur-robot = { path = "../../../drivers/ur-robot" }
 epics-rs = { workspace = true, features = ["asyn", "bridge"] }
+epics-libcom-rs = { workspace = true }
 asyn-rs = { workspace = true, features = ["epics"] }
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+ioc-conventions = { path = "../../../tools/ioc-conventions" }

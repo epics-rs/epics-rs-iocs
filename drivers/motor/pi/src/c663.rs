@@ -11,15 +11,14 @@
 //! Same as C-862: pure `pasynOctetSyncIO` despite the iocsh argument label
 //! "asyn address (GPIB)" — `motor_init`'s `connect(cntrl->asyn_port, 0, ...)`
 //! hardcodes the asyn sub-address to 0. Connects via
-//! [`motor_common::connect::connect_serial`].
+//! [`motor_common::connect::connect_with_eos`].
 //!
 //! ## Wire shape — the port owns framing
 //! `motor_init` calls `pasynOctetSyncIO->setOutputEos(pasynUser, "\r", 1)`
 //! and `setInputEos(pasynUser, "\n\x03", 2)` right after connecting;
 //! `send_mess`'s buffer never appends a terminator (`strcat(local_buff,
 //! com)` only). Same ownership as C-862 — see the `motor-port-eos-ownership`
-//! convention. `SyncIOHandle` has no driver-side EOS-set hook, so both EOS
-//! values are set from `st.cmd` instead of from [`PIC663Controller::new`].
+//! convention. `PIC663Config` sets both EOS values the same way.
 //!
 //! `recv_mess` unconditionally drops the **last** received byte (C
 //! `com[nread - 1] = '\0'; /* Strip traling CR. */` — a real typo in the C
@@ -86,20 +85,24 @@
 //!   command (record-side cache only, or C-862-style immediate-move no-op).
 //!
 //! ## Not modeled (documented deviations)
-//! - **`recv_mess(..., FLUSH)`** before a retry: same gap as C-862 —
-//!   `SyncIOHandle` has no synchronous flush primitive.
+//! - **`recv_mess(..., FLUSH)`** before a retry: replaced by a flush before
+//!   every query (`exchange`), a superset of C's error-path flush.
 //! - **`GET_IDENT` dead macro** (`#define GET_IDENT 0x01`, never referenced
 //!   in the C source — a vestige of the C-862 copy-paste): not ported.
-//! - **`report()`**: not implemented, matching every other port here.
 //! - **`no_motion_count`**: pure poll-rate scheduling counter, not tracked.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
+use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{nint, parse_value_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -168,11 +171,7 @@ struct PolledStatus {
 
 fn status_from_polled(polled: &PolledStatus) -> MotorStatus {
     MotorStatus {
-        position: polled.position,
-        encoder_position: polled.position,
-        velocity: 0.0,
         done: polled.done,
-        moving: !polled.done,
         powered: polled.powered,
         high_limit: polled.high_limit,
         low_limit: polled.low_limit,
@@ -185,6 +184,9 @@ fn status_from_polled(polled: &PolledStatus) -> MotorStatus {
         has_encoder: true,
         vbas_supported: false,
         ..MotorStatus::default()
+            .with_position(polled.position)
+            .with_encoder_position(polled.position)
+            .with_velocity(0.0)
     }
 }
 
@@ -209,8 +211,7 @@ impl PIC663Controller {
 
         let select_cmd = format!("\u{1}{addr:X}VE");
         for _ in 0..3 {
-            ctrl.send(&select_cmd)?;
-            let (reply, raw_len) = ctrl.recv();
+            let (reply, raw_len) = ctrl.exchange(&select_cmd);
             if raw_len > 0 {
                 ctrl.ident = reply;
                 break;
@@ -232,16 +233,31 @@ impl PIC663Controller {
     /// Write a command, no reply expected. No terminator is appended here —
     /// the port's configured output EOS puts the CR on the wire.
     fn send(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.send_bytes(cmd.as_bytes())
+    }
+
+    /// [`send`](Self::send) for raw bytes; an empty message is not sent.
+    fn send_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        self.handle.write_octet(0, cmd)?;
         Ok(())
+    }
+
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input. C flushes only at `set_status` (drvPIC663.cc:215), so a late reply
+    /// shifts its answers until the next poll: a C defect, not copied.
+    fn exchange(&self, cmd: &str) -> (String, usize) {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
     }
 
     /// Read one reply, unconditionally dropping the last byte (C
     /// `recv_mess`'s "Strip trailing CR"). Returns `(reply, raw_len)`;
     /// `raw_len` is the pre-strip byte count (C's `charcnt`).
-    fn recv(&self) -> (String, usize) {
-        match self.handle.read_octet(0, READ_BUF) {
-            Ok(raw) if !raw.is_empty() => {
+    fn reply(read: OctetRead) -> (String, usize) {
+        match read.into_parts() {
+            (raw, Ok(())) if !raw.is_empty() => {
                 let stripped = &raw[..raw.len() - 1];
                 (String::from_utf8_lossy(stripped).into_owned(), raw.len())
             }
@@ -252,8 +268,7 @@ impl PIC663Controller {
     /// C `set_status`: `TS` gated by the comm debounce, then (on a good
     /// `TS`) `TP` with no further debounce.
     fn poll_status(&mut self) -> Option<PolledStatus> {
-        let _ = self.send("TS");
-        let (ts_reply, ts_raw_len) = self.recv();
+        let (ts_reply, ts_raw_len) = self.exchange("TS");
         let regs = if ts_raw_len > 9 {
             parse_ts_reply(&ts_reply)
         } else {
@@ -272,8 +287,7 @@ impl PIC663Controller {
 
         let bits = decode_regs(&regs);
 
-        let _ = self.send("TP");
-        let (tp_reply, _) = self.recv();
+        let (tp_reply, _) = self.exchange("TP");
         let position = parse_value_at(&tp_reply, 2).map_or(0.0, |v| nint(v) as f64);
 
         Some(PolledStatus {
@@ -286,121 +300,138 @@ impl PIC663Controller {
     }
 }
 
-/// The single axis of a C-663 controller. Implements [`AsynMotor`].
+/// The single axis of a C-663 controller. Implements [`Model1Motor`].
 pub struct PIC663Axis {
     controller: Arc<Mutex<PIC663Controller>>,
     /// Record soft limits (dial EGU = raw counts, `MRES = 1`), cached from
-    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`] — the C-663 has no
+    /// [`Model1Motor::set_high_limit`]/[`set_low_limit`](Model1Motor::set_low_limit) — the C-663 has no
     /// jog command, so a jog moves to whichever of these the record's DHLM
     /// / DLLM the requested direction selects.
     high_limit: Option<f64>,
     low_limit: Option<f64>,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIC663.cc:232), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :238). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
+    strings: MoveStrings,
+    /// The record's SET_VELOCITY/SET_ACCEL pieces of the transaction under
+    /// way (`build_trans` appends them), which the move command flushes.
+    parts: String,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIC663Axis {
-    /// Construct the controller's one axis, seeding the initial status. A
-    /// failed initial poll is not an error — C leaves the zeroed defaults
-    /// in place either way.
-    pub fn new(controller: Arc<Mutex<PIC663Controller>>) -> AsynResult<Self> {
+    /// Construct the controller's one axis and read its status, as C
+    /// `motor_init`'s `set_status` does (drvPIC663.cc:554).
+    pub fn new(controller: Arc<Mutex<PIC663Controller>>) -> Self {
         let mut axis = Self {
-            controller: controller.clone(),
+            controller,
             high_limit: None,
             low_limit: None,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
-                done: true,
                 gain_support: true,
                 has_encoder: true,
                 vbas_supported: false,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
+            parts: String::new(),
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(polled) = ctrl.poll_status() {
-            axis.last_status = status_from_polled(&polled);
-        }
-        Ok(axis)
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, PIC663Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// One move transaction: the record's earlier parts, then PREM and a `,`
+    /// ahead of the move's own command (devPIC663.cc:175-190), whose POST
+    /// waits for the move to end.
+    fn write_move(&mut self, command: &str) -> AsynResult<()> {
+        let mut line = std::mem::take(&mut self.parts).into_bytes();
+        let prem = self.strings.arm();
+        if !prem.is_empty() {
+            line.extend_from_slice(&prem);
+            line.push(b',');
+        }
+        line.extend_from_slice(command.as_bytes());
+        self.lock().send_bytes(&line)
+    }
 }
 
-impl AsynMotor for PIC663Axis {
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.lock().send(&format!(
-            "SV{},{}MA{}",
-            velocity as i32,
-            crate::accel_field(acceleration),
-            position as i32
-        ))
+impl Model1Motor for PIC663Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.lock().send(&format!(
-            "SV{},{}MR{}",
-            velocity as i32,
-            crate::accel_field(acceleration),
-            distance as i32
-        ))
+    /// `update_delay` is 0.017 s (`targs`, drvPIC663.cc:103).
+    fn update_delay(&self) -> Duration {
+        Duration::from_millis(17)
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    /// SET_VELOCITY: `SV{v},` joins the transaction.
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.parts.push_str(&format!("SV{},", velocity as i32));
+        Ok(())
+    }
+
+    /// A DC motor: SET_VEL_BASE sends nothing.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.parts.push_str(&format!("SA{},", acceleration as i32));
+        Ok(())
+    }
+
+    fn poll_failure(&self) -> PollFailure {
+        self.failure
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.write_move(&format!("MA{}", position as i32))
+    }
+
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.write_move(&format!("MR{}", distance as i32))
+    }
+
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         let target = if velocity > 0.0 {
             self.high_limit
         } else {
             self.low_limit
         }
         .ok_or_else(|| pic663_err("PIC663: jog needs the record soft limits (none set yet)"))?;
-        // C's jog path issues SET_ACCEL unconditionally before the move
-        // (shared motorRecord.cc jog kickoff, no accel>0 guard), so the jog
-        // acceleration is always on the wire: `SA,SV,MA`.
-        self.lock().send(&format!(
-            "SA{},SV{},MA{}",
-            acceleration as i32,
-            velocity.abs() as i32,
-            target as i32
-        ))
+        // The record's SET_ACCEL (always, on a jog) leads: `SA,SV,MA`.
+        self.write_move(&format!("SV{},MA{}", velocity.abs() as i32, target as i32))
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
+    /// JOG_VELOCITY is SET_VELOCITY's `SV{v},` (devPIC663.cc:224), sent now with the
+    /// SET_ACCEL ahead of it and no PREM, and no move.
+    fn jog_velocity(&mut self, user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.set_velocity(user, velocity)?;
+        let mut line = std::mem::take(&mut self.parts).into_bytes();
+        if line.last() == Some(&b',') {
+            line.pop();
+        }
+        self.lock().send_bytes(&line)
+    }
+
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let cmd = if forward { "FE0" } else { "FE1" };
-        self.lock().send(&format!(
-            "SV{},{}{cmd}",
-            velocity as i32,
-            crate::accel_field(acceleration)
-        ))
+        self.write_move(cmd)
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         self.lock().send("ST")
     }
 
@@ -435,27 +466,174 @@ impl AsynMotor for PIC663Axis {
         self.lock().send(&cmd)
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut ctrl = self.lock();
+    /// `PRIMITIVE`: INIT as its own message (devPIC663.cc:172-173).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().send_bytes(init)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = ctrl.poll_status();
         let comm_err = ctrl.comm_state == CommState::CommErr;
-        drop(ctrl);
 
         let Some(polled) = polled else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pic663_err("no status reply"));
         };
         self.last_status = status_from_polled(&polled);
-        Ok(self.last_status.clone())
+        // drvPIC663.cc:273-313: POST once done or stopped by a limit in the
+        // move's direction.
+        let s = &self.last_status;
+        let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+        if (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.send_bytes(&post);
+        }
+        drop(ctrl);
+        *status = self.last_status.clone();
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
+
+    /// `TS` registers: done with no limit, moving, and moving into the
+    /// tripped -limit (a limit bit reads 0 when tripped).
+    const DONE: &str = "S:02 05 00";
+    const MOVING: &str = "S:00 05 00";
+    const MOVING_LOW_LS: &str = "S:00 04 00";
+
+    /// A C-663 on a [`LineRig`] whose `TS` reply follows `ts`; replies carry
+    /// the trailing CR C's `recv_mess` strips.
+    fn strings_rig(name: &str) -> (LineRig, PIC663Axis, Arc<Mutex<&'static str>>) {
+        let ts = Arc::new(Mutex::new(DONE));
+        let t = ts.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "TS" => format!("{}\r", t.lock().unwrap()),
+            "TP" => "P:0\r".into(),
+            _ => "C-663\r".into(),
+        });
+        let ctrl = PIC663Controller::new(io, 1).unwrap();
+        let mut axis = PIC663Axis::new(Arc::new(Mutex::new(ctrl)));
+        let user = AsynUser::default();
+        axis.set_high_limit(&user, 100.0).unwrap();
+        axis.set_low_limit(&user, -100.0).unwrap();
+        line.sent();
+        (line, axis, ts)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PIC663Axis) -> Vec<String> {
+        axis.polled(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| l != "TS" && l != "TP")
+            .collect()
+    }
+
+    /// devPIC663.cc:172-173: INIT as its own message.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pic663Init");
+        axis.primitive(&AsynUser::default(), b"DP100").unwrap();
+        assert_eq!(line.sent(), ["DP100"]);
+    }
+
+    /// devPIC663.cc:175-190: PREM and a `,` ahead of the move's own command,
+    /// for that move only.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pic663Prem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MN,MA5"]);
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MR5"]);
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.record_home(&user, 0.0, 100.0, 50.0, true).unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MN,FE0"]);
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.record_jog(&user, 0.0, -100.0, 50.0).unwrap();
+        assert_eq!(line.sent(), ["SA50,MN,SV100,MA-100"]);
+    }
+
+    /// devPIC663.cc JOG_VELOCITY: the pending `SA`/`SV` go out at once, minus
+    /// end_trans's trailing `,`, with PREM left armed for the next move.
+    #[test]
+    fn a_jvel_retune_sends_sv_and_leaves_prem_armed() {
+        let (line, mut axis, _) = strings_rig("pic663Jvel");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.set_accel(&user, 50.0).unwrap();
+        axis.jog_velocity(&user, 100.0).unwrap();
+        assert_eq!(line.sent(), ["SA50,SV100"]);
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MN,MA5"]);
+    }
+
+    /// drvPIC663.cc:307-314: POST once the move is done, not while it runs,
+    /// and only once.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, ts) = strings_rig("pic663Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MF")))
+            .unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        line.sent();
+        *ts.lock().unwrap() = MOVING;
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        *ts.lock().unwrap() = DONE;
+        assert_eq!(poll_extra(&line, &mut axis), ["MF"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
+
+    /// drvPIC663.cc:273-292: C's direction is always minus, so a tripped
+    /// -limit ends the move too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, ts) = strings_rig("pic663PostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MF")))
+            .unwrap();
+        axis.record_move_absolute(&user, -5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        line.sent();
+        *ts.lock().unwrap() = MOVING_LOW_LS;
+        assert_eq!(poll_extra(&line, &mut axis), ["MF"]);
+    }
 
     #[test]
     fn parse_ts_reply_reads_three_hex_registers() {
@@ -542,9 +720,9 @@ mod tests {
             low_limit: false,
         };
         let status = status_from_polled(&polled);
-        assert_eq!(status.position, 42.0);
-        assert_eq!(status.encoder_position, 42.0);
-        assert_eq!(status.velocity, 0.0);
+        assert_eq!(status.position(), 42.0);
+        assert_eq!(status.encoder_position(), 42.0);
+        assert_eq!(status.velocity(), 0.0);
         assert!(status.done);
         assert!(!status.moving);
         assert!(status.has_encoder);
@@ -555,5 +733,67 @@ mod tests {
         // powered now reflects the live drv_cur_act bit (C EA_POSITION), not
         // the MotorStatus default: polled.powered = false propagates through.
         assert!(!status.powered);
+    }
+
+    /// drvPIC663.cc:223-244: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("c663Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "TS" => format!("{DONE}\r"),
+                "TP" => "P:0\r".into(),
+                _ => "C-663\r".into(),
+            }
+        });
+        let ctrl = PIC663Controller::new(io, 1).unwrap();
+        let mut axis = PIC663Axis::new(Arc::new(Mutex::new(ctrl)));
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.polled(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIC663.cc:229-242 exit stores what motor_init prepared (:542-551,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once past
+    /// RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("c663InitFail", |last| match last {
+            "TS" | "TP" => String::new(),
+            _ => "C-663\r".into(),
+        });
+        let ctrl = Arc::new(Mutex::new(PIC663Controller::new(io, 1).unwrap()));
+        let mut first = PIC663Axis::new(ctrl.clone());
+        let mut again = PIC663Axis::new(ctrl);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            again.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }

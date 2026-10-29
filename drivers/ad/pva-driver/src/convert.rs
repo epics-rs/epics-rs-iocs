@@ -9,7 +9,7 @@
 //!   selected `value` union variant (`getValueType`); compressed arrays
 //!   (`codec.name` non-empty) instead read the *original* (pre-compression)
 //!   type from `codec.parameters` (an `int`) and store the selected
-//!   variant's raw bytes verbatim as `NDDataBuffer::U8` — `codec.parameters`
+//!   variant's raw bytes verbatim as `UInt8` bytes — `codec.parameters`
 //!   never advertises `level`/`shuffle`/`compressor`, so `Codec` fields
 //!   beyond `original_data_type` are always `0` on decode (they play no
 //!   role in decompression and this converter never reads them).
@@ -30,7 +30,8 @@
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::codec::{Codec, CodecName};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::timestamp::{EPICS_EPOCH_OFFSET, EpicsTimestamp};
 use epics_rs::pva::pvdata::TypedScalarArray;
 use epics_rs::pva::{PvField, PvStructure, ScalarValue};
@@ -43,6 +44,8 @@ pub enum ConvertError {
     UnsupportedValueType(String),
     UnrecognizedCodec(String),
     InvalidDataType(i64),
+    /// The driver's pool refused the frame (pvaDriver.cpp:270-281).
+    PoolExhausted,
 }
 
 impl std::fmt::Display for ConvertError {
@@ -58,6 +61,7 @@ impl std::fmt::Display for ConvertError {
             Self::InvalidDataType(v) => {
                 write!(f, "invalid codec.parameters data type ordinal {v}")
             }
+            Self::PoolExhausted => write!(f, "the NDArray pool refused the frame"),
         }
     }
 }
@@ -107,47 +111,80 @@ fn read_time_t(s: &PvStructure, name: &'static str) -> Result<(i64, i32), Conver
     Ok((seconds_past_epoch, nanoseconds))
 }
 
-/// Decode the selected `value` union variant into a natively-typed
-/// `NDDataBuffer`, matching `NTNDArrayConverter::getValueType`'s
-/// variant-name-to-`NDDataType` table. `booleanValue` (the one variant with
-/// no `NDDataType` counterpart) errors, mirroring `getValueType` throwing on
-/// `pvBoolean`.
-fn decode_value_array(
-    variant_name: &str,
-    arr: &PvField,
-) -> Result<(NDDataType, NDDataBuffer), ConvertError> {
+/// The `value` union's array, read in place on the wire structure until
+/// [`WireValue::copy_into`] writes it into the frame: C views it and memcpys it
+/// into `pData` once (`NTNDArrayConverter::toValue`,
+/// ntndArrayConverter.cpp:242-243).
+struct WireValue<'a> {
+    data_type: NDDataType,
+    len: usize,
+    copy: fn(&PvField, &mut [u8]),
+    array: &'a PvField,
+}
+
+impl WireValue<'_> {
+    /// The array's native-endian bytes into `out`, which holds exactly them.
+    fn copy_into(&self, out: &mut [u8]) {
+        (self.copy)(self.array, out)
+    }
+}
+
+/// Matches `NTNDArrayConverter::getValueType`'s variant-name-to-`NDDataType`
+/// table. `booleanValue` (the one variant with no `NDDataType` counterpart)
+/// errors, mirroring `getValueType` throwing on `pvBoolean`.
+fn wire_value<'a>(variant_name: &str, array: &'a PvField) -> Result<WireValue<'a>, ConvertError> {
     macro_rules! typed {
-        ($ndtype:expr, $typed_variant:ident, $scalar_variant:ident, $nd_variant:ident) => {{
-            let buf = match arr {
-                PvField::ScalarArrayTyped(TypedScalarArray::$typed_variant(v)) => {
-                    NDDataBuffer::$nd_variant(v.to_vec())
-                }
+        ($ndtype:expr, $ty:ty, $typed_variant:ident, $scalar_variant:ident) => {{
+            let len = match array {
+                PvField::ScalarArrayTyped(TypedScalarArray::$typed_variant(v)) => v.len(),
                 PvField::ScalarArray(items) => {
-                    let mut out = Vec::with_capacity(items.len());
-                    for item in items {
-                        match item {
-                            ScalarValue::$scalar_variant(x) => out.push(*x),
-                            _ => return Err(ConvertError::WrongFieldType("value")),
-                        }
+                    if !items
+                        .iter()
+                        .all(|item| matches!(item, ScalarValue::$scalar_variant(_)))
+                    {
+                        return Err(ConvertError::WrongFieldType("value"));
                     }
-                    NDDataBuffer::$nd_variant(out)
+                    items.len()
                 }
                 _ => return Err(ConvertError::WrongFieldType("value")),
             };
-            Ok(($ndtype, buf))
+            let copy: fn(&PvField, &mut [u8]) = |array, out| {
+                let out = out.as_chunks_mut::<{ size_of::<$ty>() }>().0;
+                match array {
+                    PvField::ScalarArrayTyped(TypedScalarArray::$typed_variant(v)) => {
+                        for (dst, x) in out.iter_mut().zip(v.iter()) {
+                            *dst = x.to_ne_bytes();
+                        }
+                    }
+                    PvField::ScalarArray(items) => {
+                        for (dst, item) in out.iter_mut().zip(items) {
+                            if let ScalarValue::$scalar_variant(x) = item {
+                                *dst = x.to_ne_bytes();
+                            }
+                        }
+                    }
+                    _ => unreachable!("wire_value checked the array"),
+                }
+            };
+            Ok(WireValue {
+                data_type: $ndtype,
+                len,
+                copy,
+                array,
+            })
         }};
     }
     match variant_name {
-        "byteValue" => typed!(NDDataType::Int8, Byte, Byte, I8),
-        "ubyteValue" => typed!(NDDataType::UInt8, UByte, UByte, U8),
-        "shortValue" => typed!(NDDataType::Int16, Short, Short, I16),
-        "ushortValue" => typed!(NDDataType::UInt16, UShort, UShort, U16),
-        "intValue" => typed!(NDDataType::Int32, Int, Int, I32),
-        "uintValue" => typed!(NDDataType::UInt32, UInt, UInt, U32),
-        "longValue" => typed!(NDDataType::Int64, Long, Long, I64),
-        "ulongValue" => typed!(NDDataType::UInt64, ULong, ULong, U64),
-        "floatValue" => typed!(NDDataType::Float32, Float, Float, F32),
-        "doubleValue" => typed!(NDDataType::Float64, Double, Double, F64),
+        "byteValue" => typed!(NDDataType::Int8, i8, Byte, Byte),
+        "ubyteValue" => typed!(NDDataType::UInt8, u8, UByte, UByte),
+        "shortValue" => typed!(NDDataType::Int16, i16, Short, Short),
+        "ushortValue" => typed!(NDDataType::UInt16, u16, UShort, UShort),
+        "intValue" => typed!(NDDataType::Int32, i32, Int, Int),
+        "uintValue" => typed!(NDDataType::UInt32, u32, UInt, UInt),
+        "longValue" => typed!(NDDataType::Int64, i64, Long, Long),
+        "ulongValue" => typed!(NDDataType::UInt64, u64, ULong, ULong),
+        "floatValue" => typed!(NDDataType::Float32, f32, Float, Float),
+        "doubleValue" => typed!(NDDataType::Float64, f64, Double, Double),
         other => Err(ConvertError::UnsupportedValueType(other.to_string())),
     }
 }
@@ -250,8 +287,8 @@ fn convert_attribute(wire: &PvStructure) -> Result<Option<NDAttribute>, ConvertE
 }
 
 /// Decode a wire `epics:nt/NTNDArray:1.0` structure (as delivered by
-/// `PvaClient::pvmonitor_handle`'s callback) into an `NDArray`.
-pub fn decode_nt_nd_array(value: &PvField) -> Result<NDArray, ConvertError> {
+/// `PvaClient::pvmonitor_handle`'s callback) into a pool-owned `NDArray`.
+pub fn decode_nt_nd_array(pool: &DriverPool, value: &PvField) -> Result<DriverArray, ConvertError> {
     let s = match value {
         PvField::Structure(s) => s,
         _ => return Err(ConvertError::WrongFieldType("<top>")),
@@ -268,19 +305,19 @@ pub fn decode_nt_nd_array(value: &PvField) -> Result<NDArray, ConvertError> {
     if selector < 0 {
         return Err(ConvertError::NoUnionFieldSelected);
     }
-    let (_selected_dtype, buf) = decode_value_array(variant_name, array_value)?;
+    let value = wire_value(variant_name, array_value)?;
 
     let codec_s = substructure(s, "codec")?;
     let codec_name_str = scalar_string(codec_s, "name")?;
-    let (data, codec) = if codec_name_str.is_empty() {
-        (buf, None)
+    let (data_type, codec) = if codec_name_str.is_empty() {
+        (value.data_type, None)
     } else {
-        let raw = buf.as_u8_slice().to_vec();
+        // A compressed frame holds the array's bytes.
         let original_data_type = codec_parameters_dtype(codec_s)?;
         let name = codec_name_from_str(&codec_name_str)?;
         let compressed_size = scalar_int(s, "compressedSize")? as usize;
         (
-            NDDataBuffer::U8(raw),
+            NDDataType::UInt8,
             Some(Codec {
                 name,
                 compressed_size,
@@ -329,15 +366,19 @@ pub fn decode_nt_nd_array(value: &PvField) -> Result<NDArray, ConvertError> {
     let (dts_sec, dts_nsec) = read_time_t(s, "dataTimeStamp")?;
     let time_stamp = (dts_sec as f64 + dts_nsec as f64 * 1e-9) - EPICS_EPOCH_OFFSET as f64;
 
-    let mut array = NDArray::with_data(dims, data);
-    array.unique_id = unique_id;
-    // Field by field, not `update_time_stamps`: NTNDArray carries `timeStamp`
-    // and `dataTimeStamp` as two independent fields and each half keeps its
-    // own source, as `NTNDArrayConverter::toTimeStamp`/`toDataTimeStamp` do.
-    array.timestamp = timestamp;
-    array.time_stamp = time_stamp;
-    array.attributes = attributes;
-    array.codec = codec;
+    // C's alloc of `totalBytes` under the dims (pvaDriver.cpp:270), which a
+    // compressed frame's dims do not size.
+    let total_bytes = value.len * value.data_type.element_size();
+    let mut array = pool
+        .alloc_sized(dims, data_type, total_bytes)
+        .map_err(|_| ConvertError::PoolExhausted)?;
+    let mut frame = array.fill();
+    value.copy_into(frame.data_mut().as_u8_slice_mut());
+    frame.set_unique_id(unique_id);
+    frame.set_timestamp(timestamp);
+    frame.set_time_stamp(time_stamp);
+    *frame.attributes_mut() = attributes;
+    frame.set_codec(codec);
     Ok(array)
 }
 
@@ -345,6 +386,7 @@ pub fn decode_nt_nd_array(value: &PvField) -> Result<NDArray, ConvertError> {
 mod tests {
     use super::*;
     use epics_rs::ad_core::color::NDColorMode;
+    use epics_rs::ad_core::ndarray::NDDataView;
     use epics_rs::pva::nt::nd_array::{
         NdArrayBuffer, NdAttribute as WireAttribute, NdCodec, NdDimension as WireDimension,
         NdTimeStamp, NtNdArray, nt_nd_array_value,
@@ -373,9 +415,10 @@ mod tests {
         }
     }
 
-    fn decode(nt: &NtNdArray) -> NDArray {
+    fn decode(nt: &NtNdArray) -> DriverArray {
         let value = nt_nd_array_value(nt);
-        decode_nt_nd_array(&value).unwrap_or_else(|e| panic!("decode failed: {e}"))
+        decode_nt_nd_array(&DriverPool::standalone(0), &value)
+            .unwrap_or_else(|e| panic!("decode failed: {e}"))
     }
 
     #[test]
@@ -398,8 +441,8 @@ mod tests {
         assert_eq!(arr.dims.len(), 2);
         assert_eq!(arr.dims[0].size, 4);
         assert_eq!(arr.dims[1].size, 3);
-        match &arr.data {
-            NDDataBuffer::U8(v) => assert_eq!(v.len(), 12),
+        match arr.data().view() {
+            NDDataView::U8(v) => assert_eq!(v.len(), 12),
             other => panic!("expected U8 buffer, got {other:?}"),
         }
         assert!(arr.codec.is_none());
@@ -419,27 +462,30 @@ mod tests {
         assert!((arr.time_stamp - 1_000.25).abs() < 1e-9);
     }
 
+    /// Each variant's elements land in a frame of its type, in native byte
+    /// order (ntndArrayConverter.cpp:243).
     #[test]
     fn decodes_all_ten_numeric_value_variants() {
-        let cases: Vec<(NdArrayBuffer, NDDataType)> = vec![
-            (NdArrayBuffer::Byte(vec![-1, 2].into()), NDDataType::Int8),
-            (NdArrayBuffer::UByte(vec![1, 2].into()), NDDataType::UInt8),
-            (NdArrayBuffer::Short(vec![-1, 2].into()), NDDataType::Int16),
-            (NdArrayBuffer::UShort(vec![1, 2].into()), NDDataType::UInt16),
-            (NdArrayBuffer::Int(vec![-1, 2].into()), NDDataType::Int32),
-            (NdArrayBuffer::UInt(vec![1, 2].into()), NDDataType::UInt32),
-            (NdArrayBuffer::Long(vec![-1, 2].into()), NDDataType::Int64),
-            (NdArrayBuffer::ULong(vec![1, 2].into()), NDDataType::UInt64),
-            (
-                NdArrayBuffer::Float(vec![1.5, 2.5].into()),
-                NDDataType::Float32,
-            ),
-            (
-                NdArrayBuffer::Double(vec![1.5, 2.5].into()),
-                NDDataType::Float64,
-            ),
+        macro_rules! case {
+            ($variant:ident, $nd:expr, $values:expr) => {{
+                let values = $values;
+                let bytes: Vec<u8> = values.iter().flat_map(|x| x.to_ne_bytes()).collect();
+                (NdArrayBuffer::$variant(values.into()), $nd, bytes)
+            }};
+        }
+        let cases: Vec<(NdArrayBuffer, NDDataType, Vec<u8>)> = vec![
+            case!(Byte, NDDataType::Int8, vec![-1i8, 2]),
+            case!(UByte, NDDataType::UInt8, vec![1u8, 2]),
+            case!(Short, NDDataType::Int16, vec![-1i16, 2]),
+            case!(UShort, NDDataType::UInt16, vec![1u16, 2]),
+            case!(Int, NDDataType::Int32, vec![-1i32, 2]),
+            case!(UInt, NDDataType::UInt32, vec![1u32, 2]),
+            case!(Long, NDDataType::Int64, vec![-1i64, 2]),
+            case!(ULong, NDDataType::UInt64, vec![1u64, 2]),
+            case!(Float, NDDataType::Float32, vec![1.5f32, 2.5]),
+            case!(Double, NDDataType::Float64, vec![1.5f64, 2.5]),
         ];
-        for (buf, expected) in cases {
+        for (buf, expected, bytes) in cases {
             let nt = base_nt(
                 buf,
                 vec![WireDimension {
@@ -448,15 +494,66 @@ mod tests {
                 }],
             );
             let arr = decode(&nt);
-            assert_eq!(arr.data.data_type(), expected);
+            assert_eq!(arr.data().data_type(), expected);
+            assert_eq!(arr.data().as_u8_slice(), &bytes[..], "{expected:?}");
         }
+    }
+
+    /// The untyped wire array (one `ScalarValue` per element) decodes like
+    /// the typed one, and a stray element type is refused.
+    #[test]
+    fn an_untyped_value_array_decodes_its_elements() {
+        let nt = base_nt(
+            NdArrayBuffer::UShort(vec![0, 0].into()),
+            vec![WireDimension {
+                size: 2,
+                ..Default::default()
+            }],
+        );
+        let with_items = |items: Vec<ScalarValue>| {
+            let mut wire = nt_nd_array_value(&nt);
+            let PvField::Structure(s) = &mut wire else {
+                panic!("NTNDArray is a structure");
+            };
+            let Some(PvField::Union { value, .. }) = s.get_field_mut("value") else {
+                panic!("NTNDArray value is a union");
+            };
+            **value = PvField::ScalarArray(items);
+            decode_nt_nd_array(&DriverPool::standalone(0), &wire)
+        };
+        let arr = with_items(vec![ScalarValue::UShort(7), ScalarValue::UShort(900)]).unwrap();
+        assert!(matches!(arr.data().view(), NDDataView::U16(v) if v == [7, 900]));
+        assert!(matches!(
+            with_items(vec![ScalarValue::UShort(7), ScalarValue::Int(9)]),
+            Err(ConvertError::WrongFieldType("value"))
+        ));
+    }
+
+    /// pvaDriver.cpp:270-280 allocates with a NULL pData, so a frame over
+    /// the pool's maxMemory is refused.
+    #[test]
+    fn a_frame_over_the_pool_limit_is_refused() {
+        let nt = base_nt(
+            NdArrayBuffer::UByte((0..12).collect()),
+            vec![WireDimension {
+                size: 12,
+                ..Default::default()
+            }],
+        );
+        let value = nt_nd_array_value(&nt);
+        let err = decode_nt_nd_array(&DriverPool::standalone(8), &value)
+            .err()
+            .expect("decode error");
+        assert!(matches!(err, ConvertError::PoolExhausted));
     }
 
     #[test]
     fn rejects_boolean_value_variant() {
         let nt = base_nt(NdArrayBuffer::Boolean(vec![true, false].into()), vec![]);
         let value = nt_nd_array_value(&nt);
-        let err = decode_nt_nd_array(&value).unwrap_err();
+        let err = decode_nt_nd_array(&DriverPool::standalone(0), &value)
+            .err()
+            .expect("decode error");
         assert!(matches!(err, ConvertError::UnsupportedValueType(_)));
     }
 
@@ -479,8 +576,8 @@ mod tests {
         nt.compressed_size = 4;
         let arr = decode(&nt);
 
-        match &arr.data {
-            NDDataBuffer::U8(v) => assert_eq!(v.as_slice(), &[0xAA, 0xBB, 0xCC, 0xDD]),
+        match arr.data().view() {
+            NDDataView::U8(v) => assert_eq!(v, &[0xAA, 0xBB, 0xCC, 0xDD]),
             other => panic!("expected raw U8 buffer, got {other:?}"),
         }
         let codec = arr
@@ -505,7 +602,9 @@ mod tests {
             )),
         };
         let value = nt_nd_array_value(&nt);
-        let err = decode_nt_nd_array(&value).unwrap_err();
+        let err = decode_nt_nd_array(&DriverPool::standalone(0), &value)
+            .err()
+            .expect("decode error");
         assert!(matches!(err, ConvertError::UnrecognizedCodec(_)));
     }
 
@@ -635,7 +734,9 @@ mod tests {
                 value: Box::new(PvField::Null),
             };
         }
-        let err = decode_nt_nd_array(&value).unwrap_err();
+        let err = decode_nt_nd_array(&DriverPool::standalone(0), &value)
+            .err()
+            .expect("decode error");
         assert_eq!(err, ConvertError::NoUnionFieldSelected);
     }
 }

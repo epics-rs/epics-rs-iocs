@@ -1,0 +1,3 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+MVP2001CreateController("MVP1", "serial1", 1, 250, 1000)
+MVP2001CreateAxis("MVP1", 0, 16, 1000, 0)

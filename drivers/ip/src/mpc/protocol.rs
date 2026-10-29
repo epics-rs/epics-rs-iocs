@@ -1,207 +1,144 @@
-//! MPC / Digitel ion-pump controller ASCII protocol (`devMPC.c`).
+//! What `devMPC.c` puts on the wire and takes off it.
 //!
-//! Wire format, quoted from `devMPC.c:317-330`:
-//!
-//! ```text
-//! ~ AA XX d cc<CR>
-//! ```
-//!
-//! `AA` = controller address (2 hex digits), `XX` = 2-hex-digit command,
-//! `d` = comma-separated data, `cc` = 2-hex-digit checksum. The C sends a
-//! constant `00` checksum with the note "the device is happy with just 00";
-//! that is a byte the device accepts, so it is kept verbatim here.
-//!
-//! The reply is `AA OK 00 <data> cc`: `OK` sits at offset 3, the payload at
-//! offset 9, and the trailing three bytes are the space plus checksum.
-//! The `<CR>` terminator on both directions comes from the octet port's EOS
-//! (set in `st.cmd`), as it did in C.
+//! A command is `~ AA XX d 00` (`buildCommand`, `devMPC.c:313-346`): the
+//! controller address in two hex digits, the command in two, the data, and the
+//! constant `00` checksum C sends ("the device is happy with just 00"). The
+//! `<CR>` on both directions is the octet port's EOS.
 
-/// Supplies (pumps) per controller: the MPC drives two.
-pub const NUM_SUPPLIES: usize = 2;
+use epics_rs::base::runtime::stdlib::strtod;
 
-/// Setpoint pairs: setpoints 1..8, two per pair (odd = supply 1, even = 2).
-pub const NUM_SETPOINT_PAIRS: usize = 4;
-
-/// Command codes, from the `hexCmd` values in `devMPC.c`.
-pub mod cmd {
-    pub const READ_STATUS: u8 = 0x0d;
-    pub const READ_PRESSURE: u8 = 0x0b;
-    pub const READ_CURRENT: u8 = 0x0a;
-    pub const READ_VOLTAGE: u8 = 0x0c;
-    pub const READ_SIZE: u8 = 0x11;
-    pub const READ_SETPOINT: u8 = 0x3c;
-    pub const READ_AUTO_RESTART: u8 = 0x34;
-    pub const READ_TSP_STATUS: u8 = 0x2a;
-
-    pub const SET_UNIT: u8 = 0x0e;
-    pub const SET_DISPLAY: u8 = 0x25;
-    pub const SET_SIZE: u8 = 0x12;
-    pub const SET_SETPOINT: u8 = 0x3d;
-    /// `devMPC.c:663` sends 0x37 for VAL 0 and 0x38 otherwise; `MPC.db`'s STOP
-    /// record names VAL 0 `START` and VAL 1 `STOP`, so 0x37 starts the pump.
-    pub const PUMP_START: u8 = 0x37;
-    pub const PUMP_STOP: u8 = 0x38;
-    pub const KEYBOARD_LOCK: u8 = 0x44;
-    pub const KEYBOARD_UNLOCK: u8 = 0x45;
-    pub const SET_AUTO_RESTART: u8 = 0x33;
-    pub const TSP_TIMED: u8 = 0x27;
-    pub const TSP_OFF: u8 = 0x28;
-    pub const TSP_FILAMENT: u8 = 0x29;
-    pub const TSP_CLEAR: u8 = 0x2b;
-    pub const TSP_AUTO_ADVANCE: u8 = 0x2c;
-    pub const TSP_CONTINUOUS: u8 = 0x2d;
-    pub const TSP_SUBLIMATION: u8 = 0x2e;
-    pub const TSP_DEGAS: u8 = 0x2f;
+/// `devMPC.h`'s command numbers, by `mpcCommands[]`'s names (`devMPC.c:90-126`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    GetStatus = 0,
+    GetPres = 1,
+    GetCur = 2,
+    GetVolt = 3,
+    GetSize = 4,
+    GetSpVal12 = 5,
+    GetSpS12 = 6,
+    GetSpVal34 = 7,
+    GetSpS34 = 8,
+    GetSpVal56 = 9,
+    GetSpS56 = 10,
+    GetSpVal78 = 11,
+    GetSpS78 = 12,
+    GetAutoRestart = 13,
+    GetTspStat = 14,
+    SetUnit = 20,
+    SetDis = 21,
+    SetSize = 22,
+    SetSp12 = 23,
+    SetSp34 = 24,
+    SetSp56 = 25,
+    SetSp78 = 26,
+    SetStart = 27,
+    SetStop = 28,
+    SetLock = 29,
+    SetUnlock = 30,
+    SetAutoRestart = 31,
+    SetTspTimed = 32,
+    SetTspOff = 33,
+    SetTspFilament = 34,
+    SetTspClear = 35,
+    SetTspAutoAdv = 36,
+    SetTspContinuous = 37,
+    SetTspSublimation = 38,
+    SetTspDegas = 39,
 }
 
-/// Display/units selection sent with `SET_UNIT` and `SET_DISPLAY`
-/// (`DisplayStr[]`, `devMPC.h:50`).
+const COMMANDS: [(Command, &str); 35] = [
+    (Command::GetStatus, "GET_STATUS"),
+    (Command::GetPres, "GET_PRESSURE"),
+    (Command::GetCur, "GET_CURRENT"),
+    (Command::GetVolt, "GET_VOLT"),
+    (Command::GetSize, "GET_SIZE"),
+    (Command::GetSpVal12, "GET_SPVAL12"),
+    (Command::GetSpS12, "GET_SPS12"),
+    (Command::GetSpVal34, "GET_SPVAL34"),
+    (Command::GetSpS34, "GET_SPS34"),
+    (Command::GetSpVal56, "GET_SPVAL56"),
+    (Command::GetSpS56, "GET_SPS56"),
+    (Command::GetSpVal78, "GET_SPVAL78"),
+    (Command::GetSpS78, "GET_SPS78"),
+    (Command::GetAutoRestart, "GET_AUTO_RESTART"),
+    (Command::GetTspStat, "GET_TSP_STATUS"),
+    (Command::SetUnit, "SET_UNIT"),
+    (Command::SetDis, "SET_DISPLAY"),
+    (Command::SetSize, "SET_SIZE"),
+    (Command::SetSp12, "SET_SP12"),
+    (Command::SetSp34, "SET_SP34"),
+    (Command::SetSp56, "SET_SP56"),
+    (Command::SetSp78, "SET_SP78"),
+    (Command::SetStart, "SET_START"),
+    (Command::SetStop, "SET_STOP"),
+    (Command::SetLock, "SET_LOCK"),
+    (Command::SetUnlock, "SET_UNLOCK"),
+    (Command::SetAutoRestart, "SET_AUTO_RESTART"),
+    (Command::SetTspTimed, "SET_TSP_TIMED"),
+    (Command::SetTspOff, "SET_TSP_OFF"),
+    (Command::SetTspFilament, "SET_TSP_FILAMENT"),
+    (Command::SetTspClear, "SET_TSP_CLEAR"),
+    (Command::SetTspAutoAdv, "SET_TSP_AUTO_ADVANCE"),
+    (Command::SetTspContinuous, "SET_TSP_CONTINUOUS"),
+    (Command::SetTspSublimation, "SET_TSP_SUBLIMATION"),
+    (Command::SetTspDegas, "SET_TSP_DEGAS"),
+];
+
+impl Command {
+    /// `epicsStrCaseCmp` over `mpcCommands[]` (`devMPC.c:243-249`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        COMMANDS
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name))
+            .map(|(c, _)| *c)
+    }
+
+    pub fn number(self) -> i32 {
+        self as i32
+    }
+}
+
+/// `DisplayStr[]` (`devMPC.h:50`), indexed by the mbbo's RVAL.
 pub const DISPLAY_STRINGS: [&str; 3] = [",PRES", ",CUR", ",VOLT"];
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MpcError {
-    #[error("reply is too short ({0} bytes): {1:?}")]
-    TooShort(usize, String),
-
-    /// The C (`devMPC.c:890`) only copies the payload when the reply says `OK`,
-    /// but leaves the asyn status at success, so a rejected command silently
-    /// published 0 / "" to the record. Here it is an error.
-    #[error("controller rejected the command: {0:?}")]
-    Rejected(String),
-
-    #[error("cannot parse {field} from {raw:?}")]
-    Parse { field: &'static str, raw: String },
+/// `buildCommand`'s `sendBuf`: `address` is already `%02X`.
+pub fn build_command(address: &str, hex: u8, data: &str) -> String {
+    format!("~ {address} {hex:02X} {data} 00")
 }
 
-/// Encode `~ AA XX d 00` (without the CR, which the octet port's output EOS
-/// appends). `devMPC.c::buildCommand`.
-pub fn build_command(address: u8, command: u8, data: &str) -> String {
-    format!("~ {address:02X} {command:02X} {data} 00")
+/// `initCommon`'s `sscanf(userParam, "%s %d", command, &i)`: the command word
+/// and the supply. A missing supply leaves C's `i` uninitialised; it is 0 here.
+pub fn split_user_param(user_param: &str) -> (&str, i32) {
+    let mut words = user_param.split_ascii_whitespace();
+    let command = words.next().unwrap_or("");
+    let supply = words.next().map_or(0, |w| c_atoi(w.as_bytes()));
+    (command, supply)
 }
 
-/// Setpoint number 1..8 for `pair` (0-based) and `supply` (1 or 2).
-///
-/// `devMPC.c:383` (`readAi`), `:502` (`readBi`) and `:621` (`writeAo`) each
-/// spell this out; all three reduce to `pair * 2 + supply`.
-pub fn setpoint_number(pair: usize, supply: u8) -> u8 {
-    (pair as u8) * 2 + supply
+/// C `atoi`, and `sscanf("%d")` where it converts: glibc reads both as
+/// `(int) strtol`. 0 when there are no digits.
+pub use epics_rs::base::types::c_parse::atoi as c_atoi;
+
+/// C `strtod(s, NULL)`.
+pub fn c_strtod(s: &[u8]) -> f64 {
+    strtod(s).value
 }
 
-/// Strip the MPC reply frame and return the payload (`devMPC.c:878-898`).
-pub fn parse_reply(raw: &str) -> Result<String, MpcError> {
-    let raw = raw.trim_end_matches(['\r', '\n']);
-    let len = raw.len();
-    if len < 5 {
-        return Err(MpcError::TooShort(len, raw.to_string()));
+/// `devMPCCallback`'s reply stripping (`devMPC.c:890-898`), on a read of at
+/// least 4 bytes: an `OK` at offset 3 keeps the data between the 9-byte header
+/// and the trailing space and checksum, or `OK` for a reply shorter than 12;
+/// anything else leaves `recBuf` empty.
+pub fn strip_reply(read: &[u8]) -> Vec<u8> {
+    if read.get(3) != Some(&b'O') || read.get(4) != Some(&b'K') {
+        return Vec::new();
     }
-    if &raw[3..5] != "OK" {
-        return Err(MpcError::Rejected(raw.to_string()));
+    if read.len() < 12 {
+        return b"OK".to_vec();
     }
-    if len < 12 {
-        return Ok("OK".to_string());
-    }
-    Ok(raw[9..len - 3].to_string())
-}
-
-/// A reading plus the engineering units the controller reported for it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Reading {
-    pub value: f64,
-    pub egu: String,
-}
-
-fn number(field: &'static str, text: &str) -> Result<f64, MpcError> {
-    text.trim().parse::<f64>().map_err(|_| MpcError::Parse {
-        field,
-        raw: text.to_string(),
-    })
-}
-
-/// `<value 7 chars> <units>` — e.g. `1.2E-09 MBAR` (`devMPC.c:423-431`).
-///
-/// The C copies the units with `strncpy(pvalue, ploc, rtnSize-8)` into a
-/// 10-byte buffer, which overruns for a longer reply; here the units are just
-/// the rest of the payload.
-pub fn parse_pressure(payload: &str) -> Result<Reading, MpcError> {
-    if payload.len() < 9 {
-        return Err(MpcError::TooShort(payload.len(), payload.to_string()));
-    }
-    Ok(Reading {
-        value: number("pressure", &payload[..7])?,
-        egu: payload[8..].trim().to_string(),
-    })
-}
-
-/// `<value 7 chars>[ AMPS]` — units are forced to `AMPS` (`devMPC.c:432-438`).
-pub fn parse_current(payload: &str) -> Result<Reading, MpcError> {
-    if payload.len() < 7 {
-        return Err(MpcError::TooShort(payload.len(), payload.to_string()));
-    }
-    Ok(Reading {
-        value: number("current", &payload[..7])?,
-        egu: "AMPS".to_string(),
-    })
-}
-
-/// The whole payload is the voltage (`devMPC.c:439-445`).
-pub fn parse_voltage(payload: &str) -> Result<Reading, MpcError> {
-    Ok(Reading {
-        value: number("voltage", payload)?,
-        egu: "VOLTS".to_string(),
-    })
-}
-
-/// `<size>L/S` — the digits before the `L` (`devMPC.c:446-458`).
-pub fn parse_size(payload: &str) -> Result<Reading, MpcError> {
-    let digits = payload.split('L').next().unwrap_or("");
-    if digits.is_empty() {
-        return Err(MpcError::Parse {
-            field: "pump size",
-            raw: payload.to_string(),
-        });
-    }
-    Ok(Reading {
-        value: number("pump size", digits)?,
-        egu: "L/S".to_string(),
-    })
-}
-
-/// `n,s,<value 7 chars>...` — the setpoint pressure starts at offset 4
-/// (`devMPC.c:459-469`).
-pub fn parse_setpoint_value(payload: &str) -> Result<Reading, MpcError> {
-    if payload.len() < 11 {
-        return Err(MpcError::TooShort(payload.len(), payload.to_string()));
-    }
-    Ok(Reading {
-        value: number("setpoint", &payload[4..11])?,
-        egu: "TORR".to_string(),
-    })
-}
-
-/// The setpoint relay state is the last character of the payload
-/// (`devMPC.c:527-533`).
-pub fn parse_setpoint_state(payload: &str) -> Result<i32, MpcError> {
-    let last = payload.trim_end().chars().last().ok_or(MpcError::Parse {
-        field: "setpoint state",
-        raw: payload.to_string(),
-    })?;
-    last.to_digit(10).map(|d| d as i32).ok_or(MpcError::Parse {
-        field: "setpoint state",
-        raw: payload.to_string(),
-    })
-}
-
-/// `YES` / `NO` (`devMPC.c:534-536`).
-pub fn parse_auto_restart(payload: &str) -> i32 {
-    i32::from(payload.trim() == "YES")
-}
-
-/// Data field for `SET_SETPOINT`: `n,s,<on>,<off>`, both pressures set to
-/// `value` (`devMPC.c:616-630`).
-pub fn setpoint_data(pair: usize, supply: u8, value: f64) -> String {
-    let number = setpoint_number(pair, supply);
-    let pressure = crate::fmt::exp_c(value, 1);
-    format!("{number},{supply},{pressure},{pressure}")
+    let data = &read[9..9 + read.len() - 12];
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    data[..end].to_vec()
 }
 
 #[cfg(test)]
@@ -209,91 +146,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_frame_matches_the_c_builder() {
-        // devMPC.c: "~ " + "%02X" address + " %2.2X " command + data + " 00"
-        assert_eq!(build_command(5, cmd::READ_PRESSURE, "1"), "~ 05 0B 1 00");
-        assert_eq!(build_command(0, cmd::READ_STATUS, "2"), "~ 00 0D 2 00");
-        assert_eq!(build_command(0xff, cmd::TSP_OFF, ""), "~ FF 28  00");
+    fn command_frame_matches_build_command() {
+        assert_eq!(build_command("05", 0x0b, "1"), "~ 05 0B 1 00");
+        assert_eq!(build_command("05", 0x2a, ""), "~ 05 2A  00");
     }
 
     #[test]
-    fn setpoint_numbers_are_one_to_eight() {
-        assert_eq!(setpoint_number(0, 1), 1);
-        assert_eq!(setpoint_number(0, 2), 2);
-        assert_eq!(setpoint_number(3, 1), 7);
-        assert_eq!(setpoint_number(3, 2), 8);
-    }
-
-    #[test]
-    fn reply_payload_strips_header_and_checksum() {
-        // "05 OK 00 " header (9 bytes), payload, " cc" trailer (3 bytes).
+    fn command_names_match_case_insensitively() {
+        assert_eq!(Command::from_name("get_pressure"), Some(Command::GetPres));
         assert_eq!(
-            parse_reply("05 OK 00 1.2E-09 MBAR 3B").unwrap(),
-            "1.2E-09 MBAR"
+            Command::from_name("SET_TSP_DEGAS"),
+            Some(Command::SetTspDegas)
         );
-        assert_eq!(parse_reply("05 OK 00\r").unwrap(), "OK");
+        assert_eq!(Command::from_name("GET_PRES"), None);
+        assert_eq!(Command::SetTspDegas.number(), 39);
     }
 
     #[test]
-    fn rejected_reply_is_an_error_not_an_empty_payload() {
-        // The C leaves recBuf empty and the status at success here.
-        assert_eq!(
-            parse_reply("05 ER 01 3F"),
-            Err(MpcError::Rejected("05 ER 01 3F".to_string()))
-        );
-        assert!(matches!(parse_reply("05"), Err(MpcError::TooShort(2, _))));
+    fn user_param_is_the_command_and_the_supply() {
+        assert_eq!(split_user_param("GET_STATUS 2"), ("GET_STATUS", 2));
+        assert_eq!(split_user_param("GET_STATUS"), ("GET_STATUS", 0));
+        assert_eq!(split_user_param("GET_STATUS x"), ("GET_STATUS", 0));
+    }
+
+    /// One case per `devMPCCallback` arm after the size checks.
+    #[test]
+    fn replies_strip_as_dev_mpc_callback_does() {
+        assert_eq!(strip_reply(b"05 OK 00 1.2E-09 MBAR 3B"), b"1.2E-09 MBAR");
+        assert_eq!(strip_reply(b"05 OK 00 Y 3B"), b"Y");
+        assert_eq!(strip_reply(b"05 OK 00 3B"), b"OK");
+        assert_eq!(strip_reply(b"05 ER 00 SYNTAX 3B"), b"");
+        assert_eq!(strip_reply(b"05 O"), b"");
     }
 
     #[test]
-    fn pressure_carries_the_units_the_controller_reported() {
-        let r = parse_pressure("1.2E-09 MBAR").unwrap();
-        assert_eq!(r.value, 1.2e-9);
-        assert_eq!(r.egu, "MBAR");
-        // Longer units string: the C would have overrun its 10-byte buffer.
-        assert_eq!(parse_pressure("3.4E-06 PASCAL").unwrap().egu, "PASCAL");
-        assert!(parse_pressure("1.2E-09").is_err());
-    }
-
-    #[test]
-    fn current_and_voltage_use_fixed_units() {
-        let c = parse_current("2.1E-08 AMPS").unwrap();
-        assert_eq!(c.value, 2.1e-8);
-        assert_eq!(c.egu, "AMPS");
-        // Recent controllers omit AMPS from the reply (devMPC.c:5-7).
-        assert_eq!(parse_current("2.1E-08").unwrap().value, 2.1e-8);
-
-        let v = parse_voltage("3200").unwrap();
-        assert_eq!(v.value, 3200.0);
-        assert_eq!(v.egu, "VOLTS");
-    }
-
-    #[test]
-    fn pump_size_reads_the_digits_before_the_l() {
-        let s = parse_size("60L/S").unwrap();
-        assert_eq!(s.value, 60.0);
-        assert_eq!(s.egu, "L/S");
-        assert!(parse_size("L/S").is_err());
-    }
-
-    #[test]
-    fn setpoint_readback_splits_value_and_state() {
-        // "n,s,<7-char pressure>,<7-char pressure>,<state>"
-        let payload = "1,1,1.0E-06,1.0E-06,0";
-        assert_eq!(parse_setpoint_value(payload).unwrap().value, 1.0e-6);
-        assert_eq!(parse_setpoint_state(payload).unwrap(), 0);
-        assert_eq!(parse_setpoint_state("1,1,1.0E-06,1.0E-06,1").unwrap(), 1);
-        assert!(parse_setpoint_value("1,1,1.0E").is_err());
-    }
-
-    #[test]
-    fn auto_restart_is_yes_or_no() {
-        assert_eq!(parse_auto_restart("YES"), 1);
-        assert_eq!(parse_auto_restart("NO"), 0);
-    }
-
-    #[test]
-    fn setpoint_write_repeats_the_pressure_for_on_and_off() {
-        assert_eq!(setpoint_data(0, 1, 1.0e-6), "1,1,1.0E-06,1.0E-06");
-        assert_eq!(setpoint_data(3, 2, 5.5e-8), "8,2,5.5E-08,5.5E-08");
+    fn numbers_parse_as_c_does() {
+        assert_eq!(c_strtod(b"1.2E-09"), 1.2e-9);
+        assert_eq!(c_strtod(b" 30L/S"), 30.0);
+        assert_eq!(c_strtod(b"junk"), 0.0);
+        assert_eq!(c_atoi(b"1"), 1);
+        assert_eq!(c_atoi(b"x"), 0);
+        // glibc: (int) strtol, the same for sscanf("%d").
+        use epics_rs::base::types::c_parse::long_to_int;
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        assert_eq!(c_atoi(b"4294967297"), wrapped);
+        assert_eq!(c_atoi(b"99999999999999999999"), long_to_int(c_long::MAX));
     }
 }

@@ -1,0 +1,14 @@
+# dbl of motor R7-4-5 motorMicos iocBoot/iocMicos st.cmd with MoCo.cmd alone
+micos:alldone
+micos:alldoneBlink
+micos:allstop
+micos:m1
+micos:m1_able
+micos:m1_twCh
+micos:m1_vCh
+micos:m2
+micos:m2_able
+micos:m2_twCh
+micos:m2_vCh
+micos:moving
+micos:movingDiff

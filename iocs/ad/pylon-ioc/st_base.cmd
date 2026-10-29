@@ -9,30 +9,34 @@
 #============================================================
 
 epicsEnvSet("CAM",    "cam1:")
-epicsEnvSet("QSIZE",  "200")
-epicsEnvSet("NCHANS", "128")
-epicsEnvSet("CBUFFS", "50")
+epicsEnvSet("QSIZE",  "2000")
+epicsEnvSet("NCHANS", "2048")
+epicsEnvSet("CBUFFS", "500")
 
 # Template-internal `include` lines resolve through the db search path:
 # pylon.template includes ADGenICam.template, which includes ad-core-rs's
 # ADBase.template.
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(ADPYLON)/db")
 
-# Autosave configuration
-set_requestfile_path("$(ADPYLON)/db")
-set_requestfile_path("$(ADCORE)/db")
-set_savefile_path("$(ADPYLON)/autosave")
-save_restoreSet_status_prefix("$(PREFIX)")
-set_pass0_restoreFile("pylon_settings.req", "P=$(PREFIX),R=$(CAM)")
-set_pass1_restoreFile("pylon_settings.req", "P=$(PREFIX),R=$(CAM)")
-
 # ADPylonConfig(portName, cameraId, maxMemory, priority, stackSize)
 ADPylonConfig("$(PORT)", "$(CAMERA_ID)", 0, 0, 0)
+asynSetTraceIOMask($(PORT), 0, 2)
 
 # Main database
 dbLoadRecords("$(ADPYLON)/db/pylon.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT)")
 
-# Load all common plugins (includes image1 StdArrays)
-< $(ADCORE)/ioc/commonPlugins.cmd
+# Create a standard arrays plugin
+NDStdArraysConfigure("Image1", 5, 0, "$(PORT)", 0, 0)
+# Use this line for 8-bit or 16-bit data
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS)")
 
-create_monitor_set("pylon_settings.req", 30, "P=$(PREFIX),R=$(CAM)")
+# Load all other plugins using commonPlugins.cmd
+< $(ADCORE)/ioc/commonPlugins.cmd
+# As st.cmd.base: NDStats_settings.req includes calc's sseq_settings.req.
+set_requestfile_path("$(CALC)/db")
+
+# commonPlugins.cmd sets up autosave with ./autosave as the save path; these
+# keep the request and save files under $(ADPYLON) whatever the start dir.
+set_requestfile_path("$(ADPYLON)")
+set_requestfile_path("$(ADPYLON)/db")
+set_savefile_path("$(ADPYLON)/autosave")

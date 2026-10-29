@@ -18,9 +18,7 @@
 # 0.24.3 `AdIoc` registers those commands and `$(ADCORE)` resolves to
 # ad-core-rs's real crate dir: the camserver port is created, the EOS
 # commands exist, and `$(ADCORE)/db` + `$(ADCORE)/ioc/commonPlugins.cmd`
-# all resolve (verified live to iocInit). The EOS-setting lines below are
-# still commented pending a decision on whether to set them (the commands
-# are now registered, so uncommenting should work; not separately tested).
+# all resolve (verified live to iocInit).
 #============================================================
 
 # Prefix for all records
@@ -49,16 +47,9 @@ epicsEnvSet("NELEMENTS", "94965")
 # (drvAsynIPPortConfigure is registered by AdIoc as of ad-plugins-rs 0.24.3.)
 drvAsynIPPortConfigure("camserver", "gse-pilatus1:41234")
 
-# camserver framing (reproduced from the C st.cmd): camserver terminates
-# every asynchronous reply with 0x18 (CAN) and expects commands terminated
-# with 0x0A (LF). The C boot sets these with:
-#   asynOctetSetInputEos("camserver", 0, "\x18")
-#   asynOctetSetOutputEos("camserver", 0, "\n")
-# Left commented pending verification: as of ad-plugins-rs 0.24.3 AdIoc
-# registers the asynOctetSetInputEos / asynOctetSetOutputEos iocsh commands,
-# so these lines can be enabled. The driver's read loop consumes camserver
-# replies framed on the 0x18 input terminator, so this EOS must be set for
-# correct operation.
+# Set the input and output terminators.
+asynOctetSetInputEos("camserver", 0, "\x18")
+asynOctetSetOutputEos("camserver", 0, "\n")
 
 pilatusDetectorConfig("$(PORT)", "camserver", $(XSIZE), $(YSIZE), 0, 0)
 # Template-internal `include` lines (ADBase.template, NDArrayBase.template,
@@ -73,9 +64,13 @@ dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=I
 
 # Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
 < $(ADCORE)/ioc/commonPlugins.cmd
+set_requestfile_path("$(ADPILATUS)/db")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30,"P=$(PREFIX)")
+
 # Example interactive commands:
 #   dbl                                   # List all PVs
 #   dbpf 13PIL1:cam1:Acquire 1            # Start acquisition

@@ -6,11 +6,14 @@
 //! `asynOctetSetOutputEos` — the driver sends the bare command text.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceManager;
 
 use crate::protocol::{INT_REPLY_LEN, VERSION_REPLY_LEN, decode_f32, decode_i32, decode_version};
 
@@ -35,6 +38,10 @@ impl Transport {
         Self { handle }
     }
 
+    pub fn trace(&self) -> Arc<TraceManager> {
+        self.handle.trace().clone()
+    }
+
     /// Send `command` and read up to `expect` bytes back.
     ///
     /// Returns the bytes that arrived, which may be fewer than `expect` if the
@@ -48,43 +55,42 @@ impl Transport {
         expect: usize,
         timeout: Duration,
     ) -> AsynResult<Vec<u8>> {
-        let io = SyncIOHandle::from_handle(self.handle.clone(), ADDR, timeout);
-        io.write_octet(0, command)?;
-
+        let io =
+            SyncIOHandle::from_handle(self.handle.clone(), ADDR, timeout, InterfaceType::Octet)?;
         let deadline = Instant::now() + timeout;
         let mut reply = Vec::with_capacity(expect);
-        while reply.len() < expect {
-            let remaining = expect - reply.len();
-            match io.read_octet(0, remaining) {
-                Ok(bytes) if bytes.is_empty() => break,
-                Ok(bytes) => reply.extend_from_slice(&bytes),
+        // C's writeRead flushes, writes and reads once; the later reads gather
+        // the rest of a split reply.
+        let mut read = io.write_read(0, command, expect);
+        loop {
+            match read.into_parts() {
+                (bytes, Ok(())) if bytes.is_empty() => break,
+                (bytes, Ok(())) => reply.extend_from_slice(&bytes),
                 // A timeout with something already in hand is a short reply,
                 // which the caller has to see; with nothing in hand it is the
                 // detector not answering at all.
-                Err(e) if is_timeout(&e) => {
+                (bytes, Err(e)) if e.status() == AsynStatus::Timeout => {
+                    reply.extend_from_slice(&bytes);
                     if reply.is_empty() {
                         return Err(e);
                     }
                     break;
                 }
-                Err(e) => return Err(e),
+                (_, Err(e)) => return Err(e),
             }
-            if Instant::now() >= deadline {
+            if reply.len() >= expect || Instant::now() >= deadline {
                 break;
             }
+            read = io.read_octet(0, expect - reply.len());
         }
         Ok(reply)
     }
 
-    /// Send a command whose reply is a status integer, and check it
+    /// Send a command whose reply is a status integer
     /// (C `sendCommand`, mythen.cpp:221).
     pub fn send_command(&self, command: &str) -> AsynResult<i32> {
         let reply = self.write_read(command.as_bytes(), INT_REPLY_LEN, M1K_TIMEOUT)?;
-        let value = decode_i32(&reply).ok_or_else(|| short_reply(command, reply.len()))?;
-        if value < 0 {
-            log::error!("mythen: [{command}] error, expected 0, received {value}");
-        }
-        Ok(value)
+        decode_i32(&reply).ok_or_else(|| short_reply(command, reply.len()))
     }
 
     /// `-get <name>` returning a 4-byte integer.
@@ -125,19 +131,126 @@ impl Transport {
     }
 }
 
-fn is_timeout(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        }
-    )
-}
-
 fn short_reply(command: &str, got: usize) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message: format!("mythen: [{command}] short reply: {got} bytes"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+    use epics_rs::asyn::user::AsynUser;
+
+    /// An octet port whose every read times out after delivering `abc`.
+    struct PartialThenTimeout(PortDriverBase);
+
+    impl PortDriver for PartialThenTimeout {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            buf[..3].copy_from_slice(b"abc");
+            OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(3, EomReason::empty())
+            }
+        }
+    }
+
+    fn partial_then_timeout_port(name: &str) -> PortRuntimeHandle {
+        let claim = claim_port(name).unwrap();
+        let (runtime, _actor) = create_port_runtime(
+            &claim,
+            PartialThenTimeout(PortDriverBase::new(
+                name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        runtime
+    }
+
+    /// A timeout after part of a reply is a short reply the caller sees
+    /// (mythen.cpp compares `nread` with `nread_expect`), not a failure.
+    #[test]
+    fn a_timeout_after_part_of_a_reply_returns_the_part() {
+        let runtime = partial_then_timeout_port("MYTHEN_PARTIAL_TIMEOUT");
+        let transport = Transport::new(runtime.port_handle().clone());
+        let reply = transport
+            .write_read(b"-get version", 7, Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(reply, b"abc");
+    }
+
+    /// An octet port logging each flush, write and read; reads answer `1234`.
+    struct Logged(PortDriverBase, Arc<parking_lot::Mutex<Vec<&'static str>>>);
+
+    impl PortDriver for Logged {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+            self.1.lock().push("flush");
+            Ok(())
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.1.lock().push("write");
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            self.1.lock().push("read");
+            let n = buf.len().min(4);
+            buf[..n].copy_from_slice(&b"1234"[..n]);
+            OctetReadResult::ok(n, EomReason::empty())
+        }
+    }
+
+    /// `writeReadMeter` is `pasynOctetSyncIO->writeRead` (mythen.cpp:248-259),
+    /// which flushes the stale input before writing (asynOctetSyncIO.c:250).
+    #[test]
+    fn a_command_flushes_before_it_writes() {
+        let name = "MYTHEN_FLUSH";
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (runtime, _actor) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Logged(
+                PortDriverBase::new(
+                    name,
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::OCTET_TRANSPORT,
+                    InterfaceMask::OCTET,
+                ),
+                log.clone(),
+            ),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let transport = Transport::new(runtime.port_handle().clone());
+        assert_eq!(transport.send_command("-start").unwrap(), 0x3433_3231);
+        assert_eq!(*log.lock(), ["flush", "write", "read"]);
     }
 }

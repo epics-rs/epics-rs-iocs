@@ -1,0 +1,3 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+PIJEDSSetup(1, 2, 60)
+PIJEDSConfig(0, "serial1", 0)

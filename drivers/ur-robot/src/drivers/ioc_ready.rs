@@ -1,53 +1,42 @@
-//! The gate that holds a poll thread's first parameter flush until the
-//! records exist.
+//! The gate that holds a poll thread's parameter flushes until the records
+//! exist.
 //!
 //! Every `*Config` command runs from st.cmd *before* `iocInit()`, and each one
-//! starts its driver's poll thread. That thread's first
-//! `callParamCallbacks` therefore fires with no record subscribed to anything,
-//! and the flush consumes the changed flags it found (`ParamList::take_changed`
-//! clears them). `set_int32` / `set_float64` raise the flag again only when the
-//! value actually differs (C `paramVal::setDouble`, paramVal.cpp:241-252), so a
-//! parameter that holds still after that first poll — `safety_mode`,
-//! `runtime_state`, the digital-bit words, `target_speed_fraction`,
-//! `actual_momentum`, the analog I/O, every dashboard string — is never flushed
-//! again and its record stays UDF/INVALID for the life of the IOC. Only the
-//! continuously-moving values (timestamp, voltages, currents, joint angles)
-//! looked healthy.
+//! starts its driver's poll thread. A `callParamCallbacks` before the records
+//! subscribe consumes the changed flags it found (`ParamList::take_changed`
+//! clears them), and `set_int32` / `set_float64` raise the flag again only
+//! when the value differs (C `paramVal::setDouble`, paramVal.cpp:241-252), so
+//! a parameter that holds still after that flush — `safety_mode`, the
+//! digital-bit words, every dashboard string — would stay UDF for the life of
+//! the IOC.
 //!
-//! So the poll threads wait for `initHookAfterScanInit` before their first
-//! pass, which is where drvMqtt puts its own first subscribe
-//! (drvMqtt.cpp:124,186-189).
+//! The poll threads still start polling at construction, as the C++ pollers
+//! do: `RTDEControlConfig` and `URGripperConfig` read the safety word and the
+//! robot mode those first polls produce. Only the parameter updates and the
+//! COMM-alarm edges wait for `initHookAfterScanInit`, where drvMqtt puts its
+//! own first subscribe (drvMqtt.cpp:124,186-189). Every cycle carries the full
+//! parameter set, so the first open cycle publishes everything.
 //!
-//! [`arm`] registers the hook on the caller's thread and hands back the handle
-//! the poll thread waits on, so the registration cannot lose a race against
-//! `iocInit()`: there is no way to obtain something to wait on without having
-//! registered the hook first, and `arm` is called from the `*Config` command
-//! itself.
+//! [`arm`] registers the hook on the caller's thread, so the registration
+//! cannot lose a race against `iocInit()`.
 
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 
 /// A one-way gate: closed until `initHookAfterScanInit`, open ever after.
 #[derive(Default)]
-pub struct IocReady {
-    open: Mutex<bool>,
-    opened: Condvar,
-}
+pub struct IocReady(AtomicBool);
 
 impl IocReady {
-    /// Block until `iocInit` has finished its scan pass. Returns at once once
-    /// the gate is open.
-    pub fn wait(&self) {
-        let mut open = self.open.lock().unwrap();
-        while !*open {
-            open = self.opened.wait(open).unwrap();
-        }
+    /// Whether `iocInit` has finished its scan pass.
+    pub fn is_open(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 
-    fn open(&self) {
-        *self.open.lock().unwrap() = true;
-        self.opened.notify_all();
+    pub(crate) fn open(&self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -73,20 +62,9 @@ mod tests {
 
     #[test]
     fn the_gate_stays_shut_until_it_is_opened() {
-        let gate = Arc::new(IocReady::default());
-        assert!(!*gate.open.lock().unwrap());
-        let waiter = {
-            let gate = gate.clone();
-            std::thread::spawn(move || gate.wait())
-        };
-        gate.open();
-        waiter.join().expect("waiter returns once the gate opens");
-    }
-
-    #[test]
-    fn waiting_on_an_open_gate_returns_at_once() {
         let gate = IocReady::default();
+        assert!(!gate.is_open());
         gate.open();
-        gate.wait();
+        assert!(gate.is_open());
     }
 }

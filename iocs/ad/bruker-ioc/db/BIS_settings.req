@@ -1,0 +1,5 @@
+$(P)$(R)ReadSFRMTimeout
+$(P)$(R)NumDarks
+# C names "ADBASE_settings.req", which no case-sensitive filesystem opens.
+file "ADBase_settings.req", P=$(P), R=$(R)
+file "NDFile_settings.req", P=$(P), R=$(R)

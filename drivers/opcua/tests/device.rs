@@ -8,12 +8,14 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use async_opcua::types::{StatusCode, Variant};
+use async_opcua::types::{
+    Array, QualifiedName, StatusCode, UAString, Variant, VariantScalarTypeId,
+};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use epics_rs::base::server::device_support::DeviceSupport;
-use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType};
+use epics_rs::base::server::device_support::{DeviceAlarm, DeviceReadOutcome, DeviceSupport};
+use epics_rs::base::server::record::{AlarmSeverity, Ftype, ProcessContext, Record, ScanType};
 use epics_rs::base::server::records::ai::AiRecord;
 use epics_rs::base::server::records::ao::AoRecord;
 use epics_rs::base::server::records::bi::BiRecord;
@@ -29,7 +31,7 @@ use epics_rs::base::server::records::stringin::StringinRecord;
 use epics_rs::base::server::records::waveform::{ArrayKind, WaveformRecord};
 use epics_rs::base::types::{DbFieldType, EpicsValue};
 
-use opcua::client::{UaConnection, UaConnector};
+use opcua::client::{SetupError, UaClient, UaConnector};
 use opcua::device_support::OpcuaDevice;
 use opcua::item::Leaf;
 use opcua::queue::{ConnectionStatus, ProcessReason, Update};
@@ -45,8 +47,8 @@ struct NoConnector;
 
 #[async_trait]
 impl UaConnector for NoConnector {
-    async fn connect(&self, _config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
-        Err("no server".to_string())
+    async fn setup(&self, _config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+        Err(SetupError::new("no server"))
     }
 }
 
@@ -60,15 +62,19 @@ fn registry() -> Arc<Registry> {
 
 /// Bind one record to `ns=2;s=Node` on session `S`.
 ///
-/// `init_record(0)` is what `iocInit` runs once the database has set the record's
-/// fields, and it is where mbbi/mbbo derive `sdef` from their state table — a
-/// record configured here field by field would otherwise reach the device with a
-/// state table it does not know it has.
+/// `init_record(0)`, `init_record(1)`, the dset's init, then `after_dset_init`
+/// is the order `iocInit` runs once the database has set the record's fields;
+/// pass 1 derives mbbi/mbbo MASK (`mbboRecord.c:136-138`) and the last sets
+/// `sdef` from their state table (`mbbiRecord.c:135`) — a record configured
+/// here field by field would otherwise process with a state table it does not
+/// know it has.
 fn bind(registry: &Arc<Registry>, record: &mut dyn Record, link: &str) -> OpcuaDevice {
     record.init_record(0).expect("the record initialises");
-    let mut device = OpcuaDevice::new(registry.clone(), link.to_string());
+    record.init_record(1).expect("the record initialises");
+    let mut device = OpcuaDevice::new(registry.clone(), link.to_string(), record.record_type());
     device.set_record_info("REC", ScanType::IoIntr);
     device.init(record).expect("the link binds");
+    record.after_dset_init();
     device
 }
 
@@ -79,6 +85,15 @@ fn leaf(registry: &Arc<Registry>) -> Arc<Mutex<Leaf>> {
     let leaf = item.lock().leaves[0].clone();
     drop(items);
     leaf
+}
+
+/// The pass an update's pulse brings, as the framework runs it: armed, read,
+/// reconciled (`process_record_readback`).
+fn pulse_pass(device: &mut OpcuaDevice, record: &mut dyn Record) -> DeviceReadOutcome {
+    device.arm_readback_callback();
+    let outcome = device.read(record).expect("the update is delivered");
+    device.reconcile_readback_callback();
+    outcome
 }
 
 /// A value arrives from the server, and the record processes for it.
@@ -92,14 +107,14 @@ fn incoming(
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::Up;
         leaf.incoming = Some(v.clone());
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::IncomingData,
             Some(v),
             StatusCode::Good,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1),
         ));
     }
-    let outcome = device.read(record).expect("the update is delivered");
+    let outcome = pulse_pass(device, record);
     // The framework runs the record's own conversion next when the device did
     // not compute the value itself.
     record.set_device_did_compute(outcome.did_compute());
@@ -125,16 +140,19 @@ fn field(record: &dyn Record, name: &str) -> EpicsValue {
 
 /// The per-cycle state the framework pushes into device support, for a record
 /// whose value is no longer undefined.
-fn defined() -> ProcessContext<'static> {
+fn defined() -> ProcessContext {
     ProcessContext {
-        udf: false,
+        udf: 0,
         udfs: AlarmSeverity::Invalid,
         nsev: AlarmSeverity::NoAlarm,
         phas: 0,
         tse: 0,
-        time: SystemTime::UNIX_EPOCH,
-        dtyp: opcua::device_support::DTYP,
+        time: SystemTime::UNIX_EPOCH.into(),
+        soft: None,
         callback_priority: epics_rs::base::runtime::task::CallbackPriority::Low,
+        scan: epics_rs::base::server::record::ScanType::Passive,
+        proc_field: 0,
+        tpro: 0,
     }
 }
 
@@ -152,7 +170,7 @@ fn longin_takes_the_value_into_val() {
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(-7));
     assert_eq!(
         device.last_timestamp(),
-        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+        Some((SystemTime::UNIX_EPOCH + Duration::from_secs(1)).into())
     );
     assert_eq!(device.last_alarm(), None);
 }
@@ -184,7 +202,14 @@ fn a_value_out_of_the_records_range_raises_read_invalid() {
     );
 
     // READ_ALARM, INVALID — and the record keeps the value it had.
-    assert_eq!(device.last_alarm(), Some((1, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(1));
 }
 
@@ -222,6 +247,41 @@ fn stringin_truncates_to_the_epics_string_size() {
     );
 }
 
+/// EPICS string sizes are byte counts: the C copies 39 bytes even through the
+/// middle of a character (`DataElementOpen62541Leaf.cpp:427-431`).
+#[test]
+fn stringin_cuts_at_the_byte_size_inside_a_character() {
+    let registry = registry();
+    let mut record = StringinRecord::new("");
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    let long = format!("{}\u{e9}", "x".repeat(38));
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::String(long.as_str().into()),
+    );
+
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::String(long.as_bytes()[..39].into())
+    );
+}
+
+#[test]
+fn stringin_takes_a_byte_node_as_its_raw_byte() {
+    let registry = registry();
+    let mut record = StringinRecord::new("");
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    incoming(&mut device, &leaf, &mut record, Variant::Byte(0xff));
+
+    assert_eq!(field(&record, "VAL"), EpicsValue::String(vec![0xff].into()));
+}
+
 #[test]
 fn lsi_takes_a_long_string_and_sets_len() {
     let registry = registry();
@@ -238,7 +298,7 @@ fn lsi_takes_a_long_string_and_sets_len() {
 
     assert_eq!(
         field(&record, "VAL"),
-        EpicsValue::CharArray(b"a long string".to_vec().into())
+        EpicsValue::CharArray(b"a long string\0".to_vec().into())
     );
     assert_eq!(field(&record, "LEN"), EpicsValue::ULong(14));
 }
@@ -372,6 +432,8 @@ fn mbbo_direct_reads_back_val_and_its_bits_from_the_shifted_raw() {
     // recomputes it; the record's own readback keeps the two fields apart.
     assert_eq!(field(&record, "RVAL"), EpicsValue::ULong(0x50));
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(5));
+    // The bits follow VAL at the record's monitor() (mbboDirectRecord.c:240).
+    record.monitor_value_changed();
     assert_eq!(field(&record, "B0"), EpicsValue::UChar(1));
     assert_eq!(field(&record, "B1"), EpicsValue::UChar(0));
     assert_eq!(field(&record, "B2"), EpicsValue::UChar(1));
@@ -437,17 +499,27 @@ fn the_servers_enumeration_fills_a_state_table_the_database_left_empty() {
     assert_eq!(field(&record, "TWST"), EpicsValue::String("".into()));
     // The state the value names, through the table the server just defined.
     assert_eq!(field(&record, "VAL"), EpicsValue::Enum(1));
+}
 
-    // And the new table is posted DBE_PROPERTY, once.
-    let mut rx = device
-        .property_post_receiver()
-        .expect("mbbi posts properties");
-    let posted = rx.try_recv().expect("the table was posted");
-    // The device stores the fields in place; the post itself carries no
-    // writes and names VAL, C++'s db_post_events target (devOpcua.cpp:732).
-    assert!(posted.writes.is_empty());
-    assert_eq!(posted.post_field, "VAL");
-    assert!(rx.try_recv().is_err());
+/// A state string is cut at 25 bytes, as `strncpy` cuts it (`devOpcua.cpp:723`).
+#[test]
+fn a_state_name_from_the_server_is_cut_at_the_byte_size() {
+    let registry = registry();
+    let mut record = MbbiRecord::new(0);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    let name = format!("{}\u{e9}", "x".repeat(24));
+    let mut choices = EnumChoices::new();
+    choices.insert(3, name.clone());
+    leaf.lock().choices = Some(Arc::new(choices));
+
+    incoming(&mut device, &leaf, &mut record, Variant::UInt32(3));
+
+    assert_eq!(
+        field(&record, "ZRST"),
+        EpicsValue::String(name.as_bytes()[..25].into())
+    );
 }
 
 #[test]
@@ -547,6 +619,22 @@ fn nobt_and_shft_put_the_mask_over_the_nodes_bit_window() {
 }
 
 #[test]
+fn an_mbbo_without_state_values_reads_back_the_masked_shifted_raw() {
+    // devOpcua.cpp:813-828: mask, shift, then VAL is the shifted RVAL.
+    let registry = registry();
+    let mut record = MbboRecord::new(0);
+    record.put_field("NOBT", EpicsValue::UShort(3)).unwrap();
+    record.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    incoming(&mut device, &leaf, &mut record, Variant::UInt32(0x120));
+
+    assert_eq!(field(&record, "RVAL"), EpicsValue::ULong(2));
+    assert_eq!(field(&record, "VAL"), EpicsValue::UShort(2));
+}
+
+#[test]
 fn an_mbbo_value_no_state_carries_is_the_unknown_state() {
     let registry = registry();
     let mut record = MbboRecord::new(0);
@@ -617,6 +705,28 @@ fn an_array_longer_than_nelm_is_clamped() {
     );
 }
 
+/// Each element is cut at 39 bytes (`DataElementOpen62541Leaf.cpp:548-551`).
+#[test]
+fn a_string_waveform_cuts_each_element_at_the_byte_size() {
+    let registry = registry();
+    let mut record = WaveformRecord::new(2, DbFieldType::String);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    let long = format!("{}\u{e9}", "x".repeat(38));
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::from(vec![UAString::from(long.as_str()), UAString::from("ok")]),
+    );
+
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::StringArray(vec![long.as_bytes()[..39].into(), "ok".into()].into())
+    );
+}
+
 #[test]
 fn a_char_waveform_holds_a_string_node_as_its_bytes() {
     let registry = registry();
@@ -634,6 +744,206 @@ fn a_char_waveform_holds_a_string_node_as_its_bytes() {
     assert_eq!(
         field(&record, "VAL"),
         EpicsValue::CharArray(b"text".to_vec().into())
+    );
+}
+
+/// FTVL = UCHAR is the `epicsUInt8` array overload, never the long-string
+/// path (`DataElementOpen62541Leaf.cpp:652-662`): a ByteString node is its
+/// raw bytes, any other scalar node is not an array.
+#[test]
+fn a_uchar_waveform_reads_a_bytestring_raw_and_refuses_a_string_node() {
+    let registry = registry();
+    let mut record = WaveformRecord::new(8, DbFieldType::UChar);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::ByteString(vec![0x01, 0xff].into()),
+    );
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::UCharArray(vec![0x01, 0xff].into())
+    );
+    assert_eq!(device.last_alarm(), None);
+
+    incoming(
+        &mut device,
+        &leaf,
+        &mut record,
+        Variant::String("text".into()),
+    );
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: ""
+        })
+    );
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::UCharArray(vec![0x01, 0xff].into())
+    );
+}
+
+/// `writeArray<epicsUInt8>` (`DataElementOpen62541Leaf.cpp:1238-1252`).
+#[test]
+fn a_uchar_aao_writes_a_bytestring_raw_and_refuses_a_string_node() {
+    let registry = registry();
+    let mut record = WaveformRecord::with_kind(ArrayKind::Aao);
+    record.put_field("NELM", EpicsValue::Long(4)).unwrap();
+    record
+        .put_field("FTVL", EpicsValue::Short(Ftype::UChar.index()))
+        .unwrap();
+    record
+        .put_field("VAL", EpicsValue::UCharArray(vec![0x41, 0x42].into()))
+        .unwrap();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    typed(&leaf, Variant::ByteString(vec![0u8].into()));
+    outgoing(&mut device, &mut record);
+    assert_eq!(
+        leaf.lock().outgoing,
+        Some(Variant::ByteString(vec![0x41, 0x42].into()))
+    );
+    assert_eq!(device.last_alarm(), None);
+
+    leaf.lock().outgoing = None;
+    typed(&leaf, Variant::String("".into()));
+    outgoing(&mut device, &mut record);
+    assert_eq!(leaf.lock().outgoing, None);
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 2,
+            sevr: 3,
+            msg: ""
+        })
+    );
+}
+
+fn byte_array(bytes: &[u8]) -> Variant {
+    let elements: Vec<Variant> = bytes.iter().map(|b| Variant::Byte(*b)).collect();
+    Variant::Array(Box::new(
+        Array::new(VariantScalarTypeId::Byte, elements).unwrap(),
+    ))
+}
+
+fn idle_busy() -> EnumChoices {
+    let mut choices = EnumChoices::new();
+    choices.insert(3, "Idle".to_string());
+    choices.insert(7, "Busy".to_string());
+    choices
+}
+
+/// A device alarm's STAT and SEVR.
+type Alarm = Option<(u16, u16)>;
+
+fn alarm(device: &OpcuaDevice) -> Alarm {
+    device.last_alarm().map(|a| (a.stat, a.sevr))
+}
+
+/// The alarm and VAL of a FTVL = CHAR waveform after one update of `v`.
+fn char_waveform_reads(nelm: i32, choices: Option<EnumChoices>, v: Variant) -> (Alarm, EpicsValue) {
+    let registry = registry();
+    let mut record = WaveformRecord::new(nelm, DbFieldType::Char);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+    leaf.lock().choices = choices.map(Arc::new);
+    incoming(&mut device, &leaf, &mut record, v);
+    (alarm(&device), field(&record, "VAL"))
+}
+
+fn text(bytes: &[u8]) -> (Alarm, EpicsValue) {
+    (None, EpicsValue::CharArray(bytes.to_vec().into()))
+}
+
+/// FTVL = CHAR is always `readScalar(char*, nelm)`
+/// (`DataElementOpen62541Leaf.cpp:300-455`): any node reads as its text, and
+/// an array node as its first element, the payload the C points at
+/// (`:350-351`); only a Byte array is taken whole (`:402-409`).
+#[test]
+fn a_char_waveform_reads_any_node_as_text() {
+    let qn = Variant::QualifiedName(Box::new(QualifiedName::new(2, "name")));
+    let strings = Variant::from(vec![UAString::from("ab"), UAString::from("cd")]);
+    assert_eq!(
+        [
+            char_waveform_reads(8, None, Variant::Int32(42)),
+            char_waveform_reads(8, None, qn),
+            char_waveform_reads(8, Some(idle_busy()), Variant::Int32(3)),
+            char_waveform_reads(8, None, Variant::from(vec![true, false])),
+            char_waveform_reads(8, None, strings),
+        ],
+        [
+            text(b"42"),
+            text(b"name"),
+            text(b"Idle"),
+            text(b"true"),
+            text(b"ab"),
+        ]
+    );
+}
+
+/// Text keeps a NUL's room (`n = len-1`, `:346`); a Byte array may fill the
+/// buffer (`n++`, `:408`).
+#[test]
+fn a_char_waveform_cuts_text_at_nelm_less_one_and_bytes_at_nelm() {
+    assert_eq!(
+        [
+            char_waveform_reads(4, None, Variant::String("abcdef".into())),
+            char_waveform_reads(4, None, byte_array(&[1, 2, 3, 4, 5])),
+        ],
+        [text(b"abc"), text(&[1, 2, 3, 4])]
+    );
+}
+
+/// The alarm and outgoing value of a FTVL = CHAR aao holding `text`, writing
+/// to a node last seen as `node`.
+fn char_aao_sends(
+    text: &str,
+    choices: Option<EnumChoices>,
+    node: Variant,
+) -> (Alarm, Option<Variant>) {
+    let registry = registry();
+    let mut record = WaveformRecord::with_kind(ArrayKind::Aao);
+    record.put_field("NELM", EpicsValue::Long(8)).unwrap();
+    record
+        .put_field("FTVL", EpicsValue::Short(Ftype::Char.index()))
+        .unwrap();
+    record
+        .put_field("VAL", EpicsValue::CharArray(text.as_bytes().into()))
+        .unwrap();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+    leaf.lock().choices = choices.map(Arc::new);
+    typed(&leaf, node);
+    outgoing(&mut device, &mut record);
+    let sent = leaf.lock().outgoing.clone();
+    (alarm(&device), sent)
+}
+
+/// FTVL = CHAR is always `writeScalar(char*, nord)` (`:867-1120`), which
+/// parses the text into a scalar of the node's type — for an array node its
+/// element type, as the C never asks whether it is one (`:878`).
+#[test]
+fn a_char_aao_sends_the_scalar_its_text_parses_to() {
+    assert_eq!(
+        [
+            char_aao_sends("42", None, Variant::Int32(0)),
+            char_aao_sends("Busy", Some(idle_busy()), Variant::Int32(0)),
+            char_aao_sends("200", None, byte_array(&[0, 0])),
+            char_aao_sends("200", None, byte_array(&[])),
+        ],
+        [
+            (None, Some(Variant::Int32(42))),
+            (None, Some(Variant::Int32(7))),
+            (None, Some(Variant::Byte(200))),
+            (None, Some(Variant::Byte(200))),
+        ]
     );
 }
 
@@ -670,7 +980,14 @@ fn an_output_record_takes_the_type_of_the_value_the_node_last_sent() {
     outgoing(&mut device, &mut record);
 
     // 300 does not fit a Byte: the write is refused, WRITE_ALARM / INVALID.
-    assert_eq!(device.last_alarm(), Some((2, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 2,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert_eq!(leaf.lock().outgoing, None);
 
     record.put_field("VAL", EpicsValue::Long(200)).unwrap();
@@ -690,7 +1007,14 @@ fn a_record_on_a_session_that_is_down_raises_a_comm_alarm() {
     outgoing(&mut device, &mut record);
 
     // COMM_ALARM, INVALID — and nothing is queued for the server.
-    assert_eq!(device.last_alarm(), Some((9, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 9,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert!(!leaf.lock().dirty);
 }
 
@@ -702,7 +1026,14 @@ fn an_input_record_on_a_session_that_is_down_raises_a_comm_alarm() {
 
     device.read(&mut record).expect("the read stage runs");
 
-    assert_eq!(device.last_alarm(), Some((9, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 9,
+            sevr: 3,
+            msg: ""
+        })
+    );
 }
 
 #[test]
@@ -729,7 +1060,7 @@ fn bini_write_asks_an_output_record_to_send_its_value() {
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::InitialWrite;
         leaf.incoming = Some(Variant::Int32(0));
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::WriteRequest,
             None,
             StatusCode::Good,
@@ -737,10 +1068,79 @@ fn bini_write_asks_an_output_record_to_send_its_value() {
         ));
     }
 
-    device.read(&mut record).expect("the request is delivered");
+    pulse_pass(&mut device, &mut record);
 
     assert_eq!(leaf.lock().outgoing, Some(Variant::Int32(5)));
     assert!(leaf.lock().dirty);
+}
+
+// ------------------------------------------------------------ one pass per update
+
+/// A pass that pops an update with another queued behind it wakes the record
+/// again; the pass that pops the last one does not
+/// (`if (nextReason) pcon->requestRecordProcessing(nextReason)`,
+/// `devOpcua.cpp:408`).
+#[test]
+fn a_pass_that_leaves_an_update_queued_wakes_the_record_again() {
+    let registry = registry();
+    let mut record = LonginRecord::new(0);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf(&registry);
+    leaf.lock().state = ConnectionStatus::Up;
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    leaf.lock().request_processing(ProcessReason::WriteFailure);
+    assert!(wake.try_recv().is_ok(), "the first update wakes the record");
+    assert!(
+        wake.try_recv().is_err(),
+        "the second finds it already woken"
+    );
+
+    pulse_pass(&mut device, &mut record);
+    assert!(wake.try_recv().is_ok(), "one update is still queued");
+
+    pulse_pass(&mut device, &mut record);
+    assert!(wake.try_recv().is_err(), "nothing is left to wake for");
+}
+
+/// A pulse's pass that never reaches `read` (DISA, a breakpoint) wakes nothing,
+/// so a record that stays disabled does not spin; the next update wakes the
+/// record for the one still queued, which the C strands
+/// (`DataElementOpen62541Leaf.cpp:129-134`).
+#[test]
+fn a_pulse_pass_that_never_reads_leaves_its_wake_to_the_next_update() {
+    let registry = registry();
+    let mut record = LonginRecord::new(0);
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf(&registry);
+    leaf.lock().state = ConnectionStatus::Up;
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    assert!(wake.try_recv().is_ok());
+
+    device.arm_readback_callback();
+    device.reconcile_readback_callback();
+    assert!(wake.try_recv().is_err(), "the pass took nothing");
+
+    leaf.lock().request_processing(ProcessReason::WriteFailure);
+    assert!(
+        wake.try_recv().is_ok(),
+        "the next update wakes for the first"
+    );
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    assert!(wake.try_recv().is_err(), "the owed wake is spent");
+
+    pulse_pass(&mut device, &mut record);
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: "",
+        }),
+        "the first update's read failure"
+    );
+    assert!(wake.try_recv().is_ok(), "two updates are still queued");
 }
 
 // ---------------------------------------------------------------- failure reasons
@@ -754,28 +1154,49 @@ fn each_failure_reason_raises_its_own_alarm() {
     leaf.lock().state = ConnectionStatus::Up;
 
     for (reason, alarm) in [
-        (ProcessReason::ReadFailure, (1, 3)),
-        (ProcessReason::WriteFailure, (2, 3)),
-        (ProcessReason::ConnectionLoss, (9, 3)),
+        (
+            ProcessReason::ReadFailure,
+            DeviceAlarm {
+                stat: 1,
+                sevr: 3,
+                msg: "",
+            },
+        ),
+        (
+            ProcessReason::WriteFailure,
+            DeviceAlarm {
+                stat: 2,
+                sevr: 3,
+                msg: "",
+            },
+        ),
+        (
+            ProcessReason::ConnectionLoss,
+            DeviceAlarm {
+                stat: 9,
+                sevr: 3,
+                msg: "",
+            },
+        ),
     ] {
-        leaf.lock().queue.push(Update::new(
+        leaf.lock().push(Update::new(
             reason,
             None,
             StatusCode::Good,
             SystemTime::UNIX_EPOCH,
         ));
-        device.read(&mut record).expect("the update is delivered");
+        pulse_pass(&mut device, &mut record);
         assert_eq!(device.last_alarm(), Some(alarm), "{reason:?}");
     }
 
     // A completed write leaves the record alone.
-    leaf.lock().queue.push(Update::new(
+    leaf.lock().push(Update::new(
         ProcessReason::WriteComplete,
         None,
         StatusCode::Good,
         SystemTime::UNIX_EPOCH,
     ));
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
     assert_eq!(device.last_alarm(), None);
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(0));
 }
@@ -789,7 +1210,7 @@ fn a_bad_status_code_carries_no_value() {
     {
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::Up;
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::IncomingData,
             Some(Variant::Int32(9)),
             StatusCode::BadNodeIdUnknown,
@@ -797,9 +1218,16 @@ fn a_bad_status_code_carries_no_value() {
         ));
     }
 
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
 
-    assert_eq!(device.last_alarm(), Some((1, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(1));
 }
 
@@ -812,7 +1240,7 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
     {
         let mut leaf = leaf.lock();
         leaf.state = ConnectionStatus::Up;
-        leaf.queue.push(Update::new(
+        leaf.push(Update::new(
             ProcessReason::IncomingData,
             Some(Variant::Int32(9)),
             StatusCode::UncertainLastUsableValue,
@@ -820,9 +1248,16 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
         ));
     }
 
-    device.read(&mut record).expect("the update is delivered");
+    pulse_pass(&mut device, &mut record);
 
-    assert_eq!(device.last_alarm(), Some((1, 1)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 1,
+            msg: ""
+        })
+    );
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(9));
 }
 
@@ -830,11 +1265,82 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
 fn a_record_type_with_no_opc_ua_device_support_is_refused() {
     let registry = registry();
     let mut record = epics_rs::base::server::records::calc::CalcRecord::new("");
-    let mut device = OpcuaDevice::new(registry.clone(), "S ns=2;s=Node monitor=n".to_string());
+    let mut device = OpcuaDevice::new(
+        registry.clone(),
+        "S ns=2;s=Node monitor=n".to_string(),
+        "calc",
+    );
     device.set_record_info("REC", ScanType::Passive);
 
     let err = device
         .init(&mut record)
         .expect_err("calc has no OPC UA dset");
     assert!(err.to_string().contains("calc"), "{err}");
+}
+
+/// `opcua_del_record` returns -1 (`devOpcua.cpp:111-116`): a bound record
+/// keeps its link through every device-link put.
+#[test]
+fn del_record_refuses_to_let_the_link_go() {
+    let registry = registry();
+    let mut record = AiRecord::default();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    assert!(device.del_record().is_err());
+}
+
+/// What `printByteString` writes into a `len`-byte buffer: whole hex pairs
+/// while `l < len-3` (`DataElementOpen62541Leaf.cpp:245-255`). Under 3 the C
+/// wraps and overruns the buffer; rs writes nothing.
+#[test]
+fn a_bytestring_reads_as_whole_hex_pairs() {
+    let bytes: Vec<u8> = (0..30).collect();
+    let hex = |pairs: usize| -> Vec<u8> {
+        bytes[..pairs]
+            .iter()
+            .flat_map(|b| format!("{b:02X}").into_bytes())
+            .collect()
+    };
+    let node = || Variant::ByteString(bytes.clone().into());
+
+    let stringin = {
+        let registry = registry();
+        let mut record = StringinRecord::new("");
+        let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+        incoming(&mut device, &leaf(&registry), &mut record, node());
+        field(&record, "VAL")
+    };
+    let lsi = {
+        let registry = registry();
+        let mut record = LsiRecord::new("");
+        record.sizv = 21;
+        let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+        incoming(&mut device, &leaf(&registry), &mut record, node());
+        field(&record, "VAL")
+    };
+    let strings = {
+        let registry = registry();
+        let mut record = WaveformRecord::new(1, DbFieldType::String);
+        let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+        let array = Variant::from(vec![async_opcua::types::ByteString::from(bytes.clone())]);
+        incoming(&mut device, &leaf(&registry), &mut record, array);
+        field(&record, "VAL")
+    };
+    assert_eq!(
+        [
+            char_waveform_reads(10, None, node()).1,
+            char_waveform_reads(11, None, node()).1,
+            char_waveform_reads(2, None, node()).1,
+            stringin,
+            lsi,
+            strings,
+        ],
+        [
+            EpicsValue::CharArray(hex(4).into()),
+            EpicsValue::CharArray(hex(4).into()),
+            EpicsValue::CharArray(Vec::new().into()),
+            EpicsValue::String(hex(19).into()),
+            EpicsValue::CharArray([hex(9), vec![0]].concat().into()),
+            EpicsValue::StringArray(vec![hex(19).into()].into()),
+        ]
+    );
 }

@@ -1,0 +1,1283 @@
+# c-expansion of st.cmd.xps5 over the C sources, the records of st.cmd.xps5.names:
+# Records of motor R7-4-5 motorNewport iocBoot/iocNewport st.cmd.xps5, from
+# msi over motor.substitutions.xps5 (the dbl oracle has no busy record).
+record(bo, "IOC:Prof1:Abort") {
+    field(DESC, "Abort profile motion")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Abort")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_ABORT")
+    field(ZNAM, "Done")
+}
+record(ao, "IOC:Prof1:Acceleration") {
+    field(DESC, "Profile Acceleration")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_ACCELERATION")
+    field(PINI, "YES")
+    field(PREC, "3")
+    field(VAL, "0.5")
+}
+record(busy, "IOC:Prof1:Build") {
+    field(DESC, "Build and check profile")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Build")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_BUILD")
+    field(ZNAM, "Done")
+}
+record(waveform, "IOC:Prof1:BuildMessage") {
+    field(DESC, "Profile build message")
+    field(DTYP, "asynOctetRead")
+    field(FTVL, "CHAR")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_BUILD_MESSAGE")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+record(mbbi, "IOC:Prof1:BuildState") {
+    field(DESC, "Profile build state")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_BUILD_STATE")
+    field(ONST, "Busy")
+    field(ONSV, "MINOR")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(ZRST, "Done")
+    field(ZRSV, "NO_ALARM")
+    field(ZRVL, "0")
+}
+record(mbbi, "IOC:Prof1:BuildStatus") {
+    field(DESC, "Profile build status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_BUILD_STATUS")
+    field(ONST, "Success")
+    field(ONSV, "NO_ALARM")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(TWST, "Failure")
+    field(TWSV, "MAJOR")
+    field(TWVL, "2")
+    field(ZRST, "Undefined")
+    field(ZRSV, "INVALID")
+    field(ZRVL, "0")
+}
+record(longin, "IOC:Prof1:CurrentPoint") {
+    field(DESC, "Current point in profile")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_CURRENT_POINT")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "IOC:Prof1:EndPulses") {
+    field(DESC, "Point # to end pulses")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_END_PULSES")
+    field(PINI, "YES")
+    field(VAL, "2000")
+}
+record(busy, "IOC:Prof1:Execute") {
+    field(DESC, "Execute profile motion")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Execute")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_EXECUTE")
+    field(ZNAM, "Done")
+}
+record(waveform, "IOC:Prof1:ExecuteMessage") {
+    field(DESC, "Profile execute message")
+    field(DTYP, "asynOctetRead")
+    field(FTVL, "CHAR")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_EXECUTE_MESSAGE")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+record(mbbi, "IOC:Prof1:ExecuteState") {
+    field(DESC, "Profile execute state")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_EXECUTE_STATE")
+    field(ONST, "Move start")
+    field(ONSV, "MINOR")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(THST, "Flyback")
+    field(THSV, "MINOR")
+    field(THVL, "3")
+    field(TWST, "Executing")
+    field(TWSV, "MINOR")
+    field(TWVL, "2")
+    field(ZRST, "Done")
+    field(ZRSV, "NO_ALARM")
+    field(ZRVL, "0")
+}
+record(mbbi, "IOC:Prof1:ExecuteStatus") {
+    field(DESC, "Profile execute status")
+    field(DTYP, "asynInt32")
+    field(FRST, "Timeout")
+    field(FRSV, "MAJOR")
+    field(FRVL, "4")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_EXECUTE_STATUS")
+    field(ONST, "Success")
+    field(ONSV, "NO_ALARM")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(THST, "Abort")
+    field(THSV, "MAJOR")
+    field(THVL, "3")
+    field(TWST, "Failure")
+    field(TWSV, "MAJOR")
+    field(TWVL, "2")
+    field(ZRST, "Undefined")
+    field(ZRSV, "INVALID")
+    field(ZRVL, "0")
+}
+record(ao, "IOC:Prof1:FixedTime") {
+    field(DESC, "Profile fixed time per point")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_FIXED_TIME")
+    field(PINI, "YES")
+    field(PREC, "3")
+    field(VAL, "1.")
+}
+record(stringout, "IOC:Prof1:GroupName") {
+    field(DESC, "XPS PVT group name")
+    field(DTYP, "asynOctetWrite")
+    field(OUT, "@asyn(XPS1,0,1)XPS_PROFILE_GROUP_NAME")
+    field(PINI, "YES")
+    field(VAL, "Group1")
+}
+record(waveform, "IOC:Prof1:M1FollowingErrors") {
+    field(DESC, "Axis 0 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M1MaxAcceleration") {
+    field(DESC, "Axis 0 max acceleration")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,0,1)XPS_PROFILE_MAX_ACCELERATION")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M1MaxPosition") {
+    field(DESC, "Axis 0 max position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,0,1)XPS_PROFILE_MAX_POSITION")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M1MaxVelocity") {
+    field(DESC, "Axis 0 max velocity")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,0,1)XPS_PROFILE_MAX_VELOCITY")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M1MinPosition") {
+    field(DESC, "Axis 0 min position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,0,1)XPS_PROFILE_MIN_POSITION")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "IOC:Prof1:M1Positions") {
+    field(DESC, "Axis 0 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "3")
+}
+record(waveform, "IOC:Prof1:M1Readbacks") {
+    field(DESC, "Axis 0 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:Prof1:M1UseAxis") {
+    field(DESC, "Use axis 0?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "IOC:Prof1:M2FollowingErrors") {
+    field(DESC, "Axis 1 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,1,1)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M2MaxAcceleration") {
+    field(DESC, "Axis 1 max acceleration")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,1,1)XPS_PROFILE_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M2MaxPosition") {
+    field(DESC, "Axis 1 max position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,1,1)XPS_PROFILE_MAX_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M2MaxVelocity") {
+    field(DESC, "Axis 1 max velocity")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,1,1)XPS_PROFILE_MAX_VELOCITY")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M2MinPosition") {
+    field(DESC, "Axis 1 min position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,1,1)XPS_PROFILE_MIN_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "IOC:Prof1:M2Positions") {
+    field(DESC, "Axis 1 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,1,1)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "IOC:Prof1:M2Readbacks") {
+    field(DESC, "Axis 1 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,1,1)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:Prof1:M2UseAxis") {
+    field(DESC, "Use axis 1?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(XPS1,1,1)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "IOC:Prof1:M3FollowingErrors") {
+    field(DESC, "Axis 2 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,2,1)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M3MaxAcceleration") {
+    field(DESC, "Axis 2 max acceleration")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,2,1)XPS_PROFILE_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M3MaxPosition") {
+    field(DESC, "Axis 2 max position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,2,1)XPS_PROFILE_MAX_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M3MaxVelocity") {
+    field(DESC, "Axis 2 max velocity")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,2,1)XPS_PROFILE_MAX_VELOCITY")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M3MinPosition") {
+    field(DESC, "Axis 2 min position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,2,1)XPS_PROFILE_MIN_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "IOC:Prof1:M3Positions") {
+    field(DESC, "Axis 2 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,2,1)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "IOC:Prof1:M3Readbacks") {
+    field(DESC, "Axis 2 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,2,1)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:Prof1:M3UseAxis") {
+    field(DESC, "Use axis 2?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(XPS1,2,1)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "IOC:Prof1:M4FollowingErrors") {
+    field(DESC, "Axis 3 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,3,1)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M4MaxAcceleration") {
+    field(DESC, "Axis 3 max acceleration")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,3,1)XPS_PROFILE_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M4MaxPosition") {
+    field(DESC, "Axis 3 max position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,3,1)XPS_PROFILE_MAX_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M4MaxVelocity") {
+    field(DESC, "Axis 3 max velocity")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,3,1)XPS_PROFILE_MAX_VELOCITY")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M4MinPosition") {
+    field(DESC, "Axis 3 min position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,3,1)XPS_PROFILE_MIN_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "IOC:Prof1:M4Positions") {
+    field(DESC, "Axis 3 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,3,1)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "IOC:Prof1:M4Readbacks") {
+    field(DESC, "Axis 3 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,3,1)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:Prof1:M4UseAxis") {
+    field(DESC, "Use axis 3?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(XPS1,3,1)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "IOC:Prof1:M5FollowingErrors") {
+    field(DESC, "Axis 4 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,4,1)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M5MaxAcceleration") {
+    field(DESC, "Axis 4 max acceleration")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,4,1)XPS_PROFILE_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M5MaxPosition") {
+    field(DESC, "Axis 4 max position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,4,1)XPS_PROFILE_MAX_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M5MaxVelocity") {
+    field(DESC, "Axis 4 max velocity")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,4,1)XPS_PROFILE_MAX_VELOCITY")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M5MinPosition") {
+    field(DESC, "Axis 4 min position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,4,1)XPS_PROFILE_MIN_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "IOC:Prof1:M5Positions") {
+    field(DESC, "Axis 4 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,4,1)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "IOC:Prof1:M5Readbacks") {
+    field(DESC, "Axis 4 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,4,1)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:Prof1:M5UseAxis") {
+    field(DESC, "Use axis 4?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(XPS1,4,1)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "IOC:Prof1:M6FollowingErrors") {
+    field(DESC, "Axis 5 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,5,1)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M6MaxAcceleration") {
+    field(DESC, "Axis 5 max acceleration")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,5,1)XPS_PROFILE_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M6MaxPosition") {
+    field(DESC, "Axis 5 max position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,5,1)XPS_PROFILE_MAX_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M6MaxVelocity") {
+    field(DESC, "Axis 5 max velocity")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,5,1)XPS_PROFILE_MAX_VELOCITY")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M6MinPosition") {
+    field(DESC, "Axis 5 min position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,5,1)XPS_PROFILE_MIN_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "IOC:Prof1:M6Positions") {
+    field(DESC, "Axis 5 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,5,1)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "IOC:Prof1:M6Readbacks") {
+    field(DESC, "Axis 5 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,5,1)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:Prof1:M6UseAxis") {
+    field(DESC, "Use axis 5?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(XPS1,5,1)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "IOC:Prof1:M7FollowingErrors") {
+    field(DESC, "Axis 6 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,6,1)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M7MaxAcceleration") {
+    field(DESC, "Axis 6 max acceleration")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,6,1)XPS_PROFILE_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M7MaxPosition") {
+    field(DESC, "Axis 6 max position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,6,1)XPS_PROFILE_MAX_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M7MaxVelocity") {
+    field(DESC, "Axis 6 max velocity")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,6,1)XPS_PROFILE_MAX_VELOCITY")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M7MinPosition") {
+    field(DESC, "Axis 6 min position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,6,1)XPS_PROFILE_MIN_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "IOC:Prof1:M7Positions") {
+    field(DESC, "Axis 6 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,6,1)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "IOC:Prof1:M7Readbacks") {
+    field(DESC, "Axis 6 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,6,1)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:Prof1:M7UseAxis") {
+    field(DESC, "Use axis 6?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(XPS1,6,1)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(waveform, "IOC:Prof1:M8FollowingErrors") {
+    field(DESC, "Axis 7 following errors")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,7,1)PROFILE_FOLLOWING_ERRORS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M8MaxAcceleration") {
+    field(DESC, "Axis 7 max acceleration")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,7,1)XPS_PROFILE_MAX_ACCELERATION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M8MaxPosition") {
+    field(DESC, "Axis 7 max position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,7,1)XPS_PROFILE_MAX_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M8MaxVelocity") {
+    field(DESC, "Axis 7 max velocity")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,7,1)XPS_PROFILE_MAX_VELOCITY")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ai, "IOC:Prof1:M8MinPosition") {
+    field(DESC, "Axis 7 min position")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,7,1)XPS_PROFILE_MIN_POSITION")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(waveform, "IOC:Prof1:M8Positions") {
+    field(DESC, "Axis 7 positions")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,7,1)PROFILE_POSITIONS")
+    field(NELM, "2000")
+    field(PREC, "4")
+}
+record(waveform, "IOC:Prof1:M8Readbacks") {
+    field(DESC, "Axis 7 readbacks")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,7,1)PROFILE_READBACKS")
+    field(NELM, "2000")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:Prof1:M8UseAxis") {
+    field(DESC, "Use axis 7?")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Yes")
+    field(OUT, "@asyn(XPS1,7,1)PROFILE_USE_AXIS")
+    field(PINI, "YES")
+    field(VAL, "0")
+    field(ZNAM, "No")
+}
+record(bo, "IOC:Prof1:MoveMode") {
+    field(DESC, "Profile move mode")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Relative")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_MOVE_MODE")
+    field(PINI, "YES")
+    field(ZNAM, "Absolute")
+}
+record(longin, "IOC:Prof1:NumActualPulses") {
+    field(DESC, "Actual # of output pulses")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_ACTUAL_PULSES")
+    field(SCAN, "I/O Intr")
+}
+record(longout, "IOC:Prof1:NumAxes") {
+    field(DESC, "# of axes being used")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_NUM_AXES")
+    field(PINI, "YES")
+    field(VAL, "6")
+}
+record(longout, "IOC:Prof1:NumPoints") {
+    field(DESC, "# of points in profile")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_NUM_POINTS")
+    field(PINI, "YES")
+    field(VAL, "2000")
+}
+record(longout, "IOC:Prof1:NumPulses") {
+    field(DESC, "Number of output pulses")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_NUM_PULSES")
+    field(PINI, "YES")
+    field(VAL, "2000")
+}
+record(busy, "IOC:Prof1:Readback") {
+    field(DESC, "Read back actual positions")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Readback")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_READBACK")
+    field(ZNAM, "Done")
+}
+record(waveform, "IOC:Prof1:ReadbackMessage") {
+    field(DESC, "Profile readback message")
+    field(DTYP, "asynOctetRead")
+    field(FTVL, "CHAR")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_READBACK_MESSAGE")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+record(mbbi, "IOC:Prof1:ReadbackState") {
+    field(DESC, "Readback state")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_READBACK_STATE")
+    field(ONST, "Busy")
+    field(ONSV, "MINOR")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(ZRST, "Done")
+    field(ZRSV, "NO_ALARM")
+    field(ZRVL, "0")
+}
+record(mbbi, "IOC:Prof1:ReadbackStatus") {
+    field(DESC, "Readback status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_READBACK_STATUS")
+    field(ONST, "Success")
+    field(ONSV, "NO_ALARM")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(TWST, "Failure")
+    field(TWSV, "MAJOR")
+    field(TWVL, "2")
+    field(ZRST, "Undefined")
+    field(ZRSV, "INVALID")
+    field(ZRVL, "0")
+}
+record(longout, "IOC:Prof1:StartPulses") {
+    field(DESC, "Point # to start pulses")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_START_PULSES")
+    field(PINI, "YES")
+    field(VAL, "1")
+}
+record(bo, "IOC:Prof1:TimeMode") {
+    field(DESC, "Profile time mode")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Array")
+    field(OUT, "@asyn(XPS1,0,1)PROFILE_TIME_MODE")
+    field(PINI, "YES")
+    field(ZNAM, "Fixed")
+}
+record(waveform, "IOC:Prof1:Times") {
+    field(DESC, "Profile time at each point")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(FTVL, "DOUBLE")
+    field(INP, "@asyn(XPS1,0,1)PROFILE_TIME_ARRAY")
+    field(NELM, "2000")
+    field(PREC, "3")
+}
+record(stringout, "IOC:Prof1:TrajectoryFile") {
+    field(DESC, "XPS trajectory file")
+    field(DTYP, "asynOctetWrite")
+    field(OUT, "@asyn(XPS1,0,1)XPS_TRAJECTORY_FILE")
+    field(PINI, "YES")
+    field(VAL, "TrajectoryScan.trj")
+}
+record(motor, "IOC:m1") {
+    field(ACCL, ".25")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Phi")
+    field(DHLM, "180")
+    field(DIR, "Neg")
+    field(DLLM, "-180")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, ".001")
+    field(OUT, "@asyn(XPS1,0)")
+    field(PREC, "3")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "4.0")
+}
+record(longout, "IOC:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "IOC:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m1MAX_JERK_TIME") {
+    field(DESC, "Max jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,0)XPS_MAX_JERK")
+    field(PREC, "3")
+    field(VAL, ".03")
+}
+record(ao, "IOC:m1MIN_JERK_TIME") {
+    field(DESC, "Min jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,0)XPS_MIN_JERK")
+    field(PREC, "3")
+    field(VAL, ".01")
+}
+record(ao, "IOC:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "IOC:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,0)MOTOR_REC_OFFSET")
+    field(PREC, "3")
+}
+record(ai, "IOC:m1READBACK") {
+    field(DESC, "Readback")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,0)MOTOR_POSITION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "IOC:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "IOC:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "3")
+}
+record(ai, "IOC:m1XPS_STATUS") {
+    field(DESC, "XPS Group Status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,0)XPS_STATUS")
+    field(PINI, "1")
+    field(PREC, "0")
+    field(SCAN, "I/O Intr")
+}
+record(motor, "IOC:m2") {
+    field(ACCL, ".88")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Kappa")
+    field(DHLM, "180")
+    field(DIR, "Neg")
+    field(DLLM, "-180")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, ".0001")
+    field(OUT, "@asyn(XPS1,1)")
+    field(PREC, "4")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "6.0")
+}
+record(longout, "IOC:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "IOC:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m2MAX_JERK_TIME") {
+    field(DESC, "Max jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,1)XPS_MAX_JERK")
+    field(PREC, "3")
+    field(VAL, ".03")
+}
+record(ao, "IOC:m2MIN_JERK_TIME") {
+    field(DESC, "Min jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,1)XPS_MIN_JERK")
+    field(PREC, "3")
+    field(VAL, ".01")
+}
+record(ao, "IOC:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "IOC:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,1)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ai, "IOC:m2READBACK") {
+    field(DESC, "Readback")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,1)MOTOR_POSITION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "IOC:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "IOC:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(ai, "IOC:m2XPS_STATUS") {
+    field(DESC, "XPS Group Status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,1)XPS_STATUS")
+    field(PINI, "1")
+    field(PREC, "0")
+    field(SCAN, "I/O Intr")
+}
+record(motor, "IOC:m3") {
+    field(ACCL, "1.5")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Omega")
+    field(DHLM, "360")
+    field(DIR, "Neg")
+    field(DLLM, "-180")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, ".0001")
+    field(OUT, "@asyn(XPS1,2)")
+    field(PREC, "4")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "7.0")
+}
+record(longout, "IOC:m3Direction") {
+    field(DESC, "m3 direction")
+    field(DOL, "IOC:m3.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,2)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m3MAX_JERK_TIME") {
+    field(DESC, "Max jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,2)XPS_MAX_JERK")
+    field(PREC, "3")
+    field(VAL, ".03")
+}
+record(ao, "IOC:m3MIN_JERK_TIME") {
+    field(DESC, "Min jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,2)XPS_MIN_JERK")
+    field(PREC, "3")
+    field(VAL, ".01")
+}
+record(ao, "IOC:m3Offset") {
+    field(DESC, "m3 offset")
+    field(DOL, "IOC:m3.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,2)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ai, "IOC:m3READBACK") {
+    field(DESC, "Readback")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,2)MOTOR_POSITION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "IOC:m3Resolution") {
+    field(DESC, "m3 resolution")
+    field(DOL, "IOC:m3.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,2)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(ai, "IOC:m3XPS_STATUS") {
+    field(DESC, "XPS Group Status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,2)XPS_STATUS")
+    field(PINI, "1")
+    field(PREC, "0")
+    field(SCAN, "I/O Intr")
+}
+record(motor, "IOC:m4") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Psi")
+    field(DHLM, "190")
+    field(DIR, "Neg")
+    field(DLLM, "-190")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, ".00025")
+    field(OUT, "@asyn(XPS1,3)")
+    field(PREC, "4")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "4.0")
+}
+record(longout, "IOC:m4Direction") {
+    field(DESC, "m4 direction")
+    field(DOL, "IOC:m4.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,3)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m4MAX_JERK_TIME") {
+    field(DESC, "Max jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,3)XPS_MAX_JERK")
+    field(PREC, "3")
+    field(VAL, ".03")
+}
+record(ao, "IOC:m4MIN_JERK_TIME") {
+    field(DESC, "Min jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,3)XPS_MIN_JERK")
+    field(PREC, "3")
+    field(VAL, ".01")
+}
+record(ao, "IOC:m4Offset") {
+    field(DESC, "m4 offset")
+    field(DOL, "IOC:m4.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,3)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ai, "IOC:m4READBACK") {
+    field(DESC, "Readback")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,3)MOTOR_POSITION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "IOC:m4Resolution") {
+    field(DESC, "m4 resolution")
+    field(DOL, "IOC:m4.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,3)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(ai, "IOC:m4XPS_STATUS") {
+    field(DESC, "XPS Group Status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,3)XPS_STATUS")
+    field(PINI, "1")
+    field(PREC, "0")
+    field(SCAN, "I/O Intr")
+}
+record(motor, "IOC:m5") {
+    field(ACCL, "1.0")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "2theta")
+    field(DHLM, "196")
+    field(DIR, "Neg")
+    field(DLLM, "-17")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, ".0001")
+    field(OUT, "@asyn(XPS1,4)")
+    field(PREC, "4")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "4.0")
+}
+record(longout, "IOC:m5Direction") {
+    field(DESC, "m5 direction")
+    field(DOL, "IOC:m5.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,4)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m5MAX_JERK_TIME") {
+    field(DESC, "Max jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,4)XPS_MAX_JERK")
+    field(PREC, "3")
+    field(VAL, ".03")
+}
+record(ao, "IOC:m5MIN_JERK_TIME") {
+    field(DESC, "Min jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,4)XPS_MIN_JERK")
+    field(PREC, "3")
+    field(VAL, ".01")
+}
+record(ao, "IOC:m5Offset") {
+    field(DESC, "m5 offset")
+    field(DOL, "IOC:m5.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,4)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ai, "IOC:m5READBACK") {
+    field(DESC, "Readback")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,4)MOTOR_POSITION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "IOC:m5Resolution") {
+    field(DESC, "m5 resolution")
+    field(DOL, "IOC:m5.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,4)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(ai, "IOC:m5XPS_STATUS") {
+    field(DESC, "XPS Group Status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,4)XPS_STATUS")
+    field(PINI, "1")
+    field(PREC, "0")
+    field(SCAN, "I/O Intr")
+}
+record(motor, "IOC:m6") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Nu")
+    field(DHLM, "190")
+    field(DIR, "Neg")
+    field(DLLM, "-190")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, ".00025")
+    field(OUT, "@asyn(XPS1,5)")
+    field(PREC, "4")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, "0.1")
+    field(VELO, "4.0")
+}
+record(longout, "IOC:m6Direction") {
+    field(DESC, "m6 direction")
+    field(DOL, "IOC:m6.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,5)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m6MAX_JERK_TIME") {
+    field(DESC, "Max jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,5)XPS_MAX_JERK")
+    field(PREC, "3")
+    field(VAL, ".03")
+}
+record(ao, "IOC:m6MIN_JERK_TIME") {
+    field(DESC, "Min jerk time")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(XPS1,5)XPS_MIN_JERK")
+    field(PREC, "3")
+    field(VAL, ".01")
+}
+record(ao, "IOC:m6Offset") {
+    field(DESC, "m6 offset")
+    field(DOL, "IOC:m6.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,5)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ai, "IOC:m6READBACK") {
+    field(DESC, "Readback")
+    field(DTYP, "asynFloat64")
+    field(INP, "@asyn(XPS1,5)MOTOR_POSITION")
+    field(PINI, "1")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+record(ao, "IOC:m6Resolution") {
+    field(DESC, "m6 resolution")
+    field(DOL, "IOC:m6.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,5)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(ai, "IOC:m6XPS_STATUS") {
+    field(DESC, "XPS Group Status")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(XPS1,5)XPS_STATUS")
+    field(PINI, "1")
+    field(PREC, "0")
+    field(SCAN, "I/O Intr")
+}
+record(motor, "IOC:m7") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Dummy1")
+    field(DHLM, "190")
+    field(DIR, "Neg")
+    field(DLLM, "-190")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, ".00025")
+    field(OUT, "@asyn(XPS1,6)")
+    field(PREC, "4")
+    field(TWV, "1")
+    field(VBAS, "0.1")
+    field(VELO, "4.0")
+}
+record(longout, "IOC:m7Direction") {
+    field(DESC, "m7 direction")
+    field(DOL, "IOC:m7.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,6)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m7Offset") {
+    field(DESC, "m7 offset")
+    field(DOL, "IOC:m7.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,6)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "IOC:m7Resolution") {
+    field(DESC, "m7 resolution")
+    field(DOL, "IOC:m7.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,6)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(motor, "IOC:m8") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "Dummy2")
+    field(DHLM, "190")
+    field(DIR, "Neg")
+    field(DLLM, "-190")
+    field(DTYP, "asynMotor")
+    field(EGU, "degrees")
+    field(INIT, "")
+    field(MRES, ".00025")
+    field(OUT, "@asyn(XPS1,7)")
+    field(PREC, "4")
+    field(TWV, "1")
+    field(VBAS, "0.1")
+    field(VELO, "4.0")
+}
+record(longout, "IOC:m8Direction") {
+    field(DESC, "m8 direction")
+    field(DOL, "IOC:m8.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,7)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m8Offset") {
+    field(DESC, "m8 offset")
+    field(DOL, "IOC:m8.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,7)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "IOC:m8Resolution") {
+    field(DESC, "m8 resolution")
+    field(DOL, "IOC:m8.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(XPS1,7)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}

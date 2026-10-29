@@ -4,30 +4,33 @@
 //! left; areaDetector wants host order with the origin at the top left. C did
 //! this in `copyToNDArray8/16/32` and `copyProfileToNDArray32`.
 
-use epics_rs::ad_core::ndarray::NDDataBuffer;
+use epics_rs::ad_core::ndarray::{NDDataType, NDDataViewMut};
 
 use crate::protocol::MpxError;
 
-/// Copy the binary payload of a data frame into an NDArray buffer, flipping
-/// the Y axis and swapping byte order when the detector needs it.
-///
-/// `offset` is the payload start, from the beginning of the frame body.
-///
-/// C indexed the source row as `(dims[1] - y)`, which read one row past the
-/// payload on `y == 0` and never read source row 0. The correct flip is
-/// `(height - 1 - y)`.
-pub fn decode_image(
+/// The binary payload of a data frame, checked against its header's geometry.
+pub struct ImagePayload<'a> {
+    src: &'a [u8],
+    width: usize,
+    height: usize,
+    data_type: NDDataType,
+    swap: bool,
+}
+
+/// Check that `body` holds a `width x height` frame of `pixel_depth` bits
+/// from `offset`, the payload start.
+pub fn image_payload(
     body: &[u8],
     offset: usize,
     width: usize,
     height: usize,
     pixel_depth: i32,
     swap: bool,
-) -> Result<NDDataBuffer, MpxError> {
-    let bpp = match pixel_depth {
-        8 => 1usize,
-        16 => 2,
-        32 => 4,
+) -> Result<ImagePayload<'_>, MpxError> {
+    let (bpp, data_type) = match pixel_depth {
+        8 => (1usize, NDDataType::UInt8),
+        16 => (2, NDDataType::UInt16),
+        32 => (4, NDDataType::UInt32),
         _ => return Err(MpxError::Malformed),
     };
     let needed = width
@@ -39,54 +42,97 @@ pub fn decode_image(
     if offset > body.len() || body.len() - offset < needed {
         return Err(MpxError::BadBodySize((offset + needed) as i64));
     }
-    let src = &body[offset..offset + needed];
+    Ok(ImagePayload {
+        src: &body[offset..offset + needed],
+        width,
+        height,
+        data_type,
+        swap,
+    })
+}
 
-    let row_bytes = width * bpp;
-    let mut out: Vec<u8> = Vec::with_capacity(needed);
-    for y in 0..height {
-        let sy = height - 1 - y;
-        out.extend_from_slice(&src[sy * row_bytes..(sy + 1) * row_bytes]);
+impl ImagePayload<'_> {
+    pub fn data_type(&self) -> NDDataType {
+        self.data_type
     }
 
-    Ok(match bpp {
-        1 => NDDataBuffer::U8(out),
-        2 => NDDataBuffer::U16(
-            out.as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| {
-                    let b = *c;
-                    if swap {
-                        u16::from_be_bytes(b)
-                    } else {
-                        u16::from_le_bytes(b)
-                    }
-                })
-                .collect(),
-        ),
-        _ => NDDataBuffer::U32(
-            out.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| {
-                    let b = *c;
-                    if swap {
-                        u32::from_be_bytes(b)
-                    } else {
-                        u32::from_le_bytes(b)
-                    }
-                })
-                .collect(),
-        ),
-    })
+    /// Copy the payload into `out`, a `width x height` buffer of
+    /// [`Self::data_type`], flipping the Y axis and swapping byte order when
+    /// the detector needs it.
+    ///
+    /// C indexed the source row as `(dims[1] - y)`, which read one row past
+    /// the payload on `y == 0` and never read source row 0. The correct flip
+    /// is `(height - 1 - y)`.
+    pub fn decode_into(&self, out: NDDataViewMut<'_>) {
+        let (w, h, swap) = (self.width, self.height, self.swap);
+        match out {
+            NDDataViewMut::U8(d) => flip_into(self.src, d, w, h, |[b]: [u8; 1]| b),
+            NDDataViewMut::U16(d) => flip_into(
+                self.src,
+                d,
+                w,
+                h,
+                if swap {
+                    u16::from_be_bytes
+                } else {
+                    u16::from_le_bytes
+                },
+            ),
+            NDDataViewMut::U32(d) => flip_into(
+                self.src,
+                d,
+                w,
+                h,
+                if swap {
+                    u32::from_be_bytes
+                } else {
+                    u32::from_le_bytes
+                },
+            ),
+            _ => unreachable!("decode_into is handed a {:?} buffer", self.data_type),
+        }
+    }
+}
+
+/// Row `y` of `dst` takes source row `height - 1 - y`, pixel by pixel.
+fn flip_into<const N: usize, T>(
+    src: &[u8],
+    dst: &mut [T],
+    width: usize,
+    height: usize,
+    pixel: impl Fn([u8; N]) -> T,
+) {
+    for y in 0..height {
+        let sy = height - 1 - y;
+        let row = &src[sy * width * N..(sy + 1) * width * N];
+        for (d, c) in dst[y * width..(y + 1) * width]
+            .iter_mut()
+            .zip(row.as_chunks::<N>().0)
+        {
+            *d = pixel(*c);
+        }
+    }
 }
 
 /// The X and Y profiles carried by a `PR1` frame.
 pub struct Profiles {
     pub x: Vec<i32>,
     pub y: Vec<i32>,
-    /// The two profiles packed into one `max(x,y) * 2` NDArray, as C did.
-    pub image: NDDataBuffer,
+}
+
+impl Profiles {
+    /// Pack both profiles into one `max(x,y) x 2` NDUInt32 buffer, X in row
+    /// 0 and Y in row 1, zero padded.
+    pub fn pack_into(&self, image: &mut [u32]) {
+        let (row_x, row_y) = image.split_at_mut(image.len() / 2);
+        for (row, profile) in [(row_x, &self.x), (row_y, &self.y)] {
+            let (head, pad) = row.split_at_mut(profile.len());
+            for (d, v) in head.iter_mut().zip(profile) {
+                *d = *v as u32;
+            }
+            pad.fill(0);
+        }
+    }
 }
 
 /// Decode a profile frame payload: `width` then `height` 64-bit counts,
@@ -109,7 +155,7 @@ pub fn decode_profiles(
     if offset > body.len() || body.len() - offset < needed {
         return Err(MpxError::BadBodySize((offset + needed) as i64));
     }
-    let words: Vec<u32> = body[offset..offset + needed]
+    let mut counts = body[offset..offset + needed]
         .as_chunks::<8>()
         .0
         .iter()
@@ -120,33 +166,34 @@ pub fn decode_profiles(
             } else {
                 u64::from_le_bytes(b)
             };
-            v as u32
-        })
-        .collect();
-
-    let x: Vec<i32> = words[..width].iter().map(|v| *v as i32).collect();
-    let y: Vec<i32> = words[width..].iter().rev().map(|v| *v as i32).collect();
-
-    // C allocated a max(width, height) x 2 NDArray and filled it row-major.
-    let stride = width.max(height);
-    let mut image = vec![0u32; stride * 2];
-    for (i, v) in words[..width].iter().enumerate() {
-        image[i] = *v;
-    }
-    for (i, v) in words[width..].iter().rev().enumerate() {
-        image[stride + i] = *v;
-    }
-
-    Ok(Profiles {
-        x,
-        y,
-        image: NDDataBuffer::U32(image),
-    })
+            v as u32 as i32
+        });
+    let x: Vec<i32> = counts.by_ref().take(width).collect();
+    let mut y: Vec<i32> = counts.collect();
+    y.reverse();
+    Ok(Profiles { x, y })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataView};
+
+    fn decode_image(
+        body: &[u8],
+        offset: usize,
+        width: usize,
+        height: usize,
+        pixel_depth: i32,
+        swap: bool,
+    ) -> Result<NDDataBuffer, MpxError> {
+        let payload = image_payload(body, offset, width, height, pixel_depth, swap)?;
+        // Stale bytes, as a reused pool buffer holds.
+        let mut buf = NDDataBuffer::zeros(payload.data_type(), width * height);
+        buf.as_u8_slice_mut().fill(0xA5);
+        payload.decode_into(buf.view_mut());
+        Ok(buf)
+    }
 
     /// 2x3 (w x h) 8-bit image, rows tagged by their source row index.
     fn image8() -> Vec<u8> {
@@ -158,7 +205,7 @@ mod tests {
     #[test]
     fn decode_image8_flips_y_without_reading_past_the_payload() {
         let buf = decode_image(&image8(), 4, 2, 3, 8, true).unwrap();
-        let NDDataBuffer::U8(px) = buf else {
+        let NDDataView::U8(px) = buf.view() else {
             panic!("expected U8")
         };
         // Source rows are (0,1) (10,11) (20,21); output must start with the
@@ -171,7 +218,7 @@ mod tests {
         // 1x2 image, pixels 0x0102 and 0x0304 big-endian.
         let body = [b'X', 0x01, 0x02, 0x03, 0x04];
         let buf = decode_image(&body, 1, 1, 2, 16, true).unwrap();
-        let NDDataBuffer::U16(px) = buf else {
+        let NDDataView::U16(px) = buf.view() else {
             panic!("expected U16")
         };
         // Y-flipped: bottom row (0x0304) first.
@@ -182,7 +229,7 @@ mod tests {
     fn decode_image16_keeps_host_order_when_detector_does_not_swap() {
         let body = [b'X', 0x01, 0x02, 0x03, 0x04];
         let buf = decode_image(&body, 1, 1, 2, 16, false).unwrap();
-        let NDDataBuffer::U16(px) = buf else {
+        let NDDataView::U16(px) = buf.view() else {
             panic!("expected U16")
         };
         assert_eq!(px, vec![0x0403, 0x0201]);
@@ -192,7 +239,7 @@ mod tests {
     fn decode_image32_swaps_big_endian_pixels() {
         let body = [b'X', 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x03, 0x04];
         let buf = decode_image(&body, 1, 1, 2, 32, true).unwrap();
-        let NDDataBuffer::U32(px) = buf else {
+        let NDDataView::U32(px) = buf.view() else {
             panic!("expected U32")
         };
         assert_eq!(px, vec![0x0304, 0x0102]);
@@ -236,9 +283,9 @@ mod tests {
         let p = decode_profiles(&body, 1, 2, 3, true).unwrap();
         assert_eq!(p.x, vec![1, 2]);
         assert_eq!(p.y, vec![30, 20, 10]);
-        let NDDataBuffer::U32(img) = p.image else {
-            panic!("expected U32")
-        };
+        // A reused pool buffer's stale words.
+        let mut img = vec![0xA5A5_A5A5u32; 6];
+        p.pack_into(&mut img);
         // stride = max(2,3) = 3: row 0 is X (padded), row 1 is the flipped Y.
         assert_eq!(img, vec![1, 2, 0, 30, 20, 10]);
     }

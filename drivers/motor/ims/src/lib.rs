@@ -3,6 +3,8 @@
 //! See [`mdriveplus`] for the MDrivePlus / MForce / Lexium protocol and porting
 //! notes, and [`ioc`] for the iocsh configuration command.
 
+pub mod drv_im483;
+pub mod drv_mdrive;
 pub mod ioc;
 pub mod mdriveplus;
 

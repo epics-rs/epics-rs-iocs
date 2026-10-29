@@ -1,0 +1,14 @@
+# dbl of motor R7-4-5 motorAerotech iocBoot/iocAerotech a3.asyn.st.cmd.linux-x86
+aerotech:alldone
+aerotech:alldoneBlink
+aerotech:allstop
+aerotech:moving
+aerotech:movingDiff
+aerotech:X
+aerotech:XDirection
+aerotech:XOffset
+aerotech:XResolution
+aerotech:Y
+aerotech:YDirection
+aerotech:YOffset
+aerotech:YResolution

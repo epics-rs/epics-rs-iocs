@@ -8,8 +8,9 @@
 //! input EOS on read. [`write_read`] therefore sends the bare command text
 //! and does not append anything.
 
-use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+
+use crate::connect::OctetLink;
 
 /// asyn reason used for every octet transaction against the underlying
 /// serial/IP port — that port has a single octet stream, so the reason
@@ -17,41 +18,116 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 /// `motor_common::connect`/`motor-mclennan`).
 const OCTET_REASON: usize = 0;
 
+/// None of the C delaygen drivers writes the record's
+/// `pasynUser->errorMessage`, so a failed transfer reaches the record as its
+/// status alone.
+pub(crate) fn record_error(status: AsynStatus) -> AsynError {
+    AsynError::Status {
+        status,
+        message: String::new(),
+    }
+}
+
+/// C's `if( pport->init==0 ) return asynError;` at the top of every
+/// DG645 and Coherent SDG transfer: a port whose constructor gave up after
+/// `registerPort` stays registered and refuses all I/O.
+pub(crate) fn require_init(init: bool) -> AsynResult<()> {
+    if init {
+        Ok(())
+    } else {
+        Err(record_error(AsynStatus::Error))
+    }
+}
+
+/// A failed C `pasynOctetSyncIO` transaction with the byte counts the C
+/// drivers' error lines print.
+#[derive(Debug)]
+pub struct OctetFailure {
+    pub error: AsynError,
+    pub sent: usize,
+    pub received: usize,
+}
+
+impl OctetFailure {
+    /// The C `asynStatus` number the error lines print.
+    pub fn status(&self) -> i32 {
+        self.error.status() as i32
+    }
+}
+
+impl From<OctetFailure> for AsynError {
+    fn from(f: OctetFailure) -> Self {
+        f.error
+    }
+}
+
+/// Write `cmd`; any write that sent fewer bytes than `cmd` is `asynError`,
+/// as every C driver turns `nActual != nRequested` into one — including a
+/// refused `queueLockPort`, whose own status (e.g. asynDisconnected) C drops.
+fn write_all(link: &OctetLink, cmd: &str) -> Result<usize, OctetFailure> {
+    let short = |n: usize, message: String| OctetFailure {
+        error: AsynError::Status {
+            status: AsynStatus::Error,
+            message,
+        },
+        sent: n,
+        received: 0,
+    };
+    match link.sync.write_octet(OCTET_REASON, cmd.as_bytes()) {
+        Ok(n) if n == cmd.len() => Ok(n),
+        Ok(n) => Err(short(n, format!("wrote {n} of {} bytes", cmd.len()))),
+        Err(error) if cmd.is_empty() => Err(OctetFailure {
+            error,
+            sent: 0,
+            received: 0,
+        }),
+        Err(error) => Err(short(0, error.message())),
+    }
+}
+
 /// Send `cmd` and return the reply with the port's configured input EOS
 /// already stripped (C `pasynOctetSyncIO->writeRead`, composed from the two
 /// primitives asyn-rs exposes).
-pub fn write_read(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
-    handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-    let raw = handle.read_octet(OCTET_REASON, 4096)?;
-    Ok(String::from_utf8_lossy(&raw).into_owned())
+pub fn write_read(link: &OctetLink, cmd: &str) -> Result<String, OctetFailure> {
+    write_read_bytes(link, cmd).map(|raw| String::from_utf8_lossy(&raw).into_owned())
+}
+
+/// [`write_read`]'s reply as the device sent it.
+pub fn write_read_bytes(link: &OctetLink, cmd: &str) -> Result<Vec<u8>, OctetFailure> {
+    let (raw, status) = exchange(link, cmd);
+    status.map(|()| raw)
+}
+
+/// [`write_read_bytes`] with the bytes a failed read delivered, which C's
+/// buffer holds; a failed write reads none.
+pub fn exchange(link: &OctetLink, cmd: &str) -> (Vec<u8>, Result<(), OctetFailure>) {
+    let sent = match write_all(link, cmd) {
+        Ok(sent) => sent,
+        Err(f) => return (Vec::new(), Err(f)),
+    };
+    let (raw, status) = link.sync.read_octet(OCTET_REASON, 4096).into_parts();
+    let status = status.map_err(|error| OctetFailure {
+        received: raw.len(),
+        error,
+        sent,
+    });
+    (raw, status)
 }
 
 /// Send `cmd` without reading a reply (C `pasynOctetSyncIO->write`).
-pub fn write_only(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
-    handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-    Ok(())
+pub fn write_only(link: &OctetLink, cmd: &str) -> Result<(), OctetFailure> {
+    write_all(link, cmd).map(drop)
 }
 
 /// Read a reply with no command sent first (used where a caller already
 /// wrote and only needs to drain an extra line, e.g. Colby's serial echo).
-pub fn read_only(handle: &SyncIOHandle) -> AsynResult<String> {
-    let raw = handle.read_octet(OCTET_REASON, 4096)?;
+pub fn read_only(link: &OctetLink) -> AsynResult<String> {
+    let (raw, status) = link.sync.read_octet(OCTET_REASON, 4096).into_parts();
+    status?;
     Ok(String::from_utf8_lossy(&raw).into_owned())
 }
 
-/// Mimic C `atoi`: parse the leading integer prefix, `0` on junk.
-pub fn atoi(s: &str) -> i32 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i32>().ok()).unwrap_or(0)
-}
+pub use epics_rs::base::types::c_parse::atoi;
 
 /// Extract the leading numeric token (sign, digits, optional `.digits`,
 /// optional exponent) that C `atof`/`sscanf("%e", ...)` would consume,
@@ -113,6 +189,20 @@ mod tests {
         assert_eq!(atoi("  -7abc"), -7);
         assert_eq!(atoi("abc"), 0);
         assert_eq!(atoi(""), 0);
+    }
+
+    #[test]
+    fn atoi_wraps_an_overflow_as_glibc_does() {
+        // glibc's atoi is `(int) strtol(s, NULL, 10)`.
+        use epics_rs::base::types::c_parse::long_to_int;
+        use std::ffi::c_long;
+        let past_int = if c_long::BITS == 64 {
+            i32::MIN
+        } else {
+            i32::MAX
+        };
+        assert_eq!(atoi("2147483648"), past_int);
+        assert_eq!(atoi("99999999999999999999"), long_to_int(c_long::MAX));
     }
 
     #[test]

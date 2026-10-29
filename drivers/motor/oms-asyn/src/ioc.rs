@@ -1,161 +1,315 @@
-//! iocsh commands for the OMS MAXnet / MXA driver.
-//!
-//! Mirrors the C two-step configuration: `omsMAXnetConfig` / `omsMXAConfig`
-//! connect the asyn octet port, run the init preamble, and register a
-//! controller under a logical name; then `omsCreateAxis(controllerName, axis)`
-//! probes and attaches each axis to a `DTYP`-keyed motor device support
-//! (`OMS_{controllerName}_{axis}`). The controller is looked up by name from a
-//! registry shared by the commands. Both port kinds (`drvAsynIPPort` /
-//! `drvAsynSerialPort`) work, so `connect_ip` is used (the lookup is
-//! transport-agnostic).
-//!
-//! `omsMAXnetConfig` and `omsMXAConfig` differ only in the controller label
-//! (and, in the C driver, a minimum-firmware value used to select command
-//! forms — this port assumes the modern forms both controllers use when their
-//! firmware meets its minimum), so both route through one shared body.
+//! `omsMAXnetConfig` / `omsMXAConfig`: the controller and its axes, which
+//! records reach through `DTYP "asynMotor"` and `@asyn(portName,axis)`.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_ip;
-use motor_common::iocsh::{
-    arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, poll_intervals,
-    req_int, req_string,
-};
+use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
+use motor_common::model1::c_int;
+use motor_common::{Controller, asyn_user, register_port_with};
 
-use crate::oms::{OmsAxis, OmsController};
+use crate::oms::{FirmwareVersion, OmsAxis, OmsController, OmsParams};
 
-/// Default communication timeout when the `timeoutMs` arg is omitted.
-const DEFAULT_TIMEOUT_MS: f64 = 2000.0;
+/// C `OMS_MAX_AXES`.
+const OMS_MAX_AXES: usize = 10;
 
-/// A registered controller plus the poll periods to install its axes with.
-struct ControllerReg {
-    controller: Arc<Mutex<OmsController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
-}
+/// The constructor's `timeout = 2.0`.
+const TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Shared name -> controller registry for the commands.
-type Registry = Arc<Mutex<HashMap<String, ControllerReg>>>;
-
-fn registry_lock(reg: &Registry) -> std::sync::MutexGuard<'_, HashMap<String, ControllerReg>> {
-    reg.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Build all OMS iocsh commands, sharing one controller registry.
-pub fn oms_commands(holder: &Arc<MotorHolder>) -> Vec<CommandDef> {
-    let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+/// `omsMAXnetConfig` and `omsMXAConfig`.
+pub fn oms_commands() -> Vec<CommandDef> {
     vec![
-        oms_config_command(&registry, "omsMAXnetConfig", "MAXnet"),
-        oms_config_command(&registry, "omsMXAConfig", "MXA"),
-        oms_create_axis_command(&registry, holder),
+        oms_config_command("omsMAXnetConfig", "MAXnet"),
+        oms_config_command("omsMXAConfig", "MXA"),
     ]
 }
 
-/// `omsMAXnetConfig` / `omsMXAConfig`
-/// `(controllerName, asynPort, [initString], [movingPollMs], [idlePollMs],
-/// [timeoutMs])`.
-fn oms_config_command(
-    registry: &Registry,
-    cmd_name: &'static str,
-    controller_type: &'static str,
-) -> CommandDef {
-    let registry = registry.clone();
+/// `<cmd_name>(portName, numAxes, serialPortName, movingPollPeriod,
+/// idlePollPeriod, initString)`. As C's constructor, a failure past the
+/// port's creation is printed and leaves the port without axes.
+fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> CommandDef {
+    // The constructors' minFwMajor, minFwMinor, minFwRevision.
+    let min_fw = FirmwareVersion {
+        major: 1,
+        minor: if controller_type == "MAXnet" { 30 } else { 0 },
+        revision: 0,
+    };
     CommandDef::new(
         cmd_name,
         vec![
-            arg_str_req("controllerName"),
-            arg_str_req("asynPort"),
-            arg_str_opt("initString"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-            arg_double_opt("timeoutMs"),
+            arg_str_req("asyn motor port name"),
+            arg_int_req("number of axes"),
+            arg_str_req("asyn serial/tcp port name"),
+            arg_int_req("moving poll rate"),
+            arg_int_req("idle poll rate"),
+            arg_str_req("initstring"),
         ],
         format!(
-            "{cmd_name}(controllerName, asynPort, [initString], [movingPollMs], \
-             [idlePollMs], [timeoutMs]) - Register a Pro-Dex OMS {controller_type} \
-             controller by name"
+            "{cmd_name}(portName, numAxes, serialPortName, movingPollPeriod, \
+             idlePollPeriod, initString)"
         ),
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let init_string = req_string(args, 2, "initString").unwrap_or_default();
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "asyn motor port name")?;
+            let num_axes = c_int(args, 1);
+            let serial_port = req_string(args, 2, "asyn serial/tcp port name")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-            let timeout_ms = opt_double(args, 5, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
+            let init_string = req_string(args, 5, "initstring").unwrap_or_default();
+            let who = format!("{controller_type}Config");
 
-            if registry_lock(&registry).contains_key(&name) {
-                return Err(format!(
-                    "{cmd_name}: controller '{name}' already registered"
+            let (params, report) = OmsParams::new(controller_type);
+            register_port_with(ctx, &port_name, num_axes, params)?;
+            // On each early return C still runs startPoller on the half-built
+            // controller and crashes (a C bug); the port keeps no axes here.
+            let handle = match connect_with_default_eos(&serial_port, TIMEOUT, &who) {
+                Ok(handle) => handle,
+                Err(line) => {
+                    println!("{line}");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            let mut controller =
+                OmsController::new(handle, &port_name, &serial_port, controller_type);
+            if let Err(e) = controller.watch_connection() {
+                println!("{who}: can't set exceptionCallback for {serial_port}: {e}");
+                return Ok(CommandOutcome::Continue);
+            }
+            let fw = match controller.firmware_version() {
+                Ok(version) => version,
+                Err(e) => {
+                    println!(
+                        "{who}: unable to talk to controller at {serial_port}: {}",
+                        e.message_display()
+                    );
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            let _ = report.fw.set(fw);
+            controller.set_firmware(fw, min_fw);
+            if fw.minor < min_fw.minor {
+                println!(
+                    "{}",
+                    unsupported_firmware(controller_type, fw.major, fw.minor)
+                );
+            }
+            controller.init(&init_string);
+
+            // omsBaseController::Init: the axes are the fields of `AA RP;`.
+            let total_axes = controller.axis_count();
+            // Init leaves errorMessage untouched, so C prints it empty.
+            if num_axes as usize > OMS_MAX_AXES {
+                errlog_vprintf(format_args!(
+                    "omsBaseController:Init: number of axes={num_axes} exceeds allowed maximum\n"
                 ));
+                println!("{who}: unable to talk to controller at {serial_port}: ");
+                return Ok(CommandOutcome::Continue);
             }
-            let handle = connect_ip(
-                &asyn_port,
-                Duration::from_millis(timeout_ms.max(0.0) as u64),
-            )?;
-            let controller = OmsController::new(handle, controller_type);
-            match controller.firmware_version() {
-                Ok(fw) => println!("{cmd_name}: {controller_type} firmware: {fw}"),
-                Err(e) => println!("{cmd_name}: warning: firmware read failed: {e}"),
+            if total_axes > num_axes.max(0) as usize {
+                errlog_vprintf(format_args!(
+                    "omsBaseController:Init: actual number of axes={total_axes} > \
+                     MIN(numAxes={num_axes}, OMS_MAX_AXES)\n"
+                ));
+                println!("{who}: unable to talk to controller at {serial_port}: ");
+                return Ok(CommandOutcome::Continue);
             }
-            controller
-                .init(&init_string)
-                .map_err(|e| format!("{cmd_name}: init failed: {e}"))?;
 
+            let shared = controller.poll_shared().clone();
             let controller = Arc::new(Mutex::new(controller));
-            registry_lock(&registry).insert(
-                name.clone(),
-                ControllerReg {
-                    controller,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                },
-            );
-            println!(
-                "{cmd_name}: controller='{name}' asynPort={asyn_port} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (attach axes with omsCreateAxis)"
+            let _ = report.controller.set(controller.clone());
+            let axes = (0..total_axes)
+                .map(|axis| {
+                    OmsAxis::new(controller.clone(), axis)
+                        .map_err(|e| format!("{cmd_name}: axis {axis}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let _ = report.axes.set(shared);
+            crate::poller::init_positions(&controller);
+            let mut posters = Vec::with_capacity(total_axes);
+            // No timed pass: the OMS poller posts (zero periods wait on
+            // events alone).
+            let axes_poller = Controller::new();
+            for (axis, axis_dev) in axes.into_iter().enumerate() {
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
+                posters.push(axes_poller.install(asyn_user(&port_name, axis as i32), motor)?);
+            }
+            axes_poller.start(&port_name, 0, 0, 0);
+            crate::poller::start(
+                &controller,
+                posters,
+                axes_poller.first_poll_pending(),
+                Duration::from_millis(moving_poll_ms),
+                Duration::from_millis(idle_poll_ms),
+                fw.minor,
             );
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// `omsCreateAxis(controllerName, axis)`.
-fn oms_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> CommandDef {
-    let registry = registry.clone();
-    let holder = holder.clone();
-    CommandDef::new(
-        "omsCreateAxis",
-        vec![arg_str_req("controllerName"), arg_int_req("axis")],
-        "omsCreateAxis(controllerName, axis) - Attach one OMS axis \
-         (DTYP OMS_{controllerName}_{axis}); axis is 0-based",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let axis = req_int(args, 1, "axis")?;
-            if !(0..=9).contains(&axis) {
-                return Err("omsCreateAxis: axis must be 0..=9".into());
-            }
-
-            let reg = registry_lock(&registry);
-            let entry = reg
-                .get(&name)
-                .ok_or_else(|| format!("omsCreateAxis: controller '{name}' not registered"))?;
-            let controller = entry.controller.clone();
-            let moving_poll_ms = entry.moving_poll_ms;
-            let idle_poll_ms = entry.idle_poll_ms;
-            drop(reg);
-
-            let axis_dev = OmsAxis::new(controller, axis as usize)
-                .map_err(|e| format!("omsCreateAxis: {e}"))?;
-            let dtyp_key = format!("OMS_{name}_{axis}");
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
-            holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
-            println!("omsCreateAxis: {dtyp_key} (axis={axis})");
-            Ok(CommandOutcome::Continue)
-        },
+/// The constructors' unsupported-firmware line; only MXA's names the minimum
+/// from its fields.
+fn unsupported_firmware(controller_type: &str, major: i32, minor: i32) -> String {
+    let mandatory = if controller_type == "MAXnet" {
+        "1.30"
+    } else {
+        "1.0"
+    };
+    format!(
+        "This Controllers Firmware Version {major}.{minor} is not supported, version \
+         {mandatory} or higher is mandatory"
     )
+}
+
+/// Connect to the octet port, flush it, and give it the OMS EOS (input
+/// `"\n\r"`, output `"\n"`) only where st.cmd left that direction empty, as
+/// `omsMAXnet`/`omsMXA` do after `getInputEos`/`getOutputEos`. As there, a
+/// refused get skips that direction and a refused set is printed, never fatal
+/// (omsMAXnet.cpp:128-142, omsMXA.cpp:123-137).
+///
+/// `Err` is C's console line for the refusal: `connectDevice` on an unknown
+/// port, then `findInterface(asynOctet)` (omsMAXnet.cpp:96-115).
+fn connect_with_default_eos(
+    port_name: &str,
+    timeout: Duration,
+    who: &str,
+) -> Result<SyncIOHandle, String> {
+    let port = get_port(port_name).ok_or_else(|| {
+        format!(
+            "{who}: can't connect to port {port_name}: asynManager:connectDevice port \
+             {port_name} not found"
+        )
+    })?;
+    if !port.handle.has_interface(InterfaceType::Octet) {
+        return Err(format!(
+            "{who}: {} driver not supported",
+            InterfaceType::Octet
+        ));
+    }
+    let handle = SyncIOHandle::from_handle(port.handle.clone(), 0, timeout, InterfaceType::Octet)
+        .map_err(|e| format!("{who}: {e}"))?;
+    let _ = handle.flush(0);
+    if handle.get_input_eos(0).is_ok_and(|eos| eos.is_empty())
+        && let Err(e) = handle.set_input_eos(0, b"\n\r")
+    {
+        println!("{who}: unable to set InputEOS {port_name}: {e}");
+    }
+    if handle.get_output_eos(0).is_ok_and(|eos| eos.is_empty())
+        && let Err(e) = handle.set_output_eos(0, b"\n")
+    {
+        println!("{who}: unable to set OutputEOS {port_name}: {e}");
+    }
+    Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::port::InterfaceMask;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::user::AsynUser;
+
+    /// A port with no EOS support of its own: both sets are refused.
+    struct Bare(PortDriverBase);
+
+    impl PortDriver for Bare {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    /// omsMAXnet.cpp:128-142, omsMXA.cpp:123-137: the connect flushes, then
+    /// gets and sets each EOS through `pasynOctetSyncIO`, each call printing
+    /// its TRACEIO_DEVICE line.
+    #[test]
+    fn the_connect_flushes_and_sets_the_eos_as_asyn_octet_sync_io() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use motor_common::testing::LineRig;
+
+        let name = "omsSyncIoEos";
+        let (_line, io) = LineRig::new(name, |_| String::new());
+        let trace = io.port().unwrap().trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_ok());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.split_once(" asynOctetSyncIO ").map(|(_, call)| call))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "flush",
+                "setInputEos eoslen 0",
+                "setInputEos eoslen 2",
+                "setOutputEos eoslen 0",
+                "setOutputEos eoslen 1",
+            ],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_port_refusing_the_default_eos_still_connects() {
+        let name = "omsEosRefused";
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
+        );
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        let port = rt.port_handle().clone();
+        assert!(
+            port.set_input_eos_blocking(AsynUser::new(0), b"\n\r")
+                .is_err()
+        );
+        claim.publish(port, &open_owner()).unwrap();
+        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_ok());
+    }
+
+    /// omsMAXnet.cpp:112-115 and omsMXA.cpp:108-111: a port without
+    /// asynOctet ends the configure with "asynOctet driver not supported".
+    #[test]
+    fn a_port_without_asyn_octet_is_refused() {
+        let name = "omsNoOctet";
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::COMMON | InterfaceMask::INT32,
+            InterfaceMask::NONE,
+        );
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let e = connect_with_default_eos(name, Duration::from_secs(1), "MXAConfig")
+            .err()
+            .unwrap();
+        assert_eq!(e, "MXAConfig: asynOctet driver not supported");
+    }
 }

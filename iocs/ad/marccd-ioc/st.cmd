@@ -18,9 +18,7 @@
 # 0.24.3 `AdIoc` registers those commands and `$(ADCORE)` resolves to
 # ad-core-rs's real crate dir: the marServer port is created, the EOS
 # commands exist, and `$(ADCORE)/db` + `$(ADCORE)/ioc/commonPlugins.cmd`
-# all resolve (verified live to iocInit). The EOS-setting lines below are
-# still commented pending a decision on whether to set them (the commands
-# are now registered, so uncommenting should work; not separately tested).
+# all resolve (verified live to iocInit).
 #============================================================
 
 # Prefix for all records
@@ -49,14 +47,10 @@ epicsEnvSet("NELEMENTS", "4200000")
 # (drvAsynIPPortConfigure is registered by AdIoc as of ad-plugins-rs 0.24.3.)
 drvAsynIPPortConfigure("marServer", "gse-marccd1.cars.aps.anl.gov:2222")
 
-# marServer framing (reproduced from the C st.cmd): commands and replies are
-# both terminated with 0x0A (LF). The C boot sets these with:
-#   asynOctetSetInputEos("marServer", 0, "\n")
-#   asynOctetSetOutputEos("marServer", 0, "\n")
-# Left commented pending verification: as of ad-plugins-rs 0.24.3 AdIoc
-# registers the asynOctetSetInputEos / asynOctetSetOutputEos iocsh commands,
-# so these lines can be enabled. The driver sends commands and parses replies
-# with no embedded terminator, so this EOS must be set for correct operation.
+# marServer framing (as the C st.cmd): commands and replies both end in LF.
+# The driver sends and parses them with no terminator of its own.
+asynOctetSetInputEos("marServer", 0, "\n")
+asynOctetSetOutputEos("marServer", 0, "\n")
 
 marCCDConfig("$(PORT)", "marServer", 0, 0)
 # Template-internal `include` lines (ADBase.template, NDArrayBase.template,
@@ -72,9 +66,13 @@ dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=I
 
 # Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
 < $(ADCORE)/ioc/commonPlugins.cmd
+set_requestfile_path("$(ADMARCCD)/db")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30,"P=$(PREFIX)")
+
 # Example interactive commands:
 #   dbl                                   # List all PVs
 #   dbpf 13MARCCD1:cam1:Acquire 1         # Start acquisition

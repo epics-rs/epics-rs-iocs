@@ -1,92 +1,266 @@
-//! `SC800Setup` / `SC800Config` iocsh commands for the Kohzu SC-200/400/800.
+//! `SC800Setup` / `SC800Config` iocsh commands for the Kohzu SC-200/400/800,
+//! C's model-1 interface: records reach axis `signal` of `card` through
+//! `DTYP "SC-800"` and `OUT "#C card S signal"`.
 //!
-//! Mirrors C `SC800Config(card, name, addr)`: connect the serial octet port,
-//! identify the controller ([`KohzuController::new`]), and register each axis
-//! behind a `DTYP`-keyed motor device support (`SC800_{card}_{index}`, 0-based).
-//! The axis count comes from the controller model (SC-800 → 8, SC-400 → 4,
-//! SC-200 → 2). `SC800Setup` (which only sized a controller array in C) is
-//! accepted as a no-op for startup-script parity.
-//!
-//! C's GPIB `addr` argument is dropped: this is a serial octet port (asyn
-//! address 0).
+//! Config keeps the port and address; `motor_init` at iocInit connects and
+//! identifies the controller, and the axis count comes from the model
+//! (SC-800 → 8, SC-400 → 4, SC-200 → 2).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
-use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
-};
+use motor_common::connect::{EosRefusal, connect_with_eos};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1_device;
 
-use crate::kohzu::{KohzuAxis, KohzuController};
+use crate::kohzu::{INPUT_EOS, KohzuAxis, KohzuController, OUTPUT_EOS};
 
 /// Serial command timeout (C `TIMEOUT` 3 s).
 const SC800_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Build the `SC800Setup(maxControllers, [scanRate])` no-op command
-/// (startup-script parity; the asyn-rs port allocates per `SC800Config`).
+/// `device(motor,VME_IO, devSC800, "SC-800")` (devKohzuMotor.dbd:4).
+static DEV_SC800: DevSup = model1_device("devSC800", "SC-800");
+
+/// `SC800_NUM_CARDS` (drvSC800.cc:59).
+static SC800: Model1 = Model1::new(&DEV_SC800, 16, SCAN_RATE);
+
+/// `SC800Setup(num_cards, scan_rate)`.
 pub fn sc800_setup_command() -> CommandDef {
+    SC800.register_report("drvSC800", |cards| {
+        cards.report("SC800", |card, line| {
+            format!("    SC800 controller {card}, {line} \n")
+        })
+    });
+    SC800.setup_command("SC800Setup")
+}
+
+/// `SC800Config(card, name, address)`; `address` is the asyn address C
+/// connects at.
+pub fn sc800_config_command() -> CommandDef {
     CommandDef::new(
-        "SC800Setup",
-        vec![arg_int_req("maxControllers"), arg_int_opt("scanRate")],
-        "SC800Setup(maxControllers, [scanRate]) - Accepted for parity; SC800Config allocates per call",
+        "SC800Config",
+        vec![
+            arg_int_req("Card# being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
+        ],
+        "SC800Config(card, name, address)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxControllers")?;
-            if max < 1 {
-                return Err("SC800Setup: maxControllers must be > 0".into());
+            let card = c_int(args, 0);
+            if !SC800.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let address = c_int(args, 2);
+            SC800.config(card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    address,
+                    SC800_TIMEOUT,
+                    INPUT_EOS,
+                    OUTPUT_EOS,
+                    EosRefusal::Ignored,
+                ) else {
+                    errlog_vprintf(format_args!(
+                        "\ndrvSC800.cc:motor_init() *** asyn connection error on port = \
+                         {asyn_port}, address = {address} ***\n\n"
+                    ));
+                    std::thread::sleep(Duration::from_secs(5));
+                    return;
+                };
+                let Ok(controller) = KohzuController::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let line = format!(
+                    "port={asyn_port}, address={address}, id: {}",
+                    controller.ident()
+                );
+                let controller = Arc::new(Mutex::new(controller));
+                for index in 0..num_axes {
+                    let motor: Arc<Mutex<dyn Model1Motor>> =
+                        Arc::new(Mutex::new(KohzuAxis::new(controller.clone(), index)));
+                    init.axis(index as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `SC800Config(card, asynPort, [movingPollMs], [idlePollMs])`
-/// command bound to `holder`.
-pub fn sc800_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
-    CommandDef::new(
-        "SC800Config",
-        vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-        ],
-        "SC800Config(card, asynPort, [movingPollMs], [idlePollMs]) - \
-         Create a Kohzu SC-200/400/800 controller (DTYP SC800_{card}_{0..N-1}); \
-         axis count comes from the controller model",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("SC800Config: card must be >= 0".into());
-            }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_common::testing::{
+        LineRig, driver_report, drvsup_init, ioc_init_errlog, run_command,
+    };
 
-            let handle = connect_serial(&asyn_port, SC800_TIMEOUT)?;
-            let controller =
-                KohzuController::new(handle).map_err(|e| format!("SC800Config: {e}"))?;
-            let ident = controller.ident().to_string();
-            let num_axes = controller.num_axes();
-            let controller = Arc::new(Mutex::new(controller));
-
-            for index in 0..num_axes {
-                let ax = KohzuAxis::new(controller.clone(), index);
-                let dtyp_key = format!("SC800_{card}_{index}");
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+    /// drvSC800.cc:537-538 connects at the Config's `address`.
+    #[epics_rs::base::epics_test]
+    async fn sc800_talks_at_the_config_address() {
+        let int = ArgValue::Int;
+        run_command(sc800_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::multi_device("sc800Gpib", 8, |cmd| {
+            match cmd.trim_start_matches('\u{2}').trim_end() {
+                "IDN" => "C\tIDN0\t200\t1".into(),
+                c => format!("C\t{c}"),
             }
-            println!(
-                "SC800Config: card={card} asynPort={asyn_port} axes={num_axes} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=SC800_{card}_{{0..{}}})",
-                num_axes - 1
+        });
+        let config = vec![int(0), ArgValue::String("sc800Gpib".into()), int(5)];
+        run_command(sc800_config_command(), config).await;
+        drvsup_init().await;
+        let addrs = line.addresses();
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|&a| a == 5), "{addrs:?}");
+    }
+
+    /// drvSC800.cc:541-545: a connect refused at motor_init is the one card
+    /// failure C prints, then it sleeps 5 s.
+    #[epics_rs::base::epics_test]
+    async fn sc800_prints_a_connect_error_at_ioc_init() {
+        let int = ArgValue::Int;
+        run_command(sc800_setup_command(), vec![int(1), int(10)]).await;
+        let config = vec![int(0), ArgValue::String("sc800Nowhere".into()), int(3)];
+        run_command(sc800_config_command(), config).await;
+        let start = std::time::Instant::now();
+        let lines = ioc_init_errlog("").await;
+        assert!(start.elapsed() >= Duration::from_secs(5));
+        assert_eq!(
+            lines,
+            [
+                "\ndrvSC800.cc:motor_init() *** asyn connection error on port = sc800Nowhere, \
+              address = 3 ***"
+            ]
+        );
+    }
+
+    /// drvSC800.cc:557-578: IDN goes out up to 3 times, until a reply names
+    /// an SC-800, 400 or 200.
+    #[epics_rs::base::epics_test]
+    async fn sc800_sends_idn_up_to_three_times() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let int = ArgValue::Int;
+        run_command(sc800_setup_command(), vec![int(2), int(10)]).await;
+        let idn = |name: &str, good_on: usize| {
+            let seen = AtomicUsize::new(0);
+            LineRig::new(name, move |cmd| {
+                match cmd.trim_start_matches('\u{2}').trim_end() {
+                    "IDN" if seen.fetch_add(1, Ordering::SeqCst) + 1 == good_on => {
+                        "C\tIDN0\t200\t1".into()
+                    }
+                    "IDN" => "C\tIDN0\t?".into(),
+                    c => format!("C\t{c}"),
+                }
+            })
+        };
+        let (third, _io3) = idn("sc800Third", 3);
+        let (never, _io0) = idn("sc800Never", 0);
+        for (card, port) in [(0, "sc800Third"), (1, "sc800Never")] {
+            let config = vec![int(card), ArgValue::String(port.into()), int(0)];
+            run_command(sc800_config_command(), config).await;
+        }
+        let db = r##"record(motor, "sc800:m0") {
+            field(DTYP, "SC-800")
+            field(OUT, "#C0 S0 @")
+        }
+        record(motor, "sc800:m1") {
+            field(DTYP, "SC-800")
+            field(OUT, "#C1 S0 @")
+        }"##;
+        assert_eq!(
+            ioc_init_errlog(db).await,
+            [
+                "recGblRecordError: motor_init_record_com(): card does not exist! \
+              Illegal field value PV: sc800:m1"
+            ]
+        );
+        let idns = |sent: Vec<String>| sent.iter().filter(|c| c.contains("IDN")).count();
+        assert_eq!(idns(third.sent()), 3);
+        assert_eq!(idns(never.sent()), 3);
+    }
+
+    /// drvSC800.cc's drvet `report` (drvSC800.cc:144-170), which `dbior` runs
+    /// at every level.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_sc800_card() {
+        let int = ArgValue::Int;
+        let setup = sc800_setup_command();
+        assert_eq!(
+            driver_report("drvSC800", 0),
+            "    No SC800 controllers configured.\n"
+        );
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::multi_device("sc800RepGpib", 8, |cmd| {
+            match cmd.trim_start_matches('\u{2}').trim_end() {
+                "IDN" => "C\tIDN0\t400\t7".into(),
+                c => format!("C\t{c}"),
+            }
+        });
+        let config = vec![int(1), ArgValue::String("sc800RepGpib".into()), int(4)];
+        run_command(sc800_config_command(), config).await;
+        drvsup_init().await;
+        for level in [0, 1, 2] {
+            assert_eq!(
+                driver_report("drvSC800", level),
+                "    SC800 controller 0 connection failed.\n    SC800 controller 1, \
+                 port=sc800RepGpib, address=4, id: SC-400 Ver7 \n"
             );
-            Ok(CommandOutcome::Continue)
-        },
-    )
+        }
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvSC800.cc:605-621: `motor_init` reads each axis's status once, past
+    /// IDN, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_each_status_once() {
+        let int = ArgValue::Int;
+        run_command(sc800_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("sc800InitLine", |cmd| {
+            match cmd.trim_start_matches('\u{2}').trim_end() {
+                "IDN" => "C\tIDN0\t200\t1".into(),
+                "RDP1/0" => "C\tRDP1\t14".into(),
+                "RDP2/0" => "C\tRDP2\t3".into(),
+                s if s.starts_with("STR1/") => {
+                    format!("C\tSTR{}\t1\t0\t0\t0\t0\t0\t0\t0", &s[5..])
+                }
+                c => format!("C\t{c}\t0"),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("sc800InitLine".into()), int(0)];
+        run_command(sc800_config_command(), config).await;
+        drvsup_init().await;
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_start_matches('\u{2}').trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "IDN", "STR1/1", "RDP1/0", "RSY1/21", "STR1/2", "RDP2/0", "RSY2/21"
+            ]
+        );
+        let db = record_init(
+            r##"
+record(motor, "sc800:m1") { field(DTYP, "SC-800") field(OUT, "#C0 S0 @") }
+record(motor, "sc800:m2") { field(DTYP, "SC-800") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("sc800:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("sc800:m2.RMP").unwrap(), EpicsValue::Long(3));
+    }
 }

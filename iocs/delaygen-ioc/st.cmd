@@ -37,8 +37,8 @@ asynOctetSetInputEos("serial1", 0, "\r\n")
 asynOctetSetOutputEos("serial1", 0, "\n")
 asynSetOption(serial1, 0, "crtscts", "Y")
 
-# DG645Config(myport,ioport,ioaddr)
-DG645Config("DG1", "serial1", -1)
+# drvAsynDG645(myport,ioport,ioaddr)
+drvAsynDG645("DG1", "serial1", -1)
 
 dbLoadRecords("$(DELAYGEN)/db/dg645.template", "P=delaygen:,R=DG1:,PORT=DG1")
 
@@ -49,8 +49,8 @@ dbLoadRecords("$(DELAYGEN)/db/dg645.template", "P=delaygen:,R=DG1:,PORT=DG1")
 # asynOctetSetInputEos("serial1", -1, ":")
 # asynOctetSetOutputEos("serial1", -1, "\r\n")
 #
-# ColbyConfig(myport,ioport,addr,units,iface)
-# ColbyConfig("COL", "serial1", -1, "ns", 1)
+# drvAsynColby(myport,ioport,addr,units,iface)
+# drvAsynColby("COL", "serial1", -1, "ns", 1)
 #
 # dbLoadRecords("$(DELAYGEN)/db/colbyPDL100A.template", "P=delaygen:,R=Colby:,PREC=3,A=Colby,PORT=COL")
 
@@ -60,8 +60,8 @@ dbLoadRecords("$(DELAYGEN)/db/dg645.template", "P=delaygen:,R=DG1:,PORT=DG1")
 # asynOctetSetInputEos("serial1", 0, "\r")
 # asynOctetSetOutputEos("serial1", 0, "\r")
 #
-# CoherentSdgConfig(myport,ioport,ioaddr)
-# CoherentSdgConfig("SDG", "serial1", -1)
+# drvAsynCoherentSDG(myport,ioport,ioaddr)
+# drvAsynCoherentSDG("SDG", "serial1", -1)
 #
 # dbLoadRecords("$(DELAYGEN)/db/coherentSDG.template", "P=delaygen:,R=sdg:,PORT=SDG")
 

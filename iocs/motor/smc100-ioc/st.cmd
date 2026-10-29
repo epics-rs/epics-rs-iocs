@@ -8,9 +8,8 @@
 #============================================================
 
 epicsEnvSet("P",      "SMC100:")
-epicsEnvSet("M",      "m1")
-epicsEnvSet("PORT",   "MOTOR1")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("PORT",   "SMC100_1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -24,23 +23,18 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# NOTE (hardware path): the SMC100 driver appends the CR/LF command
-# terminator itself, so no output EOS is required. Input-response framing
-# relies on the serial read returning a complete reply; asyn-rs exposes no
-# `asynOctetSetInputEos` iocsh command yet, so the input terminator cannot be
-# set here. Verify response framing against real hardware / a serial
-# simulator before production use.
+# CR/LF both ways (C st.cmd.SMC100); the driver sends bare commands.
+asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- SMC100 controller ----
-# SMC100CreateController(motorPort, serialPort, wireScale, [movingPollMs], [idlePollMs])
-# wireScale is controller-units-per-record-EGU: 1.0 when the record EGU is the
-# controller's native unit (mm), which is the normal configuration. This is
-# NOT the C driver's eguPerStep — the record boundary here is EGU, not steps.
-SMC100CreateController("$(PORT)", "$(SERIAL)", 1.0, 100, 1000)
+# SMC100CreateController(portName, SMC100PortName, numAxes, movingPollPeriod,
+#                        idlePollPeriod, eguPerStep)
+SMC100CreateController("$(PORT)", "$(SERIAL)", 1, 100, 0, "0.00005")
 
-# MRES only sets the record's raw-count resolution (display/deadband
-# granularity); positions travel the driver boundary in EGU directly.
-dbLoadRecords("$(SMC100_IOC)/db/smc100.template", "P=$(P),M=$(M),PORT=$(PORT),MRES=0.001,EGU=mm")
+# The axis's basic_asyn_motor.db, as C's st.cmd.SMC100 loads it. The
+# boundary is raw steps: its MRES must equal eguPerStep above.
+dbLoadTemplate("$(SMC100_IOC)/db/motor.substitutions.SMC100", "P=$(P),PORT=$(PORT)")
 
 iocInit()
 

@@ -5,6 +5,9 @@
 //! Everything here is a pure function of bytes in and bytes out, so it is
 //! tested without a detector.
 
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::runtime::stdlib::{c_isspace, strtod};
+
 use crate::types::{
     CoolingStatus, DEW_POINT_ERROR, DEW_POINT_WARNING, FrameType, HVMode, SyncOutFunction,
     SyncPolarity, TCOLD_ERROR, TCOLD_WARNING, THOT_ERROR, THOT_WARNING, TriggerMode,
@@ -17,7 +20,11 @@ pub fn system_reset() -> String {
 
 /// `DAQ:! INIT <cooling> <coolingOn> <HV> <HVOn>` (C `setCoolingAndHV`).
 pub fn init(cooling_value: f64, cooling_state: i32, hv_value: f64, hv_state: i32) -> String {
-    format!("DAQ:! INIT {cooling_value:.1} {cooling_state} {hv_value:.1} {hv_state}")
+    format!(
+        "DAQ:! INIT {cooling_value:.1} {cooling_state} {hv_value:.1} {hv_state}",
+        cooling_value = CFloat(cooling_value),
+        hv_value = CFloat(hv_value)
+    )
 }
 
 /// `DAQ:! SET_SYNC <in> <out> <function>` (C `setSync`).
@@ -108,50 +115,111 @@ pub fn get_additional_info() -> String {
     "SYS:? GET_ADDITIONAL_INFO".into()
 }
 
+/// The C string in a reply buffer: its bytes up to the first NUL, as
+/// `setStringParam`, `strstr` and `sscanf` see `fromServer_`.
+pub fn c_string(bytes: &[u8]) -> &[u8] {
+    bytes.split(|&b| b == 0).next().unwrap_or_default()
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Did the box accept the command? (C `writeReadServer`: every reply to a
 /// non-`SYS:?` command has to contain `GOT:`.)
-pub fn reply_is_ok(command: &str, reply: &str) -> bool {
-    command.contains("SYS:?") || reply.contains("GOT:")
+pub fn reply_is_ok(command: &str, reply: &[u8]) -> bool {
+    command.contains("SYS:?") || find(reply, b"GOT:").is_some()
 }
 
-/// `DETECTOR <serial> FRMW_VER: <version>` → (serial, version).
-pub fn parse_firmware_version(reply: &str) -> Option<(String, String)> {
-    let mut tokens = reply.split_whitespace();
-    if tokens.next()? != "DETECTOR" {
+/// `DETECTOR <serial> FRMW_VER: <version>` → (serial, version), each present
+/// as far as C's `sscanf(fromServer_, "DETECTOR %s FRMW_VER: %s")` got
+/// before the reply stopped matching.
+pub fn parse_firmware_version(reply: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    // C `isspace` in the "C" locale.
+    let is_space = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let skip_space = |s: &[u8]| -> usize { s.iter().take_while(|c| is_space(c)).count() };
+    // `%s ` : skip blanks, take the longest non-blank run (not empty), then the
+    // format blank after it.
+    let word = |rest: &mut &[u8]| {
+        let s = &rest[skip_space(rest)..];
+        let end = s.iter().position(is_space).unwrap_or(s.len());
+        *rest = &s[end..];
+        *rest = &rest[skip_space(rest)..];
+        (end > 0).then(|| s[..end].to_vec())
+    };
+    // A literal matches as written; a blank after it matches none or more.
+    let literal = |rest: &mut &[u8], text: &[u8]| match rest.strip_prefix(text) {
+        Some(s) => {
+            *rest = &s[skip_space(s)..];
+            true
+        }
+        None => false,
+    };
+    let mut rest = c_string(reply);
+    if !literal(&mut rest, b"DETECTOR") {
+        return (None, None);
+    }
+    let Some(serial) = word(&mut rest) else {
+        return (None, None);
+    };
+    let version = if literal(&mut rest, b"FRMW_VER:") {
+        word(&mut rest)
+    } else {
+        None
+    };
+    (Some(serial), version)
+}
+
+/// Everything after `ADDITIONAL INFO:`, byte for byte.
+///
+/// C bug, pixirad.cpp:569-570: `strstr` returns NULL for a reply without the
+/// marker and C publishes the string at address 0x10; here the parameter is
+/// left unset.
+pub fn parse_additional_info(reply: &[u8]) -> Option<&[u8]> {
+    const MARKER: &[u8] = b"ADDITIONAL INFO:";
+    let reply = c_string(reply);
+    find(reply, MARKER).map(|i| &reply[i + MARKER.len()..])
+}
+
+/// The value the status broadcast carries for `key`, e.g. `READ_TCOLD -21.5`:
+/// C's `sscanf(strstr(buffer, key), "<key> %f", &value)` on the C string in
+/// the datagram, into a `float`.
+pub fn status_value(message: &[u8], key: &str) -> Option<f64> {
+    let message = c_string(message);
+    let rest = &message[find(message, key.as_bytes())? + key.len()..];
+    let s = &rest[rest.iter().take_while(|&&b| c_isspace(b as char)).count()..];
+    let parsed = strtod(s);
+    if parsed.len == 0 || scanf_cannot_back_out(s) {
         return None;
     }
-    let serial = tokens.next()?.to_string();
-    if tokens.next()? != "FRMW_VER:" {
-        return None;
-    }
-    Some((serial, tokens.next()?.to_string()))
+    // `strtof` rounds once; a decimal through `f64` could round twice.
+    let value = std::str::from_utf8(&s[..parsed.len])
+        .ok()
+        .and_then(|t| t.parse::<f32>().ok())
+        .unwrap_or(parsed.value as f32);
+    Some(f64::from(value))
 }
 
-/// Everything after `ADDITIONAL INFO:`.
-///
-/// C added `strlen("ADDITIONAL INFO:")` to the result of `strstr` without
-/// checking it, so a reply that did not carry the marker made it publish the
-/// string at address 0x10.
-pub fn parse_additional_info(reply: &str) -> Option<&str> {
-    const MARKER: &str = "ADDITIONAL INFO:";
-    reply.find(MARKER).map(|i| &reply[i + MARKER.len()..])
+/// Where glibc's `%f` refuses what `strtof` reads: having taken an `i` after
+/// `inf` or the `x` of `0x`, it cannot push them back, so the input must go on
+/// to `infinity`, or to a hex digit or point.
+fn scanf_cannot_back_out(s: &[u8]) -> bool {
+    let s = &s[usize::from(matches!(s.first(), Some(b'+' | b'-')))..];
+    let starts = |w: &[u8]| s.len() >= w.len() && s[..w.len()].eq_ignore_ascii_case(w);
+    (starts(b"infi") && !starts(b"infinity"))
+        || (starts(b"0x")
+            && !s
+                .get(2)
+                .is_some_and(|&b| b.is_ascii_hexdigit() || b == b'.'))
 }
 
-/// The value the status broadcast carries for `key`, e.g. `READ_TCOLD -21.5`
-/// (C's `sscanf(pString, "%s %f")`).
-pub fn status_value(message: &str, key: &str) -> Option<f64> {
-    let start = message.find(key)?;
-    let rest = &message[start + key.len()..];
-    rest.split_whitespace().next()?.parse().ok()
-}
-
-/// The dew point of the box (Magnus formula, C `statusTask`).
-///
-/// C divided by the literal `0.4343`, which is `log10(e)` to four places; the
-/// constant itself is used here.
+/// The dew point of the box (Magnus formula, C `statusTask`), with C's
+/// literal `0.4343` for `log10(e)` (pixirad.cpp:1350).
 pub fn dew_point(humidity: f64, box_temp: f64) -> f64 {
-    let h = (humidity.log10() - 2.0) / std::f64::consts::LOG10_E
-        + (17.62 * box_temp) / (243.12 + box_temp);
+    // The same double as the literal, spelt so clippy does not take it for a
+    // mistyped LOG10_E.
+    const C_LOG10_E: f64 = 4343.0 / 10000.0;
+    let h = (humidity.log10() - 2.0) / C_LOG10_E + (17.62 * box_temp) / (243.12 + box_temp);
     243.12 * h / (17.62 - h)
 }
 
@@ -184,9 +252,16 @@ pub fn cooling_status(cold_temp: f64, hot_temp: f64, dew_point: f64) -> CoolingS
 mod tests {
     use super::*;
 
+    fn fw(reply: &str) -> (Option<String>, Option<String>) {
+        let text = |v: Vec<u8>| String::from_utf8(v).unwrap();
+        let (serial, version) = parse_firmware_version(reply.as_bytes());
+        (serial.map(text), version.map(text))
+    }
+
     #[test]
     fn init_command_matches_c() {
         assert_eq!(init(15.0, 1, 350.0, 1), "DAQ:! INIT 15.0 1 350.0 1");
+        assert_eq!(init(f64::NAN, 1, -f64::NAN, 0), "DAQ:! INIT nan 1 -nan 0");
     }
 
     #[test]
@@ -227,39 +302,103 @@ mod tests {
 
     #[test]
     fn reply_is_ok_only_when_the_box_said_got() {
-        assert!(reply_is_ok("DAQ:! SYSTEM_RESET", "GOT: SYSTEM_RESET"));
-        assert!(!reply_is_ok("DAQ:! SYSTEM_RESET", "ERR"));
+        assert!(reply_is_ok("DAQ:! SYSTEM_RESET", b"GOT: SYSTEM_RESET"));
+        assert!(!reply_is_ok("DAQ:! SYSTEM_RESET", b"ERR"));
         // SYS:? queries answer with data, not with an acknowledgement.
         assert!(reply_is_ok(
             "SYS:? GET_FIRMWARE_VERSION",
-            "DETECTOR 007 FRMW_VER: 2.1"
+            b"DETECTOR 007 FRMW_VER: 2.1"
         ));
     }
 
     #[test]
     fn firmware_version_is_split_into_serial_and_version() {
         assert_eq!(
-            parse_firmware_version("DETECTOR PX8-007 FRMW_VER: 3.14\r\n"),
-            Some(("PX8-007".to_string(), "3.14".to_string()))
+            fw("DETECTOR PX8-007 FRMW_VER: 3.14\r\n"),
+            (Some("PX8-007".to_string()), Some("3.14".to_string()))
         );
-        assert_eq!(parse_firmware_version("nonsense"), None);
+        assert_eq!(fw("DETECTOR PX8-007"), (Some("PX8-007".to_string()), None));
+        assert_eq!(fw("nonsense"), (None, None));
+    }
+
+    /// The edges of C's `sscanf(fromServer_, "DETECTOR %s FRMW_VER: %s")`:
+    /// a literal does not skip leading space, a format blank matches none or
+    /// more, and only `isspace` separates.
+    #[test]
+    fn firmware_version_follows_sscanf() {
+        let both = |s: &str, v: &str| (Some(s.to_string()), Some(v.to_string()));
+        assert_eq!(fw(" DETECTOR PX8 FRMW_VER: 3"), (None, None));
+        assert_eq!(fw("DETECTORPX8 FRMW_VER: 3"), both("PX8", "3"));
+        assert_eq!(fw("DETECTOR PX8 FRMW_VER:3"), both("PX8", "3"));
+        assert_eq!(
+            fw("DETECTOR PX8FRMW_VER: 3"),
+            (Some("PX8FRMW_VER:".into()), None)
+        );
+        assert_eq!(fw("DETECTOR\x0bPX8\x0bFRMW_VER:\x0b3"), both("PX8", "3"));
+        assert_eq!(
+            fw("DETECTOR PX8\u{a0}1 FRMW_VER: 3"),
+            both("PX8\u{a0}1", "3")
+        );
+        assert_eq!(fw("DETECTOR PX8 FRMW_VERS 3"), (Some("PX8".into()), None));
+        assert_eq!(fw("DETECTOR "), (None, None));
     }
 
     #[test]
     fn additional_info_is_the_tail_and_none_when_absent() {
         assert_eq!(
-            parse_additional_info("HEAD ADDITIONAL INFO: box 3"),
-            Some(" box 3")
+            parse_additional_info(b"HEAD ADDITIONAL INFO: box 3 \r\0junk"),
+            Some(&b" box 3 \r"[..])
         );
-        assert_eq!(parse_additional_info("HEAD"), None);
+        assert_eq!(parse_additional_info(b"HEAD"), None);
+        assert_eq!(parse_additional_info(b"HEAD\0ADDITIONAL INFO: x"), None);
     }
 
     #[test]
     fn status_broadcast_values_are_found_by_key() {
-        let msg = "READ_TCOLD -21.5 READ_THOT 33.0 READ_BOX_HUM 12.5";
+        let msg = b"READ_TCOLD -21.5 READ_THOT 33.0 READ_BOX_HUM 12.5";
         assert_eq!(status_value(msg, "READ_TCOLD"), Some(-21.5));
         assert_eq!(status_value(msg, "READ_THOT"), Some(33.0));
         assert_eq!(status_value(msg, "READ_HV"), None);
+    }
+
+    /// `%f` stops at the first byte that cannot continue the number, the
+    /// datagram's C string ends at its NUL, and the value is a `float`.
+    #[test]
+    fn status_values_scan_as_c_sscanf_float() {
+        let msg =
+            b"READ_HV_CURRENT 0.50\0READ_TCOLD 1 READ_THOT 2.5e1x READ_HV 3e READ_BOX_HUM 24.7";
+        assert_eq!(status_value(msg, "READ_HV_CURRENT"), Some(0.5));
+        assert_eq!(status_value(msg, "READ_TCOLD"), None);
+        let msg = b"READ_THOT 2.5e1x READ_HV 3e READ_BOX_HUM 24.7 READ_TCOLD -.5, READ_BOX_TEMP .";
+        assert_eq!(status_value(msg, "READ_THOT"), Some(25.0));
+        assert_eq!(status_value(msg, "READ_HV"), Some(3.0));
+        assert_eq!(status_value(msg, "READ_BOX_HUM"), Some(f64::from(24.7f32)));
+        assert_eq!(status_value(msg, "READ_TCOLD"), Some(-0.5));
+        assert_eq!(status_value(msg, "READ_BOX_TEMP"), None);
+    }
+
+    /// glibc's `%f`, probed: `strtof` after any C space, hex included, but it
+    /// cannot back out of `inf` going on with an `i` short of `infinity`, nor
+    /// of a `0x` with no hex digit or point after it.
+    #[test]
+    fn status_values_scan_as_glibc_percent_f() {
+        let value = |text: &str| status_value(format!("K{text}").as_bytes(), "K");
+        assert_eq!(value(" 0x10"), Some(16.0));
+        assert_eq!(value(" 0x.8"), Some(0.5));
+        assert_eq!(value(" 0x1p4"), Some(16.0));
+        assert_eq!(value(" \u{b}1.5"), Some(1.5));
+        assert_eq!(value(" \u{c}3"), Some(3.0));
+        assert_eq!(value(" INFINITY"), Some(f64::INFINITY));
+        assert_eq!(value(" -inF"), Some(f64::NEG_INFINITY));
+        assert!(value(" nan(12)").unwrap().is_nan());
+        assert_eq!(value(" infinit"), None);
+        assert_eq!(value(" -infi"), None);
+        assert_eq!(value(" 0x"), None);
+        assert_eq!(value(" 0xg"), None);
+        assert_eq!(value(" 0x.g"), Some(0.0));
+        assert_eq!(value(" 00x1"), Some(0.0));
+        assert_eq!(value(" 1e+"), Some(1.0));
+        assert_eq!(value(" in"), None);
     }
 
     #[test]
@@ -267,6 +406,13 @@ mod tests {
         // 50 % relative humidity at 20 C is a dew point of 9.3 C.
         let dp = dew_point(50.0, 20.0);
         assert!((dp - 9.26).abs() < 0.05, "dew point {dp}");
+    }
+
+    /// C's value for these inputs, from its expression compiled with cc.
+    #[test]
+    fn dew_point_is_c_value() {
+        let dp = dew_point(f64::from(21.3f32), f64::from(24.7f32));
+        assert!((dp - 1.089_111_869_989_379).abs() < 1e-12, "dew point {dp}");
     }
 
     #[test]

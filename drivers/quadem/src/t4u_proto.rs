@@ -5,7 +5,10 @@
 //! `bc`, `tr`, and the device's `rr`/`tr` replies — and publish the same data
 //! samples; they differ in the transport (see [`crate::t4u`]).
 
+use std::collections::HashMap;
 use std::time::Duration;
+
+use epics_libcom_rs::cfmt::CFloat;
 
 use crate::drv_quad_em::QE_MAX_INPUTS;
 
@@ -578,98 +581,164 @@ pub struct Calibration {
     pub pulsed: CalTable,
 }
 
-/// C++ `drvT4UDirect_EM::parseConfigFile` with `inicpp`.
+/// C++ `drvT4UDirect_EM::parseConfigFile`, with the lines it prints.
 ///
 /// The file names a `selected` calibration set (and optionally a separate
 /// `pulsed` one) in its `[config]` section; each set has one section per range
 /// (`<name>_range<N>`) holding `ChannelA`..`ChannelD` = `"<slope>, <offset>"`.
-/// Every range and channel of both sets must be present — C++ aborts the IOC
-/// otherwise, and so does the caller here.
-pub fn parse_calibration(text: &str) -> Result<Calibration, String> {
-    let ini = parse_ini(text);
-    let get = |section: &str, key: &str| -> Option<&String> {
-        ini.iter()
-            .find(|(s, _, _)| s == section)
-            .map(|_| ())
-            .and(ini.iter().find(|(s, k, _)| s == section && k == key))
-            .map(|(_, _, v)| v)
+/// `None` is C++'s -1, after which the constructor aborts the IOC.
+pub fn parse_calibration(ini: &Ini) -> Option<Calibration> {
+    let Some(cw_name) = ini.get("config", "selected") else {
+        println!(
+            "No selected calibration discovered.  Missing key selected=<name> in section [config]."
+        );
+        return None;
+    };
+    println!("Using CW calibration set \"{cw_name}\".");
+    let pulsed_name = match ini.get("config", "pulsed") {
+        Some(name) => {
+            println!("Using pulsed mode calibration set \"{name}\".");
+            name
+        }
+        None => {
+            println!(
+                "No separate pulsed mode calibration selected: key pulsed=<name> in section [config].  Using selected CW value \"{cw_name}\".  This is expected if your T4U does not support pulsed mode."
+            );
+            cw_name
+        }
     };
 
-    let cw_name = get("config", "selected")
-        .ok_or_else(|| {
-            "No selected calibration discovered. Missing key selected=<name> in section [config]."
-                .to_string()
-        })?
-        .clone();
-    // A T4U without pulsed mode has no separate pulsed set; C++ falls back to
-    // the CW one.
-    let pulsed_name = get("config", "pulsed").cloned().unwrap_or_else(|| {
-        log::info!(
-            "drvT4UDirect_EM: no pulsed-mode calibration selected; using the CW set \"{cw_name}\""
-        );
-        cw_name.clone()
-    });
-
-    let load = |name: &str| -> Result<CalTable, String> {
+    let load = |name: &str| -> Option<CalTable> {
         let mut table = CalTable::default();
         for range in 0..NUM_RANGES {
             let section = format!("{name}_range{range}");
             for channel in 0..QE_MAX_INPUTS {
-                let key = format!("Channel{}", (b'A' + channel as u8) as char);
-                let value = get(&section, &key).ok_or_else(|| {
-                    format!(
-                        "Calibration {name} entry for range {range} channel {} not found.",
-                        (b'A' + channel as u8) as char
-                    )
-                })?;
-                let (slope, offset) = parse_cal_pair(value)
-                    .ok_or_else(|| format!("Invalid value string: {value}"))?;
+                let letter = (b'A' + channel as u8) as char;
+                let Some(value) = ini.get(&section, &format!("Channel{letter}")) else {
+                    println!(
+                        "Calibration {name} entry for Range {range} Channel {letter} not found."
+                    );
+                    return None;
+                };
+                let Some((slope, offset)) = parse_cal_pair(value) else {
+                    println!("Invalid value string: {value}\nAborting calibration load.");
+                    return None;
+                };
                 table.slope[range][channel] = slope;
                 table.offset[range][channel] = offset;
+                println!("{}", calibration_line(range, channel, slope, offset));
             }
         }
-        Ok(table)
+        Some(table)
     };
 
-    Ok(Calibration {
-        cw: load(&cw_name)?,
-        pulsed: load(&pulsed_name)?,
+    Some(Calibration {
+        cw: load(cw_name)?,
+        pulsed: load(pulsed_name)?,
     })
 }
 
-/// C++ `sscanf(curr_val.c_str(), " \" %f , %f \" ")`: the quotes are optional.
-fn parse_cal_pair(value: &str) -> Option<(f32, f32)> {
-    let body = value.trim().trim_matches('"');
-    let (slope, offset) = body.split_once(',')?;
-    Some((
-        slope.trim().parse::<f32>().ok()?,
-        offset.trim().parse::<f32>().ok()?,
-    ))
+/// C drvT4UDirect_EM.cpp:402's line for one loaded pair.
+fn calibration_line(range: usize, channel: usize, slope: f32, offset: f32) -> String {
+    format!(
+        "Calibration Range {range} Channel {channel} Slope {} Offset {}",
+        CFloat(f64::from(slope)),
+        CFloat(f64::from(offset))
+    )
 }
 
-/// A minimal INI reader: `[section]` headers, `key = value` pairs, `#`/`;`
-/// comments. Enough for the calibration file `inicpp` reads upstream.
-fn parse_ini(text: &str) -> Vec<(String, String, String)> {
-    let mut out = Vec::new();
-    let mut section = String::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            section = name.trim().to_string();
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            out.push((
-                section.clone(),
-                key.trim().to_string(),
-                value.trim().to_string(),
-            ));
-        }
+/// C++ `sscanf(curr_val.c_str(), " \" %f , %f \" ")`: the opening quote must
+/// be there, and whatever follows the second number is not looked at.
+fn parse_cal_pair(value: &str) -> Option<(f32, f32)> {
+    let rest = value.trim_start().strip_prefix('"')?;
+    let (slope, rest) = scan_float(rest)?;
+    let rest = rest.trim_start().strip_prefix(',')?;
+    let (offset, _) = scan_float(rest)?;
+    Some((slope, offset))
+}
+
+/// `%f`: leading whitespace, then the longest prefix `strtof` takes.
+fn scan_float(s: &str) -> Option<(f32, &str)> {
+    let s = s.trim_start();
+    (1..=s.len())
+        .rev()
+        .filter(|&end| s.is_char_boundary(end))
+        .find_map(|end| Some((s[..end].parse::<f32>().ok()?, &s[end..])))
+}
+
+/// The calibration file as `inicpp` holds it: section → key → value, a later
+/// duplicate key replacing the earlier one.
+#[derive(Debug, Default)]
+pub struct Ini(HashMap<String, HashMap<String, String>>);
+
+impl Ini {
+    /// `findIniKey` and the lookup after it.
+    fn get(&self, section: &str, key: &str) -> Option<&str> {
+        self.0.get(section)?.get(key).map(String::as_str)
     }
-    out
+}
+
+/// `inicpp`'s `whitespaces()`, the set its `trim` strips from both ends.
+const INI_WHITESPACE: [char; 6] = [' ', '\t', '\n', '\r', '\x0c', '\x0b'];
+
+/// `inicpp`'s `IniFile::decode`: lines split on `\n` alone, `#` and `;`
+/// comments erased wherever they start unless escaped with `\\`, then trimmed
+/// of `INI_WHITESPACE`. `Err` is the `std::logic_error` text it throws.
+pub fn parse_ini(text: &str) -> Result<Ini, String> {
+    let mut ini = Ini::default();
+    let mut section: Option<String> = None;
+    for (n, raw) in text.split('\n').enumerate() {
+        let line_no = n + 1;
+        let mut line = raw.to_string();
+        for prefix in ["#", ";"] {
+            erase_comment(&mut line, prefix, 0);
+        }
+        let line = line.trim_matches(INI_WHITESPACE);
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            let Some(pos) = line.find(']') else {
+                return Err(format!(
+                    "l.{line_no}: ini parsing failed, section not closed"
+                ));
+            };
+            if pos == 1 {
+                return Err(format!("l.{line_no}: ini parsing failed, section is empty"));
+            }
+            let name = line[1..pos].to_string();
+            ini.0.entry(name.clone()).or_default();
+            section = Some(name);
+            continue;
+        }
+        let Some(name) = &section else {
+            return Err(format!(
+                "l.{line_no}: ini parsing failed, field has no section or ini file in use by \
+                 another application"
+            ));
+        };
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("l.{line_no}: ini parsing failed, no '=' found"));
+        };
+        ini.0.entry(name.clone()).or_default().insert(
+            key.trim_matches(INI_WHITESPACE).to_string(),
+            value.trim_matches(INI_WHITESPACE).to_string(),
+        );
+    }
+    Ok(ini)
+}
+
+/// `IniFileBase::eraseComment`.
+fn erase_comment(line: &mut String, prefix: &str, start: usize) {
+    let Some(pos) = line[start..].find(prefix).map(|p| p + start) else {
+        return;
+    };
+    if pos != 0 && line.as_bytes()[pos - 1] == b'\\' {
+        line.remove(pos - 1);
+        erase_comment(line, prefix, pos - 1 + prefix.len());
+    } else {
+        line.truncate(pos);
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1009,10 @@ mod tests {
         );
     }
 
+    fn cal_of(text: &str) -> Option<Calibration> {
+        parse_calibration(&parse_ini(text).unwrap())
+    }
+
     const CAL_FILE: &str = "\
 [config]
 selected = default
@@ -980,7 +1053,7 @@ ChannelD = \"9.3, 0.9\"
 
     #[test]
     fn calibration_file_loads_both_modes() {
-        let cal = parse_calibration(CAL_FILE).unwrap();
+        let cal = cal_of(CAL_FILE).unwrap();
         assert_eq!(cal.cw.slope[0][0], 1.0);
         assert_eq!(cal.cw.offset[0][3], 0.4);
         assert_eq!(cal.cw.slope[2][3], 3.3);
@@ -990,17 +1063,16 @@ ChannelD = \"9.3, 0.9\"
     #[test]
     fn calibration_file_without_a_pulsed_set_falls_back_to_cw() {
         let text = CAL_FILE.replace("pulsed = pulse1\n", "");
-        let cal = parse_calibration(&text).unwrap();
+        let cal = cal_of(&text).unwrap();
         assert_eq!(cal.pulsed, cal.cw);
     }
 
     #[test]
     fn calibration_file_missing_a_channel_is_an_error() {
         let text = CAL_FILE.replace("ChannelC = \"1.2, 0.3\"\n", "");
-        let err = parse_calibration(&text).unwrap_err();
-        assert!(err.contains("channel C"), "{err}");
+        assert!(cal_of(&text).is_none());
         let text = CAL_FILE.replace("selected = default\n", "");
-        assert!(parse_calibration(&text).is_err());
+        assert!(cal_of(&text).is_none());
     }
 
     /// `iocBoot/iocT4UDirect_EM/DBPM_Settings.ini`, verbatim.
@@ -1032,7 +1104,7 @@ ChannelD=\"0.9527919082805758, 1.4346421308430505e-05\"
         // The table is f32, as C++'s is; the file's digits are compared through
         // the same narrowing rather than as f32 literals.
         let f32_of = |s: &str| s.parse::<f32>().unwrap();
-        let cal = parse_calibration(UPSTREAM_CAL_FILE).unwrap();
+        let cal = cal_of(UPSTREAM_CAL_FILE).unwrap();
         assert_eq!(cal.cw.slope[0][0], f32_of("0.8823024931401017"));
         assert_eq!(cal.cw.offset[0][0], f32_of("1.0223252432686801e-10"));
         assert_eq!(cal.cw.slope[2][3], f32_of("0.9527919082805758"));
@@ -1041,11 +1113,53 @@ ChannelD=\"0.9527919082805758, 1.4346421308430505e-05\"
         assert_eq!(cal.pulsed, cal.cw);
     }
 
+    /// sscanf's format starts with a literal quote; nothing after the offset
+    /// is matched.
     #[test]
-    fn calibration_values_may_be_unquoted() {
+    fn a_calibration_value_needs_its_opening_quote_only() {
         let text = CAL_FILE.replace("ChannelA = \"1.0, 0.1\"", "ChannelA = 1.0,0.1");
-        let cal = parse_calibration(&text).unwrap();
-        assert_eq!(cal.cw.slope[0][0], 1.0);
-        assert_eq!(cal.cw.offset[0][0], 0.1);
+        assert!(cal_of(&text).is_none());
+        let text = CAL_FILE.replace("ChannelA = \"1.0, 0.1\"", "ChannelA = \" 1.5 ,2.5e-3x");
+        let cal = cal_of(&text).unwrap();
+        assert_eq!(cal.cw.slope[0][0], 1.5);
+        assert_eq!(cal.cw.offset[0][0], 2.5e-3);
+    }
+
+    /// inicpp erases comments anywhere on a line, keeps `\r`, lets a later
+    /// duplicate key win and throws on a line it cannot read.
+    #[test]
+    fn the_ini_reader_follows_inicpp() {
+        let ini = parse_ini("[s]\nk = a ; note\nk = b # later wins\ne = x\\#y\n").unwrap();
+        assert_eq!(ini.get("s", "k"), Some("b"));
+        assert_eq!(ini.get("s", "e"), Some("x#y"));
+        let ini = parse_ini("[config]\r\nselected=direct\r\n\x0bv = 1\x0c\r\n").unwrap();
+        assert_eq!(ini.get("config", "selected"), Some("direct"));
+        assert_eq!(ini.get("config", "v"), Some("1"));
+        assert_eq!(
+            parse_ini("k=v\n").unwrap_err(),
+            "l.1: ini parsing failed, field has no section or ini file in use by another \
+             application"
+        );
+        assert_eq!(
+            parse_ini("[s]\nnovalue\n").unwrap_err(),
+            "l.2: ini parsing failed, no '=' found"
+        );
+        assert_eq!(
+            parse_ini("[s\n").unwrap_err(),
+            "l.1: ini parsing failed, section not closed"
+        );
+        assert!(parse_ini("").unwrap().get("config", "selected").is_none());
+    }
+
+    #[test]
+    fn calibration_slopes_print_as_printf_f() {
+        assert_eq!(
+            calibration_line(2, 3, 0.8823025, 1.0223252e-10),
+            "Calibration Range 2 Channel 3 Slope 0.882303 Offset 0.000000"
+        );
+        assert_eq!(
+            calibration_line(0, 0, f32::NAN, -f32::NAN),
+            "Calibration Range 0 Channel 0 Slope nan Offset -nan"
+        );
     }
 }

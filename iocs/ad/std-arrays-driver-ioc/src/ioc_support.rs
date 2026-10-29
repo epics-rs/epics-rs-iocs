@@ -15,7 +15,7 @@ use ad_std_arrays_driver::{NdStdArraysRuntime, create_nd_std_arrays};
 /// Rust publisher task runs on a `run_thread_named` worker with no equivalent
 /// knobs, so both are accepted and ignored.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("NDDRIVERSTDARRAYS", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("NDDRIVERSTDARRAYS", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<NdStdArraysRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -48,9 +48,9 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 },
             ],
             "NDDriverStdArraysConfig portName [maxBuffers] [maxMemory] [priority] [stackSize]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 // C: `(maxBuffers < 0) ? 0 : maxBuffers`. The Rust pool is
@@ -66,15 +66,19 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "NDDriverStdArraysConfig: port={port_name}, maxBuffers={max_buffers}, \
-                     maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let nd_rt = create_nd_std_arrays(&port_name, max_buffers, max_memory)
+                let nd_rt = create_nd_std_arrays(&claim, max_buffers, max_memory)
                     .map_err(|e| format!("failed to create NDDriverStdArrays: {e}"))?;
 
-                epics_rs::asyn::asyn_record::register_port(&port_name, nd_rt.port_handle().clone())
+                claim
+                    .publish(
+                        nd_rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
                     .map_err(|e| e.to_string())?;
 
                 // The single address-0 NDArray output doubles as the driver

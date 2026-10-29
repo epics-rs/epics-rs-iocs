@@ -12,7 +12,7 @@ use ad_simdetector::{SimDetectorRuntime, create_sim_detector};
 /// Signature matches the C iocsh command (simDetector.cpp:1160-1196):
 ///   `simDetectorConfig(portName, maxSizeX, maxSizeY, dataType, maxBuffers, maxMemory)`
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<SimDetectorRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -49,9 +49,9 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 },
             ],
             "simDetectorConfig portName [maxSizeX] [maxSizeY] [dataType] [maxBuffers] [maxMemory]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let size_x = match args.get(1) {
@@ -83,26 +83,21 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "simDetectorConfig: port={port_name}, size={size_x}x{size_y}, \
-                     dataType={data_type_code}, maxBuffers={max_buffers}, maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let sim_rt = create_sim_detector(
-                    &port_name,
-                    size_x,
-                    size_y,
-                    data_type,
-                    max_buffers,
-                    max_memory,
-                )
-                .map_err(|e| format!("failed to create simDetector: {e}"))?;
+                let sim_rt =
+                    create_sim_detector(&claim, size_x, size_y, data_type, max_buffers, max_memory)
+                        .map_err(|e| format!("failed to create simDetector: {e}"))?;
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    sim_rt.port_handle().clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        sim_rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     sim_rt.pool().clone(),

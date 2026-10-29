@@ -10,6 +10,8 @@ pub const SERVER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Timeout on `GetImage`, which waits for the exposure (C
 /// `PSL_GET_IMAGE_TIMEOUT`).
 pub const GET_IMAGE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Timeout on each later block of an image (the literal 1 in C `getImage`).
+pub const IMAGE_BLOCK_TIMEOUT: Duration = Duration::from_secs(1);
 /// Oldest PSLViewer this driver speaks to (C `getVersion`).
 pub const MIN_SERVER_VERSION: f64 = 4.3;
 /// The prefix of the `GetVersion` reply (C `expectedResponse`).

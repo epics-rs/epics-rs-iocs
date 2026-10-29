@@ -3,7 +3,7 @@
 //! Ported from `motorMclennan/mclennanApp/src/drvPM304.cc` + `devPM304.cc` (the
 //! model-1 dev/drv pair). One serial line drives a multi-axis controller; each
 //! command is prefixed with the 1-based axis number and terminated by CR (the
-//! driver owns output framing; the startup script sets only the input EOS). The
+//! startup script sets both EOS, as C needs; the driver sends bare commands). The
 //! controller answers **every** command, so each command is written and its
 //! reply consumed to keep the stream synchronized.
 //!
@@ -34,26 +34,25 @@
 //! ## Deviations from C (documented)
 //!
 //! - The C poller is a background thread; here the `OS`/`OA`/`OC` reads run
-//!   inside [`poll`](AsynMotor::poll).
+//!   inside [`poll`](Model1Motor::poll).
 //! - `use_encoder` follows C: always true on the PM304; on the PM600 it is
 //!   false only when the per-axis `ID` reply reports `Open loop stepper mode`.
 //! - The C `set_status` velocity readback is marked `NEEDS WORK` and always
 //!   reports 0; this port reports 0 likewise.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 200;
-
-/// Command terminator; the driver owns output framing (PM304/PM600 accept CR).
-const TERMINATOR: &[u8] = b"\r";
 
 /// Controller family, selected from the `1ID` reply.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,21 +70,18 @@ fn pm304_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Shared controller endpoint: owns the serial handle, the model, and per-axis
-/// encoder flags.
+/// Shared controller endpoint: owns the serial handle and the model.
 pub struct Pm304Controller {
     handle: SyncIOHandle,
     ident: String,
     model: Model,
     n_axes: usize,
-    use_encoder: Vec<bool>,
 }
 
 impl Pm304Controller {
-    /// Connect and identify a Mclennan controller (C `motor_init`): stop axis 1,
-    /// read `1ID` to select the model, then read each axis `ID` to decide
-    /// whether it reports position from the encoder (`OA`) or the command
-    /// counter (`OC`). Performs blocking serial I/O.
+    /// Connect and identify a Mclennan controller (C `motor_init`): find it
+    /// by a `1OA` reply, stop axis 1 and read `1ID` to select the model.
+    /// Performs blocking serial I/O.
     pub fn new(handle: SyncIOHandle, n_axes: usize) -> AsynResult<Self> {
         let n_axes = n_axes.max(1);
         let mut ctrl = Self {
@@ -93,37 +89,31 @@ impl Pm304Controller {
             ident: String::new(),
             model: Model::Pm304,
             n_axes,
-            use_encoder: Vec::with_capacity(n_axes),
         };
 
+        // drvPM304.cc:643-647: the card is there once `1OA` gets a reply,
+        // tried three times. send_recv_mess ignores every status, so a
+        // reply cut by a timeout counts.
+        if !(0..3).any(|_| !ctrl.exchange("1OA").0.is_empty()) {
+            return Err(pm304_err("PM304: no response to 1OA position query"));
+        }
+
         // Stop axis 1 for safety (C sends "1ST;" before identifying).
-        let _ = ctrl.write_read_raw("1ST")?;
+        let _ = ctrl.exchange("1ST");
 
         // Model detection is robust to the PM600 echo: the reply is
         // "1ID\r<ident>" on the PM600 and "<ident>" on the PM304, and both
         // contain "PM304" only for the PM304.
-        let ident = ctrl.write_read_raw("1ID")?;
+        let ident = ctrl.exchange("1ID").0;
         ctrl.model = if ident.contains("PM304") {
             Model::Pm304
         } else {
             Model::Pm600
         };
-        ctrl.ident = ctrl.strip_echo(&ident).trim().to_string();
-        if ctrl.ident.is_empty() {
-            return Err(pm304_err("PM304: no response to 1ID identification query"));
-        }
-
-        for axis in 1..=n_axes {
-            let id = ctrl.write_read_raw(&format!("{axis}ID"))?;
-            // C: PM304 always uses the encoder; PM600 uses the command counter
-            // only when the axis reports "Open loop stepper mode".
-            let use_encoder = match ctrl.model {
-                Model::Pm304 => true,
-                Model::Pm600 => !id.contains("Open loop stepper mode"),
-            };
-            ctrl.use_encoder.push(use_encoder);
-        }
-
+        // C reads 1ID still assuming a PM304 (drvPM304.cc:583) and so keeps a
+        // PM600's echo in the ident it reports (:663); a C defect not copied.
+        // Its blanks stay, as strncpy keeps them.
+        ctrl.ident = ctrl.strip_echo(&ident).to_string();
         Ok(ctrl)
     }
 
@@ -142,18 +132,6 @@ impl Pm304Controller {
         self.n_axes
     }
 
-    /// Whether axis `index` (0-based) reports position from its encoder.
-    fn use_encoder(&self, index: usize) -> bool {
-        self.use_encoder.get(index).copied().unwrap_or(true)
-    }
-
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// On the PM600, drop the echoed command (everything up to and including the
     /// first CR); on the PM304 the reply has no echo and is returned unchanged.
     fn strip_echo<'a>(&self, reply: &'a str) -> &'a str {
@@ -167,22 +145,38 @@ impl Pm304Controller {
         }
     }
 
-    /// Write a command and return its raw reply (input EOS already stripped by
-    /// the port), without removing the PM600 echo — used during identification
-    /// before the model is known.
-    fn write_read_raw(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+    /// C `send_recv_mess`: write a command and return its raw reply (input
+    /// EOS already stripped by the port) beside the status, without removing
+    /// the PM600 echo — used during identification before the model is
+    /// known. The EOS layer NUL-terminates the buffer on every read, so a
+    /// failed read leaves the bytes it delivered, which every C caller parses.
+    fn exchange(&self, cmd: &str) -> (String, AsynResult<()>) {
+        // pasynOctetSyncIO->writeRead flushes first so a stray line cannot
+        // shift every later reply.
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
         let text = String::from_utf8_lossy(&raw);
-        Ok(text.trim_end_matches(['\r', '\n', '\0']).to_string())
+        let text = text.trim_end_matches(['\r', '\n', '\0']).to_string();
+        (text, status)
     }
 
-    /// Write a command and return its reply with the PM600 echo removed. Every
-    /// command produces a reply, so this is used for both queries and set
-    /// commands (whose reply is discarded) to keep the stream synchronized.
-    fn command(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.write_read_raw(cmd)?;
-        Ok(self.strip_echo(&raw).trim().to_string())
+    /// Write a query and return its reply with the PM600 echo removed,
+    /// whatever the read's status: C `set_status` ignores
+    /// `send_recv_mess`'s (drvPM304.cc:231/:301).
+    fn command(&self, cmd: &str) -> String {
+        let (raw, _) = self.exchange(cmd);
+        self.strip_echo(&raw).trim().to_string()
+    }
+
+    /// C `send_mess`: each `;`-separated piece of `msg` is its own command,
+    /// its reply read and dropped, and its status too, so every piece goes
+    /// out (drvPM304.cc:367-376).
+    fn send_mess(&self, msg: &[u8]) {
+        for piece in msg.split(|&b| b == b';').filter(|p| !p.is_empty()) {
+            let _ = self.handle.write_read(0, piece, READ_BUF);
+        }
     }
 }
 
@@ -231,222 +225,253 @@ fn parse_position(reply: &str) -> i32 {
     }
 }
 
-/// One PM304/PM600 axis sharing a controller. Implements [`AsynMotor`].
+/// One PM304/PM600 axis sharing a controller. Implements [`Model1Motor`].
 pub struct Pm304Axis {
     controller: Arc<Mutex<Pm304Controller>>,
     /// 1-based wire axis number.
     axis: u32,
-    /// 0-based index into the controller's `use_encoder` table.
-    index: usize,
+    /// Whether the axis reports position from its encoder (`OA`) or the
+    /// command counter (`OC`).
+    use_encoder: bool,
     prev_position: i32,
-    last_status: MotorStatus,
+    /// C's RA_DIRECTION, carried from poll to poll in `motor_info->status`.
+    direction: bool,
+    strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl Pm304Axis {
-    /// Construct axis `index` (0-based; wire axis = `index + 1`).
+    /// Axis `index` (0-based; wire axis = `index + 1`) as `motor_init` takes
+    /// it up: its `ID`, then its status (drvPM304.cc:684-700).
     pub fn new(controller: Arc<Mutex<Pm304Controller>>, index: usize) -> Self {
-        Self {
+        let axis = index as u32 + 1;
+        let use_encoder = {
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let id = ctrl.exchange(&format!("{axis}ID")).0;
+            // C: PM304 always uses the encoder; PM600 uses the command
+            // counter only when the axis reports "Open loop stepper mode".
+            match ctrl.model {
+                Model::Pm304 => true,
+                Model::Pm600 => !id.contains("Open loop stepper mode"),
+            }
+        };
+        let mut axis = Self {
             controller,
-            axis: index as u32 + 1,
-            index,
+            axis,
+            use_encoder,
             prev_position: 0,
-            last_status: MotorStatus {
-                done: true,
-                gain_support: true,
-                ..MotorStatus::default()
-            },
-        }
+            direction: false,
+            strings: MoveStrings::default(),
+            init_status: None,
+        };
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, Pm304Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Program the move speeds before a move (C sends `SV`/`SA`/`SD` as separate
-    /// transactions ahead of the move command). Non-positive values are skipped.
-    fn program_speeds(
-        ctrl: &Pm304Controller,
-        axis: u32,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        if velocity > 0.0 {
-            ctrl.command(&format!("{axis}SV{}", nint(velocity)))?;
-        }
-        if acceleration > 0.0 {
-            let accel = nint(acceleration);
-            ctrl.command(&format!("{axis}SA{accel}"))?;
-            ctrl.command(&format!("{axis}SD{accel}"))?;
-        }
-        Ok(())
+    /// PREM, which devPM304.cc puts just ahead of the motion command; it
+    /// goes out piece by piece like the rest of the message.
+    fn send_prem(&mut self, ctrl: &Pm304Controller) {
+        let prem = self.strings.arm();
+        ctrl.send_mess(&prem);
     }
 }
 
-impl AsynMotor for Pm304Axis {
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
-        ctrl.command(&format!("{}MA{}", self.axis, nint(position)))?;
+impl Model1Motor for Pm304Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, MotorStatus::default(), self.poll_failure())
+    }
+
+    /// `update_delay` is 0 (drvPM304.cc `thread_args`).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// C `set_status` ignores `send_recv_mess`'s result (drvPM304.cc).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
+    /// SET_VELOCITY: `SV`, whatever its value (devPM304.cc).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.lock()
+            .send_mess(format!("{}SV{}", self.axis, nint(velocity)).as_bytes());
         Ok(())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        Pm304Axis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
-        ctrl.command(&format!("{}MR{}", self.axis, nint(distance)))?;
+    /// SET_VEL_BASE is a no-op in devPM304.cc.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
         Ok(())
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    /// SET_ACCEL: `SA` then `SD` (devPM304.cc).
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
         let ctrl = self.lock();
+        let accel = nint(acceleration);
+        ctrl.send_mess(format!("{}SA{accel}", self.axis).as_bytes());
+        ctrl.send_mess(format!("{}SD{accel}", self.axis).as_bytes());
+        Ok(())
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        self.send_prem(&ctrl);
+        ctrl.send_mess(format!("{}MA{}", self.axis, nint(position)).as_bytes());
+        Ok(())
+    }
+
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        self.send_prem(&ctrl);
+        ctrl.send_mess(format!("{}MR{}", self.axis, nint(distance)).as_bytes());
+        Ok(())
+    }
+
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        self.send_prem(&ctrl);
         match ctrl.model {
             Model::Pm304 => {
-                // PM304: set the (unsigned) slew speed, then a signed direction.
-                let speed = nint(velocity.abs());
-                if speed > 0 {
-                    ctrl.command(&format!("{}SV{speed}", self.axis))?;
-                }
-                let dir = if velocity >= 0.0 { 1 } else { -1 };
-                ctrl.command(&format!("{}CV{dir}", self.axis))?;
+                // PM304: the signed speed as SV, then CV1 only for a
+                // positive one (devPM304.cc JOG case).
+                let speed = nint(velocity);
+                ctrl.send_mess(format!("{}SV{speed}", self.axis).as_bytes());
+                let dir = if speed > 0 { 1 } else { -1 };
+                ctrl.send_mess(format!("{}CV{dir}", self.axis).as_bytes());
             }
             Model::Pm600 => {
                 // PM600: signed continuous velocity in one command.
-                ctrl.command(&format!("{}CV{}", self.axis, nint(velocity)))?;
+                ctrl.send_mess(format!("{}CV{}", self.axis, nint(velocity)).as_bytes());
             }
         }
         Ok(())
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
-        let ctrl = self.lock();
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        self.send_prem(&ctrl);
         let cmd = match (ctrl.model, forward) {
             (Model::Pm304, true) => format!("{}IX", self.axis),
             (Model::Pm304, false) => format!("{}IX-1", self.axis),
             (Model::Pm600, true) => format!("{}HD", self.axis),
             (Model::Pm600, false) => format!("{}HD-1", self.axis),
         };
-        ctrl.command(&cmd)?;
+        ctrl.send_mess(cmd.as_bytes());
         Ok(())
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.command(&format!("{}ST", self.axis))?;
+        ctrl.send_mess(format!("{}ST", self.axis).as_bytes());
         Ok(())
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        let cmd = if ctrl.use_encoder(self.index) {
+        let cmd = if self.use_encoder {
             format!("{}AP{}", self.axis, nint(position))
         } else {
             format!("{}CP{}", self.axis, nint(position))
         };
-        ctrl.command(&cmd)?;
+        ctrl.send_mess(cmd.as_bytes());
         Ok(())
     }
 
-    fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
-        let ctrl = self.lock();
-        // C ENABLE_TORQUE -> "RS", DISABL_TORQUE -> "AB".
-        let cmd = if enable {
-            format!("{}RS", self.axis)
-        } else {
-            format!("{}AB", self.axis)
-        };
-        ctrl.command(&cmd)?;
+    /// `PRIMITIVE`: INIT and a CR (devPM304.cc:194-198), split on `;`.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut msg = init.to_vec();
+        msg.push(b'\r');
+        self.lock().send_mess(&msg);
         Ok(())
     }
 
-    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
-        let ctrl = self.lock();
-        let g = nint(gain);
-        let cmd = match kind {
-            PidGainKind::Proportional => format!("{}KP{g}", self.axis),
-            PidGainKind::Integral => format!("{}KS{g}", self.axis),
-            PidGainKind::Derivative => format!("{}KV{g}", self.axis),
-        };
-        ctrl.command(&cmd)?;
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
-        let use_encoder = ctrl.use_encoder(self.index);
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
+        let controller = self.controller.clone();
+        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let model = ctrl.model;
 
-        let status_reply = ctrl.command(&format!("{}OS", self.axis))?;
+        let status_reply = ctrl.command(&format!("{}OS", self.axis));
         let bits = parse_status(model, &status_reply);
 
-        let pos_cmd = if use_encoder {
+        let pos_cmd = if self.use_encoder {
             format!("{}OA", self.axis)
         } else {
             format!("{}OC", self.axis)
         };
-        let pos_reply = ctrl.command(&pos_cmd)?;
+        let pos_reply = ctrl.command(&pos_cmd);
+
+        // drvPM304.cc:330-338: POST and a CR once done or on a limit; only
+        // the PM304 branch sets ls_active.
+        let ls_active = model == Model::Pm304 && (bits.plus_ls || bits.minus_ls);
+        if (bits.done || ls_active)
+            && let Some(mut post) = self.strings.post_due()
+        {
+            post.push(b'\r');
+            ctrl.send_mess(&post);
+        }
         drop(ctrl);
 
         let position = parse_position(&pos_reply);
 
-        // Direction: a limit switch fixes it (C); otherwise infer from motion.
-        let direction = if bits.plus_ls {
-            true
-        } else if bits.minus_ls {
-            false
-        } else {
-            position >= self.prev_position
-        };
-        self.prev_position = position;
+        // drvPM304.cc:252-261, 302-311: a PM304 limit sets the direction,
+        // a position change sets it after that, and otherwise it keeps its
+        // last value.
+        if model == Model::Pm304 {
+            if bits.plus_ls {
+                self.direction = true;
+            }
+            if bits.minus_ls {
+                self.direction = false;
+            }
+        }
+        if position != self.prev_position {
+            self.direction = position > self.prev_position;
+            self.prev_position = position;
+        }
 
         let status = MotorStatus {
-            position: position as f64,
-            encoder_position: position as f64,
-            velocity: 0.0,
             done: bits.done,
-            moving: !bits.done,
             high_limit: bits.plus_ls,
             low_limit: bits.minus_ls,
             problem: bits.problem,
-            direction,
-            has_encoder: use_encoder,
-            gain_support: true,
+            direction: self.direction,
+            // No GAIN_SUPPORT or EA_PRESENT: C set_status keeps the status
+            // word zeroed at init, so the record never sends torque (RS/AB)
+            // or gain commands and never offers UEIP.
             ..MotorStatus::default()
-        };
-        self.last_status = status.clone();
-        Ok(status)
+        }
+        .with_position(position as f64)
+        .with_encoder_position(position as f64)
+        .with_velocity(0.0);
+        *out = status;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use motor_common::testing::{Model1Polled, RecordWrites};
 
     #[test]
     fn pm304_status_moving_and_limits() {
@@ -471,6 +496,180 @@ mod tests {
         assert!(!s.problem);
         assert!(s.plus_ls);
         assert!(!s.minus_ls);
+    }
+
+    /// drvPM304.cc:499-522 ignores writeRead's status and keeps what
+    /// arrived, so a card whose replies are cut by a timeout is still found
+    /// and identified, and set_status still parses its OS and OA replies.
+    #[test]
+    fn replies_cut_by_a_timeout_are_still_parsed() {
+        let (_line, io) = LineRig::cut(
+            "pm304_cut",
+            |last| match last {
+                "1OA" => "AP=123".into(),
+                "1ID" => "Mclennan PM304".into(),
+                "1OS" => "00010000".into(),
+                _ => "OK".into(),
+            },
+            |_| true,
+        );
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        assert!(ctrl.model == Model::Pm304);
+        assert_eq!(ctrl.ident, "Mclennan PM304");
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let status = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!((status.position(), status.done), (123.0, true));
+    }
+
+    /// drvPM304.cc:662-663: the ident is the 1ID reply as it came.
+    #[test]
+    fn the_ident_keeps_its_blanks() {
+        let (_line, io) = LineRig::new("pm304_ident", |last| match last {
+            "1OA" => "AP=0".into(),
+            "1ID" => " Mclennan PM304 v1 ".into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        assert_eq!(ctrl.ident(), " Mclennan PM304 v1 ");
+    }
+
+    fn pm304_line(name: &str) -> (LineRig, Pm304Axis) {
+        let (line, io) = LineRig::new(name, |last| match last {
+            "1ID" => "Mclennan PM304".into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        (line, axis)
+    }
+
+    /// devPM304.cc builds the record's SET_VELOCITY and SET_ACCEL parts of
+    /// a home, and SET_ACCEL of a jog, ahead of the motion command.
+    #[test]
+    fn home_and_jog_program_the_record_speeds() {
+        let (line, mut axis) = pm304_line("pm304_speeds");
+        let user = AsynUser::default();
+        axis.record_home(&user, 0.0, 400.0, 800.0, true).unwrap();
+        assert_eq!(line.sent(), ["1SV400", "1SA800", "1SD800", "1IX"]);
+        axis.record_jog(&user, 0.0, -300.0, 600.0).unwrap();
+        assert_eq!(line.sent(), ["1SA600", "1SD600", "1SV-300", "1CV-1"]);
+    }
+
+    /// devPM304.cc sends SV%ld whatever its value, signed on a jog, and
+    /// CV-1 unless the rounded jog speed is positive.
+    #[test]
+    fn sv_goes_out_signed_and_a_zero_jog_runs_negative() {
+        let (line, mut axis) = pm304_line("pm304_sv");
+        let user = AsynUser::default();
+        axis.record_move_absolute(&user, 10.0, 0.0, 0.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["1SV0", "1MA10"]);
+        axis.record_jog(&user, 0.0, -300.0, 600.0).unwrap();
+        assert_eq!(line.sent(), ["1SA600", "1SD600", "1SV-300", "1CV-1"]);
+        axis.record_jog(&user, 0.0, 0.4, 600.0).unwrap();
+        assert_eq!(line.sent(), ["1SA600", "1SD600", "1SV0", "1CV-1"]);
+    }
+
+    /// devPM304.cc: INIT and a CR, PREM just ahead of the motion command,
+    /// POST and a CR once done, each `;` piece its own command.
+    #[test]
+    fn init_prem_and_post_go_out_piece_by_piece() {
+        let (line, io) = LineRig::new("pm304_strings", |last| match last {
+            "1ID" => "Mclennan PM304".into(),
+            "1OS" => "00010000".into(),
+            "1OA" => "AP=10".into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        let user = AsynUser::default();
+        axis.primitive(&user, b"1RS;1KP5").unwrap();
+        assert_eq!(line.sent(), ["1RS", "1KP5\r"]);
+        let post = PostMessage::default();
+        post.set(b"1AB");
+        axis.set_move_strings(&user, b"1RS;1SC", Some(post))
+            .unwrap();
+        axis.record_move_absolute(&user, 50.0, 0.0, 400.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["1SV400", "1RS", "1SC", "1MA50"]);
+        axis.polled(&user).unwrap();
+        axis.polled(&user).unwrap();
+        assert_eq!(line.sent(), ["1OS", "1OA", "1AB\r", "1OS", "1OA"]);
+    }
+
+    /// drvPM304.cc:668-690: `1OA` finds the card, retried while silent;
+    /// an empty `1ID` does not lose it.
+    #[test]
+    fn the_card_is_found_by_its_position_reply() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let probes = AtomicUsize::new(0);
+        let (line, io) = LineRig::new("pm304Probe", move |last| match last {
+            "1OA" if probes.fetch_add(1, Ordering::SeqCst) < 2 => String::new(),
+            "1OA" => "AP=0".into(),
+            _ => String::new(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        assert_eq!(ctrl.ident(), "");
+        assert_eq!(line.sent(), ["1OA", "1OA", "1OA", "1ST", "1ID"]);
+
+        let (_line, io) = LineRig::new("pm304Absent", |_| String::new());
+        assert!(Pm304Controller::new(io, 1).is_err());
+    }
+
+    /// drvPM304.cc:367-376: send_mess ignores each piece's status, so a
+    /// refused SV does not keep the move from going out.
+    #[test]
+    fn a_refused_piece_does_not_stop_the_move() {
+        let (line, io) = LineRig::failing(
+            "pm304Refused",
+            |last| match last {
+                "1ID" => "Mclennan PM304".into(),
+                _ => "OK".into(),
+            },
+            |sent| sent == "1SV400",
+        );
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        axis.record_move_absolute(&AsynUser::default(), 50.0, 0.0, 400.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["1SV400", "1MA50"]);
+    }
+
+    /// drvPM304.cc:252-261, 302-311: the direction follows a position
+    /// change, holds while the position does, and only a PM304 limit sets it.
+    #[test]
+    fn direction_holds_until_the_position_moves() {
+        use std::sync::Mutex as StdMutex;
+        let replies = Arc::new(StdMutex::new(("00010000", "AP=10")));
+        let r = replies.clone();
+        let (_line, io) = LineRig::new("pm304Dir", move |last| match last {
+            "1ID" => "Mclennan PM304".into(),
+            "1OS" => r.lock().unwrap().0.into(),
+            "1OA" => r.lock().unwrap().1.into(),
+            _ => "OK".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        assert!(axis.polled(&user).unwrap().direction);
+        *replies.lock().unwrap() = ("00010000", "AP=5");
+        assert!(!axis.polled(&user).unwrap().direction);
+        assert!(!axis.polled(&user).unwrap().direction);
+        *replies.lock().unwrap() = ("01010000", "AP=5");
+        assert!(axis.polled(&user).unwrap().direction);
+
+        let (_line, io) = LineRig::new("pm600Dir", |last| match last {
+            "1ID" => "1ID\rMclennan PM600".into(),
+            "1OS" => "1OS\r01:10100000".into(),
+            _ => "1OA\r01:0".into(),
+        });
+        let ctrl = Pm304Controller::new(io, 1).unwrap();
+        let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let s = axis.polled(&user).unwrap();
+        assert!(s.high_limit && !s.direction);
     }
 
     #[test]

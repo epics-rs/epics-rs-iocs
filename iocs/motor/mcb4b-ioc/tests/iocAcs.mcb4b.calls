@@ -1,0 +1,2 @@
+# c-expansion of st.cmd.mcb4b over the C sources, its controller calls:
+MCB4BCreateController("MCB4B1", "serial1", 4, 100, 5000)

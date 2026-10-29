@@ -2,73 +2,177 @@
 //!
 //! Usage:
 //!   cargo run -p ip-ioc -- iocs/ip/ip-ioc/st.cmd
-//!
-//! Each device family gets one iocsh command that puts an asyn port on top of an
-//! octet port created earlier by `drvAsynSerialPortConfigure` /
-//! `drvAsynIPPortConfigure`:
-//!
-//! ```text
-//! MPCConfig(port, octetPort, address, [pollPeriod])
-//! TPG261Config(port, octetPort, [pollPeriod])
-//! TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
-//! MKSConfig(port, octetPort, numGauges, [pollPeriod])
-//! ND261Config(port, octetPort, [pollPeriod])
-//! EurothermConfig(port, octetPort, groupAddress)
-//! ```
-
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use epics_rs::base::error::CaResult;
-use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use ip_devices::eurotherm::create_eurotherm;
-use ip_devices::mks::create_mks;
-use ip_devices::mpc::create_mpc;
-use ip_devices::nd261::create_nd261;
-use ip_devices::runtime::IpPortRuntime;
-use ip_devices::televac::create_televac;
-use ip_devices::tpg261::create_tpg261;
-
-/// Every port the startup script creates, kept alive for the life of the IOC.
-type Ports = Arc<Mutex<Vec<IpPortRuntime>>>;
-
-fn string_arg(args: &[ArgValue], i: usize) -> Result<String, String> {
-    match args.get(i) {
-        Some(ArgValue::String(s)) => Ok(s.clone()),
-        _ => Err(format!("argument {i} must be a string")),
-    }
-}
-
-fn int_arg(args: &[ArgValue], i: usize) -> Result<i64, String> {
-    match args.get(i) {
-        Some(ArgValue::Int(v)) => Ok(*v),
-        _ => Err(format!("argument {i} must be an integer")),
-    }
-}
-
-/// Poll period in seconds; the C device support polled at the record's SCAN
-/// rate, so this is the port's equivalent knob.
-fn poll_arg(args: &[ArgValue], i: usize, default: f64) -> Result<Duration, String> {
-    let seconds = match args.get(i) {
-        Some(ArgValue::Double(v)) => *v,
-        Some(ArgValue::Int(v)) => *v as f64,
-        None => default,
-        _ => return Err(format!("argument {i} must be a number")),
-    };
-    if seconds <= 0.0 {
-        return Err(format!("the poll period must be positive, got {seconds}"));
-    }
-    Ok(Duration::from_secs_f64(seconds))
-}
-
-fn register(ports: &Ports, name: &str, port: IpPortRuntime) -> Result<(), String> {
-    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone())
-        .map_err(|e| e.to_string())?;
-    ports.lock().expect("port list poisoned").push(port);
-    Ok(())
-}
+/// `ipSupport.dbd`'s `devAiMKS` (`"HPS SensaVac 937"`), `dev<Type>MPC`
+/// (`"asyn MPC"`), `dev<Type>TPG261` (`"asyn TPG261"`), `dev<Xx>Eurotherm`
+/// (`"asyn <xx> Eurotherm"`), `devAiHeidND261` (`"asyn ai HeidND261"`) and
+/// `dev<Type>Televac` (`"asyn Televac"`) rows; their dsets
+/// are `{6, 0, 0, init, 0, read/write, convert}`, with no convert on the
+/// non-analog types.
+static DEVICES: &[(&str, &[DevSup])] = &[
+    (
+        "ai",
+        &[
+            DevSup {
+                name: "devAiMKS",
+                choice: ip_devices::mks::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+            DevSup {
+                name: "devAiMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+            DevSup {
+                name: "devAiTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+            DevSup {
+                name: "devAiHeidND261",
+                choice: ip_devices::nd261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devAiTelevac",
+                choice: ip_devices::televac::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+        ],
+    ),
+    (
+        "ao",
+        &[
+            DevSup {
+                name: "devAoMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+            DevSup {
+                name: "devAoTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4, 5], false),
+            },
+            DevSup {
+                name: "devAoEurotherm",
+                choice: "asyn ao Eurotherm",
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
+    ),
+    (
+        "bi",
+        &[
+            DevSup {
+                name: "devBiMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devBiTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devBiTelevac",
+                choice: ip_devices::televac::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
+    ),
+    (
+        "bo",
+        &[
+            DevSup {
+                name: "devBoMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devBoTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
+    ),
+    (
+        "mbbi",
+        &[DevSup {
+            name: "devMbbiTPG261",
+            choice: ip_devices::tpg261::DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }],
+    ),
+    (
+        "mbbo",
+        &[
+            DevSup {
+                name: "devMbboMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devMbboTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
+    ),
+    (
+        "stringin",
+        &[
+            DevSup {
+                name: "devSiMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devSiTPG261",
+                choice: ip_devices::tpg261::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
+    ),
+    (
+        "stringout",
+        &[
+            DevSup {
+                name: "devSoMPC",
+                choice: ip_devices::mpc::DTYP,
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+            DevSup {
+                name: "devSoEurotherm",
+                choice: "asyn so Eurotherm",
+                link_type: DbLinkType::InstIo,
+                dset: Dset::new(6, &[2, 4], false),
+            },
+        ],
+    ),
+];
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -76,13 +180,11 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: ip-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: ip-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("IP", env!("CARGO_MANIFEST_DIR"));
-
-    let ports: Ports = Arc::new(Mutex::new(Vec::new()));
+    epics_rs::base::runtime::env::set_default_path("IP", ip_devices::IP_DIR);
 
     let mut app = IocApplication::new();
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
@@ -94,233 +196,31 @@ async fn main() -> CaResult<()> {
         Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
     });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+    // ipSupport.dbd's registrar() lines: the Federal, Keithley and Oxford
+    // programs and the shell's `seq` command.
+    ip_devices::register_ip_dbd();
+    // devXxStrParm's rows come from this crate, ahead of the rest as
+    // ipSupport.dbd lists them.
+    app = app.register_dynamic_device_support(
+        &ip_devices::strparm::DEVICE_ROWS,
+        ip_devices::strparm::device_support_factory(),
+    );
+    // devAiMKS, devMPC, devTPG261, devXxEurotherm, devAiHeidND261 and
+    // devTelevac: per-record device support, bound by DTYP.
+    let mks = ip_devices::mks::device_support_factory();
+    let mpc = ip_devices::mpc::device_support_factory();
+    let tpg = ip_devices::tpg261::device_support_factory();
+    let eurotherm = ip_devices::eurotherm::device_support_factory();
+    let nd261 = ip_devices::nd261::device_support_factory();
+    let televac = ip_devices::televac::device_support_factory();
+    app = app.register_dynamic_device_support(DEVICES, move |ctx| {
+        mks(ctx)
+            .or_else(|| mpc(ctx))
+            .or_else(|| tpg(ctx))
+            .or_else(|| eurotherm(ctx))
+            .or_else(|| nd261(ctx))
+            .or_else(|| televac(ctx))
+    });
 
-    // MPCConfig(port, octetPort, address, [pollPeriod])
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "MPCConfig",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "address",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "pollPeriod",
-                    arg_type: ArgType::Double,
-                },
-            ],
-            "MPCConfig portName octetPort address [pollPeriod] - MPC/Digitel ion-pump controller",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let address = int_arg(args, 2)?;
-                let address = u8::try_from(address)
-                    .map_err(|_| format!("MPCConfig: address {address} is not 0..255"))?;
-                let poll = poll_arg(args, 3, 1.0)?;
-                let port = create_mpc(&name, &octet, address, poll)
-                    .map_err(|e| format!("MPCConfig failed: {e}"))?;
-                register(&ports, &name, port)?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // TPG261Config(port, octetPort, [pollPeriod])
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "TPG261Config",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "pollPeriod",
-                    arg_type: ArgType::Double,
-                },
-            ],
-            "TPG261Config portName octetPort [pollPeriod] - Pfeiffer TPG261/TPG262 gauge controller",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let poll = poll_arg(args, 2, 2.0)?;
-                let port = create_tpg261(&name, &octet, poll)
-                    .map_err(|e| format!("TPG261Config failed: {e}"))?;
-                register(&ports, &name, port)?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "TelevacConfig",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "numStations",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "numRelays",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "pollPeriod",
-                    arg_type: ArgType::Double,
-                },
-            ],
-            "TelevacConfig portName octetPort numStations numRelays [pollPeriod] - \
-             Televac vacuum gauge controller",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let stations = int_arg(args, 2)?;
-                let relays = int_arg(args, 3)?;
-                let stations = u8::try_from(stations)
-                    .map_err(|_| format!("TelevacConfig: numStations {stations} is not 1..9"))?;
-                let relays = u8::try_from(relays)
-                    .map_err(|_| format!("TelevacConfig: numRelays {relays} is not 0..8"))?;
-                let poll = poll_arg(args, 4, 1.0)?;
-                let port = create_televac(&name, &octet, stations, relays, poll)
-                    .map_err(|e| format!("TelevacConfig failed: {e}"))?;
-                register(&ports, &name, port)?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // MKSConfig(port, octetPort, numGauges, [pollPeriod])
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "MKSConfig",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "numGauges",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "pollPeriod",
-                    arg_type: ArgType::Double,
-                },
-            ],
-            "MKSConfig portName octetPort numGauges [pollPeriod] - MKS/HPS SensaVac 937 \
-             gauge controller",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let gauges = int_arg(args, 2)?;
-                let gauges = u8::try_from(gauges)
-                    .map_err(|_| format!("MKSConfig: numGauges {gauges} is not 1..5"))?;
-                let poll = poll_arg(args, 3, 1.0)?;
-                let port = create_mks(&name, &octet, gauges, poll)
-                    .map_err(|e| format!("MKSConfig failed: {e}"))?;
-                register(&ports, &name, port)?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // ND261Config(port, octetPort, [pollPeriod])
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "ND261Config",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "pollPeriod",
-                    arg_type: ArgType::Double,
-                },
-            ],
-            "ND261Config portName octetPort [pollPeriod] - Heidenhain ND261 display unit",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let poll = poll_arg(args, 2, 1.0)?;
-                let port = create_nd261(&name, &octet, poll)
-                    .map_err(|e| format!("ND261Config failed: {e}"))?;
-                register(&ports, &name, port)?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // EurothermConfig(port, octetPort, groupAddress)
-    {
-        let ports = ports.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "EurothermConfig",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "octetPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "groupAddress",
-                    arg_type: ArgType::Int,
-                },
-            ],
-            "EurothermConfig portName octetPort groupAddress - Eurotherm 800/2000 \
-             temperature controller (the asyn address is the local address)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let name = string_arg(args, 0)?;
-                let octet = string_arg(args, 1)?;
-                let group = int_arg(args, 2)?;
-                let group = u8::try_from(group)
-                    .map_err(|_| format!("EurothermConfig: groupAddress {group} is not 0..9"))?;
-                let port = create_eurotherm(&name, &octet, group)
-                    .map_err(|e| format!("EurothermConfig failed: {e}"))?;
-                register(&ports, &name, port)?;
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    app.startup_script(&script)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

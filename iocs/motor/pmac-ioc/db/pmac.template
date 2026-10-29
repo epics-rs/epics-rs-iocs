@@ -1,6 +1,5 @@
-# Delta Tau PMAC real (motor) axis: one motor record per axis. DTYP is
-# PMAC_$(CTRL)_$(AXIS), the key registered by pmacCreateAxis/pmacCreateAxes
-# (controller name + 1-based axis number).
+# Delta Tau PMAC real (motor) axis: one motor record per axis, ADDR the
+# 1-based axis number on controller port PORT (address 0 is the controller's).
 #
 # The driver speaks the controller's own counts: demands go out as `#n J=` in
 # counts and readbacks come back in counts, with no driver-side scaling. The
@@ -12,7 +11,8 @@
 # controller's I{n}22 (counts/msec) and I{n}20 (acceleration time, msec).
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "PMAC_$(CTRL)_$(AXIS)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1000)")
     field(ACCL, "$(ACCL=0.5)")

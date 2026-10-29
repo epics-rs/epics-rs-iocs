@@ -9,5 +9,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
+epics-libcom-rs = { workspace = true }
 epics-rs = { workspace = true, features = ["asyn", "motor"] }
 motor-common = { path = "../common" }
+
+[dev-dependencies]
+motor-common = { path = "../common", features = ["testing"] }

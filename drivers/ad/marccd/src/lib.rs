@@ -18,23 +18,13 @@
 //!
 //! # Deviations from the C driver
 //!
-//! * **marServer I/O runs on worker threads.** A Rust `PortDriver` method
-//!   executes inside its port actor's current-thread runtime and cannot block
-//!   on a second port, so the three C contexts (the port thread's
-//!   `writeInt32` / `writeFloat64` inline work, `marCCDTask`, `getImageDataTask`)
-//!   become three worker threads sharing one [`server::Server`] behind a
-//!   `tokio::sync::Mutex` — the analog of C's driver lock. Command order and
-//!   the marServer byte stream are unchanged; only the moment a record's write
-//!   callback returns differs, and `getServerMode` / `getConfig` / `getState`
-//!   run just after construction (via [`task::Cmd::Init`]) instead of
-//!   synchronously inside it.
 //! * **The exposure timer is emulated inline.** C arms an `epicsTimer` that
 //!   signals the stop event when the internal-trigger exposure time expires;
 //!   this port folds that deadline into the exposure wait loop, so no separate
 //!   timer thread or `epicsTimerCancel` on abort is needed. External trigger
 //!   modes have no timer in either version.
 //! * **Published images are 16-bit only.** C's `readTiff` copies raw strip
-//!   bytes into an `NDUInt16` buffer; [`image::decode_tiff`] accepts a 16-bit
+//!   bytes into an `NDUInt16` buffer; [`image::TiffFile`] accepts a 16-bit
 //!   single-sample TIFF and rejects other bit depths.
 //! * **Multi-strip TIFFs decode correctly.** C's `readTiff` passes strip index
 //!   `0` on every loop iteration; the `tiff` crate reads every strip. marServer
@@ -44,10 +34,6 @@
 //! * **`getConfig` parse failures fall back to 0.** Where a `get_size` /
 //!   `get_bin` reply cannot be parsed this port stores 0; C leaves the previous
 //!   `sscanf` target unchanged.
-//! * **Base-class `writeOctet` side effects are not reproduced.** marCCD does
-//!   not override `writeOctet`; the base `asynNDArrayDriver::writeOctet` updates
-//!   `NDFilePathExists` (via `checkPath`) and reloads `NDAttributesFile`. This
-//!   port only stores the string, so `NDFilePathExists` is not tracked.
 //! * **`ADAcquireBusy` is cleared directly by the worker** at acquisition
 //!   completion (alongside `ADAcquire`), approximating
 //!   `asynNDArrayDriver::setIntegerParam`'s side effect for the common

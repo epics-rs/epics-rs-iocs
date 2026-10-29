@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::param::ParamType;
 use asyn_rs::port_handle::PortHandle;
+use asyn_rs::registry::PortClaim;
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::trace::TraceMask;
 use parking_lot::{Mutex, RwLock};
 
-use ad_core_rs::driver::{ADDriverBase, ADStatus, ImageMode};
-use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::driver::{ADDriverBase, ADStatus, ImageMode, undefined_as_zero};
+use ad_core_rs::ndarray_pool::DriverPool;
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::{ArrayPublisher, NDArrayOutput};
 
@@ -134,7 +135,7 @@ impl PylonBackend {
         if let Err(e) = self.open_camera() {
             ad.port_base.trace_print(
                 TraceMask::ERROR,
-                &format!(
+                format_args!(
                     "{DRIVER_NAME}::connectCamera error opening camera {}: {e}\n",
                     self.camera_id
                 ),
@@ -202,7 +203,7 @@ impl PylonBackend {
             None => {
                 ad.port_base.trace_print(
                     TraceMask::ERROR,
-                    &format!(
+                    format_args!(
                         "{DRIVER_NAME}::processFrame Error: Unknown pixel conversion format {format}\n"
                     ),
                 );
@@ -238,11 +239,15 @@ impl GenICamBackend for PylonBackend {
         }
         let ad = &mut *ctx.ad;
         let p = ad.params;
-        let image_mode = ImageMode::from_i32(ad.port_base.get_int32_param(p.image_mode, 0)?);
-        let num_images = ad.port_base.get_int32_param(p.num_images, 0)?;
+        // ADPylon.cpp:770-771 ignore both statuses; neither is seeded before
+        // its PINI record runs.
+        let image_mode = ImageMode::from_i32(undefined_as_zero(
+            ad.port_base.get_int32_param(p.image_mode, 0),
+        )?);
+        let num_images = undefined_as_zero(ad.port_base.get_int32_param(p.num_images, 0))?;
 
         ad.port_base.set_int32_param(p.num_images_counter, 0, 0)?;
-        ad.set_shutter(true)?;
+        ad.set_shutter(true);
         let count = match image_mode {
             ImageMode::Single => Some(1),
             ImageMode::Multiple => Some(num_images.max(0) as u64),
@@ -253,7 +258,7 @@ impl GenICamBackend for PylonBackend {
             ad.set_acquire(0)?;
             ad.port_base.trace_print(
                 TraceMask::ERROR,
-                &format!("{DRIVER_NAME}:startCapture: failed to start grabbing: {e}\n"),
+                format_args!("{DRIVER_NAME}:startCapture: failed to start grabbing: {e}\n"),
             );
             return Err(error(e));
         }
@@ -267,7 +272,7 @@ impl GenICamBackend for PylonBackend {
     fn stop_capture(&mut self, ctx: &mut DriverCtx<'_>) -> AsynResult<()> {
         let ad = &mut *ctx.ad;
         ad.set_acquire(0)?;
-        ad.set_shutter(false)?;
+        ad.set_shutter(false);
         // Waits for the grab-loop thread, which never waits on this one.
         let stopped = self.camera.stop();
         self.acquiring = false;
@@ -284,7 +289,7 @@ impl GenICamBackend for PylonBackend {
         if let Err(e) = self.connect_camera(ctx.ad) {
             ctx.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                &format!("{DRIVER_NAME}:connect:  camera connection failed ({e})\n"),
+                format_args!("{DRIVER_NAME}:connect:  camera connection failed ({e})\n"),
             );
             ctx.ad.port_base.call_param_callbacks(0)?;
             return Err(e);
@@ -351,7 +356,7 @@ pub struct PylonRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub pylon_params: PylonParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<Mutex<NDArrayOutput>>,
     _task: std::thread::JoinHandle<()>,
 }
@@ -361,7 +366,7 @@ impl PylonRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -374,11 +379,12 @@ impl PylonRuntime {
 /// cameras found, anything else a serial number; `max_memory` of 0 is
 /// unlimited.
 pub fn create_pylon(
-    port_name: &str,
+    claim: &PortClaim,
     camera_id: &str,
     max_memory: usize,
     array_output: NDArrayOutput,
 ) -> AsynResult<PylonRuntime> {
+    let port_name = claim.name();
     let (tx, rx) = task::channel();
     let driver = ADPylon::new(port_name, max_memory, |ad, index| {
         PylonBackend::new(ad, index, camera_id, tx)
@@ -388,7 +394,7 @@ pub fn create_pylon(
     let pool = driver.ad.pool.clone();
     let shared = driver.backend.shared.clone();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let array_output = Arc::new(Mutex::new(array_output));
     let task = ImageTask {
         rx,
@@ -431,7 +437,8 @@ mod tests {
         // SAFETY: set before this test starts pylon; no other test here
         // reads the environment.
         unsafe { std::env::set_var("PYLON_CAMEMU", "1") };
-        let rt = create_pylon("EMU_STALE", "0815-0000", 0, NDArrayOutput::new()).unwrap();
+        let claim = asyn_rs::registry::claim_port("EMU_STALE").unwrap();
+        let rt = create_pylon(&claim, "0815-0000", 0, NDArrayOutput::new()).unwrap();
         let h = rt.port_handle();
         let bind = |drv_info: &str| {
             h.drv_user_create_blocking(&DrvUserRequest::new(drv_info, 0))
@@ -463,7 +470,7 @@ mod tests {
         let counter = h.read_int32_blocking(p.base.array_counter, 0).unwrap();
         for outcome in [
             Outcome::Frame {
-                array,
+                array: Box::new(array),
                 layout: (NDColorMode::Mono, NDBayerPattern::RGGB),
                 updates: Vec::new(),
             },

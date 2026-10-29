@@ -11,6 +11,7 @@
 
 use std::collections::BTreeSet;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::ndarray::NDDataType;
 
@@ -43,7 +44,11 @@ impl std::fmt::Display for ProtocolError {
         match self {
             Self::BadVersion(s) => write!(f, "unexpected version string '{s}'"),
             Self::OldVersion(s) => {
-                write!(f, "server version '{s}' is older than {MIN_SERVER_VERSION}")
+                write!(
+                    f,
+                    "server version '{s}' is older than {}",
+                    CFloat(MIN_SERVER_VERSION).g()
+                )
             }
             Self::UnknownImageMode(s) => write!(f, "unknown image mode '{s}'"),
             Self::BadImageHeader => write!(f, "malformed image header"),
@@ -397,11 +402,11 @@ pub fn set_exposure(seconds: f64) -> String {
 }
 
 pub fn set_frame_time(seconds: f64) -> String {
-    format!("SetFrameTime;{:.6}", seconds * 1000.0)
+    format!("SetFrameTime;{:.6}", CFloat(seconds * 1000.0))
 }
 
 pub fn set_chip_gain(gain: f64) -> String {
-    format!("SetChipGain;{gain:.6}")
+    format!("SetChipGain;{gain:.6}", gain = CFloat(gain))
 }
 
 pub fn set_frame_number(frames: i32) -> String {
@@ -677,5 +682,7 @@ mod tests {
     #[test]
     fn set_chip_gain_matches_c_printf() {
         assert_eq!(set_chip_gain(2.5), "SetChipGain;2.500000");
+        assert_eq!(set_chip_gain(f64::NAN), "SetChipGain;nan");
+        assert_eq!(set_frame_time(-f64::NAN), "SetFrameTime;-nan");
     }
 }

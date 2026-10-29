@@ -1,5 +1,5 @@
 # GM10 Math (calculation) channel — address family "A" (A1-A200).
-# Macros: P, DAU, HANDLE, ADDRESS (bare "A"-prefixed address, e.g. A1).
+# Macros: P, DAU, HANDLE, ADDRESS (bare "A"-prefixed address, e.g. A001).
 # Port of yokogawaDasApp/Db/GM10_calculation_channel.db.
 
 record(ai, "$(P)$(DAU):$(ADDRESS)")

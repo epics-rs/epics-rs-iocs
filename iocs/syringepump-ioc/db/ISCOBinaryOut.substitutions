@@ -1,8 +1,7 @@
 # Ported from epics-modules/SyringePump/SPApp/Db/ISCOBinaryOut.substitutions.
-# Only change from upstream: `file "$(MODBUS)/db/bo_bit.template"` rewritten
-# to a bare filename resolved relative to this file's own directory (db/) --
-# dbLoadTemplate does not macro-expand `file` paths.
-file "bo_bit.template" {
+# `$(MODBUS)/db/` is `$(SYRINGEPUMP)/db/`: the modbus
+# templates are copied into this directory.
+file "$(SYRINGEPUMP)/db/bo_bit.template" {
 pattern
 {  R,                 PORT,      OFFSET,  ZNAM,    ONAM}
 {A:Run,             SP1_Bit_Out,     0,    Stop,    Run}

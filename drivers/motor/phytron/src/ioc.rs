@@ -1,38 +1,39 @@
 //! iocsh commands for the Phytron driver.
 //!
-//! Mirrors the C two-step configuration: `phytronCreatePhymotion` /
-//! `phytronCreateMCC` connect the asyn octet port and register a controller
-//! under a logical name, then `phytronCreateAxis(controllerName, module, index)`
-//! attaches each axis to a `DTYP`-keyed motor device support
-//! (`PHYTRON_{controllerName}_{module}_{index}`). The controller is looked up by
+//! Mirrors the C two-step configuration: `phytronCreateController` (phyMOTION)
+//! / `phytronCreateMCC` connect the asyn octet port and create controller port
+//! `controllerName`, then `phytronCreateAxis(controllerName, module, index)`
+//! adds axis `module*10 + index`, which records address as
+//! `@asyn(controllerName,module*10+index)`. The controller is looked up by
 //! name from a registry shared by the three commands (the C `controllers_`
-//! list). Both port kinds (`drvAsynIPPort` / `drvAsynSerialPort`) work, so
-//! `connect_ip` is used (the lookup is transport-agnostic).
+//! list). Both port kinds (`drvAsynIPPort` / `drvAsynSerialPort`) work.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::manager::{PortManager, claim_port_driver};
+use epics_rs::asyn::port::DrvUserRequest;
+use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_ip;
+use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
-    arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
-    req_int, req_string,
+    arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_int,
+    opt_string, poll_intervals, req_int, req_string,
 };
+use motor_common::{AxisReport, Controller, asyn_user, register_port_with};
 
-use crate::phytron::{CtrlType, PhytronAxis, PhytronController};
+use crate::io;
+use crate::phytron::{CtrlType, PhytronAxis, PhytronAxisReport, PhytronController, PhytronParams};
 
 /// Default communication timeout when the `timeoutMs` arg is omitted.
 const DEFAULT_TIMEOUT_MS: f64 = 1000.0;
 
-/// A registered controller plus the poll periods to install its axes with.
+/// A registered controller and the started poller its axes join.
 struct ControllerReg {
     controller: Arc<Mutex<PhytronController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
+    poller: Arc<Controller>,
 }
 
 /// Shared name -> controller registry for the three commands.
@@ -42,40 +43,49 @@ fn registry_lock(reg: &Registry) -> std::sync::MutexGuard<'_, HashMap<String, Co
     reg.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Build all three Phytron iocsh commands, sharing one controller registry.
-pub fn phytron_commands(holder: &Arc<MotorHolder>) -> Vec<CommandDef> {
+/// C `phytronController` creates its port with 0xFF axes, room for every
+/// `module*10 + index` address.
+const PHYTRON_PORT_AXES: i32 = 0xFF;
+
+/// Build the Phytron iocsh commands, sharing one controller registry.
+pub fn phytron_commands() -> Vec<CommandDef> {
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     vec![
         phytron_create_phymotion_command(&registry),
         phytron_create_mcc_command(&registry),
-        phytron_create_axis_command(&registry, holder),
+        phytron_create_axis_command(&registry),
+        phytron_brake_output_command(&registry),
+        phytron_create_io_command(&registry, "phytronCreateDigital", false),
+        phytron_create_io_command(&registry, "phytronCreateAnalog", true),
     ]
 }
 
-/// `phytronCreatePhymotion(controllerName, asynPort, [movingPollMs],
-/// [idlePollMs], [timeoutMs], [noResetAtBoot])`.
+/// `phytronCreateController(controllerName, asynPort, movingPollPeriod,
+/// idlePollPeriod, timeout, noResetAtBoot)`, C's `phytronCreatePhymotion`;
+/// periods and timeout in ms.
 fn phytron_create_phymotion_command(registry: &Registry) -> CommandDef {
     let registry = registry.clone();
     CommandDef::new(
-        "phytronCreatePhymotion",
+        "phytronCreateController",
         vec![
-            arg_str_req("controllerName"),
-            arg_str_req("asynPort"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-            arg_double_opt("timeoutMs"),
-            arg_int_opt("noResetAtBoot"),
+            arg_str_req("Controller name"),
+            arg_str_req("Phytron communication port name"),
+            arg_int_opt("Moving poll period (ms)"),
+            arg_int_opt("Idle poll period (ms)"),
+            arg_double_opt("Timeout (ms)"),
+            arg_int_opt("Do not restart controller with IOC"),
         ],
-        "phytronCreatePhymotion(controllerName, asynPort, [movingPollMs], [idlePollMs], \
-         [timeoutMs], [noResetAtBoot]) - Register a Phytron phyMOTION controller by name",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let asyn_port = req_string(args, 1, "asynPort")?;
+        "phytronCreateController(controllerName, asynPort, movingPollPeriod, idlePollPeriod, \
+         timeout, noResetAtBoot)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let name = req_string(args, 0, "Controller name")?;
+            let asyn_port = req_string(args, 1, "Phytron communication port name")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
-            let timeout_ms = opt_double(args, 4, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
-            let no_reset = opt_int(args, 5, 0, "noResetAtBoot")?;
+            let timeout_ms = opt_double(args, 4, DEFAULT_TIMEOUT_MS, "Timeout (ms)")?;
+            let no_reset = opt_int(args, 5, 0, "Do not restart controller with IOC")?;
 
             register_controller(
+                ctx,
                 &registry,
                 name,
                 asyn_port,
@@ -85,41 +95,42 @@ fn phytron_create_phymotion_command(registry: &Registry) -> CommandDef {
                 idle_poll_ms,
                 timeout_ms,
                 no_reset != 1,
-                "phytronCreatePhymotion",
+                "phytronCreateController",
             )
         },
     )
 }
 
-/// `phytronCreateMCC(controllerName, asynPort, address, [movingPollMs],
-/// [idlePollMs], [timeoutMs], [noResetAtBoot])`.
+/// `phytronCreateMCC(controllerName, asynPort, address, movingPollPeriod,
+/// idlePollPeriod, timeout, noResetAtBoot)`, periods and timeout in ms.
 fn phytron_create_mcc_command(registry: &Registry) -> CommandDef {
     let registry = registry.clone();
     CommandDef::new(
         "phytronCreateMCC",
         vec![
-            arg_str_req("controllerName"),
-            arg_str_req("asynPort"),
-            arg_int_req("address"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-            arg_double_opt("timeoutMs"),
-            arg_int_opt("noResetAtBoot"),
+            arg_str_req("Controller name"),
+            arg_str_req("Phytron communication port name"),
+            arg_int_req("Controller address (0..15)"),
+            arg_int_opt("Moving poll period (ms)"),
+            arg_int_opt("Idle poll period (ms)"),
+            arg_double_opt("Timeout (ms)"),
+            arg_int_opt("Do not restart controller with IOC"),
         ],
-        "phytronCreateMCC(controllerName, asynPort, address, [movingPollMs], [idlePollMs], \
-         [timeoutMs], [noResetAtBoot]) - Register a Phytron MCC-1/MCC-2 controller by name",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let address = req_int(args, 2, "address")?;
+        "phytronCreateMCC(controllerName, asynPort, address, movingPollPeriod, idlePollPeriod, \
+         timeout, noResetAtBoot)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let name = req_string(args, 0, "Controller name")?;
+            let asyn_port = req_string(args, 1, "Phytron communication port name")?;
+            let address = req_int(args, 2, "Controller address (0..15)")?;
             if !(0..=15).contains(&address) {
                 return Err("phytronCreateMCC: address must be 0..=15".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-            let timeout_ms = opt_double(args, 5, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
-            let no_reset = opt_int(args, 6, 0, "noResetAtBoot")?;
+            let timeout_ms = opt_double(args, 5, DEFAULT_TIMEOUT_MS, "Timeout (ms)")?;
+            let no_reset = opt_int(args, 6, 0, "Do not restart controller with IOC")?;
 
             register_controller(
+                ctx,
                 &registry,
                 name,
                 asyn_port,
@@ -138,6 +149,7 @@ fn phytron_create_mcc_command(registry: &Registry) -> CommandDef {
 /// Shared body for the two create-controller commands.
 #[allow(clippy::too_many_arguments)]
 fn register_controller(
+    ctx: &CommandContext,
     registry: &Registry,
     name: String,
     asyn_port: String,
@@ -154,63 +166,211 @@ fn register_controller(
             "{cmd_name}: controller '{name}' already registered"
         ));
     }
-    let handle = connect_ip(
+    let params = PhytronParams::new(moving_poll_ms as f64 / 1000.0, idle_poll_ms as f64 / 1000.0);
+    let slot = params.controller_slot();
+    register_port_with(ctx, &name, PHYTRON_PORT_AXES, params)?;
+    // C leaves a controller that misses its port out of the list
+    // phytronCreateAxis searches, and skips the reset; its port stays.
+    let (handle, connected) = connect_controller(
         &asyn_port,
         Duration::from_millis(timeout_ms.max(0.0) as u64),
-    )?;
-    let controller = PhytronController::new(handle, ctrl_type, address);
-    if reset_at_boot {
-        controller.reset_at_boot();
+        &name,
+        format_args!("phytronController::phytronController: cannot connect to phytron controller"),
+    );
+    if connected.is_err() {
+        return Ok(CommandOutcome::Continue);
     }
+    let mut controller = PhytronController::new(handle, &name, ctrl_type, address);
+    if reset_at_boot {
+        controller.reset_at_boot(&name);
+    }
+    controller.read_type();
+    let port = PortManager::global()
+        .find_port_handle(&name)
+        .map_err(|e| format!("{cmd_name}: {e}"))?;
+    let axis_status = port
+        .drv_user_create_blocking(&DrvUserRequest::new("AXIS_STATUS", 0))
+        .map_err(|e| format!("{cmd_name}: {e}"))?
+        .reason;
+    controller.set_axis_status_reason(axis_status);
     let controller = Arc::new(Mutex::new(controller));
-    registry_lock(registry).insert(
+    let _ = slot.set(controller.clone());
+    let poller = Controller::new().controller_poll({
+        let controller = controller.clone();
+        move || controller.lock().unwrap_or_else(|e| e.into_inner()).poll()
+    });
+    // C startPoller, phytronAxisMotor.cpp:240
+    poller.start(&name, moving_poll_ms, idle_poll_ms, 5);
+    let mut controllers = registry_lock(registry);
+    // C registers its hook with the first controller (:186-187).
+    if controllers.is_empty() {
+        let registry = registry.clone();
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AfterInitDevSup {
+                wait_for_initial_readout(&registry);
+            }
+        }));
+    }
+    controllers.insert(
         name.clone(),
         ControllerReg {
             controller,
-            moving_poll_ms,
-            idle_poll_ms,
+            poller: Arc::new(poller),
         },
-    );
-    println!(
-        "{cmd_name}: controller='{name}' asynPort={asyn_port} poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-         (attach axes with phytronCreateAxis)"
     );
     Ok(CommandOutcome::Continue)
 }
 
-/// `phytronCreateAxis(controllerName, module, index)`.
-fn phytron_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> CommandDef {
+/// C `phytronController::epicsInithookFunction` (phytronAxisMotor.cpp:
+/// 1003-1024): before motorRecord init_record pass 1, wait until every
+/// controller has been read once. The shell thread waits; the pollers run.
+fn wait_for_initial_readout(registry: &Registry) {
+    let controllers: Vec<_> = registry_lock(registry)
+        .values()
+        .map(|reg| reg.controller.clone())
+        .collect();
+    for controller in controllers {
+        while !controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .did_initial_readout()
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// `phytronCreateAxis(controllerName, module, index)`, printing C's error lines.
+fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
     let registry = registry.clone();
-    let holder = holder.clone();
     CommandDef::new(
         "phytronCreateAxis",
         vec![
-            arg_str_req("controllerName"),
-            arg_int_req("module"),
-            arg_int_req("index"),
+            arg_str_req("Controller Name"),
+            arg_int_req("Module index"),
+            arg_int_req("Axis index"),
         ],
-        "phytronCreateAxis(controllerName, module, index) - Attach one Phytron axis \
-         (DTYP PHYTRON_{controllerName}_{module}_{index})",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let module = req_int(args, 1, "module")?;
-            let index = req_int(args, 2, "index")?;
+        "phytronCreateAxis(controllerName, module, index)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let name = req_string(args, 0, "Controller Name")?;
+            let module = req_int(args, 1, "Module index")?;
+            let index = req_int(args, 2, "Axis index")?;
+            if index <= 0 {
+                println!("ERROR: invalid axis specified");
+                return Ok(CommandOutcome::Continue);
+            }
 
             let reg = registry_lock(&registry);
-            let entry = reg
-                .get(&name)
-                .ok_or_else(|| format!("phytronCreateAxis: controller '{name}' not registered"))?;
+            let Some(entry) = reg.get(&name) else {
+                println!("ERROR: phytronCreateAxis: Controller {name} is not registered");
+                return Ok(CommandOutcome::Continue);
+            };
             let controller = entry.controller.clone();
-            let moving_poll_ms = entry.moving_poll_ms;
-            let idle_poll_ms = entry.idle_poll_ms;
+            let poller = entry.poller.clone();
             drop(reg);
 
-            let axis = PhytronAxis::new(controller, module as i32, index as i32)
-                .map_err(|e| format!("phytronCreateAxis: {e}"))?;
-            let dtyp_key = format!("PHYTRON_{name}_{module}_{index}");
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
-            println!("phytronCreateAxis: {dtyp_key} (module={module} index={index})");
+            let axis_no = (module * 10 + index) as i32;
+            // C constructs the axis under pC->lock() (phytronAxisMotor.cpp:
+            // 1262-1265).
+            poller.install_built(asyn_user(&name, axis_no), || {
+                let axis = PhytronAxis::new(controller.clone(), module as i32, index as i32)
+                    .map_err(|e| format!("phytronCreateAxis: {e}"))?;
+                let report: Arc<dyn AxisReport> = Arc::new(PhytronAxisReport(axis_no));
+                Ok((Arc::new(Mutex::new(axis)), Some(report)))
+            })?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `phytronBrakeOutput(controllerName, axis, output, disableMotor,
+/// engageTime, releaseTime)`: the axis and output as `module.index`, the
+/// times in ms.
+fn phytron_brake_output_command(registry: &Registry) -> CommandDef {
+    let registry = registry.clone();
+    CommandDef::new(
+        "phytronBrakeOutput",
+        vec![
+            arg_str_opt("Controller Name"),
+            arg_double_opt("Axis index"),
+            arg_double_opt("Output index"),
+            arg_int_opt("Motor disable flag"),
+            arg_double_opt("Brake engage wait time (ms)"),
+            arg_double_opt("Brake release wait time (ms)"),
+        ],
+        "phytronBrakeOutput(controllerName, axis, output, disableMotor, engageTime, releaseTime)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let name = opt_string(args, 0)?.unwrap_or_default();
+            let axis = opt_double(args, 1, 0.0, "Axis index")? as f32;
+            let output = opt_double(args, 2, 0.0, "Output index")? as f32;
+            let disable = opt_int(args, 3, 0, "Motor disable flag")? != 0;
+            let engage = opt_double(args, 4, 0.0, "Brake engage wait time (ms)")?;
+            let release = opt_double(args, 5, 0.0, "Brake release wait time (ms)")?;
+            let controller = registry_lock(&registry)
+                .get(&name)
+                .map(|reg| reg.controller.clone());
+            // C prints its unset axis name for a missing controller.
+            let configured = controller.map_or(Err(String::new()), |c| {
+                c.lock().unwrap_or_else(|e| e.into_inner()).configure_brake(
+                    axis,
+                    output,
+                    disable,
+                    engage / 1000.,
+                    release / 1000.,
+                )
+            });
+            if let Err(m) = configured {
+                println!(
+                    "ERROR: phytronBrakeOutput: Controller {name} is not registered or axis {m} not found"
+                );
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `phytronCreateDigital` / `phytronCreateAnalog(ioName, controllerName,
+/// card, channel, initCommands)`, C `phytronIO::createIOcontroller`
+/// (phytronIOctrl.cpp:110-141); card and channel are C's `epicsUInt8`.
+fn phytron_create_io_command(registry: &Registry, name: &'static str, analog: bool) -> CommandDef {
+    let registry = registry.clone();
+    CommandDef::new(
+        name,
+        vec![
+            arg_str_opt("IO Controller Name"),
+            arg_str_opt("Phytron Controller Name"),
+            arg_int_opt("card number (1..)"),
+            arg_int_opt("channel number (1..)"),
+            arg_str_opt("initial commands string"),
+        ],
+        format!("{name}(ioName, controllerName, card, channel, initCommands)"),
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let io_name = opt_string(args, 0)?.unwrap_or_default();
+            let ctrl_name = opt_string(args, 1)?.unwrap_or_default();
+            let card = opt_int(args, 2, 0, "card number (1..)")? as u8;
+            let channel = opt_int(args, 3, 0, "channel number (1..)")? as u8;
+            let init = opt_string(args, 4)?.unwrap_or_default();
+            let controller = registry_lock(&registry)
+                .get(&ctrl_name)
+                .filter(|_| !io_name.is_empty())
+                .map(|reg| reg.controller.clone());
+            let probed = controller.and_then(|c| {
+                let ctrl = c.lock().unwrap_or_else(|e| e.into_inner());
+                let probed = io::probe(&ctrl, analog, card, channel, &init);
+                drop(ctrl);
+                Some((c, probed?))
+            });
+            let Some((controller, probed)) = probed else {
+                println!("ERROR: invalid call to phytronCreateIOcontroller");
+                return Ok(CommandOutcome::Continue);
+            };
+            let claim = match claim_port_driver(&io_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+            let owner = ctx.db().scan_control().interrupt_gate();
+            io::register(claim, &controller, probed, card, channel, owner)
+                .map_err(|e| format!("{name}: {e}"))?;
             Ok(CommandOutcome::Continue)
         },
     )

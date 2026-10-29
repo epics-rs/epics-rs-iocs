@@ -19,7 +19,7 @@ epicsEnvSet("HANDLE",  "gm10_0")
 gm10Init("$(HANDLE)", "192.168.1.100")
 
 # Per-instrument system records: module presence, error/alarm summary, the
-# four 1-second poll triggers, freeze/recording/compute mode.
+# three 1-second poll triggers, freeze/recording/compute mode.
 dbLoadRecords("$(GM10)/db/gm10_system.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE)")
 
 # One record set per configured channel, address-family template matching
@@ -27,20 +27,20 @@ dbLoadRecords("$(GM10)/db/gm10_system.template", "P=$(P),DAU=$(DAU),HANDLE=$(HAN
 # module-relative: module N's channels occupy N*100+1 .. N*100+channel_count
 # (drvGM10.c load_modules), so a digital-input module in module slot 1 owns
 # 101-1xx, not a small standalone number.
-dbLoadRecords("$(GM10)/db/gm10_analog_input.template",  "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=1")
-dbLoadRecords("$(GM10)/db/gm10_analog_input.template",  "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=2")
-dbLoadRecords("$(GM10)/db/gm10_digital_input.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=101")
-dbLoadRecords("$(GM10)/db/gm10_digital_output.template","P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=201")
-dbLoadRecords("$(GM10)/db/gm10_pulse_input.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=301")
-dbLoadRecords("$(GM10)/db/gm10_analog_output.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=401")
-dbLoadRecords("$(GM10)/db/gm10_calculation.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=A1")
-dbLoadRecords("$(GM10)/db/gm10_communication.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=C1")
-dbLoadRecords("$(GM10)/db/gm10_constant.template",      "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=K1")
-dbLoadRecords("$(GM10)/db/gm10_varconstant.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=W1")
+dbLoadRecords("$(GM10)/db/gm10_analog_input.template",  "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=0001")
+dbLoadRecords("$(GM10)/db/gm10_analog_input.template",  "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=0002")
+dbLoadRecords("$(GM10)/db/gm10_digital_input.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=0101")
+dbLoadRecords("$(GM10)/db/gm10_digital_output.template","P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=0201")
+dbLoadRecords("$(GM10)/db/gm10_pulse_input.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=0301")
+dbLoadRecords("$(GM10)/db/gm10_analog_output.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=0401")
+dbLoadRecords("$(GM10)/db/gm10_calculation.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=A001")
+dbLoadRecords("$(GM10)/db/gm10_communication.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=C001")
+dbLoadRecords("$(GM10)/db/gm10_constant.template",      "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=K001")
+dbLoadRecords("$(GM10)/db/gm10_varconstant.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=W001")
 
 iocInit()
 
 # Example:
 #   dbl
-#   camonitor gm10:dau1:1 gm10:dau1:1:Unit
-#   caput gm10:dau1:401:Set 12.5
+#   camonitor gm10:dau1:0001 gm10:dau1:0001:Unit
+#   caput gm10:dau1:0401:Set 12.5

@@ -59,6 +59,10 @@ fn main() {
     {
         println!("cargo::rustc-link-lib=dylib={l}");
     }
+    // A link arg reaches only this package's own binaries (its tests); every
+    // other binary that links ad-pylon sets its rpath from
+    // DEP_PYLONSHIM_LIBDIR in its own build script.
+    println!("cargo::metadata=libdir={lib}");
     println!("cargo::rustc-link-arg=-Wl,-rpath,{lib}");
     println!("cargo::rustc-link-arg=-Wl,-E");
 }

@@ -2,14 +2,16 @@ use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::port_handle::PortHandle;
 
-use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
+use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
 
 use realsense_rust::config::Config;
@@ -31,6 +33,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 
 use crate::params::{D435iConfigSnapshot, D435iParams};
+use crate::trace::{self, TraceMask};
 use crate::types::CameraCapabilities;
 use crate::types::{AcqCommand, DirtyFlags};
 
@@ -45,7 +48,7 @@ async fn write_string(handle: &PortHandle, reason: usize, addr: i32, value: Stri
             vec![ParamSetValue::new(
                 reason,
                 addr,
-                ParamValue::Octet(value.into_bytes()),
+                ParamValue::Octet(value.into_bytes().into()),
             )],
         )
         .await;
@@ -57,15 +60,14 @@ pub(crate) struct AcquisitionContext {
     // Color port
     pub color_handle: PortHandle,
     pub color_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    pub color_queued: Arc<QueuedArrayCounter>,
+    pub color_pool: DriverPool,
     // Depth port
     pub depth_handle: PortHandle,
     pub depth_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    pub depth_queued: Arc<QueuedArrayCounter>,
+    pub depth_pool: DriverPool,
     // Pointcloud output
+    /// Point clouds are the colour port's arrays.
     pub pc_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    #[allow(dead_code)] // kept alive for QueuedArrayCounter
-    pub pc_queued: Arc<QueuedArrayCounter>,
     // Shared
     pub dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     pub color_ad: ADBaseParams,
@@ -78,17 +80,19 @@ pub(crate) struct AcquisitionContext {
 }
 
 impl AcquisitionContext {
-    async fn end_acquisition(&self, wait_for_plugins: bool) {
-        if wait_for_plugins {
-            self.color_queued.wait_until_zero(Duration::from_secs(5));
-            self.depth_queued.wait_until_zero(Duration::from_secs(5));
-        }
+    /// Lines of the acquisition task, printed on the colour (main) port.
+    fn trace(&self, mask: TraceMask, msg: &str) {
+        trace::print(self.color_handle.port_name(), mask, msg);
+    }
+
+    /// ADAcquireBusy follows the ADAcquire store, WaitForPlugins included, on
+    /// the colour port's own queued count (asynNDArrayDriver.cpp:636-663).
+    async fn end_acquisition(&self) {
         let _ = self
             .color_handle
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::new(self.color_ad.acquire_busy, 0, ParamValue::Int32(0)),
                     ParamSetValue::new(
                         self.color_ad.status,
                         0,
@@ -109,16 +113,21 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
 
 /// Open a fresh context and start a pipeline for `config`.
 fn start_pipeline(
+    port: &str,
     config: &D435iConfigSnapshot,
     caps: &CameraCapabilities,
 ) -> anyhow::Result<realsense_rust::pipeline::ActivePipeline> {
     let rs_ctx = Context::new()?;
     let rs_pipeline = InactivePipeline::try_from(&rs_ctx)?;
-    let rs_config = build_config(config, caps)?;
+    let rs_config = build_config(port, config, caps)?;
     rs_pipeline.start(Some(rs_config))
 }
 
-fn build_config(config: &D435iConfigSnapshot, caps: &CameraCapabilities) -> anyhow::Result<Config> {
+fn build_config(
+    port: &str,
+    config: &D435iConfigSnapshot,
+    caps: &CameraCapabilities,
+) -> anyhow::Result<Config> {
     let mut cfg = Config::new();
     let w = config.res_x as usize;
     let h = config.res_y as usize;
@@ -133,7 +142,11 @@ fn build_config(config: &D435iConfigSnapshot, caps: &CameraCapabilities) -> anyh
         cfg.enable_stream(Rs2StreamKind::Accel, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
         cfg.enable_stream(Rs2StreamKind::Gyro, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
     } else {
-        log::info!("D435i: no IMU on this camera; streaming colour and depth only");
+        trace::print(
+            port,
+            TraceMask::FLOW,
+            "D435i: no IMU on this camera; streaming colour and depth only\n",
+        );
     }
 
     if !config.serial.is_empty() {
@@ -150,17 +163,34 @@ fn build_config(config: &D435iConfigSnapshot, caps: &CameraCapabilities) -> anyh
 /// Options are not uniform across the D400 family, and a discarded error here
 /// is indistinguishable from a setting that took effect -- the readback record
 /// echoes the requested value either way.
-fn set_sensor_option(sensor: &mut realsense_rust::sensor::Sensor, option: Rs2Option, value: f32) {
+fn set_sensor_option(
+    port: &str,
+    sensor: &mut realsense_rust::sensor::Sensor,
+    option: Rs2Option,
+    value: f32,
+) {
     if !sensor.supports_option(option) {
-        log::warn!("D435i: this camera has no {option:?} option; ignoring");
+        trace::print(
+            port,
+            TraceMask::WARNING,
+            &format!("D435i: this camera has no {option:?} option; ignoring\n"),
+        );
         return;
     }
     if let Err(e) = sensor.set_option(option, value) {
-        log::warn!("D435i: camera refused {option:?}={value}: {e}");
+        trace::print(
+            port,
+            TraceMask::WARNING,
+            &format!(
+                "D435i: camera refused {option:?}={}: {e}\n",
+                CFloat(f64::from(value)).g()
+            ),
+        );
     }
 }
 
 fn apply_sensor_options(
+    port: &str,
     composite: &CompositeFrame,
     config: &D435iConfigSnapshot,
     caps: &CameraCapabilities,
@@ -173,11 +203,16 @@ fn apply_sensor_options(
         && let Ok(mut sensor) = FrameEx::sensor(color_frame)
     {
         if config.auto_exposure {
-            set_sensor_option(&mut sensor, Rs2Option::EnableAutoExposure, 1.0);
+            set_sensor_option(port, &mut sensor, Rs2Option::EnableAutoExposure, 1.0);
         } else {
-            set_sensor_option(&mut sensor, Rs2Option::EnableAutoExposure, 0.0);
-            set_sensor_option(&mut sensor, Rs2Option::Exposure, config.exposure as f32);
-            set_sensor_option(&mut sensor, Rs2Option::Gain, config.gain as f32);
+            set_sensor_option(port, &mut sensor, Rs2Option::EnableAutoExposure, 0.0);
+            set_sensor_option(
+                port,
+                &mut sensor,
+                Rs2Option::Exposure,
+                config.exposure as f32,
+            );
+            set_sensor_option(port, &mut sensor, Rs2Option::Gain, config.gain as f32);
         }
     }
 
@@ -190,12 +225,14 @@ fn apply_sensor_options(
         && let Ok(mut sensor) = FrameEx::sensor(depth_frame)
     {
         set_sensor_option(
+            port,
             &mut sensor,
             Rs2Option::EmitterEnabled,
             if config.emitter_enabled { 1.0 } else { 0.0 },
         );
         if config.emitter_enabled {
             set_sensor_option(
+                port,
                 &mut sensor,
                 Rs2Option::LaserPower,
                 config.laser_power as f32,
@@ -357,22 +394,20 @@ async fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame
     }
 }
 
-/// Copy frame data, stripping any row stride padding.
-/// Returns a tightly-packed buffer of `row_bytes * h` bytes.
-fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, h: usize) -> Vec<u8> {
+/// Copy frame data into `out`, `row_bytes` per row, stripping any row stride
+/// padding.
+fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, out: &mut [u8]) {
     if stride == row_bytes {
         // No padding — fast path
-        let total = row_bytes * h;
-        unsafe { std::slice::from_raw_parts(frame_ptr, total) }.to_vec()
+        out.copy_from_slice(unsafe { std::slice::from_raw_parts(frame_ptr, out.len()) });
     } else {
         // Strip per-row padding
-        let mut buf = Vec::with_capacity(row_bytes * h);
-        for row in 0..h {
+        for (row, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
             let offset = row * stride;
-            let row_slice = unsafe { std::slice::from_raw_parts(frame_ptr.add(offset), row_bytes) };
-            buf.extend_from_slice(row_slice);
+            dst.copy_from_slice(unsafe {
+                std::slice::from_raw_parts(frame_ptr.add(offset), row_bytes)
+            });
         }
-        buf
     }
 }
 
@@ -381,7 +416,7 @@ async fn publish_array(
     handle: &PortHandle,
     output: &Arc<parking_lot::Mutex<NDArrayOutput>>,
     base_params: &epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
-    mut array: NDArray,
+    mut array: DriverArray,
     color_mode: NDColorMode,
 ) {
     // Tag the array itself, not just the parameter. `NDArray::info()` resolves
@@ -392,7 +427,7 @@ async fn publish_array(
     // as Mono: NDColorConvert saw source == target and passed the frame through
     // unconverted, so `image1:ArraySize0_RBV` stayed 3 (the RGB component count)
     // where a viewer expects the image width.
-    array.attributes.add(NDAttribute::new_static(
+    array.fill().attributes_mut().add(NDAttribute::new_static(
         "ColorMode",
         "Color mode",
         NDAttrSource::Driver,
@@ -410,7 +445,7 @@ async fn publish_array(
         ),
         _ => (0, 0, 0),
     };
-    let data_type = array.data.data_type();
+    let data_type = array.data().data_type();
     // ArraySize_RBV is total bytes (C ADCore NDPluginBase convention):
     //   size = prod(dims) * bytes_per_element
     let num_elements: i64 = array.dims.iter().map(|d| d.size as i64).product();
@@ -469,9 +504,7 @@ async fn publish_array(
     // list under the lock, releases it, then fans out. Holding a parking_lot
     // guard across the await would block the whole executor thread the moment
     // a downstream queue applies back-pressure.
-    ArrayPublisher::new(output.clone())
-        .publish(Arc::new(array))
-        .await;
+    ArrayPublisher::new(output.clone()).publish(array).await;
 }
 
 async fn process_color_frame(
@@ -487,9 +520,7 @@ async fn process_color_frame(
         let row_bytes = w * 3; // RGB8: 3 bytes per pixel
 
         let ptr = unsafe { frame.get_data() as *const std::os::raw::c_void as *const u8 };
-        let bytes = copy_frame_data(ptr, stride, row_bytes, h);
 
-        let data = NDDataBuffer::U8(bytes);
         // RGB1 layout: [3, width, height]
         let dims = vec![
             NDDimension::new(3),
@@ -498,9 +529,15 @@ async fn process_color_frame(
         ];
 
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-        let mut array = NDArray::with_data(dims, data);
-        array.unique_id = array_counter;
-        array.update_time_stamps(ts);
+        // No C driver to follow: a refused frame is dropped after the pool's
+        // limit line.
+        let Ok(mut array) = ctx.color_pool.alloc(dims, NDDataType::UInt8) else {
+            return;
+        };
+        let mut out = array.fill();
+        copy_frame_data(ptr, stride, row_bytes, out.data_mut().as_u8_slice_mut());
+        out.set_unique_id(array_counter);
+        out.update_time_stamps(ts);
 
         publish_array(
             &ctx.color_handle,
@@ -532,24 +569,26 @@ async fn process_depth_frame(
     let row_bytes = w * 2; // Z16: 2 bytes per pixel
 
     let ptr = unsafe { frame.get_data() as *const std::os::raw::c_void as *const u8 };
-    let bytes = copy_frame_data(ptr, stride, row_bytes, h);
 
-    // Reinterpret as u16 (RealSense USB protocol is little-endian)
-    let pixels: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-
-    let data = NDDataBuffer::U16(pixels);
     // Mono layout: [width, height]
     let dims = vec![NDDimension::new(w), NDDimension::new(h)];
 
     let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-    let mut array = NDArray::with_data(dims, data);
-    array.unique_id = array_counter;
-    array.update_time_stamps(ts);
+    let Ok(mut array) = ctx.depth_pool.alloc(dims, NDDataType::UInt16) else {
+        return;
+    };
+    let mut out = array.fill();
+    copy_frame_data(ptr, stride, row_bytes, out.data_mut().as_u8_slice_mut());
+    // RealSense USB protocol is little-endian.
+    for p in out
+        .data_mut()
+        .as_mut_slice::<u16>()
+        .expect("allocated as NDUInt16")
+    {
+        *p = u16::from_le(*p);
+    }
+    out.set_unique_id(array_counter);
+    out.update_time_stamps(ts);
 
     publish_array(
         &ctx.depth_handle,
@@ -579,24 +618,29 @@ async fn process_pointcloud(
             return;
         }
 
-        // Flatten vertices [N][3] → Vec<f32>
-        let data: Vec<f32> = vertices
-            .iter()
-            .take(count)
-            .flat_map(|v| v.xyz.iter().copied())
-            .collect();
-
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-        let mut array = NDArray::with_data(
+        let Ok(mut array) = ctx.color_pool.alloc(
             vec![
                 NDDimension::new(3),
                 NDDimension::new(w),
                 NDDimension::new(h),
             ],
-            NDDataBuffer::F32(data),
-        );
-        array.unique_id = array_counter;
-        array.update_time_stamps(ts);
+            NDDataType::Float32,
+        ) else {
+            return;
+        };
+        let mut frame = array.fill();
+        // librealsense emits one vertex per depth pixel, so `count` is w * h.
+        let (points, _) = frame
+            .data_mut()
+            .as_mut_slice::<f32>()
+            .expect("allocated as NDFloat32")
+            .as_chunks_mut::<3>();
+        for (dst, v) in points.iter_mut().zip(&vertices[..count]) {
+            *dst = v.xyz;
+        }
+        frame.set_unique_id(array_counter);
+        frame.update_time_stamps(ts);
 
         publish_array(
             &ctx.color_handle,
@@ -659,6 +703,8 @@ async fn process_imu(composite: &CompositeFrame, ctx: &AcquisitionContext) {
 
 /// Depth post-processing filter chain, created once per acquisition session.
 struct DepthFilterChain {
+    /// The port the filter failures are printed on.
+    port: String,
     decimation: Decimation,
     spatial: SpatialFilter,
     temporal: TemporalFilter,
@@ -666,8 +712,9 @@ struct DepthFilterChain {
 }
 
 impl DepthFilterChain {
-    fn new() -> anyhow::Result<Self> {
+    fn new(port: &str) -> anyhow::Result<Self> {
         Ok(Self {
+            port: port.to_string(),
             decimation: Decimation::new(1)?,
             spatial: SpatialFilter::new(1)?,
             temporal: TemporalFilter::new(1)?,
@@ -709,7 +756,11 @@ impl DepthFilterChain {
                     f = $filter
                         .wait(timeout)
                         .map_err(|e| {
-                            log::warn!("D435i: {} wait failed: {e}", $name);
+                            trace::print(
+                                &self.port,
+                                TraceMask::WARNING,
+                                &format!("D435i: {} wait failed: {e}\n", $name),
+                            );
                         })
                         .ok()?;
                 }
@@ -738,7 +789,7 @@ async fn try_connect_pipeline(
                 ParamSetValue::new(
                     ctx.color_ad.status_message,
                     0,
-                    ParamValue::Octet("Connecting to camera...".into()),
+                    ParamValue::Octet("Connecting to camera...".as_bytes().into()),
                 ),
                 ParamSetValue::new(ctx.rs_params.rs_connected, 0, ParamValue::Int32(0)),
             ],
@@ -752,17 +803,23 @@ async fn try_connect_pipeline(
             return None;
         }
 
-        let result = start_pipeline(config, &ctx.caps);
+        let result = start_pipeline(ctx.color_handle.port_name(), config, &ctx.caps);
 
         match result {
             Ok(p) => return Some(p),
             Err(e) => {
                 retry_count += 1;
                 if retry_count == 1 || retry_count.is_multiple_of(5) {
-                    log::warn!("D435i: connection attempt {retry_count} failed: {e}");
+                    ctx.trace(
+                        TraceMask::WARNING,
+                        &format!("D435i: connection attempt {retry_count} failed: {e}\n"),
+                    );
                 }
                 if retry_count >= MAX_CONNECT_RETRIES {
-                    log::error!("D435i: giving up after {retry_count} connection attempts");
+                    ctx.trace(
+                        TraceMask::ERROR,
+                        &format!("D435i: giving up after {retry_count} connection attempts\n"),
+                    );
                     write_string(
                         &ctx.color_handle,
                         ctx.color_ad.status_message,
@@ -806,7 +863,6 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         0,
                         ParamValue::Int32(ADStatus::Acquire as i32),
                     ),
-                    ParamSetValue::new(ctx.color_ad.acquire_busy, 0, ParamValue::Int32(1)),
                 ],
             )
             .await;
@@ -838,8 +894,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         {
             Ok(cfg) => cfg,
             Err(e) => {
-                log::error!("D435i: failed to read config: {e}");
-                ctx.end_acquisition(false).await;
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &format!("D435i: failed to read config: {e}\n"),
+                );
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -848,7 +907,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         let mut pipeline = match try_connect_pipeline(&mut ctx, &config).await {
             Some(p) => p,
             None => {
-                ctx.end_acquisition(false).await;
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -863,18 +922,21 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     ParamSetValue::new(
                         ctx.color_ad.status_message,
                         0,
-                        ParamValue::Octet("Acquiring data".into()),
+                        ParamValue::Octet("Acquiring data".as_bytes().into()),
                     ),
                 ],
             )
             .await;
 
         // Create processing blocks
-        let mut depth_filters = match DepthFilterChain::new() {
+        let mut depth_filters = match DepthFilterChain::new(ctx.color_handle.port_name()) {
             Ok(f) => f,
             Err(e) => {
-                log::error!("D435i: failed to create depth filters: {e}");
-                ctx.end_acquisition(false).await;
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &format!("D435i: failed to create depth filters: {e}\n"),
+                );
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -883,8 +945,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         let mut align = match Align::new(Rs2StreamKind::Color, 1) {
             Ok(a) => a,
             Err(e) => {
-                log::error!("D435i: failed to create align block: {e}");
-                ctx.end_acquisition(false).await;
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &format!("D435i: failed to create align block: {e}\n"),
+                );
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -892,8 +957,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         let mut pc_block = match PointCloud::new(1) {
             Ok(p) => p,
             Err(e) => {
-                log::error!("D435i: failed to create pointcloud block: {e}");
-                ctx.end_acquisition(false).await;
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &format!("D435i: failed to create pointcloud block: {e}\n"),
+                );
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -923,7 +991,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 };
 
                 drop(pipeline.stop());
-                pipeline = match start_pipeline(&config, &ctx.caps) {
+                pipeline = match start_pipeline(ctx.color_handle.port_name(), &config, &ctx.caps) {
                     Ok(p) => p,
                     Err(e) => {
                         // RSStreamMode offers every mode the D435i supports,
@@ -931,7 +999,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         // stream over a refused mode is the wrong answer:
                         // report it, go back to the mode that was running, and
                         // only give up if that fails too.
-                        log::error!("D435i: stream mode refused by the camera: {e}");
+                        ctx.trace(
+                            TraceMask::ERROR,
+                            &format!("D435i: stream mode refused by the camera: {e}\n"),
+                        );
                         write_string(
                             &ctx.color_handle,
                             ctx.color_ad.status_message,
@@ -951,10 +1022,15 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                                 )],
                             )
                             .await;
-                        match start_pipeline(&config, &ctx.caps) {
+                        match start_pipeline(ctx.color_handle.port_name(), &config, &ctx.caps) {
                             Ok(p) => p,
                             Err(e) => {
-                                log::error!("D435i: could not fall back to the previous mode: {e}");
+                                ctx.trace(
+                                    TraceMask::ERROR,
+                                    &format!(
+                                        "D435i: could not fall back to the previous mode: {e}\n"
+                                    ),
+                                );
                                 write_string(
                                     &ctx.color_handle,
                                     ctx.color_ad.status_message,
@@ -1025,14 +1101,20 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
                     // Log first error, then every 10th to avoid spam
                     if consecutive_errors == 1 || consecutive_errors.is_multiple_of(10) {
-                        log::warn!("D435i: frame wait error ({consecutive_errors}x): {e}");
+                        ctx.trace(
+                            TraceMask::WARNING,
+                            &format!("D435i: frame wait error ({consecutive_errors}x): {e}\n"),
+                        );
                     }
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        log::error!("D435i: {} consecutive frame errors", consecutive_errors);
+                        ctx.trace(
+                            TraceMask::ERROR,
+                            &format!("D435i: {consecutive_errors} consecutive frame errors\n"),
+                        );
 
                         // Continuous mode: attempt reconnection
                         if config.image_mode == ImageMode::Continuous {
-                            log::info!("D435i: attempting reconnection...");
+                            ctx.trace(TraceMask::FLOW, "D435i: attempting reconnection...\n");
                             write_string(
                                 &ctx.color_handle,
                                 ctx.color_ad.status_message,
@@ -1124,7 +1206,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Apply sensor options on first frame after config change
             if !sensor_options_applied {
-                apply_sensor_options(&composite, &config, &ctx.caps);
+                apply_sensor_options(ctx.color_handle.port_name(), &composite, &config, &ctx.caps);
                 sensor_options_applied = true;
             }
 
@@ -1203,6 +1285,22 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         }
 
         // Pipeline is dropped here (ActivePipeline::drop calls rs2_delete_pipeline)
-        ctx.end_acquisition(config.wait_for_plugins).await;
+        ctx.end_acquisition().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_frame_data_strips_the_row_padding() {
+        let frame = [1u8, 2, 3, 0xee, 4, 5, 6, 0xee];
+        let mut out = [0u8; 6];
+        copy_frame_data(frame.as_ptr(), 4, 3, &mut out);
+        assert_eq!(out, [1, 2, 3, 4, 5, 6]);
+        let mut out = [0u8; 8];
+        copy_frame_data(frame.as_ptr(), 4, 4, &mut out);
+        assert_eq!(out, frame);
     }
 }

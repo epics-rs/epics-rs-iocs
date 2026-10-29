@@ -6,34 +6,36 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::base::error::CaResult;
+use epics_rs::base::runtime::log::{ErrlogSevEnum, errlog_sev_vprintf};
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
 use usb_ctr::{CtrRuntime, CtrScalerDriver, create_usb_ctr};
 
+/// `scalerSupport.dbd`'s `device(scaler,INST_IO,devScalerAsyn,"Asyn Scaler")`.
+static SCALER_DEVICES: &[epics_rs::base::server::record::DevSup] =
+    &[epics_rs::base::server::record::DevSup {
+        name: "devScalerAsyn",
+        choice: "Asyn Scaler",
+        link_type: epics_rs::base::server::record::DbLinkType::InstIo,
+        dset: epics_rs::base::server::record::Dset::new(7, &[2, 4, 5, 6], false),
+    }];
+
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
-    // The drivers report every uldaq failure through `log`; without a
-    // backend installed those calls are no-ops and a failed ulAOut or
-    // ulAInScan leaves no trace anywhere. Defaults to warn-and-above.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-
     let args: Vec<String> = std::env::args().collect();
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: usb-ctr-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: usb-ctr-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default(
+    epics_rs::base::runtime::env::set_default_path(
         "MEASCOMP",
         concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
     );
-    // This IOC's own directory: its auto_settings.req and autosave/ live
-    // here, so the two meascomp IOCs never share a request or save file.
-    epics_rs::base::runtime::env::set_default("USB_CTR_IOC", env!("CARGO_MANIFEST_DIR"));
     // scaler-rs ships scaler.db; st.cmd loads it from $(SCALER)/db the
     // way upstream's USBCTR st.cmd loads it from the scaler module. The
     // crate's const names the db dir itself; SCALER names the crate dir
@@ -41,9 +43,19 @@ async fn main() -> CaResult<()> {
     let scaler_dir = std::path::Path::new(epics_rs::scaler::SCALER_DB_DIR)
         .parent()
         .expect("SCALER_DB_DIR is <crate>/db");
-    epics_rs::base::runtime::env::set_default(
+    epics_rs::base::runtime::env::set_default_path(
         "SCALER",
         scaler_dir.to_str().expect("cargo paths are UTF-8"),
+    );
+
+    // mca ships SIS38XX_waveform.template; MCA names its crate dir, as
+    // SCALER does, so st.cmd loads it from $(MCA)/db.
+    let mca_dir = std::path::Path::new(mca::MCA_DB_DIR)
+        .parent()
+        .expect("MCA_DB_DIR is <crate>/db");
+    epics_rs::base::runtime::env::set_default_path(
+        "MCA",
+        mca_dir.to_str().expect("cargo paths are UTF-8"),
     );
 
     // Runtime kept alive by being captured in the startup command closure
@@ -58,7 +70,8 @@ async fn main() -> CaResult<()> {
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
 
-    // The optional mca-record form of the MCS spectra (meascomp_mca.template).
+    // C's app links mcaSupport.dbd (measCompAppInclude.dbd:8) for st.cmd's
+    // optional mca-record form of the MCS spectra.
     let (mca_name, mca_factory) = mca_rs::mca_record_factory();
     app = app.register_record_type(mca_name, move || mca_factory());
 
@@ -74,7 +87,7 @@ async fn main() -> CaResult<()> {
     // The scaler device support binds dynamically by DTYP at iocInit, so the
     // name is in no device menu when scaler.db's DTYP field is applied.
     // Contributing the menu here makes that assignment resolve.
-    epics_rs::base::server::record::register_device_menu(scaler_name, &["Asyn Scaler"]);
+    epics_rs::base::server::record::register_device_menu(scaler_name, SCALER_DEVICES);
 
     // Universal asyn device support, and with it asyn.dbd's shell commands
     // (asynReport, asynSetTraceMask, ...) on PortManager::global().
@@ -107,13 +120,13 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "USBCTRConfig portName uniqueID [maxTimePoints]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let unique_id = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("uniqueID required".into()),
                 };
                 let max_points = match args.get(2) {
@@ -121,16 +134,24 @@ async fn main() -> CaResult<()> {
                     _ => 2048,
                 };
 
-                let ctr_rt = create_usb_ctr(&port_name, &unique_id, max_points)?;
+                // drvUSBCTR is an asynPortDriver: its base registers the port
+                // before the device is opened.
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let ctr_rt = create_usb_ctr(&claim, &unique_id, max_points)?;
 
                 *scaler_slot.lock().unwrap() = Some(CtrScalerDriver::new(
                     ctr_rt.device.clone(),
                     ctr_rt.state.clone(),
-                    ctr_rt.port_handle().clone(),
                 ));
 
-                let port_handle = ctr_rt.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle)
+                claim
+                    .publish(
+                        ctr_rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
                     .map_err(|e| e.to_string())?;
 
                 *rt.lock().unwrap() = Some(ctr_rt);
@@ -142,30 +163,81 @@ async fn main() -> CaResult<()> {
     // Binds the USB-CTR08's counters to the scalerRecord scaler.db declares.
     {
         let scaler_slot = pending_scaler.clone();
-        app = app.register_dynamic_device_support(move |ctx: &DeviceSupportContext| {
-            if ctx.dtyp != "Asyn Scaler" {
-                return None;
-            }
-            let driver = scaler_slot.lock().unwrap().take()?;
-            Some(Box::new(
-                epics_rs::scaler::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(
-                    Box::new(driver),
+        app = app.register_dynamic_device_support(
+            &[(
+                "scaler",
+                std::slice::from_ref(
+                    &epics_rs::scaler::device_support::scaler_asyn::ASYN_SCALER_DEVICE,
                 ),
-            ) as Box<dyn DeviceSupport>)
-        });
+            )],
+            move |ctx: &DeviceSupportContext| {
+                if ctx.dtyp != "Asyn Scaler" {
+                    return None;
+                }
+                let driver = scaler_slot.lock().unwrap().take()?;
+                Some(Box::new(
+                    epics_rs::scaler::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(
+                        Box::new(driver),
+                    ),
+                ) as Box<dyn DeviceSupport>)
+            },
+        );
     }
 
-    // Binds every mca record with DTYP "asynMCA" to the port its INP names,
-    // as upstream's devMcaAsyn does.
-    app = app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-        if ctx.dtyp != mca::interface::ASYN_MCA_DTYP {
-            return None;
-        }
-        let dev = mca::dev_mca_asyn::connect(ctx.inp)?;
-        Some(Box::new(dev) as Box<dyn DeviceSupport>)
-    });
+    // seq's iocsh command (seq_cmd.c:134-164), for the one program this IOC
+    // links.
+    app = app.register_startup_command(CommandDef::new(
+        "seq",
+        vec![
+            ArgDesc {
+                name: "sequencer",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "macro definitions",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "stack size",
+                arg_type: ArgType::Int,
+            },
+        ],
+        "seq sequencer [macro definitions] [stack size]",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let Some(ArgValue::String(table)) = args.first() else {
+                println!("No sequencer specified.");
+                return Ok(CommandOutcome::Continue);
+            };
+            let stack_size = match args.get(2) {
+                Some(ArgValue::Int(n)) => *n,
+                _ => 0,
+            };
+            if stack_size < 0 {
+                errlog_sev_vprintf(
+                    ErrlogSevEnum::Fatal,
+                    format_args!("3rd argument of seq must be a positive integer"),
+                );
+                return Ok(CommandOutcome::Continue);
+            }
+            let table = table.to_str()?;
+            let table = table.strip_prefix('&').unwrap_or(table);
+            if table != "USBCTR_SNL" {
+                println!("Can't find sequencer `{table}'.");
+                return Ok(CommandOutcome::Continue);
+            }
+            let macros = match args.get(1) {
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
+                _ => String::new(),
+            };
+            epics_seq_rs::seq(
+                &usb_ctr::snl::USBCTR_SNL,
+                &macros,
+                stack_size as u32,
+                ctx.db(),
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    ));
 
-    app.startup_script(&script)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

@@ -1,0 +1,97 @@
+# c-expansion of st.cmd.AGAP_CONEX over the C sources, the records of iocNewport.AGAP_CONEX.dbl:
+# dbl of motor R7-4-5 motorNewport iocBoot/iocNewport st.cmd.AGAP_CONEX
+record(motor, "IOC:m1") {
+    field(ACCL, ".25")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "U tilt")
+    field(DHLM, "2")
+    field(DIR, "Pos")
+    field(DLLM, "-2")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, ".0001")
+    field(NTM, "0")
+    field(OUT, "@asyn(Agilis1,0)")
+    field(PREC, "4")
+    field(RTRY, "0")
+    field(TWV, "1")
+    field(VBAS, "0.1")
+    field(VELO, ".5")
+}
+record(longout, "IOC:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "IOC:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Agilis1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "IOC:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Agilis1,0)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "IOC:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "IOC:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Agilis1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(motor, "IOC:m2") {
+    field(ACCL, ".25")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "V tilt")
+    field(DHLM, "2")
+    field(DIR, "Pos")
+    field(DLLM, "-2")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, ".0001")
+    field(OUT, "@asyn(Agilis1,1)")
+    field(PREC, "4")
+    field(TWV, "1")
+    field(VBAS, "0.1")
+    field(VELO, ".5")
+}
+record(longout, "IOC:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "IOC:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Agilis1,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "IOC:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Agilis1,1)MOTOR_REC_OFFSET")
+    field(PREC, "4")
+}
+record(ao, "IOC:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "IOC:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(Agilis1,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "4")
+}
+record(asyn, "IOC:serial1") {
+    field(ADDR, "0")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "256")
+    field(OMAX, "256")
+    field(PORT, "serial1")
+}

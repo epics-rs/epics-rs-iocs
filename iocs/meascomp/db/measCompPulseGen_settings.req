@@ -1,0 +1,10 @@
+# DutyCycle, not C's Width: DutyCycle's PINI writes its 0.5 and CalcWidth
+# overwrites the restored Width from it (measCompPulseGen.template:87-115),
+# so C boots every generator at 50 % duty. C defect, not copied
+# (upstream-c-defects #228).
+$(P)$(R)Period
+$(P)$(R)DutyCycle
+$(P)$(R)Delay
+$(P)$(R)Count
+$(P)$(R)IdleState
+$(P)$(R)Run

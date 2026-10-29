@@ -10,6 +10,9 @@
 //! every command and splits replies on the `0x18` (CAN) byte camserver sends
 //! after each reply. The strings below therefore carry no terminator.
 
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
+
 use crate::types::{GAIN_STRINGS, TriggerMode};
 
 // ---------------------------------------------------------------------------
@@ -27,22 +30,12 @@ pub(crate) fn expect_lit<'a>(s: &'a str, lit: &str) -> Option<&'a str> {
     s.strip_prefix(lit)
 }
 
-/// `%d`: skip leading whitespace, then read an optionally-signed decimal.
+/// `%d`, which glibc stores as `(int) strtol(s, &end, 10)`.
 pub(crate) fn scan_i32(s: &str) -> Option<(i32, &str)> {
-    let s = skip_ws(s);
-    let bytes = s.as_bytes();
-    let mut end = 0;
-    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-        end += 1;
+    match strtol(s, 10) {
+        (_, 0) => None,
+        (v, end) => Some((long_to_int(v), &s[end..])),
     }
-    let digits_start = end;
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end == digits_start {
-        return None;
-    }
-    s[..end].parse::<i32>().ok().map(|v| (v, &s[end..]))
 }
 
 /// `%f`: skip leading whitespace, then read the longest prefix `strtod` would
@@ -78,17 +71,17 @@ pub fn cmd_nexpframe(n: i32) -> String {
 
 /// C: `"exptime %11.8f"`
 pub fn cmd_exptime(v: f64) -> String {
-    format!("exptime {v:11.8}")
+    format!("exptime {v:11.8}", v = CFloat(v))
 }
 
 /// C: `"expperiod %11.8f"`
 pub fn cmd_expperiod(v: f64) -> String {
-    format!("expperiod {v:11.8}")
+    format!("expperiod {v:11.8}", v = CFloat(v))
 }
 
 /// C: `"delay %f"`
 pub fn cmd_delay(v: f64) -> String {
-    format!("delay {v:.6}")
+    format!("delay {v:.6}", v = CFloat(v))
 }
 
 /// C: `"gapfill %d"`
@@ -102,9 +95,9 @@ pub fn cmd_set_threshold(energy_kev: f64, gain_index: i32, threshold_kev: f64) -
     let gain = GAIN_STRINGS[gain_index.clamp(0, 3) as usize];
     format!(
         "SetThreshold energy {:.0} {} {:.0}",
-        energy_kev * 1000.0,
+        CFloat(energy_kev * 1000.0),
         gain,
-        threshold_kev * 1000.0
+        CFloat(threshold_kev * 1000.0)
     )
 }
 
@@ -135,12 +128,16 @@ pub fn cmd_imgpath(path: &str) -> String {
 
 /// C: `"mxsettings <Name> %f"`
 pub fn cmd_mx_f64(name: &str, v: f64) -> String {
-    format!("mxsettings {name} {v:.6}")
+    format!("mxsettings {name} {v:.6}", v = CFloat(v))
 }
 
 /// C: `"mxsettings <Name> %f,%f"` (`Energy_range`, `Beam_xy`)
 pub fn cmd_mx_pair(name: &str, a: f64, b: f64) -> String {
-    format!("mxsettings {name} {a:.6},{b:.6}")
+    format!(
+        "mxsettings {name} {a:.6},{b:.6}",
+        a = CFloat(a),
+        b = CFloat(b)
+    )
 }
 
 /// C: `"mxsettings N_oscillations %d"`
@@ -346,6 +343,8 @@ mod tests {
         assert_eq!(cmd_exptime(12.25), "exptime 12.25000000");
         // Width 11 is a minimum, not a truncation.
         assert_eq!(cmd_exptime(1234.5), "exptime 1234.50000000");
+        assert_eq!(cmd_exptime(f64::NAN), "exptime         nan");
+        assert_eq!(cmd_exptime(-f64::NAN), "exptime        -nan");
     }
 
     #[test]
@@ -357,6 +356,12 @@ mod tests {
     fn delay_matches_c_percent_f() {
         assert_eq!(cmd_delay(0.0), "delay 0.000000");
         assert_eq!(cmd_delay(0.001), "delay 0.001000");
+        assert_eq!(cmd_delay(f64::NAN), "delay nan");
+        assert_eq!(cmd_delay(-f64::NAN), "delay -nan");
+        assert_eq!(
+            cmd_mx_pair("Beam_xy", -f64::NAN, 1.0),
+            "mxsettings Beam_xy -nan,1.000000"
+        );
     }
 
     #[test]
@@ -642,6 +647,23 @@ mod tests {
         assert_eq!(scan_f32("31.4eC").unwrap().0, 31.4);
         assert_eq!(scan_f32("22.1%").unwrap().1, "%");
         assert!(scan_f32("abc").is_none());
+    }
+
+    /// glibc's `%d` stores `(int) strtol(s, &end, 10)`.
+    #[test]
+    fn an_out_of_range_int_is_glibc_s_cut_to_int() {
+        use std::ffi::c_long;
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        assert_eq!(
+            parse_energy_setting("15 OK Energy setting: 4294967297 eV"),
+            wrapped
+        );
+        assert_eq!(
+            parse_version("Code release: 99999999999999999999.1.2")
+                .unwrap()
+                .major,
+            Some(long_to_int(c_long::MAX))
+        );
     }
 
     #[test]

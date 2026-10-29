@@ -1,0 +1,18 @@
+# C's iocParker motor.substitutions.oem, P and PORT from st.cmd.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{N,  M,       DTYP,         ADDR,  DESC,          EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,           PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "asynMotor",  0,     "motor $(N)",  mm,   Pos,  5,     1,     5,     0,     0,     0,     4.92125984e-5,  5,     20,    -20,   ""}
+{2,  "m$(N)", "asynMotor",  1,     "motor $(N)",  mm,   Pos,  5,     1,     5,     0,     0,     0,     4.92125984e-5,  5,     20,    -20,   ""}
+{3,  "m$(N)", "asynMotor",  2,     "motor $(N)",  mm,   Pos,  5,     1,     5,     0,     0,     0,     4.92125984e-5,  5,     20,    -20,   ""}
+}
+
+file "$(PARKER_IOC)/db/OEMSupport.template"
+{
+pattern
+{R,    RESOLUTION,  ADDR}
+{m1:,  50800,       0}
+{m2:,  50800,       1}
+{m3:,  50800,       2}
+}

@@ -17,59 +17,123 @@
 use std::collections::BTreeMap;
 
 use async_opcua::types::{
-    Array, ByteString, DateTime, LocalizedText, QualifiedName, UAString, Variant,
-    VariantScalarTypeId, VariantTypeId, XmlElement,
+    Array, ByteString, LocalizedText, QualifiedName, UAString, Variant, VariantScalarTypeId,
+    VariantTypeId, XmlElement,
 };
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::types::c_parse::{atoi, strtol_errno, strtoll_errno, strtoul_errno};
+
+use crate::print::ua_print;
 
 /// `EnumChoices` (`DataElement.h:25`) — an enumeration's value → name map, as
 /// read from the server's type dictionary.
 pub type EnumChoices = BTreeMap<u32, String>;
 
-/// Why a value could not be moved between the record and the wire.
+/// Why an incoming value could not be read into the record: each variant is
+/// one of the C's `readScalar`/`readArray` errlog texts
+/// (`DataElementOpen62541Leaf.h:697-950`, `.cpp:300-680`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConvError {
-    /// The value does not fit the target type (`READ_ALARM`/`WRITE_ALARM`,
-    /// `INVALID`; C logs "out-of-bounds"/"value out of range").
-    OutOfRange { value: String, target: &'static str },
-    /// The OPC UA type has no conversion to/from this EPICS type at all
-    /// (C logs "unsupported type kind"/"unsupported conversion").
-    Unsupported { from: String, to: String },
-    /// Incoming data is a scalar where an array was expected, or the reverse.
+pub enum ReadError {
+    /// `incoming data (%s %s) out-of-bounds for %s`: the value does not fit
+    /// the record's type, or is no choice of its enumeration (`.h:806`).
+    OutOfBounds { value: String, target: &'static str },
+    /// A type kind `readScalar` has no arm for. The C prints `unsupported type
+    /// kind %s for incoming data` and then falls into the out-of-bounds line
+    /// (`.h:824-838`).
+    UnsupportedKind {
+        kind: String,
+        value: String,
+        target: &'static str,
+    },
+    /// `incoming data is not an array`.
     NotAnArray,
-    /// Array element type differs from the record's FTVL. The C requires an
-    /// exact match for numeric arrays (`DataElementOpen62541Leaf.h:915`).
+    /// `incoming data type (%s) does not match EPICS array type (%s)`. The C
+    /// requires an exact match for numeric arrays (`.h:915`).
     ArrayTypeMismatch {
         incoming: String,
         target: &'static str,
     },
-    /// The value is outside the enumeration's choices.
-    NotAnEnumChoice { value: String },
 }
 
-impl std::fmt::Display for ConvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ReadError {
+    /// The lines the C logs, each to go out behind `"<record> : "`.
+    pub fn lines(&self) -> Vec<String> {
+        let out_of_bounds = |value: &str, target: &str| {
+            format!("incoming data ({value}) out-of-bounds for {target}")
+        };
         match self {
-            ConvError::OutOfRange { value, target } => {
-                write!(f, "incoming data ({value}) out-of-bounds for {target}")
-            }
-            ConvError::Unsupported { from, to } => {
-                write!(f, "unsupported conversion from {from} to {to}")
-            }
-            ConvError::NotAnArray => f.write_str("incoming data is not an array"),
-            ConvError::ArrayTypeMismatch { incoming, target } => write!(
-                f,
+            ReadError::OutOfBounds { value, target } => vec![out_of_bounds(value, target)],
+            ReadError::UnsupportedKind {
+                kind,
+                value,
+                target,
+            } => vec![
+                format!("unsupported type kind {kind} for incoming data"),
+                out_of_bounds(value, target),
+            ],
+            ReadError::NotAnArray => vec!["incoming data is not an array".to_string()],
+            ReadError::ArrayTypeMismatch { incoming, target } => vec![format!(
                 "incoming data type ({incoming}) does not match EPICS array type ({target})"
-            ),
-            ConvError::NotAnEnumChoice { value } => {
-                write!(f, "value {value} is not a choice of this enumeration")
-            }
+            )],
         }
     }
 }
 
-impl std::error::Error for ConvError {}
+/// Why a record value could not go out to the server: each variant is one of
+/// the C's `writeScalar`/`writeArray` errlog texts
+/// (`DataElementOpen62541Leaf.h:961-1163`, `.cpp:857-1290`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteError {
+    /// `value out of range`, or `value "%s" out of range` when the record's
+    /// value is a string (`text`).
+    OutOfRange { text: Option<String> },
+    /// The node's type has no arm for this value: `unsupported conversion from
+    /// %s to %s for outgoing data`, then the out-of-range line (`.h:1087-1096`,
+    /// `.cpp:1075-1100`).
+    Unsupported {
+        from: String,
+        to: String,
+        text: Option<String>,
+    },
+    /// `OPC UA data type is not an array`.
+    NotAnArray,
+    /// `OPC UA data type (%s) does not match expected type (%s) for EPICS array
+    /// (%s)`.
+    ArrayTypeMismatch {
+        incoming: String,
+        expected: String,
+        target: &'static str,
+    },
+}
 
-pub type Result<T> = std::result::Result<T, ConvError>;
+impl WriteError {
+    /// The lines the C logs, each to go out behind `"<record> : "`.
+    pub fn lines(&self) -> Vec<String> {
+        let out_of_range = |text: &Option<String>| match text {
+            Some(text) => format!("value \"{text}\" out of range"),
+            None => "value out of range".to_string(),
+        };
+        match self {
+            WriteError::OutOfRange { text } => vec![out_of_range(text)],
+            WriteError::Unsupported { from, to, text } => vec![
+                format!("unsupported conversion from {from} to {to} for outgoing data"),
+                out_of_range(text),
+            ],
+            WriteError::NotAnArray => vec!["OPC UA data type is not an array".to_string()],
+            WriteError::ArrayTypeMismatch {
+                incoming,
+                expected,
+                target,
+            } => vec![format!(
+                "OPC UA data type ({incoming}) does not match expected type ({expected}) \
+                 for EPICS array ({target})"
+            )],
+        }
+    }
+}
+
+pub type ReadResult<T> = std::result::Result<T, ReadError>;
+pub type WriteResult = std::result::Result<Variant, WriteError>;
 
 /// Every OPC UA numeric widened into the three shapes EPICS can convert from.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -79,19 +143,9 @@ pub enum Number {
     Float(f64),
 }
 
-impl std::fmt::Display for Number {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Number::Int(v) => write!(f, "{v}"),
-            Number::Uint(v) => write!(f, "{v}"),
-            Number::Float(v) => write!(f, "{v}"),
-        }
-    }
-}
-
 /// An EPICS scalar the device support can ask a variant to be read into
 /// (`readScalar(epicsInt32|epicsInt64|epicsUInt32|epicsFloat64*)`).
-pub trait ScalarTarget: Copy + Sized + std::fmt::Display {
+pub trait ScalarTarget: Copy + Sized {
     const NAME: &'static str;
     fn from_number(n: Number) -> Option<Self>;
     /// Parse the text of a STRING/LOCALIZEDTEXT node (`string_to`,
@@ -100,6 +154,9 @@ pub trait ScalarTarget: Copy + Sized + std::fmt::Display {
     fn from_text(s: &str) -> Option<Self>;
     /// The record's own value, on the way out to the server.
     fn to_number(self) -> Number;
+    /// C++ `std::to_string(value)`, the text written to a STRING or
+    /// LOCALIZEDTEXT node (`DataElementOpen62541Leaf.h:1066`, `:1077`).
+    fn to_std_string(self) -> String;
 }
 
 /// Range-checked float → integer. The C checks `!(v < lowest || v > max)` and
@@ -135,7 +192,7 @@ macro_rules! impl_int_target {
             }
 
             fn from_text(s: &str) -> Option<Self> {
-                parse_int_base0(s).and_then(|v| <$t>::try_from(v).ok())
+                stoll(s).and_then(|v| <$t>::try_from(v).ok())
             }
 
             fn to_number(self) -> Number {
@@ -145,6 +202,10 @@ macro_rules! impl_int_target {
                 } else {
                     Number::Uint(self as u64)
                 }
+            }
+
+            fn to_std_string(self) -> String {
+                self.to_string()
             }
         }
     };
@@ -177,26 +238,27 @@ impl ScalarTarget for f64 {
     fn to_number(self) -> Number {
         Number::Float(self)
     }
+
+    /// `%f`.
+    fn to_std_string(self) -> String {
+        CFloat(self).to_string()
+    }
 }
 
-/// `strtol(s, nullptr, 0)` — decimal, `0x` hex, leading-`0` octal, signed.
-fn parse_int_base0(s: &str) -> Option<i128> {
-    let s = s.trim();
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let magnitude = if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        i128::from_str_radix(hex, 16).ok()?
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        i128::from_str_radix(&digits[1..], 8).ok()?
-    } else {
-        digits.parse().ok()?
-    };
-    Some(if negative { -magnitude } else { magnitude })
+/// `std::stoll(s, 0, 0)`, which throws on no conversion and on `ERANGE`. The
+/// `epicsInt32` overload's `std::stol` reads the same here, since its
+/// silently truncated `long` is range-checked instead.
+fn stoll(s: &str) -> Option<i128> {
+    match strtoll_errno(s, 0) {
+        Some((v, end)) if end != 0 => Some(i128::from(v)),
+        _ => None,
+    }
+}
+
+/// The namespace of a "namespace|name" value: its `atoi`, kept to the 16 bits
+/// of `namespaceIndex` (`DataElementOpen62541Leaf.cpp:933`).
+fn namespace_index(text: &str) -> u16 {
+    atoi(text) as u16
 }
 
 /// The scalar payload of a variant, as a number — the common part of the C's
@@ -235,7 +297,8 @@ fn scalar_text(v: &Variant) -> Option<String> {
 pub fn type_name(v: &Variant) -> String {
     match v {
         Variant::Empty => "Null".to_string(),
-        Variant::Array(a) => format!("{:?}[{}]", a.value_type, a.values.len()),
+        // An array's data type is its element type.
+        Variant::Array(a) => format!("{:?}", a.value_type),
         other => match other.type_id() {
             VariantTypeId::Scalar(id) => format!("{id:?}"),
             other => format!("{other:?}"),
@@ -243,11 +306,27 @@ pub fn type_name(v: &Variant) -> String {
     }
 }
 
-fn describe(v: &Variant) -> String {
-    match scalar_number(v) {
-        Some(n) => format!("{} {n}", type_name(v)),
-        None => type_name(v),
+/// `typeKindName(typeKindOf(data))` (`SessionOpen62541.cpp:245-284`): the
+/// builtin kinds are named as their types, a variant without a type is "None".
+fn kind_name(v: &Variant) -> String {
+    match v {
+        Variant::Empty => "None".to_string(),
+        other => type_name(other),
     }
+}
+
+/// The `%s %.*s` of the out-of-bounds line: the variant's type, then the
+/// value as `UA_print` renders it (`DataElementOpen62541Leaf.h:830-837`).
+fn describe(v: &Variant) -> String {
+    let printed = match v {
+        // C skips `UA_print` for a variant without a type.
+        Variant::Empty => String::new(),
+        _ => ua_print(v).map_or_else(
+            || format!("{v:?}"),
+            |b| String::from_utf8_lossy(&b).into_owned(),
+        ),
+    };
+    format!("{} {printed}", type_name(v))
 }
 
 /// Read a scalar variant into an EPICS numeric type (`readScalar<ET>`,
@@ -256,18 +335,17 @@ fn describe(v: &Variant) -> String {
 /// `choices` is set when the node's data type is an enumeration; then the value
 /// must be one of its choices, exactly as the C checks against `enumChoices`
 /// (`DataElementOpen62541Leaf.h:806`).
-pub fn read_scalar<T: ScalarTarget>(v: &Variant, choices: Option<&EnumChoices>) -> Result<T> {
+pub fn read_scalar<T: ScalarTarget>(v: &Variant, choices: Option<&EnumChoices>) -> ReadResult<T> {
+    let out_of_bounds = || ReadError::OutOfBounds {
+        value: describe(v),
+        target: T::NAME,
+    };
     if let Some(n) = scalar_number(v) {
-        let value = T::from_number(n).ok_or_else(|| ConvError::OutOfRange {
-            value: describe(v),
-            target: T::NAME,
-        })?;
+        let value = T::from_number(n).ok_or_else(out_of_bounds)?;
         if let Some(choices) = choices
             && !is_choice(choices, n)
         {
-            return Err(ConvError::NotAnEnumChoice {
-                value: n.to_string(),
-            });
+            return Err(out_of_bounds());
         }
         return Ok(value);
     }
@@ -276,14 +354,12 @@ pub fn read_scalar<T: ScalarTarget>(v: &Variant, choices: Option<&EnumChoices>) 
         // `readScalar<ET>` accepts STRING and LOCALIZEDTEXT only; a
         // QUALIFIEDNAME reaches its `default` arm, so keep it out of here.
         Some(text) if !matches!(v, Variant::QualifiedName(_)) => {
-            T::from_text(&text).ok_or_else(|| ConvError::OutOfRange {
-                value: format!("String '{text}'"),
-                target: T::NAME,
-            })
+            T::from_text(&text).ok_or_else(out_of_bounds)
         }
-        _ => Err(ConvError::Unsupported {
-            from: type_name(v),
-            to: T::NAME.to_string(),
+        _ => Err(ReadError::UnsupportedKind {
+            kind: kind_name(v),
+            value: describe(v),
+            target: T::NAME,
         }),
     }
 }
@@ -297,61 +373,81 @@ fn is_choice(choices: &EnumChoices, n: Number) -> bool {
     key.is_some_and(|k| choices.contains_key(&k))
 }
 
-/// Read any variant as text (`readScalar(char*, len)`,
-/// `DataElementOpen62541Leaf.cpp:300-455`) — the stringin/stringout/lsi/lso path.
-///
-/// Deviation from the C, documented rather than reproduced: the C falls back to
-/// open62541's `UA_print` for every type kind it does not special-case, so the
-/// exact text of an exotic type (Guid, NodeId, StatusCode, ...) is that
-/// library's rendering. This port formats those with the `async-opcua` type's
-/// own `Display`, which is not byte-identical for every type.
-pub fn read_string(v: &Variant, choices: Option<&EnumChoices>) -> Result<String> {
+/// Read any variant as the bytes the C copies into the record's `len`-byte
+/// char buffer (`readScalar(char*, len)`, `DataElementOpen62541Leaf.cpp:300-455`)
+/// — the stringin/stringout/lsi/lso and FTVL=CHAR path. Text keeps a NUL's
+/// room (`n = len-1`, `:346`), Byte data may fill the buffer (`n++`, `:408`),
+/// a ByteString is whole hex pairs. A kind with no text of its own is printed
+/// by `UA_print` (`:422-426`).
+pub fn read_string(v: &Variant, choices: Option<&EnumChoices>, len: usize) -> ReadResult<Vec<u8>> {
+    let unsupported = || ReadError::UnsupportedKind {
+        kind: kind_name(v),
+        value: describe(v),
+        target: "epicsString",
+    };
     // An enumeration prints as its choice name; a value with no matching choice
     // falls through to the numeric text (`DataElementOpen62541Leaf.cpp:411-421`).
     if let (Some(choices), Some(n)) = (choices, scalar_number(v))
         && let Some(name) = enum_choice_name(choices, n)
     {
-        return Ok(name.to_string());
+        return Ok(cut_text(name.as_bytes().to_vec(), len));
     }
 
-    Ok(match v {
-        Variant::String(s) => s.as_ref().to_string(),
-        Variant::XmlElement(x) => x.to_string(),
-        Variant::LocalizedText(lt) => lt.text.as_ref().to_string(),
-        Variant::QualifiedName(qn) => qn.name.as_ref().to_string(),
-        Variant::ByteString(bs) => hex_encode(bs.as_ref()),
-        Variant::DateTime(dt) => format_local_time(dt),
-        // The C hands the raw byte(s) to the record's char buffer
-        // (`DataElementOpen62541Leaf.cpp:402-409`).
-        Variant::Byte(b) => String::from_utf8_lossy(&[*b]).into_owned(),
-        Variant::SByte(b) => String::from_utf8_lossy(&[*b as u8]).into_owned(),
-        Variant::Boolean(b) => b.to_string(),
-        Variant::Float(x) => x.to_string(),
-        Variant::Double(x) => x.to_string(),
-        Variant::Guid(g) => g.to_string(),
-        Variant::NodeId(id) => id.to_string(),
-        Variant::StatusCode(s) => format!("{s}"),
-        Variant::Array(a) if matches!(a.value_type, VariantScalarTypeId::Byte) => {
-            let bytes: Vec<u8> = a
-                .values
-                .iter()
-                .filter_map(|e| match e {
-                    Variant::Byte(b) => Some(*b),
-                    _ => None,
-                })
-                .collect();
-            String::from_utf8_lossy(&bytes).into_owned()
+    let text = match v {
+        Variant::String(s) => s.as_ref().as_bytes().to_vec(),
+        Variant::XmlElement(x) => x.to_string().into_bytes(),
+        Variant::LocalizedText(lt) => lt.text.as_ref().as_bytes().to_vec(),
+        Variant::QualifiedName(qn) => qn.name.as_ref().as_bytes().to_vec(),
+        Variant::ByteString(bs) => return Ok(print_byte_string(bs.as_ref(), len)),
+        // The C hands the raw byte(s) to the record's char buffer (`:402-409`).
+        Variant::Byte(_) | Variant::SByte(_) => return Ok(raw_bytes([v], len)),
+        Variant::Array(a)
+            if matches!(
+                a.value_type,
+                VariantScalarTypeId::Byte | VariantScalarTypeId::SByte
+            ) =>
+        {
+            return Ok(raw_bytes(&a.values, len));
         }
-        other => match scalar_number(other) {
-            Some(n) => n.to_string(),
-            None => {
-                return Err(ConvError::Unsupported {
-                    from: type_name(other),
-                    to: "CString".to_string(),
-                });
-            }
+        // C dereferences the null type of a variant without a value (`:353`).
+        Variant::Empty => return Err(unsupported()),
+        // The C reads the payload pointer, an array's first element
+        // (`:350-351`); an empty array's points at the sentinel.
+        Variant::Array(a) => match a.values.first() {
+            Some(first) => return read_string(first, choices, len),
+            None => return Err(unsupported()),
         },
-    })
+        // All but a structure decoded into a generated type.
+        other => ua_print(other).ok_or_else(unsupported)?,
+    };
+    Ok(cut_text(text, len))
+}
+
+/// Byte data may fill a `len`-byte buffer (`n++`, `:408`).
+fn raw_bytes<'a>(values: impl IntoIterator<Item = &'a Variant>, len: usize) -> Vec<u8> {
+    values
+        .into_iter()
+        .filter_map(|e| match e {
+            Variant::Byte(b) => Some(*b),
+            Variant::SByte(b) => Some(*b as u8),
+            _ => None,
+        })
+        .take(len)
+        .collect()
+}
+
+/// Text in a `len`-byte buffer keeps a NUL's room (`n = len-1`).
+fn cut_text(mut text: Vec<u8>, len: usize) -> Vec<u8> {
+    text.truncate(len.saturating_sub(1));
+    text
+}
+
+/// `printByteString` (`DataElementOpen62541Leaf.cpp:245-255`) into a
+/// `len`-byte buffer: whole hex pairs while `l < len-3`. Under 3 the C's
+/// `size_t` wraps and it writes past the buffer; that is not copied.
+fn print_byte_string(bytes: &[u8], len: usize) -> Vec<u8> {
+    let pairs = len.saturating_sub(2) / 2;
+    hex_encode(&bytes[..bytes.len().min(pairs)]).into_bytes()
 }
 
 fn enum_choice_name(choices: &EnumChoices, n: Number) -> Option<&str> {
@@ -361,16 +457,6 @@ fn enum_choice_name(choices: &EnumChoices, n: Number) -> Option<&str> {
         Number::Float(_) => return None,
     };
     choices.get(&key).map(String::as_str)
-}
-
-/// The C prints a DateTime in *local* time — it adds
-/// `UA_DateTime_localTimeUtcOffset()` before formatting
-/// (`DataElementOpen62541Leaf.cpp:393-400`).
-fn format_local_time(dt: &DateTime) -> String {
-    dt.as_chrono()
-        .with_timezone(&chrono::Local)
-        .format("%Y-%m-%dT%H:%M:%S%.9f")
-        .to_string()
 }
 
 /// `printByteString` (`DataElementOpen62541Leaf.cpp:244-255`) — upper-case hex,
@@ -461,10 +547,10 @@ impl_array_target!(u64, "epicsUInt64", UInt64, UInt64);
 impl_array_target!(f32, "epicsFloat32", Float, Float);
 impl_array_target!(f64, "epicsFloat64", Double, Double);
 
-pub fn read_array<T: ArrayTarget>(v: &Variant) -> Result<Vec<T>> {
+pub fn read_array<T: ArrayTarget>(v: &Variant) -> ReadResult<Vec<T>> {
     let array = as_array(v)?;
     if array.value_type != T::ELEMENT {
-        return Err(ConvError::ArrayTypeMismatch {
+        return Err(ReadError::ArrayTypeMismatch {
             incoming: type_name(v),
             target: T::NAME,
         });
@@ -473,7 +559,7 @@ pub fn read_array<T: ArrayTarget>(v: &Variant) -> Result<Vec<T>> {
 }
 
 /// The `epicsUInt8` array: a Byte or Boolean array, or a scalar ByteString.
-pub fn read_array_u8(v: &Variant) -> Result<Vec<u8>> {
+pub fn read_array_u8(v: &Variant) -> ReadResult<Vec<u8>> {
     if let Variant::ByteString(bs) = v {
         return Ok(bs.as_ref().to_vec());
     }
@@ -495,28 +581,29 @@ pub fn read_array_u8(v: &Variant) -> Result<Vec<u8>> {
                 _ => None,
             })
             .collect()),
-        _ => Err(ConvError::ArrayTypeMismatch {
+        _ => Err(ReadError::ArrayTypeMismatch {
             incoming: type_name(v),
             target: "epicsUInt8",
         }),
     }
 }
 
-/// String arrays (`readArray(char*, len, num, ...)`,
-/// `DataElementOpen62541Leaf.cpp:487-600`): String, XmlElement, LocalizedText,
-/// QualifiedName and ByteString (hex-encoded) all read as text.
-pub fn read_string_array(v: &Variant) -> Result<Vec<String>> {
+/// String arrays of `len`-byte elements (`readArray(char*, len, num, ...)`,
+/// `DataElementOpen62541Leaf.cpp:487-600`): String, XmlElement, LocalizedText
+/// and QualifiedName read as text cut at `len-1` bytes, a ByteString as whole
+/// hex pairs (`:570-574`).
+pub fn read_string_array(v: &Variant, len: usize) -> ReadResult<Vec<Vec<u8>>> {
     let array = as_array(v)?;
     array
         .values
         .iter()
         .map(|e| match e {
-            Variant::String(s) => Ok(s.as_ref().to_string()),
-            Variant::XmlElement(x) => Ok(x.to_string()),
-            Variant::LocalizedText(lt) => Ok(lt.text.as_ref().to_string()),
-            Variant::QualifiedName(qn) => Ok(qn.name.as_ref().to_string()),
-            Variant::ByteString(bs) => Ok(hex_encode(bs.as_ref())),
-            other => Err(ConvError::ArrayTypeMismatch {
+            Variant::String(s) => Ok(cut_text(s.as_ref().as_bytes().to_vec(), len)),
+            Variant::XmlElement(x) => Ok(cut_text(x.to_string().into_bytes(), len)),
+            Variant::LocalizedText(lt) => Ok(cut_text(lt.text.as_ref().as_bytes().to_vec(), len)),
+            Variant::QualifiedName(qn) => Ok(cut_text(qn.name.as_ref().as_bytes().to_vec(), len)),
+            Variant::ByteString(bs) => Ok(print_byte_string(bs.as_ref(), len)),
+            other => Err(ReadError::ArrayTypeMismatch {
                 incoming: type_name(other),
                 target: "epicsString",
             }),
@@ -524,10 +611,10 @@ pub fn read_string_array(v: &Variant) -> Result<Vec<String>> {
         .collect()
 }
 
-fn as_array(v: &Variant) -> Result<&Array> {
+fn as_array(v: &Variant) -> ReadResult<&Array> {
     match v {
         Variant::Array(a) => Ok(a),
-        _ => Err(ConvError::NotAnArray),
+        _ => Err(ReadError::NotAnArray),
     }
 }
 
@@ -541,19 +628,14 @@ pub fn write_scalar<T: ScalarTarget>(
     value: T,
     incoming: &Variant,
     choices: Option<&EnumChoices>,
-) -> Result<Variant> {
+) -> WriteResult {
     let n = value.to_number();
-    let out_of_range = || ConvError::OutOfRange {
-        value: value.to_string(),
-        target: "the node's type",
-    };
+    let out_of_range = || WriteError::OutOfRange { text: None };
 
     // An enumeration only accepts one of its choices, whatever its width.
     if let Some(choices) = choices {
         if !is_choice(choices, n) {
-            return Err(ConvError::NotAnEnumChoice {
-                value: n.to_string(),
-            });
+            return Err(out_of_range());
         }
         return Ok(Variant::Int32(
             i32::from_number(n).ok_or_else(out_of_range)?,
@@ -575,16 +657,17 @@ pub fn write_scalar<T: ScalarTarget>(
         Variant::UInt64(_) => Variant::UInt64(u64::try_from_number(n).ok_or_else(out_of_range)?),
         Variant::Float(_) => Variant::Float(f32_from_number(n).ok_or_else(out_of_range)?),
         Variant::Double(_) => Variant::Double(f64::from_number(n).ok_or_else(out_of_range)?),
-        Variant::String(_) => Variant::String(UAString::from(value.to_string())),
+        Variant::String(_) => Variant::String(UAString::from(value.to_std_string())),
         Variant::LocalizedText(lt) => Variant::LocalizedText(Box::new(LocalizedText {
             // The locale is not the record's to change.
             locale: lt.locale.clone(),
-            text: UAString::from(value.to_string()),
+            text: UAString::from(value.to_std_string()),
         })),
         other => {
-            return Err(ConvError::Unsupported {
+            return Err(WriteError::Unsupported {
                 from: T::NAME.to_string(),
                 to: type_name(other),
+                text: None,
             });
         }
     })
@@ -598,14 +681,24 @@ pub fn write_scalar<T: ScalarTarget>(
 /// (`DataElementOpen62541Leaf.cpp:1066-1073`, compare the FLOAT arm at
 /// `:1056-1064`), so writing a string record to a Double node always raised
 /// `WRITE_ALARM`/`INVALID` with "value out of range" and never sent anything.
-pub fn write_string(
-    value: &str,
-    incoming: &Variant,
-    choices: Option<&EnumChoices>,
-) -> Result<Variant> {
-    let out_of_range = || ConvError::OutOfRange {
-        value: format!("\"{value}\""),
-        target: "the node's type",
+pub fn write_string(value: &str, incoming: &Variant, choices: Option<&EnumChoices>) -> WriteResult {
+    // The C switches on `incomingData.type` and never asks whether the node is
+    // an array (`DataElementOpen62541Leaf.cpp:878`): it sends a scalar.
+    if let Variant::Array(a) = incoming {
+        return write_string(value, &element_template(a), choices);
+    }
+    let out_of_range = || WriteError::OutOfRange {
+        text: Some(value.to_string()),
+    };
+    // `strtol`/`strtoul(value, &end, 0)` and `end != value`; C ignores errno,
+    // so an overflow writes the saturated `LONG_MAX`, which is refused here.
+    let long = || match strtol_errno(value, 0) {
+        Some((v, end)) if end != 0 => Ok(i128::from(v)),
+        _ => Err(out_of_range()),
+    };
+    let ulong = || match strtoul_errno(value, 0) {
+        Some((v, end)) if end != 0 => Ok(i128::from(v)),
+        _ => Err(out_of_range()),
     };
 
     if let Some(choices) = choices {
@@ -616,19 +709,16 @@ pub fn write_string(
                 i32::try_from(*v).map_err(|_| out_of_range())?,
             ));
         }
-        let n = parse_int_base0(value).ok_or_else(out_of_range)?;
+        let n = long()?;
         let v = u32::try_from(n).ok().filter(|v| choices.contains_key(v));
         return match v {
             Some(v) => Ok(Variant::Int32(
                 i32::try_from(v).map_err(|_| out_of_range())?,
             )),
-            None => Err(ConvError::NotAnEnumChoice {
-                value: value.to_string(),
-            }),
+            None => Err(out_of_range()),
         };
     }
 
-    let int = || parse_int_base0(value).ok_or_else(out_of_range);
     let float = || value.trim().parse::<f64>().map_err(|_| out_of_range());
 
     Ok(match incoming {
@@ -649,7 +739,7 @@ pub fn write_string(
         // "namespace|name", likewise (`:907-923`).
         Variant::QualifiedName(qn) => {
             let (namespace_index, name) = match value.split_once('|') {
-                Some((ns, name)) => (ns.trim().parse().unwrap_or(0), name),
+                Some((ns, name)) => (namespace_index(ns), name),
                 None => (qn.namespace_index, value),
             };
             Variant::QualifiedName(Box::new(QualifiedName {
@@ -661,38 +751,67 @@ pub fn write_string(
             hex_decode(value).ok_or_else(out_of_range)?,
         )),
         Variant::Boolean(_) => Variant::Boolean(value.starts_with(['Y', 'y', 'T', 't', '1'])),
-        Variant::SByte(_) => Variant::SByte(i8::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::Byte(_) => Variant::Byte(u8::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::Int16(_) => Variant::Int16(i16::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::UInt16(_) => Variant::UInt16(u16::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::Int32(_) => Variant::Int32(i32::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::UInt32(_) => Variant::UInt32(u32::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::Int64(_) => Variant::Int64(i64::try_from(int()?).map_err(|_| out_of_range())?),
-        Variant::UInt64(_) => Variant::UInt64(u64::try_from(int()?).map_err(|_| out_of_range())?),
+        Variant::SByte(_) => Variant::SByte(i8::try_from(long()?).map_err(|_| out_of_range())?),
+        Variant::Byte(_) => Variant::Byte(u8::try_from(ulong()?).map_err(|_| out_of_range())?),
+        Variant::Int16(_) => Variant::Int16(i16::try_from(long()?).map_err(|_| out_of_range())?),
+        Variant::UInt16(_) => Variant::UInt16(u16::try_from(ulong()?).map_err(|_| out_of_range())?),
+        Variant::Int32(_) => Variant::Int32(i32::try_from(long()?).map_err(|_| out_of_range())?),
+        Variant::UInt32(_) => Variant::UInt32(u32::try_from(ulong()?).map_err(|_| out_of_range())?),
+        Variant::Int64(_) => Variant::Int64(i64::try_from(long()?).map_err(|_| out_of_range())?),
+        Variant::UInt64(_) => Variant::UInt64(u64::try_from(ulong()?).map_err(|_| out_of_range())?),
         Variant::Float(_) => {
             Variant::Float(f32_from_number(Number::Float(float()?)).ok_or_else(out_of_range)?)
         }
         Variant::Double(_) => Variant::Double(float()?),
         other => {
-            return Err(ConvError::Unsupported {
-                from: "CString".to_string(),
+            return Err(WriteError::Unsupported {
+                from: "string".to_string(),
                 to: type_name(other),
+                text: Some(value.to_string()),
             });
         }
     })
 }
 
+/// A scalar of `a`'s element type: its first element, whose locale or
+/// namespace a text write keeps, or a default one when it is empty.
+fn element_template(a: &Array) -> Variant {
+    if let Some(first) = a.values.first() {
+        return first.clone();
+    }
+    match a.value_type {
+        VariantScalarTypeId::Boolean => Variant::Boolean(false),
+        VariantScalarTypeId::SByte => Variant::SByte(0),
+        VariantScalarTypeId::Byte => Variant::Byte(0),
+        VariantScalarTypeId::Int16 => Variant::Int16(0),
+        VariantScalarTypeId::UInt16 => Variant::UInt16(0),
+        VariantScalarTypeId::Int32 => Variant::Int32(0),
+        VariantScalarTypeId::UInt32 => Variant::UInt32(0),
+        VariantScalarTypeId::Int64 => Variant::Int64(0),
+        VariantScalarTypeId::UInt64 => Variant::UInt64(0),
+        VariantScalarTypeId::Float => Variant::Float(0.0),
+        VariantScalarTypeId::Double => Variant::Double(0.0),
+        VariantScalarTypeId::String => Variant::String(UAString::null()),
+        VariantScalarTypeId::XmlElement => Variant::XmlElement(XmlElement::default()),
+        VariantScalarTypeId::LocalizedText => Variant::LocalizedText(Box::default()),
+        VariantScalarTypeId::QualifiedName => Variant::QualifiedName(Box::default()),
+        VariantScalarTypeId::ByteString => Variant::ByteString(ByteString::null()),
+        _ => Variant::Empty,
+    }
+}
+
 /// Build the outgoing variant for an array record value (`writeArray<ET>`,
 /// `DataElementOpen62541Leaf.h:1131-1163`): the node must already be an array of
 /// exactly this element type.
-pub fn write_array<T: ArrayTarget>(values: &[T], incoming: &Variant) -> Result<Variant> {
+pub fn write_array<T: ArrayTarget>(values: &[T], incoming: &Variant) -> WriteResult {
     let array = match incoming {
         Variant::Array(a) => a,
-        _ => return Err(ConvError::NotAnArray),
+        _ => return Err(WriteError::NotAnArray),
     };
     if array.value_type != T::ELEMENT {
-        return Err(ConvError::ArrayTypeMismatch {
+        return Err(WriteError::ArrayTypeMismatch {
             incoming: type_name(incoming),
+            expected: format!("{:?}", T::ELEMENT),
             target: T::NAME,
         });
     }
@@ -704,7 +823,7 @@ pub fn write_array<T: ArrayTarget>(values: &[T], incoming: &Variant) -> Result<V
 
 /// The `epicsUInt8` array on the way out: a Byte array, a Boolean array, or a
 /// scalar ByteString node.
-pub fn write_array_u8(values: &[u8], incoming: &Variant) -> Result<Variant> {
+pub fn write_array_u8(values: &[u8], incoming: &Variant) -> WriteResult {
     match incoming {
         Variant::ByteString(_) => Ok(Variant::ByteString(ByteString::from(values.to_vec()))),
         Variant::Array(a) => {
@@ -714,8 +833,9 @@ pub fn write_array_u8(values: &[u8], incoming: &Variant) -> Result<Variant> {
                     values.iter().map(|b| Variant::Boolean(*b != 0)).collect()
                 }
                 _ => {
-                    return Err(ConvError::ArrayTypeMismatch {
+                    return Err(WriteError::ArrayTypeMismatch {
                         incoming: type_name(incoming),
+                        expected: "Byte".to_string(),
                         target: "epicsUInt8",
                     });
                 }
@@ -724,16 +844,20 @@ pub fn write_array_u8(values: &[u8], incoming: &Variant) -> Result<Variant> {
                 Array::new(a.value_type, elements).expect("elements are of the array's type"),
             )))
         }
-        _ => Err(ConvError::NotAnArray),
+        _ => Err(WriteError::NotAnArray),
     }
 }
 
-/// String arrays on the way out (`writeArray(const char*, len, num, ...)`).
-pub fn write_string_array(values: &[String], incoming: &Variant) -> Result<Variant> {
+/// String arrays on the way out (`writeArray(const char*, len, num, ...)`,
+/// `DataElementOpen62541Leaf.cpp:1137-1224`).
+pub fn write_string_array(values: &[String], incoming: &Variant) -> WriteResult {
     let array = match incoming {
         Variant::Array(a) => a,
-        _ => return Err(ConvError::NotAnArray),
+        _ => return Err(WriteError::NotAnArray),
     };
+    // An element without "locale|" or "namespace|" keeps the node's element
+    // at its index, else the one built before it.
+    let kept = |built: &[Variant]| array.values.get(built.len()).or(built.last()).cloned();
     let elements: Vec<Variant> = match array.value_type {
         VariantScalarTypeId::String => values
             .iter()
@@ -743,29 +867,57 @@ pub fn write_string_array(values: &[String], incoming: &Variant) -> Result<Varia
             .iter()
             .map(|s| Variant::XmlElement(XmlElement::from(s.as_str())))
             .collect(),
-        VariantScalarTypeId::LocalizedText => values
-            .iter()
-            .map(|s| {
-                Variant::LocalizedText(Box::new(LocalizedText {
-                    locale: UAString::null(),
-                    text: UAString::from(s.as_str()),
-                }))
-            })
-            .collect(),
+        VariantScalarTypeId::LocalizedText => {
+            let mut built = Vec::with_capacity(values.len());
+            for value in values {
+                let (locale, text) = match value.split_once('|') {
+                    Some((locale, text)) => (UAString::from(locale), text),
+                    None => match kept(&built) {
+                        Some(Variant::LocalizedText(lt)) => (lt.locale, value.as_str()),
+                        _ => (UAString::null(), value.as_str()),
+                    },
+                };
+                built.push(Variant::LocalizedText(Box::new(LocalizedText {
+                    locale,
+                    text: UAString::from(text),
+                })));
+            }
+            built
+        }
+        VariantScalarTypeId::QualifiedName => {
+            let mut built = Vec::with_capacity(values.len());
+            for value in values {
+                let (namespace_index, name) = match value.split_once('|') {
+                    Some((ns, name)) => (namespace_index(ns), name),
+                    None => match kept(&built) {
+                        Some(Variant::QualifiedName(qn)) => (qn.namespace_index, value.as_str()),
+                        _ => (0, value.as_str()),
+                    },
+                };
+                built.push(Variant::QualifiedName(Box::new(QualifiedName {
+                    namespace_index,
+                    name: UAString::from(name),
+                })));
+            }
+            built
+        }
+        // C writes each element's text as the bytes, though it reads a
+        // ByteString array as hex (`:570-574` against `:1158-1163`), so a
+        // value does not survive the round trip; hex both ways here.
         VariantScalarTypeId::ByteString => values
             .iter()
             .map(|s| {
                 hex_decode(s)
                     .map(|b| Variant::ByteString(ByteString::from(b)))
-                    .ok_or_else(|| ConvError::OutOfRange {
-                        value: format!("\"{s}\""),
-                        target: "ByteString",
+                    .ok_or_else(|| WriteError::OutOfRange {
+                        text: Some(s.clone()),
                     })
             })
-            .collect::<Result<_>>()?,
+            .collect::<Result<_, _>>()?,
         _ => {
-            return Err(ConvError::ArrayTypeMismatch {
+            return Err(WriteError::ArrayTypeMismatch {
                 incoming: type_name(incoming),
+                expected: "String".to_string(),
                 target: "epicsString",
             });
         }

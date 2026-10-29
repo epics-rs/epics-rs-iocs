@@ -9,10 +9,12 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::ad_core::driver::ADDriverBase;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::RequestOp;
-use epics_rs::asyn::user::AsynUser;
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::types::c_parse::atoi;
 
 use crate::protocol::{self, MpxError};
 use crate::types::*;
@@ -38,6 +40,34 @@ impl std::fmt::Display for ChannelError {
     }
 }
 
+impl ChannelError {
+    /// The `asynStatus` C prints for this failure.
+    pub(crate) fn code(&self) -> i32 {
+        match self {
+            Self::Timeout => AsynStatus::Timeout as i32,
+            Self::Transport(e) => e.status() as i32,
+            Self::Protocol(_) => AsynStatus::Error as i32,
+        }
+    }
+}
+
+/// What C's `mpxSet`/`mpxCommand` return to `writeInt32`/`writeFloat64`:
+/// the status alone. mpxConnection talks on its own asynUser, so the record's
+/// `errorMessage` stays empty.
+impl From<ChannelError> for AsynError {
+    fn from(e: ChannelError) -> Self {
+        let status = match e {
+            ChannelError::Transport(e) => e.status(),
+            ChannelError::Timeout => AsynStatus::Timeout,
+            ChannelError::Protocol(_) => AsynStatus::Error,
+        };
+        AsynError::Status {
+            status,
+            message: String::new(),
+        }
+    }
+}
+
 impl From<MpxError> for ChannelError {
     fn from(e: MpxError) -> Self {
         Self::Protocol(e)
@@ -46,8 +76,6 @@ impl From<MpxError> for ChannelError {
 
 impl From<AsynError> for ChannelError {
     fn from(e: AsynError) -> Self {
-        // `status()` reads *through* a `PartialRead` carrier, so a timeout that
-        // returned partial bytes (EOS interpose installed) is still recognized.
         if e.status() == AsynStatus::Timeout {
             Self::Timeout
         } else {
@@ -58,152 +86,226 @@ impl From<AsynError> for ChannelError {
 
 /// A framed MPX channel on top of one asyn octet port.
 pub struct MpxConnection {
-    handle: PortHandle,
+    io: SyncIOHandle,
     max_frame: usize,
 }
 
 impl MpxConnection {
-    pub fn new(handle: PortHandle, max_frame: usize) -> Self {
-        Self { handle, max_frame }
+    pub fn new(io: SyncIOHandle, max_frame: usize) -> Self {
+        Self { io, max_frame }
     }
 
-    fn user(&self, timeout: Duration) -> AsynUser {
-        AsynUser::new(0).with_addr(0).with_timeout(timeout)
+    /// C prints these on the asynUser of the socket being read or written.
+    pub(crate) fn trace(&self, msg: &str) {
+        self.io.print(0, TraceMask::ERROR, format_args!("{msg}"));
     }
 
-    /// Read exactly `count` bytes, or fail. A zero-length read means the peer
-    /// closed the socket.
-    fn read_exact(&self, count: usize, timeout: Duration) -> Result<Vec<u8>, ChannelError> {
-        let mut out = Vec::with_capacity(count);
-        while out.len() < count {
-            // OctetReadBinary brackets the read with the input EOS cleared, so
-            // a 0x0A byte inside a pixel payload cannot terminate it early —
-            // MPX frames are length-delimited, never EOS-delimited.
-            let result = self.handle.submit_blocking(
-                RequestOp::OctetReadBinary {
-                    buf_size: count - out.len(),
-                },
-                self.user(timeout),
-            )?;
-            let chunk = result.data.unwrap_or_default();
+    /// Read exactly `count` more bytes into `out`. `Err(None)` is C's read
+    /// that succeeded with zero bytes: the peer closed the socket.
+    fn read_exact(
+        &self,
+        out: &mut Vec<u8>,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<(), Option<ChannelError>> {
+        let want = out.len() + count;
+        while out.len() < want {
+            // C adds `nread` only on asynSuccess (mpxConnection.cpp:647-648).
+            let (chunk, status) = self
+                .io
+                .with_timeout(timeout)
+                .read_octet(0, want - out.len())
+                .into_parts();
+            status.map_err(|e| Some(e.into()))?;
             if chunk.is_empty() {
-                return Err(ChannelError::Transport(AsynError::Status {
-                    status: AsynStatus::Disconnected,
-                    message: "peer closed the MPX socket".into(),
-                }));
+                return Err(None);
             }
             out.extend_from_slice(&chunk);
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Read one MPX frame, discarding any bytes that precede the `MPX` magic
-    /// so the channel re-syncs after an error or a server restart.
+    /// so the channel re-syncs after an error or a server restart. `header`
+    /// receives the frame header once it is complete (C `fromLabviewHeader`).
     ///
     /// C matched the magic with a counter it reset to zero on every mismatch,
     /// so junk ending in a prefix of the magic (`"...MMPX"`) desynchronised it
     /// permanently. This slides the window by one byte instead.
-    pub fn read_frame(&self, timeout: Duration) -> Result<Vec<u8>, ChannelError> {
-        let mut window = self.read_exact(MPX_HEADER.len(), timeout)?;
+    fn read_frame_into(
+        &self,
+        header: &mut String,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let timeout_s = timeout.as_secs_f64();
+        let closed = || {
+            ChannelError::Transport(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: "peer closed the MPX socket".into(),
+            })
+        };
+        // C prints `fromLabview`, which `mpxReadCmd` clears before every read
+        // and which this connection never fills in between.
+        let mut window = Vec::with_capacity(MPX_FRAME_HEADER_LEN);
+        self.read_exact(&mut window, MPX_HEADER.len(), timeout)
+            .map_err(|e| e.unwrap_or_else(closed))?;
         let mut junk = 0usize;
         while window != MPX_HEADER {
             window.remove(0);
-            window.extend_from_slice(&self.read_exact(1, timeout)?);
+            self.read_exact(&mut window, 1, timeout)
+                .map_err(|e| e.unwrap_or_else(closed))?;
             junk += 1;
         }
         if junk > 0 {
-            log::error!("merlin: discarded {junk} bytes of junk before an MPX header");
+            self.trace(&format!(
+                "merlinDetector:mpxRead, status=0 {junk} bytes of leading garbage discarded before header  \n"
+            ));
         }
 
-        let rest = self.read_exact(MPX_FRAME_HEADER_LEN - MPX_HEADER.len(), timeout)?;
-        window.extend_from_slice(&rest);
-        let body_len = protocol::parse_frame_header(&window, self.max_frame)?;
+        let rest = MPX_FRAME_HEADER_LEN - MPX_HEADER.len();
+        match self.read_exact(&mut window, rest, timeout) {
+            Ok(()) => {}
+            Err(None) => {
+                self.trace("merlinDetector:mpxRead, Header too short\n");
+                return Err(closed());
+            }
+            Err(Some(e)) => {
+                self.trace(&format!(
+                    "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes\n\n",
+                    e.code(),
+                    window.len() - MPX_HEADER.len(), timeout_s = CFloat(timeout_s)
+                ));
+                return Err(e);
+            }
+        }
+        *header = String::from_utf8_lossy(&window).into_owned();
+        let body_len = match protocol::parse_frame_header(&window, self.max_frame) {
+            Ok(n) => n,
+            Err(e) => {
+                if let MpxError::BadBodySize(n) = e {
+                    self.trace(&format!(
+                        "merlinDetector:mpxRead, frame size {n} not supported\n"
+                    ));
+                }
+                return Err(e.into());
+            }
+        };
 
         // C returned asynSuccess on a short body read (`status = asynSuccess ?
         // asynError : status` always took the else branch), handing the caller
-        // a truncated frame it believed was complete. read_exact cannot.
-        self.read_exact(body_len, timeout)
+        // a truncated frame it believed was complete. This fails it instead.
+        let mut body = Vec::with_capacity(body_len);
+        if let Err(e) = self.read_exact(&mut body, body_len, timeout) {
+            self.trace(&format!(
+                "merlinDetector:mpxRead, timeout={timeout_s:.6}, status={} received {} bytes in MPX command body, expected {body_len}\n",
+                e.as_ref().map_or(0, ChannelError::code),
+                body.len(), timeout_s = CFloat(timeout_s)
+            ));
+            return Err(e.unwrap_or_else(closed));
+        }
+        Ok(body)
     }
 
-    fn write(&self, msg: &str, timeout: Duration) -> Result<(), ChannelError> {
-        self.handle.submit_blocking(
-            RequestOp::OctetWrite {
-                data: msg.as_bytes().to_vec(),
-            },
-            self.user(timeout),
-        )?;
-        Ok(())
+    pub fn read_frame(&self, timeout: Duration) -> Result<Vec<u8>, ChannelError> {
+        self.read_frame_into(&mut String::new(), timeout)
     }
 
     /// Send one command and read frames until the reply that echoes it comes
-    /// back (C `mpxWriteRead`). Anything else on the wire is logged and
+    /// back (C `mpxWriteRead`). Anything else on the wire is reported and
     /// dropped, which is how the channel recovers from a desynchronised
     /// server.
+    ///
+    /// The command lands on `ADStringToServer` whatever the write did, and
+    /// every frame read lands on `ADStringFromServer`, stray ones included
+    /// (mpxConnection.cpp:571/:763); C posts neither.
     fn transact(
         &self,
+        ad: &mut ADDriverBase,
         kind: MpxKind,
         name: &str,
         value: Option<&str>,
         timeout: Duration,
     ) -> Result<Vec<u8>, ChannelError> {
         let msg = protocol::encode(kind, name, value)?;
-        log::debug!("merlin -> {msg}");
-        self.write(&msg, timeout)?;
+        // C `mpxWrite` reports a failed write and still reads the reply.
+        if let Err(e) = self.io.with_timeout(timeout).write_octet(0, msg.as_bytes()) {
+            self.trace(&format!(
+                "merlinDetector:mpxWrite, status={}, sent\n{msg}\n",
+                ChannelError::from(e).code()
+            ));
+        }
+        let _ = ad
+            .port_base
+            .set_string_param(ad.params.string_to_server, 0, msg.clone());
 
         loop {
-            let body = self.read_frame(timeout)?;
-            if protocol::response_echoes(&body, kind, name) {
-                log::debug!("merlin <- {}", String::from_utf8_lossy(&body));
-                return Ok(body);
+            let mut header = String::new();
+            let read = self.read_frame_into(&mut header, timeout);
+            if let Ok(body) = &read {
+                let from = format!("{header}{}", String::from_utf8_lossy(body));
+                let _ = ad
+                    .port_base
+                    .set_string_param(ad.params.string_from_server, 0, from);
             }
-            log::error!(
-                "merlin: unexpected response to {} {name}: '{}'",
-                kind.as_str(),
-                String::from_utf8_lossy(&body)
-            );
+            let (code, body) = match &read {
+                Ok(body) if protocol::response_echoes(body, kind, name) => break read,
+                Ok(body) => (0, String::from_utf8_lossy(body).into_owned()),
+                Err(e) => (e.code(), String::new()),
+            };
+            self.trace(&format!(
+                "merlinDetector:mpxReadCmd error, status={code} unexpected response from labview: '{header}{body}'\n"
+            ));
+            read?;
         }
     }
 
     /// `SET <name> <value>`.
-    pub fn set(&self, name: &str, value: &str, timeout: Duration) -> Result<(), ChannelError> {
-        let body = self.transact(MpxKind::Set, name, Some(value), timeout)?;
+    pub fn set(
+        &self,
+        ad: &mut ADDriverBase,
+        name: &str,
+        value: &str,
+        timeout: Duration,
+    ) -> Result<(), ChannelError> {
+        let body = self.transact(ad, MpxKind::Set, name, Some(value), timeout)?;
         protocol::decode_ack(&body)?;
         Ok(())
     }
 
     /// `GET <name>`, returning the device's value field.
-    pub fn get(&self, name: &str, timeout: Duration) -> Result<String, ChannelError> {
-        let body = self.transact(MpxKind::Get, name, None, timeout)?;
+    pub fn get(
+        &self,
+        ad: &mut ADDriverBase,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<String, ChannelError> {
+        let body = self.transact(ad, MpxKind::Get, name, None, timeout)?;
         Ok(protocol::decode_get(&body)?)
     }
 
     /// `CMD <name>`.
-    pub fn command(&self, name: &str, timeout: Duration) -> Result<(), ChannelError> {
-        let body = self.transact(MpxKind::Cmd, name, None, timeout)?;
+    pub fn command(
+        &self,
+        ad: &mut ADDriverBase,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<(), ChannelError> {
+        let body = self.transact(ad, MpxKind::Cmd, name, None, timeout)?;
         protocol::decode_ack(&body)?;
         Ok(())
     }
 
     /// `GET <name>` parsed as a float, or `None` if the device refused.
-    pub fn get_f64(&self, name: &str, timeout: Duration) -> Option<f64> {
-        match self.get(name, timeout) {
+    pub fn get_f64(&self, ad: &mut ADDriverBase, name: &str, timeout: Duration) -> Option<f64> {
+        match self.get(ad, name, timeout) {
             Ok(v) => v.trim().parse().ok(),
-            Err(e) => {
-                log::error!("merlin: GET {name} failed: {e}");
-                None
-            }
+            Err(_) => None,
         }
     }
 
-    /// `GET <name>` parsed as an integer, or `None` if the device refused.
-    pub fn get_i32(&self, name: &str, timeout: Duration) -> Option<i32> {
-        match self.get(name, timeout) {
-            Ok(v) => v.trim().parse().ok(),
-            Err(e) => {
-                log::error!("merlin: GET {name} failed: {e}");
-                None
-            }
-        }
+    /// `GET <name>` read with C `atoi`, or `None` if the device refused.
+    pub fn get_i32(&self, ad: &mut ADDriverBase, name: &str, timeout: Duration) -> Option<i32> {
+        self.get(ad, name, timeout).ok().map(atoi)
     }
 }
 
@@ -216,23 +318,123 @@ pub fn default_timeout() -> Duration {
 #[cfg(test)]
 mod is_timeout_tests {
     use super::*;
-    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+    use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::user::AsynUser;
 
-    /// A read that times out *after* transferring bytes arrives as
-    /// `AsynError::PartialRead` when the EOS interpose is installed (this
-    /// port's st.cmd uses `noProcessEos=0`). A bare `AsynError::Status`
-    /// match missed it and misclassified the timeout as a transport fault.
     #[test]
-    fn a_partial_read_wrapped_timeout_maps_to_timeout() {
+    fn a_timeout_maps_to_timeout() {
         let e = AsynError::Status {
             status: AsynStatus::Timeout,
             message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: b"partial".to_vec(),
-            eom_reason: EomReason::empty(),
-        });
+        };
         assert!(matches!(ChannelError::from(e), ChannelError::Timeout));
+    }
+
+    /// A Merlin command socket: each write queues the reply the fake rig
+    /// sends, each read takes what is queued, up to its buffer.
+    struct Mpx {
+        base: epics_rs::asyn::port::PortDriverBase,
+        queued: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Mpx {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut AsynUser,
+            data: &[u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            let body = b"GET,X,1,0";
+            self.queued = format!("MPX,{:010},", body.len() + 1).into_bytes();
+            self.queued.extend_from_slice(body);
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let n = buf.len().min(self.queued.len());
+            buf[..n].copy_from_slice(&self.queued[..n]);
+            self.queued.drain(..n);
+            OctetReadResult::ok(n, EomReason::empty())
+        }
+    }
+
+    /// `mpxWrite` and `mpxRead` are `pasynOctetSyncIO` write and read
+    /// (mpxConnection.cpp:561, :617, :645, :701), which print their
+    /// TRACEIO_DEVICE lines (asynOctetSyncIO.c:194-200, :219-223).
+    #[test]
+    fn a_transaction_prints_its_sync_io_lines() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceIoMask};
+
+        let name = "MERLIN_LINES";
+        let (rt, _) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Mpx {
+                base: PortDriverBase::new(
+                    name,
+                    1,
+                    Default::default(),
+                    InterfaceMask::OCTET_TRANSPORT,
+                    InterfaceMask::OCTET,
+                ),
+                queued: Vec::new(),
+            },
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let trace = rt.port_handle().trace();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        trace.set_trace_io_mask(Some(name), TraceIoMask::ASCII);
+        let conn = MpxConnection::new(
+            SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+            1 << 20,
+        );
+        let mut ad = ADDriverBase::new(
+            "MERLIN_LINES_DET",
+            1,
+            1 << 20,
+            PortFlags::default(),
+            InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::GENERIC_POINTER
+                | InterfaceMask::INT16_ARRAY,
+            InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::GENERIC_POINTER
+                | InterfaceMask::INT16_ARRAY,
+        )
+        .unwrap();
+        assert_eq!(conn.get(&mut ad, "X", Duration::from_secs(1)).unwrap(), "1");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("asynOctetSyncIO wrote:\nMPX,"), "{text}");
+        assert!(text.contains("asynOctetSyncIO read:\nMPX\n"), "{text}");
+        std::mem::forget(rt);
     }
 
     #[test]

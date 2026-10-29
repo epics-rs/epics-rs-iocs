@@ -9,23 +9,27 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
+use epics_rs::asyn::error::{AsynResult, AsynStatus};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
-use crate::connection::P2Util;
+use crate::connection::{ChannelError, P2Util};
 use crate::params::PhotonIIParams;
 use crate::protocol;
 use crate::raw;
@@ -61,14 +65,21 @@ impl PhotonIIDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<Self> {
-        let mut ad =
-            ADDriverBase::new(port_name, PII_SIZE_X as i32, PII_SIZE_Y as i32, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_memory,
+            ASYN_CANBLOCK,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        )?;
         let params = PhotonIIParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Bruker")?;
         base.set_string_param(ad.params.base.model, 0, "PhotonII")?;
-        base.set_string_param(ad.params.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
+        // PhotonII.h:16-18.
+        base.set_string_param(ad.params.base.driver_version, 0, "1.0.0")?;
 
         base.set_int32_param(ad.params.max_size_x, 0, PII_SIZE_X as i32)?;
         base.set_int32_param(ad.params.max_size_y, 0, PII_SIZE_Y as i32)?;
@@ -77,10 +88,9 @@ impl PhotonIIDetector {
         base.set_int32_param(ad.params.base.array_size_x, 0, PII_SIZE_X as i32)?;
         base.set_int32_param(ad.params.base.array_size_y, 0, PII_SIZE_Y as i32)?;
         base.set_int32_param(ad.params.base.array_size, 0, raw::frame_bytes() as i32)?;
-        // C advertised NDUInt32 here while allocating every frame as NDInt32,
-        // so the DataType readback disagreed with the arrays the plugins got.
-        // The frames are signed 32-bit; say so.
-        base.set_int32_param(ad.params.base.data_type, 0, NDDataType::Int32 as u8 as i32)?;
+        // C's own inconsistency, kept on both sides: it seeds NDUInt32 here
+        // (PhotonII.cpp:124) and allocates every frame NDInt32 (:416).
+        base.set_int32_param(ad.params.base.data_type, 0, NDDataType::UInt32 as u8 as i32)?;
         base.set_int32_param(ad.params.image_mode, 0, 2)?; // ADImageContinuous
         base.set_int32_param(ad.params.status, 0, ADStatus::Idle as i32)?;
 
@@ -96,16 +106,25 @@ impl PhotonIIDetector {
     /// Send one command line to p2util and publish both sides of the exchange
     /// to the StringToServer / StringFromServer records (C `writePhotonII`).
     fn command(&mut self, command: &str) -> AsynResult<()> {
-        let reply = match self.p2.write_read(command, COMMAND_TIMEOUT) {
-            Ok(reply) => reply,
-            Err(e) => {
-                log::error!("photonii: '{command}' failed: {e}");
-                String::new()
-            }
-        };
+        let (reply, status) = self.p2.write_read(command, COMMAND_TIMEOUT);
+        if let Err(e) = status {
+            let status = match &e {
+                ChannelError::Timeout => AsynStatus::Timeout,
+                ChannelError::Transport(e) => e.status(),
+            };
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!(
+                    "PhotonII::writePhotonII, status={}, sent\n{command}\n",
+                    status as i32
+                ),
+            );
+        }
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.string_to_server, 0, command)?;
-        base.set_string_param(self.ad.params.string_from_server, 0, reply)?;
+        if let Some(reply) = reply {
+            base.set_string_param(self.ad.params.string_from_server, 0, reply)?;
+        }
         Ok(())
     }
 
@@ -115,9 +134,7 @@ impl PhotonIIDetector {
 
     fn set_acquire(&mut self, value: i32, was_acquiring: bool) -> AsynResult<()> {
         if value != 0 && !was_acquiring {
-            if self.commands.try_send(TaskCommand::Start).is_err() {
-                log::error!("photonii: the acquisition task is not accepting commands");
-            }
+            let _ = self.commands.try_send(TaskCommand::Start);
         } else if value == 0 && was_acquiring {
             self.shared.stop_requested.store(true, Ordering::Release);
             self.command(&protocol::abort())?;
@@ -141,51 +158,88 @@ impl PortDriver for PhotonIIDetector {
         let was_acquiring = self.get_i32(self.ad.params.acquire) != 0;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
+        let mut status: AsynResult<()> = Ok(());
         if reason == self.ad.params.acquire {
             self.set_acquire(value, was_acquiring)?;
         } else if reason == self.params.shutter {
-            self.ad.set_shutter(value != 0)?;
+            self.ad.set_shutter(value != 0);
         } else if reason == self.params.dr_sum_enable {
             self.command(&protocol::set_dr_summation(value))?;
         } else if reason == self.ad.params.trigger_mode {
-            match TriggerSource::from_i32(value) {
-                Some(source) => self.command(&protocol::set_trigger_source(source))?,
-                None => log::error!("photonii: unknown TriggerMode {value}"),
+            if let Some(source) = TriggerSource::from_i32(value) {
+                self.command(&protocol::set_trigger_source(source))?;
             }
         } else if reason == self.params.trigger_type {
-            match TriggerType::from_i32(value) {
-                Some(t) => self.command(&protocol::set_trigger_type(t))?,
-                None => log::error!("photonii: unknown TriggerType {value}"),
+            if let Some(t) = TriggerType::from_i32(value) {
+                self.command(&protocol::set_trigger_type(t))?;
             }
         } else if reason == self.params.trigger_edge {
-            match TriggerEdge::from_i32(value) {
-                Some(e) => self.command(&protocol::set_trigger_edge(e))?,
-                None => log::error!("photonii: unknown TriggerEdge {value}"),
+            if let Some(e) = TriggerEdge::from_i32(value) {
+                self.command(&protocol::set_trigger_edge(e))?;
             }
         } else if reason == self.params.num_subframes {
             self.command(&protocol::set_num_subframes(value))?;
+        } else if reason < self.params.dr_sum_enable {
+            // FIRST_PII_PARAM is PII_DRSumEnable (PhotonII.h:47).
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "PhotonII::writeInt32: error, status={} function={reason}, value={value}\n",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("PhotonII::writeInt32: function={reason}, value={value}\n"),
+            ),
+        }
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         if reason == self.ad.params.acquire_time {
-            self.command(&protocol::set_exposure_time(value))?;
+            let _ = self.command(&protocol::set_exposure_time(value));
+        } else if reason < self.params.dr_sum_enable {
+            // ADDriver::writeFloat64 is asynPortDriver's (PhotonII.cpp:549).
+            status = self.ad.port_base.write_float64_param(user, value);
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "PhotonII::writeFloat64: error, status={} function={reason}, value={value:.6}\n",
+                    e.status() as i32, value = CFloat(value)
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("PhotonII::writeFloat64: function={reason}, value={value:.6}\n", value = CFloat(value)),
+            ),
+        }
+        status
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, value: &[u8]) -> AsynResult<usize> {
@@ -198,13 +252,8 @@ impl PortDriver for PhotonIIDetector {
             self.ad.port_base.call_param_callbacks(0)?;
             return Ok(value.len());
         }
-        self.ad.port_base.params.set_string(
-            reason,
-            user.addr,
-            String::from_utf8_lossy(value).into_owned(),
-        )?;
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(value.len())
+        // C has no writeOctet and inherits `ADDriver::writeOctet`.
+        self.ad.write_octet(user, value)
     }
 }
 
@@ -223,9 +272,8 @@ pub struct PhotonIIRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub params: PhotonIIParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     task: std::thread::JoinHandle<()>,
 }
@@ -235,7 +283,7 @@ impl PhotonIIRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -243,21 +291,22 @@ impl PhotonIIRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
 
 /// Create the detector port and start its acquisition task.
 ///
-/// `command_handle` is the `drvAsynIPPort` that reaches p2util (C
-/// `PhotonIIConfig`'s `commandPort`).
+/// `command_handle` is the user of the `drvAsynIPPort` that reaches p2util (C
+/// `PhotonIIConfig`'s `commandPort`) — one with no port when that port does
+/// not exist, since C ignores the connect status (PhotonII.cpp:112).
 pub fn create_photonii_detector(
-    port_name: &str,
-    command_handle: PortHandle,
+    claim: &PortClaim,
+    command_handle: SyncIOHandle,
     max_memory: usize,
 ) -> AsynResult<PhotonIIRuntime> {
+    let port_name = claim.name();
     let shared = Arc::new(SharedState {
         stop_requested: AtomicBool::new(false),
     });
@@ -268,16 +317,14 @@ pub fn create_photonii_detector(
     let ad_params = det.ad.params;
     let params = det.params;
     let pool = det.ad.pool.clone();
-
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let task = start_acquisition_task(AcquisitionContext {
         p2,
         handle: runtime_handle.port_handle().clone(),
         output: ArrayPublisher::new(array_output.clone()),
-        queued: queued_counter.clone(),
+        pool: pool.clone(),
         ad_params,
         params,
         shared,
@@ -290,7 +337,505 @@ pub fn create_photonii_detector(
         params,
         pool,
         array_output,
-        queued_counter,
         task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::registry::claim_port;
+    use std::time::Duration;
+
+    fn detector(name: &str) -> PhotonIIDetector {
+        let ip = format!("{name}_IP");
+        let (runtime, _) = create_port_runtime(
+            &claim_port(&ip).unwrap(),
+            DrvAsynIPPort::new(&ip, "127.0.0.1:1").unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let p2 = P2Util::new(
+            SyncIOHandle::from_handle(
+                runtime.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        PhotonIIDetector::new(name, p2, 0, shared, tx).unwrap()
+    }
+
+    /// PhotonII.cpp:103-105 formats DRIVER_VERSION.REVISION.MODIFICATION
+    /// (PhotonII.h:16-18).
+    #[test]
+    fn the_driver_version_is_the_c_driver_release() {
+        let det = detector("PII_VERSION");
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.ad.params.base.driver_version, 0)
+                .unwrap(),
+            b"1.0.0"
+        );
+    }
+
+    /// DataType starts NDUInt32 (PhotonII.cpp:124); the frames are NDInt32
+    /// (:416), which `a_frame_leaves_the_array_params_alone` reads back.
+    #[test]
+    fn data_type_is_cs_seed() {
+        let det = detector("PII_DTYPE");
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(det.ad.params.base.data_type, 0)
+                .unwrap(),
+            NDDataType::UInt32 as i32
+        );
+    }
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let mut det = detector("PII_BASE_WRITE");
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (PhotonII.cpp:549), whose
+    /// IO_DRIVER line precedes PhotonII's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "PII_BASE_F64";
+        let mut det = detector(port);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("pii-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let gain = det.ad.params.gain;
+        let mut user = AsynUser::new(gain).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        det.write_float64(&mut user, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base =
+            format!("asynPortDriver:writeFloat64: function={gain}, name=GAIN, value=2.000000");
+        let own = format!("PhotonII::writeFloat64: function={gain}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
+    }
+
+    /// C ignores the `pasynOctetSyncIO->connect` status (PhotonII.cpp:112):
+    /// with no p2util port configured the detector port still exists.
+    #[test]
+    fn a_detector_whose_command_port_is_missing_still_boots() {
+        let (cmd, status) =
+            SyncIOHandle::connect_port("PII_NONE_CMD", 0, Duration::ZERO, InterfaceType::Octet);
+        assert!(status.is_err());
+        let rt = create_photonii_detector(&claim_port("PII_NONE").unwrap(), cmd, 1 << 20)
+            .expect("the detector port");
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Octet,
+        )
+        .unwrap();
+        let p = rt.ad_params;
+        sync.write_int32(p.num_images, 3).unwrap();
+        assert_eq!(sync.read_int32(p.num_images).unwrap(), 3);
+    }
+
+    /// PhotonII.cpp:412 publishes every frame type but Dark, so an ADC0 frame
+    /// reaches the plugins.
+    #[test]
+    fn an_adc0_frame_is_published() {
+        use crate::types::FrameType;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use std::io::{BufRead, BufReader, Write};
+
+        let dir = std::env::temp_dir().join(format!("pii-adc0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // p2util: "OK" to every line; after a grab, the frame file and its
+        // `wrote N bytes to "<file>"` line.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut out = conn.try_clone().unwrap();
+            for line in BufReader::new(conn).lines() {
+                let line = line.unwrap();
+                out.write_all(b"OK\r\n").unwrap();
+                let words: Vec<&str> = line.split_whitespace().collect();
+                if words.first() != Some(&"grab") {
+                    continue;
+                }
+                let arg = |flag: &str| words[words.iter().position(|w| *w == flag).unwrap() + 1];
+                let file = format!("{}/{}_0001.raw", arg("--dstdir"), arg("--basename"));
+                std::thread::sleep(Duration::from_millis(200));
+                std::fs::write(&file, vec![0u8; crate::raw::frame_bytes()]).unwrap();
+                write!(
+                    out,
+                    "wrote {} bytes to \"{file}\"\r\n",
+                    crate::raw::frame_bytes()
+                )
+                .unwrap();
+            }
+        });
+
+        let ip = "PII_ADC0_IP";
+        let (ip_rt, _) = create_port_runtime(
+            &claim_port(ip).unwrap(),
+            DrvAsynIPPort::new_configured(ip, &addr.to_string(), false, false).unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        // iocPhotonII/st.cmd's EOS.
+        let eos_user = || AsynUser::default().with_addr(0);
+        ip_rt
+            .port_handle()
+            .set_input_eos_blocking(eos_user(), b"\r\n")
+            .unwrap();
+        ip_rt
+            .port_handle()
+            .set_output_eos_blocking(eos_user(), b"\n")
+            .unwrap();
+        let cmd = SyncIOHandle::from_handle(
+            ip_rt.port_handle().clone(),
+            0,
+            Duration::from_secs(2),
+            InterfaceType::Octet,
+        )
+        .unwrap();
+        let rt = create_photonii_detector(&claim_port("PII_ADC0").unwrap(), cmd, 1 << 26).unwrap();
+        let (tx, mut rx) = ndarray_channel("PII_ADC0_SINK", 4);
+        rt.connect_downstream(tx);
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Octet,
+        )
+        .unwrap();
+        let p = rt.ad_params;
+        sync.write_octet(p.base.file_path, dir.to_str().unwrap().as_bytes())
+            .unwrap();
+        sync.write_octet(p.base.file_name, b"adc").unwrap();
+        sync.write_int32(p.base.array_callbacks, 1).unwrap();
+        sync.write_int32(rt.params.num_darks, 1).unwrap();
+        sync.write_int32(p.frame_type, FrameType::Adc0 as i32)
+            .unwrap();
+        sync.write_int32(p.acquire, 1).unwrap();
+
+        let (got_tx, got_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = got_tx.send(rx.blocking_recv());
+        });
+        let frame = got_rx.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(frame, Ok(Some(_))),
+            "no ADC0 frame reached the plugins"
+        );
+        std::mem::forget((ip_rt, rt));
+    }
+
+    /// A p2util that answers every command with `reply`, on a read that then
+    /// times out.
+    struct CutReply {
+        base: PortDriverBase,
+        reply: &'static [u8],
+    }
+
+    impl PortDriver for CutReply {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            let n = self.reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.reply[..n]);
+            epics_rs::asyn::interpose::OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "reply cut by a timeout".into(),
+                }),
+                ..epics_rs::asyn::interpose::OctetReadResult::ok(
+                    n,
+                    epics_rs::asyn::interpose::EomReason::empty(),
+                )
+            }
+        }
+    }
+
+    /// writePhotonII posts `fromPhotonII_` whatever the read's status
+    /// (PhotonII.cpp:226-237), so a reply a timeout cut still reaches
+    /// StringFromServer.
+    #[test]
+    fn a_reply_cut_by_a_timeout_reaches_string_from_server() {
+        let ip = "PII_CUT_IP";
+        let mut base = PortDriverBase::new(
+            ip,
+            1,
+            Default::default(),
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
+        );
+        base.init_connected(true);
+        let fake = CutReply {
+            base,
+            reply: b"set ok",
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
+        let p2 = P2Util::new(
+            SyncIOHandle::from_handle(
+                runtime.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        let mut det = PhotonIIDetector::new("PII_CUT", p2, 0, shared, tx).unwrap();
+        det.command("set --subframes-per-frame 2").unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_string_param(det.ad.params.string_from_server, 0)
+                .unwrap(),
+            b"set ok"
+        );
+    }
+
+    /// A p2util that answers the first command with `set ok` and refuses
+    /// every write after it.
+    struct DeadAfterOne {
+        base: PortDriverBase,
+        writes: usize,
+    }
+
+    impl PortDriver for DeadAfterOne {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.writes += 1;
+            if self.writes > 1 {
+                return Err(epics_rs::asyn::error::AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "write refused".into(),
+                });
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            buf[..6].copy_from_slice(b"set ok");
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                6,
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
+        }
+    }
+
+    /// A failed write leaves `fromPhotonII_` as it was (asynOctetSyncIO.c:
+    /// 254-257), so StringFromServer keeps the last reply
+    /// (PhotonII.cpp:236-237).
+    #[test]
+    fn a_failed_write_keeps_string_from_server() {
+        let ip = "PII_DEAD_IP";
+        let mut base = PortDriverBase::new(
+            ip,
+            1,
+            Default::default(),
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
+        );
+        base.init_connected(true);
+        let fake = DeadAfterOne { base, writes: 0 };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
+        let p2 = P2Util::new(
+            SyncIOHandle::from_handle(
+                runtime.port_handle().clone(),
+                0,
+                Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .unwrap(),
+        );
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        let mut det = PhotonIIDetector::new("PII_DEAD", p2, 0, shared, tx).unwrap();
+        det.command("set a").unwrap();
+        det.command("set b").unwrap();
+        let (p, base) = (det.ad.params, &det.ad.port_base);
+        assert_eq!(
+            base.get_string_param(p.string_to_server, 0).unwrap(),
+            b"set b"
+        );
+        assert_eq!(
+            base.get_string_param(p.string_from_server, 0).unwrap(),
+            b"set ok"
+        );
+    }
+
+    /// A p2util that answers each command with `ok`, then sends `progress`
+    /// unprompted on every read, which a timeout cuts.
+    struct Chatty {
+        base: PortDriverBase,
+        answer: bool,
+    }
+
+    impl PortDriver for Chatty {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.answer = true;
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            if std::mem::take(&mut self.answer) {
+                buf[..2].copy_from_slice(b"ok");
+                return OctetReadResult::ok(2, EomReason::empty());
+            }
+            buf[..8].copy_from_slice(b"progress");
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "line cut by a timeout".into(),
+                }),
+                ..OctetReadResult::ok(8, EomReason::empty())
+            }
+        }
+    }
+
+    /// readPhotonII posts every read's bytes, a timeout's included
+    /// (PhotonII.cpp:250-260).
+    #[test]
+    fn a_cut_line_while_waiting_for_a_frame_reaches_string_from_server() {
+        let ip = "PII_CHAT_IP";
+        let mut base = PortDriverBase::new(
+            ip,
+            1,
+            Default::default(),
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
+        );
+        base.init_connected(true);
+        let fake = Chatty {
+            base,
+            answer: false,
+        };
+        let (fake_rt, _) =
+            create_port_runtime(&claim_port(ip).unwrap(), fake, RuntimeConfig::default()).unwrap();
+        let cmd = SyncIOHandle::from_handle(
+            fake_rt.port_handle().clone(),
+            0,
+            Duration::ZERO,
+            InterfaceType::Octet,
+        )
+        .unwrap();
+        std::mem::forget(fake_rt);
+        let rt = create_photonii_detector(&claim_port("PII_CHAT").unwrap(), cmd, 1 << 20).unwrap();
+        let sync = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            Duration::from_secs(5),
+            InterfaceType::Int32,
+        )
+        .unwrap();
+        let p = rt.ad_params;
+        let from = || {
+            rt.port_handle()
+                .get_string_param_blocking(p.string_from_server, 0, 256)
+                .unwrap()
+        };
+        sync.write_int32(p.acquire, 1).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while from() != b"progress" && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let seen = from();
+        // The stop's abort command posts its own reply.
+        sync.write_int32(p.acquire, 0).unwrap();
+        assert_eq!(seen, b"progress");
+    }
+
+    /// PhotonII.cpp:117: MaxSize is the sensor, 768 x 1024.
+    #[test]
+    fn max_size_is_the_sensor() {
+        let det = detector("PII_MAX_SIZE");
+        let (p, base) = (det.ad.params, &det.ad.port_base);
+        assert_eq!(base.get_int32_param(p.max_size_x, 0).unwrap(), 768);
+        assert_eq!(base.get_int32_param(p.max_size_y, 0).unwrap(), 1024);
+    }
 }

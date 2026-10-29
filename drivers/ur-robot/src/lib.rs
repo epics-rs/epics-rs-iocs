@@ -21,11 +21,13 @@ pub mod drivers;
 pub mod error;
 pub mod gripper;
 pub mod io;
+mod net;
 pub mod receive;
 pub mod registry;
 pub mod rtde;
 pub mod script;
 pub mod session;
+pub mod spdlog;
 pub mod state;
 pub mod stream;
 

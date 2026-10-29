@@ -4,37 +4,50 @@
 # Usage:
 #   cargo run -p acsmotion-ioc -- st.cmd
 #
-# Requires an ACS SPiiPlus controller reachable over TCP (default control port
-# 701) or serial. One controller drives numAxes axes (0-based).
+# C's iocAcsMotion st.cmd with AcsMotion.cmd and AcsMotionAuxIO.cmd: one
+# ACS SPiiPlus controller reachable over TCP (control port 701) drives
+# numAxes axes (0-based), its auxiliary I/O read on a second connection.
 #============================================================
 
-epicsEnvSet("P",      "acs:")
-epicsEnvSet("CTRL",   "0")
-epicsEnvSet("IPPORT", "acsAsyn")
-epicsEnvSet("HOST",   "192.168.1.100:701")
-epicsEnvSet("NUMAXES", "1")
+epicsEnvSet("P",       "acs:")
+epicsEnvSet("CTRL",    "ACS1")
+epicsEnvSet("IPPORT",  "ACS1_ETH")
+epicsEnvSet("AUXIO",   "ACS1_IO")
+epicsEnvSet("AUXPORT", "ACS1_IO_ETH")
+epicsEnvSet("HOST",    "192.168.1.100:701")
+epicsEnvSet("NUMAXES", "8")
 
-# ---- asyn octet port ----
+# motorUtil (allstop & alldone)
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+
+# ---- SPiiPlus controller, as C's ACS_Motion_tcp.iocsh ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
-#drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
-#asynSetOption("$(IPPORT)", -1, "baud", "115200")
+# AcsMotionConfig(acsPort, asynPort, numAxes, movingPollPeriod, idlePollPeriod,
+#                 virtualAxisList). Poll periods in seconds; virtualAxisList is
+#                 comma-separated 0-based indices.
+AcsMotionConfig("$(CTRL)", "$(IPPORT)", $(NUMAXES), 0.1, 1.0, "")
+# Profile moves: SPiiPlusCreateProfile(acsPort, maxPoints, maxPulses), as
+# ACS_Motion.iocsh always calls it.
+SPiiPlusCreateProfile("$(CTRL)", 2000, 2000)
 
-# SPiiPlus framing: ACSPL+ replies are terminated by CR ("\r"). The driver owns
-# the output terminator ("\r"), so only the input EOS is set here. Do NOT set an
-# output EOS (it would double-terminate).
-asynOctetSetInputEos("$(IPPORT)", 0, "\r")
+# The motor records, profile move and SPiiPlus per-axis PVs, and an asyn
+# record for debugging, as C's AcsMotion.cmd loads them.
+dbLoadTemplate("$(ACSMOTION_IOC)/db/AcsMotion.substitutions", "P=$(P),PORT=$(CTRL)")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=asyn,PORT=$(IPPORT),ADDR=0,OMAX=256,IMAX=256")
 
-# ---- SPiiPlus controller ----
-# AcsMotionConfig(card, asynPort, numAxes, [virtualAxisList], [homingMethod],
-#                 [movingPollMs], [idlePollMs]). homingMethod default 1
-#                 (limit+index); virtualAxisList is comma/space-separated
-#                 0-based indices.
-AcsMotionConfig("$(CTRL)", "$(IPPORT)", $(NUMAXES), "", 1, 100, 1000)
+# ---- auxiliary I/O, as C's ACS_Motion_AuxIO_tcp.iocsh ----
+drvAsynIPPortConfigure("$(AUXPORT)", "$(HOST)", 0, 0, 0)
+# AcsMotionAuxIOConfig(auxIOPortName, asynPortName, numChannels, pollPeriod)
+AcsMotionAuxIOConfig("$(AUXIO)", "$(AUXPORT)", 32, 0.1)
 
-# One motor record for axis 0. DTYP = ACSMOTION_$(CTRL)_$(AXIS).
-dbLoadRecords("$(ACSMOTION_IOC)/db/acsmotion.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
+# Its records and asyn record, as C's AcsMotionAuxIO.cmd loads them.
+dbLoadTemplate("$(ACSMOTION_IOC)/db/AcsMotionAuxIO.substitutions", "P=$(P),PORT=$(AUXIO)")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=io:asyn,PORT=$(AUXPORT),ADDR=0,OMAX=256,IMAX=256")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
 
 # Example:
 #   dbl

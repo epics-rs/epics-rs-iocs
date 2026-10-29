@@ -2,41 +2,53 @@
 #============================================================
 # st.cmd — Sydor T4U electrometer IOC, straight to the meter
 #
-# Usage:
-#   cargo run -p t4u-direct-em-ioc -- iocs/quadem/t4u-direct-em-ioc/st.cmd
+# Usage (from this directory, as C runs from iocBoot/iocT4UDirect_EM):
+#   ../../../target/debug/t4u-direct-em-ioc st.cmd
 #
-# Mirrors quadEM's iocBoot/iocT4UDirect_EM/T4UDirect_EM.cmd.
+# Port of quadEM iocBoot/iocT4UDirect_EM/st.cmd + T4UDirect_EM.cmd. dbLoadDatabase and
+# registerRecordDeviceDriver have no epics-rs counterpart; $(QUADEM) is set
+# to iocs/quadem by ioc_support.
 #============================================================
+
+errlogInit(5000)
+
+# The search path for database files
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
 
 epicsEnvSet("PREFIX",    "QE1_")
 epicsEnvSet("RECORD",    "T4U_EM_")
 epicsEnvSet("PORT",      "T4U_EM")
+# C loads T4U_EM; the direct-only records are in T4UDirect_EM.template.
 epicsEnvSet("TEMPLATE",  "T4UDirect_EM")
+epicsEnvSet("QSIZE",     "20")
 epicsEnvSet("RING_SIZE", "10000")
 epicsEnvSet("TSPOINTS",  "5000")
-epicsEnvSet("T4U_ADDR",  "192.168.11.90")
+epicsEnvSet("T4U_ADDR", "192.168.11.90")
 epicsEnvSet("DATA_PORT", "10101")
+epicsEnvSet("CALFILE", "DBPM_Settings.ini");
 
-# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
-# at IOC startup; every quadEM template lives in its db/ subdir.
-epicsEnvSet("CALFILE", "$(QUADEM)/DBPM_Settings.ini")
+# Load asynRecord record
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(PREFIX), R=asyn1,PORT=TCP_Command_$(PORT),ADDR=0,OMAX=256,IMAX=256")
 
-# Commands go to the meter's telnet port (23); data arrives as UDP datagrams on
-# $(DATA_PORT), which the driver binds. The calibration file supplies the
-# per-range slope/offset pairs written to registers 100-107 on a range change.
 drvT4UDirect_EMConfigure("$(PORT)", "$(T4U_ADDR)", $(RING_SIZE), $(DATA_PORT), "$(CALFILE)")
 
-# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
-# ...) resolve through the db search path; direct dbLoad paths stay explicit.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
+#asynSetTraceIOMask("UDP_$(PORT)", 0, 2)
+#asynSetTraceMask("UDP_$(PORT)", 0, 9)
+#asynSetTraceIOMask("TCP_Command_$(PORT)", 0, 2)
+#asynSetTraceMask("TCP_Command_$(PORT)", 0, 9)
+#asynSetTraceIOMask("TCP_Data_$(PORT)", 0, 2)
+#asynSetTraceMask("TCP_Data_$(PORT)", 0, 9)
 
-dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
+dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
-# Example interactive commands:
-#   dbl                                  # List all PVs
-#   dbpf QE1_T4U_EM_WaitStateMode 2      # Triggered mode (pulsed calibration)
-#   dbpf QE1_T4U_EM_ReadsPerPacket 50
-#   dbgf QE1_T4U_EM_Current1:MeanValue_RBV
-#   asynReport                           # Show port/plugin status
+< $(QUADEM)/quadEM_Plugins.cmd
+
+asynSetTraceIOMask("$(PORT)",0,2)
+#asynSetTraceMask("$(PORT)",  0,0x29)
+
+< $(QUADEM)/saveRestore.cmd
+
+iocInit()
+
+# save settings every thirty seconds
+create_monitor_set("auto_settings.req",30,"P=$(PREFIX), R=$(RECORD)")

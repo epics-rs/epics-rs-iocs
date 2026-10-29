@@ -11,7 +11,7 @@
 
 epicsEnvSet("P",      "PM304:")
 epicsEnvSet("CARD",   "0")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -23,29 +23,31 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# PM304/PM600 framing: the driver appends the CR terminator to each command, so
-# only the input EOS is configured here (replies are CR+LF terminated; on the
-# PM600 the command echo ends in a lone CR that the driver strips). Do not set
-# an output EOS — the port would append it a second time.
+# Port EOS as C needs it: drvPM304 sets no EOS and sends bare commands. Replies
+# are CR+LF terminated; on the PM600 the command echo ends in a lone CR that the
+# driver strips.
 asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- PM304 controller ----
-# PM304Setup(maxControllers, [scanRate]) is accepted for startup-script parity;
-# the asyn-rs port allocates per PM304Config call.
+# PM304Setup(num_cards, scan_rate in Hz)
 PM304Setup(1, 10)
 
-# PM304Config(card, asynPort, nAxes, [movingPollMs], [idlePollMs]) - the model
+# PM304Config(card, asyn port, n_axes) - the model
 # (PM304 vs PM600) is auto-detected from the 1ID reply.
-PM304Config(0, "$(SERIAL)", 2, 100, 1000)
+PM304Config(0, "$(SERIAL)", 1)
 
-# One motor record per axis (DTYP PM304_$(CARD)_0, _1, ...). The controller
-# works in motor steps, so MRES = 1 and EGU = steps.
-dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+# motorUtil's records and the axis's motor.db, as C's st.cmd and
+# PM304.cmd load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(MCLENNAN_IOC)/db/PM304.substitutions", "P=$(P),C=$(CARD)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
 
 # Example:
 #   dbl
 #   camonitor PM304:m1 PM304:m1.RBV
-#   caput PM304:m1 10000
+#   caput PM304:m1 10

@@ -1,0 +1,14 @@
+# C's iocOmsAsyn MXA.substitutions, P and PORT from st.mxa.cmd.
+file "$(MOTOR)/db/asyn_motor_model2.db"
+{
+pattern
+{N,  M,       DTYP,         ADDR,  DESC,          EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "asynMotor",  0,     "motor $(N)",  deg,  Pos,  10,    0,     .2,    0,     1,     2,     0.01,  5,     0,     0,     ""}
+{2,  "m$(N)", "asynMotor",  1,     "motor $(N)",  deg,  Pos,  10,    0,     .2,    0,     1,     2,     0.01,  5,     0,     0,     ""}
+{3,  "m$(N)", "asynMotor",  2,     "motor $(N)",  deg,  Pos,  10,    0,     .2,    0,     1,     2,     0.01,  5,     0,     0,     ""}
+{4,  "m$(N)", "asynMotor",  3,     "motor $(N)",  deg,  Pos,  10,    0,     .2,    0,     1,     2,     0.01,  5,     0,     0,     ""}
+{5,  "m$(N)", "asynMotor",  4,     "motor $(N)",  deg,  Pos,  10,    0,     .2,    0,     1,     2,     0.01,  5,     0,     0,     ""}
+{6,  "m$(N)", "asynMotor",  5,     "motor $(N)",  deg,  Pos,  10,    0,     .2,    0,     1,     2,     0.01,  5,     0,     0,     ""}
+{7,  "m$(N)", "asynMotor",  6,     "motor $(N)",  deg,  Pos,  10,    0,     .2,    0,     1,     2,     0.01,  5,     0,     0,     ""}
+{8,  "m$(N)", "asynMotor",  7,     "motor $(N)",  deg,  Pos,  10,    0,     .2,    0,     1,     2,     0.01,  5,     0,     0,     ""}
+}

@@ -21,16 +21,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::base::error::CaResult;
-use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
-use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
+use epics_rs::ca::server::ioc_app::IocApplication;
 
 use mca::dev_mca_asyn;
 use mca::fastsweep::FastSweepDriver;
-use mca::interface::ASYN_MCA_DTYP;
 
 mod demo_source;
 
@@ -38,10 +37,10 @@ mod demo_source;
 /// (mirrors `ur-robot-ioc`'s `Ports`; see its `main.rs`).
 type Ports = Arc<Mutex<Vec<PortRuntimeHandle>>>;
 
-fn arg_string(args: &[ArgValue], i: usize) -> Option<String> {
+fn arg_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
+        _ => Ok(None),
     }
 }
 
@@ -66,11 +65,11 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: mca-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: mca-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("MCA_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("MCA_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let ports: Ports = Arc::new(Mutex::new(Vec::new()));
 
@@ -80,6 +79,12 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(asyn_name, move || asyn_factory());
     let (mca_name, mca_factory) = mca_rs::mca_record_factory();
     app = app.register_record_type(mca_name, move || mca_factory());
+    // mca.db's busy and transform records: opt-in in epics-rs, as a C IOC
+    // links busy and std's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+    app = app.register_record_type("transform", || {
+        Box::new(epics_rs::base::server::records::transform::TransformRecord::default())
+    });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // DemoSourceConfig(portName, maxSignals, period)
@@ -102,19 +107,21 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "DemoSourceConfig portName maxSignals period - start the demo signal source",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let port_name = arg_string(args, 0).ok_or("portName required")?;
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port_name = arg_string(args, 0)?.ok_or("portName required")?;
                 let max_signals = arg_int(args, 1).ok_or("maxSignals required")? as usize;
                 let period = arg_double(args, 2).ok_or("period required")?;
 
+                let claim = claim_port(&port_name).map_err(|e| format!("DemoSourceConfig: {e}"))?;
                 let runtime_handle =
-                    demo_source::connect(&port_name, max_signals, Duration::from_secs_f64(period))
+                    demo_source::connect(&claim, max_signals, Duration::from_secs_f64(period))
                         .map_err(|e| format!("DemoSourceConfig: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime_handle.port_handle().clone(),
-                )
-                .map_err(|e| format!("DemoSourceConfig: {e}"))?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| format!("DemoSourceConfig: {e}"))?;
                 ports
                     .lock()
                     .expect("port list poisoned")
@@ -157,14 +164,15 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "initFastSweep portName inputName maxSignals maxPoints [dataString] [intervalString]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let port_name = arg_string(args, 0).ok_or("portName required")?;
-                let input_name = arg_string(args, 1).ok_or("inputName required")?;
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port_name = arg_string(args, 0)?.ok_or("portName required")?;
+                let input_name = arg_string(args, 1)?.ok_or("inputName required")?;
                 let max_signals = arg_int(args, 2).ok_or("maxSignals required")? as usize;
                 let max_points = arg_int(args, 3).ok_or("maxPoints required")? as usize;
-                let data_string = arg_string(args, 4).unwrap_or_default();
-                let interval_string = arg_string(args, 5).unwrap_or_default();
+                let data_string = arg_string(args, 4)?.unwrap_or_default();
+                let interval_string = arg_string(args, 5)?.unwrap_or_default();
 
+                let claim = claim_port(&port_name).map_err(|e| format!("initFastSweep: {e}"))?;
                 let (driver, subscriptions) = FastSweepDriver::connect(
                     &port_name,
                     &input_name,
@@ -175,14 +183,15 @@ async fn main() -> CaResult<()> {
                 )
                 .map_err(|e| format!("initFastSweep: {e}"))?;
                 let (runtime_handle, _actor) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("initFastSweep: {e}"))?;
                 mca::fastsweep::start(runtime_handle.port_handle().clone(), subscriptions);
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime_handle.port_handle().clone(),
-                )
-                .map_err(|e| format!("initFastSweep: {e}"))?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| format!("initFastSweep: {e}"))?;
                 ports
                     .lock()
                     .expect("port list poisoned")
@@ -192,20 +201,7 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    // Binds every mca record with DTYP "asynMCA" to the asyn port its own
-    // INP link (`@asyn(portName,addr)`) names -- unlike scalerRecord
-    // (scaler974-ioc), mcaRecord's INP is now mirrored into
-    // DeviceSupportContext (epics-base-rs 0.24.0), so no single-instance
-    // registry workaround is needed here.
-    app = app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-        if ctx.dtyp != ASYN_MCA_DTYP {
-            return None;
-        }
-        let dev = dev_mca_asyn::connect(ctx.inp)?;
-        Some(Box::new(dev) as Box<dyn DeviceSupport>)
-    });
+    app = dev_mca_asyn::register_dev_mca_asyn(app);
 
-    app.startup_script(&script)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

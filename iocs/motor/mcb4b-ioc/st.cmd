@@ -10,7 +10,7 @@
 #============================================================
 
 epicsEnvSet("P",        "acs:")
-epicsEnvSet("CARD",     "0")
+epicsEnvSet("MCB4B",    "MCB4B1")
 epicsEnvSet("PORT",     "serial1")
 epicsEnvSet("TTY",      "/dev/ttyUSB0")
 epicsEnvSet("NUM_AXES", "4")
@@ -32,20 +32,29 @@ asynOctetSetInputEos( "$(PORT)", -1, "\r")
 asynOctetSetOutputEos("$(PORT)", -1, "\r")
 
 # ---- ACS MCB-4B controller ----
-# MCB4BCreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
-# card is the DTYP prefix (MCB4B_{card}_{index}); axes are 0-based, matching the
-# C "#%02d" wire prefix.
-MCB4BCreateController($(CARD), "$(PORT)", $(NUM_AXES), 100, 1000)
+# MCB4BCreateController(portName, MCB4BPortName, numAxes, movingPollPeriod,
+# idlePollPeriod), poll periods in ms. Axes are 0-based, matching the C "#%02d"
+# wire prefix.
+MCB4BCreateController("$(MCB4B)", "$(PORT)", $(NUM_AXES), 100, 5000)
 
-# One motor record per axis (the MCB-4B works in raw controller steps, MRES=1).
-dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m0,CARD=$(CARD),AXIS=0")
-dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m1,CARD=$(CARD),AXIS=1")
-dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m2,CARD=$(CARD),AXIS=2")
-dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m3,CARD=$(CARD),AXIS=3")
+# Each axis's basic_asyn_motor.db and the serial line's asyn record, as
+# C's st.cmd.mcb4b loads them.
+dbLoadTemplate("$(MCB4B_IOC)/db/motor.substitutions.mcb4b", "P=$(P),PORT=$(MCB4B)")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=serial1,PORT=$(PORT),ADDR=0,OMAX=80,IMAX=80")
 
 iocInit()
 
+# This IOC does not use save/restore, so set values of some PVs
+dbpf("$(P)m1.RTRY", "0")
+dbpf("$(P)m1.TWV", "0.1")
+dbpf("$(P)m2.RTRY", "0")
+dbpf("$(P)m2.TWV", "0.1")
+dbpf("$(P)m3.RTRY", "0")
+dbpf("$(P)m3.TWV", "0.1")
+dbpf("$(P)m4.RTRY", "0")
+dbpf("$(P)m4.TWV", "0.1")
+
 # Example:
 #   dbl
-#   camonitor acs:m0 acs:m0.RBV
-#   caput acs:m0 1000
+#   camonitor acs:m1 acs:m1.RBV
+#   caput acs:m1 1

@@ -13,12 +13,7 @@
 
 use epics_rs::asyn::interfaces::motor::PidGainKind;
 
-use super::rpc::{XpsError, XpsResult, XpsSocket, format_g};
-
-/// `%.13g` double format used on the wire.
-fn g(value: f64) -> String {
-    format_g(value, 13)
-}
+use super::rpc::{XpsError, XpsResult, XpsSocket, g13 as g};
 
 /// The XPS corrector type in use for a positioner (`XPSController.cpp`
 /// `CorrectorTypes`).
@@ -39,6 +34,17 @@ pub enum CorrectorType {
 }
 
 impl CorrectorType {
+    /// The `<T>` of C's `PositionerCorrector<T>Get`/`Set` error lines.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            CorrectorType::PiPosition => "PIPosition",
+            CorrectorType::PidFfVelocity => "PIDFFVelocity",
+            CorrectorType::PidFfAcceleration => "PIDFFAcceleration",
+            CorrectorType::PidDualFfVoltage => "PIDDualFFVoltage",
+            CorrectorType::NoCorrector | CorrectorType::Other => "",
+        }
+    }
+
     fn parse(s: &str) -> Self {
         match s {
             "PositionerCorrectorPIPosition" => CorrectorType::PiPosition,
@@ -71,42 +77,68 @@ pub struct XpsCorrectorInfo {
     pub friction: f64,
 }
 
-/// Read the corrector type for `positioner` (`PositionerCorrectorTypeGet`).
-pub fn corrector_type(sock: &XpsSocket, positioner: &str) -> XpsResult<CorrectorType> {
+/// Read the corrector type name for `positioner` (`PositionerCorrectorTypeGet`).
+fn corrector_type_name(sock: &XpsSocket, positioner: &str) -> XpsResult<String> {
     let cmd = format!("PositionerCorrectorTypeGet ({positioner},char *)");
     let r = sock.exec(&cmd)?.require_ok()?;
-    Ok(CorrectorType::parse(r.string(1)))
+    Ok(r.string(1).to_string())
+}
+
+/// Read the corrector type for `positioner` (`PositionerCorrectorTypeGet`).
+pub fn corrector_type(sock: &XpsSocket, positioner: &str) -> XpsResult<CorrectorType> {
+    corrector_type_name(sock, positioner).map(|name| CorrectorType::parse(&name))
 }
 
 /// Read the full PID/corrector parameter set for `positioner`, dispatching on
-/// its corrector type (`XPSAxis::getPID`). Returns an error for `NoCorrector`
-/// or an unrecognized type, matching C.
-pub fn get_pid(sock: &XpsSocket, positioner: &str) -> XpsResult<XpsCorrectorInfo> {
+/// its corrector type (`XPSAxis::getPID`). `NoCorrector` or an unrecognized
+/// type is a failure, matching C.
+pub fn get_pid(sock: &XpsSocket, positioner: &str) -> Result<XpsCorrectorInfo, PidFailure> {
+    let name = corrector_type_name(sock, positioner).map_err(|e| PidFailure::TypeGet(e.code()))?;
+    let ct = CorrectorType::parse(&name);
+    if matches!(ct, CorrectorType::NoCorrector | CorrectorType::Other) {
+        return Err(PidFailure::Unsupported(ct, name));
+    }
     let mut info = XpsCorrectorInfo::default();
-    read_into(
-        sock,
-        positioner,
-        corrector_type(sock, positioner)?,
-        &mut info,
-    )?;
+    read_into(sock, positioner, ct, &mut info).map_err(|e| PidFailure::Get(ct, e.code()))?;
     Ok(info)
+}
+
+/// The `XPSAxis::getPID`/`setPID` step that failed, for the caller to print C's line.
+#[derive(Debug)]
+pub enum PidFailure {
+    /// `PositionerCorrectorTypeGet` failed with this code.
+    TypeGet(i32),
+    /// The type's `PositionerCorrector*Get` failed with this code.
+    Get(CorrectorType, i32),
+    /// The type's `PositionerCorrector*Set` failed with this code.
+    Set(CorrectorType, i32),
+    /// `NoCorrector` or an unrecognized type, with the name the XPS gave.
+    Unsupported(CorrectorType, String),
 }
 
 /// Apply a single P/I/D gain to `positioner` via read-modify-write
 /// (`XPSAxis::setPID` + `setPIDValue`).
-pub fn set_pid(sock: &XpsSocket, positioner: &str, kind: PidGainKind, gain: f64) -> XpsResult<()> {
-    let ct = corrector_type(sock, positioner)?;
+pub fn set_pid(
+    sock: &XpsSocket,
+    positioner: &str,
+    kind: PidGainKind,
+    gain: f64,
+) -> Result<(), PidFailure> {
+    let name = corrector_type_name(sock, positioner).map_err(|e| PidFailure::TypeGet(e.code()))?;
+    let ct = CorrectorType::parse(&name);
+    if matches!(ct, CorrectorType::NoCorrector | CorrectorType::Other) {
+        return Err(PidFailure::Unsupported(ct, name));
+    }
     let mut info = XpsCorrectorInfo::default();
-    read_into(sock, positioner, ct, &mut info)?;
+    read_into(sock, positioner, ct, &mut info).map_err(|e| PidFailure::Get(ct, e.code()))?;
     match kind {
         PidGainKind::Proportional => info.kp = gain,
         PidGainKind::Integral => info.ki = gain,
         PidGainKind::Derivative => info.kd = gain,
     }
-    write_from(sock, positioner, ct, &info)
+    write_from(sock, positioner, ct, &info).map_err(|e| PidFailure::Set(ct, e.code()))
 }
 
-/// Read the type-specific parameters into `info`.
 fn read_into(
     sock: &XpsSocket,
     positioner: &str,

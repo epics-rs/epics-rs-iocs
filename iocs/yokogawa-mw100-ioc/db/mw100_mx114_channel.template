@@ -1,13 +1,9 @@
 # MW100 MX114 (pulse/counter) channel.
 # Macros: P, DAU, HANDLE, ADDRESS (Signal channel address).
 # Port of yokogawaDasApp/Db/MW100_MX114_channel.db.
-#
-# Upstream-defect fix (MW100_MX114_channel.db Alarm1-4 THSV, 4 sites): every
-# Alarm1-4 record's THSV field was "MAJR", not a valid EPICS severity string
-# (ZRSV/ONSV/.../FVSV in the very same records all correctly say "MAJOR") —
-# an unambiguous single-character typo of the surrounding pattern, not a
-# distinct severity level. Fixed to "MAJOR" below (same defect repeats in
-# MW100_MX115_channel.db).
+# THSV is "MAJOR" in Alarm1-4: upstream MW100_MX114_channel.db
+# lines 64, 98, 132, 166 write "MAJR", no menuAlarmSevr choice, so C
+# refuses it at load and leaves THSV at NO_ALARM. Not copied.
 
 record(longin, "$(P)$(DAU):$(ADDRESS):Counter")
 {

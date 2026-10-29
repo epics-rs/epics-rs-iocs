@@ -1,0 +1,10 @@
+# C's iocPI PI_C848.substitutions, P and C from st.cmd.
+#
+# PI C-848: one motor record per axis. DTYP is "PIC848", OUT #C$(C) S$(S) ; the
+# wire letter is 'A'+$(S), i.e. A-D, placed at byte 5 of each command.
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{N,  M,        DTYP,      S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{2,  "m$(N)",  "PIC848",  0,  "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
+}

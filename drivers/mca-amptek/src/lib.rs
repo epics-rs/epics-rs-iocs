@@ -6,7 +6,7 @@
 //! `CConsoleHelper` -- a handful of `SendCommand`/`ReceiveData` calls and
 //! the ASCII configuration helpers -- not the ~10k-line `AmptekSrc` SDK
 //! tree at large. Ported here:
-//! * [`protocol`] -- binary wire framing/checksum ([`SendCommand.cpp`],
+//! * [`protocol`] -- binary wire framing/checksum (`SendCommand.cpp`,
 //!   `ParsePacket.cpp`, `DP5Protocol.h`).
 //! * [`status`] -- the DP4-format status block decode (`DP5Status.cpp`).
 //! * [`ascii_cmd`] -- ASCII `KEY=value;` configuration string helpers
@@ -15,24 +15,22 @@
 //!   (`NetFinder.cpp`).
 //! * [`transport`] -- the Ethernet/UDP transport (`DppSocket.cpp`'s
 //!   `DppInterfaceEthernet` path).
+//! * [`usb`] -- the USB transport (`DppLibUsb.cpp` and `ConsoleHelper.cpp`'s
+//!   `LibUsb_*`) over a [`usb::UsbBus`], on nusb with the default `usb`
+//!   feature.
 //! * [`driver`] -- the asyn `PortDriver` implementation
 //!   (`drvAmptek.cpp`/`drvAmptek.h`).
 //!
-//! **Not ported** (feasibility-gated, see the crate's port report rather
-//! than this doc for the full determination):
-//! * USB (`DppLibUsb.cpp`, `libusb`-based) -- needs a Rust USB crate
-//!   (`rusb`/`nusb`) not currently in this workspace.
-//! * Serial (`DppInterfaceSerial`) -- unimplemented even in the upstream
-//!   C driver itself (`ConnectDpp`'s and `SendCommand`'s serial branches
-//!   are both empty no-ops), so there is nothing to port.
-//! * NetFinder broadcast discovery's per-network-interface enumeration
-//!   (`osiSockDiscoverBroadcastAddresses`) -- scoped down to a single
-//!   global broadcast; see [`transport::AmptekUdpTransport::discover_broadcast`].
+//! Serial (`DppInterfaceSerial`) is unimplemented in the C driver itself
+//! (`ConnectDpp`'s and `SendCommand`'s serial branches are empty), so a
+//! Serial port is built as C builds it and never connects.
 
 pub mod ascii_cmd;
 pub mod config;
 pub mod driver;
+mod link;
 pub mod net_finder;
 pub mod protocol;
 pub mod status;
 pub mod transport;
+pub mod usb;

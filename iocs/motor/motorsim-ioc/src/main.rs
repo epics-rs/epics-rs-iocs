@@ -1,8 +1,8 @@
 //! Simulated motor IOC.
 //!
 //! Assembles: the simulated motor controller (`motorSimCreateController` /
-//! `motorSimConfigAxis`), the motor record type, and the CA + PVA (QSRV)
-//! server. No hardware — the axes integrate their own trajectories, so this is
+//! `motorSimConfigAxis`, and drvMotorSim.c's `motorSimCreate`), the motor
+//! record type, and the CA + PVA (QSRV) server. No hardware — the axes integrate their own trajectories, so this is
 //! a self-contained motor-record test/demo target.
 //!
 //! Usage:
@@ -11,7 +11,9 @@
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_motorsim::ioc::MotorSimHolder;
+use motor_motorsim::ioc::{
+    MOTOR_SIM, MotorSimHolder, drv_asyn_motor_configure_command, motor_sim_create_command,
+};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -19,28 +21,47 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: motorsim-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: motorsim-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("MOTORSIM_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("MOTORSIM_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let mut app = IocApplication::new();
 
     // Motor record type.
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
+    // motorSupport.dbd's asynMotorControllerRegister.
+    for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
+        app = app.register_startup_command(cmd);
+    }
+    // motorUtilRegister: motorUtilInit, printChIDlist, listMovingMotors.
+    for cmd in epics_rs::motor::motor_util::motor_util_commands() {
+        app = app.register_startup_command(cmd);
+    }
 
-    // motorSimCreateController / motorSimConfigAxis commands + motor device
-    // support. No octet port is needed — the simulator has no hardware.
+    // asyn.dbd, which motorSimIOC links (motorSimApp/src/Makefile:23): the
+    // asyn record and the devEpics basic_asyn_motor.db's records use.
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, move || asyn_factory());
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+
+    // motorSimCreateController / motorSimConfigAxis commands, and the
+    // asynMotor device support their axes serve. No octet port is needed —
+    // the simulator has no hardware.
     let holder = MotorSimHolder::new();
     app = app.register_startup_command(holder.create_controller_command());
     app = app.register_startup_command(holder.config_axis_command());
-    app = app.register_dynamic_device_support(holder.inner().device_support_factory());
+    // motorSimCreate and its "Motor Simulation" DTYP (drvMotorSim.c).
+    app = app.register_startup_command(motor_sim_create_command());
+    // drvAsynMotorConfigure(port, "motorSim", card, nAxes): the same axes
+    // through drvMotorAsyn (model 2).
+    app = app.register_startup_command(drv_asyn_motor_configure_command(vec![&MOTOR_SIM]));
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
-    app.startup_script(&script)
-        .register_link_set_installer(epics_rs::ca::calink::calink_link_set_install)
-        .register_link_set_installer(epics_rs::bridge::qsrv::pvalink_link_set_install)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

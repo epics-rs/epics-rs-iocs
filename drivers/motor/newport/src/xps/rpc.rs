@@ -12,9 +12,9 @@
 //! The XPS driver opens several TCP connections to the same controller
 //! (`XPSController.cpp` / `XPSAxis.cpp`):
 //!
-//! - a shared **poll socket** (positive timeout, [`XpsSocket::query`]) used by
+//! - a shared **poll socket** (positive timeout, `XpsSocket::query`) used by
 //!   the controller poll and every axis for reads;
-//! - one **move socket per axis** (negative timeout, [`XpsSocket::fire`]) used
+//! - one **move socket per axis** (negative timeout, `XpsSocket::fire`) used
 //!   for the actual `GroupMove*` / `GroupHomeSearch` commands. The controller
 //!   does not wait for the move to finish; completion is observed by polling
 //!   `GroupStatusGet` on the poll socket.
@@ -22,15 +22,22 @@
 //! # Framing
 //!
 //! Like `asynOctetSocket.cpp` (which configures the port with `noProcessEos`),
-//! [`XpsSocket::query`] accumulates reads until the reply ends with
+//! `XpsSocket::query` accumulates reads until the reply ends with
 //! [`XPS_TERMINATOR`] and strips it. Framing is therefore self-contained — the
 //! port needs no input-EOS configuration, so the IOC `st.cmd` only has to
 //! register a plain `drvAsynIPPort` per socket.
 
 use std::fmt;
+use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use crate::util::{atof, atoi};
 
@@ -72,22 +79,45 @@ impl fmt::Display for XpsError {
 
 impl std::error::Error for XpsError {}
 
+impl XpsError {
+    /// The `int` C's wrapper returns: the controller's code, or the `ret = -1`
+    /// it keeps when `SendAndReceive` left no reply to `sscanf`.
+    pub fn code(&self) -> i32 {
+        match self {
+            XpsError::Transport(_) => -1,
+            XpsError::Api(code) => *code,
+        }
+    }
+
+    /// C `return (asynStatus)status` (XPSAxis.cpp:793): the int itself.
+    pub fn into_c_status(self) -> AsynError {
+        let message = match &self {
+            XpsError::Transport(e) => e.message(),
+            XpsError::Api(_) => self.to_string(),
+        };
+        AsynError::from_c_status_code(self.code(), message).expect("an XPS failure is nonzero")
+    }
+}
+
 impl From<AsynError> for XpsError {
     fn from(e: AsynError) -> Self {
         XpsError::Transport(e)
     }
 }
 
-/// Convert back into an `AsynError` so RPC calls can be used with `?` inside
-/// `AsynMotor` methods (which return `AsynResult`).
+/// C `return asynError` / `status ? asynError : asynSuccess` after an XPS
+/// call, so RPC calls can be used with `?` inside `AsynMotor` methods. C
+/// never sees the transport's asynStatus, only the call's -1; a method that
+/// returns the int itself uses [`XpsError::into_c_status`].
 impl From<XpsError> for AsynError {
     fn from(e: XpsError) -> Self {
-        match e {
-            XpsError::Transport(a) => a,
-            XpsError::Api(code) => AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("XPS API error {code}"),
-            },
+        let message = match e {
+            XpsError::Transport(a) => a.message(),
+            XpsError::Api(code) => format!("XPS API error {code}"),
+        };
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message,
         }
     }
 }
@@ -102,11 +132,15 @@ pub type XpsResult<T> = Result<T, XpsError>;
 pub struct XpsReply(String);
 
 impl XpsReply {
-    /// The leading error code (C `sscanf(reply, "%i", &ret)`); `0` = OK. An
-    /// empty reply yields `0` (C leaves `ret` at its `-1` init, but for our
-    /// EOS-framed transport an empty reply cannot occur; `atoi("") == 0`).
+    /// The leading error code (C `sscanf(reply, "%i", &ret)`); `0` = OK. A
+    /// reply with no leading integer keeps C's `ret = -1` init: a move written
+    /// into a socket the controller closed reads EOF and gets an empty reply,
+    /// which C reports as an error (XPS_C8_drivers.cpp:3355,3376).
     pub fn code(&self) -> i32 {
-        atoi(&self.0)
+        match strtol(&self.0, 0) {
+            (_, 0) => -1,
+            (v, _) => long_to_int(v),
+        }
     }
 
     /// Require a success code, returning `self` for out-param extraction or
@@ -122,7 +156,7 @@ impl XpsReply {
     /// C string out-params take everything up to the next comma; for XPS values
     /// (numbers, and status strings that never contain commas) that equals this
     /// split.
-    fn field(&self, n: usize) -> Option<&str> {
+    pub(crate) fn field(&self, n: usize) -> Option<&str> {
         self.0.split(',').nth(n)
     }
 
@@ -136,12 +170,11 @@ impl XpsReply {
         self.field(n).map(atoi).unwrap_or(0)
     }
 
-    /// Out-param `n` as a raw 32-bit bitmask. Parses the field as a (possibly
-    /// `> i32::MAX` or negative) decimal and truncates to the low 32 bits,
-    /// matching C reading an unsigned XPS error code into a signed `int`
-    /// (`PositionerErrorGet`; the end-of-run masks set bit 31).
+    /// Out-param `n` as a raw 32-bit bitmask: C's `sscanf("%d")` of an
+    /// unsigned XPS error code into a signed `int` (`PositionerErrorGet`; the
+    /// end-of-run masks set bit 31).
     pub fn bits(&self, n: usize) -> u32 {
-        self.field(n).map(atoi64).unwrap_or(0) as u32
+        self.field(n).map(atoi).unwrap_or(0) as u32
     }
 
     /// Out-param `n` as a string slice (C `strcpy` up to the next comma).
@@ -169,33 +202,117 @@ pub enum SocketMode {
 /// [`Query`]: SocketMode::Query
 /// [`Fire`]: SocketMode::Fire
 pub struct XpsSocket {
-    handle: SyncIOHandle,
+    /// `None` is C's socket index -1, from a failed `ConnectToServer`.
+    link: Option<Link>,
+    /// C's socket index, `ConnectToServer`'s return.
+    index: i32,
+    /// The asyn port `handle` is connected to: C prints its `SendAndReceive`
+    /// errors on that port's user.
+    port: String,
     mode: SocketMode,
 }
 
+struct Link {
+    handle: SyncIOHandle,
+    /// The same port at timeout 0, for [`XpsSocket::read_pending`].
+    pending: SyncIOHandle,
+}
+
 impl XpsSocket {
-    /// Wrap an already-connected octet handle with the given send mode.
-    pub fn new(handle: SyncIOHandle, mode: SocketMode) -> Self {
-        Self { handle, mode }
+    /// Wrap the connected octet port `handle`, C socket `index`, named
+    /// `port`, with the given send mode and per-call timeout.
+    pub fn new(
+        handle: PortHandle,
+        index: i32,
+        port: &str,
+        mode: SocketMode,
+        timeout: Duration,
+    ) -> Self {
+        // The port is `ConnectToServer`'s own asynOctet IP port.
+        let io = SyncIOHandle::from_handle(handle, 0, timeout, InterfaceType::Octet)
+            .expect("an XPS socket port registers asynOctet");
+        Self {
+            index,
+            link: Some(Link {
+                pending: io.with_timeout(Duration::ZERO),
+                handle: io.with_timeout(timeout),
+            }),
+            port: port.to_string(),
+            mode,
+        }
+    }
+
+    /// C's socket -1, which a driver keeps using after `ConnectToServer`
+    /// failed: every call prints and answers `-22`.
+    pub fn invalid(port: &str, mode: SocketMode) -> Self {
+        Self {
+            link: None,
+            index: -1,
+            port: port.to_string(),
+            mode,
+        }
+    }
+
+    /// `asynPrint(psock->pasynUser, ASYN_TRACE_ERROR, ...)`.
+    fn trace_error(&self, args: fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            args,
+        );
     }
 
     /// Send a marshalled command and return its reply. The socket's [`mode`]
     /// selects the C `SendAndReceive` path: [`Query`] waits for the framed
-    /// reply; [`Fire`] writes without waiting and synthesizes a `"0"` success
-    /// reply (so callers can uniformly `require_ok()`). Move completion on a
-    /// [`Fire`] socket is observed later by polling `GroupStatusGet`.
+    /// reply; [`Fire`] waits only its short timeout and returns what it read,
+    /// or a synthesized `"0"` success reply. Move completion on a [`Fire`]
+    /// socket is observed later by polling `GroupStatusGet`.
     ///
     /// [`mode`]: XpsSocket::mode
     /// [`Query`]: SocketMode::Query
     /// [`Fire`]: SocketMode::Fire
     pub fn exec(&self, cmd: &str) -> XpsResult<XpsReply> {
+        let Some(link) = &self.link else {
+            // asynOctetSocket.cpp:137-141.
+            println!("SendAndReceive: invalid SocketIndex -1");
+            let reply = XpsReply("-22".to_string());
+            return match self.mode {
+                SocketMode::Query => Ok(reply),
+                SocketMode::Fire => Err(XpsError::Api(reply.code())),
+            };
+        };
         match self.mode {
-            SocketMode::Query => self.query(cmd),
-            SocketMode::Fire => {
-                self.fire(cmd)?;
-                Ok(XpsReply("0".to_string()))
+            SocketMode::Query => self.query(link, cmd),
+            SocketMode::Fire => self.fire(link, cmd),
+        }
+    }
+
+    /// C `ReadXPSSocket(socket, ..., 0)`: whatever reply is already waiting,
+    /// read until the terminator or the first read that does not succeed.
+    /// Returns the bytes read.
+    pub fn read_pending(&self) -> Vec<u8> {
+        let Some(link) = &self.link else {
+            // asynOctetSocket.cpp:241-245.
+            println!("ReadXPSSocket: invalid SocketIndex -1");
+            return Vec::new();
+        };
+        let mut buf = Vec::new();
+        while !buf.ends_with(XPS_TERMINATOR.as_bytes()) && buf.len() < MAX_REPLY {
+            match link.pending.read_octet(OCTET_REASON, READ_BUF).into_parts() {
+                // A zero-byte success is the peer closing; C's next read
+                // fails on the closed socket.
+                (chunk, Ok(())) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
+                _ => break,
             }
         }
+        buf
+    }
+
+    /// C's socket index, -1 when `ConnectToServer` failed.
+    pub fn index(&self) -> i32 {
+        self.index
     }
 
     /// This socket's send mode.
@@ -208,15 +325,27 @@ impl XpsSocket {
     /// (`asynOctetSocket.cpp` uses `noProcessEos` and loops the same way), and
     /// return it with the terminator stripped. Self-contained: it does not rely
     /// on any port-level input EOS.
-    fn query(&self, cmd: &str) -> XpsResult<XpsReply> {
-        self.handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-        let mut buf = Vec::new();
-        loop {
-            let chunk = self.handle.read_octet(OCTET_REASON, READ_BUF)?;
+    ///
+    /// The first read that fails ends the reply: C leaves what was read for
+    /// the caller's `sscanf` whatever the status (asynOctetSocket.cpp:162-184).
+    fn query(&self, link: &Link, cmd: &str) -> XpsResult<XpsReply> {
+        // C writeRead (asynOctetSocket.cpp:153) flushes stale input before the
+        // write; only the continuation chunks are plain reads.
+        let handle = &link.handle;
+        let (mut buf, mut status) = handle
+            .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        if let Err(e) = &status {
+            self.trace_error(format_args!(
+                "SendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
+                e.status() as i32,
+                e.message()
+            ));
+        }
+        while status.is_ok() && !buf.ends_with(XPS_TERMINATOR.as_bytes()) {
+            let (chunk, read) = handle.read_octet(OCTET_REASON, READ_BUF).into_parts();
+            status = read;
             buf.extend_from_slice(&chunk);
-            if buf.ends_with(XPS_TERMINATOR.as_bytes()) {
-                break;
-            }
             if buf.len() > MAX_REPLY {
                 return Err(XpsError::Transport(AsynError::Status {
                     status: AsynStatus::Overflow,
@@ -240,104 +369,85 @@ impl XpsSocket {
     ///
     /// The move handle's per-call timeout should be short (C sets `-0.1` s on
     /// the move socket) so the write returns promptly.
-    fn fire(&self, cmd: &str) -> XpsResult<()> {
+    fn fire(&self, link: &Link, cmd: &str) -> XpsResult<XpsReply> {
+        let synthesized = || XpsReply("0".to_string());
         for _ in 0..MOVE_MAX_RETRIES {
-            self.handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-            match self.handle.read_octet(OCTET_REASON, READ_BUF) {
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    ..
-                }) => return Ok(()),
-                Err(e) => return Err(XpsError::Transport(e)),
-                Ok(raw) => {
-                    let reply = XpsReply(String::from_utf8_lossy(&raw).into_owned());
-                    match reply.code() {
-                        0 => return Ok(()),
-                        -1 => continue,
-                        code => return Err(XpsError::Api(code)),
+            // C writeRead (asynOctetSocket.cpp:189), so a late reply to the
+            // previous move is flushed rather than read as this one's.
+            match link
+                .handle
+                .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
+                .into_parts()
+            {
+                // write_read wraps its failure in the step that failed, so
+                // the timeout is read through `status()`.
+                (_, Err(e)) if e.status() == AsynStatus::Timeout => return Ok(synthesized()),
+                (_, Err(e)) => {
+                    // C prints only for asynError (asynOctetSocket.cpp:197).
+                    if e.status() == AsynStatus::Error {
+                        self.trace_error(format_args!(
+                            "SendAndReceive error calling write, output={cmd} status={}, error={}\n",
+                            e.status() as i32,
+                            e.message()
+                        ));
                     }
+                    return Err(XpsError::Transport(e));
+                }
+                (raw, Ok(())) => {
+                    // A reply in time is the caller's to parse, as C's
+                    // `ErrorStringGet` on HXP's move socket does.
+                    let text = String::from_utf8_lossy(&raw);
+                    let reply = XpsReply(
+                        text.strip_suffix(XPS_TERMINATOR)
+                            .unwrap_or(&text)
+                            .to_string(),
+                    );
+                    // The retry test is C's `atoi(valueRtrn)`; the verdict is the
+                    // caller's `sscanf` on the reply it was left with.
+                    match atoi(&reply.0) {
+                        -1 => continue,
+                        0 => {}
+                        _ => self.trace_error(format_args!(
+                            "SendAndReceive unexpected response ={}\n",
+                            reply.0
+                        )),
+                    }
+                    return match reply.code() {
+                        0 => Ok(reply),
+                        code => Err(XpsError::Api(code)),
+                    };
                 }
             }
         }
         // C: after MAX_RETRIES with no clean response, forces "0" (success).
-        Ok(())
+        Ok(synthesized())
     }
 }
 
-/// Format `value` like C `printf("%.*g", precision, value)`, used to marshal
-/// doubles into XPS command strings (the vendor library uses `%.13g`), so the
-/// wire bytes match. C `%g` rules: let `p` be the precision (min 1) and `x` the
-/// decimal exponent; use `%e` with precision `p-1` when `x < -4 || x >= p`,
-/// else `%f` with precision `p-1-x`; then strip trailing fractional zeros and a
-/// trailing decimal point.
-pub(crate) fn format_g(value: f64, precision: usize) -> String {
-    let p = precision.max(1);
-
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-
-    // Extract the rounded decimal exponent via a scientific formatting at the
-    // target precision (rounding may bump the exponent, so read it back).
-    let sci = format!("{:.*e}", p - 1, value);
-    let exp: i32 = sci
-        .rsplit_once('e')
-        .and_then(|(_, e)| e.parse().ok())
-        .unwrap_or(0);
-
-    if exp < -4 || exp >= p as i32 {
-        // Scientific style, %e with precision p-1, mantissa zero-stripped.
-        let (mantissa, _) = sci.split_once('e').unwrap_or((sci.as_str(), ""));
-        let mantissa = strip_trailing_zeros(mantissa);
-        format!("{mantissa}e{}", format_exponent(exp))
-    } else {
-        // Fixed style, %f with precision p-1-exp, zero-stripped.
-        let frac_digits = (p as i32 - 1 - exp).max(0) as usize;
-        let fixed = format!("{value:.frac_digits$}");
-        strip_trailing_zeros(&fixed).to_string()
-    }
-}
-
-/// Strip trailing fractional zeros and a dangling decimal point from a decimal
-/// string (no exponent). Leaves integers untouched.
-fn strip_trailing_zeros(s: &str) -> &str {
-    if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.')
-    } else {
-        s
-    }
-}
-
-/// Format an exponent C-style: always a sign, at least two digits
-/// (`e+05`, `e-13`, `e+100`).
-fn format_exponent(exp: i32) -> String {
-    let sign = if exp < 0 { '-' } else { '+' };
-    format!("{sign}{:02}", exp.abs())
-}
-
-/// C `atoi` widened to `i64`: parse the leading (optionally signed) integer
-/// prefix, `0` on junk. Used for 32-bit bitmasks that exceed `i32::MAX`.
-fn atoi64(s: &str) -> i64 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i64>().ok()).unwrap_or(0)
+/// C `%.13g`, the format XPS_C8_drivers.cpp and hxp_drivers.cpp write every
+/// double with.
+pub(crate) fn g13(value: f64) -> String {
+    format!("{:.13}", CFloat(value).g())
 }
 
 #[cfg(test)]
 mod tests {
+    /// asynOctetSocket.cpp:137-141: socket -1 answers every call with -22.
+    #[test]
+    fn an_invalid_socket_answers_minus_22() {
+        let query = XpsSocket::invalid("xpsInvalid", SocketMode::Query);
+        assert_eq!(
+            query.exec("GroupStatusGet(HEXAPOD,int *)").unwrap().code(),
+            -22
+        );
+        let fire = XpsSocket::invalid("xpsInvalid", SocketMode::Fire);
+        assert!(matches!(
+            fire.exec("HexapodMoveAbsolute()"),
+            Err(XpsError::Api(-22))
+        ));
+        assert!(query.read_pending().is_empty());
+    }
+
     use super::*;
 
     #[test]
@@ -352,11 +462,52 @@ mod tests {
         assert_eq!(r.string(9), "");
     }
 
+    /// C sees only the int an XPS call returns: a transport failure is its
+    /// -1, and a method returns it as is or as asynError.
+    #[test]
+    fn an_xps_failure_is_its_c_int() {
+        let transport = || {
+            XpsError::Transport(AsynError::Status {
+                status: AsynStatus::Disconnected,
+                message: "not connected".into(),
+            })
+        };
+        assert_eq!(transport().into_c_status().c_status_code(), -1);
+        assert_eq!(XpsError::Api(-17).into_c_status().c_status_code(), -17);
+        assert_eq!(AsynError::from(transport()).c_status_code(), 3);
+        assert_eq!(AsynError::from(XpsError::Api(-17)).c_status_code(), 3);
+    }
+
+    /// glibc's `%d` is `(int) strtol`: an overflowing out-param saturates
+    /// before the cast, `0xFFFFFFFF` on LP64.
+    #[test]
+    fn an_overflowing_bitmask_is_strtol_cast_to_int() {
+        let r = XpsReply("0,99999999999999999999".to_string());
+        assert_eq!(r.bits(1), long_to_int(std::os::raw::c_long::MAX) as u32);
+    }
+
+    /// C `sscanf(ReturnedValue, "%i", &ret)` is base 0: octal, hex and, with
+    /// glibc 2.39 under `_GNU_SOURCE`, binary.
+    #[test]
+    fn reply_error_code_is_percent_i() {
+        assert_eq!(XpsReply("010".to_string()).code(), 8);
+        assert_eq!(XpsReply("-0x1A".to_string()).code(), -26);
+        assert_eq!(XpsReply("0b11".to_string()).code(), 3);
+        assert_eq!(XpsReply("0x".to_string()).code(), 0);
+    }
+
     #[test]
     fn reply_error_code_negative() {
         let r = XpsReply("-17".to_string());
         assert_eq!(r.code(), -17);
         assert!(matches!(r.require_ok(), Err(XpsError::Api(-17))));
+    }
+
+    #[test]
+    fn reply_without_a_code_keeps_c_minus_one() {
+        assert_eq!(XpsReply(String::new()).code(), -1);
+        assert_eq!(XpsReply("EndOfAPI".to_string()).code(), -1);
+        assert_eq!(XpsReply("-".to_string()).code(), -1);
     }
 
     #[test]
@@ -367,25 +518,186 @@ mod tests {
     }
 
     #[test]
-    fn format_g_matches_c_printf() {
+    fn g13_matches_c_printf() {
         // Reference values from C printf("%.13g", x).
-        assert_eq!(format_g(0.0, 13), "0");
-        assert_eq!(format_g(50.0, 13), "50");
-        assert_eq!(format_g(-50.0, 13), "-50");
-        assert_eq!(format_g(0.1, 13), "0.1");
-        assert_eq!(format_g(-0.5, 13), "-0.5");
-        assert_eq!(format_g(1.5e-3, 13), "0.0015");
-        assert_eq!(format_g(1234567890123.0, 13), "1234567890123");
+        assert_eq!(g13(0.0), "0");
+        assert_eq!(g13(50.0), "50");
+        assert_eq!(g13(-50.0), "-50");
+        assert_eq!(g13(0.1), "0.1");
+        assert_eq!(g13(-0.5), "-0.5");
+        assert_eq!(g13(1.5e-3), "0.0015");
+        assert_eq!(g13(1234567890123.0), "1234567890123");
         // exp -5 < -4 → scientific.
-        assert_eq!(format_g(1e-5, 13), "1e-05");
+        assert_eq!(g13(1e-5), "1e-05");
         // exp 20 >= 13 → scientific.
-        assert_eq!(format_g(1e20, 13), "1e+20");
-        assert_eq!(format_g(1.25, 13), "1.25");
+        assert_eq!(g13(1e20), "1e+20");
+        assert_eq!(g13(1.25), "1.25");
+        assert_eq!(g13(-0.0), "-0");
+        assert_eq!(g13(-f64::NAN), "-nan");
+        assert_eq!(g13(f64::NAN), "nan");
+    }
+
+    /// An XPS that takes every command and never answers.
+    struct Silent(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for Silent {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            _buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            epics_rs::asyn::interpose::OctetReadResult::failed(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "no reply".into(),
+            })
+        }
+    }
+
+    /// An XPS whose reads hand out `reads` in turn, each `(bytes, cut)`; a
+    /// cut read delivers its bytes and then times out, as does every read
+    /// after the last.
+    struct Chunks {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reads: std::collections::VecDeque<(&'static [u8], bool)>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Chunks {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            let (bytes, cut) = self.reads.pop_front().unwrap_or((b"", true));
+            buf[..bytes.len()].copy_from_slice(bytes);
+            let read = epics_rs::asyn::interpose::OctetReadResult::ok(
+                bytes.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            );
+            if !cut {
+                return read;
+            }
+            epics_rs::asyn::interpose::OctetReadResult {
+                status: Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "reply cut by a timeout".into(),
+                }),
+                ..read
+            }
+        }
+    }
+
+    fn chunked_socket(port: &str, reads: &[(&'static [u8], bool)]) -> XpsSocket {
+        use epics_rs::asyn::port::InterfaceMask;
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let mut base = PortDriverBase::new(
+            port,
+            1,
+            PortFlags::default(),
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
+        );
+        base.init_connected(true);
+        let driver = Chunks {
+            base,
+            reads: reads.iter().copied().collect(),
+        };
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(port).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = rt.port_handle().clone();
+        std::mem::forget(rt);
+        XpsSocket::new(
+            handle,
+            0,
+            port,
+            SocketMode::Query,
+            Duration::from_millis(100),
+        )
+    }
+
+    /// asynOctetSocket.cpp:162-184: the reply stops at the first read that
+    /// fails, and the caller parses what was read.
+    #[test]
+    fn a_reply_cut_by_a_timeout_is_parsed() {
+        let sock = chunked_socket("xps_query_cut", &[(b"0,1.", false), (b"5", true)]);
+        assert_eq!(sock.group_position_current_get("G1.P1").unwrap(), 1.5);
+        let sock = chunked_socket("xps_query_none", &[(b"", true)]);
+        assert_eq!(sock.group_status_get("G1").unwrap_err().code(), -1);
+    }
+
+    /// C `SendAndReceive` with a negative timeout: a move whose reply has
+    /// not come back yet is sent, not failed.
+    #[test]
+    fn a_fire_command_with_no_reply_yet_succeeds() {
+        use epics_rs::asyn::port::InterfaceMask;
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = "xps_fire_silent";
+        let (rt, _jh) = create_port_runtime(
+            &claim_port(port).unwrap(),
+            Silent(PortDriverBase::new(
+                port,
+                1,
+                PortFlags::default(),
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
+            )),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let sock = XpsSocket::new(
+            rt.port_handle().clone(),
+            0,
+            port,
+            SocketMode::Fire,
+            Duration::from_millis(100),
+        );
+        sock.group_move_absolute("G1.P1", &[1.0]).unwrap();
+    }
+
+    /// asynOctetSocket.cpp:189-215: the move socket's writeRead leaves the
+    /// reply that came back in time for the caller to parse.
+    #[test]
+    fn a_fire_command_returns_the_reply_it_read() {
+        let line = super::super::fake::FakeLine::new("xps_fire_reply", "");
+        let sock = line.socket(SocketMode::Fire);
+        assert_eq!(sock.error_string_get(-22).unwrap(), "Not allowed action");
     }
 
     #[test]
-    fn format_g_rounds_to_precision() {
+    fn g13_rounds_to_precision() {
         // 1/3 at 13 significant digits.
-        assert_eq!(format_g(1.0 / 3.0, 13), "0.3333333333333");
+        assert_eq!(g13(1.0 / 3.0), "0.3333333333333");
     }
 }

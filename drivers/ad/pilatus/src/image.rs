@@ -2,10 +2,11 @@
 //!
 //! Everything here is pure and file-driven so it can be exercised with fixtures.
 
+use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use tiff::decoder::{Decoder, DecodingResult};
+use tiff::decoder::{Decoder, DecodingBuffer, DecodingSampleType};
 use tiff::tags::Tag;
 
 use crate::protocol::{expect_lit, scan_i32, skip_ws};
@@ -15,80 +16,80 @@ use crate::types::{BadPixel, MAX_BAD_PIXELS};
 /// `TIFFTAG_IMAGEDESCRIPTION` into the `TIFFImageDescription` attribute.
 const MAX_IMAGE_DESCRIPTION: usize = 2047;
 
-/// A decoded single-channel TIFF.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TiffImage {
+/// A TIFF opened as far as its dimensions, which C's `readTiff` checks
+/// before it reads a strip (pilatusDetector.cpp:677-690).
+pub struct TiffFile {
+    decoder: Decoder<BufReader<File>>,
     pub width: u32,
     pub height: u32,
-    /// One `epicsInt32` per pixel.
-    pub data: Vec<i32>,
-    /// `TIFFTAG_IMAGEDESCRIPTION`, if present.
-    pub description: Option<String>,
 }
 
-/// Decode a TIFF the way C's `readTiff` consumes one.
-///
-/// C copies the raw strip bytes straight into an `epicsInt32` buffer and only
-/// validates the width, the height and the total byte count. The equivalent
-/// here is: accept any 32-bit single-sample image and reinterpret its bits as
-/// `epicsInt32`; reject anything whose decoded element count is not
-/// `width * height` (C's `totalSize != arrayInfo.totalBytes` retry path) or
-/// whose sample width is not 32 bits (same path).
-///
-/// Deviation from C, documented in the crate docs: the `tiff` crate decodes
-/// every strip, whereas C's loop passes strip index `0` on each iteration.
-/// The two agree for the single-strip files camserver writes; for a
-/// multi-strip file C repeats strip 0 and this function does not.
-pub fn decode_tiff(path: &Path) -> Result<TiffImage, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("cannot open {path:?}: {e}"))?;
-    let mut decoder =
-        Decoder::new(BufReader::new(file)).map_err(|e| format!("not a TIFF file: {e}"))?;
-    let (width, height) = decoder
-        .dimensions()
-        .map_err(|e| format!("no image dimensions: {e}"))?;
-
-    let image = decoder
-        .read_image()
-        .map_err(|e| format!("cannot decode image: {e}"))?;
-
-    let data: Vec<i32> = match image {
-        DecodingResult::I32(v) => v,
-        // Bit-identical to C's raw byte copy into an epicsInt32 buffer.
-        DecodingResult::U32(v) => v.into_iter().map(|x| x as i32).collect(),
-        DecodingResult::F32(v) => v.into_iter().map(|x| x.to_bits() as i32).collect(),
-        _ => return Err("image is not 32 bits per sample".to_string()),
-    };
-
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .ok_or_else(|| "image dimensions overflow".to_string())?;
-    if data.len() != expected {
-        return Err(format!(
-            "file size incorrect = {} samples, should be {expected}",
-            data.len()
-        ));
+impl TiffFile {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| format!("cannot open {path:?}: {e}"))?;
+        let mut decoder =
+            Decoder::new(BufReader::new(file)).map_err(|e| format!("not a TIFF file: {e}"))?;
+        let (width, height) = decoder
+            .dimensions()
+            .map_err(|e| format!("no image dimensions: {e}"))?;
+        Ok(Self {
+            decoder,
+            width,
+            height,
+        })
     }
 
-    let description = decoder
-        .get_tag_ascii_string(Tag::ImageDescription)
-        .ok()
-        .map(|mut s| {
-            if s.len() > MAX_IMAGE_DESCRIPTION {
-                let cut = (0..=MAX_IMAGE_DESCRIPTION)
-                    .rev()
-                    .find(|&i| s.is_char_boundary(i))
-                    .unwrap_or(0);
-                s.truncate(cut);
-            }
-            s
-        });
+    /// Decode the pixels into `out` and return `TIFFTAG_IMAGEDESCRIPTION`.
+    ///
+    /// C reads the raw strip bytes straight into the `epicsInt32` array and
+    /// only checks the total byte count. The equivalent here: any 32-bit
+    /// sample type is decoded bit for bit, and anything whose sample width is
+    /// not 32 bits or whose first plane is not `out.len()` samples fails, as
+    /// C's `totalSize != arrayInfo.totalBytes` retry path does.
+    ///
+    /// Deviation from C, documented in the crate docs: the `tiff` crate decodes
+    /// every strip, whereas C's loop passes strip index `0` on each iteration.
+    /// The two agree for the single-strip files camserver writes; for a
+    /// multi-strip file C repeats strip 0 and this function does not.
+    pub fn read_into(mut self, out: &mut [i32]) -> Result<Option<String>, String> {
+        let layout = self
+            .decoder
+            .image_buffer_layout()
+            .map_err(|e| format!("cannot decode image: {e}"))?;
+        if !matches!(
+            layout.sample_type,
+            Some(DecodingSampleType::I32 | DecodingSampleType::U32 | DecodingSampleType::F32)
+        ) {
+            return Err("image is not 32 bits per sample".to_string());
+        }
+        let mut buffer = DecodingBuffer::I32(out);
+        let bytes = buffer.as_bytes_mut();
+        if layout.len != bytes.len() {
+            return Err(format!(
+                "file size incorrect = {} bytes, should be {}",
+                layout.len,
+                bytes.len()
+            ));
+        }
+        self.decoder
+            .read_image_bytes(bytes)
+            .map_err(|e| format!("cannot decode image: {e}"))?;
 
-    Ok(TiffImage {
-        width,
-        height,
-        data,
-        description,
-    })
+        Ok(self
+            .decoder
+            .get_tag_ascii_string(Tag::ImageDescription)
+            .ok()
+            .map(|mut s| {
+                if s.len() > MAX_IMAGE_DESCRIPTION {
+                    let cut = (0..=MAX_IMAGE_DESCRIPTION)
+                        .rev()
+                        .find(|&i| s.is_char_boundary(i))
+                        .unwrap_or(0);
+                    s.truncate(cut);
+                }
+                s
+            }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +106,10 @@ pub fn decode_tiff(path: &Path) -> Result<TiffImage, String> {
 /// stride. Row-major addressing uses the *width*, matching the bad index's
 /// `ybad * nx + xbad`; the two only agreed on a square detector. This uses
 /// `ygood * nx + xgood`, so the height is no longer a parameter.
-pub fn parse_bad_pixel_file(text: &str, nx: i32) -> Result<Vec<BadPixel>, String> {
+///
+/// An entry that does not scan fails with the number of items `fscanf`
+/// converted, which C reports.
+pub fn parse_bad_pixel_file(text: &str, nx: i32) -> Result<Vec<BadPixel>, i32> {
     let mut rest = text;
     let mut out = Vec::new();
 
@@ -114,18 +118,22 @@ pub fn parse_bad_pixel_file(text: &str, nx: i32) -> Result<Vec<BadPixel>, String
         if skip_ws(rest).is_empty() {
             break;
         }
+        let mut converted = 0;
         let mut scan = || -> Option<(i32, i32, i32, i32)> {
             let (xbad, s) = scan_i32(rest)?;
+            converted = 1;
             let s = expect_lit(s, ",")?;
             let (ybad, s) = scan_i32(s)?;
+            converted = 2;
             let (xgood, s) = scan_i32(s)?;
+            converted = 3;
             let s = expect_lit(s, ",")?;
             let (ygood, s) = scan_i32(s)?;
             rest = s;
             Some((xbad, ybad, xgood, ygood))
         };
         let Some((xbad, ybad, xgood, ygood)) = scan() else {
-            return Err("too few items, should be 4".to_string());
+            return Err(converted);
         };
         out.push(BadPixel {
             bad_index: ybad as i64 * nx as i64 + xbad as i64,
@@ -240,6 +248,15 @@ mod tests {
         img.write_data(data).unwrap();
     }
 
+    /// Open `path` and decode it into a stale buffer sized from its header.
+    fn decode(path: &Path) -> Result<(u32, u32, Vec<i32>, Option<String>), String> {
+        let tiff = TiffFile::open(path)?;
+        let (width, height) = (tiff.width, tiff.height);
+        let mut pixels = vec![0x5a5a_5a5a; width as usize * height as usize];
+        let description = tiff.read_into(&mut pixels)?;
+        Ok((width, height, pixels, description))
+    }
+
     #[test]
     fn tiff_roundtrip_single_strip() {
         let dir = tempfile::tempdir().unwrap();
@@ -254,14 +271,10 @@ mod tests {
             None,
         );
 
-        let img = decode_tiff(&path).unwrap();
-        assert_eq!(img.width, 6);
-        assert_eq!(img.height, 4);
-        assert_eq!(img.data, data);
-        assert_eq!(
-            img.description.as_deref(),
-            Some("Pilatus 100K, exp 1.000000 s")
-        );
+        let (width, height, pixels, description) = decode(&path).unwrap();
+        assert_eq!((width, height), (6, 4));
+        assert_eq!(pixels, data);
+        assert_eq!(description.as_deref(), Some("Pilatus 100K, exp 1.000000 s"));
     }
 
     #[test]
@@ -270,9 +283,9 @@ mod tests {
         let path = dir.path().join("neg.tif");
         let data = vec![-1i32, -2147483648, 2147483647, 0];
         write_tiff(&path, 2, 2, &data, None, None);
-        let img = decode_tiff(&path).unwrap();
-        assert_eq!(img.data, data);
-        assert_eq!(img.description, None);
+        let (_, _, pixels, description) = decode(&path).unwrap();
+        assert_eq!(pixels, data);
+        assert_eq!(description, None);
     }
 
     #[test]
@@ -282,13 +295,28 @@ mod tests {
         let path = dir.path().join("multi.tif");
         let data: Vec<i32> = (0..4 * 6).collect();
         write_tiff(&path, 4, 6, &data, None, Some(2));
-        let img = decode_tiff(&path).unwrap();
-        assert_eq!(img.data, data);
+        let (_, _, pixels, _) = decode(&path).unwrap();
+        assert_eq!(pixels, data);
+    }
+
+    #[test]
+    fn a_buffer_other_than_the_image_size_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("img.tif");
+        write_tiff(&path, 2, 2, &[1, 2, 3, 4], None, None);
+        for len in [3, 5] {
+            let mut pixels = vec![0; len];
+            let err = TiffFile::open(&path)
+                .unwrap()
+                .read_into(&mut pixels)
+                .unwrap_err();
+            assert!(err.contains("file size incorrect = 16 bytes"), "{err}");
+        }
     }
 
     #[test]
     fn tiff_missing_file_is_an_error() {
-        assert!(decode_tiff(Path::new("/nonexistent/none.tif")).is_err());
+        assert!(TiffFile::open(Path::new("/nonexistent/none.tif")).is_err());
     }
 
     #[test]
@@ -296,7 +324,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.tif");
         std::fs::write(&path, b"II*\x00garbage").unwrap();
-        assert!(decode_tiff(&path).is_err());
+        assert!(decode(&path).is_err());
     }
 
     #[test]
@@ -310,7 +338,7 @@ mod tests {
             enc.write_image::<colortype::Gray16>(2, 2, &[1u16, 2, 3, 4])
                 .unwrap();
         }
-        let err = decode_tiff(&path).unwrap_err();
+        let err = decode(&path).unwrap_err();
         assert!(err.contains("32 bits per sample"), "{err}");
     }
 
@@ -320,8 +348,8 @@ mod tests {
         let path = dir.path().join("long.tif");
         let desc = "x".repeat(3000);
         write_tiff(&path, 1, 1, &[0], Some(&desc), None);
-        let img = decode_tiff(&path).unwrap();
-        assert_eq!(img.description.unwrap().len(), MAX_IMAGE_DESCRIPTION);
+        let (_, _, _, description) = decode(&path).unwrap();
+        assert_eq!(description.unwrap().len(), MAX_IMAGE_DESCRIPTION);
     }
 
     #[test]
@@ -353,8 +381,8 @@ mod tests {
 
     #[test]
     fn bad_pixel_file_short_record_is_an_error() {
-        assert!(parse_bad_pixel_file("10,20 11", 10).is_err());
-        assert!(parse_bad_pixel_file("10,20 11,", 10).is_err());
+        assert_eq!(parse_bad_pixel_file("10,20 11", 10), Err(3));
+        assert_eq!(parse_bad_pixel_file("10,20 11,", 10), Err(3));
         // The literal ',' does not skip whitespace, matching fscanf.
         assert!(parse_bad_pixel_file("10 ,20 11,20", 10).is_err());
     }

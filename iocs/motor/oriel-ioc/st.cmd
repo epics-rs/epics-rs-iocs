@@ -12,38 +12,34 @@
 
 epicsEnvSet("P",      "ORIEL:")
 epicsEnvSet("CARD",   "0")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
 drvAsynSerialPortConfigure("$(SERIAL)", "$(TTY)")
 
 # Match the controller's configured serial settings.
-asynSetOption("$(SERIAL)", 0, "baud",   "9600")
+asynSetOption("$(SERIAL)", 0, "baud",   "4800")
 asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# EMC18011 framing: the driver appends the CR command terminator, so only the
-# input EOS is configured here (replies are LF terminated). Do not set an output
-# EOS — the port would append it a second time.
-asynOctetSetInputEos("$(SERIAL)", 0, "\n")
-
 # ---- EMC18011 controller ----
-# EMC18011Setup(maxControllers, [scanRate]) is accepted for startup-script
-# parity; the asyn-rs port allocates per EMC18011Config call.
-EMC18011Setup(1, 10)
+# EMC18011Setup(num_cards, scan_rate in Hz)
+EMC18011Setup(1, 60)
 
-# EMC18011Config(card, asynPort, [movingPollMs], [idlePollMs]) - fixed 3 axes.
-EMC18011Config(0, "$(SERIAL)", 100, 1000)
+# EMC18011Config(card, asyn port) - fixed 3 axes.
+EMC18011Config(0, "$(SERIAL)")
 
-# One motor record per axis (DTYP EMC18011_$(CARD)_0, _1, _2). The controller
-# works in millimetres, so MRES = 1 and EGU = mm.
-dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+# The motor.db row C's EMC18011.cmd loads, and motorUtil's records, as
+# C's st.cmd loads them.
+dbLoadTemplate("$(ORIEL_IOC)/db/EMC18011.substitutions", "P=$(P),C=$(CARD)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
 
 # Example:
 #   dbl

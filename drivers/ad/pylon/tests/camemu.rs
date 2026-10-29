@@ -8,13 +8,19 @@ use ad_core_rs::driver::{ADStatus, ImageMode};
 use ad_core_rs::plugin::channel::NDArrayOutput;
 use ad_pylon::{PylonRuntime, create_pylon};
 use asyn_rs::port::DrvUserRequest;
+use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
 const CAMERA_ID: &str = "0815-0000";
 
 fn emulated(port: &str) -> PylonRuntime {
     // SAFETY: set before any other thread exists in this test process.
     unsafe { std::env::set_var("PYLON_CAMEMU", "1") };
-    let rt = create_pylon(port, CAMERA_ID, 0, NDArrayOutput::new()).unwrap();
+    let claim = asyn_rs::registry::claim_port(port).unwrap();
+    let rt = create_pylon(&claim, CAMERA_ID, 0, NDArrayOutput::new()).unwrap();
+    // No IOC raises the gate here; until it is up a flush keeps its flags.
+    claim
+        .publish(rt.port_handle().clone(), &InterruptGate::opened())
+        .unwrap();
     // As at iocInit: the first record to bind maps the ADDriver parameters
     // onto GenICam features, ImageMode onto AcquisitionMode among them.
     bind(&rt, "IMAGE_MODE");
@@ -141,8 +147,6 @@ fn a_write_notifies_the_readback_subscribers() {
     use asyn_rs::param::ParamValue;
     use std::sync::{Arc, Mutex};
 
-    // No IOC raises the gate here; until it is up a flush keeps its flags.
-    epics_rs::base::runtime::interrupt_accept::set_interrupts_accepted(true);
     let rt = emulated("EMU_INTR");
     let h = rt.port_handle();
     let size_x = rt.ad_params.size_x;
@@ -154,6 +158,7 @@ fn a_write_notifies_the_readback_subscribers() {
             addr: Some(0),
             uint32_mask: None,
             iface: None,
+            ..Default::default()
         },
         move |iv: &InterruptValue| {
             if let ParamValue::Int32(v) = &iv.value {
@@ -167,7 +172,7 @@ fn a_write_notifies_the_readback_subscribers() {
 
 #[test]
 fn a_string_feature_write_reaches_the_camera() {
-    use asyn_rs::request::RequestOp;
+    use asyn_rs::request::{OctetReadOp, RequestOp};
     use asyn_rs::user::AsynUser;
 
     let rt = emulated("EMU_STR");
@@ -184,13 +189,15 @@ fn a_string_feature_write_reaches_the_camera() {
     // now holds what the camera holds.
     let size_x = rt.ad_params.size_x;
     h.write_int32_blocking(size_x, 0, 512).unwrap();
-    let read = h
-        .submit_blocking(
-            RequestOp::OctetRead { buf_size: 64 },
+    let (data, status) = h
+        .submit_octet_read_blocking(
+            OctetReadOp::Read { buf_size: 64 },
             AsynUser::new(user_id).with_addr(0),
         )
-        .unwrap();
-    assert_eq!(read.data.as_deref(), Some(&b"beamline-7"[..]));
+        .into_parts();
+    status.unwrap();
+    // asynPortDriver::readOctet counts the NUL (asynPortDriver.cpp:2629).
+    assert_eq!(data, b"beamline-7\0");
 }
 
 /// C `processFrame`: `getAttributes` puts the `NDAttributesFile` set on every

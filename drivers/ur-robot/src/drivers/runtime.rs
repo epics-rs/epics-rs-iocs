@@ -5,13 +5,14 @@
 //! keeps the returned [`UrPortRuntime`] alive for the life of the process.
 //!
 //! Each factory also arms the [`ioc_ready`] gate before it starts the thread,
-//! and the thread holds its first parameter flush until `iocInit` opens it —
+//! and the thread holds its parameter flushes until `iocInit` opens it —
 //! see that module for what a pre-`iocInit` flush costs.
 
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 
@@ -32,17 +33,18 @@ impl UrPortRuntime {
 
 /// `URDashboardConfig(port, ip, poll_period)`.
 pub fn create_dashboard(
-    port_name: &str,
+    claim: &PortClaim,
     robot_ip: &str,
     poll_period: Duration,
 ) -> AsynResult<UrPortRuntime> {
+    let port_name = claim.name();
     let driver = dashboard::DashboardDriver::new(port_name, robot_ip)?;
     let params = driver.params();
     let client = driver.client();
     let shared = driver.shared();
 
     let ready = ioc_ready::arm();
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let poller = dashboard::start_poller(
         runtime_handle.port_handle().clone(),
         params,
@@ -59,17 +61,18 @@ pub fn create_dashboard(
 
 /// `RTDEReceiveConfig(port, ip, poll_period)`.
 pub fn create_receive(
-    port_name: &str,
+    claim: &PortClaim,
     robot_ip: &str,
     poll_period: Duration,
 ) -> AsynResult<UrPortRuntime> {
+    let port_name = claim.name();
     let driver = receive::ReceiveDriver::new(port_name, robot_ip)?;
     let params = driver.params();
     let iface = driver.iface();
     let shared = driver.shared();
 
     let ready = ioc_ready::arm();
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let poller = receive::start_poller(
         runtime_handle.port_handle().clone(),
         params,
@@ -88,9 +91,10 @@ pub fn create_receive(
 /// `RTDEInOutConfig(port, ip, poll_period)` — the I/O driver is write-only and
 /// has no poll thread (`rtde_io_driver.cpp` creates none; its `poll_period`
 /// argument is accepted and ignored, as upstream does).
-pub fn create_io(port_name: &str, robot_ip: &str) -> AsynResult<UrPortRuntime> {
+pub fn create_io(claim: &PortClaim, robot_ip: &str) -> AsynResult<UrPortRuntime> {
+    let port_name = claim.name();
     let driver = io::IoDriver::new(port_name, robot_ip)?;
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     Ok(UrPortRuntime {
         runtime_handle,
         _poller: None,
@@ -99,18 +103,19 @@ pub fn create_io(port_name: &str, robot_ip: &str) -> AsynResult<UrPortRuntime> {
 
 /// `RTDEControlConfig(port, dashboard_port, receive_port, poll_period)`.
 pub fn create_control(
-    port_name: &str,
+    claim: &PortClaim,
     dashboard_port: &str,
     receive_port: &str,
     poll_period: Duration,
 ) -> AsynResult<UrPortRuntime> {
+    let port_name = claim.name();
     let driver = control::ControlDriver::new(port_name, dashboard_port, receive_port)?;
     let params = driver.params();
     let inner = driver.inner();
     let receive = driver.receive();
 
     let ready = ioc_ready::arm();
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let poller = control::start_poller(
         runtime_handle.port_handle().clone(),
         params,
@@ -127,17 +132,18 @@ pub fn create_control(
 
 /// `URGripperConfig(port, dashboard_port, poll_period)`.
 pub fn create_gripper(
-    port_name: &str,
+    claim: &PortClaim,
     dashboard_port: &str,
     poll_period: Duration,
 ) -> AsynResult<UrPortRuntime> {
+    let port_name = claim.name();
     let driver = gripper::GripperDriver::new(port_name, dashboard_port)?;
     let params = driver.params();
     let g = driver.gripper();
     let dash = driver.dashboard();
 
     let ready = ioc_ready::arm();
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let poller = gripper::start_poller(
         runtime_handle.port_handle().clone(),
         params,

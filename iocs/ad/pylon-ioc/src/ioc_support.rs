@@ -9,7 +9,7 @@ use ad_pylon::{ADPylon, PylonRuntime, create_pylon};
 
 /// Register `ADPylonConfig` on an `AdIoc`.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADPYLON", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADPYLON", env!("CARGO_MANIFEST_DIR"));
 
     let runtimes: Arc<std::sync::Mutex<Vec<PylonRuntime>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -43,7 +43,9 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
         "ADPylonConfig portName cameraId [maxMemory] [priority] [stackSize]",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let string = |i: usize, name: &str| match args.get(i) {
-                Some(ArgValue::String(s)) => Ok(s.clone()),
+                Some(ArgValue::String(s)) => {
+                    s.to_str().map(str::to_owned).map_err(|e| e.to_string())
+                }
                 // A bare serial number or index parses as an integer.
                 Some(ArgValue::Int(n)) => Ok(n.to_string()),
                 _ => Err(format!("{name} required")),
@@ -57,7 +59,11 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             // priority and stackSize size an EPICS port thread; the port
             // here is an actor and has neither.
 
-            let runtime = create_pylon(&port_name, &camera_id, max_memory, NDArrayOutput::new())
+            let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+            let runtime = create_pylon(&claim, &camera_id, max_memory, NDArrayOutput::new())
                 .map_err(|e| format!("failed to create ADPylon: {e}"))?;
 
             // The CA client behind the `EPICS_PV` entries of an
@@ -72,11 +78,20 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             runtime
                 .port_handle()
                 .with_driver_blocking(move |driver: &mut ADPylon| {
-                    driver.ad.attributes.set_ca_client(client, handle)
+                    driver
+                        .ad
+                        .owner
+                        .attributes()
+                        .lock()
+                        .set_ca_client(client, handle)
                 })
                 .map_err(|e| e.to_string())?;
 
-            asyn_rs::asyn_record::register_port(&port_name, runtime.port_handle().clone())
+            claim
+                .publish(
+                    runtime.port_handle().clone(),
+                    ctx.db().scan_control().interrupt_gate(),
+                )
                 .map_err(|e| e.to_string())?;
 
             mgr.set_driver(Arc::new(GenericDriverContext::new(
@@ -110,19 +125,7 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             else {
                 return Err("portName and featureName required".to_string());
             };
-            let Some(port) = asyn_rs::registry::get_port(port_name) else {
-                ctx.println(&format!(
-                    "ADGenICam::showFeature cannot find port {port_name}"
-                ));
-                return Ok(CommandOutcome::Continue);
-            };
-            let feature_name = feature_name.clone();
-            let text = port
-                .handle
-                .with_driver_blocking(move |driver: &mut ADPylon| {
-                    driver.show_feature(&feature_name)
-                })
-                .map_err(|e| e.to_string())?;
+            let text = show_feature(port_name.to_str()?, feature_name.to_str()?);
             ctx.println(text.trim_end_matches('\n'));
             Ok(CommandOutcome::Continue)
         },
@@ -130,4 +133,64 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
     // Keep the runtimes alive for the IOC's lifetime.
     ioc.keep_alive(runtimes);
+}
+
+/// C `genicamShowFeature`: `findDerivedAsynPortDriver<ADGenICam>` is a
+/// `dynamic_cast`, so a port that is not this driver reads as no port at all
+/// (ADGenICam.cpp:655-659). It checks no interface, so the bare registry
+/// lookup is the equivalent.
+fn show_feature(port_name: &str, feature_name: &str) -> String {
+    let feature_name = feature_name.to_owned();
+    asyn_rs::registry::get_port(port_name)
+        .and_then(|port| {
+            port.handle
+                .with_driver_blocking(move |driver: &mut ADPylon| {
+                    driver.show_feature(&feature_name)
+                })
+                .ok()
+        })
+        .unwrap_or_else(|| format!("ADGenICam::showFeature cannot find port {port_name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+    struct Other(PortDriverBase);
+
+    impl PortDriver for Other {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    /// A registered port that is not an ADPylon is not found, as C's
+    /// `dynamic_cast` gives no driver; it is not a command error.
+    #[test]
+    fn a_port_of_another_driver_is_not_found() {
+        let name = "pylonShowOther";
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::OCTET,
+            InterfaceMask::OCTET,
+        );
+        let (_rt, _actor) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Other(base),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            show_feature(name, "Width"),
+            format!("ADGenICam::showFeature cannot find port {name}")
+        );
+    }
 }

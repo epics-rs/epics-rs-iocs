@@ -1,22 +1,24 @@
-# Delta Tau PMAC coordinate-system (kinematic) axis. DTYP is
-# PMACCS_$(CS)_$(AXIS), the key registered by pmacAsynCoordCreate (CS name +
-# 1-based CS axis number: 1=A 2=B 3=C 4=U 5=V 6=W 7=X 8=Y 9=Z).
+# Delta Tau PMAC coordinate-system (kinematic) axis ADDR of the port
+# drvAsynMotorConfigure made over pmacAsynCoord (0=A 1=B 2=C 3=U 4=V 5=W 6=X
+# 7=Y 8=Z).
 #
-# A CS axis is driven in the EGU the coordinate system's position-reporting PLC
-# publishes on Q8n, so MRES = 1 (the C driver's stepsPerUnit was the same factor
-# applied twice, once in the driver and once as its reciprocal in MRES).
+# A CS axis is driven in record steps of stepSize EGU, the EGU the coordinate
+# system's position-reporting PLC publishes on Q8n, so MRES must equal stepSize:
+# the C default 1e-4 unless pmacSetCoordStepsPerUnit/pmacSetDefaultCoordSteps
+# changes it (pmacAsynCoord.c).
 #
 # Homing and jogging are not defined for a kinematic axis: HOMF/HOMR/JOGF/JOGR
 # return an error, as they do in the C driver.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "PMACCS_$(CS)_$(AXIS)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1)")
     field(ACCL, "$(ACCL=0.5)")
     field(DHLM, "$(HLM=100)")
     field(DLLM, "$(LLM=-100)")
-    field(MRES, "$(MRES=1.0)")
+    field(MRES, "$(MRES=0.0001)")
     field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=4)")
 }

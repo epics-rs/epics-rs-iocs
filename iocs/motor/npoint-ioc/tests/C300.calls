@@ -1,0 +1,2 @@
+# c-expansion of st.cmd, C300.cmd, no LC400.cmd over the C sources, its controller calls:
+C300CreateController("C300", "serial1", 3, 250, 2000)

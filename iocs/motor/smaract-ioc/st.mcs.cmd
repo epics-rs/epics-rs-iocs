@@ -10,37 +10,49 @@
 #============================================================
 
 epicsEnvSet("P",       "MCS:")
-epicsEnvSet("CARD",    "0")
+epicsEnvSet("CTRL",    "MCS_1")
 epicsEnvSet("IPPORT",  "MCS")
 epicsEnvSet("HOST",    "192.168.1.210:5000")
+
+# ---- motorUtil (allstop & alldone) ----
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 # ---- asyn IP octet port (RAW terminal server) ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
-# MCS framing: the driver appends the LF command terminator, so only the input
-# EOS is configured here. Do not set an output EOS — the port would append it a
-# second time.
-asynOctetSetInputEos("$(IPPORT)", 0, "\n")
-
 # ---- MCS controller + axes ----
-# smarActMCSCreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs],
-#                           [disableSpeed]). disableSpeed non-zero suppresses SCLS.
-smarActMCSCreateController(0, "$(IPPORT)", 3, 50, 1000, 0)
+# smarActMCSCreateController(motorPortName, ioPortName, numAxes,
+#                            movingPollPeriod, idlePollPeriod, disableSpeed),
+# periods in seconds.
+smarActMCSCreateController("$(CTRL)", "$(IPPORT)", 1, 0.020, 1.0, 0)
 
-# smarActMCSCreateAxis(card, axisNo, channel): axisNo is 0-based (DTYP
-# MCS_$(CARD)_$(N)), channel is the controller channel it drives.
-smarActMCSCreateAxis(0, 0, 0)
-smarActMCSCreateAxis(0, 1, 1)
-smarActMCSCreateAxis(0, 2, 2)
+# smarActMCSCreateAxis(controllerPortName, axisNumber, channel): records reach
+# axisNumber as @asyn($(CTRL),axisNumber); channel is the controller channel.
+smarActMCSCreateAxis("$(CTRL)", 0, 0)
 
-# One motor record per axis. The driver reports the controller's raw position in
-# nanometres (linear) / micro-degrees (rotary) with no scaling, so MRES = 1e-6
-# reads the record in millimetres (linear) / degrees (rotary).
-dbLoadRecords("$(SMARACT_IOC)/db/mcs.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(SMARACT_IOC)/db/mcs.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("$(SMARACT_IOC)/db/mcs.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+# The motor of C's motor.substitutions.smaractmcs.
+dbLoadRecords("$(MOTOR)/db/asyn_motor.db", "P=$(P),M=m1,DTYP=asynMotor,PORT=$(CTRL),ADDR=0,DESC=motor 1,EGU=mm,DIR=Pos,VELO=1,VBAS=0,ACCL=0.2,BDST=0,BVEL=1,BACC=0.2,MRES=1e-6,PREC=2,DHLM=3,DLLM=-3,INIT=")
+
+# ---- autosave/restore machinery (C iocSmarAct AutoSave.cmd) ----
+set_requestfile_path("$(SMARACT_IOC)", "")
+set_requestfile_path("$(MOTOR)", "db")
+set_savefile_path("$(SMARACT_IOC)", "autosave")
+set_pass0_restoreFile("auto_positions_mcs.sav")
+set_pass0_restoreFile("auto_settings_mcs.sav")
+set_pass1_restoreFile("auto_settings_mcs.sav")
+# C's AutoSave.cmd names $(PREFIX), which its st.cmd never sets
+save_restoreSet_status_prefix("$(P)")
+dbLoadRecords("$(AUTOSAVE)/db/save_restoreStatus.db", "P=$(P)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
+# save motor positions every five seconds
+create_monitor_set("auto_positions_mcs.req", 5, "P=$(P)")
+# save settings every thirty seconds
+create_monitor_set("auto_settings_mcs.req", 30, "P=$(P)")
 
 # Example:
 #   dbl

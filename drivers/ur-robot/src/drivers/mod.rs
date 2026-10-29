@@ -41,6 +41,7 @@ pub mod receive;
 pub mod runtime;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriverBase, PortFlags};
 
 /// The full asyn parameter table of every driver kind, keyed by the names
@@ -53,7 +54,13 @@ pub fn created_param_names() -> Vec<(&'static str, Vec<String>)> {
         max_addr: usize,
         create: impl FnOnce(&mut PortDriverBase) -> AsynResult<P>,
     ) -> Vec<String> {
-        let mut base = PortDriverBase::new("wiring-check", max_addr, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "wiring-check",
+            max_addr,
+            PortFlags::default(),
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        );
         create(&mut base).expect("a fresh parameter table accepts every create_param");
         (0..base.params.len())
             .map(|i| base.params.param_name(i).expect("index < len").to_string())
@@ -84,13 +91,20 @@ pub fn created_param_names() -> Vec<(&'static str, Vec<String>)> {
 /// a reconnect re-uploads the control script).
 pub(crate) const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The `asynError` a C driver returns from `writeInt32` / `writeFloat64` /
-/// `writeOctet` when the device call failed.
+/// A port construction failure, reported by the `*Config` command.
 pub(crate) fn asyn_error(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message: message.into(),
     }
+}
+
+/// The `asynError` the C++ handlers return from a refused or failed
+/// read/write. They never set `pasynUser->errorMessage` — what the operator
+/// sees is the spdlog line printed at the refusal — so devAsyn's
+/// "process write error" ends with an empty message.
+pub(crate) fn refused() -> AsynError {
+    asyn_error("")
 }
 
 /// The address a C handler acts on: `asynPortDriver::getAddress`
@@ -143,8 +157,6 @@ pub(crate) fn health_transition(
     };
     targets
         .iter()
-        .map(|&(reason, addr)| {
-            epics_rs::asyn::request::ParamSetValue::status(reason, addr, status, 0, 0)
-        })
+        .map(|&(reason, addr)| epics_rs::asyn::request::ParamSetValue::status(reason, addr, status))
         .collect()
 }

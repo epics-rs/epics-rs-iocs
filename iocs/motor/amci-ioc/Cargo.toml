@@ -14,3 +14,6 @@ motor-amci = { path = "../../../drivers/motor/amci" }
 motor-common = { path = "../../../drivers/motor/common" }
 epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
 modbus-rs = { workspace = true, features = ["ioc"] }
+
+[dev-dependencies]
+ioc-conventions = { path = "../../../tools/ioc-conventions" }

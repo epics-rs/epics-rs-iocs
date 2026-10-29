@@ -1,0 +1,2 @@
+This directory holds the save/restore files set_savefile_path names.
+quadEM iocBoot/iocT4UDirect_EM ships none, so C autosave cannot write until one is made.

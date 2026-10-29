@@ -2,68 +2,71 @@
 //!
 //! Everything here is pure and file-driven so it can be exercised with fixtures.
 
+use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use tiff::decoder::{Decoder, DecodingResult};
+use tiff::decoder::{Decoder, DecodingBuffer, DecodingSampleType};
 
-/// A decoded single-channel 16-bit TIFF.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TiffImage {
+/// A TIFF opened as far as its dimensions, which C's `readTiff` checks
+/// before it reads a strip.
+pub struct TiffFile {
+    decoder: Decoder<BufReader<File>>,
     pub width: u32,
     pub height: u32,
-    /// One `epicsUInt16` per pixel.
-    pub data: Vec<u16>,
 }
 
-/// Decode a TIFF the way C's `readTiff` consumes one.
-///
-/// C copies the raw strip bytes straight into an `NDUInt16` buffer and only
-/// validates `TIFFTAG_IMAGEWIDTH`, `TIFFTAG_IMAGELENGTH` and the total byte
-/// count. The equivalent here is: accept a 16-bit single-sample image and
-/// return its samples as `epicsUInt16`; reject anything whose decoded element
-/// count is not `width * height` (C's `totalSize` mismatch retry path) or whose
-/// sample width is not 16 bits (same path).
-///
-/// Deviation from C, documented in the crate docs: the `tiff` crate decodes
-/// every strip, whereas C's loop passes strip index `0` on each iteration. The
-/// two agree for the single-strip files `marccd_server` writes; for a
-/// multi-strip file C repeats strip 0 and this function does not.
-pub fn decode_tiff(path: &Path) -> Result<TiffImage, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("cannot open {path:?}: {e}"))?;
-    let mut decoder =
-        Decoder::new(BufReader::new(file)).map_err(|e| format!("not a TIFF file: {e}"))?;
-    let (width, height) = decoder
-        .dimensions()
-        .map_err(|e| format!("no image dimensions: {e}"))?;
-
-    let image = decoder
-        .read_image()
-        .map_err(|e| format!("cannot decode image: {e}"))?;
-
-    let data: Vec<u16> = match image {
-        DecodingResult::U16(v) => v,
-        // C reinterprets the raw strip bytes as epicsUInt16; a signed 16-bit
-        // sample carries the same bit pattern.
-        DecodingResult::I16(v) => v.into_iter().map(|x| x as u16).collect(),
-        _ => return Err("image is not 16 bits per sample".to_string()),
-    };
-
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .ok_or_else(|| "image dimensions overflow".to_string())?;
-    if data.len() != expected {
-        return Err(format!(
-            "file size incorrect = {} samples, should be {expected}",
-            data.len()
-        ));
+impl TiffFile {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| format!("cannot open {path:?}: {e}"))?;
+        let mut decoder =
+            Decoder::new(BufReader::new(file)).map_err(|e| format!("not a TIFF file: {e}"))?;
+        let (width, height) = decoder
+            .dimensions()
+            .map_err(|e| format!("no image dimensions: {e}"))?;
+        Ok(Self {
+            decoder,
+            width,
+            height,
+        })
     }
 
-    Ok(TiffImage {
-        width,
-        height,
-        data,
-    })
+    /// Decode the pixels into `out`.
+    ///
+    /// C copies the raw strip bytes straight into the `NDUInt16` array and only
+    /// checks the total byte count. The equivalent here: a 16-bit sample,
+    /// signed or not, is decoded bit for bit, and anything whose sample width
+    /// is not 16 bits or whose first plane is not `out.len()` samples fails, as
+    /// C's `totalSize` mismatch retry path does.
+    ///
+    /// Deviation from C, documented in the crate docs: the `tiff` crate decodes
+    /// every strip, whereas C's loop passes strip index `0` on each iteration.
+    /// The two agree for the single-strip files `marccd_server` writes; for a
+    /// multi-strip file C repeats strip 0 and this function does not.
+    pub fn read_into(mut self, out: &mut [u16]) -> Result<(), String> {
+        let layout = self
+            .decoder
+            .image_buffer_layout()
+            .map_err(|e| format!("cannot decode image: {e}"))?;
+        if !matches!(
+            layout.sample_type,
+            Some(DecodingSampleType::U16 | DecodingSampleType::I16)
+        ) {
+            return Err("image is not 16 bits per sample".to_string());
+        }
+        let mut buffer = DecodingBuffer::U16(out);
+        let bytes = buffer.as_bytes_mut();
+        if layout.len != bytes.len() {
+            return Err(format!(
+                "file size incorrect = {} bytes, should be {}",
+                layout.len,
+                bytes.len()
+            ));
+        }
+        self.decoder
+            .read_image_bytes(bytes)
+            .map_err(|e| format!("cannot decode image: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -83,6 +86,15 @@ mod tests {
         }
     }
 
+    /// Open `path` and decode it into a stale buffer sized from its header.
+    fn decode(path: &Path) -> Result<(u32, u32, Vec<u16>), String> {
+        let tiff = TiffFile::open(path)?;
+        let (width, height) = (tiff.width, tiff.height);
+        let mut pixels = vec![0x5a5a; width as usize * height as usize];
+        tiff.read_into(&mut pixels)?;
+        Ok((width, height, pixels))
+    }
+
     #[test]
     fn tiff_roundtrip_single_strip() {
         let dir = tempfile::tempdir().unwrap();
@@ -90,10 +102,9 @@ mod tests {
         let data: Vec<u16> = (0..6 * 4).map(|i| (i * 7 + 3) as u16).collect();
         write_tiff(&path, 6, 4, &data, None);
 
-        let img = decode_tiff(&path).unwrap();
-        assert_eq!(img.width, 6);
-        assert_eq!(img.height, 4);
-        assert_eq!(img.data, data);
+        let (width, height, pixels) = decode(&path).unwrap();
+        assert_eq!((width, height), (6, 4));
+        assert_eq!(pixels, data);
     }
 
     #[test]
@@ -102,8 +113,8 @@ mod tests {
         let path = dir.path().join("range.tif");
         let data = vec![0u16, 1, 32767, 32768, 65535];
         write_tiff(&path, 5, 1, &data, None);
-        let img = decode_tiff(&path).unwrap();
-        assert_eq!(img.data, data);
+        let (_, _, pixels) = decode(&path).unwrap();
+        assert_eq!(pixels, data);
     }
 
     #[test]
@@ -113,13 +124,28 @@ mod tests {
         let path = dir.path().join("multi.tif");
         let data: Vec<u16> = (0..4 * 6).map(|i| i as u16).collect();
         write_tiff(&path, 4, 6, &data, Some(2));
-        let img = decode_tiff(&path).unwrap();
-        assert_eq!(img.data, data);
+        let (_, _, pixels) = decode(&path).unwrap();
+        assert_eq!(pixels, data);
+    }
+
+    #[test]
+    fn a_buffer_other_than_the_image_size_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("img.tif");
+        write_tiff(&path, 2, 2, &[1, 2, 3, 4], None);
+        for len in [3, 5] {
+            let mut pixels = vec![0; len];
+            let err = TiffFile::open(&path)
+                .unwrap()
+                .read_into(&mut pixels)
+                .unwrap_err();
+            assert!(err.contains("file size incorrect = 8 bytes"), "{err}");
+        }
     }
 
     #[test]
     fn tiff_missing_file_is_an_error() {
-        assert!(decode_tiff(Path::new("/nonexistent/none.tif")).is_err());
+        assert!(TiffFile::open(Path::new("/nonexistent/none.tif")).is_err());
     }
 
     #[test]
@@ -127,7 +153,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.tif");
         std::fs::write(&path, b"II*\x00garbage").unwrap();
-        assert!(decode_tiff(&path).is_err());
+        assert!(decode(&path).is_err());
     }
 
     #[test]
@@ -141,7 +167,7 @@ mod tests {
             enc.write_image::<colortype::GrayI32>(2, 2, &[1i32, 2, 3, 4])
                 .unwrap();
         }
-        let err = decode_tiff(&path).unwrap_err();
+        let err = decode(&path).unwrap_err();
         assert!(err.contains("16 bits per sample"), "{err}");
     }
 }

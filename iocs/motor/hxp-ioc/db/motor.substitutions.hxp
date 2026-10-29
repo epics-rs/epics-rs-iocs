@@ -1,0 +1,30 @@
+# C's iocNewport motor.substitutions.hxp, P and PORT from st.cmd. HXPDriver
+# converts record steps with a hardcoded MRES of 0.00001, so MRES must stay
+# at that value.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{M,   DTYP,        ADDR,  DESC,  EGU,      DIR,  VMAX,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,     PREC,  DHLM,  DLLM,  INIT,  RTRY}
+{m1,  "asynMotor", 0,     "X",   mm,       Pos,  15.,   3.,    .05,   .5,    0,     1.0,   2,     0.00001,  5,     0,     0,     "",    0}
+{m2,  "asynMotor", 1,     "Y",   mm,       Pos,  15.,   3.,    .05,   .5,    0,     1.0,   2,     0.00001,  5,     0,     0,     "",    0}
+{m3,  "asynMotor", 2,     "Z",   mm,       Pos,  15.,   3.,    .05,   .5,    0,     1.0,   2,     0.00001,  5,     0,     0,     "",    0}
+{m4,  "asynMotor", 3,     "U",   degrees,  Pos,  15.,   3.,    .05,   .5,    0,     1.0,   2,     0.00001,  5,     0,     0,     "",    0}
+{m5,  "asynMotor", 4,     "V",   degrees,  Pos,  15.,   3.,    .05,   .5,    0,     1.0,   2,     0.00001,  5,     0,     0,     "",    0}
+{m6,  "asynMotor", 5,     "W",   degrees,  Pos,  15.,   3.,    .05,   .5,    0,     1.0,   2,     0.00001,  5,     0,     0,     "",    0}
+}
+
+# Coordinate system for moves, group status/error, move-all targets.
+file "$(HXP_IOC)/db/HXP_extra.db"
+{
+pattern
+{R}
+{""}
+}
+
+# Coordinate-system definitions: read back, set, then sync the motors.
+file "$(HXP_IOC)/db/HXP_coords.db"
+{
+pattern
+{R,   M1,  M2,  M3,  M4,  M5,  M6}
+{"",  m1,  m2,  m3,  m4,  m5,  m6}
+}

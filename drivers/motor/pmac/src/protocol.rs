@@ -6,6 +6,8 @@
 //! `pmacAsynCoord.c`. Keeping the parsers here — free functions over `&str` —
 //! is what makes the wire formats testable without a controller.
 
+use epics_rs::base::runtime::stdlib::strtod;
+
 /// Motor status word 1 (`#n ?`, first 6 hex digits).
 pub const STATUS1_HOMING: u32 = 1 << 10;
 pub const STATUS1_DESIRED_VELOCITY_ZERO: u32 = 1 << 13;
@@ -254,26 +256,38 @@ pub fn may_disable_limits(flags: &HomeFlags, home_velocity: f64) -> bool {
 /// `drvPmacGetCoordStatus`, `sscanf(response, "%6x%6x%6x", &status[0],
 /// &status[1], &status[2])` on the `&n ??` reply.
 pub fn parse_cs_status(resp: &str) -> Option<(u32, u32, u32)> {
-    let (s0, s1, rest) = take_status_pair(resp)?;
-    let (s2, _) = take_hex(rest, 6)?;
-    Some((s0, s1, s2))
+    let mut status = [0; 3];
+    (scan_cs_status(resp, &mut status) == 3).then_some((status[0], status[1], status[2]))
+}
+
+/// C `sscanf(resp, "%6x%6x%6x", ...)`: overwrites the words it reads, in
+/// order, and returns how many.
+pub fn scan_cs_status(resp: &str, status: &mut [u32; 3]) -> usize {
+    let mut rest = resp;
+    for (n, word) in status.iter_mut().enumerate() {
+        let Some((value, tail)) = take_hex(rest, 6) else {
+            return n;
+        };
+        *word = value;
+        rest = tail;
+    }
+    status.len()
 }
 
 /// The coordinate-system position block: C `drvPmacGetAxesStatus` walks the
-/// `&n Q81 Q82 … Q89` reply with successive `strtod` calls. Returns the
-/// positions actually present, in order — the C code reads exactly `count`
-/// of them and treats a short reply as a (logged) parse failure while still
-/// using whatever it got, so the caller checks the length.
-pub fn parse_cs_positions(resp: &str, count: usize) -> Vec<f64> {
-    let mut sc = Scanner::new(resp);
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        match sc.double() {
-            Some(v) => out.push(v),
-            None => break,
-        }
-    }
-    out
+/// `&n Q81 Q82 … Q89` reply with `count` successive `strtod` calls, each
+/// from where the last stopped, so a short or bad reply reads 0 from there
+/// on. Each value comes with C's `position == 0 && errno != 0`: an underflow
+/// to 0.
+pub fn parse_cs_positions(resp: &str, count: usize) -> Vec<(f64, bool)> {
+    let mut rest = resp.as_bytes();
+    (0..count)
+        .map(|_| {
+            let read = strtod(rest);
+            rest = &rest[read.len..];
+            (read.value, read.value == 0.0 && read.erange)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -411,9 +425,18 @@ mod tests {
     }
 
     #[test]
-    fn cs_positions_reads_up_to_count() {
-        let p = parse_cs_positions("1.5\r-2.5\r0\r", 9);
-        assert_eq!(p, vec![1.5, -2.5, 0.0]);
-        assert_eq!(parse_cs_positions("1 2 3", 2), vec![1.0, 2.0]);
+    fn cs_positions_reads_count_strtods() {
+        let values = |resp, count| -> Vec<f64> {
+            parse_cs_positions(resp, count)
+                .into_iter()
+                .map(|(v, _)| v)
+                .collect()
+        };
+        assert_eq!(values("1.5\r-2.5\r0\r", 4), [1.5, -2.5, 0.0, 0.0]);
+        assert_eq!(values("1 2 3", 2), [1.0, 2.0]);
+        assert_eq!(
+            parse_cs_positions("1e-400 0 1e400", 3),
+            [(0.0, true), (0.0, false), (f64::INFINITY, false)]
+        );
     }
 }

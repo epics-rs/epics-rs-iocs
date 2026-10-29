@@ -37,18 +37,24 @@ pub struct ParsedLink<'a> {
     pub arg: Option<&'a str>,
 }
 
+/// C `isblank`, the only separator `gm10_parse_link` splits on.
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
 pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
-    let text = text.trim_start();
-    let sep = text.find(char::is_whitespace)?;
-    let device = &text[..sep];
-    if device.is_empty() {
+    // C returns 1 on a leading blank, and reads past the NUL when there is
+    // no blank at all.
+    if text.starts_with(is_blank) {
         return None;
     }
-    let rest = text[sep..].trim_start();
+    let sep = text.find(is_blank)?;
+    let device = &text[..sep];
+    let rest = text[sep..].trim_start_matches(is_blank);
     if rest.is_empty() {
         return None;
     }
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let end = rest.find(is_blank).unwrap_or(rest.len());
     let cmd_and_arg = &rest[..end];
     let (command, arg) = match cmd_and_arg.split_once(':') {
         Some((c, a)) => (c, Some(a)),
@@ -64,40 +70,54 @@ pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
     })
 }
 
-/// Parse a family-prefixed channel address: bare digits (`Signal`, 1-999),
-/// `A<n>` (`Math`, 1-200), `C<n>` (`Comm`, 1-500), `K<n>` (`Const`, 1-100),
-/// `W<n>` (`VarConst`, 1-100). Returns `None` on a malformed or
-/// out-of-range address.
-pub fn parse_channel_address(arg: &str) -> Option<ChannelAddress> {
-    let mut chars = arg.chars();
-    let first = chars.next()?;
-    let (family, digits, max): (_, &str, u32) = match first {
-        '0'..='9' => (ChannelFamily::Signal, arg, 999),
-        'A' => (ChannelFamily::Math, arg.get(1..)?, 200),
-        'C' => (ChannelFamily::Comm, arg.get(1..)?, 500),
-        'K' => (ChannelFamily::Const, arg.get(1..)?, 100),
-        'W' => (ChannelFamily::VarConst, arg.get(1..)?, 100),
-        _ => return None,
-    };
-    let index: u32 = digits.parse().ok()?;
-    if index == 0 || index > max {
-        return None;
-    }
-    Some(ChannelAddress { family, index })
+/// C `int i = strtol(s, &end, 10)`, which every devGM10 `atoi`/`strtol`
+/// caller writes: that `int` and the unparsed tail, which is `s` itself when
+/// there are no digits.
+pub fn strtol(s: &str) -> (i32, &str) {
+    let (long, end) = epics_rs::base::types::c_parse::strtol(s, 10);
+    (epics_rs::base::types::c_parse::long_to_int(long), &s[end..])
 }
 
-/// `ALARM:<addr>.<1-4>` — a channel address plus a mandatory `.N` sub-index.
+/// Parse a family-prefixed channel address: bare digits (`Signal`, 1-999),
+/// `A<n>` (`Math`, 1-200), `C<n>` (`Comm`, 1-500), `K<n>` (`Const`, 1-100),
+/// `W<n>` (`VarConst`, 1-100). The number is read with C `atoi`, so
+/// trailing text after the digits is ignored. Returns `None` on an
+/// unknown prefix or an out-of-range number.
+pub fn parse_channel_address(arg: &str) -> Option<ChannelAddress> {
+    parse_channel_address_tail(arg).map(|(addr, _)| addr)
+}
+
+fn parse_channel_address_tail(arg: &str) -> Option<(ChannelAddress, &str)> {
+    let first = arg.chars().next()?;
+    let (family, digits, max): (_, &str, i32) = match first {
+        '0'..='9' => (ChannelFamily::Signal, arg, 999),
+        'A' => (ChannelFamily::Math, &arg[1..], 200),
+        'C' => (ChannelFamily::Comm, &arg[1..], 500),
+        'K' => (ChannelFamily::Const, &arg[1..], 100),
+        'W' => (ChannelFamily::VarConst, &arg[1..], 100),
+        _ => return None,
+    };
+    let (index, tail) = strtol(digits);
+    if index <= 0 || index > max {
+        return None;
+    }
+    Some((
+        ChannelAddress {
+            family,
+            index: index as u32,
+        },
+        tail,
+    ))
+}
+
+/// `ALARM:<addr>.<1-4>`: the text right after the address number must be
+/// exactly `.N` (`devGM10_mbbi.c:176-183`).
 pub fn parse_alarm_address(arg: &str) -> Option<(ChannelAddress, u8)> {
-    let (addr_part, sub_part) = arg.split_once('.')?;
-    let addr = parse_channel_address(addr_part)?;
-    if sub_part.len() != 1 {
-        return None;
+    let (addr, tail) = parse_channel_address_tail(arg)?;
+    match tail.as_bytes() {
+        [b'.', sub @ b'1'..=b'4'] => Some((addr, sub - b'0')),
+        _ => None,
     }
-    let sub = sub_part.as_bytes()[0];
-    if !(b'1'..=b'4').contains(&sub) {
-        return None;
-    }
-    Some((addr, sub - b'0'))
 }
 
 #[cfg(test)]
@@ -124,6 +144,17 @@ mod tests {
         assert!(parse_link("hdl").is_none());
         assert!(parse_link("").is_none());
         assert!(parse_link("   ").is_none());
+    }
+
+    #[test]
+    fn splits_on_c_isblank_only_and_refuses_a_leading_blank() {
+        assert!(parse_link(" hdl VAL:1").is_none());
+        assert!(parse_link("\thdl VAL:1").is_none());
+        assert!(parse_link("hdl\u{a0}VAL:1").is_none());
+        let l = parse_link("h\x0cdl\tVAL:1\x0bx").unwrap();
+        assert_eq!(l.device, "h\x0cdl");
+        assert_eq!(l.command, "VAL");
+        assert_eq!(l.arg, Some("1\x0bx"));
     }
 
     #[test]
@@ -202,5 +233,41 @@ mod tests {
         assert_eq!(parse_alarm_address("0027.5"), None);
         assert_eq!(parse_alarm_address("0027"), None);
         assert_eq!(parse_alarm_address("0027.12"), None);
+        assert_eq!(parse_alarm_address("0027x.2"), None);
+        assert_eq!(
+            parse_alarm_address("A3.4").map(|(a, s)| (a.index, s)),
+            Some((3, 4))
+        );
+    }
+
+    #[test]
+    fn address_number_reads_like_c_atoi() {
+        assert_eq!(parse_channel_address("27abc").map(|a| a.index), Some(27));
+        assert_eq!(parse_channel_address("A 7").map(|a| a.index), Some(7));
+        assert_eq!(parse_channel_address("C+12").map(|a| a.index), Some(12));
+        assert_eq!(parse_channel_address("C-12"), None);
+        assert_eq!(parse_channel_address("99999999999999999999999"), None);
+        assert_eq!(strtol("  -42rest"), (-42, "rest"));
+        assert_eq!(strtol("x1"), (0, "x1"));
+    }
+
+    /// Every devGM10 caller stores strtol/atoi in an `int i`.
+    #[test]
+    fn address_number_is_strtol_stored_in_an_int() {
+        use std::ffi::c_long;
+        let int = |n: i128| {
+            epics_rs::base::types::c_parse::long_to_int(
+                n.clamp(c_long::MIN as i128, c_long::MAX as i128) as c_long,
+            )
+        };
+        let huge = 99_999_999_999_999_999_999_i128;
+        assert_eq!(strtol("-99999999999999999999").0, int(-huge));
+        assert_eq!(strtol("99999999999999999999").0, int(huge));
+        let n = i128::from(u32::MAX) + 2;
+        let want = Some(int(n)).filter(|i| (1..=999).contains(i));
+        assert_eq!(
+            parse_channel_address(&n.to_string()).map(|a| a.index as i32),
+            want
+        );
     }
 }

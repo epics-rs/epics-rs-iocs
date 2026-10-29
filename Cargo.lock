@@ -7,6 +7,7 @@ name = "acsmotion-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-acsmotion",
  "motor-common",
 ]
@@ -16,24 +17,26 @@ name = "acstech80-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-acstech80",
  "motor-common",
 ]
 
 [[package]]
 name = "ad-core-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed9b0fb16a9a0fb95bb60b62025a607aaa215fa10d7a39730cd619c5cd313bc0"
+checksum = "4ff7362024c16cc64bd81abf155c3087e3f168b24b55b1320157435453526bbc"
 dependencies = [
  "asyn-rs",
+ "bytemuck",
  "epics-base-rs",
  "epics-ca-rs",
  "epics-libcom-rs",
  "fearless_simd 1.1.0",
  "fearless_simd_macros",
- "futures-util",
  "parking_lot",
+ "smallvec",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -44,7 +47,6 @@ name = "ad-csimdetector"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "tokio",
 ]
@@ -65,6 +67,7 @@ version = "0.1.0"
 dependencies = [
  "ad-core-rs",
  "asyn-rs",
+ "epics-libcom-rs",
  "epics-rs",
  "parking_lot",
 ]
@@ -73,8 +76,8 @@ dependencies = [
 name = "ad-mar345"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -82,20 +85,19 @@ dependencies = [
 name = "ad-marccd"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
  "tempfile",
  "tiff",
- "tokio",
 ]
 
 [[package]]
 name = "ad-pilatus"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
  "tempfile",
  "tiff",
@@ -103,22 +105,23 @@ dependencies = [
 
 [[package]]
 name = "ad-plugins-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68c977e8f9c6a9c4812b1858a2cd1592392402296e3e6db6fd59b907bf5779dc"
+checksum = "e26fe06a8596a6750c61ba5eb89e0b98629bc2eed7ad451c80ad881a0c13cabc"
 dependencies = [
  "ad-core-rs",
  "asyn-rs",
  "epics-base-rs",
  "epics-bridge-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
  "epics-pva-rs",
  "fearless_simd 1.1.0",
  "fearless_simd_macros",
  "flate2",
  "image",
- "jpeg-decoder",
  "jpeg-encoder",
+ "libc",
  "lz4_flex",
  "parking_lot",
  "rayon",
@@ -129,6 +132,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -136,7 +140,6 @@ name = "ad-pva-driver"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "tokio",
 ]
@@ -170,7 +173,6 @@ name = "ad-simdetector"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -188,8 +190,8 @@ dependencies = [
 name = "ad-specs-analyser"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -198,7 +200,6 @@ name = "ad-std-arrays-driver"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "tokio",
 ]
@@ -220,7 +221,6 @@ dependencies = [
  "anyhow",
  "epics-rs",
  "image",
- "log",
  "parking_lot",
  "ureq 2.12.1",
 ]
@@ -236,6 +236,7 @@ name = "aerotech-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-aerotech",
  "motor-common",
 ]
@@ -267,6 +268,7 @@ name = "ag-uc-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -275,6 +277,7 @@ name = "agap-conex-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -331,6 +334,7 @@ version = "0.1.0"
 dependencies = [
  "epics-modbus-rs",
  "epics-rs",
+ "ioc-conventions",
  "motor-amci",
  "motor-common",
 ]
@@ -450,14 +454,15 @@ dependencies = [
 
 [[package]]
 name = "asyn-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a9f5c17fd8945b152a81acfc530cf8aa3305592c0b241505ca7e08302791bab"
+checksum = "700b41115d3980bbd68b092bbb866c8f73f525f577e7edd6f95fc5eb18f66056"
 dependencies = [
  "bitflags 2.11.1",
  "chrono",
  "epics-base-rs",
  "epics-libcom-rs",
+ "epics-seq-rs",
  "libc",
  "parking_lot",
  "serde",
@@ -604,7 +609,7 @@ checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.6",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -625,6 +630,7 @@ name = "attocube-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-attocube",
  "motor-common",
 ]
@@ -699,8 +705,8 @@ dependencies = [
 name = "bruker"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -725,6 +731,20 @@ name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
 
 [[package]]
 name = "byteorder"
@@ -746,21 +766,11 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "bzip2"
-version = "0.5.2"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
 dependencies = [
- "bzip2-sys",
-]
-
-[[package]]
-name = "bzip2-sys"
-version = "0.1.13+1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
-dependencies = [
- "cc",
- "pkg-config",
+ "libbz2-rs-sys",
 ]
 
 [[package]]
@@ -802,6 +812,14 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "cfloat-gate"
+version = "0.0.0"
+source = "git+https://github.com/epics-rs/epics-rs?rev=32cf8af4ac185d3cdeaad6f531b5e8442ed63907#32cf8af4ac185d3cdeaad6f531b5e8442ed63907"
+dependencies = [
+ "source-guard",
+]
 
 [[package]]
 name = "chacha20"
@@ -921,6 +939,7 @@ name = "conex-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -943,6 +962,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec182b0ca2f35d8fc196cf3404988fd8b8c739a4d270ff118a398feb0cbec1ca"
 dependencies = [
  "unicode-segmentation",
+]
+
+[[package]]
+name = "core-foundation"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]
@@ -1057,9 +1086,10 @@ name = "d435i"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
+ "pkg-config",
  "realsense-rust",
 ]
 
@@ -1129,6 +1159,7 @@ dependencies = [
 name = "delaygen"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
 ]
 
@@ -1268,11 +1299,14 @@ name = "eiger"
 version = "0.1.0"
 dependencies = [
  "ad-plugins-rs",
+ "bytes",
+ "epics-libcom-rs",
  "epics-rs",
  "hdf5-reader",
- "log",
+ "libc",
  "lz4_flex",
  "parking_lot",
+ "rust-hdf5",
  "serde_json",
  "tokio",
  "ureq 3.3.0",
@@ -1326,9 +1360,9 @@ dependencies = [
 
 [[package]]
 name = "epics-base-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdbca093c8aea4f45c5c0b30a1e547a5bb2d2cf37a75c39335c9e9d052bb0509"
+checksum = "6173afb3032f72626d24c801fd9966e35f12b3a845ba8bbdad775ada53ad7a20"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1339,22 +1373,23 @@ dependencies = [
  "epics-macros-rs",
  "epics-rtems-boot",
  "hostname",
- "if-addrs",
  "libc",
  "parking_lot",
  "rustyline",
  "serde_json",
+ "smallvec",
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "epics-bridge-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d74bf26cfc90510a0c259c5c635a596a58c59be41b767e00eb6f9112bf76ab4"
+checksum = "89bf486dcb7d03e19b2b434df688d4f1035f58c6b231fcec8c97b0454b701efa"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1377,9 +1412,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b80c3e807faada9f1a6735d567c5c110fda9e98ec081de6bb1b4195812ef2ac"
+checksum = "304b9dc2ecb05715110e6d9cd53c3f8eb1dc7a157d4d3e2d8d6d5f5ea9bf0687"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1387,9 +1422,9 @@ dependencies = [
  "clap",
  "dashmap",
  "epics-base-rs",
+ "epics-libcom-rs",
  "epics-rtems-boot",
  "futures-util",
- "if-addrs",
  "libc",
  "metrics",
  "parking_lot",
@@ -1402,26 +1437,26 @@ dependencies = [
 
 [[package]]
 name = "epics-libcom-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "780014a23d3703356670b0e7b60b9b319748d790e65e070263d006a8a57f2a97"
+checksum = "1c4f520a089eab40e9b1069ea88fdb1b2295d72f324150a7f5b88c36a0e356d2"
 dependencies = [
  "chrono",
- "epics-rtems-boot",
  "hostname",
- "if-addrs",
  "libc",
  "parking_lot",
+ "parking_lot_core",
  "socket2 0.5.10",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ed7312a16fcef4675650cae0692927162524f69923b9d54a06b8340b9b4ad07"
+checksum = "152ef7e79aca6232c856a04606d8edc93560837d5901ae6515bd634c869e1058"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1431,9 +1466,9 @@ dependencies = [
 
 [[package]]
 name = "epics-modbus-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f97a702ca6b077d2b475bdeecf10d464c122069770f771c3745e72b97d81bde8"
+checksum = "7b10597324aa6a8598c9deb28a53ae4a2b2a7dea72913d0e12fcbdc0e405f8f5"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -1444,21 +1479,22 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25084bd68f8fc46fd8598c6e04507ba525c29373a5da82e3b2359b6df15adf52"
+checksum = "32d7399fee9336f3022fed8f472aedba8efc187221453237bbd227b4966393d3"
 dependencies = [
+ "arc-swap",
  "bytes",
  "chrono",
  "clap",
  "dashmap",
  "der 0.8.0",
  "epics-base-rs",
+ "epics-libcom-rs",
  "epics-macros-rs",
  "futures-util",
  "hmac 0.13.0",
  "hostname",
- "if-addrs",
  "libc",
  "p12",
  "parking_lot",
@@ -1483,9 +1519,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6410d03e66328eee74c6f3d2a2e19e90308d10e84f9beedea31c7cb90d765407"
+checksum = "73ad7708b5d7902fafb397318cfaf62215cccc94a745e39ef560e34e85f4f42a"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -1500,12 +1536,38 @@ dependencies = [
 
 [[package]]
 name = "epics-rtems-boot"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ba7d7c62c8bf6013c6fefb802a7ca2e4450535e95c8741ccb11c6fac841bb46"
+checksum = "1e8b36c0a0e4b8f05859571fc9384b034d2978d3e0f65e0da8141e2f95955c3b"
 dependencies = [
  "cc",
  "libc",
+]
+
+[[package]]
+name = "epics-seq-rs"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "201a40c9258483488793471e7fc257f97a7b260c7951ca91ccbc378b13ff72ec"
+dependencies = [
+ "chrono",
+ "epics-base-rs",
+ "epics-libcom-rs",
+ "parking_lot",
+]
+
+[[package]]
+name = "epics-stream-rs"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a20cfe449bca3d34f130569e3d8ef2679e4e6dec78e1f4b5cbe7d2bbdc3848e2"
+dependencies = [
+ "asyn-rs",
+ "chrono",
+ "epics-base-rs",
+ "epics-libcom-rs",
+ "libc",
+ "parking_lot",
 ]
 
 [[package]]
@@ -1535,6 +1597,7 @@ name = "esp300-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -1542,9 +1605,12 @@ dependencies = [
 name = "ether-ip"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "epics-libcom-rs",
  "epics-rs",
- "log",
+ "libc",
  "parking_lot",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1555,7 +1621,6 @@ version = "0.1.0"
 dependencies = [
  "epics-rs",
  "ether-ip",
- "log",
  "tokio",
 ]
 
@@ -1570,6 +1635,7 @@ name = "faulhaber-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-faulhaber",
 ]
@@ -1626,7 +1692,7 @@ checksum = "3e91d94c6885390b81782d7ee60fd6583b33907333a8b340de25ccf468353315"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.6",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1972,6 +2038,7 @@ name = "hxp-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -2112,16 +2179,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "if-addrs"
-version = "0.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
-dependencies = [
- "libc",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2155,6 +2212,7 @@ name = "ims-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-ims",
 ]
@@ -2190,16 +2248,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-kit-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06d3a048d09fbb6597dbf7c69f40d14df4a49487db1487191618c893fc3b1c26"
+dependencies = [
+ "core-foundation-sys",
+ "mach2",
+]
+
+[[package]]
 name = "ioc-conventions"
 version = "0.1.0"
+dependencies = [
+ "cfloat-gate",
+ "epics-rs",
+ "tempfile",
+]
 
 [[package]]
 name = "ip-devices"
 version = "0.1.0"
 dependencies = [
+ "asyn-rs",
+ "epics-libcom-rs",
  "epics-rs",
- "log",
- "thiserror 2.0.18",
+ "epics-seq-rs",
+ "epics-stream-rs",
 ]
 
 [[package]]
@@ -2261,15 +2336,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jpeg-decoder"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
-dependencies = [
- "rayon",
-]
-
-[[package]]
 name = "jpeg-encoder"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2281,6 +2347,8 @@ version = "0.3.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2964e92d1d9dc3364cae4d718d93f227e3abb088e747d92e0395bfdedf1c12ca"
 dependencies = [
+ "cfg-if",
+ "futures-util",
  "once_cell",
  "wasm-bindgen",
 ]
@@ -2290,31 +2358,9 @@ name = "kohzu-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-kohzu",
-]
-
-[[package]]
-name = "lazy-regex"
-version = "3.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bae91019476d3ec7147de9aa291cadb6d870abf2f3015d2da73a90325ac1496"
-dependencies = [
- "lazy-regex-proc_macros",
- "once_cell",
- "regex",
-]
-
-[[package]]
-name = "lazy-regex-proc_macros"
-version = "3.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4de9c1e1439d8b7b3061b2d209809f447ca33241733d9a3c01eabf2dc8d94358"
-dependencies = [
- "proc-macro2",
- "quote",
- "regex",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -2327,6 +2373,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libbz2-rs-sys"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2337,6 +2389,32 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "libssh2-sys"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f5eb74291e8691cab524a01274a1b1e7742b1a94f29d8b101d8aadc8372c1cd"
+dependencies = [
+ "cc",
+ "libc",
+ "libz-sys",
+ "openssl-sys",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
+name = "libz-sys"
+version = "1.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f710a23e6dbf193214fd46ca56a9d6864e550abe86202184532ae7275e46de19"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -2384,6 +2462,7 @@ version = "0.1.0"
 dependencies = [
  "asyn-rs",
  "epics-rs",
+ "ioc-conventions",
  "love",
  "tokio",
 ]
@@ -2404,6 +2483,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "mach2"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1b95cd5421ec55b445b5ae102f5ea0e768de1f82bd3001e11f426c269c3aea"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -2449,6 +2537,7 @@ dependencies = [
 name = "mca"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "mca-rs",
  "tokio",
@@ -2459,8 +2548,10 @@ name = "mca-amptek"
 version = "0.1.0"
 dependencies = [
  "asyn-rs",
+ "epics-libcom-rs",
  "epics-rs",
  "mca",
+ "nusb",
  "tempfile",
 ]
 
@@ -2491,6 +2582,7 @@ dependencies = [
 name = "mca-rontec"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "mca",
 ]
@@ -2509,12 +2601,14 @@ dependencies = [
 
 [[package]]
 name = "mca-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55449461c74d5df4fa1e98e7eeb79daff7c98c41bac13e79d716b1b0c9c5fc21"
+checksum = "e6d847edadb3b72dd7277a97634172c3548f459bb6197cd54eb9b5a1b394d384"
 dependencies = [
  "chrono",
  "epics-base-rs",
+ "epics-libcom-rs",
+ "epics-seq-rs",
 ]
 
 [[package]]
@@ -2522,6 +2616,7 @@ name = "mcb4b-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-acs",
  "motor-common",
 ]
@@ -2531,6 +2626,7 @@ name = "mclennan-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-mclennan",
 ]
@@ -2563,8 +2659,8 @@ dependencies = [
 name = "merlin"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -2593,6 +2689,7 @@ name = "micos-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-micos",
 ]
@@ -2610,6 +2707,7 @@ version = "0.1.0"
 dependencies = [
  "asyn-rs",
  "epics-rs",
+ "epics-stream-rs",
  "microepsilon",
  "tokio",
 ]
@@ -2619,6 +2717,7 @@ name = "micromo-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-micromo",
 ]
@@ -2628,6 +2727,7 @@ name = "micronix-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-micronix",
 ]
@@ -2664,6 +2764,7 @@ name = "mm3000-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -2672,6 +2773,8 @@ name = "mm4000-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
+ "motor-common",
  "motor-newport",
 ]
 
@@ -2679,6 +2782,7 @@ dependencies = [
 name = "motor-acs"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2687,6 +2791,7 @@ dependencies = [
 name = "motor-acsmotion"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2703,7 +2808,9 @@ dependencies = [
 name = "motor-aerotech"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
+ "epics-seq-rs",
  "motor-common",
 ]
 
@@ -2711,6 +2818,7 @@ dependencies = [
 name = "motor-amci"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2719,6 +2827,7 @@ dependencies = [
 name = "motor-attocube"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2727,6 +2836,7 @@ dependencies = [
 name = "motor-common"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "tokio",
 ]
@@ -2743,6 +2853,7 @@ dependencies = [
 name = "motor-ims"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2767,6 +2878,7 @@ dependencies = [
 name = "motor-micos"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2775,6 +2887,7 @@ dependencies = [
 name = "motor-micromo"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2783,6 +2896,7 @@ dependencies = [
 name = "motor-micronix"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2791,6 +2905,7 @@ dependencies = [
 name = "motor-motorsim"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2799,8 +2914,11 @@ dependencies = [
 name = "motor-newport"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "suppaftp",
+ "epics-seq-rs",
+ "motor-common",
+ "ssh2",
  "tokio",
 ]
 
@@ -2808,6 +2926,7 @@ dependencies = [
 name = "motor-npoint"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2816,6 +2935,7 @@ dependencies = [
 name = "motor-oms-asyn"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2824,6 +2944,7 @@ dependencies = [
 name = "motor-oriel"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2832,6 +2953,7 @@ dependencies = [
 name = "motor-parker"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2840,6 +2962,7 @@ dependencies = [
 name = "motor-phytron"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2848,6 +2971,7 @@ dependencies = [
 name = "motor-pi"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2856,6 +2980,7 @@ dependencies = [
 name = "motor-pi-gcs2"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2864,6 +2989,7 @@ dependencies = [
 name = "motor-pijena"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2872,28 +2998,32 @@ dependencies = [
 name = "motor-pmac"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
 
 [[package]]
 name = "motor-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f98300a13562bd05e623028ba54b6bf14250d1fd3d7e34bcb17e15759420cc04"
+checksum = "ce85a5cc817d0e0ea004e5a911472afe36dd2e1d71cdb1a07d717defe1eb6350"
 dependencies = [
  "asyn-rs",
  "bitflags 2.11.1",
  "epics-base-rs",
  "epics-ca-rs",
+ "epics-libcom-rs",
+ "libc",
+ "parking_lot",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "motor-smaract"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2910,6 +3040,7 @@ dependencies = [
 name = "motor-thorlabs"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "motor-common",
 ]
@@ -2919,6 +3050,7 @@ name = "motorsim-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-motorsim",
 ]
 
@@ -2936,8 +3068,8 @@ dependencies = [
 name = "mythen"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -2971,6 +3103,7 @@ name = "newfocus-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -3010,6 +3143,7 @@ name = "npoint-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-npoint",
 ]
@@ -3116,6 +3250,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "nusb"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03fba503685f5c3e9f6a11ff9711c16086ab6beacaa6ad3df9e217a91a8d4c82"
+dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
+ "futures-core",
+ "io-kit-sys",
+ "js-sys",
+ "linux-raw-sys 0.12.1",
+ "log",
+ "once_cell",
+ "rustix 1.1.4",
+ "slab",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3129,7 +3285,7 @@ name = "oms-asyn-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "motor-common",
+ "ioc-conventions",
  "motor-oms-asyn",
 ]
 
@@ -3152,9 +3308,12 @@ dependencies = [
  "async-opcua",
  "async-trait",
  "chrono",
+ "epics-libcom-rs",
  "epics-rs",
- "log",
+ "futures-util",
+ "libc",
  "parking_lot",
+ "tempfile",
  "tokio",
 ]
 
@@ -3163,8 +3322,19 @@ name = "opcua-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "opcua",
+]
+
+[[package]]
+name = "openssl-sys"
+version = "0.9.117"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
 ]
 
 [[package]]
@@ -3172,6 +3342,7 @@ name = "oriel-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-oriel",
 ]
@@ -3198,6 +3369,7 @@ name = "parker-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-parker",
 ]
@@ -3270,8 +3442,8 @@ checksum = "3637c05577168127568a64e9dc5a6887da720efef07b3d9472d45f63ab191166"
 name = "photonii"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -3290,6 +3462,7 @@ name = "phytron-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-phytron",
 ]
@@ -3299,6 +3472,7 @@ name = "pi-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-pi",
 ]
@@ -3308,6 +3482,7 @@ name = "pigcs2-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-pi-gcs2",
 ]
@@ -3317,6 +3492,7 @@ name = "pijena-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-pijena",
 ]
@@ -3341,8 +3517,8 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "pixirad"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
  "socket2 0.6.3",
 ]
@@ -3404,6 +3580,7 @@ name = "pm500-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -3499,8 +3676,8 @@ dependencies = [
 name = "psl"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -3534,11 +3711,13 @@ checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 name = "quadem"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "futures-util",
- "log",
+ "libc",
  "parking_lot",
  "serde_json",
+ "socket2 0.6.3",
  "tokio",
  "tokio-tungstenite",
 ]
@@ -3789,9 +3968,9 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.7.2"
+version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b048b9e8dce79f1259084fead30e6ba572f127e0188ab1bf6e8b9a2a333decf"
+checksum = "36e40088823964d69fc4f6012fcce5f6e7a9a83404301f937d6149b5984daf54"
 dependencies = [
  "bzip2",
  "fearless_simd 1.1.0",
@@ -3958,9 +4137,9 @@ dependencies = [
 
 [[package]]
 name = "scaler-rs"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3007d49f2e44b142959a20526d9a23ad9c5a4f9bc3e8d5341f32b6326a78d1d6"
+checksum = "5d97041547e3f1a15c8afdd27a818fc3bb93d42bb0077184f54a551cb23f769c"
 dependencies = [
  "epics-base-rs",
  "tokio",
@@ -4198,6 +4377,7 @@ name = "smartmotor-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-smartmotor",
 ]
@@ -4207,6 +4387,7 @@ name = "smc100-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -4235,6 +4416,11 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "source-guard"
+version = "0.33.0"
+source = "git+https://github.com/epics-rs/epics-rs?rev=32cf8af4ac185d3cdeaad6f531b5e8442ed63907#32cf8af4ac185d3cdeaad6f531b5e8442ed63907"
 
 [[package]]
 name = "specs-analyser-ioc"
@@ -4273,6 +4459,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssh2"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c95eb3c09e378543395a3fa9796f897861862466ee331d59140ade4ea0dcfdfc"
+dependencies = [
+ "bitflags 2.11.1",
+ "libc",
+ "libssh2-sys",
+ "parking_lot",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4297,18 +4495,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "suppaftp"
-version = "10.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81b8286a5639930b8fc0400f8a5111439ffb57e5fba6e8276a8bce857ec47b18"
-dependencies = [
- "chrono",
- "lazy-regex",
- "log",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4321,9 +4507,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.6"
+version = "3.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4342,19 +4528,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "syringepump"
-version = "0.1.0"
-dependencies = [
- "epics-rs",
-]
-
-[[package]]
 name = "syringepump-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-modbus-rs",
  "epics-rs",
- "syringepump",
+ "epics-stream-rs",
 ]
 
 [[package]]
@@ -4445,6 +4624,7 @@ name = "thorlabs-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-common",
  "motor-thorlabs",
 ]
@@ -4507,8 +4687,9 @@ dependencies = [
 name = "timepix3"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
- "log",
+ "libc",
  "parking_lot",
  "serde_json",
  "tokio",
@@ -4521,6 +4702,7 @@ version = "0.1.0"
 dependencies = [
  "ad-plugins-rs",
  "epics-rs",
+ "ioc-conventions",
  "timepix3",
  "tokio",
 ]
@@ -4784,8 +4966,8 @@ name = "twincat-ads"
 version = "0.1.0"
 dependencies = [
  "asyn-rs",
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -4795,6 +4977,7 @@ version = "0.1.0"
 dependencies = [
  "asyn-rs",
  "epics-rs",
+ "ioc-conventions",
  "tokio",
  "twincat-ads",
 ]
@@ -4852,8 +5035,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 name = "ur-robot"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "parking_lot",
  "thiserror 2.0.18",
 ]
@@ -4863,7 +5047,9 @@ name = "ur-robot-ioc"
 version = "0.1.0"
 dependencies = [
  "asyn-rs",
+ "epics-libcom-rs",
  "epics-rs",
+ "ioc-conventions",
  "tokio",
  "ur-robot",
 ]
@@ -4935,9 +5121,8 @@ name = "usb-2408"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
+ "epics-libcom-rs",
  "epics-rs",
- "log",
  "meascomp",
  "parking_lot",
  "uldaq-sys",
@@ -4948,9 +5133,9 @@ name = "usb-2408-ioc"
 version = "0.1.0"
 dependencies = [
  "asyn-rs",
- "env_logger",
  "epics-rs",
  "tokio",
+ "uldaq-sys",
  "usb-2408",
 ]
 
@@ -4959,10 +5144,9 @@ name = "usb-ctr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
+ "epics-libcom-rs",
  "epics-rs",
- "log",
- "mca",
+ "epics-seq-rs",
  "meascomp",
  "parking_lot",
  "uldaq-sys",
@@ -4973,11 +5157,12 @@ name = "usb-ctr-ioc"
 version = "0.1.0"
 dependencies = [
  "asyn-rs",
- "env_logger",
  "epics-rs",
+ "epics-seq-rs",
  "mca",
  "mca-rs",
  "tokio",
+ "uldaq-sys",
  "usb-ctr",
 ]
 
@@ -5014,6 +5199,7 @@ dependencies = [
 name = "vac"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
 ]
 
@@ -5030,6 +5216,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"
@@ -5066,6 +5258,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-bindgen-futures"
+version = "0.4.68"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f371d383f2fb139252e0bfac3b81b265689bf45b6874af544ffa4c975ac1ebf8"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "wasm-bindgen-macro"
 version = "0.2.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5095,6 +5297,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fd04d9e306f1907bd13c6361b5c6bfc7b3b3c095ed3f8a9246390f8dbdee129"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "web-sys"
+version = "0.3.95"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f2dfbb17949fa2088e5d39408c48368947b86f7834484e87b73de55bc14d97d"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -5337,6 +5549,7 @@ name = "xps-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "ioc-conventions",
  "motor-newport",
 ]
 
@@ -5373,6 +5586,7 @@ dependencies = [
 name = "yokogawa-gm10"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "log",
  "parking_lot",
@@ -5384,6 +5598,8 @@ name = "yokogawa-gm10-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "libc",
+ "tempfile",
  "yokogawa-gm10",
 ]
 
@@ -5391,6 +5607,7 @@ dependencies = [
 name = "yokogawa-mw100"
 version = "0.1.0"
 dependencies = [
+ "epics-libcom-rs",
  "epics-rs",
  "log",
  "parking_lot",
@@ -5402,6 +5619,8 @@ name = "yokogawa-mw100-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
+ "libc",
+ "tempfile",
  "yokogawa-mw100",
 ]
 

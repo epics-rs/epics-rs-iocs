@@ -5,11 +5,13 @@ use std::any::Any;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, FieldMetadataOverride, ProcessOutcome, Record,
+    AlarmSeverity, CommonFields, DeclaredFields, FieldDesc, FieldIx, FieldMetadataOverride,
+    ProcessOutcome, Record, declared_set,
 };
-use epics_rs::base::types::{DbFieldType, DbfCode, EpicsValue, PvString};
+use epics_rs::base::types::{EpicsValue, PvString};
 
-use super::{record_fields, set_sevr, severity_of};
+use super::dbd_generated::DIGITEL_FIELDS;
+use super::{rec_gbl_alarm, rec_gbl_range, record_fields, set_sevr, severity_of};
 
 /// `SPC_MOD` clamp limits (`digitelRecord.c:96-99`).
 const DIGITEL_MAXSP: f64 = 1e-3;
@@ -34,32 +36,6 @@ const MOD_S3TS: u32 = 0x2000;
 
 /// `menuYesNoYES`.
 const YES: u16 = 1;
-
-// --- menus (digitelRecord.dbd) -------------------------------------------
-
-const DSPL_CHOICES: &[&str] = &["VOLTS", "CURR", "PRES"];
-const KLCK_CHOICES: &[&str] = &["Unlocked", "Locked"];
-const MODS_CHOICES: &[&str] = &["STBY", "OPER"];
-const MODR_CHOICES: &[&str] = &["STBY", "OPER", "CONN", "COOL", "PERR", "LOCK"];
-const SET1_CHOICES: &[&str] = &["Off", "On"];
-const S1MS_CHOICES: &[&str] = &["Pressure", "Current"];
-const S1VS_CHOICES: &[&str] = &["Off", "On"];
-const BAKS_CHOICES: &[&str] = &["Disabled", "Enabled"];
-const S3BS_CHOICES: &[&str] = &["Real Time", "Heat On Time"];
-const PTYP_CHOICES: &[&str] = &[
-    "30  Liter/sec",
-    "60  Liter/sec",
-    "120 Liter/sec",
-    "220 Liter/sec",
-    "400 Liter/sec",
-    "700 Liter/sec",
-    "1200 Liter/sec",
-];
-const CMOR_CHOICES: &[&str] = &["Off", "On"];
-const BKIN_CHOICES: &[&str] = &["Absent", "Installed"];
-const TYPE_CHOICES: &[&str] = &["MPC", "D500", "D1500", "QPC"];
-const ALARM_SEVR: &[&str] = &["NO_ALARM", "MINOR", "MAJOR", "INVALID"];
-const YESNO_CHOICES: &[&str] = &["NO", "YES"];
 
 #[derive(Debug, Clone)]
 pub struct DigitelRecord {
@@ -169,8 +145,9 @@ pub struct DigitelRecord {
     /// Set once device support (or the simulation branch) has produced a value;
     /// C clears `pr->udf` on every such path.
     pub dev_ran: bool,
-    /// `recGblSetSevr(pr, READ_ALARM, INVALID_ALARM)` raised by device support.
-    pub read_alarm: bool,
+    /// The `recGblSetSevr(pr, <stat>, INVALID_ALARM)` device support raised:
+    /// READ_ALARM from a reply, COMM_ALARM from a refused `queueRequest`.
+    pub dev_alarm: Option<u16>,
 }
 
 impl Default for DigitelRecord {
@@ -263,77 +240,77 @@ impl Default for DigitelRecord {
             err: 0,
             ierr: 0,
             dev_ran: false,
-            read_alarm: false,
+            dev_alarm: None,
         }
     }
 }
 
 record_fields! {
-    SCALAR_FIELDS, get_scalar, put_scalar, DigitelRecord;
-    "TYPE": Enum = tipe, false;
-    "VAL": Double = val, true;
-    "LVAL": Double = lval, true;
-    "HIHI": Double = hihi, false;
-    "LOLO": Double = lolo, false;
-    "HIGH": Double = high, false;
-    "LOW": Double = low, false;
-    "HHSV": Enum = hhsv, false;
-    "LLSV": Enum = llsv, false;
-    "HSV": Enum = hsv, false;
-    "LSV": Enum = lsv, false;
-    "HYST": Double = hyst, false;
-    "LALM": Double = lalm, true;
-    "DSPL": Enum = dspl, false;
-    "KLCK": Enum = klck, false;
-    "MODS": Enum = mods, false;
-    "MODR": Enum = modr, true;
-    "BAKS": Enum = baks, false;
-    "BAKR": Enum = bakr, true;
-    "COOL": Double = cool, true;
-    "CMOR": Enum = cmor, true;
-    "ACCW": Double = accw, true;
-    "ACCI": Double = acci, true;
-    "PTYP": Enum = ptyp, true;
-    "S3BS": Enum = s3bs, false;
-    "S3BR": Enum = s3br, true;
-    "S3TS": Double = s3ts, false;
-    "S3TR": Double = s3tr, true;
-    "HOPR": Float = hopr, false;
-    "LOPR": Float = lopr, false;
-    "HCTR": Float = hctr, false;
-    "LCTR": Float = lctr, false;
-    "HVTR": Float = hvtr, false;
-    "LVTR": Float = lvtr, false;
-    "HLPR": Float = hlpr, false;
-    "LLPR": Float = llpr, false;
-    "SIMM": Enum = simm, false;
-    "SVMO": Enum = svmo, false;
-    "SVS1": Enum = svs1, false;
-    "SVS2": Enum = svs2, false;
-    "SVCR": Double = svcr, false;
-    "TONL": ULong = tonl, true;
-    "CRNT": Double = crnt, true;
-    "VOLT": Double = volt, true;
-    "FLGS": ULong = flgs, true;
-    "SPFG": ULong = spfg, true;
-    "BKIN": Enum = bkin, true;
-    "IVAL": Double = ival, true;
-    "ILVA": Double = ilva, true;
-    "IMOD": Enum = imod, true;
-    "IBAK": Enum = ibak, true;
-    "ICOL": Double = icol, true;
-    "IACW": Double = iacw, true;
-    "IACI": Double = iaci, true;
-    "IPTY": Enum = ipty, true;
-    "IBKN": Enum = ibkn, true;
-    "IB3": Enum = ib3, true;
-    "IT3": Double = it3, true;
-    "ITON": ULong = iton, true;
-    "ICRN": Double = icrn, true;
-    "IVOL": Double = ivol, true;
-    "CYCL": Long = cycl, false;
-    "ERR": Short = err, true;
-    "IERR": Short = ierr, true;
+    get_scalar, put_scalar, DigitelRecord;
+    "TYPE": Enum = tipe;
+    "VAL": Double = val;
+    "LVAL": Double = lval;
+    "HIHI": Double = hihi;
+    "LOLO": Double = lolo;
+    "HIGH": Double = high;
+    "LOW": Double = low;
+    "HHSV": Enum = hhsv;
+    "LLSV": Enum = llsv;
+    "HSV": Enum = hsv;
+    "LSV": Enum = lsv;
+    "HYST": Double = hyst;
+    "LALM": Double = lalm;
+    "DSPL": Enum = dspl;
+    "KLCK": Enum = klck;
+    "MODS": Enum = mods;
+    "MODR": Enum = modr;
+    "BAKS": Enum = baks;
+    "BAKR": Enum = bakr;
+    "COOL": Double = cool;
+    "CMOR": Enum = cmor;
+    "ACCW": Double = accw;
+    "ACCI": Double = acci;
+    "PTYP": Enum = ptyp;
+    "S3BS": Enum = s3bs;
+    "S3BR": Enum = s3br;
+    "S3TS": Double = s3ts;
+    "S3TR": Double = s3tr;
+    "HOPR": Float = hopr;
+    "LOPR": Float = lopr;
+    "HCTR": Float = hctr;
+    "LCTR": Float = lctr;
+    "HVTR": Float = hvtr;
+    "LVTR": Float = lvtr;
+    "HLPR": Float = hlpr;
+    "LLPR": Float = llpr;
+    "SIMM": Enum = simm;
+    "SVMO": Enum = svmo;
+    "SVS1": Enum = svs1;
+    "SVS2": Enum = svs2;
+    "SVCR": Double = svcr;
+    "TONL": ULong = tonl;
+    "CRNT": Double = crnt;
+    "VOLT": Double = volt;
+    "FLGS": ULong = flgs;
+    "SPFG": ULong = spfg;
+    "BKIN": Enum = bkin;
+    "IVAL": Double = ival;
+    "ILVA": Double = ilva;
+    "IMOD": Enum = imod;
+    "IBAK": Enum = ibak;
+    "ICOL": Double = icol;
+    "IACW": Double = iacw;
+    "IACI": Double = iaci;
+    "IPTY": Enum = ipty;
+    "IBKN": Enum = ibkn;
+    "IB3": Enum = ib3;
+    "IT3": Double = it3;
+    "ITON": ULong = iton;
+    "ICRN": Double = icrn;
+    "IVOL": Double = ivol;
+    "CYCL": Long = cycl;
+    "ERR": Short = err;
+    "IERR": Short = ierr;
 }
 
 /// Indexed setpoint-group fields. Tag identifies the array; the returned index
@@ -358,144 +335,6 @@ fn indexed(name: &str) -> Option<(&'static str, usize)> {
     };
     let n = (*digit as char).to_digit(10)? as usize;
     (1..=4).contains(&n).then_some((tag, n - 1))
-}
-
-/// `(name, dbf_type, read_only)` for the indexed fields, in a fixed order so
-/// `field_list` is stable.
-static INDEXED_FIELDS: &[FieldDesc] = &{
-    const fn f(name: &'static str, dbf_type: DbFieldType, ro: bool) -> FieldDesc {
-        FieldDesc::new(name, dbf_type, ro)
-    }
-    use DbFieldType::{Double, Enum};
-    [
-        f("SP1S", Double, false),
-        f("SP2S", Double, false),
-        f("SP3S", Double, false),
-        f("SP4S", Double, false),
-        f("SP1R", Double, true),
-        f("SP2R", Double, true),
-        f("SP3R", Double, true),
-        f("SP4R", Double, true),
-        f("S1HS", Double, false),
-        f("S2HS", Double, false),
-        f("S3HS", Double, false),
-        f("S4HS", Double, false),
-        f("S1HR", Double, true),
-        f("S2HR", Double, true),
-        f("S3HR", Double, true),
-        f("S4HR", Double, true),
-        f("S1MS", Enum, false),
-        f("S2MS", Enum, false),
-        f("S3MS", Enum, false),
-        f("S4MS", Enum, false),
-        f("S1MR", Enum, true),
-        f("S2MR", Enum, true),
-        f("S3MR", Enum, true),
-        f("S4MR", Enum, true),
-        f("S1VS", Enum, false),
-        f("S2VS", Enum, false),
-        f("S3VS", Enum, false),
-        f("S4VS", Enum, false),
-        f("S1VR", Enum, true),
-        f("S2VR", Enum, true),
-        f("S3VR", Enum, true),
-        f("S4VR", Enum, true),
-        f("SET1", Enum, true),
-        f("SET2", Enum, true),
-        f("SET3", Enum, true),
-        f("SET4", Enum, true),
-        f("ISP1", Enum, true),
-        f("ISP2", Enum, true),
-        f("ISP3", Enum, true),
-        f("ISP4", Enum, true),
-        f("IS1", Double, true),
-        f("IS2", Double, true),
-        f("IS3", Double, true),
-        f("IS4", Double, true),
-        f("IH1", Double, true),
-        f("IH2", Double, true),
-        f("IH3", Double, true),
-        f("IH4", Double, true),
-        f("IM1", Enum, true),
-        f("IM2", Enum, true),
-        f("IM3", Enum, true),
-        f("IM4", Enum, true),
-        f("II1", Enum, true),
-        f("II2", Enum, true),
-        f("II3", Enum, true),
-        f("II4", Enum, true),
-    ]
-};
-
-/// DBF_STRING readbacks and the simulation link fields.
-static STRING_FIELDS: &[FieldDesc] = &{
-    const fn f(name: &'static str, ro: bool) -> FieldDesc {
-        FieldDesc::new(name, DbFieldType::String, ro)
-    }
-    [
-        f("MODL", true),
-        f("VERS", true),
-        f("SIML", true),
-        f("SLMO", true),
-        f("SLS1", true),
-        f("SLS2", true),
-        f("SLCR", true),
-    ]
-};
-
-static ALL_FIELDS: std::sync::LazyLock<Vec<FieldDesc>> = std::sync::LazyLock::new(|| {
-    // `field(INP,DBF_INLINK) special(SPC_NOMOD)` in `digitelRecord.dbd`.
-    let inp = FieldDesc {
-        declared_dbf: DbfCode::Inlink,
-        ..FieldDesc::new("INP", DbFieldType::String, true)
-    };
-    // Each menu field declares `DBF_MENU` and carries its choices, as the
-    // `.dbd` does. The loader's refusal gate resolves menu names by identity
-    // against base's generated tables, so an external menu never resolves
-    // there — but its numeric arms do not decide `DBF_MENU` either, so the
-    // label reaches the apply path, which reads `menu_field_choices`.
-    SCALAR_FIELDS
-        .iter()
-        .chain(INDEXED_FIELDS.iter())
-        .chain(STRING_FIELDS.iter())
-        .cloned()
-        .chain(std::iter::once(inp))
-        .map(|mut f| {
-            f.menu = menu_of(f.name);
-            if f.menu.is_some() {
-                f.declared_dbf = DbfCode::Menu;
-            }
-            f
-        })
-        .collect()
-});
-
-/// The `.dbd` menu of each menu field — the single owner both
-/// `Record::menu_field_choices` and the declared descriptors read.
-fn menu_of(field: &str) -> Option<&'static [&'static str]> {
-    match field {
-        "TYPE" => Some(TYPE_CHOICES),
-        "HHSV" | "LLSV" | "HSV" | "LSV" => Some(ALARM_SEVR),
-        "DSPL" => Some(DSPL_CHOICES),
-        "KLCK" => Some(KLCK_CHOICES),
-        "MODS" | "SVMO" | "IMOD" => Some(MODS_CHOICES),
-        "MODR" => Some(MODR_CHOICES),
-        "BAKS" | "BAKR" | "IBAK" => Some(BAKS_CHOICES),
-        "CMOR" => Some(CMOR_CHOICES),
-        "PTYP" | "IPTY" => Some(PTYP_CHOICES),
-        "BKIN" | "IBKN" => Some(BKIN_CHOICES),
-        "SIMM" => Some(YESNO_CHOICES),
-        "SET1" | "SET2" | "SET3" | "SET4" | "ISP1" | "ISP2" | "ISP3" | "ISP4" | "SVS1" | "SVS2" => {
-            Some(SET1_CHOICES)
-        }
-        "S3BS" | "S3BR" | "IB3" => Some(S3BS_CHOICES),
-        _ => match indexed(field) {
-            Some(("SnMS" | "SnMR" | "IMn", _)) => Some(S1MS_CHOICES),
-            Some(("SnVS" | "SnVR" | "IIn", _)) => Some(S1VS_CHOICES),
-            Some(("SETn" | "ISPn", _)) => Some(SET1_CHOICES),
-            _ => None,
-        },
-    }
 }
 
 impl DigitelRecord {
@@ -709,13 +548,7 @@ impl Record for DigitelRecord {
     }
 
     fn declared_fields(&self) -> &'static [FieldDesc] {
-        let fields: &Vec<FieldDesc> = &ALL_FIELDS;
-        // `ALL_FIELDS` is a `LazyLock` that lives for the whole program.
-        unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
-    }
-
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        menu_of(field)
+        DIGITEL_FIELDS
     }
 
     /// `pp(TRUE)` in `digitelRecord.dbd`.
@@ -730,7 +563,7 @@ impl Record for DigitelRecord {
     /// C `digitelRecord.c::special` — record which `SPC_MOD` field changed, and
     /// clamp the setpoint / hysteresis fields. `TYPE` carries `SPC_MOD` but the
     /// C `special()` has no arm for it, so it is a no-op here too.
-    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+    fn special(&mut self, field: &str, after: bool, _common: &CommonFields) -> CaResult<()> {
         if !after {
             return Ok(());
         }
@@ -819,18 +652,22 @@ impl Record for DigitelRecord {
     /// C posts every readback with the cycle's alarm mask when the alarm
     /// transitioned, even if the value did not change (`monitor()`'s
     /// `|| alrm_chg_flg` clauses).
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &[
-            "VAL", "LVAL", "MODR", "BAKR", "COOL", "BKIN", "SET1", "SET2", "SET3", "SET4", "ACCW",
-            "ACCI", "PTYP", "SP1R", "S1HR", "S1MR", "S1VR", "SP2R", "S2HR", "S2MR", "S2VR", "SP3R",
-            "S3HR", "S3MR", "S3VR", "S3BR", "S3TR", "SP4R", "S4HR", "S4MR", "S4VR", "TONL", "CRNT",
-            "VOLT", "ERR",
-        ]
+    fn alarm_cycle_monitored_fields(&self) -> DeclaredFields {
+        static MONITORED: [FieldIx; 35] = declared_set(
+            DIGITEL_FIELDS,
+            [
+                "VAL", "LVAL", "MODR", "BAKR", "COOL", "BKIN", "SET1", "SET2", "SET3", "SET4",
+                "ACCW", "ACCI", "PTYP", "SP1R", "S1HR", "S1MR", "S1VR", "SP2R", "S2HR", "S2MR",
+                "S2VR", "SP3R", "S3HR", "S3MR", "S3VR", "S3BR", "S3TR", "SP4R", "S4HR", "S4MR",
+                "S4VR", "TONL", "CRNT", "VOLT", "ERR",
+            ],
+        );
+        &MONITORED
     }
 
     fn check_alarms(&mut self, common: &mut CommonFields) {
-        if self.read_alarm {
-            set_sevr(common, alarm_status::READ_ALARM, AlarmSeverity::Invalid);
+        if let Some(stat) = self.dev_alarm {
+            set_sevr(common, stat, AlarmSeverity::Invalid);
         }
         if common.udf != 0 {
             return;
@@ -864,21 +701,22 @@ impl Record for DigitelRecord {
                 "CRNT" => Some((self.hctr as f64, self.lctr as f64)),
                 "LVAL" => Some((self.hlpr as f64, self.llpr as f64)),
                 "VOLT" => Some((self.hvtr as f64, self.lvtr as f64)),
-                _ => None,
+                _ => rec_gbl_range(DIGITEL_FIELDS, field),
             }
         };
 
+        // VAL is not listed: C hands it to `recGblGetControlDouble`.
         let ctrl_limits = if matches!(indexed(field), Some(("SnHS", _))) {
             Some((DIGITEL_MAXHY, DIGITEL_MINHY))
         } else if matches!(indexed(field), Some(("SPnS", _))) {
             Some((DIGITEL_MAXSP, DIGITEL_MINSP))
         } else {
-            None
+            rec_gbl_range(DIGITEL_FIELDS, field)
         };
 
         let alarm_limits = match field {
             "VAL" => Some((self.hihi, self.high, self.low, self.lolo)),
-            _ => None,
+            _ => rec_gbl_alarm(DIGITEL_FIELDS, field),
         };
 
         Some(FieldMetadataOverride {
@@ -900,10 +738,9 @@ mod tests {
     use super::*;
 
     fn common() -> CommonFields {
-        CommonFields {
-            udf: 0,
-            ..CommonFields::default()
-        }
+        let mut common = CommonFields::default();
+        common.udf = 0;
+        common
     }
 
     #[test]
@@ -941,17 +778,17 @@ mod tests {
     #[test]
     fn special_sets_the_flag_bits() {
         let mut r = DigitelRecord::default();
-        r.special("DSPL", true).unwrap();
+        r.special("DSPL", true, &CommonFields::default()).unwrap();
         assert_eq!(r.flgs, MOD_DSPL);
 
         let mut r = DigitelRecord::default();
-        r.special("S2MS", true).unwrap();
+        r.special("S2MS", true, &CommonFields::default()).unwrap();
         assert_eq!(r.spfg, MOD_SNMS[1]);
         assert_eq!(r.flgs, MOD_SETP);
 
         // The "before" callback latches nothing.
         let mut r = DigitelRecord::default();
-        r.special("DSPL", false).unwrap();
+        r.special("DSPL", false, &CommonFields::default()).unwrap();
         assert_eq!(r.flgs, 0);
     }
 
@@ -959,13 +796,13 @@ mod tests {
     fn special_clamps_setpoints_to_the_1e_minus_3_ceiling() {
         let mut r = DigitelRecord::default();
         r.sps[0] = 1.0; // way above the ceiling
-        r.special("SP1S", true).unwrap();
+        r.special("SP1S", true, &CommonFields::default()).unwrap();
         assert_eq!(r.sps[0], DIGITEL_MAXSP);
         assert_eq!(r.spfg, MOD_SPNS[0]);
         assert_eq!(r.flgs, MOD_SETP);
 
         r.shs[2] = -1.0; // below the floor
-        r.special("S3HS", true).unwrap();
+        r.special("S3HS", true, &CommonFields::default()).unwrap();
         assert_eq!(r.shs[2], DIGITEL_MINHY);
         assert!(r.spfg & MOD_SNHS[2] != 0);
     }
@@ -973,7 +810,7 @@ mod tests {
     #[test]
     fn type_special_is_a_no_op() {
         let mut r = DigitelRecord::default();
-        r.special("TYPE", true).unwrap();
+        r.special("TYPE", true, &CommonFields::default()).unwrap();
         assert_eq!(r.flgs, 0);
         assert_eq!(r.spfg, 0);
     }
@@ -1057,7 +894,7 @@ mod tests {
     fn a_read_alarm_is_invalid_and_survives_the_limit_chain() {
         let mut r = DigitelRecord {
             dev_ran: true,
-            read_alarm: true,
+            dev_alarm: Some(alarm_status::READ_ALARM),
             hhsv: 1, // MINOR limit cannot outrank INVALID
             hihi: 1e-6,
             val: 1e-5,
@@ -1111,9 +948,17 @@ mod tests {
             r.field_metadata_override("VAL").unwrap().alarm_limits,
             Some((1e-6, 1e-7, 2e-12, 1e-12))
         );
+        // Unlisted: `recGblGetAlarmDouble`'s four NaN.
+        let (a, b, c, d) = r
+            .field_metadata_override("CRNT")
+            .unwrap()
+            .alarm_limits
+            .unwrap();
+        assert!([a, b, c, d].iter().all(|v| v.is_nan()));
+        // VAL's control limits are `recGblGetControlDouble`'s DBF_DOUBLE range.
         assert_eq!(
-            r.field_metadata_override("CRNT").unwrap().alarm_limits,
-            None
+            r.field_metadata_override("VAL").unwrap().ctrl_limits,
+            Some((1e300, -1e300))
         );
     }
 

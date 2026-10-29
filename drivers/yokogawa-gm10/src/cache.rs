@@ -4,7 +4,7 @@
 //! "not really needed, just run everything, no async here").
 
 pub const MAX_MODULES: usize = 10;
-pub const MAX_SIGNAL: usize = 999;
+pub const MAX_MEAS_CHAN: usize = 1000;
 pub const MAX_MATH: usize = 200;
 pub const MAX_COMM: usize = 500;
 pub const MAX_CONST: usize = 100;
@@ -37,7 +37,7 @@ pub enum ModuleType {
 
 #[derive(Debug, Clone, Default)]
 pub struct Module {
-    pub module_string: String,
+    pub module_string: Vec<u8>,
     pub use_flag: bool,
     pub mod_type: ModuleType,
     /// [input channel count, output channel count] (`channel_number[2]`).
@@ -60,25 +60,28 @@ pub struct ChannelInfo {
     /// depends on the channel's `ModuleType`; `16` is the shared "unknown"
     /// sentinel both C enums use.
     pub ch_mode: i32,
-    pub unit: String,
+    pub unit: Vec<u8>,
     /// 0-6, indexes `scaled_value`'s `scaler` table.
     pub scale: u8,
 }
 
+/// Discriminants are C's `VL_*` values (`drvGM10.c:55-57`); `VAL_STATUS`
+/// writes them to RVAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum DataStatus {
     #[default]
-    Normal,
-    Skip,
-    PosOverrange,
-    NegOverrange,
-    PosBurnout,
-    NegBurnout,
-    AdError,
-    InvalidData,
-    MathNan,
-    CommError,
-    Unknown,
+    Normal = 0,
+    Skip = 1,
+    PosOverrange = 2,
+    NegOverrange = 3,
+    PosBurnout = 4,
+    NegBurnout = 5,
+    AdError = 6,
+    InvalidData = 7,
+    MathNan = 16,
+    CommError = 17,
+    Unknown = 32,
 }
 
 impl DataStatus {
@@ -117,14 +120,14 @@ pub fn scaled_value(value: i32, scale: u8) -> f64 {
 #[derive(Debug, Clone, Default)]
 pub struct ExprInfo {
     pub on_flag: bool,
-    pub expr: String,
+    pub expr: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ErrorState {
     pub code: i32,
     pub parameter: i32,
-    pub strings: [String; 3],
+    pub strings: [Vec<u8>; 3],
 }
 
 pub struct Cache {
@@ -139,8 +142,9 @@ pub struct Cache {
     pub comm_info: Vec<ChannelInfo>,
     pub comm_data: Vec<ChannelData>,
 
-    pub constant: Vec<f64>,
-    pub varconstant: Vec<f64>,
+    /// `float` in C (`drvGM10.c:244-245`).
+    pub constant: Vec<f32>,
+    pub varconstant: Vec<f32>,
 
     pub modules: Vec<Module>,
 
@@ -156,9 +160,9 @@ pub struct Cache {
 impl Default for Cache {
     fn default() -> Self {
         Self {
-            meas_type: vec![ChannelType::default(); MAX_SIGNAL],
-            meas_info: vec![ChannelInfo::default(); MAX_SIGNAL],
-            meas_data: vec![ChannelData::default(); MAX_SIGNAL],
+            meas_type: vec![ChannelType::default(); MAX_MEAS_CHAN],
+            meas_info: vec![ChannelInfo::default(); MAX_MEAS_CHAN],
+            meas_data: vec![ChannelData::default(); MAX_MEAS_CHAN],
             calc_info: vec![ChannelInfo::default(); MAX_MATH],
             calc_data: vec![ChannelData::default(); MAX_MATH],
             calc_expr: vec![ExprInfo::default(); MAX_MATH],
@@ -194,5 +198,12 @@ mod tests {
         assert_eq!(DataStatus::from_wire(0x20 | 6), DataStatus::AdError);
         assert_eq!(DataStatus::from_wire(9), DataStatus::Unknown);
         assert_eq!(DataStatus::from_wire(16), DataStatus::MathNan);
+    }
+
+    #[test]
+    fn data_status_discriminants_are_c_vl_values() {
+        for (wire, rval) in [(0, 0), (7, 7), (16, 16), (17, 17), (9, 32)] {
+            assert_eq!(DataStatus::from_wire(wire) as u32, rval);
+        }
     }
 }

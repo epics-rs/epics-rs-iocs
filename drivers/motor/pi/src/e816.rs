@@ -50,18 +50,22 @@
 //!   wire command.
 //!
 //! ## Framing & not-modeled deviations
-//! Same as the E-516 port: port-owned EOS (`"\n"` both ways, set in `st.cmd`),
+//! Same as the E-516 port: port-owned EOS (`"\n"` both ways, set at Config),
 //! the redundant `EOL`+output-EOS trailing empty command on moves collapsed to
-//! a single terminator, and `recv_mess(FLUSH)` / `no_motion_count` / `report()`
-//! not modeled. See [`crate::e516`] for the full rationale.
+//! a single terminator, and `recv_mess(FLUSH)` / `no_motion_count` not
+//! modeled. See [`crate::e516`] for the full rationale.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
+use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, nint};
 
 use crate::scan_int;
@@ -104,17 +108,17 @@ struct AxisReading {
 /// `VEL {label}{value}` fragment. The caller supplies the already-scaled value
 /// (`SET_VELOCITY` scales by `res`, `JOG` does not).
 fn vel_cmd(label: &str, value: f64) -> String {
-    format!("VEL {label}{value:.*}", MAX_DIGITS)
+    format!("VEL {label}{:.*}", MAX_DIGITS, CFloat(value))
 }
 
 /// `MOV {label}{p·res}` absolute-move fragment.
 fn mov_cmd(label: &str, position: f64) -> String {
-    format!("MOV {label}{:.*}", MAX_DIGITS, position * POS_RES)
+    format!("MOV {label}{:.*}", MAX_DIGITS, CFloat(position * POS_RES))
 }
 
 /// `MVR {label}{d·res}` relative-move fragment.
 fn mvr_cmd(label: &str, distance: f64) -> String {
-    format!("MVR {label}{:.*}", MAX_DIGITS, distance * POS_RES)
+    format!("MVR {label}{:.*}", MAX_DIGITS, CFloat(distance * POS_RES))
 }
 
 /// Fold one raw reading into a [`MotorStatus`] (C `set_status` tail); identical
@@ -133,11 +137,9 @@ fn fold_reading(
     }
     let position = reading.position as f64;
     MotorStatus {
-        position,
-        encoder_position: position,
-        velocity: 0.0,
         done,
-        moving: !done,
+        moving: false,
+        msta_moving: false,
         high_limit: done && reading.overflow,
         low_limit: false,
         home: done,
@@ -146,11 +148,16 @@ fn fold_reading(
         problem: false,
         direction,
         slip_stall: false,
+        slip: false,
         comms_error: false,
         homed: false,
         gain_support: true,
         has_encoder: true,
         vbas_supported: false,
+        ..MotorStatus::default()
+            .with_position(position)
+            .with_encoder_position(position)
+            .with_velocity(0.0)
     }
 }
 
@@ -174,13 +181,11 @@ impl PIE816Controller {
             num_axes: 0,
         };
 
-        ctrl.send("*IDN?")?;
-        ctrl.ident = ctrl.recv();
+        ctrl.ident = ctrl.exchange("*IDN?");
 
         let mut num_axes = 0;
         for label in AXIS_LABELS {
-            ctrl.send(&format!("POS? {label}"))?;
-            if ctrl.recv().is_empty() {
+            if ctrl.exchange(&format!("POS? {label}")).is_empty() {
                 break;
             }
             num_axes += 1;
@@ -202,15 +207,30 @@ impl PIE816Controller {
 
     /// Write a command, no terminator (the port's output EOS adds `"\n"`).
     fn send(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.send_bytes(cmd.as_bytes())
+    }
+
+    /// [`send`](Self::send) for raw bytes; an empty message is not sent.
+    fn send_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        self.handle.write_octet(0, cmd)?;
         Ok(())
+    }
+
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input. C flushes only at `set_status` (drvPIE816.cc:252), so a late reply
+    /// shifts its answers until the next poll: a C defect, not copied.
+    fn exchange(&self, cmd: &str) -> String {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
     }
 
     /// Read one reply (the port's input EOS already stripped the `"\n"`). Any
     /// transport failure or empty read folds into `""`.
-    fn recv(&self) -> String {
-        match self.handle.read_octet(0, READ_BUF) {
-            Ok(raw) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
+    fn reply(read: OctetRead) -> String {
+        match read.into_parts() {
+            (raw, Ok(())) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
             _ => String::new(),
         }
     }
@@ -238,17 +258,13 @@ impl PIE816Controller {
     fn read_axis(&mut self, axis: usize) -> Option<AxisReading> {
         let label = AXIS_LABELS[axis];
 
-        self.send(&format!("ONT? {label}")).ok()?;
-        let ontarget = scan_int(&self.recv())?;
+        let ontarget = scan_int(&self.exchange(&format!("ONT? {label}")))?;
 
-        self.send(&format!("OVF? {label}")).ok()?;
-        let overflow = scan_int(&self.recv())?;
+        let overflow = scan_int(&self.exchange(&format!("OVF? {label}")))?;
 
-        self.send(&format!("SVO? {label}")).ok()?;
-        let servo = scan_int(&self.recv())?;
+        let servo = scan_int(&self.exchange(&format!("SVO? {label}")))?;
 
-        self.send(&format!("POS? {label}")).ok()?;
-        let pos_reply = self.recv();
+        let pos_reply = self.exchange(&format!("POS? {label}"));
         if pos_reply.is_empty() {
             return None;
         }
@@ -263,36 +279,42 @@ impl PIE816Controller {
     }
 }
 
-/// One axis of an E-816 controller. Implements [`AsynMotor`].
+/// One axis of an E-816 controller. Implements [`Model1Motor`].
 pub struct PIE816Axis {
     controller: Arc<Mutex<PIE816Controller>>,
     axis: usize,
     prev_position: i32,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIE816.cc:295), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :301). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
+    strings: MoveStrings,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIE816Axis {
-    /// Construct one axis, seeding the initial status. `prev_position` starts
-    /// at 0.
-    pub fn new(controller: Arc<Mutex<PIE816Controller>>, axis: usize) -> AsynResult<Self> {
+    /// Construct one axis and read its status, as C `motor_init`'s
+    /// `set_status` does (drvPIE816.cc:661). `prev_position` starts at 0.
+    pub fn new(controller: Arc<Mutex<PIE816Controller>>, axis: usize) -> Self {
         let mut me = Self {
-            controller: controller.clone(),
+            controller,
             axis,
             prev_position: 0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
-                done: true,
                 gain_support: true,
                 has_encoder: true,
                 vbas_supported: false,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(reading) = ctrl.poll_axis(axis) {
-            drop(ctrl);
-            me.last_status = fold_reading(&mut me.prev_position, false, &reading);
-        }
-        Ok(me)
+        me.init_status = Some(init_poll(&mut me, &AsynUser::new(0)));
+        me
     }
 
     fn label(&self) -> &'static str {
@@ -302,61 +324,97 @@ impl PIE816Axis {
     fn lock(&self) -> MutexGuard<'_, PIE816Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// A record string with its first `#` replaced by the axis letter, as
+    /// C's `send_mess` addresses a message (drvPIE816.cc:426).
+    fn addressed(&self, text: &[u8]) -> Vec<u8> {
+        let mut text = text.to_vec();
+        if let Some(b) = text.iter_mut().find(|b| **b == b'#') {
+            *b = self.label().as_bytes()[0];
+        }
+        text
+    }
+
+    /// A move's own message: PREM and an `EOL_E816` ahead of its command
+    /// (devPIE816.cc:199-208), whose POST waits for the move to end. C
+    /// addresses only the first `#` of the whole message, so a PREM holding
+    /// one leaves the command's `#` on the wire; not copied.
+    fn move_line(&mut self, command: &str) -> Vec<u8> {
+        let prem = self.strings.arm();
+        let mut line = self.addressed(&prem);
+        if !line.is_empty() {
+            line.push(b'\n');
+        }
+        line.extend_from_slice(command.as_bytes());
+        line
+    }
 }
 
-impl AsynMotor for PIE816Axis {
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        let label = self.label();
-        let ctrl = self.lock();
-        ctrl.send(&vel_cmd(label, velocity * POS_RES))?;
-        ctrl.send(&mov_cmd(label, position))
+impl Model1Motor for PIE816Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        let label = self.label();
-        let ctrl = self.lock();
-        ctrl.send(&vel_cmd(label, velocity * POS_RES))?;
-        ctrl.send(&mvr_cmd(label, distance))
+    /// `update_delay` is 0 (`targs`, drvPIE816.cc:144).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
+    /// SET_VELOCITY: `VEL #` scaled by `POS_RES`. motordrvCom sends each
+    /// message whatever the one before returned (motordrvCom.cc:397-484).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let _ = self.lock().send(&vel_cmd(self.label(), velocity * POS_RES));
+        Ok(())
+    }
+
+    /// A DC-motor leftover: SET_VEL_BASE sends nothing.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// The PIE816 does not support acceleration commands.
+    fn set_accel(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn poll_failure(&self) -> PollFailure {
+        self.failure
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        let line = self.move_line(&mov_cmd(self.label(), position));
+        self.lock().send_bytes(&line)
+    }
+
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        let line = self.move_line(&mvr_cmd(self.label(), distance));
+        self.lock().send_bytes(&line)
+    }
+
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         // JOG: raw velocity, no `res` scaling, signed; no move command follows.
-        let cmd = vel_cmd(self.label(), velocity);
-        self.lock().send(&cmd)
+        let line = self.move_line(&vel_cmd(self.label(), velocity));
+        self.lock().send_bytes(&line)
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    /// JOG_VELOCITY is JOG's `VEL` alone: PREM and POST go with the moves
+    /// (devPIE816.cc:276).
+    fn jog_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.lock()
+            .send_bytes(vel_cmd(self.label(), velocity).as_bytes())
+    }
+
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
+        // C `devPIE816_build_trans` HOME_FOR/HOME_REV → ERROR (no home
+        // command), after the message already took PREM and its EOL,
+        // which C still sends; POST follows the next done poll.
+        let line = self.move_line("");
+        self.lock().send_bytes(&line)?;
         Err(pie816_err("PIE816: homing is not supported"))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C STOP_AXIS → MVR #0 (zero relative move; no stop command).
         let cmd = format!("MVR {}0", self.label());
         self.lock().send(&cmd)
@@ -373,28 +431,181 @@ impl AsynMotor for PIE816Axis {
         self.lock().send(&cmd)
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut ctrl = self.lock();
+    /// `PRIMITIVE`: INIT as its own message, its first `#` addressed
+    /// (devPIE816.cc:191-192).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let line = self.addressed(init);
+        self.lock().send_bytes(&line)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let reading = ctrl.poll_axis(self.axis);
         let comm_err = ctrl.comm_state == CommState::CommErr;
-        drop(ctrl);
 
         let Some(reading) = reading else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pie816_err("no status reply"));
         };
         let last_direction = self.last_status.direction;
         self.last_status = fold_reading(&mut self.prev_position, last_direction, &reading);
-        Ok(self.last_status.clone())
+        // drvPIE816.cc:336-382: POST, unaddressed, once done or stopped by a
+        // limit in the move's direction.
+        let s = &self.last_status;
+        let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+        if (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.send_bytes(&post);
+        }
+        drop(ctrl);
+        *status = self.last_status.clone();
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// C sprintf's `%.*f` and `%+.*f` spell a NaN as glibc does: `nan`,
+    /// `-nan`, `+nan`.
+    #[test]
+    fn floats_go_out_as_c_sprintf() {
+        let nan = f64::NAN;
+        let neg = -f64::NAN;
+        assert_eq!(vel_cmd("A", nan), "VEL Anan");
+        assert_eq!(mov_cmd("A", neg), "MOV A-nan");
+        assert_eq!(mvr_cmd("A", nan), "MVR Anan");
+    }
+
+    const QUERIES: [&str; 4] = ["ONT? A", "OVF? A", "SVO? A", "POS? A"];
+
+    /// Axis A of a one-axis E-816 on a [`LineRig`] whose `ONT? A` reply
+    /// follows `ont`.
+    fn strings_rig(name: &str) -> (LineRig, PIE816Axis, Arc<AtomicU8>) {
+        refusing_rig(name, |_| false)
+    }
+
+    /// [`strings_rig`] with each write `refused` picks recorded and refused.
+    fn refusing_rig(name: &str, refused: fn(&str) -> bool) -> (LineRig, PIE816Axis, Arc<AtomicU8>) {
+        let ont = Arc::new(AtomicU8::new(1));
+        let o = ont.clone();
+        let (line, io) = LineRig::failing(
+            name,
+            move |last| match last {
+                "*IDN?" => "E-816".into(),
+                "SVO? A" => "1".into(),
+                "POS? A" => "0.000".into(),
+                "ONT? A" => o.load(Ordering::SeqCst).to_string(),
+                "OVF? A" => "0".into(),
+                _ => String::new(),
+            },
+            refused,
+        );
+        let ctrl = PIE816Controller::new(io).unwrap();
+        let axis = PIE816Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        (line, axis, ont)
+    }
+
+    /// The velocity and the move are each a message of their own, whose
+    /// status C's motor task drops.
+    #[test]
+    fn a_refused_velocity_still_sends_the_move() {
+        let (line, mut axis, _) = refusing_rig("e816Refused", |cmd| cmd.starts_with("VEL A"));
+        let user = AsynUser::default();
+        axis.record_move_absolute(&user, 1.0, 0.0, 2.0, 0.0)
+            .unwrap();
+        axis.record_move_relative(&user, -1.0, 0.0, 2.0, 0.0)
+            .unwrap();
+        let sent: Vec<String> = line.sent().iter().map(|c| c[..3].to_string()).collect();
+        assert_eq!(sent, ["VEL", "MOV", "VEL", "MVR"]);
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PIE816Axis) -> Vec<String> {
+        axis.polled(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| !QUERIES.contains(&l.as_str()))
+            .collect()
+    }
+
+    /// devPIE816.cc:191-192: INIT as its own message, its first `#`
+    /// addressed.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pie816Init");
+        axis.primitive(&AsynUser::default(), b"SVO #1").unwrap();
+        assert_eq!(line.sent(), ["SVO A1"]);
+    }
+
+    /// devPIE816.cc:199-208: PREM and a LF ahead of the move's own command,
+    /// for that move only; the velocity goes ahead as its own message.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pie816Prem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"SVO #1", None).unwrap();
+        axis.record_move_absolute(&user, 1000.0, 0.0, 1000.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["VEL A0.100", "SVO A1\nMOV A0.100"]);
+        axis.record_move_relative(&user, 1000.0, 0.0, 1000.0, 0.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["VEL A0.100", "MVR A0.100"]);
+        axis.set_move_strings(&user, b"SVO #1", None).unwrap();
+        axis.record_jog(&user, 0.0, -2.0, 0.0).unwrap();
+        assert_eq!(line.sent(), ["SVO A1\nVEL A-2.000"]);
+        axis.set_move_strings(&user, b"SVO #1", None).unwrap();
+        // HOME builds no command, but its PREM keeps the EOL, after the
+        // record's SET_VELOCITY.
+        assert!(axis.record_home(&user, 0.0, 1.0, 0.0, true).is_err());
+        assert_eq!(line.sent(), ["VEL A0.000", "SVO A1\n"]);
+    }
+
+    /// drvPIE816.cc:375-382: POST, unaddressed, once the move is done, not
+    /// while it runs, and only once.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, ont) = strings_rig("pie816Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"SVO #0")))
+            .unwrap();
+        axis.record_move_absolute(&user, 1000.0, 0.0, 1000.0, 0.0)
+            .unwrap();
+        line.sent();
+        ont.store(0, Ordering::SeqCst);
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        ont.store(1, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["SVO #0"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
 
     #[test]
     fn move_commands_use_finer_res_than_e516() {
@@ -474,5 +685,70 @@ mod tests {
         );
         assert!(!kept.direction);
         assert_eq!(prev, 7);
+    }
+
+    /// drvPIE816.cc:286-307: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("e816Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "*IDN?" => "E-816".into(),
+                "SVO? A" => "1".into(),
+                "POS? A" => "0.000".into(),
+                "ONT? A" => "1".into(),
+                "OVF? A" => "0".into(),
+                _ => String::new(),
+            }
+        });
+        let ctrl = PIE816Controller::new(io).unwrap();
+        let mut axis = PIE816Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.polled(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIE816.cc:286-306 exit stores what motor_init prepared (:648-657,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once past
+    /// RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("e816InitFail", |last| match last {
+            "*IDN?" => "E-816".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(PIE816Controller::new(io).unwrap()));
+        let mut first = PIE816Axis::new(ctrl.clone(), 0);
+        let mut second = PIE816Axis::new(ctrl, 1);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }

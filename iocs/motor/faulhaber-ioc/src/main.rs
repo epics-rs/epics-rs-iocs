@@ -10,7 +10,6 @@
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_common::MotorHolder;
 use motor_faulhaber::ioc::{mcdc2805_config_command, mcdc2805_setup_command};
 
 #[epics_rs::base::epics_main]
@@ -19,31 +18,39 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: faulhaber-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: faulhaber-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("FAULHABER_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("FAULHABER_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let mut app = IocApplication::new();
 
     // Motor record type.
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
+    // motorSupport.dbd's asynMotorControllerRegister.
+    for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
+        app = app.register_startup_command(cmd);
+    }
+    // motorUtilRegister: motorUtilInit, printChIDlist, listMovingMotors.
+    for cmd in epics_rs::motor::motor_util::motor_util_commands() {
+        app = app.register_startup_command(cmd);
+    }
 
-    // Standard asyn iocsh commands — provides `drvAsynSerialPortConfigure`.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
+    // asyn.dbd, as C's IOC links it: the asyn record, devEpics and the
+    // iocsh commands (`drvAsynSerialPortConfigure`).
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, asyn_factory);
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // MCDC2805 iocsh commands + motor device support.
-    let holder = MotorHolder::new();
     app = app.register_startup_command(mcdc2805_setup_command());
-    app = app.register_startup_command(mcdc2805_config_command(&holder));
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(mcdc2805_config_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
-    app.startup_script(&script)
-        .register_link_set_installer(epics_rs::ca::calink::calink_link_set_install)
-        .register_link_set_installer(epics_rs::bridge::qsrv::pvalink_link_set_install)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

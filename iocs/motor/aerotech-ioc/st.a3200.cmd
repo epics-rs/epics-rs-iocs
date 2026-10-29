@@ -5,14 +5,13 @@
 #   cargo run -p aerotech-ioc -- st.a3200.cmd
 #
 # Requires an Aerotech A3200 controller reachable over TCP (or swap in the
-# serial port line below). Axes are addressed by name string; A3200AsynConfig
-# discovers the name of each axis 0..numAxes and installs it at
-# DTYP A3200_{card}_{axisName}.
+# serial port line below). A3200AsynConfig discovers the name of each axis
+# 0..numAxes; records address axis n as @asyn($(CTRL),n).
 #============================================================
 
 epicsEnvSet("P",      "a3200:")
-epicsEnvSet("CARD",   "0")
-epicsEnvSet("IPPORT", "a3200Asyn")
+epicsEnvSet("CTRL",   "L1")
+epicsEnvSet("IPPORT", "L0")
 epicsEnvSet("HOST",   "192.168.1.50:8000")
 
 # ---- asyn octet port ----
@@ -20,22 +19,28 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "115200")
 
-# A3200 framing: replies end with "\n"; the driver owns the "\n" output
-# terminator, so only the input EOS is set here. Do NOT set an output EOS.
-asynOctetSetInputEos("$(IPPORT)", 0, "\n")
-
 # ---- A3200 controller ----
-# A3200AsynConfig(card, asynPort, numAxes, [taskNumber], [linear], [movingPollMs],
-#                 [idlePollMs], [timeoutMs]). Discovers axis names 0..numAxes and
-#                 attaches each; DTYP is A3200_{card}_{axisName}.
-A3200AsynConfig("$(CARD)", "$(IPPORT)", 1, 1, 1, 100, 1000, 2000)
+A3200AsynSetup(1)
 
-# One motor record per axis. AXISNAME is the controller's axis name (X here).
-dbLoadRecords("$(AEROTECH_IOC)/db/a3200.template", "P=$(P),M=m1,CTRL=$(CARD),AXISNAME=X")
+# A3200AsynConfig(card, portName, asynAddress, numAxes, movingPollPeriod,
+#                 idlePollPeriod, taskNumber, linear), periods in ms. C's
+# a3.asyn.st.cmd.linux-x86 still passes the 2014 order (task 1, moving 1000,
+# idle 2500), which the current signature reads as a 1 ms moving poll on
+# task 2500; this line passes what C's means.
+A3200AsynConfig(0, "$(IPPORT)", 0, 2, 1000, 2500, 1, 0)
+drvAsynMotorConfigure("$(CTRL)", "motorA3200", 0, 2)
+
+# The axes' basic_asyn_motor.db and motorUtil's records, as C's
+# a3.asyn.st.cmd.linux-x86 loads them.
+dbLoadTemplate("$(AEROTECH_IOC)/db/a3.asyn.motor.substitutions", "P=$(P),PORT=$(CTRL)")
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
-#   camonitor a3200:m1 a3200:m1.RBV
-#   caput a3200:m1 10
+#   camonitor a3200:X a3200:X.RBV
+#   caput a3200:X 10

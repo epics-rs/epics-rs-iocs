@@ -1,10 +1,9 @@
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumReadContacts.substitutions.
-# `file "$(MODBUS)/db/bi_bit.template"` rewritten to a bare filename resolved
-# relative to this file's own directory (db/) -- dbLoadTemplate does not
-# macro-expand `file` paths.
+# `$(MODBUS)/db/` is `$(SYRINGEPUMP)/db/`: the modbus
+# templates are copied into this directory.
 #
 # These are the bits values for the input registers starting at 0 with function code 2
-file "bi_bit.template" {
+file "$(SYRINGEPUMP)/db/bi_bit.template" {
 pattern
 {     R,        OFFSET,      ZNAM,       ZSV,     ONAM,    OSV,    SCAN}
 {A:Running,          0,   Stopped,  NO_ALARM,  Running,  MINOR, "I/O Intr"}

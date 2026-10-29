@@ -8,17 +8,18 @@ use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
 
-use crate::mcs::{self, McsState};
+use crate::mcs::{self, McsPass, McsState};
 use crate::params::*;
 use crate::scaler::{self, ScalerState};
-use crate::trace::{self, DRIVER, GetStatus};
+use crate::trace::SelfTrace;
 
 /// Shared state between driver and poller.
 pub struct PollerState {
-    /// C `numCounters_`, fixed by the board model at construction.
+    /// C `numCounters_`: 8 on a USB-CTR08, 4 on a USB-CTR04.
     pub num_counters: usize,
     pub scaler: ScalerState,
     pub mcs: McsState,
+    pub trace: SelfTrace,
 }
 
 /// Start the polling thread that reads DIO, counters, scaler, and MCS.
@@ -39,21 +40,12 @@ pub fn start_poller(
 #[derive(Default)]
 struct PollSnapshot {
     digital_input: Option<u64>,
-    // Normal counter polling (scaler/MCS not running)
-    counters: [Option<i64>; MAX_COUNTERS],
-    // Scaler state
-    scaler_done_snapshot: Option<[u64; MAX_COUNTERS]>,
-    // MCS state
-    mcs_running: bool,
-    mcs_current_point: usize,
-    mcs_just_stopped: bool,
-    /// Seconds since the MCS scan started; C readMCS keeps
-    /// mcaElapsedRealTime/LiveTime on every counter address.
-    mcs_elapsed: f64,
+    mcs: Option<McsPass>,
     num_counters: usize,
-    errors: Vec<String>,
 }
 
+/// C `USBCTR::pollerThread`: DIn, then the running scaler or MCS, then every
+/// address's callbacks.
 fn poller_loop(
     handle: PortHandle,
     params: CtrParams,
@@ -62,28 +54,13 @@ fn poller_loop(
 ) {
     let mut prev_digital_input: u64 = 0;
     let mut force_callback = true;
-    let mut cycle_start = Instant::now();
+    let trace = state.lock().unwrap().trace.clone();
+    let mut start = Instant::now();
 
     loop {
-        // C publishes the time from the previous loop top to this one, so
-        // POLL_TIME_MS is the real cycle time, sleep included.
-        let now = Instant::now();
-        publish(
-            &handle,
-            0,
-            vec![ParamSetValue::new(
-                params.poll_time_ms,
-                0,
-                ParamValue::Float64(now.duration_since(cycle_start).as_secs_f64() * 1000.0),
-            )],
-        );
-        cycle_start = now;
-
-        // C readMCS re-reads PresetReal on every poll, so a change mid-scan
-        // takes effect.
-        let preset_real = handle
-            .read_float64_blocking(params.mca_preset_real, 0)
-            .unwrap_or(0.0);
+        // C's POLL_TIME_MS is the period from one pass's start to the next.
+        let poll_time = start.elapsed();
+        start = Instant::now();
 
         // ---- Phase 1: uldaq reads (device lock held) ----
         let snapshot = {
@@ -91,206 +68,153 @@ fn poller_loop(
             if let Ok(dev) = device.lock() {
                 match dev.digital_in(uldaq_sys::AUXPORT) {
                     Ok(data) => snap.digital_input = Some(data),
-                    Err(e) => snap.errors.push(format!(
-                        "{DRIVER}:pollerThread: ERROR calling cbDIn, status={}",
-                        e.code
-                    )),
+                    Err(e) => trace.print(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "USBCTR:pollerThread: ERROR calling cbDIn, status={}\n",
+                            e.code
+                        ),
+                    ),
                 }
 
                 if let Ok(mut st) = state.lock() {
-                    let num_counters = st.num_counters;
-                    snap.num_counters = num_counters;
                     if st.scaler.running {
-                        let read = scaler::read_scaler(&dev, &mut st.scaler, num_counters);
-                        trace::print(
-                            &handle,
-                            None,
-                            TraceMask::FLOW,
-                            format_args!("{}", GetStatus("readScaler", read.position)),
-                        );
-                        snap.errors.extend(read.stop_error);
-                        if let Some(last_index) = read.last_index {
-                            trace::print(
-                                &handle,
-                                None,
-                                TraceMask::FLOW,
-                                format_args!(
-                                    "{DRIVER}::readScaler lastIndex={last_index}, \
-                                     scalerCounts_[0]={}, scalerPresetCounts_[0]={}",
-                                    st.scaler.counts[0] as i32, st.scaler.presets[0]
-                                ),
-                            );
-                        }
-                        if st.scaler.done {
-                            snap.scaler_done_snapshot = Some(st.scaler.counts);
-                        }
+                        let num_counters = st.num_counters;
+                        scaler::read_scaler(&dev, &mut st.scaler, num_counters, &trace);
                     } else if st.mcs.running {
-                        let readout = mcs::read_mcs(&dev, &mut st.mcs, preset_real);
-                        trace::print(
-                            &handle,
-                            None,
-                            TraceMask::FLOW,
-                            format_args!("{}", GetStatus("readMCS", readout.position)),
-                        );
-                        snap.errors.extend(readout.stop_error);
-                        snap.mcs_running = true;
-                        snap.mcs_current_point = readout.current_point;
-                        snap.mcs_just_stopped = readout.finished;
-                        snap.mcs_elapsed = readout.elapsed;
-                    } else {
-                        for counter in 0..num_counters {
-                            match dev.counter_in(counter as i32) {
-                                Ok(value) => snap.counters[counter] = Some(value as i64),
-                                // C does not check ulCIn; reported in the
-                                // form of its DIn line.
-                                Err(e) => snap.errors.push(format!(
-                                    "{DRIVER}:pollerThread: ERROR calling ulCIn, counter={counter}, \
-                                     status={}",
-                                    e.code
-                                )),
-                            }
-                        }
+                        snap.mcs = Some(mcs::read_mcs(&dev, &mut st.mcs, &trace));
+                        snap.num_counters = st.num_counters;
                     }
                 }
             }
             snap
         }; // device lock released here
 
-        // ---- Phase 2: log + write results (no device lock) ----
-        // C prints its DIn failure on every cycle it happens.
-        for msg in &snapshot.errors {
-            trace::print(&handle, None, TraceMask::ERROR, format_args!("{msg}"));
-        }
-        if let Some(msg) = snapshot.errors.last() {
-            let _ = handle.set_params_and_notify_blocking(
-                0,
-                vec![ParamSetValue::new(
-                    params.last_error_message,
-                    0,
-                    ParamValue::Octet(msg.clone().into_bytes()),
-                )],
-            );
-        }
-
+        // ---- Phase 2: set params (no device lock), as setXxxParam does ----
+        let mut updates = vec![ParamSetValue::new(
+            params.poll_time_ms,
+            0,
+            ParamValue::Float64(poll_time.as_secs_f64() * 1000.0),
+        )];
         if let Some(data) = snapshot.digital_input {
-            let changed = data ^ prev_digital_input;
-            if force_callback || changed != 0 {
-                prev_digital_input = data;
-                force_callback = false;
-                let _ = handle.set_params_and_notify_blocking(
-                    0,
-                    vec![ParamSetValue::uint32_digital(
-                        params.digital_input,
-                        0,
-                        data as u32,
-                        0xFFFF_FFFF,
-                        0,
-                    )],
-                );
-            }
-        }
-        if let Some(counts) = snapshot.scaler_done_snapshot {
-            for (i, c) in counts.iter().enumerate() {
-                let addr = i as i32;
-                publish(
-                    &handle,
-                    addr,
-                    vec![ParamSetValue::new(
-                        params.counter_value,
-                        addr,
-                        ParamValue::Int32(*c as i32),
-                    )],
-                );
-            }
-        } else if snapshot.mcs_running {
-            publish(
-                &handle,
-                0,
-                vec![ParamSetValue::new(
-                    params.mcs_current_point,
-                    0,
-                    ParamValue::Int32(snapshot.mcs_current_point as i32),
-                )],
+            push_digital_in(
+                &mut updates,
+                &params,
+                data,
+                &mut prev_digital_input,
+                &mut force_callback,
             );
-            // C readMCS sets the elapsed times on every counter address, so a
-            // per-counter mca record sees them too, and clears MCA_ACQUIRING
-            // on every counter address once the scan has ended.
-            for addr in 0..MAX_MCS_COUNTERS as i32 {
-                let mut updates = vec![
-                    ParamSetValue::new(
-                        params.mca_elapsed_real,
-                        addr,
-                        ParamValue::Float64(snapshot.mcs_elapsed),
-                    ),
-                    ParamSetValue::new(
-                        params.mca_elapsed_live,
-                        addr,
-                        ParamValue::Float64(snapshot.mcs_elapsed),
-                    ),
-                ];
-                if snapshot.mcs_just_stopped && (addr as usize) < snapshot.num_counters {
-                    updates.push(ParamSetValue::new(
-                        params.mca_acquiring,
-                        addr,
-                        ParamValue::Int32(0),
-                    ));
-                }
-                publish(&handle, addr, updates);
-            }
-        } else {
-            for (counter, value) in snapshot.counters.iter().enumerate() {
-                if let Some(v) = value {
-                    let addr = counter as i32;
-                    publish(
-                        &handle,
-                        addr,
-                        vec![ParamSetValue::new(
-                            params.counter_value,
-                            addr,
-                            ParamValue::Int32(*v as i32),
-                        )],
-                    );
-                }
-            }
         }
+        if let Some(pass) = snapshot.mcs {
+            updates.extend(
+                pass.updates(&params, snapshot.num_counters)
+                    .into_iter()
+                    .map(|(reason, addr, value)| ParamSetValue::new(reason, addr, value)),
+            );
+        }
+        let _ = handle.set_params_and_notify_blocking(0, updates);
 
         // Callbacks for all addresses
         for addr in 0..MAX_MCS_COUNTERS as i32 {
             let _ = handle.call_param_callbacks_blocking(addr);
         }
+        if let Ok(st) = state.lock() {
+            st.scaler.done.call_callbacks();
+        }
 
         let poll_ms = handle
             .read_float64_blocking(params.poll_sleep_ms, 0)
             .unwrap_or(50.0);
-        std::thread::sleep(poll_sleep(poll_ms));
+        std::thread::sleep(Duration::from_secs_f64(poll_ms.max(0.0) / 1000.0));
     }
 }
 
-/// Store readbacks and run their callbacks, without going through the
-/// driver's write handlers: a readback is not a command.
-fn publish(handle: &PortHandle, addr: i32, updates: Vec<ParamSetValue>) {
-    let _ = handle.set_params_and_notify_blocking(addr, updates);
-}
-
-/// C `epicsThreadSleep(pollTime/1000.)`: the fraction of a millisecond is
-/// kept, and a negative or non-finite POLL_SLEEP_MS sleeps not at all.
-fn poll_sleep(poll_ms: f64) -> Duration {
-    Duration::try_from_secs_f64(poll_ms / 1000.0).unwrap_or(Duration::ZERO)
+/// C's digital-input set of one poll: on the first poll or a changed bit
+/// (drvUSBCTR.cpp:1517-1523).
+fn push_digital_in(
+    updates: &mut Vec<ParamSetValue>,
+    params: &CtrParams,
+    data: u64,
+    prev: &mut u64,
+    force: &mut bool,
+) {
+    if !*force && data == *prev {
+        return;
+    }
+    // C's set carries no interrupt mask, so its first poll fires whatever
+    // paramVal left in the never-initialised uInt32CallbackMask
+    // (paramVal.cpp:34-46). The first poll forces every bit instead, so each
+    // bit record processes once at boot even when its bit reads 0.
+    let interrupt_mask = if *force { 0xFFFF_FFFF } else { 0 };
+    *prev = data;
+    *force = false;
+    updates.push(ParamSetValue::uint32_digital(
+        params.digital_input,
+        0,
+        data as u32,
+        0xFFFF_FFFF,
+        interrupt_mask,
+    ));
 }
 
 #[cfg(test)]
 mod tests {
+    use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+
     use super::*;
 
     #[test]
-    fn a_fractional_poll_sleep_is_kept() {
-        assert_eq!(poll_sleep(0.5), Duration::from_micros(500));
-        assert_eq!(poll_sleep(50.0), Duration::from_millis(50));
-    }
-
-    #[test]
-    fn an_unusable_poll_sleep_does_not_sleep() {
-        assert_eq!(poll_sleep(-1.0), Duration::ZERO);
-        assert_eq!(poll_sleep(f64::NAN), Duration::ZERO);
+    fn the_first_digital_poll_calls_back_every_bit() {
+        let mut base = PortDriverBase::new(
+            "CTRPOLLDI",
+            MAX_MCS_COUNTERS,
+            PortFlags::default(),
+            InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::INT32
+                | InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET,
+        );
+        let params = CtrParams::create(&mut base).unwrap();
+        let (mut prev, mut force) = (0, true);
+        // Every input low: no bit changed, yet each bit record must process.
+        for (poll, want) in [(0, Some(0xFFFF_FFFF)), (1, None)] {
+            let mut updates = Vec::new();
+            push_digital_in(&mut updates, &params, 0, &mut prev, &mut force);
+            assert_eq!(updates.len(), usize::from(want.is_some()), "poll {poll}");
+            for update in &updates {
+                base.set_param(update).unwrap();
+            }
+            if let Some(mask) = want {
+                assert_eq!(
+                    base.params
+                        .take_uint32_interrupt_mask(params.digital_input, 0)
+                        .unwrap(),
+                    mask
+                );
+            }
+        }
+        // A later change calls back the changed bits only.
+        let mut updates = Vec::new();
+        push_digital_in(&mut updates, &params, 0x5, &mut prev, &mut force);
+        for update in &updates {
+            base.set_param(update).unwrap();
+        }
+        assert_eq!(
+            base.params
+                .take_uint32_interrupt_mask(params.digital_input, 0)
+                .unwrap(),
+            0x5
+        );
     }
 }

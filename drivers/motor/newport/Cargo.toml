@@ -12,10 +12,22 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "motor"] }
+epics-libcom-rs = { workspace = true }
+motor-common = { path = "../common" }
+epics-seq-rs = { workspace = true, features = ["runtime"] }
 # The holder stores poll-loop command senders (tokio mpsc) created by
 # motor-rs's MotorBuilder; only the `sync` channel type is needed here.
 tokio = { version = "1", features = ["sync"] }
-# Blocking FTP client for uploading XPS PVT trajectory files (XPS-C/Q). Default
-# (sync) features only — the iocsh command handler that calls it is synchronous.
-# Pure Rust, so the crate still builds/tests on any host.
-suppaftp = "10"
+# XPS-D trajectory upload over SFTP (C xpsSFTPUpload.cpp's HAVE_LIBSSH2 build).
+ssh2 = { workspace = true, optional = true }
+
+[build-dependencies]
+epics-seq-rs = { workspace = true, features = ["snc"] }
+
+[features]
+# C's HAVE_LIBSSH2, off by default as in CONFIG_SITE; without it an XPS-D
+# upload runs the curl command C's default build runs.
+sftp = ["dep:ssh2"]
+
+[dev-dependencies]
+motor-common = { path = "../common", features = ["testing"] }

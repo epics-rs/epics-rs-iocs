@@ -32,15 +32,15 @@ pub enum ChannelType {
 /// content.
 #[derive(Debug, Clone, Default)]
 pub struct Module {
-    pub set_message: String,
-    pub status_message: String,
-    pub error_message: String,
+    pub set_message: [u8; 13],
+    pub status_message: [u8; 13],
+    pub error_message: Vec<u8>,
     pub use_flag: bool,
-    pub module_string: String,
+    pub module_string: Vec<u8>,
     /// 110/112/114/115/120/125, or 0 if empty (`drvMW100.c:53`).
     pub model: i32,
     /// 3-char code field (`drvMW100.c:627-631`).
-    pub code: String,
+    pub code: Vec<u8>,
     /// 0=Low, 1=Medium, 2=High, -1=unrecognized (`drvMW100.c:633-646`).
     pub speed: i32,
     pub number: i32,
@@ -62,7 +62,7 @@ pub struct ChannelInfo {
     /// Relay (`CH_MODE_RELAY_*`, 0-6) or DAC (`CH_MODE_DAC_*`, 0-3) mode,
     /// meaning depends on the channel's `ChannelType` (`drvMW100.c:67-71`).
     pub ch_mode: i32,
-    pub unit: String,
+    pub unit: Vec<u8>,
     /// 0-4, indexes `scaled_value`'s `scaler` table.
     pub scale: u8,
 }
@@ -137,7 +137,7 @@ pub struct ExprInfo {
     /// buffer, channels 61-300) — see [`crate::codec`] module docs for why
     /// that split is a genuine upstream buffer-overflow defect this port
     /// structurally eliminates rather than reproduces.
-    pub expr: String,
+    pub expr: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -160,8 +160,9 @@ pub struct Cache {
     pub calc_data: Vec<ChannelData>,
     pub calc_expr: Vec<ExprInfo>,
 
-    pub comm_input: Vec<f64>,
-    pub constant: Vec<f64>,
+    /// `float` in C (`drvMW100.c:436-437`).
+    pub comm_input: Vec<f32>,
+    pub constant: Vec<f32>,
 
     pub modules: Vec<Module>,
 

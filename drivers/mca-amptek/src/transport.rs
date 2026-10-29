@@ -2,15 +2,14 @@
 //! `CDppSocket`'s send/receive primitives (`DppSocket.cpp`) and the
 //! connect sequences `CConsoleHelper::DppSocket_Connect_Direct_DPP`/
 //! `DppSocket_Connect_Default_DPP` drive (`ConsoleHelper.cpp:300-374`).
-//! `DppLibUsb`/USB and `DppInterfaceSerial` are out of scope -- see the
-//! crate-level feasibility note in `lib.rs`.
+//! USB is [`crate::usb`].
 //!
 //! # Restructuring vs. C
 //! C's `CDppSocket::UDPRecvFrom` sets the socket non-blocking, attempts a
 //! `recvfrom`, and on failure sleeps for `timeout` (`CDppSocket::SetTimeOut`,
 //! 10 ms for Ethernet -- `drvAmptek.cpp:49,303`) before trying exactly
 //! once more. A single blocking `recv_from` with `set_read_timeout` set
-//! to that same duration is behaviorally equivalent for every caller
+//! to that same duration is behaviorally equivalent for every `UDPRecvFrom` caller
 //! here (all of which only care "did a response arrive within the
 //! timeout budget, yes or no") without reproducing the
 //! non-blocking-poll-then-sleep-then-retry-once dance. [`READ_TIMEOUT`]
@@ -28,6 +27,9 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::Duration;
+
+use epics_rs::base::net::iface_v4;
+use epics_rs::ca::hostname::ip_addr_to_a;
 
 use crate::net_finder;
 
@@ -54,9 +56,7 @@ const MAX_RESPONSE_SIZE: usize = 24648;
 /// `SendPacketInet`'s call site, `DppSocket.cpp:470`).
 const RECV_CHUNK_SIZE: usize = 1024;
 
-/// `doNetFinderBroadcast`'s per-interface receive cap (`MAX_ENTRIES=10`,
-/// `NetFinder.h`) -- reused here as the scoped-down single-broadcast poll
-/// count. See the module doc and [`AmptekUdpTransport::discover_broadcast`].
+/// `doNetFinderBroadcast`'s receive budget (`MAX_ENTRIES=10`, `NetFinder.h`).
 const MAX_ENTRIES: usize = 10;
 
 /// `SendPacketInet`'s iteration cap ("there can be up to 48 packets",
@@ -94,142 +94,229 @@ fn is_no_response(kind: io::ErrorKind) -> bool {
     )
 }
 
+/// `osiSockDiscoverBroadcastAddresses` with a wildcard match address, as
+/// the `CDppSocket` ctor calls it (`DppSocket.cpp:25-27`): one entry per
+/// eligible interface, not deduplicated, at the NetFinder port.
+fn interface_broadcast_list() -> Vec<SocketAddrV4> {
+    iface_v4::enumerate()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|iface| iface.search_destination())
+        .map(|ip| SocketAddrV4::new(ip, NETFINDER_BROADCAST_PORT))
+        .collect()
+}
+
+/// `ipAddrToA` of a broadcast list node, whose port is still 0
+/// (`DppSocket.cpp:34,148`).
+fn ip_addr_to_a_port0(ip: Ipv4Addr) -> String {
+    let addr = SocketAddr::V4(SocketAddrV4::new(ip, 0));
+    String::from_utf8_lossy(&ip_addr_to_a(addr)).into_owned()
+}
+
+/// A send and one `UDPRecvFrom` on C's invalid descriptor: the failed send
+/// is followed by the 50 ms settle, and the failed `recvfrom` by the
+/// timeout sleep before its failed retry (`DppSocket.cpp:186-200`).
+fn no_socket_exchange() {
+    std::thread::sleep(Duration::from_millis(50) + READ_TIMEOUT);
+}
+
 pub struct AmptekUdpTransport {
-    socket: UdpSocket,
+    /// `CDppSocket::m_hDppSocket`; `None` when `epicsSocketCreate` failed,
+    /// after which C keeps the instance and every send/receive on the
+    /// invalid descriptor fails, so nothing ever replies.
+    socket: Option<UdpSocket>,
     /// The DP5 command port every send targets. Always
     /// [`DP5_COMMAND_PORT`] in production ([`Self::bind`]); tests point
     /// this at a loopback responder's ephemeral port instead of binding
     /// the real well-known port, which would conflict across parallel
     /// test runs.
     command_port: u16,
+    /// `CDppSocket::broadcastList`: one NetFinder destination per
+    /// interface, as `osiSockDiscoverBroadcastAddresses` lists them.
+    broadcast_list: Vec<SocketAddrV4>,
 }
 
 impl AmptekUdpTransport {
-    /// Bind an ephemeral local UDP socket with broadcast sends enabled
-    /// (`CDppSocket`'s ctor binds `INADDR_ANY:0`, `DppSocket.cpp:36-64`;
-    /// `SO_BROADCAST` is set per-send in C's `BroadCastSendTo`,
-    /// `DppSocket.cpp:128-136` -- enabled once here instead, since this
-    /// transport only ever broadcasts on the NetFinder discovery path).
-    pub fn bind() -> io::Result<Self> {
-        Self::bind_on_command_port(DP5_COMMAND_PORT)
+    /// The `CDppSocket` ctor (`DppSocket.cpp:10-64`): an ephemeral
+    /// `INADDR_ANY:0` UDP socket with broadcast sends enabled (C sets
+    /// `SO_BROADCAST` per send in `SendNetFinderBroadCast`; enabled once
+    /// here, since only the NetFinder path broadcasts). A socket failure is
+    /// not fatal, as in C: the line is printed and the transport is built
+    /// without a socket.
+    pub fn bind() -> Self {
+        Self::open(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))
     }
 
-    fn bind_on_command_port(command_port: u16) -> io::Result<Self> {
+    pub(crate) fn open(socket: io::Result<UdpSocket>) -> Self {
+        let Ok(socket) = socket else {
+            println!("epicsSocketCreate failed");
+            return Self::with_socket(None, DP5_COMMAND_PORT);
+        };
+        let mut transport = Self::with_socket(Some(socket), DP5_COMMAND_PORT);
+        let list = interface_broadcast_list();
+        println!("Found {} broadcast interfaces ...", list.len());
+        println!("Broadcast list ...");
+        for dest in &list {
+            println!("{}", ip_addr_to_a_port0(*dest.ip()));
+        }
+        transport.broadcast_list = list;
+        transport
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_on_command_port(command_port: u16) -> io::Result<Self> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-        socket.set_broadcast(true)?;
-        Ok(AmptekUdpTransport {
+        Ok(Self::with_socket(Some(socket), command_port))
+    }
+
+    fn with_socket(socket: Option<UdpSocket>, command_port: u16) -> Self {
+        // A refused SO_BROADCAST fails each broadcast send, whose result C
+        // ignores.
+        if let Some(socket) = &socket {
+            let _ = socket.set_broadcast(true);
+        }
+        AmptekUdpTransport {
             socket,
             command_port,
-        })
-    }
-
-    /// `CDppSocket::UDPSendTo` + `UDPRecvFrom` as used by
-    /// `doAmptekNetFinderPacket` (`ConsoleHelper.cpp:199-261`): send the
-    /// fixed NetFinder direct-query request to `target:10001`, sleep
-    /// 50 ms (`Sleep(50)`, `ConsoleHelper.cpp:222`), then wait up to
-    /// [`READ_TIMEOUT`] for exactly one response. Returns the address the
-    /// device reported (which the caller compares against `target`) or
-    /// `None` if nothing valid arrived -- matches
-    /// `doAmptekNetFinderPacket`'s "one attempt" shape; the 3x retry loop
-    /// lives in [`Self::connect_direct`].
-    fn connect_direct_attempt(&self, target: Ipv4Addr) -> io::Result<Option<Ipv4Addr>> {
-        let request = net_finder::build_direct_request();
-        self.socket.send_to(&request, (target, self.command_port))?;
-        std::thread::sleep(Duration::from_millis(50));
-        self.socket.set_read_timeout(Some(READ_TIMEOUT))?;
-        let mut buf = [0u8; RECV_CHUNK_SIZE];
-        match self.socket.recv_from(&mut buf) {
-            Ok((n, _from)) => Ok(net_finder::parse_direct_response(&buf[..n])),
-            Err(e) if is_no_response(e.kind()) => Ok(None),
-            Err(e) => Err(e),
+            broadcast_list: Vec::new(),
         }
     }
 
+    /// `CConsoleHelper::doAmptekNetFinderPacket` (`ConsoleHelper.cpp:199-261`):
+    /// send the NetFinder direct query to `target:10001`, sleep 50 ms, read
+    /// one reply. Returns the address the reply carries, `None` when no
+    /// acceptable reply arrived (C's `iNumDevices == 0`).
+    fn amptek_net_finder_packet(&self, target: Ipv4Addr) -> io::Result<Option<Ipv4Addr>> {
+        let request = net_finder::build_direct_request();
+        let Some(socket) = &self.socket else {
+            no_socket_exchange();
+            return Ok(None);
+        };
+        socket.send_to(&request, (target, self.command_port))?;
+        std::thread::sleep(Duration::from_millis(50));
+        socket.set_read_timeout(Some(READ_TIMEOUT))?;
+        let mut buf = [0u8; RECV_CHUNK_SIZE];
+        let n = match socket.recv_from(&mut buf) {
+            Ok((n, _from)) => n,
+            Err(e) if is_no_response(e.kind()) => 0,
+            Err(e) => return Err(e),
+        };
+        Ok(net_finder::parse_direct_response(&mut buf, n))
+    }
+
     /// `CConsoleHelper::DppSocket_Connect_Direct_DPP`
-    /// (`ConsoleHelper.cpp:347-374`): retries (up to 3 attempts, 1 s apart)
-    /// only while nothing responds at all (`NumDevices == 0`); the first
-    /// attempt that gets any reply ends the retry loop, and the *final*
-    /// address match (`lTestAddr == lDppAddr`) is checked once against
-    /// whatever that attempt reported -- a mismatched reply is not retried.
-    pub fn connect_direct(&self, target: Ipv4Addr) -> io::Result<bool> {
+    /// (`ConsoleHelper.cpp:347-374`): up to 3 queries, 1 s apart, while no
+    /// reply is accepted, then one address comparison against the last
+    /// accepted reply (`ulNetFinderAddr`, reset to 0 first). Returns
+    /// `(connected, NumDevices)`.
+    pub fn connect_direct(&self, target: Ipv4Addr) -> io::Result<(bool, usize)> {
         let mut reported = None;
         for attempt in 0..3 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_secs(1));
             }
-            reported = self.connect_direct_attempt(target)?;
+            reported = self.amptek_net_finder_packet(target)?;
             if reported.is_some() {
                 break;
             }
         }
-        Ok(reported == Some(target))
+        let num_devices = usize::from(reported.is_some());
+        Ok((
+            reported.unwrap_or(Ipv4Addr::UNSPECIFIED) == target,
+            num_devices,
+        ))
     }
 
-    /// `CConsoleHelper::doNetFinderBroadcast` (`ConsoleHelper.cpp:127-178`),
-    /// scoped down to a single global broadcast rather than C's
-    /// per-interface enumeration (`osiSockDiscoverBroadcastAddresses`) --
-    /// see the crate-level feasibility note in `lib.rs` for why: no
-    /// broadcast-interface-enumeration crate is in this workspace, and
-    /// the underlying NetFinder wire protocol (nonce, packet shape) is
-    /// ported faithfully regardless of how many interfaces it's sent on.
-    /// `broadcast_addr` is `255.255.255.255:3040` in production; tests
-    /// pass a loopback unicast address to exercise the same
-    /// send/collect logic without requiring broadcast permissions.
-    pub fn discover_broadcast(&self, broadcast_addr: SocketAddrV4) -> io::Result<Vec<Ipv4Addr>> {
-        let rand = net_finder::create_rand();
-        let request = net_finder::build_broadcast_request(rand);
-        self.socket.send_to(&request, broadcast_addr)?;
-        std::thread::sleep(Duration::from_millis(100));
+    /// `CDppSocket::UDPRecvFromNfAddr` (`DppSocket.cpp:217-243`): one
+    /// non-blocking receive into `buf`, 0 on any error. The address is
+    /// the one the reply carries at bytes 20..24 when more than 67 bytes
+    /// arrived, otherwise `None` (C's empty `szDPP`).
+    fn recv_from_nf_addr(&self, buf: &mut [u8; RECV_CHUNK_SIZE]) -> (usize, Option<Ipv4Addr>) {
+        let Some(socket) = &self.socket else {
+            return (0, None);
+        };
+        if socket.set_nonblocking(true).is_err() {
+            return (0, None);
+        }
+        let n = socket.recv_from(buf).map_or(0, |(n, _from)| n);
+        let _ = socket.set_nonblocking(false);
+        let addr = (n > 67).then(|| Ipv4Addr::new(buf[20], buf[21], buf[22], buf[23]));
+        (n, addr)
+    }
 
-        self.socket.set_read_timeout(Some(READ_TIMEOUT))?;
+    /// `CConsoleHelper::doNetFinderBroadcast` (`ConsoleHelper.cpp:127-178`):
+    /// one broadcast per interface in [`Self::broadcast_list`], each with a
+    /// new nonce, collecting every accepted reply. As in C the receive
+    /// buffer and the `iNetFinderLoops` budget are shared by all
+    /// interfaces, so after the first interface times out each further one
+    /// reads a single reply. C's `szNetAddress[10]` overflows past 10
+    /// entries; the list is unbounded here.
+    fn net_finder_broadcast(&self) -> Vec<Option<Ipv4Addr>> {
+        let mut buf = [0u8; RECV_CHUNK_SIZE];
         let mut found = Vec::new();
-        for _ in 0..MAX_ENTRIES {
-            let mut buf = [0u8; RECV_CHUNK_SIZE];
-            match self.socket.recv_from(&mut buf) {
-                Ok((n, SocketAddr::V4(from)))
-                    if net_finder::have_netfinder_packet(&buf[..n], rand) =>
-                {
-                    found.push(*from.ip());
+        let mut loops = 0;
+        for dest in &self.broadcast_list {
+            let rand = net_finder::create_rand();
+            println!(
+                "interface broadcast address {}",
+                ip_addr_to_a_port0(*dest.ip())
+            );
+            // C ignores the SendNetFinderBroadCast result.
+            if let Some(socket) = &self.socket {
+                let _ = socket.send_to(&net_finder::build_broadcast_request(rand), dest);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            println!("Searching for Amptek modules on network:");
+            loop {
+                let (n, addr) = self.recv_from_nf_addr(&mut buf);
+                if n > 0 {
+                    if net_finder::have_netfinder_packet(&buf, rand, n) {
+                        let shown = addr.map(|a| a.to_string()).unwrap_or_default();
+                        println!(
+                            "  Address: {shown}  Port: {NETFINDER_BROADCAST_PORT}   bytes:{n}"
+                        );
+                        found.push(addr);
+                    }
+                } else {
+                    loops += MAX_ENTRIES;
                 }
-                Ok(_) => continue,
-                Err(e) if is_no_response(e.kind()) => break,
-                Err(e) => return Err(e),
+                loops += 1;
+                if n == 0 || loops >= MAX_ENTRIES {
+                    break;
+                }
             }
         }
-        Ok(found)
+        println!("Found {} Amptek units", found.len());
+        found
     }
 
     /// `CConsoleHelper::DppSocket_Connect_Default_DPP`
-    /// (`ConsoleHelper.cpp:300-342`): broadcast-discover all responding
-    /// devices (retrying up to 3 times, 1 s apart, while *none* respond at
-    /// all -- the same retry shape as [`Self::connect_direct`]), then check
-    /// whether `target` is among the addresses found. Unlike
-    /// `connect_direct`, a round that finds *other* devices but not
-    /// `target` is not retried -- `DppSocket_Connect_Default_DPP`'s retry
-    /// condition is `NumDevices == 0`, not "no match yet"; the match check
-    /// against `target` runs once, against whichever round's results first
-    /// came back nonempty.
-    pub fn discover_default(
-        &self,
-        broadcast_addr: SocketAddrV4,
-        target: Ipv4Addr,
-    ) -> io::Result<bool> {
-        let mut found = Vec::new();
-        for attempt in 0..3 {
-            if attempt > 0 {
+    /// (`ConsoleHelper.cpp:300-342`): up to 3 searches, 1 s apart, while
+    /// none finds a device, then match `target` against the addresses
+    /// found (an empty address compares as `inet_addr("")`, i.e.
+    /// `INADDR_NONE`). On a match C sleeps 1 s and sends one direct query,
+    /// whose result it ignores. Returns `(connected, NumDevices)`.
+    pub fn connect_default(&self, target: Ipv4Addr) -> io::Result<(bool, usize)> {
+        let mut found = self.net_finder_broadcast();
+        for _ in 0..2 {
+            if found.is_empty() {
                 std::thread::sleep(Duration::from_secs(1));
-            }
-            found = self.discover_broadcast(broadcast_addr)?;
-            if !found.is_empty() {
-                break;
+                found = self.net_finder_broadcast();
             }
         }
-        Ok(found.contains(&target))
+        let connected = found
+            .iter()
+            .any(|addr| addr.unwrap_or(Ipv4Addr::BROADCAST) == target);
+        if connected {
+            std::thread::sleep(Duration::from_secs(1));
+            self.amptek_net_finder_packet(target)?;
+        }
+        Ok((connected, found.len()))
     }
 
     /// `CDppSocket::SendPacketInet` (`DppSocket.cpp:452-506`): send
     /// `packet` to `target:10001`, sleep 50 ms, then accumulate up to
-    /// [`MAX_RESPONSE_SIZE`] bytes across up to [`MAX_RECV_ITERATIONS`]
+    /// `MAX_RESPONSE_SIZE` bytes across up to `MAX_RECV_ITERATIONS`
     /// receives, stopping early once exactly `expected_size` bytes have
     /// arrived (`iTotal == iRequestedSize`) or a receive times out
     /// (`iSize <= 0`). Errors (not "no response") only for actual socket
@@ -241,14 +328,18 @@ impl AmptekUdpTransport {
         packet: &[u8],
         expected_size: usize,
     ) -> io::Result<Vec<u8>> {
-        self.socket.send_to(packet, (target, self.command_port))?;
+        let Some(socket) = &self.socket else {
+            no_socket_exchange();
+            return Ok(Vec::new());
+        };
+        socket.send_to(packet, (target, self.command_port))?;
         std::thread::sleep(Duration::from_millis(50));
-        self.socket.set_read_timeout(Some(READ_TIMEOUT))?;
+        socket.set_read_timeout(Some(READ_TIMEOUT))?;
 
         let mut total = Vec::new();
         for _ in 0..MAX_RECV_ITERATIONS {
             let mut chunk = [0u8; RECV_CHUNK_SIZE];
-            match self.socket.recv_from(&mut chunk) {
+            match socket.recv_from(&mut chunk) {
                 Ok((n, _from)) if n > 0 => {
                     if total.len() + n > MAX_RESPONSE_SIZE {
                         break;
@@ -271,8 +362,14 @@ impl AmptekUdpTransport {
 mod tests {
     use super::*;
     use crate::protocol;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+    /// Privileged port 1: no test can bind it, so nothing answers there.
+    /// A freed ephemeral port can be taken by a concurrent test's responder.
+    const DEAD_PORT: u16 = 1;
 
     /// Spawn a UDP responder bound to an ephemeral port and hand back
     /// both a transport wired to send to that port (standing in for
@@ -296,170 +393,123 @@ mod tests {
         )
     }
 
+    fn direct_reply(ip: [u8; 4]) -> Vec<u8> {
+        let mut raw = vec![protocol::SYNC1, protocol::SYNC2, 0x82, 0x08, 0x00, 24];
+        raw.extend_from_slice(&[0u8; 20]);
+        raw.extend_from_slice(&ip);
+        raw.extend_from_slice(&[0, 0]); // unverified trailer
+        raw
+    }
+
     #[test]
     fn connect_direct_confirms_on_matching_response() {
-        let mut data = vec![0u8; 24];
-        data[20..24].copy_from_slice(&[127, 0, 0, 1]);
-        let (transport, handle) = transport_with_responder(move |_req, _from| {
-            let mut raw = vec![
-                protocol::SYNC1,
-                protocol::SYNC2,
-                0x82,
-                0x08,
-                0x00,
-                data.len() as u8,
-            ];
-            raw.extend_from_slice(&data);
-            raw.extend_from_slice(&[0, 0]); // unverified trailer
-            raw
-        });
-
-        assert!(transport.connect_direct(LOOPBACK).unwrap());
+        let (transport, handle) =
+            transport_with_responder(|_req, _from| direct_reply([127, 0, 0, 1]));
+        assert_eq!(transport.connect_direct(LOOPBACK).unwrap(), (true, 1));
         handle.join().unwrap();
     }
 
-    #[test]
-    fn connect_direct_rejects_mismatched_response() {
-        let mut data = vec![0u8; 24];
-        data[20..24].copy_from_slice(&[10, 0, 0, 99]); // a different device
-        let (transport, handle) = transport_with_responder(move |_req, _from| {
-            let mut raw = vec![
-                protocol::SYNC1,
-                protocol::SYNC2,
-                0x82,
-                0x08,
-                0x00,
-                data.len() as u8,
-            ];
-            raw.extend_from_slice(&data);
-            raw.extend_from_slice(&[0, 0]);
-            raw
-        });
-
-        assert_eq!(
-            transport.connect_direct_attempt(LOOPBACK).unwrap(),
-            Some(Ipv4Addr::new(10, 0, 0, 99))
-        );
-        handle.join().unwrap();
-    }
-
-    /// Regression coverage for the retry-condition fix: a *mismatched*
-    /// reply must end the retry loop immediately (`connect_direct` returns
-    /// `false` after the responder's single reply, not after 3 rounds) --
-    /// only silence retries, per `DppSocket_Connect_Direct_DPP`.
+    /// A mismatched reply ends the retry loop: only silence retries
+    /// (`ConsoleHelper.cpp:356-364`).
     #[test]
     fn connect_direct_does_not_retry_past_a_mismatched_reply() {
-        let mut data = vec![0u8; 24];
-        data[20..24].copy_from_slice(&[10, 0, 0, 99]); // a different device
-        let (transport, handle) = transport_with_responder(move |_req, _from| {
-            let mut raw = vec![
-                protocol::SYNC1,
-                protocol::SYNC2,
-                0x82,
-                0x08,
-                0x00,
-                data.len() as u8,
-            ];
-            raw.extend_from_slice(&data);
-            raw.extend_from_slice(&[0, 0]);
-            raw
-        });
-
-        // The responder only answers once; if `connect_direct` retried past
-        // the mismatch it would block waiting on a second reply that never
-        // comes (masked here by `connect_direct_attempt`'s own timeout, but
-        // the join below still proves only one request was sent/consumed).
-        assert!(!transport.connect_direct(LOOPBACK).unwrap());
+        let (transport, handle) =
+            transport_with_responder(|_req, _from| direct_reply([10, 0, 0, 99]));
+        assert_eq!(transport.connect_direct(LOOPBACK).unwrap(), (false, 1));
         handle.join().unwrap();
     }
 
     #[test]
-    fn connect_direct_attempt_times_out_with_no_responder() {
-        let unused = UdpSocket::bind((LOOPBACK, 0)).unwrap();
-        let dead_port = unused.local_addr().unwrap().port();
-        drop(unused);
-        let transport = AmptekUdpTransport::bind_on_command_port(dead_port).unwrap();
-        assert_eq!(transport.connect_direct_attempt(LOOPBACK).unwrap(), None);
+    fn amptek_net_finder_packet_times_out_with_no_responder() {
+        let transport = AmptekUdpTransport::bind_on_command_port(DEAD_PORT).unwrap();
+        assert_eq!(transport.amptek_net_finder_packet(LOOPBACK).unwrap(), None);
     }
 
-    #[test]
-    fn discover_broadcast_collects_valid_responses() {
-        let responder = UdpSocket::bind((LOOPBACK, 0)).unwrap();
-        let responder_port = responder.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            let (n, from) = responder.recv_from(&mut buf).unwrap();
-            assert_eq!(n, 6); // [0x00, 0x00, rand_hi, rand_lo, 0xF4, 0xFA]
-            let mut reply = vec![0x01, 0x00, buf[2], buf[3]];
-            reply.extend(std::iter::repeat_n(0u8, 28));
-            responder.send_to(&reply, from).unwrap();
-        });
-
-        let transport = AmptekUdpTransport::bind().unwrap();
-        let broadcast_addr = SocketAddrV4::new(LOOPBACK, responder_port);
-        let found = transport.discover_broadcast(broadcast_addr).unwrap();
-        handle.join().unwrap();
-        assert_eq!(found, vec![LOOPBACK]);
+    /// A NetFinder broadcast reply of `len` bytes for the request `req`,
+    /// carrying `ip` at bytes 20..24.
+    fn broadcast_reply(req: &[u8], len: usize, ip: [u8; 4]) -> Vec<u8> {
+        let mut reply = vec![0u8; len];
+        reply[..4].copy_from_slice(&[0x01, 0x00, req[2], req[3]]);
+        reply[20..24].copy_from_slice(&ip);
+        reply
     }
 
-    #[test]
-    fn discover_default_confirms_when_target_is_among_responses() {
+    /// A transport whose broadcast list is `n` copies of a loopback
+    /// responder that answers each request with `replies(req)`.
+    fn transport_with_netfinder<F>(n: usize, replies: F) -> (AmptekUdpTransport, Arc<AtomicUsize>)
+    where
+        F: Fn(&[u8]) -> Vec<Vec<u8>> + Send + 'static,
+    {
         let responder = UdpSocket::bind((LOOPBACK, 0)).unwrap();
-        let responder_port = responder.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
+        responder
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let port = responder.local_addr().unwrap().port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
             let mut buf = [0u8; 1024];
-            let (n, from) = responder.recv_from(&mut buf).unwrap();
-            assert_eq!(n, 6);
-            let mut reply = vec![0x01, 0x00, buf[2], buf[3]];
-            reply.extend(std::iter::repeat_n(0u8, 28));
-            responder.send_to(&reply, from).unwrap();
+            while let Ok((n, from)) = responder.recv_from(&mut buf) {
+                seen.fetch_add(1, Ordering::Relaxed);
+                for reply in replies(&buf[..n]) {
+                    responder.send_to(&reply, from).unwrap();
+                }
+            }
         });
+        let mut transport = AmptekUdpTransport::bind_on_command_port(port).unwrap();
+        transport.broadcast_list = vec![SocketAddrV4::new(LOOPBACK, port); n];
+        (transport, requests)
+    }
 
-        let transport = AmptekUdpTransport::bind().unwrap();
-        let broadcast_addr = SocketAddrV4::new(LOOPBACK, responder_port);
-        assert!(
-            transport
-                .discover_default(broadcast_addr, LOOPBACK)
-                .unwrap()
+    /// The address comes from bytes 20..24 only past 67 bytes, otherwise it
+    /// is empty (`DppSocket.cpp:228-235`).
+    #[test]
+    fn net_finder_broadcast_takes_the_address_from_the_payload() {
+        let (transport, _) = transport_with_netfinder(1, |req| {
+            vec![
+                broadcast_reply(req, 68, [10, 1, 2, 3]),
+                broadcast_reply(req, 67, [10, 1, 2, 4]),
+            ]
+        });
+        assert_eq!(
+            transport.net_finder_broadcast(),
+            vec![Some(Ipv4Addr::new(10, 1, 2, 3)), None]
         );
-        handle.join().unwrap();
+    }
+
+    /// One broadcast per interface; the loop budget is shared, so the
+    /// second interface reads one reply (`ConsoleHelper.cpp:134-176`).
+    #[test]
+    fn net_finder_broadcast_sends_per_interface_with_a_shared_budget() {
+        let (transport, requests) = transport_with_netfinder(2, |req| {
+            vec![
+                broadcast_reply(req, 68, [10, 1, 2, 3]),
+                broadcast_reply(req, 68, [10, 1, 2, 4]),
+            ]
+        });
+        let found = transport.net_finder_broadcast();
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert_eq!(found.len(), 3);
     }
 
     #[test]
-    fn discover_default_rejects_when_target_is_not_among_responses() {
-        let responder = UdpSocket::bind((LOOPBACK, 0)).unwrap();
-        let responder_port = responder.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            let (n, from) = responder.recv_from(&mut buf).unwrap();
-            assert_eq!(n, 6);
-            let mut reply = vec![0x01, 0x00, buf[2], buf[3]];
-            reply.extend(std::iter::repeat_n(0u8, 28));
-            responder.send_to(&reply, from).unwrap();
+    fn connect_default_matches_and_sends_the_direct_query() {
+        let (transport, requests) = transport_with_netfinder(1, |req| {
+            if req.len() == 6 {
+                vec![broadcast_reply(req, 68, [127, 0, 0, 1])]
+            } else {
+                vec![]
+            }
         });
-
-        let transport = AmptekUdpTransport::bind().unwrap();
-        let broadcast_addr = SocketAddrV4::new(LOOPBACK, responder_port);
-        let other = Ipv4Addr::new(10, 0, 0, 99);
-        assert!(!transport.discover_default(broadcast_addr, other).unwrap());
-        handle.join().unwrap();
+        assert_eq!(transport.connect_default(LOOPBACK).unwrap(), (true, 1));
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
     }
 
     #[test]
-    fn discover_broadcast_ignores_unrecognized_traffic() {
-        let responder = UdpSocket::bind((LOOPBACK, 0)).unwrap();
-        let responder_port = responder.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            let (_, from) = responder.recv_from(&mut buf).unwrap();
-            responder.send_to(&[0x42u8; 40], from).unwrap(); // garbage, not a NetFinder reply
-        });
-
-        let transport = AmptekUdpTransport::bind().unwrap();
-        let broadcast_addr = SocketAddrV4::new(LOOPBACK, responder_port);
-        let found = transport.discover_broadcast(broadcast_addr).unwrap();
-        handle.join().unwrap();
-        assert!(found.is_empty());
+    fn connect_default_rejects_when_target_is_not_among_responses() {
+        let (transport, _) =
+            transport_with_netfinder(1, |req| vec![broadcast_reply(req, 68, [10, 0, 0, 99])]);
+        assert_eq!(transport.connect_default(LOOPBACK).unwrap(), (false, 1));
     }
 
     #[test]
@@ -473,10 +523,7 @@ mod tests {
 
     #[test]
     fn send_packet_inet_returns_empty_when_unreachable() {
-        let unused = UdpSocket::bind((LOOPBACK, 0)).unwrap();
-        let dead_port = unused.local_addr().unwrap().port();
-        drop(unused);
-        let transport = AmptekUdpTransport::bind_on_command_port(dead_port).unwrap();
+        let transport = AmptekUdpTransport::bind_on_command_port(DEAD_PORT).unwrap();
         let packet = protocol::build_command(protocol::TransmitPacketType::SendStatus);
         let result = transport.send_packet_inet(LOOPBACK, &packet, 72).unwrap();
         assert!(result.is_empty());

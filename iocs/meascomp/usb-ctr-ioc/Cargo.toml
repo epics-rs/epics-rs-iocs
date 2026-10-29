@@ -6,9 +6,12 @@ publish = false
 
 [dependencies]
 usb-ctr = { path = "../../../drivers/meascomp/usb-ctr" }
+# Direct dep so build.rs sees DEP_ULDAQ_LIBDIR: cargo hands a `links`
+# crate's metadata only to its direct dependents.
+uldaq-sys = { path = "../../../drivers/meascomp/uldaq-sys" }
 mca = { path = "../../../drivers/mca" }
 mca-rs = { workspace = true }
 epics-rs = { workspace = true, features = ["asyn", "scaler", "bridge"] }
+epics-seq-rs = { workspace = true, features = ["runtime"] }
 asyn-rs = { workspace = true, features = ["epics"] }
 tokio = { version = "1", features = ["full"] }
-env_logger = "0.11"

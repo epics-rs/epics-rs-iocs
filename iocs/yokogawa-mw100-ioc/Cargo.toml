@@ -11,3 +11,7 @@ publish = false
 [dependencies]
 yokogawa-mw100 = { path = "../../drivers/yokogawa-mw100" }
 epics-rs = { workspace = true, features = ["bridge"] }
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3"

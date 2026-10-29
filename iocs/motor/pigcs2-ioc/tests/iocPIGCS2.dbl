@@ -1,0 +1,20 @@
+# dbl of motor R7-4-5 motorPIGCS2 iocBoot/iocPIGCS2 st.cmd
+pigcs2:alldone
+pigcs2:alldoneBlink
+pigcs2:allstop
+pigcs2:m1
+pigcs2:m1_able
+pigcs2:m1Direction
+pigcs2:m1Offset
+pigcs2:m1Resolution
+pigcs2:m1_twCh
+pigcs2:m1_vCh
+pigcs2:m2
+pigcs2:m2_able
+pigcs2:m2Direction
+pigcs2:m2Offset
+pigcs2:m2Resolution
+pigcs2:m2_twCh
+pigcs2:m2_vCh
+pigcs2:moving
+pigcs2:movingDiff

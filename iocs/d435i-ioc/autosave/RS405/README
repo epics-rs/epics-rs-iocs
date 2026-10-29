@@ -1,0 +1,2 @@
+This directory holds the save/restore files set_savefile_path names.
+It has to exist: autosave does not create it.

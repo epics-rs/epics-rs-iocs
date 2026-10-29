@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -10,13 +10,12 @@ use epics_rs::asyn::request::ParamSetValue;
 
 use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDArray, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::driver::LastArray;
 use crate::params::CSimParams;
 use crate::rng::Rng;
 use crate::signals::compute_arrays;
@@ -31,9 +30,7 @@ pub(crate) struct CSimTaskContext {
     pub handle: PortHandle,
     /// Index 0 publishes the 2-D array; `1..=MAX_SIGNALS` the 1-D signals.
     pub publishers: Vec<ArrayPublisher>,
-    pub queued: Arc<QueuedArrayCounter>,
-    pub pool: Arc<NDArrayPool>,
-    pub last_array: LastArray,
+    pub pool: DriverPool,
     pub nd: NDArrayDriverParams,
     pub sim: CSimParams,
 }
@@ -52,33 +49,14 @@ fn float64(reason: usize, addr: i32, value: f64) -> ParamSetValue {
 
 impl CSimTaskContext {
     async fn notify(&self, addr: i32, updates: Vec<ParamSetValue>) {
-        if let Err(e) = self.handle.set_params_and_notify(addr, updates).await {
-            log::error!("ADCSimDetector: parameter update failed: {e}");
-        }
-    }
-
-    /// The `ADAcquire` half of `asynNDArrayDriver::setIntegerParam`, for the
-    /// task's own `setIntegerParam(ADAcquire, 0)` (ADCSimDetector.cpp:206).
-    async fn acquire_off_updates(&self) -> Vec<ParamSetValue> {
-        let wait_for_plugins = self
-            .handle
-            .read_int32(self.nd.wait_for_plugins, 0)
-            .await
-            .unwrap_or(0)
-            != 0;
-        let mut updates = Vec::with_capacity(2);
-        if !wait_for_plugins || self.queued.get() == 0 {
-            updates.push(int32(self.nd.acquire_busy, 0, 0));
-        }
-        updates.push(int32(self.nd.acquire, 0, 0));
-        updates
+        let _ = self.handle.set_params_and_notify(addr, updates).await;
     }
 }
 
 /// Slice signal `i` out of the `[MAX_SIGNALS, numTimePoints]` array and reshape
 /// the `[1, numTimePoints]` result to `[numTimePoints]`
 /// (ADCSimDetector.cpp:314-321).
-fn extract_signal(pool: &NDArrayPool, image: &NDArray, i: usize) -> ADResult<NDArray> {
+fn extract_signal(pool: &DriverPool, image: &NDArray, i: usize) -> ADResult<DriverArray> {
     let dims_out = vec![
         NDDimension {
             size: 1,
@@ -88,12 +66,13 @@ fn extract_signal(pool: &NDArrayPool, image: &NDArray, i: usize) -> ADResult<NDA
         },
         image.dims[1].clone(),
     ];
-    let mut array = pool.convert(image, &dims_out, image.data.data_type())?;
+    let mut array = pool.convert(image, &dims_out, image.data().data_type())?;
     // `NDArrayPool::convert` copies the timestamps and attributes but not
     // `uniqueId`, which C's does (NDArrayPool.cpp:658-660).
-    array.unique_id = image.unique_id;
+    let mut frame = array.fill();
+    frame.set_unique_id(image.unique_id);
     // `pArray->ndims = 1; pArray->dims[0] = pArray->dims[1];`
-    array.dims = vec![array.dims[1].clone()];
+    frame.set_dims(vec![frame.dims[1].clone()]);
     Ok(array)
 }
 
@@ -128,7 +107,6 @@ async fn sim_task(mut ctx: CSimTaskContext) {
         // zero-size dimension to `NDArrayPool::convert`. `ad-core-rs` rejects a
         // zero-size dimension, so the frame is skipped instead.
         if cfg.num_time_points == 0 {
-            log::error!("ADCSimDetector: NumTimePoints is 0, skipping frame");
             rt::sleep(Duration::from_secs_f64(0.001)).await;
             continue;
         }
@@ -145,16 +123,21 @@ async fn sim_task(mut ctx: CSimTaskContext) {
             NDDimension::new(MAX_SIGNALS),
             NDDimension::new(cfg.num_time_points),
         ];
-        let mut image = match ctx.pool.alloc(dims, cfg.data_type) {
-            Ok(image) => image,
-            Err(e) => {
-                log::error!("ADCSimDetector: error allocating array: {e}");
-                continue;
-            }
+        // C releases pArrays[0] and allocates the frame into it under the
+        // driver lock (ADCSimDetector.cpp:150-151).
+        let Some(image) = ctx.pool.owner().replace_array(0, || {
+            let mut image = ctx.pool.alloc(dims, cfg.data_type).ok()?;
+            image
+                .fill()
+                .data_mut()
+                .as_u8_slice_mut()
+                .copy_from_slice(result.data.as_u8_slice());
+            Some(image)
+        }) else {
+            continue;
         };
-        image.data = result.data;
 
-        image.unique_id = unique_id;
+        let id = unique_id;
         unique_id += 1;
 
         let array_counter = ctx
@@ -164,16 +147,26 @@ async fn sim_task(mut ctx: CSimTaskContext) {
             .unwrap_or(0)
             + 1;
 
-        let now = EpicsTimestamp::now();
-        image.time_stamp = now.sec as f64 + now.nsec as f64 / 1.0e9;
-        image.timestamp = now;
+        let time_stamp = EpicsTimestamp::now().as_f64();
+        let timestamp = ctx
+            .handle
+            .update_time_stamp()
+            .await
+            .unwrap_or_else(|_| SystemTime::now())
+            .into();
         // DEVIATION: C calls `getAttributes(pImage->pAttributeList)` here. The
         // `NDAttributesFile` machinery lives in `NDArrayDriverBase`, which this
         // driver cannot use (it hardcodes `max_addr = 1`), so no attributes are
         // attached.
 
-        let image = Arc::new(image);
-        *ctx.last_array.lock() = Some(image.clone());
+        // Stamped in place in pArrays[0] (ADCSimDetector.cpp:307-313).
+        let Ok(image) = ctx.pool.owner().refill(0, image, |image| {
+            image.set_unique_id(id);
+            image.set_time_stamp(time_stamp);
+            image.set_timestamp(timestamp);
+        }) else {
+            continue;
+        };
 
         // `doCallbacksGenericPointer(pImage, NDArrayData, 0)` — unconditional:
         // ADCSimDetector never tests `NDArrayCallbacks`.
@@ -181,11 +174,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
 
         // Per-signal 1-D arrays.
         for i in 0..MAX_SIGNALS {
-            match extract_signal(&ctx.pool, &image, i) {
-                Ok(array) => {
-                    ctx.publishers[i + 1].publish(Arc::new(array)).await;
-                }
-                Err(e) => log::error!("ADCSimDetector: error converting signal {i}: {e}"),
+            if let Ok(array) = extract_signal(&ctx.pool, &image, i) {
+                ctx.publishers[i + 1].publish(array).await;
             }
 
             // `callParamCallbacks(i)` — parameter list `i`, not `i+1`.
@@ -195,7 +185,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
                 updates.push(float64(ctx.sim.elapsed_time, 0, elapsed_time));
                 updates.push(int32(ctx.nd.array_counter, 0, array_counter));
                 if result.acquire_finished {
-                    updates.extend(ctx.acquire_off_updates().await);
+                    // ADCSimDetector.cpp:208; the base rule drives ADAcquireBusy.
+                    updates.push(int32(ctx.nd.acquire, 0, 0));
                 }
             }
             ctx.notify(addr, updates).await;
@@ -224,11 +215,11 @@ async fn sim_task(mut ctx: CSimTaskContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType};
+    use epics_rs::ad_core::ndarray::{NDDataType, NDDataView};
 
     /// A `[MAX_SIGNALS, n]` array whose element `(i, j)` is `100*i + j`, so a
     /// correct extraction of signal `j` is `[j, 100+j, 200+j, ...]`.
-    fn fixture(pool: &NDArrayPool, n: usize) -> NDArray {
+    fn fixture(pool: &DriverPool, n: usize) -> DriverArray {
         let mut image = pool
             .alloc(
                 vec![NDDimension::new(MAX_SIGNALS), NDDimension::new(n)],
@@ -238,19 +229,24 @@ mod tests {
         let data: Vec<f64> = (0..n)
             .flat_map(|i| (0..MAX_SIGNALS).map(move |j| (100 * i + j) as f64))
             .collect();
-        image.data = NDDataBuffer::F64(data);
-        image.unique_id = 42;
+        let mut frame = image.fill();
+        frame
+            .data_mut()
+            .as_mut_slice::<f64>()
+            .unwrap()
+            .copy_from_slice(&data);
+        frame.set_unique_id(42);
         image
     }
 
     #[test]
     fn each_signal_is_taken_with_a_stride_of_max_signals() {
-        let pool = NDArrayPool::new(0);
+        let pool = DriverPool::standalone(0);
         let image = fixture(&pool, 5);
         for j in 0..MAX_SIGNALS {
             let array = extract_signal(&pool, &image, j).unwrap();
-            let got = match &array.data {
-                NDDataBuffer::F64(v) => v.clone(),
+            let got = match array.data().view() {
+                NDDataView::F64(v) => v.to_vec(),
                 other => panic!("expected F64, got {:?}", other.data_type()),
             };
             let want: Vec<f64> = (0..5).map(|i| (100 * i + j) as f64).collect();
@@ -260,7 +256,7 @@ mod tests {
 
     #[test]
     fn the_extracted_signal_is_one_dimensional_with_the_time_point_count() {
-        let pool = NDArrayPool::new(0);
+        let pool = DriverPool::standalone(0);
         let image = fixture(&pool, 5);
         let array = extract_signal(&pool, &image, 3).unwrap();
         assert_eq!(array.dims.len(), 1);
@@ -271,17 +267,27 @@ mod tests {
     fn the_extracted_signal_carries_the_parent_unique_id() {
         // `NDArrayPool::convert` does not copy `unique_id`; `extract_signal`
         // restores C's behaviour.
-        let pool = NDArrayPool::new(0);
+        let pool = DriverPool::standalone(0);
         let image = fixture(&pool, 4);
         assert_eq!(extract_signal(&pool, &image, 0).unwrap().unique_id, 42);
     }
 
     #[test]
     fn the_extracted_signal_keeps_the_source_data_type() {
-        let pool = NDArrayPool::new(0);
-        let mut image = fixture(&pool, 3);
-        image.data = NDDataBuffer::I16(vec![7; MAX_SIGNALS * 3]);
+        let pool = DriverPool::standalone(0);
+        let mut image = pool
+            .alloc(
+                vec![NDDimension::new(MAX_SIGNALS), NDDimension::new(3)],
+                NDDataType::Int16,
+            )
+            .unwrap();
+        image
+            .fill()
+            .data_mut()
+            .as_mut_slice::<i16>()
+            .unwrap()
+            .fill(7);
         let array = extract_signal(&pool, &image, 2).unwrap();
-        assert_eq!(array.data.data_type(), NDDataType::Int16);
+        assert_eq!(array.data().data_type(), NDDataType::Int16);
     }
 }

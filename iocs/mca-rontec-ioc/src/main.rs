@@ -22,25 +22,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::runtime::config::RuntimeConfig;
-use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::base::error::CaResult;
-use epics_rs::base::server::device_support::DeviceSupport;
+use epics_rs::base::runtime::log::errlog_printf;
 use epics_rs::base::server::iocsh::registry::*;
-use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
+use epics_rs::ca::server::ioc_app::IocApplication;
 
 use mca::dev_mca_asyn;
-use mca::interface::ASYN_MCA_DTYP;
 use mca_rontec::driver::RontecDriver;
-
-/// Every asyn port `RontecConfig` creates, kept alive for the life of the
-/// process. Dropping a `PortRuntimeHandle` closes its actor's shutdown
-/// channel and ends the actor thread even though a `PortHandle` clone
-/// survives in `asyn_record` -- love-ioc's `LoveInit`/syringepump-ioc/
-/// delaygen-ioc all drop theirs at the end of their command closure and hit
-/// this (flagged, unfixed there); this IOC follows mca-ioc's own `Ports`
-/// pattern instead since it is new code, not a preserved defect.
-type Ports = Arc<Mutex<Vec<PortRuntimeHandle>>>;
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -48,21 +36,34 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: mca-rontec-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: mca-rontec-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("MCA_RONTEC_IOC", env!("CARGO_MANIFEST_DIR"));
-
-    let ports: Ports = Arc::new(Mutex::new(Vec::new()));
+    epics_rs::base::runtime::env::set_default_path("MCA_RONTEC_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let mut app = IocApplication::new();
 
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
+    // RontecXFlash.db uses scalcout, opt-in in epics-rs as calc's own dbd.
+    app = app.register_record_type("scalcout", || {
+        Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
+    });
     let (mca_name, mca_factory) = mca_rs::mca_record_factory();
     app = app.register_record_type(mca_name, move || mca_factory());
+    // mca.db's busy and transform records: opt-in in epics-rs, as a C IOC
+    // links busy and std's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+    app = app.register_record_type("transform", || {
+        Box::new(epics_rs::base::server::records::transform::TransformRecord::default())
+    });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+
+    let autosave_config = Arc::new(Mutex::new(
+        epics_rs::base::server::autosave::startup::AutosaveStartupConfig::new(),
+    ));
+    app = app.autosave_startup(autosave_config);
 
     // Standard asyn iocsh commands, including drvAsynSerialPortConfigure --
     // provides asynOctetSetInputEos/asynOctetSetOutputEos/asynSetOption and
@@ -86,7 +87,6 @@ async fn main() -> CaResult<()> {
     // RontecConfig(portName,serialPort,serialPortAddress) -- C
     // RontecConfig (`drvMcaRontec.c:165`).
     {
-        let ports_c = ports.clone();
         app = app.register_startup_command(CommandDef::new(
             "RontecConfig",
             vec![
@@ -104,13 +104,13 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "RontecConfig portName serialPort serialPortAddress",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match args.first() {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let serial_port = match args.get(1) {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("serialPort required".into()),
                 };
                 let serial_addr = match args.get(2) {
@@ -118,38 +118,22 @@ async fn main() -> CaResult<()> {
                     _ => return Err("serialPortAddress required".into()),
                 };
 
-                let driver = RontecDriver::connect(&port_name, &serial_port, serial_addr)
-                    .map_err(|e| format!("RontecConfig: {e}"))?;
-
-                let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default())
-                        .map_err(|e| format!("RontecConfig: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime_handle.port_handle().clone(),
-                )
-                .map_err(|e| e.to_string())?;
-                ports_c
-                    .lock()
-                    .expect("port list poisoned")
-                    .push(runtime_handle);
-
+                // C RontecConfig errlogPrintf's its failure and returns
+                // without failing the command (drvMcaRontec.c:174-178,224-226).
+                let driver = match RontecDriver::connect(&port_name, &serial_port, serial_addr) {
+                    Ok(driver) => driver,
+                    Err(e) => {
+                        errlog_printf(&format!("{}\n", e.message()));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
+                driver.register(ctx.db().scan_control().interrupt_gate());
                 Ok(CommandOutcome::Continue)
             },
         ));
     }
 
-    // Binds every mca record with DTYP "asynMCA" to the asyn port its own
-    // INP link names (see mca-ioc's own comment on this block).
-    app = app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-        if ctx.dtyp != ASYN_MCA_DTYP {
-            return None;
-        }
-        let dev = dev_mca_asyn::connect(ctx.inp)?;
-        Some(Box::new(dev) as Box<dyn DeviceSupport>)
-    });
+    app = dev_mca_asyn::register_dev_mca_asyn(app);
 
-    app.startup_script(&script)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

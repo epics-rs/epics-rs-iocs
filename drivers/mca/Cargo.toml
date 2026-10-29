@@ -19,5 +19,6 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn"] }
+epics-libcom-rs = { workspace = true }
 mca-rs = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync", "time"] }

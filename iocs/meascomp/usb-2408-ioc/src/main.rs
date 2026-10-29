@@ -13,26 +13,18 @@ use usb_2408::{MultiFunctionRuntime, create_usb_2408};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
-    // The drivers report every uldaq failure through `log`; without a
-    // backend installed those calls are no-ops and a failed ulAOut or
-    // ulAInScan leaves no trace anywhere. Defaults to warn-and-above.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-
     let args: Vec<String> = std::env::args().collect();
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: usb-2408-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: usb-2408-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default(
+    epics_rs::base::runtime::env::set_default_path(
         "MEASCOMP",
         concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
     );
-    // This IOC's own directory: its auto_settings.req and autosave/ live
-    // here, so the two meascomp IOCs never share a request or save file.
-    epics_rs::base::runtime::env::set_default("USB_2408_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<Mutex<Option<MultiFunctionRuntime>>> = Arc::new(Mutex::new(None));
 
@@ -77,13 +69,13 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "MultiFunctionConfig portName uniqueID [maxInputPoints] [maxOutputPoints]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let unique_id = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("uniqueID required".into()),
                 };
                 let max_in = match args.get(2) {
@@ -95,10 +87,19 @@ async fn main() -> CaResult<()> {
                     _ => 2048,
                 };
 
-                let mf_rt = create_usb_2408(&port_name, &unique_id, max_in, max_out)?;
+                // drvMultiFunction is an asynPortDriver: its base registers the
+                // port before the device is opened.
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let mf_rt = create_usb_2408(&claim, &unique_id, max_in, max_out)?;
 
-                let port_handle = mf_rt.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle)
+                claim
+                    .publish(
+                        mf_rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
                     .map_err(|e| e.to_string())?;
 
                 *rt.lock().unwrap() = Some(mf_rt);
@@ -107,7 +108,5 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    app.startup_script(&script)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

@@ -10,13 +10,13 @@
 //! `copyBuffer<epicsType, NDArrayType>` and `fillBuffer<NDArrayType>` cast with
 //! a plain C cast `(NDArrayType)value`, which for integer targets truncates
 //! toward zero and then wraps modulo 2^N. Rust's `as` saturates instead.
-//! [`CCast::from_f64_c`] restores the C behaviour by going through `i128`
+//! `CCast::from_f64_c` restores the C behaviour by going through `i128`
 //! (truncate) before the narrowing bit-truncation. Every waveform input type
 //! (`epicsInt8/16/32`, `epicsFloat32/64`) is exactly representable in `f64`, so
 //! converting each input element to `f64` first and then casting to the output
 //! type reproduces `(NDArrayType)(epicsType)value` for all input/output pairs.
 
-use epics_rs::ad_core::ndarray::NDDataBuffer;
+use epics_rs::ad_core::ndarray::NDDataViewMut;
 
 /// `ND_ARRAY_MAX_DIMS` (NDArray.h) — the fixed dimension bound the C driver
 /// uses for `arrayDimensions_`, `dimProd_`, and `currentIndex`.
@@ -66,18 +66,18 @@ fn fill_typed<T: CCast>(buf: &mut [T], fill_value: f64) {
 /// for those two output types; an `Int64`/`UInt64` array is left at its
 /// pool-allocated zero. This port reproduces that by leaving those buffers
 /// untouched.
-pub fn fill_buffer(buf: &mut NDDataBuffer, fill_value: f64) {
+pub fn fill_buffer(buf: NDDataViewMut<'_>, fill_value: f64) {
     match buf {
-        NDDataBuffer::I8(v) => fill_typed(v, fill_value),
-        NDDataBuffer::U8(v) => fill_typed(v, fill_value),
-        NDDataBuffer::I16(v) => fill_typed(v, fill_value),
-        NDDataBuffer::U16(v) => fill_typed(v, fill_value),
-        NDDataBuffer::I32(v) => fill_typed(v, fill_value),
-        NDDataBuffer::U32(v) => fill_typed(v, fill_value),
-        NDDataBuffer::F32(v) => fill_typed(v, fill_value),
-        NDDataBuffer::F64(v) => fill_typed(v, fill_value),
+        NDDataViewMut::I8(v) => fill_typed(v, fill_value),
+        NDDataViewMut::U8(v) => fill_typed(v, fill_value),
+        NDDataViewMut::I16(v) => fill_typed(v, fill_value),
+        NDDataViewMut::U16(v) => fill_typed(v, fill_value),
+        NDDataViewMut::I32(v) => fill_typed(v, fill_value),
+        NDDataViewMut::U32(v) => fill_typed(v, fill_value),
+        NDDataViewMut::F32(v) => fill_typed(v, fill_value),
+        NDDataViewMut::F64(v) => fill_typed(v, fill_value),
         // C parity: no NDInt64/NDUInt64 case in the fillBuffer switch.
-        NDDataBuffer::I64(_) | NDDataBuffer::U64(_) => {}
+        NDDataViewMut::I64(_) | NDDataViewMut::U64(_) => {}
     }
 }
 
@@ -119,19 +119,19 @@ fn copy_typed<T: CCast>(
 /// As with [`fill_buffer`], the C `switch (dataType)` has no `NDInt64`/
 /// `NDUInt64` case (NDDriverStdArrays.cpp:226-251), so `copyBuffer` is never
 /// instantiated for those output types and this port leaves them untouched.
-pub fn copy_buffer(out: &mut NDDataBuffer, next_element: usize, stride: usize, input: &[f64]) {
+pub fn copy_buffer(out: NDDataViewMut<'_>, next_element: usize, stride: usize, input: &[f64]) {
     let total = out.len();
     match out {
-        NDDataBuffer::I8(v) => copy_typed(v, next_element, stride, input, total),
-        NDDataBuffer::U8(v) => copy_typed(v, next_element, stride, input, total),
-        NDDataBuffer::I16(v) => copy_typed(v, next_element, stride, input, total),
-        NDDataBuffer::U16(v) => copy_typed(v, next_element, stride, input, total),
-        NDDataBuffer::I32(v) => copy_typed(v, next_element, stride, input, total),
-        NDDataBuffer::U32(v) => copy_typed(v, next_element, stride, input, total),
-        NDDataBuffer::F32(v) => copy_typed(v, next_element, stride, input, total),
-        NDDataBuffer::F64(v) => copy_typed(v, next_element, stride, input, total),
+        NDDataViewMut::I8(v) => copy_typed(v, next_element, stride, input, total),
+        NDDataViewMut::U8(v) => copy_typed(v, next_element, stride, input, total),
+        NDDataViewMut::I16(v) => copy_typed(v, next_element, stride, input, total),
+        NDDataViewMut::U16(v) => copy_typed(v, next_element, stride, input, total),
+        NDDataViewMut::I32(v) => copy_typed(v, next_element, stride, input, total),
+        NDDataViewMut::U32(v) => copy_typed(v, next_element, stride, input, total),
+        NDDataViewMut::F32(v) => copy_typed(v, next_element, stride, input, total),
+        NDDataViewMut::F64(v) => copy_typed(v, next_element, stride, input, total),
         // C parity: no NDInt64/NDUInt64 case in the copyBuffer switch.
-        NDDataBuffer::I64(_) | NDDataBuffer::U64(_) => {}
+        NDDataViewMut::I64(_) | NDDataViewMut::U64(_) => {}
     }
 }
 
@@ -196,6 +196,8 @@ mod tests {
     use super::*;
     use epics_rs::ad_core::ndarray::NDDataType;
 
+    use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataView};
+
     fn buf(dt: NDDataType, n: usize) -> NDDataBuffer {
         NDDataBuffer::zeros(dt, n)
     }
@@ -205,60 +207,60 @@ mod tests {
         // (epicsInt8)300 == 44; (epicsUInt8)-1 == 255; truncation drops the
         // fraction before the wrap.
         let mut b = buf(NDDataType::Int8, 3);
-        fill_buffer(&mut b, 300.7);
-        assert!(matches!(&b, NDDataBuffer::I8(v) if v == &[44, 44, 44]));
+        fill_buffer(b.view_mut(), 300.7);
+        assert!(matches!(b.view(), NDDataView::I8(v) if v == [44, 44, 44]));
 
         let mut b = buf(NDDataType::UInt8, 2);
-        fill_buffer(&mut b, -1.9);
-        assert!(matches!(&b, NDDataBuffer::U8(v) if v == &[255, 255]));
+        fill_buffer(b.view_mut(), -1.9);
+        assert!(matches!(b.view(), NDDataView::U8(v) if v == [255, 255]));
 
         let mut b = buf(NDDataType::Float32, 2);
-        fill_buffer(&mut b, 2.5);
-        assert!(matches!(&b, NDDataBuffer::F32(v) if v == &[2.5, 2.5]));
+        fill_buffer(b.view_mut(), 2.5);
+        assert!(matches!(b.view(), NDDataView::F32(v) if v == [2.5, 2.5]));
     }
 
     #[test]
     fn fill_buffer_is_a_noop_for_int64_and_uint64() {
         // C parity: the fillBuffer switch has no NDInt64/NDUInt64 case.
         let mut b = buf(NDDataType::Int64, 3);
-        fill_buffer(&mut b, 7.0);
-        assert!(matches!(&b, NDDataBuffer::I64(v) if v == &[0, 0, 0]));
+        fill_buffer(b.view_mut(), 7.0);
+        assert!(matches!(b.view(), NDDataView::I64(v) if v == [0, 0, 0]));
         let mut b = buf(NDDataType::UInt64, 3);
-        fill_buffer(&mut b, 7.0);
-        assert!(matches!(&b, NDDataBuffer::U64(v) if v == &[0, 0, 0]));
+        fill_buffer(b.view_mut(), 7.0);
+        assert!(matches!(b.view(), NDDataView::U64(v) if v == [0, 0, 0]));
     }
 
     #[test]
     fn copy_buffer_stride_one_writes_contiguously_from_next_element() {
         let mut b = buf(NDDataType::Float64, 6);
-        copy_buffer(&mut b, 2, 1, &[10.0, 11.0, 12.0]);
-        assert!(matches!(&b, NDDataBuffer::F64(v)
-            if v == &[0.0, 0.0, 10.0, 11.0, 12.0, 0.0]));
+        copy_buffer(b.view_mut(), 2, 1, &[10.0, 11.0, 12.0]);
+        assert!(matches!(b.view(), NDDataView::F64(v)
+            if v == [0.0, 0.0, 10.0, 11.0, 12.0, 0.0]));
     }
 
     #[test]
     fn copy_buffer_applies_the_stride() {
         // stride 2, starting at element 0: fills indices 0, 2, 4.
         let mut b = buf(NDDataType::Int32, 6);
-        copy_buffer(&mut b, 0, 2, &[1.0, 2.0, 3.0]);
-        assert!(matches!(&b, NDDataBuffer::I32(v) if v == &[1, 0, 2, 0, 3, 0]));
+        copy_buffer(b.view_mut(), 0, 2, &[1.0, 2.0, 3.0]);
+        assert!(matches!(b.view(), NDDataView::I32(v) if v == [1, 0, 2, 0, 3, 0]));
     }
 
     #[test]
     fn copy_buffer_wraps_the_stride_cursor_modulo_total() {
         // total 4, stride 3, start 0: j = 0, 3, (6 -> 2), (5 -> 1).
         let mut b = buf(NDDataType::Int32, 4);
-        copy_buffer(&mut b, 0, 3, &[1.0, 2.0, 3.0, 4.0]);
+        copy_buffer(b.view_mut(), 0, 3, &[1.0, 2.0, 3.0, 4.0]);
         // index 0 <- 1, index 3 <- 2, index 2 <- 3, index 1 <- 4.
-        assert!(matches!(&b, NDDataBuffer::I32(v) if v == &[1, 4, 3, 2]));
+        assert!(matches!(b.view(), NDDataView::I32(v) if v == [1, 4, 3, 2]));
     }
 
     #[test]
     fn copy_buffer_converts_input_to_the_output_type_with_c_casts() {
         // f64 input 257.9 -> (epicsInt8) = 1 (truncate to 257, wrap mod 256).
         let mut b = buf(NDDataType::Int8, 2);
-        copy_buffer(&mut b, 0, 1, &[257.9, -1.0]);
-        assert!(matches!(&b, NDDataBuffer::I8(v) if v == &[1, -1]));
+        copy_buffer(b.view_mut(), 0, 1, &[257.9, -1.0]);
+        assert!(matches!(b.view(), NDDataView::I8(v) if v == [1, -1]));
     }
 
     #[test]

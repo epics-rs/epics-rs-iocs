@@ -8,9 +8,10 @@
 //! Publishes two params, matching what
 //! [`FastSweepDriver::connect`](mca::fastsweep::FastSweepDriver::connect)'s
 //! default `dataString`/`intervalString` ("DATA"/"SCAN_PERIOD") expect:
-//! - `"DATA"` (`asynInt32Array`, `maxSignals` elements) — a triangular peak
-//!   that drifts one channel per period, so an acquiring sweep shows a
-//!   moving, recognizable shape rather than flat noise.
+//! - `"DATA"` (`asynInt32Array`, `maxSignals` elements) — one sample per
+//!   signal, a triangle across the signals whose peak moves one signal per
+//!   period, so each signal's swept spectrum is a periodic triangle wave.
+//!   With one signal (this IOC's `st.cmd`) every sample is 50.
 //! - `"SCAN_PERIOD"` (`asynFloat64`) — the fixed sample period, published
 //!   once at connect and never changed; FastSweep reads it once as its
 //!   `computeNumAverage` seed.
@@ -21,14 +22,23 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::{ParamType, ParamValue};
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 
 pub const DEMO_SOURCE_DATA: &str = "DATA";
 pub const DEMO_SOURCE_SCAN_PERIOD: &str = "SCAN_PERIOD";
+
+/// What `FastSweepDriver::connect` requires of its input port: int32Array
+/// and float64 with interrupts, and drvUser (`drvFastSweep.cpp:141-211`).
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32_ARRAY
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::DRV_USER);
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT32_ARRAY.or(InterfaceMask::FLOAT64);
 
 pub struct DemoSourceDriver {
     base: PortDriverBase,
@@ -63,7 +73,8 @@ fn spawn_producer(handle: PortHandle, data_reason: usize, max_signals: usize, pe
                 thread::sleep(period);
                 let data = synthesize(max_signals, phase);
                 phase = phase.wrapping_add(1);
-                let updates = vec![ParamSetValue::new(
+                // An array callback, as a C asynInt32Array source posts.
+                let updates = vec![ParamSetValue::array(
                     data_reason,
                     0,
                     ParamValue::Int32Array(Arc::from(data)),
@@ -76,15 +87,15 @@ fn spawn_producer(handle: PortHandle, data_reason: usize, max_signals: usize, pe
         .expect("failed to spawn the demo source producer thread");
 }
 
-/// Registers a new asyn port `port_name` that publishes `"DATA"`
-/// (`maxSignals` elements, once per `period`) and a fixed `"SCAN_PERIOD"`.
-/// The caller (this IOC's `main.rs`) still owns registering the port by
-/// name via `asyn_record::register_port` — this only builds and starts it.
+/// Builds the asyn port `claim` names, publishing `"DATA"` (`maxSignals`
+/// elements, once per `period`) and a fixed `"SCAN_PERIOD"`. The caller
+/// (this IOC's `main.rs`) publishes it through the claim.
 pub fn connect(
-    port_name: &str,
+    claim: &PortClaim,
     max_signals: usize,
     period: Duration,
 ) -> AsynResult<PortRuntimeHandle> {
+    let port_name = claim.name();
     let mut base = PortDriverBase::new(
         port_name,
         1,
@@ -93,14 +104,15 @@ pub fn connect(
             can_block: false,
             destructible: true,
         },
+        INTERFACES,
+        INTERRUPTS,
     );
     let data_reason = base.create_param(DEMO_SOURCE_DATA, ParamType::Int32Array)?;
     let period_reason = base.create_param(DEMO_SOURCE_SCAN_PERIOD, ParamType::Float64)?;
-    base.params
-        .set_float64(period_reason, 0, period.as_secs_f64())?;
+    base.set_float64_param(period_reason, 0, period.as_secs_f64())?;
 
     let driver = DemoSourceDriver { base };
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     spawn_producer(
         runtime_handle.port_handle().clone(),
         data_reason,
@@ -120,6 +132,69 @@ mod tests {
         assert_eq!(data[3], 50);
         assert_eq!(data[0], 35);
         assert!(data.iter().all(|&v| v >= 1));
+    }
+
+    /// DATA reaches an asynInt32Array subscriber as an array callback, the
+    /// way a C source's doCallbacksInt32Array does.
+    #[tokio::test]
+    async fn data_posts_as_an_array_callback() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let claim = epics_rs::asyn::registry::claim_port("DEMO_SRC_ARRAY").unwrap();
+        let mut base = PortDriverBase::new(
+            claim.name(),
+            1,
+            PortFlags::default(),
+            INTERFACES,
+            INTERRUPTS,
+        );
+        let data = base
+            .create_param(DEMO_SOURCE_DATA, ParamType::Int32Array)
+            .unwrap();
+        base.own_interrupts(InterruptGate::opened());
+        let (runtime, _) =
+            create_port_runtime(&claim, DemoSourceDriver { base }, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        let mut rx = handle.interrupts().subscribe_async(64, 1 << 16);
+        spawn_producer(handle, data, 2, Duration::from_millis(1));
+        let first = loop {
+            let v = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if v.reason == data {
+                break v;
+            }
+        };
+        assert_eq!(first.iface, Some(InterfaceType::Int32Array));
+        std::mem::forget(runtime);
+    }
+
+    /// The sweep driver subscribes to both of the source's interrupts, which
+    /// it skips on a port lacking either interface.
+    #[test]
+    fn the_sweep_driver_subscribes_to_the_source() {
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        use mca::fastsweep::FastSweepDriver;
+
+        let claim = epics_rs::asyn::registry::claim_port("DEMO_SRC_SWEPT").unwrap();
+        let runtime = connect(&claim, 1, Duration::from_secs(3600)).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        let (_driver, subscriptions) = FastSweepDriver::connect(
+            "DEMO_SRC_SWEEP",
+            "DEMO_SRC_SWEPT",
+            1,
+            4,
+            DEMO_SOURCE_DATA,
+            DEMO_SOURCE_SCAN_PERIOD,
+        )
+        .unwrap();
+        assert_eq!(subscriptions.connected(), (true, true));
+        std::mem::forget(runtime);
     }
 
     #[test]

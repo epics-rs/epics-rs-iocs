@@ -1,70 +1,797 @@
-//! iocsh command for the IMS MDrivePlus driver.
+//! iocsh commands for the IMS MDrivePlus driver and the model-1 IMS
+//! drivers (ImsRegister.cc).
 //!
 //! Mirrors the C `ImsMDrivePlusCreateController(motorPort, ioPort, deviceName,
 //! movingPoll, idlePoll)`: connects the asyn octet port, probes the single axis
-//! (firmware version, terminator, switch config, encoder flag) and attaches it
-//! to a `DTYP`-keyed motor device support. The `DTYP` key is the `motorPort`
-//! string (one controller = one axis). `deviceName` is empty for a
-//! non-party-mode drive.
+//! (firmware version, output EOS, switch config, encoder flag) and creates
+//! controller port `motorPort`, whose one axis records address as
+//! `@asyn(motorPort,0)`. `deviceName` is empty for a non-party-mode drive.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::{AsynMotor, Model1Motor};
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_ip;
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use motor_common::connect::{EosRefusal, connect_with_eos, set_eos_ignored};
 use motor_common::iocsh::{
-    arg_int_opt, arg_str_opt, arg_str_req, opt_double, opt_string, poll_intervals, req_string,
+    arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_string,
+};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::{Controller, asyn_user, model1_device, register_controller_port};
+
+use crate::drv_im483::{
+    DrvIm483Axis, IM483PL_NUM_CARDS, IM483SM_NUM_CARDS, Im483Controller, im483pl_probe,
+    im483sm_probe,
+};
+use crate::drv_mdrive::{DrvMDriveAxis, MDRIVE_NUM_CARDS, MDriveController, mdrive_probe};
+use crate::mdriveplus::{
+    DRIVER_NAME, INPUT_EOS, ImsLine, ImsMDrivePlusAxis, ImsParams, OUTPUT_EOS,
 };
 
-use crate::mdriveplus::ImsMDrivePlusAxis;
+/// C `IMS_TIMEOUT` (ImsMDrivePlusMotorAxis.h:17).
+const IMS_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Default communication timeout when the `timeoutMs` arg is omitted.
-const DEFAULT_TIMEOUT_MS: f64 = 2000.0;
-
-/// Build the `ImsMDrivePlusCreateController(motorPort, ioPort, [deviceName],
-/// [movingPollMs], [idlePollMs], [timeoutMs])` command bound to `holder`.
-pub fn ims_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// Build the `ImsMDrivePlusCreateController(motorPortName, IOPortName, devName,
+/// movingPollPeriod, idlePollPeriod)` command, periods in ms.
+pub fn ims_create_controller_command() -> CommandDef {
     CommandDef::new(
         "ImsMDrivePlusCreateController",
         vec![
-            arg_str_req("motorPort"),
-            arg_str_req("ioPort"),
-            arg_str_opt("deviceName"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-            arg_int_opt("timeoutMs"),
+            arg_str_req("Motor port name"),
+            arg_str_req("IO port name"),
+            arg_str_opt("Device name"),
+            arg_double_opt("Moving poll period (ms)"),
+            arg_double_opt("Idle poll period (ms)"),
         ],
-        "ImsMDrivePlusCreateController(motorPort, ioPort, [deviceName], [movingPollMs], \
-         [idlePollMs], [timeoutMs]) - Create an IMS MDrivePlus controller (DTYP motorPort) \
-         with one axis; deviceName is prepended in party mode (empty = none)",
+        "ImsMDrivePlusCreateController(motorPortName, IOPortName, devName, movingPollPeriod, \
+         idlePollPeriod)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let io_port = req_string(args, 1, "ioPort")?;
-            let device_name = opt_string(args, 2).unwrap_or_default();
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-            let timeout_ms = opt_double(args, 5, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
+            let motor_port = req_string(args, 0, "Motor port name")?;
+            let io_port = req_string(args, 1, "IO port name")?;
+            let device_name = opt_string(args, 2)?.unwrap_or_default();
+            let moving_poll_ms = opt_double(args, 3, 0.0, "Moving poll period (ms)")?;
+            let idle_poll_ms = opt_double(args, 4, 0.0, "Idle poll period (ms)")?;
 
-            let handle = connect_ip(&io_port, Duration::from_millis(timeout_ms.max(0.0) as u64))?;
-            let axis = ImsMDrivePlusAxis::new(handle, device_name.clone())
-                .map_err(|e| format!("ImsMDrivePlusCreateController: axis setup failed: {e}"))?;
+            // C prints and carries on with the user of a missing port
+            // (ImsMDrivePlusMotorController.cpp:69-74).
+            let (handle, connected) =
+                SyncIOHandle::connect_port(&io_port, 0, IMS_TIMEOUT, InterfaceType::Octet);
+            if connected.is_err() {
+                println!(
+                    "\n\n{DRIVER_NAME}:ImsMDrivePlusMotorController(): ERROR connecting to \
+                     Controller's IO port={io_port}\n"
+                );
+            }
+            println!(
+                "{DRIVER_NAME}:ImsMDrivePlusMotorController(): motorPortName={motor_port}, \
+                 IOPortName={io_port}, devName={device_name} "
+            );
+            set_eos_ignored(&handle, INPUT_EOS, OUTPUT_EOS);
+            let line = ImsLine::new(handle, device_name, &motor_port);
+            // The port C's constructor builds first; it needs the line here.
+            let owner = ctx.db().scan_control().interrupt_gate();
+            let port =
+                register_controller_port(owner, &motor_port, 1, ImsParams::new(line.clone()))?;
+            let mut axis = ImsMDrivePlusAxis::new(line, &motor_port);
+            axis.post_params_to(port)
+                .map_err(|e| format!("ImsMDrivePlusCreateController: {e}"))?;
 
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(ctx, motor_port.clone(), motor, moving_poll_ms, idle_poll_ms);
+            // C startPoller, ImsMDrivePlusMotorController.cpp:101
+            let poller = Controller::new();
+            poller.install(asyn_user(&motor_port, 0), motor)?;
+            poller.start(&motor_port, moving_poll_ms as u64, idle_poll_ms as u64, 2);
 
-            let dev = if device_name.is_empty() {
-                "(none)".to_string()
-            } else {
-                device_name
-            };
-            println!(
-                "ImsMDrivePlusCreateController: motorPort={motor_port} ioPort={io_port} \
-                 deviceName={dev} poll=[{moving_poll_ms}/{idle_poll_ms}]ms"
-            );
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// drvIM483.h's `COMM_TIMEOUT`.
+const COMM_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `device(motor,VME_IO,devIM483PL,"IM483PL")` (devImsMotor.dbd).
+static DEV_IM483PL: DevSup = model1_device("devIM483PL", "IM483PL");
+
+static IM483PL: Model1 = Model1::new(&DEV_IM483PL, IM483PL_NUM_CARDS, SCAN_RATE);
+
+/// `IM483PLSetup(num_cards, scan_rate)`.
+pub fn im483pl_setup_command() -> CommandDef {
+    IM483PL.register_report("drvIM483PL", |cards| {
+        cards.report("IM483PL", |card, port| {
+            // C clears `ident`: no identification message (drvIM483PL.cc:541).
+            format!("    IM483PL controller #{card}, port={port}, id:  \n")
+        })
+    });
+    IM483PL.setup_command("IM483PLSetup")
+}
+
+/// ImsRegister.cc's `Config` arguments.
+fn config_args() -> Vec<ArgDesc> {
+    vec![
+        arg_int_req("Card being configured"),
+        arg_str_req("asyn port name"),
+    ]
+}
+
+/// `IM483PLConfig(card, name)`. `motor_init` at iocInit connects and probes
+/// the card; a card with no answering axis is left unconfigured.
+pub fn im483pl_config_command() -> CommandDef {
+    CommandDef::new(
+        "IM483PLConfig",
+        config_args(),
+        "IM483PLConfig(card, name)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !IM483PL.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            IM483PL.config(card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    COMM_TIMEOUT,
+                    b"\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let controller = Im483Controller::new(handle);
+                let axes = im483pl_probe(&controller);
+                let controller = Arc::new(Mutex::new(controller));
+                for signal in 0..axes {
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(
+                        DrvIm483Axis::im483pl(controller.clone(), signal),
+                    ));
+                    init.axis(signal as i32, motor);
+                }
+                if axes > 0 {
+                    init.describe(asyn_port);
+                }
+            })?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `device(motor,VME_IO,devIM483SM,"IM483SM")` (devImsMotor.dbd).
+static DEV_IM483SM: DevSup = model1_device("devIM483SM", "IM483SM");
+
+static IM483SM: Model1 = Model1::new(&DEV_IM483SM, IM483SM_NUM_CARDS, SCAN_RATE);
+
+/// `IM483SMSetup(num_cards, scan_rate)`.
+pub fn im483sm_setup_command() -> CommandDef {
+    IM483SM.register_report("drvIM483SM", |cards| {
+        cards.report("IM483SM", |card, line| {
+            format!("    IM483SM controller #{card}, {line} \n")
+        })
+    });
+    IM483SM.setup_command("IM483SMSetup")
+}
+
+/// `IM483SMConfig(card, name)`: one axis per card, probed at iocInit as for
+/// [`im483pl_config_command`].
+pub fn im483sm_config_command() -> CommandDef {
+    CommandDef::new(
+        "IM483SMConfig",
+        config_args(),
+        "IM483SMConfig(card, name)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !IM483SM.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            IM483SM.config(card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    COMM_TIMEOUT,
+                    b"\r\n",
+                    b"\r",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let controller = Im483Controller::new(handle);
+                let Some(ident) = im483sm_probe(&controller) else {
+                    return;
+                };
+                let controller = Arc::new(Mutex::new(controller));
+                let motor: Arc<Mutex<dyn Model1Motor>> =
+                    Arc::new(Mutex::new(DrvIm483Axis::im483sm(controller)));
+                init.axis(0, motor);
+                init.describe(format!("port={asyn_port}, id: {ident}"));
+            })?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `device(motor,VME_IO,devMDrive,"MDrive")` (devImsMotor.dbd).
+static DEV_MDRIVE: DevSup = model1_device("devMDrive", "MDrive");
+
+static MDRIVE: Model1 = Model1::new(&DEV_MDRIVE, MDRIVE_NUM_CARDS, SCAN_RATE);
+
+/// `MDriveSetup(num_cards, scan_rate)`.
+pub fn mdrive_setup_command() -> CommandDef {
+    MDRIVE.register_report("drvMDrive", |cards| {
+        cards.report("MDrive", |card, line| {
+            format!("    MDrive controller #{card}, {line} \n")
+        })
+    });
+    MDRIVE.setup_command("MDriveSetup")
+}
+
+/// `MDriveConfig(card, name)`: probes the chain at iocInit as for
+/// [`im483pl_config_command`].
+pub fn mdrive_config_command() -> CommandDef {
+    CommandDef::new(
+        "MDriveConfig",
+        config_args(),
+        "MDriveConfig(card, name)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !MDRIVE.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            MDRIVE.config(card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    COMM_TIMEOUT,
+                    b"\r\n",
+                    b"\n",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let controller = MDriveController::new(handle);
+                let (ident, drives) = mdrive_probe(&controller);
+                if drives > 0 {
+                    init.describe(format!("port={asyn_port}, id: {ident}"));
+                }
+                let controller = Arc::new(Mutex::new(controller));
+                for signal in 0..drives {
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(
+                        DrvMDriveAxis::new(controller.clone(), card, signal, &ident),
+                    ));
+                    init.axis(signal as i32, motor);
+                }
+            })?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod one_poller {
+    use super::*;
+    use motor_common::testing::{LineRig, pollers_after};
+
+    /// C ImsMDrivePlusMotorController's one asynMotorController poller.
+    #[epics_rs::base::epics_test]
+    async fn ims_mdrive_plus_create_controller_polls_on_one_poller() {
+        let (line, _io) = LineRig::new("mdrivePlusLine", |last| {
+            if last.contains("PR VR") {
+                "1.000".into()
+            } else {
+                "0".into()
+            }
+        });
+        let args = vec![
+            ArgValue::String("mdrivePlus".into()),
+            ArgValue::String("mdrivePlusLine".into()),
+            ArgValue::String("".into()),
+            ArgValue::Double(100.0),
+            ArgValue::Double(1000.0),
+        ];
+        let cmd = ims_create_controller_command();
+        assert_eq!(pollers_after(cmd, args).await, 1);
+        assert!(!line.sent().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
+
+    /// drvIM483PL.cc's drvet `report` (drvIM483PL.cc:147-171), which `dbior`
+    /// runs; the IM483PL has no identification message.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_im483pl_card() {
+        let setup = im483pl_setup_command();
+        assert_eq!(
+            driver_report("drvIM483PL", 0),
+            "    No IM483PL controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("im483plRepLine", |_| "0".into());
+        let config = vec![int(1), ArgValue::String("im483plRepLine".into())];
+        run_command(im483pl_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvIM483PL", 0),
+            "    IM483PL controller 0 connection failed.\n    IM483PL controller #1, \
+             port=im483plRepLine, id:  \n"
+        );
+    }
+
+    /// drvMDrive.cc's drvet `report` (drvMDrive.cc:162-186), which `dbior`
+    /// runs, naming the chain by its first drive's `PR VR`.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mdrive_chain() {
+        let setup = mdrive_setup_command();
+        assert_eq!(
+            driver_report("drvMDrive", 0),
+            "    No MDrive controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("mdriveRepLine", |cmd| {
+            if cmd.ends_with("PR VR") { "3.009" } else { "0" }.into()
+        });
+        let config = vec![int(1), ArgValue::String("mdriveRepLine".into())];
+        run_command(mdrive_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvMDrive", 0),
+            "    MDrive controller 0 connection failed.\n    MDrive controller #1, \
+             port=mdriveRepLine, id: 3.009 \n"
+        );
+    }
+
+    /// drvIM483SM.cc's drvet `report` (drvIM483SM.cc:145-169), which `dbior`
+    /// runs, naming the card by its sign-on.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_im483sm_card() {
+        let setup = im483sm_setup_command();
+        assert_eq!(
+            driver_report("drvIM483SM", 0),
+            "    No IM483SM controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("im483smRepLine", |_| "X".into());
+        let config = vec![int(1), ArgValue::String("im483smRepLine".into())];
+        run_command(im483sm_config_command(), config).await;
+        let ident = vec!["X"; 26].join(" ");
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvIM483SM", 0),
+            format!(
+                "    IM483SM controller 0 connection failed.\n    IM483SM controller #1, \
+                 port=im483smRepLine, id: {ident} \n"
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod extra_params {
+    use super::*;
+    use epics_rs::asyn::manager::PortManager;
+    use motor_common::testing::{LineRig, run_command};
+
+    /// A controller `port` on line `line` with device name `A`, and the
+    /// controller port's user at axis 0.
+    async fn controller(port: &str, line: &str) -> (LineRig, SyncIOHandle) {
+        failing_controller(port, line, 1000.0, |_| false).await
+    }
+
+    /// [`controller`] polled at `idle_ms` when idle, with the writes `fails`
+    /// picks refused; `PR ER` answers 73.
+    async fn failing_controller(
+        port: &str,
+        line: &str,
+        idle_ms: f64,
+        fails: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (LineRig, SyncIOHandle) {
+        let reply = |last: &str| {
+            if last.contains("PR VR") {
+                "1.000".into()
+            } else if last.contains("PR LR") {
+                "1".into()
+            } else if last.contains("PR ER") {
+                "73".into()
+            } else {
+                "0".into()
+            }
+        };
+        let (rig, _io) = LineRig::failing(line, reply, fails);
+        let args = vec![
+            ArgValue::String(port.into()),
+            ArgValue::String(line.into()),
+            ArgValue::String("A".into()),
+            ArgValue::Double(100.0),
+            ArgValue::Double(idle_ms),
+        ];
+        run_command(ims_create_controller_command(), args).await;
+        let handle = PortManager::global().find_port_handle(port).unwrap();
+        (
+            rig,
+            SyncIOHandle::from_handle(handle, 0, IMS_TIMEOUT, InterfaceType::Octet).unwrap(),
+        )
+    }
+
+    /// The commands among `sent` that the poller does not send.
+    fn not_polled(sent: Vec<String>) -> Vec<String> {
+        sent.into_iter()
+            .filter(|s| !s.starts_with("APR "))
+            .collect()
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:325-333 and
+    /// ImsMDrivePlusMotorAxis.cpp:515-536: IMS_SAVETONVM 1 sends `S`, any
+    /// other value only stores it.
+    #[epics_rs::base::epics_test]
+    async fn save_to_nvm_sends_s_on_one() {
+        let (line, io) = controller("imsNvm", "imsNvmLine").await;
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        line.sent();
+        io.write_int32(save, 0).unwrap();
+        assert_eq!(io.read_int32(save).unwrap(), 0);
+        assert!(not_polled(line.sent()).is_empty());
+        io.write_int32(save, 1).unwrap();
+        assert_eq!(not_polled(line.sent()), ["AS"]);
+        assert_eq!(io.read_int32(save).unwrap(), 1);
+    }
+
+    /// asynPortDriver.cpp:1907: getAxis reads a user's -1 as axis 0, so an
+    /// IMS write there sends its command and stores the value on axis 0.
+    #[epics_rs::base::epics_test]
+    async fn an_ims_write_at_address_minus_one_is_axis_0() {
+        let (line, io) = controller("imsNvmAny", "imsNvmAnyLine").await;
+        let handle = PortManager::global().find_port_handle("imsNvmAny").unwrap();
+        let any = SyncIOHandle::from_handle(handle, -1, IMS_TIMEOUT, InterfaceType::Int32).unwrap();
+        let save = any.drv_user_create("IMS_SAVETONVM").unwrap();
+        line.sent();
+        any.write_int32(save, 1).unwrap();
+        assert_eq!(not_polled(line.sent()), ["AS"]);
+        assert_eq!(io.read_int32(save).unwrap(), 1);
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:317-318: an IMS write at an address
+    /// with no axis (a create that failed after the port) fails before the
+    /// val= print, the store or a command.
+    #[epics_rs::base::epics_test]
+    async fn an_ims_write_with_no_axis_does_nothing() {
+        use epics_rs::asyn::registry::open_owner;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let (line, handle) = LineRig::new("imsNoAxisLine", |_| "0".into());
+        let ims = ImsLine::new(handle, "A".into(), "imsNoAxis");
+        let port =
+            register_controller_port(&open_owner(), "imsNoAxis", 1, ImsParams::new(ims)).unwrap();
+        let io = SyncIOHandle::from_handle(port, 0, IMS_TIMEOUT, InterfaceType::Int32).unwrap();
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        let path = std::env::temp_dir().join(format!("imsNoAxis-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        let all = TraceMask::IO_DRIVER | TraceMask::FLOW | TraceMask::ERROR;
+        trace.set_trace_mask(Some("imsNoAxis"), all);
+        trace.set_trace_file(Some("imsNoAxis"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("imsNoAxis", 0, TraceFile::File(file));
+        assert!(io.write_int32(save, 1).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!text.contains(DRIVER_NAME), "{text}");
+        assert!(line.sent().is_empty());
+        assert_ne!(io.read_int32(save).ok(), Some(1));
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:525, :552 and
+    /// ImsMDrivePlusMotorController.cpp:369: a sent `S` or `CF` prints its
+    /// writeController line, then its axis method's IO_DRIVER line.
+    #[epics_rs::base::epics_test]
+    async fn a_sent_ims_write_prints_its_io_driver_lines() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let (line, io) = failing_controller("imsIoNvm", "imsIoNvmLine", 3.6e6, |_| false).await;
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        let path = std::env::temp_dir().join(format!("imsIoNvm-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("imsIoNvm"), TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some("imsIoNvm"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("imsIoNvm", 0, TraceFile::File(file));
+        line.sent();
+        io.write_int32(save, 1).unwrap();
+        io.write_int32(clear, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .filter(|l| !l.contains("writeInt32"))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "ImsMDrivePlusMotorDriver:writeController(): deviceName=A, command=AS",
+                "ImsMDrivePlusMotorDriver:saveToNVM(): Saved to NVM",
+                "ImsMDrivePlusMotorDriver:writeController(): deviceName=A, command=ACF",
+                "ImsMDrivePlusMotorDriver:clearLockedRotor(): Clear Locked Rotor Error",
+            ],
+            "{text}"
+        );
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:528-532 then
+    /// ImsMDrivePlusMotorController.cpp:328: a failed `S` runs saveToNVM's
+    /// handleAxisError before writeInt32's own ERROR line.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_save_to_nvm_prints_the_drive_s_error_code() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let (line, io) =
+            failing_controller("imsNvmErr", "imsNvmErrLine", 1000.0, |l| l == "AS").await;
+        let save = io.drv_user_create("IMS_SAVETONVM").unwrap();
+        let path = std::env::temp_dir().join(format!("imsNvmErr-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some("imsNvmErr"), TraceMask::ERROR);
+        trace.set_trace_file(Some("imsNvmErr"), TraceFile::File(file.clone()));
+        trace.set_device_trace_file("imsNvmErr", 0, TraceFile::File(file));
+        line.sent();
+        assert!(io.write_int32(save, 1).is_err());
+        // `APR ER` is among the poll's `APR ` commands; the line below is its reply.
+        assert_eq!(not_polled(line.sent()), ["AS"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<_> = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "ImsMDrivePlusMotorDriver:handleAxisError(): ImsMDrivePlusMotorDriver:saveToNVM(): \
+                 ERROR saving to NVM, 73:'Tried to save while moving'",
+                "ImsMDrivePlusMotorDriver:writeInt32: ERROR saving to NVM",
+            ],
+            "{text}"
+        );
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:582 under writeInt32: a failed
+    /// IMS_CLEARLRERROR sets the axis's problem bit, which reaches the addr-0
+    /// MOTOR_STATUS_PROBLEM and MOTOR_STATUS params until the next good poll
+    /// (:497) clears it.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_clear_lr_error_sets_the_problem_params() {
+        // An hour's idle period: the first poll is the only one.
+        let (_line, io) =
+            failing_controller("imsLrProb", "imsLrProbLine", 3.6e6, |l| l == "ACF").await;
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
+        let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
+        let locked = io.drv_user_create("IMS_LOCKEDROTOR").unwrap();
+        assert_eq!(io.read_int32(locked).unwrap(), 1);
+        assert_eq!(io.read_int32(problem).unwrap(), 0);
+        assert!(io.write_int32(clear, 1).is_err());
+        assert_eq!(io.read_int32(problem).unwrap(), 1);
+        assert_ne!(io.read_int32(msta).unwrap() & 1 << 9, 0);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:497: the good poll after a failed
+    /// IMS_CLEARLRERROR clears MOTOR_STATUS_PROBLEM again.
+    #[epics_rs::base::epics_test]
+    async fn a_good_poll_clears_the_problem_param() {
+        let (_line, io) =
+            failing_controller("imsLrClr", "imsLrClrLine", 50.0, |l| l == "ACF").await;
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
+        assert!(io.write_int32(clear, 1).is_err());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while io.read_int32(problem).unwrap() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "problem never cleared"
+            );
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:371-373, ImsMDrivePlusMotorAxis.cpp:
+    /// 494-497: a failed IO sets the controller's addr-0 COMMS_ERROR param,
+    /// not MSTA; a good poll clears it.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_poll_sets_only_the_comms_error_param() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dead = Arc::new(AtomicBool::new(false));
+        let fails = {
+            let dead = dead.clone();
+            move |l: &str| l == "APR P" && dead.load(Ordering::Relaxed)
+        };
+        let (_line, io) = failing_controller("imsComms", "imsCommsLine", 1000.0, fails).await;
+        let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
+        let msta = io.drv_user_create("MOTOR_STATUS").unwrap();
+        let until = async |want: i32| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while io.read_int32(comms).unwrap_or(-1) != want {
+                assert!(std::time::Instant::now() < deadline, "comms never {want}");
+                epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        assert_eq!(io.read_int32(comms).unwrap(), 0);
+        dead.store(true, Ordering::Relaxed);
+        until(1).await;
+        assert_eq!(io.read_int32(msta).unwrap() & 1 << 12, 0);
+        dead.store(false, Ordering::Relaxed);
+        until(0).await;
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:403-406, ImsMDrivePlusMotorAxis.cpp:
+    /// 504: a first poll that fails posts COMMS_ERROR 1 with its problem
+    /// bit, in the same callParamCallbacks.
+    #[epics_rs::base::epics_test]
+    async fn a_failed_first_poll_leaves_comms_error_set() {
+        let (_line, io) =
+            failing_controller("imsComms1", "imsComms1Line", 3.6e6, |l| l == "APR P").await;
+        let comms = io.drv_user_create("MOTOR_STATUS_COMMS_ERROR").unwrap();
+        let problem = io.drv_user_create("MOTOR_STATUS_PROBLEM").unwrap();
+        assert_eq!(io.read_int32(problem).unwrap(), 1);
+        assert_eq!(io.read_int32(comms).unwrap(), 1);
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:335-343 and
+    /// ImsMDrivePlusMotorAxis.cpp:542-563: IMS_CLEARLRERROR 1 sends `CF`.
+    #[epics_rs::base::epics_test]
+    async fn clear_lr_error_sends_cf_on_one() {
+        let (line, io) = controller("imsClrLr", "imsClrLrLine").await;
+        let clear = io.drv_user_create("IMS_CLEARLRERROR").unwrap();
+        line.sent();
+        io.write_int32(clear, 0).unwrap();
+        assert!(not_polled(line.sent()).is_empty());
+        io.write_int32(clear, 1).unwrap();
+        assert_eq!(not_polled(line.sent()), ["ACF"]);
+        assert_eq!(io.read_int32(clear).unwrap(), 1);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:479-484: the poll reads `PR LR` after
+    /// `PR C2` into IMS_LOCKEDROTOR.
+    #[epics_rs::base::epics_test]
+    async fn the_poll_reads_the_locked_rotor_flag() {
+        let (line, io) = controller("imsLr", "imsLrLine").await;
+        let locked = io.drv_user_create("IMS_LOCKEDROTOR").unwrap();
+        assert_eq!(io.read_int32(locked).unwrap(), 1);
+        let sent = line.sent();
+        let c2 = sent.iter().position(|s| s == "APR C2").unwrap();
+        assert_eq!(sent[c2 + 1], "APR LR", "{sent:?}");
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    fn trimmed(line: &LineRig) -> Vec<String> {
+        line.sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect()
+    }
+
+    /// drvIM483PL.cc:601: `motor_init` reads each axis's status once, past
+    /// the probe, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn im483pl_motor_init_reads_each_status_once() {
+        let int = ArgValue::Int;
+        run_command(im483pl_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("im483plInitLine", |cmd| {
+            let cmd = cmd.trim_end();
+            match cmd {
+                "A Z 0" => "A Z 014".into(),
+                "B Z 0" => "B Z 03".into(),
+                c if !c.starts_with(['A', 'B']) => String::new(),
+                c => format!("{c} 0"),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("im483plInitLine".into())];
+        run_command(im483pl_config_command(), config).await;
+        drvsup_init().await;
+        let mut want: Vec<String> = ["A Z 0", "B Z 0", "C Z 0", "C Z 0", "C Z 0"]
+            .map(String::from)
+            .to_vec();
+        for name in ["A", "B"] {
+            let queries = ["^", "Z 0", "] 0", "] 1", "z 0"];
+            want.extend(queries.iter().map(|q| format!("{name} {q}")));
+        }
+        assert_eq!(trimmed(&line), want);
+        let db = record_init(
+            r##"
+record(motor, "im483pl:m1") { field(DTYP, "IM483PL") field(OUT, "#C0 S0 @") }
+record(motor, "im483pl:m2") { field(DTYP, "IM483PL") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("im483pl:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("im483pl:m2.RMP").unwrap(), EpicsValue::Long(3));
+    }
+
+    /// drvIM483SM.cc:633: the one axis's status is read once, past the
+    /// sign-on.
+    #[epics_rs::base::epics_test]
+    async fn im483sm_motor_init_reads_the_status_once() {
+        let int = ArgValue::Int;
+        run_command(im483sm_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("im483smInitLine", |cmd| match cmd.trim_end() {
+            "Z 0" => "Z 0  7".into(),
+            "" => "IM483SM".into(),
+            c => format!("{c}   0"),
+        });
+        let config = vec![int(0), ArgValue::String("im483smInitLine".into())];
+        run_command(im483sm_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(trimmed(&line), ["\u{3}", "", "^", "Z 0", "] 0", "] 1"]);
+        let db = record_init(
+            r##"
+record(motor, "im483sm:m1") { field(DTYP, "IM483SM") field(OUT, "#C0 S0 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("im483sm:m1.RMP").unwrap(), EpicsValue::Long(7));
+    }
+
+    /// drvMDrive.cc:633-725: `motor_init` reads each drive's encoder and
+    /// inputs, then its status, before the next drive's; the record starts
+    /// from that read.
+    #[epics_rs::base::epics_test]
+    async fn mdrive_motor_init_reads_each_status_after_its_own_inputs() {
+        let int = ArgValue::Int;
+        run_command(mdrive_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("mdriveInitLine", |cmd| {
+            let cmd = cmd.trim_end();
+            let (drive, query) = cmd.split_at(1);
+            match (drive, query) {
+                ("1" | "2", "PR VR") => "3.009".into(),
+                (_, "PR VR") => String::new(),
+                ("1", "PR PN") => "MDI17E".into(),
+                ("1", "PR P") => "14".into(),
+                ("2", "PR P") => "3".into(),
+                (_, "PR S1") => "2,0".into(),
+                (_, "PR S2") => "3,0".into(),
+                (_, q) if q.starts_with("PR S") => "0,0".into(),
+                _ => "0".into(),
+            }
+        });
+        let config = vec![int(0), ArgValue::String("mdriveInitLine".into())];
+        run_command(mdrive_config_command(), config).await;
+        drvsup_init().await;
+        let mut want: Vec<String> = ["1PR VR", "2PR VR", "3PR VR", "3PR VR", "3PR VR"]
+            .map(String::from)
+            .to_vec();
+        for (drive, encoder) in [("1", true), ("2", false)] {
+            let mut queries = vec!["PR PN", "PR S1", "PR S2", "PR S3", "PR S4"];
+            queries.extend(["PR MV", "PR P", "PR I1", "PR I2"]);
+            if encoder {
+                queries.push("PR C2");
+            }
+            queries.push("PR V");
+            want.extend(queries.iter().map(|q| format!("{drive}{q}")));
+        }
+        assert_eq!(trimmed(&line), want);
+        let db = record_init(
+            r##"
+record(motor, "mdrive:m1") { field(DTYP, "MDrive") field(OUT, "#C0 S0 @") }
+record(motor, "mdrive:m2") { field(DTYP, "MDrive") field(OUT, "#C0 S1 @") }
+"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("mdrive:m1.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("mdrive:m2.RMP").unwrap(), EpicsValue::Long(3));
+    }
 }

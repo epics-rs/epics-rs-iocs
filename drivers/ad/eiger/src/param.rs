@@ -12,11 +12,14 @@
 //! `PortHandle`). One codec, two sinks — no duplicated encode/decode logic.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use serde_json::Value;
 
 use crate::rest::{DEFAULT_TIMEOUT, RestApi, RestError, RestResult, Sys};
+use crate::trace::Trace;
 
 /// Value flavour of a detector parameter (C `eiger_param_type_t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,18 +149,23 @@ pub fn parse_meta(
     sys: Sys,
     custom_enum: bool,
     existing: &Meta,
-) -> Result<Meta, String> {
+) -> Result<Meta, MetaError> {
+    let type_err = |msg: String| MetaError {
+        function: "parseType",
+        msg,
+        summary: "unable to parse parameter type",
+    };
     let type_str = body
         .get("value_type")
         .and_then(Value::as_str)
-        .ok_or("unable to find 'value_type' json field")?;
+        .ok_or_else(|| type_err("unable to find 'value_type' json field".into()))?;
 
     // allowed_values wins over value_type; a write-only access_mode wins over both.
     let mut kind = if body.get("allowed_values").is_some() {
         Kind::Enum
     } else {
         kind_from_type_str(type_str)
-            .ok_or_else(|| format!("unrecognized value type '{type_str}'"))?
+            .ok_or_else(|| type_err(format!("unrecognized value type '{type_str}'")))?
     };
     let access_str = body.get("access_mode").and_then(Value::as_str);
     if access_str.is_some_and(|a| a.starts_with('w')) {
@@ -198,26 +206,36 @@ pub fn parse_meta(
     // Limits are typed by value_type, not by the promoted kind: an enum with an
     // integer value_type still reports numeric min/max we must not misread.
     let numeric_char = type_str.chars().next().unwrap_or('\0');
+    // C parseMinMax names the token text it could not scan.
+    let limit_err = |key: &str, v: &Value, what: &str| MetaError {
+        function: "parseMinMax",
+        msg: format!("failed to parse '{}' as {what}", raw_value_text(v)),
+        summary: if key == "min" {
+            "unable to parse min limit"
+        } else {
+            "unable to parse max limit"
+        },
+    };
     match meta.kind {
         Kind::Int | Kind::UInt | Kind::Double => {
             let (min, max) = (body.get("min"), body.get("max"));
             if numeric_char == 'i' || numeric_char == 'u' {
                 meta.min_int = min.and_then(json_as_i32);
                 meta.max_int = max.and_then(json_as_i32);
-                if min.is_some() && meta.min_int.is_none() {
-                    return Err("failed to parse 'min' as integer".into());
+                if let (Some(v), None) = (min, meta.min_int) {
+                    return Err(limit_err("min", v, "integer"));
                 }
-                if max.is_some() && meta.max_int.is_none() {
-                    return Err("failed to parse 'max' as integer".into());
+                if let (Some(v), None) = (max, meta.max_int) {
+                    return Err(limit_err("max", v, "integer"));
                 }
             } else if numeric_char == 'f' {
                 meta.min_f64 = min.and_then(json_as_f64);
                 meta.max_f64 = max.and_then(json_as_f64);
-                if min.is_some() && meta.min_f64.is_none() {
-                    return Err("failed to parse 'min' as double".into());
+                if let (Some(v), None) = (min, meta.min_f64) {
+                    return Err(limit_err("min", v, "double"));
                 }
-                if max.is_some() && meta.max_f64.is_none() {
-                    return Err("failed to parse 'max' as double".into());
+                if let (Some(v), None) = (max, meta.max_f64) {
+                    return Err(limit_err("max", v, "double"));
                 }
             }
         }
@@ -229,6 +247,15 @@ pub fn parse_meta(
     }
 
     Ok(meta)
+}
+
+/// A metadata failure as `baseFetch` reports it: the line the parse helper
+/// prints under its own name, then `baseFetch`'s summary.
+#[derive(Debug)]
+pub struct MetaError {
+    pub function: &'static str,
+    pub msg: String,
+    pub summary: &'static str,
 }
 
 /// Accept a JSON number, or a JSON string holding a number, as C's `sscanf`
@@ -289,19 +316,11 @@ pub fn encode_int(meta: &Meta, value: i32) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-/// Encode a double for the wire.
-///
-/// C prints with `setprecision(long double digits10 + 2)`; Rust's default
-/// `Display` for f64 is the shortest representation that round-trips exactly,
-/// which is the same number with less noise.
+/// Encode a double for the wire: C `toString(double)`
+/// (eigerParam.cpp:241-246), `setprecision(long double digits10 + 2)` on a
+/// default-format ostream, which is `%.20g`.
 pub fn encode_f64(value: f64) -> String {
-    if value == value.trunc() && value.is_finite() && value.abs() < 1e15 {
-        // Keep integral doubles JSON-numeric ("1" not "1.0" is fine either way,
-        // but a trailing .0 keeps them distinguishable from ints on the wire).
-        format!("{value:.1}")
-    } else {
-        format!("{value}")
-    }
+    format!("{:.20}", CFloat(value).g())
 }
 
 /// Encode a string for the wire: JSON-quoted (C `toString(std::string)`).
@@ -444,8 +463,9 @@ impl ParamRegistry {
     /// (C `EigerParam::setEnumValues`).
     pub fn set_enum_values(&mut self, index: usize, values: &[&str]) {
         if let Some(d) = self.defs.get_mut(&index) {
+            // C leaves mType alone: the first fetch makes it an enum
+            // (eigerParam.cpp:359-363, :475-476).
             d.meta.enum_values = values.iter().map(|s| s.to_string()).collect();
-            d.meta.kind = Kind::Enum;
             d.custom_enum = true;
         }
     }
@@ -466,13 +486,15 @@ impl ParamRegistry {
 pub struct ParamOps {
     pub rest: RestApi,
     pub reg: parking_lot::Mutex<ParamRegistry>,
+    pub trace: Trace,
 }
 
 impl ParamOps {
-    pub fn new(rest: RestApi, reg: ParamRegistry) -> Self {
+    pub fn new(rest: RestApi, reg: ParamRegistry, trace: Trace) -> Self {
         Self {
             rest,
             reg: parking_lot::Mutex::new(reg),
+            trace,
         }
     }
 
@@ -502,16 +524,51 @@ impl ParamOps {
     /// the param library, and so does this.
     pub fn fetch(&self, index: usize) -> RestResult<Vec<ParamUpdate>> {
         let def = self.def(index)?;
-        if !def.is_remote() || def.meta.kind == Kind::Command || def.meta.access == Access::Wo {
+        let local = !def.is_remote() || def.meta.kind == Kind::Command;
+        if local || def.meta.access == Access::Wo {
+            // A local or command param skips to the typed fetch's line, which
+            // prints fetch(void)'s local: an empty string, or an uninitialized
+            // int or double, a C defect not copied (eigerParam.cpp:617, :662,
+            // :695).
+            if local && matches!(def.asyn_type, AsynType::Octet) {
+                self.trace
+                    .param_flow(&def.asyn_name, "fetch<string>", format_args!(""));
+            }
             return Ok(Vec::new());
         }
 
-        let body = self.rest.get(def.sys, &def.remote_name, DEFAULT_TIMEOUT)?;
+        let name = &def.asyn_name;
+        let typed = match def.asyn_type {
+            AsynType::Int32 => "fetch<int>",
+            AsynType::Float64 => "fetch<double>",
+            AsynType::Octet => "fetch<string>",
+        };
+        // baseFetch's own line, then the typed fetch that called it.
+        let base_failed = |summary: &str, buffer: &str| {
+            self.trace.param_err(
+                name,
+                "baseFetch",
+                &format!("[param={}] {summary}\n[{buffer}]", def.remote_name),
+            );
+            self.trace.param_err(
+                name,
+                typed,
+                &format!("[param={name}] underlying baseFetch failed"),
+            );
+        };
+
+        // C ignores RestAPI::get's status and parses whatever it left in the
+        // buffer, which is empty after a failed request.
+        let body = match self.rest.get(def.sys, &def.remote_name, DEFAULT_TIMEOUT) {
+            Ok(body) => body,
+            Err(e) => {
+                base_failed("unable to parse json response", "");
+                return Err(e);
+            }
+        };
         let json: Value = serde_json::from_str(&body).map_err(|e| {
-            RestError::Parse(format!(
-                "[{}] unable to parse json response: {e}",
-                def.asyn_name
-            ))
+            base_failed("unable to parse json response", &body);
+            RestError::Parse(format!("[{name}] unable to parse json response: {e}"))
         })?;
 
         // The metadata is re-read on every fetch (as in C, which re-parses
@@ -522,17 +579,25 @@ impl ParamOps {
                 .defs
                 .get_mut(&index)
                 .ok_or_else(|| RestError::Parse(format!("no eiger parameter at index {index}")))?;
-            let fresh = parse_meta(&json, d.sys, d.custom_enum, &d.meta)
-                .map_err(|e| RestError::Parse(format!("[{}] {e}\n[{body}]", d.asyn_name)))?;
-            // A custom enum keeps its hard-coded ordering forever.
-            d.meta = fresh;
+            match parse_meta(&json, d.sys, d.custom_enum, &d.meta) {
+                Ok(fresh) => d.meta = fresh,
+                Err(e) => {
+                    self.trace.param_err(name, e.function, &e.msg);
+                    base_failed(e.summary, &body);
+                    return Err(RestError::Parse(format!("[{name}] {}", e.msg)));
+                }
+            }
             d.meta.clone()
         };
 
-        let raw = json
-            .get("value")
-            .map(raw_value_text)
-            .ok_or_else(|| RestError::Parse(format!("[{}] no 'value' in reply", def.asyn_name)))?;
+        let Some(raw) = json.get("value").map(raw_value_text) else {
+            self.trace
+                .param_err(name, "parseValue", "unable to find 'value' json field");
+            base_failed("unable to parse raw value", &body);
+            return Err(RestError::Parse(format!("[{name}] no 'value' in reply")));
+        };
+        self.trace
+            .param_flow(name, "baseFetch", format_args!("{raw}"));
 
         self.decode_into_updates(&def, &meta, &raw)
     }
@@ -544,22 +609,17 @@ impl ParamOps {
         meta: &Meta,
         raw: &str,
     ) -> RestResult<Vec<ParamUpdate>> {
+        let name = &def.asyn_name;
         let bad = |what: &str| {
-            RestError::Parse(format!(
-                "[{}] couldn't parse value '{raw}' as {what}",
-                def.asyn_name
-            ))
+            let msg = format!("couldn't parse value '{raw}' as {what}");
+            self.trace.param_err(name, "parseValue", &msg);
+            RestError::Parse(format!("[{name}] {msg}"))
         };
 
         let update = match def.asyn_type {
             AsynType::Int32 => {
                 let v = match meta.kind {
-                    Kind::Enum => enum_index(&meta.enum_values, raw).ok_or_else(|| {
-                        RestError::Parse(format!(
-                            "[{}] '{raw}' is not one of {:?}",
-                            def.asyn_name, meta.enum_values
-                        ))
-                    })? as i32,
+                    Kind::Enum => self.enum_index_or_report(def, meta, raw)? as i32,
                     Kind::Bool => match raw {
                         "true" => 1,
                         "false" => 0,
@@ -569,10 +629,9 @@ impl ParamOps {
                         raw.trim().parse::<i32>().map_err(|_| bad("integer"))?
                     }
                     other => {
-                        return Err(RestError::Parse(format!(
-                            "[{}] unexpected type {other:?} for an Int32 parameter",
-                            def.asyn_name
-                        )));
+                        let msg = format!("[param={name}] unexpected type {}", other as i32);
+                        self.trace.param_err(name, "fetch<int>", &msg);
+                        return Err(RestError::Parse(msg));
                     }
                 };
                 ParamUpdate::Int32(def.index, v)
@@ -595,7 +654,31 @@ impl ParamOps {
             }
             AsynType::Octet => ParamUpdate::Octet(def.index, raw.to_string()),
         };
+        // fetch<string> returns before its line (eigerParam.cpp:687-693).
+        match update {
+            ParamUpdate::Int32(_, v) => {
+                self.trace
+                    .param_flow(name, "fetch<int>", format_args!("{v}"))
+            }
+            ParamUpdate::Float64(_, v) => {
+                self.trace
+                    .param_flow(name, "fetch<double>", format_args!("{v:.6}", v = CFloat(v)))
+            }
+            ParamUpdate::Octet(..) => {}
+        }
         Ok(vec![update])
+    }
+
+    /// C `getEnumIndex`, which reports a value the table does not hold.
+    fn enum_index_or_report(&self, def: &ParamDef, meta: &Meta, value: &str) -> RestResult<usize> {
+        enum_index(&meta.enum_values, value).ok_or_else(|| {
+            let msg = format!(
+                "[param={}] can't find index of value {value}",
+                def.asyn_name
+            );
+            self.trace.param_err(&def.asyn_name, "getEnumIndex", &msg);
+            RestError::Parse(msg)
+        })
     }
 
     /// PUT a raw (already JSON-encoded) value and re-fetch whatever the
@@ -606,14 +689,25 @@ impl ParamOps {
         raw: &str,
         timeout: Duration,
     ) -> RestResult<Vec<ParamUpdate>> {
+        let name = &def.asyn_name;
+        self.trace
+            .param_flow(name, "basePut", format_args!("'{raw}'"));
         if def.meta.access == Access::Ro {
-            return Err(RestError::Parse(format!(
-                "[{}] can't write to read-only parameter",
-                def.asyn_name
-            )));
+            let msg = format!("[param={name}] can't write to read-only parameter");
+            self.trace.param_err(name, "basePut", &msg);
+            return Err(RestError::Parse(msg));
         }
 
-        let reply = self.rest.put(def.sys, &def.remote_name, raw, timeout)?;
+        let reply = self
+            .rest
+            .put(def.sys, &def.remote_name, raw, timeout)
+            .inspect_err(|_| {
+                self.trace.param_err(
+                    name,
+                    "basePut",
+                    &format!("[param={name}] underlying RestAPI put failed"),
+                );
+            })?;
 
         // The reply is a JSON array of the detector-config parameters this write
         // changed. An empty body (or `""`) means nothing else moved.
@@ -625,9 +719,16 @@ impl ParamOps {
         let json: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
+                self.trace.param_err(
+                    name,
+                    "basePut",
+                    &format!(
+                        "[param={}] unable to parse json response\n[{reply}]",
+                        def.remote_name
+                    ),
+                );
                 return Err(RestError::Parse(format!(
-                    "[{}] unable to parse json response: {e}\n[{trimmed}]",
-                    def.asyn_name
+                    "[{name}] unable to parse json response: {e}"
                 )));
             }
         };
@@ -637,9 +738,8 @@ impl ParamOps {
             };
             // A failure to refresh one changed parameter must not abandon the
             // rest, and must not fail the write that already landed.
-            match self.fetch(idx) {
-                Ok(mut u) => updates.append(&mut u),
-                Err(e) => log::warn!("eiger: refetch of '{name}' after write failed: {e}"),
+            if let Ok(mut u) = self.fetch(idx) {
+                updates.append(&mut u);
             }
         }
         Ok(updates)
@@ -656,8 +756,18 @@ impl ParamOps {
         Ok(def)
     }
 
+    /// The line each C `put<T>` opens with, before anything can fail
+    /// (eigerParam.cpp:762, :804, :860, :906).
+    fn put_flow(&self, index: usize, function: &str, value: fmt::Arguments) {
+        let name = self.reg.lock().get(index).map(|d| d.asyn_name.clone());
+        if let Some(name) = name {
+            self.trace.param_flow(&name, function, value);
+        }
+    }
+
     /// Write an i32 (C `EigerParam::put(int)`).
     pub fn put_int(&self, index: usize, value: i32) -> RestResult<Vec<ParamUpdate>> {
+        self.put_flow(index, "put<int>", format_args!("{value}"));
         let def = self.ensure_meta(index)?;
         let mut updates = Vec::new();
         let mut value = value;
@@ -667,10 +777,9 @@ impl ParamOps {
                 def.meta.kind,
                 Kind::Bool | Kind::Int | Kind::UInt | Kind::Enum | Kind::Command
             ) {
-                return Err(RestError::Parse(format!(
-                    "[{}] expected bool, int, uint or enum",
-                    def.asyn_name
-                )));
+                let msg = format!("[param={}] expected bool, int, uint or enum", def.asyn_name);
+                self.trace.param_err(&def.asyn_name, "put<int>", &msg);
+                return Err(RestError::Parse(msg));
             }
             value = clamp_int(&def.meta, value);
             let raw = if def.meta.kind == Kind::Bool {
@@ -679,7 +788,15 @@ impl ParamOps {
                 encode_int(&def.meta, value)
             }
             .map_err(|e| RestError::Parse(format!("[{}] {e}", def.asyn_name)))?;
-            updates = self.base_put(&def, &raw, DEFAULT_TIMEOUT)?;
+            updates = self
+                .base_put(&def, &raw, DEFAULT_TIMEOUT)
+                .inspect_err(|_| {
+                    self.trace.param_err(
+                        &def.asyn_name,
+                        "put<int>",
+                        &format!("[param={}] underlying basePut failed", def.asyn_name),
+                    );
+                })?;
         }
 
         let local = match def.asyn_type {
@@ -704,6 +821,7 @@ impl ParamOps {
 
     /// Write a bool (C `EigerParam::put(bool)`).
     pub fn put_bool(&self, index: usize, value: bool) -> RestResult<Vec<ParamUpdate>> {
+        self.put_flow(index, "put<bool>", format_args!("{}", i32::from(value)));
         let def = self.ensure_meta(index)?;
         if !def.is_remote() {
             return Ok(vec![ParamUpdate::Int32(index, i32::from(value))]);
@@ -726,6 +844,11 @@ impl ParamOps {
     /// `current` is the parameter's present value, used for the epsilon check
     /// that suppresses no-op writes to the detector.
     pub fn put_f64(&self, index: usize, value: f64, current: f64) -> RestResult<Vec<ParamUpdate>> {
+        self.put_flow(
+            index,
+            "put<double>",
+            format_args!("{value:.6}", value = CFloat(value)),
+        );
         let def = self.ensure_meta(index)?;
         if def.epsilon != 0.0 && (current - value).abs() < def.epsilon {
             return Ok(Vec::new());
@@ -740,7 +863,16 @@ impl ParamOps {
                     def.asyn_name
                 )));
             }
-            value = clamp_f64(&def.meta, value);
+            let clamped = clamp_f64(&def.meta, value);
+            if clamped != value {
+                let bound = if clamped > value { "min" } else { "max" };
+                self.trace.param_err(
+                    &def.asyn_name,
+                    "put<double>",
+                    &format!("clamped to {bound} {clamped:.6}", clamped = CFloat(clamped)),
+                );
+            }
+            value = clamped;
             updates = self.base_put(&def, &encode_f64(value), DEFAULT_TIMEOUT)?;
         }
         updates.insert(0, ParamUpdate::Float64(index, value));
@@ -749,6 +881,7 @@ impl ParamOps {
 
     /// Write a string (C `EigerParam::put(std::string)`).
     pub fn put_str(&self, index: usize, value: &str) -> RestResult<Vec<ParamUpdate>> {
+        self.put_flow(index, "put<string>", format_args!("{value}"));
         let def = self.ensure_meta(index)?;
         if !def.is_remote() {
             return Ok(vec![ParamUpdate::Octet(index, value.to_string())]);
@@ -760,12 +893,7 @@ impl ParamOps {
             )));
         }
         let idx = if def.meta.kind == Kind::Enum {
-            Some(enum_index(&def.meta.enum_values, value).ok_or_else(|| {
-                RestError::Parse(format!(
-                    "[{}] '{value}' is not one of {:?}",
-                    def.asyn_name, def.meta.enum_values
-                ))
-            })?)
+            Some(self.enum_index_or_report(&def, &def.meta, value)?)
         } else {
             None
         };
@@ -805,10 +933,7 @@ impl ParamOps {
         for idx in indices {
             match self.fetch(idx) {
                 Ok(mut u) => updates.append(&mut u),
-                Err(e) => {
-                    failures += 1;
-                    log::warn!("eiger: initial fetch failed: {e}");
-                }
+                Err(_) => failures += 1,
             }
         }
         (updates, failures)
@@ -818,6 +943,10 @@ impl ParamOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
 
     fn meta_of(body: &str, sys: Sys) -> Meta {
         let v: Value = serde_json::from_str(body).unwrap();
@@ -834,10 +963,11 @@ mod tests {
         reg.add(7, "ROI_MODE", AsynType::Int32, Sys::DetConfig, "roi_mode");
         reg.set_enum_values(7, &["disabled", "4M"]);
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let ops = ParamOps::new(RestApi::new("127.0.0.1", port), reg);
+        let ops = ParamOps::new(
+            RestApi::new("127.0.0.1", DEAD_PORT),
+            reg,
+            Trace::new("EIGTEST"),
+        );
 
         assert_eq!(ops.enum_index_of(7, "disabled"), Some(0));
         assert_eq!(ops.enum_index_of(7, "4M"), Some(1));
@@ -849,13 +979,13 @@ mod tests {
     /// The port it belongs to never came up, whatever the detector answered.
     #[test]
     fn fetch_all_does_not_deadlock_on_the_registry() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
         let mut reg = ParamRegistry::new();
         reg.add(0, "STATE", AsynType::Octet, Sys::DetStatus, "state");
-        let ops = ParamOps::new(RestApi::new("127.0.0.1", port), reg);
+        let ops = ParamOps::new(
+            RestApi::new("127.0.0.1", DEAD_PORT),
+            reg,
+            Trace::new("EIGTEST"),
+        );
 
         // Every request fails against a closed port, which is the point: the
         // call has to *return*.
@@ -876,6 +1006,18 @@ mod tests {
         assert_eq!(m.min_f64, Some(0.0001));
         assert_eq!(m.max_f64, Some(3600.0));
         assert_eq!(m.min_int, None);
+    }
+
+    /// serde_json's default parser lands one ULP off on this limit; C's
+    /// strtod and the `float_roundtrip` parser the workspace enables do not.
+    #[test]
+    fn meta_float_limit_parses_correctly_rounded() {
+        let m = meta_of(
+            r#"{"value": 0.5, "value_type": "float", "access_mode": "rw",
+                "min": -1.5432835417340557e+88, "max": 3600.0}"#,
+            Sys::DetConfig,
+        );
+        assert_eq!(m.min_f64.map(f64::to_bits), Some(0xd23f_0824_128b_2f33));
     }
 
     #[test]
@@ -1018,11 +1160,18 @@ mod tests {
         assert_eq!(encode_int(&m, -3).unwrap(), "-3");
     }
 
+    /// C `toString(double)`'s text, from g++ / glibc 2.39.
     #[test]
-    fn encode_doubles_stay_json_numbers() {
-        assert_eq!(encode_f64(0.015), "0.015");
-        assert_eq!(encode_f64(1.0), "1.0");
-        assert_eq!(encode_f64(-2.5e-7), "-0.00000025");
+    fn encode_doubles_as_c_setprecision_20() {
+        assert_eq!(encode_f64(0.015), "0.014999999999999999445");
+        assert_eq!(encode_f64(1.0), "1");
+        assert_eq!(encode_f64(-2.5e-7), "-2.4999999999999998869e-07");
+        assert_eq!(encode_f64(1e15), "1000000000000000");
+        assert_eq!(encode_f64(1e20), "1e+20");
+        assert_eq!(encode_f64(-0.0), "-0");
+        assert_eq!(encode_f64(f64::NAN), "nan");
+        assert_eq!(encode_f64(-f64::NAN), "-nan");
+        assert_eq!(encode_f64(f64::NEG_INFINITY), "-inf");
     }
 
     #[test]

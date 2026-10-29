@@ -1,20 +1,21 @@
 //! Newport XPS motion controller IOC.
 //!
-//! Assembles: TCP octet ports (`drvAsynIPPortConfigure`) to the XPS — one shared
-//! poll socket plus one move socket per axis — an XPS controller
-//! (`XPSCreateController`) with its axes (`XPSCreateAxis`), the motor record
-//! type, and the CA + PVA (QSRV) server.
+//! Assembles: an XPS controller (`XPSCreateController`, which opens its TCP
+//! sockets from an IP address and port) with its axes (`XPSCreateAxis`), the motor record
+//! type, the `xpsSlave` and `XPS_trajectoryScan` sequencer programs, and the CA + PVA
+//! (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p xps-ioc -- st.cmd
-//!
-//! The XPS RPC reply framing (`,EndOfAPI`) is handled inside the driver, so the
-//! `st.cmd` only needs plain `drvAsynIPPortConfigure` ports.
 
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_newport::NewportHolder;
+use motor_newport::ioc::{
+    tclcall_command, xps_aux_config_command, xps_create_axis_command,
+    xps_create_controller_command, xps_create_profile_command, xps_disable_auto_enable_command,
+    xps_enable_moving_mode_command, xps_no_disable_error_command,
+};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -22,37 +23,55 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: xps-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: xps-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("XPS_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("XPS_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let mut app = IocApplication::new();
 
     // Motor record type.
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
+    // motorSupport.dbd's asynMotorControllerRegister.
+    for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
+        app = app.register_startup_command(cmd);
+    }
+    // motorUtilRegister: motorUtilInit, printChIDlist, listMovingMotors.
+    for cmd in epics_rs::motor::motor_util::motor_util_commands() {
+        app = app.register_startup_command(cmd);
+    }
 
-    // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
+    // trajectoryScan.db's busy records: opt-in in epics-rs, as a C IOC links
+    // busy's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+
+    // asyn.dbd, which every C motor IOC links: the asyn record, the devEpics
+    // basic_asyn_motor.db use, and the iocsh commands
+    // (`drvAsynIPPortConfigure`).
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, move || asyn_factory());
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // XPS controller + per-axis create commands + motor device support.
-    let holder = NewportHolder::new();
-    app = app.register_startup_command(holder.xps_create_controller_command());
-    app = app.register_startup_command(holder.xps_create_axis_command());
-    app = app.register_startup_command(holder.xps_tcl_script_execute_command());
-    app = app.register_startup_command(holder.xps_position_compare_command());
-    app = app.register_startup_command(holder.xps_define_profile_command());
-    app = app.register_startup_command(holder.xps_build_profile_command());
-    app = app.register_startup_command(holder.xps_execute_profile_command());
-    app = app.register_startup_command(holder.xps_readback_profile_command());
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(xps_create_controller_command());
+    app = app.register_startup_command(xps_create_axis_command());
+    app = app.register_startup_command(xps_create_profile_command());
+    app = app.register_startup_command(xps_disable_auto_enable_command());
+    app = app.register_startup_command(xps_no_disable_error_command());
+    app = app.register_startup_command(xps_enable_moving_mode_command());
+    app = app.register_startup_command(tclcall_command());
+    app = app.register_startup_command(xps_aux_config_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
-    app.startup_script(&script)
-        .register_link_set_installer(epics_rs::ca::calink::calink_link_set_install)
-        .register_link_set_installer(epics_rs::bridge::qsrv::pvalink_link_set_install)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    // devNewportSeq.dbd's registrar(XPS_trajectoryScanRegistrar) and
+    // registrar(xpsSlaveRegistrar): the seq shell commands and the two .st.
+    motor_newport::snl::xps_trajectory_scan::XPS_trajectoryScanRegistrar();
+    motor_newport::snl::xps_slave::xpsSlaveRegistrar();
+
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

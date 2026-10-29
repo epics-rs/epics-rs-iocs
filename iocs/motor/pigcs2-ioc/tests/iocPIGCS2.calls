@@ -1,0 +1,2 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+PI_GCS2_CreateController("C867", "C867_ETH", 2, 0, 0, 100, 1000)

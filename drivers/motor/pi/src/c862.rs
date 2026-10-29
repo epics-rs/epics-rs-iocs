@@ -15,8 +15,7 @@
 //! hardcodes the asyn sub-address to 0, ignoring `cntrl->asyn_address`
 //! entirely at the transport layer. The "address" is instead a protocol-level
 //! multi-drop selector (below) — this port connects via
-//! [`motor_common::connect::connect_serial`], exactly like every other octet
-//! driver in this workspace.
+//! [`motor_common::connect::connect_with_eos`].
 //!
 //! ## Wire shape — the port owns framing (not the driver)
 //!
@@ -29,23 +28,16 @@
 //! Mclennan PM304 port (which appends its own terminator and leaves the
 //! port's output EOS unset) — see the `motor-port-eos-ownership` convention:
 //! which one applies is a per-C-driver fact, not a template to copy.
-//! `SyncIOHandle` (unlike the real `pasynUser`) exposes no method for a
-//! driver to configure a port's EOS itself, so this port pushes both EOS
-//! settings into `st.cmd` (`asynOctetSetInputEos`/`asynOctetSetOutputEos`)
-//! instead of setting them from [`PIC862Controller::new`] — same wire
-//! result, different call site. [`PIC862Controller::send`] therefore writes
-//! **bare** command bytes with no manual terminator.
+//! `PIC862Config` sets both the same way, and `PIC862Controller::send`
+//! therefore writes **bare** command bytes with no manual terminator.
 //!
-//! Input terminator: `"\n\x03"` (LF then ASCII ETX, 2 bytes) — `\x03` is
-//! representable as a 2-hex-digit `\x` escape in `st.cmd` (this port's
-//! `asyn-rs` iocsh escape decoder has no octal-triplet form, so the C
-//! header's `"\n\003"` spelling doesn't carry over literally).
+//! Input terminator: `"\n\x03"` (LF then ASCII ETX, 2 bytes).
 //!
 //! `recv_mess` unconditionally drops the **last** received byte
 //! (`com[nread - 1] = '\0'; /* Strip trailing CR. */`) after the port's own
 //! EOS strip already removed the `\n\x03` — i.e. every reply carries one
 //! extra CR ahead of the terminator that the port's EOS layer doesn't know
-//! about. [`PIC862Controller::recv`] reproduces this unconditional
+//! about. `PIC862Controller::reply` reproduces this unconditional
 //! single-byte drop (not a `trim_end_matches`, which would strip a variable
 //! count) and folds any transport error into an empty reply, matching
 //! `recv_mess`'s swallow of `status != asynSuccess` into `""`.
@@ -86,8 +78,8 @@
 //! active-low in that configuration).
 //!
 //! A comm failure on `TS` runs the C `NORMAL`/`RETRY`/`COMM_ERR` two-strike
-//! debounce ([`CommState`]): the first bad `TS` in a row is silently retried
-//! (cached status returned unchanged); a second consecutive one sets
+//! debounce (`CommState`): the first bad `TS` in a row fails the poll
+//! raising nothing (RETRY); a second consecutive one sets
 //! `comms_error`/`problem`. `TS` succeeding unconditionally proceeds to `TP`
 //! with **no further debounce tied to `TP`** — a genuine C asymmetry (`TP`'s
 //! `atof(&buff[2])` has no read-failure guard at all) ported as-is: a failed
@@ -122,7 +114,7 @@
 //!   handling beyond the shared SV/SA preamble).
 //! - `JOG` (`move_velocity`) — **the C-862 has no jog command**: `SV{|v|}`
 //!   then `MA` to whichever record soft limit (`DHLM`/`DLLM`, cached from
-//!   [`AsynMotor::set_high_limit`]/[`set_low_limit`]) the velocity sign
+//!   [`Model1Motor::set_high_limit`]/[`set_low_limit`](Model1Motor::set_low_limit)) the velocity sign
 //!   selects, exactly like MM3000's jog simulation. `SET_HIGH_LIMIT`/
 //!   `SET_LOW_LIMIT` themselves send no wire command (`trans->state =
 //!   IDLE_STATE`) — record-side caching only.
@@ -140,31 +132,26 @@
 //!   `AsynMotor` counterpart either and are not ported.
 //!
 //! ## Not modeled (documented deviations)
-//! - **`recv_mess(..., FLUSH)`**: before retrying after a non-`NORMAL` comm
-//!   state, C discards any buffered input via a non-blocking port-level
-//!   flush. [`epics_rs::asyn::sync_io::SyncIOHandle`] exposes no synchronous
-//!   flush primitive (only `read_octet`/`write_octet`); emulating it with a
-//!   blocking read would stall `poll()` for a full timeout when nothing is
-//!   buffered, which is worse than the omission. Skipped — a minor hygiene
-//!   gap on an already-degraded comm path, not a wire-command difference.
-//! - **PREM/POST** (record pre/post-move command strings): handled generically
-//!   by this workspace's motor-rs record layer, not per-driver, matching
-//!   every other port here.
+//! - **`recv_mess(..., FLUSH)`**: C flushes buffered input only before
+//!   retrying after a non-`NORMAL` comm state; this port flushes before every
+//!   query (`exchange`), a superset that also covers that retry.
 //! - **`no_motion_count`**: purely a model-1 poll-rate scheduling counter
 //!   (decides how eagerly `motor_task` re-polls); the position/encoder
 //!   fields it gates are unconditionally set to the same value either way, so
 //!   this port always updates `position` from `TP` and doesn't track it.
-//! - **`report()`** driver-status iocsh diagnostic: not implemented, matching
-//!   every other port in this workspace (the identify string is logged once
-//!   at `PIC862Config` time instead, like `PIGCS2CreateController`).
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
+use epics_rs::asyn::request::OctetRead;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{nint, parse_value_at};
 
 /// Response buffer size for a single reply (C `BUFF_SIZE`).
@@ -240,11 +227,7 @@ struct PolledStatus {
 
 fn status_from_polled(polled: &PolledStatus) -> MotorStatus {
     MotorStatus {
-        position: polled.position,
-        encoder_position: polled.position,
-        velocity: 0.0, // C only ever flips the sign of an otherwise-unset 0.
         done: polled.done,
-        moving: !polled.done,
         high_limit: polled.high_limit,
         low_limit: polled.low_limit,
         direction: polled.direction,
@@ -256,6 +239,10 @@ fn status_from_polled(polled: &PolledStatus) -> MotorStatus {
         has_encoder: true,
         vbas_supported: false,
         ..MotorStatus::default()
+            .with_position(polled.position)
+            .with_encoder_position(polled.position)
+            // C only ever flips the sign of an otherwise-unset 0.
+            .with_velocity(0.0)
     }
 }
 
@@ -283,8 +270,7 @@ impl PIC862Controller {
 
         let select_cmd = format!("\u{1}{addr:X}VE");
         for _ in 0..3 {
-            ctrl.send(&select_cmd)?;
-            let (reply, raw_len) = ctrl.recv();
+            let (reply, raw_len) = ctrl.exchange(&select_cmd);
             if raw_len > 0 {
                 ctrl.ident = reply;
                 break;
@@ -307,8 +293,23 @@ impl PIC862Controller {
     /// appended here — the port's configured output EOS puts the CR on the
     /// wire (see module docs' "Wire shape" section).
     fn send(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.send_bytes(cmd.as_bytes())
+    }
+
+    /// [`send`](Self::send) for raw bytes; an empty message is not sent.
+    fn send_bytes(&self, cmd: &[u8]) -> AsynResult<()> {
+        if cmd.is_empty() {
+            return Ok(());
+        }
+        self.handle.write_octet(0, cmd)?;
         Ok(())
+    }
+
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input. C flushes only at `set_status` (drvPIC862.cc:226), so a late reply
+    /// shifts its answers until the next poll: a C defect, not copied.
+    fn exchange(&self, cmd: &str) -> (String, usize) {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
     }
 
     /// Read one reply, unconditionally dropping the last byte (C
@@ -317,9 +318,9 @@ impl PIC862Controller {
     /// pre-strip byte count (C's `charcnt`), needed by callers that gate on
     /// it directly. Any transport failure or empty read folds into `("", 0)`,
     /// matching `recv_mess`'s swallow of a bad read into an empty string.
-    fn recv(&self) -> (String, usize) {
-        match self.handle.read_octet(0, READ_BUF) {
-            Ok(raw) if !raw.is_empty() => {
+    fn reply(read: OctetRead) -> (String, usize) {
+        match read.into_parts() {
+            (raw, Ok(())) if !raw.is_empty() => {
                 let stripped = &raw[..raw.len() - 1];
                 (String::from_utf8_lossy(stripped).into_owned(), raw.len())
             }
@@ -330,12 +331,11 @@ impl PIC862Controller {
     /// C `set_status`: `TS` gated by the `NORMAL`/`RETRY`/`COMM_ERR` comm
     /// debounce, then (unconditionally on a good `TS`) `TP` with no further
     /// debounce — see the module docs' "Status" section for the exact C
-    /// asymmetry this reproduces. `None` means the caller should keep its
-    /// cached status (debounced retry) or flag a hard comm error, decided by
+    /// asymmetry this reproduces. `None` means the caller fails the poll,
+    /// raising nothing (RETRY) or a hard comm error, decided by
     /// [`Self::comm_state`] after the call.
     fn poll_status(&mut self) -> Option<PolledStatus> {
-        let _ = self.send("TS");
-        let (ts_reply, ts_raw_len) = self.recv();
+        let (ts_reply, ts_raw_len) = self.exchange("TS");
         let regs = if ts_raw_len > 18 {
             parse_ts_reply(&ts_reply)
         } else {
@@ -359,8 +359,7 @@ impl PIC862Controller {
             (!bits.plus_ls_raw, !bits.minus_ls_raw)
         };
 
-        let _ = self.send("TP");
-        let (tp_reply, _) = self.recv();
+        let (tp_reply, _) = self.exchange("TP");
         let position = parse_value_at(&tp_reply, 2).map_or(0.0, |v| nint(v) as f64);
 
         Some(PolledStatus {
@@ -374,88 +373,112 @@ impl PIC862Controller {
     }
 }
 
-/// The single axis of a C-862/C-863 controller. Implements [`AsynMotor`].
+/// The single axis of a C-862/C-863 controller. Implements [`Model1Motor`].
 pub struct PIC862Axis {
     controller: Arc<Mutex<PIC862Controller>>,
     /// Record soft limits (dial EGU = raw counts, `MRES = 1`), cached from
-    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`] — the C-862 has no
+    /// [`Model1Motor::set_high_limit`]/[`set_low_limit`](Model1Motor::set_low_limit) — the C-862 has no
     /// jog command, so a jog moves to whichever of these the record's DHLM
     /// / DLLM the requested direction selects (C `JOG` case).
     high_limit: Option<f64>,
     low_limit: Option<f64>,
+    /// What the last failed poll raises: nothing on C `set_status`'s
+    /// first missed reply (RETRY, drvPIC862.cc:243), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :249). Per axis, as the
+    /// controller's state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
+    strings: MoveStrings,
+    /// The record's SET_VELOCITY/SET_ACCEL pieces of the transaction under
+    /// way (`build_trans` appends them), which the move command flushes.
+    parts: String,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PIC862Axis {
-    /// Construct the controller's one axis, seeding the initial status (C
-    /// `motor_init`'s `set_status(card_index, motor_index)` call). A failed
-    /// initial poll is not an error — C leaves the zeroed defaults in place
-    /// either way.
-    pub fn new(controller: Arc<Mutex<PIC862Controller>>) -> AsynResult<Self> {
+    /// Construct the controller's one axis and read its status, as C
+    /// `motor_init`'s `set_status(card_index, motor_index)` does
+    /// (drvPIC862.cc:580).
+    pub fn new(controller: Arc<Mutex<PIC862Controller>>) -> Self {
         let mut axis = Self {
-            controller: controller.clone(),
+            controller,
             high_limit: None,
             low_limit: None,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
-                done: true,
                 gain_support: true,
                 has_encoder: true,
                 vbas_supported: false,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
+            parts: String::new(),
+            init_status: None,
         };
-        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(polled) = ctrl.poll_status() {
-            axis.last_status = status_from_polled(&polled);
-        }
-        Ok(axis)
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, PIC862Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// One move transaction: the record's earlier parts, then PREM and a `,`
+    /// ahead of the move's own command (devPIC862.cc:179-194), whose POST
+    /// waits for the move to end.
+    fn write_move(&mut self, command: &str) -> AsynResult<()> {
+        let mut line = std::mem::take(&mut self.parts).into_bytes();
+        let prem = self.strings.arm();
+        if !prem.is_empty() {
+            line.extend_from_slice(&prem);
+            line.push(b',');
+        }
+        line.extend_from_slice(command.as_bytes());
+        self.lock().send_bytes(&line)
+    }
 }
 
-impl AsynMotor for PIC862Axis {
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.lock().send(&format!(
-            "SV{},{}MA{}",
-            velocity as i32,
-            crate::accel_field(acceleration),
-            position as i32
-        ))
+impl Model1Motor for PIC862Axis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        self.lock().send(&format!(
-            "SV{},{}MR{}",
-            velocity as i32,
-            crate::accel_field(acceleration),
-            distance as i32
-        ))
+    /// `update_delay` is 0.017 s (`targs`, drvPIC862.cc:112).
+    fn update_delay(&self) -> Duration {
+        Duration::from_millis(17)
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    /// SET_VELOCITY: `SV{v},` joins the transaction.
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.parts.push_str(&format!("SV{},", velocity as i32));
+        Ok(())
+    }
+
+    /// A DC motor: SET_VEL_BASE sends nothing.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.parts.push_str(&format!("SA{},", acceleration as i32));
+        Ok(())
+    }
+
+    fn poll_failure(&self) -> PollFailure {
+        self.failure
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.write_move(&format!("MA{}", position as i32))
+    }
+
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
+        self.write_move(&format!("MR{}", distance as i32))
+    }
+
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         // C-862 has no jog command: set the (unsigned) jog speed, then move
         // absolute to whichever record soft limit the velocity sign selects.
         let target = if velocity > 0.0 {
@@ -464,34 +487,27 @@ impl AsynMotor for PIC862Axis {
             self.low_limit
         }
         .ok_or_else(|| pic862_err("PIC862: jog needs the record soft limits (none set yet)"))?;
-        // C's jog path issues SET_ACCEL unconditionally before the move
-        // (motorRecord.cc:2141, no accel>0 guard — unlike the ordinary move
-        // path), so the jog acceleration is always on the wire: `SA,SV,MA`.
-        self.lock().send(&format!(
-            "SA{},SV{},MA{}",
-            acceleration as i32,
-            velocity.abs() as i32,
-            target as i32
-        ))
+        // The record's SET_ACCEL (always, on a jog) leads: `SA,SV,MA`.
+        self.write_move(&format!("SV{},MA{}", velocity.abs() as i32, target as i32))
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
+    /// JOG_VELOCITY is SET_VELOCITY's `SV{v},` (devPIC862.cc:228), sent now with the
+    /// SET_ACCEL ahead of it and no PREM, and no move.
+    fn jog_velocity(&mut self, user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.set_velocity(user, velocity)?;
+        let mut line = std::mem::take(&mut self.parts).into_bytes();
+        if line.last() == Some(&b',') {
+            line.pop();
+        }
+        self.lock().send_bytes(&line)
+    }
+
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
         let cmd = if forward { "FE0" } else { "FE1" };
-        self.lock().send(&format!(
-            "SV{},{}{cmd}",
-            velocity as i32,
-            crate::accel_field(acceleration)
-        ))
+        self.write_move(cmd)
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         self.lock().send("ST")
     }
 
@@ -528,27 +544,173 @@ impl AsynMotor for PIC862Axis {
         self.lock().send(&cmd)
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut ctrl = self.lock();
+    /// `PRIMITIVE`: INIT as its own message (devPIC862.cc:176-177).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().send_bytes(init)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let polled = ctrl.poll_status();
         let comm_err = ctrl.comm_state == CommState::CommErr;
-        drop(ctrl);
 
         let Some(polled) = polled else {
-            if comm_err {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
-            }
-            return Ok(self.last_status.clone());
+            self.failure = if comm_err {
+                PollFailure::PROBLEM_AND_COMMS_ERROR
+            } else {
+                PollFailure::NONE
+            };
+            return Err(pic862_err("no status reply"));
         };
         self.last_status = status_from_polled(&polled);
-        Ok(self.last_status.clone())
+        // drvPIC862.cc:299-340: POST once done or stopped by a limit in the
+        // move's direction.
+        let s = &self.last_status;
+        let ls_active = (s.high_limit && s.direction) || (s.low_limit && !s.direction);
+        if (s.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.send_bytes(&post);
+        }
+        drop(ctrl);
+        *status = self.last_status.clone();
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
+
+    /// `TS` registers, limits active-high: done with no limit, moving, and
+    /// moving minus into the tripped -limit.
+    const DONE: &str = "S:04 00 00 02 00 00";
+    const MOVING: &str = "S:00 00 00 02 00 00";
+    const MOVING_LOW_LS: &str = "S:00 00 00 02 08 00";
+
+    /// A C-862 on a [`LineRig`] whose `TS` reply follows `ts`; replies carry
+    /// the trailing CR C's `recv_mess` strips.
+    fn strings_rig(name: &str) -> (LineRig, PIC862Axis, Arc<Mutex<&'static str>>) {
+        let ts = Arc::new(Mutex::new(DONE));
+        let t = ts.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "TS" => format!("{}\r", t.lock().unwrap()),
+            "TP" => "P:0\r".into(),
+            _ => "C-862\r".into(),
+        });
+        let ctrl = PIC862Controller::new(io, 1).unwrap();
+        let mut axis = PIC862Axis::new(Arc::new(Mutex::new(ctrl)));
+        let user = AsynUser::default();
+        axis.set_high_limit(&user, 100.0).unwrap();
+        axis.set_low_limit(&user, -100.0).unwrap();
+        line.sent();
+        (line, axis, ts)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PIC862Axis) -> Vec<String> {
+        axis.polled(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| l != "TS" && l != "TP")
+            .collect()
+    }
+
+    /// devPIC862.cc:176-177: INIT as its own message.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pic862Init");
+        axis.primitive(&AsynUser::default(), b"DP100").unwrap();
+        assert_eq!(line.sent(), ["DP100"]);
+    }
+
+    /// devPIC862.cc:179-194: PREM and a `,` ahead of the move's own command,
+    /// for that move only.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pic862Prem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MN,MA5"]);
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MR5"]);
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.record_home(&user, 0.0, 100.0, 50.0, false).unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MN,FE1"]);
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.record_jog(&user, 0.0, 100.0, 50.0).unwrap();
+        assert_eq!(line.sent(), ["SA50,MN,SV100,MA100"]);
+    }
+
+    /// devPIC862.cc:228: a JVEL retune sends SET_ACCEL's `SA` and `SV` at
+    /// once, with no PREM, no `MA`, and the PREM still armed for the next move.
+    #[test]
+    fn a_jvel_retune_sends_sv_and_leaves_prem_armed() {
+        let (line, mut axis, _) = strings_rig("pic862Jvel");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"MN", None).unwrap();
+        axis.set_accel(&user, 50.0).unwrap();
+        axis.jog_velocity(&user, 100.0).unwrap();
+        assert_eq!(line.sent(), ["SA50,SV100"]);
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["SV100,SA50,MN,MA5"]);
+    }
+
+    /// drvPIC862.cc:333-340: POST once the move is done, not while it runs,
+    /// and only once.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, ts) = strings_rig("pic862Post");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MF")))
+            .unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        line.sent();
+        *ts.lock().unwrap() = MOVING;
+        assert!(poll_extra(&line, &mut axis).is_empty());
+        *ts.lock().unwrap() = DONE;
+        assert_eq!(poll_extra(&line, &mut axis), ["MF"]);
+        assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+    }
+
+    /// drvPIC862.cc:299-318: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, ts) = strings_rig("pic862PostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MF")))
+            .unwrap();
+        axis.record_move_absolute(&user, -5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        line.sent();
+        *ts.lock().unwrap() = MOVING_LOW_LS;
+        assert_eq!(poll_extra(&line, &mut axis), ["MF"]);
+    }
 
     #[test]
     fn parse_ts_reply_reads_six_hex_registers() {
@@ -636,9 +798,9 @@ mod tests {
             low_limit: false,
         };
         let status = status_from_polled(&polled);
-        assert_eq!(status.position, 42.0);
-        assert_eq!(status.encoder_position, 42.0);
-        assert_eq!(status.velocity, 0.0);
+        assert_eq!(status.position(), 42.0);
+        assert_eq!(status.encoder_position(), 42.0);
+        assert_eq!(status.velocity(), 0.0);
         assert!(status.done);
         assert!(!status.moving);
         assert!(status.has_encoder);
@@ -646,5 +808,67 @@ mod tests {
         assert!(!status.vbas_supported);
         assert!(!status.problem);
         assert!(!status.comms_error);
+    }
+
+    /// drvPIC862.cc:234-255: a first failed status read is RETRY (nothing raised,
+    /// nothing posted), the next COMM_ERR, and a good read clears it.
+    #[test]
+    fn a_failed_status_read_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("c862Retry", move |last| {
+            if q.load(Ordering::SeqCst) {
+                return String::new();
+            }
+            match last {
+                "TS" => format!("{DONE}\r"),
+                "TP" => "P:0\r".into(),
+                _ => "C-862\r".into(),
+            }
+        });
+        let ctrl = PIC862Controller::new(io, 1).unwrap();
+        let mut axis = PIC862Axis::new(Arc::new(Mutex::new(ctrl)));
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.polled(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPIC862.cc:239-254 exit stores what motor_init prepared (:568-577,
+    /// EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once past
+    /// RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("c862InitFail", |last| match last {
+            "TS" | "TP" => String::new(),
+            _ => "C-862\r".into(),
+        });
+        let ctrl = Arc::new(Mutex::new(PIC862Controller::new(io, 1).unwrap()));
+        let mut first = PIC862Axis::new(ctrl.clone());
+        let mut again = PIC862Axis::new(ctrl);
+        let prepared = MotorStatus {
+            gain_support: true,
+            has_encoder: true,
+            vbas_supported: false,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            again.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
     }
 }

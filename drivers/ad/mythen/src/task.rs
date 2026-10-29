@@ -8,7 +8,8 @@ use std::time::Duration;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -19,7 +20,7 @@ use epics_rs::asyn::request::ParamSetValue;
 
 use crate::detector::Detector;
 use crate::driver::MythenParams;
-use crate::protocol::{CHANNELS_PER_MODULE, READ_MODE_RAW, decode_raw_readout, words_from_bytes};
+use crate::protocol::{CHANNELS_PER_MODULE, READ_MODE_RAW, decode_raw_readout};
 use crate::transport::M1K_TIMEOUT;
 
 /// Corrected readout is always 24-bit (C `dataCallback`, mythen.cpp:976).
@@ -32,6 +33,7 @@ pub struct Shared {
     pub ad: ADDriverParams,
     pub det: Arc<Detector>,
     pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    pub pool: DriverPool,
 }
 
 impl Shared {
@@ -76,10 +78,6 @@ async fn acquire(s: &Arc<Shared>) {
     // would sit in the socket and be picked up as the answer to the next
     // command, for the life of the process. Refuse instead.
     let (Some(nmodules), Some(expect)) = (det.nmodules(), det.readout_len()) else {
-        log::error!(
-            "mythen: cannot read out: the module count is unknown — `-get nmodules` has not \
-             answered since the IOC started"
-        );
         det.state.acquiring.store(false, Ordering::Release);
         s.set_int(s.ad.status, ADStatus::Disconnected as i32).await;
         s.set_int(s.ad.acquire, 0).await;
@@ -87,11 +85,6 @@ async fn acquire(s: &Arc<Shared>) {
     };
     let acquire_time = s.get_f64(s.ad.acquire_time).await;
     let timeout = M1K_TIMEOUT + Duration::from_secs_f64(acquire_time.max(0.0));
-    let command = if read_mode == READ_MODE_RAW {
-        "-readoutraw"
-    } else {
-        "-readout"
-    };
     // Raw readout packs several channels into one 32-bit word; a corrected
     // readout is one word per channel.
     let decode_nbits = if read_mode == READ_MODE_RAW {
@@ -113,15 +106,18 @@ async fn acquire(s: &Arc<Shared>) {
                     status = read_status(s).await;
                 }
             }
-            Ok(reply) => {
-                log::debug!(
-                    "mythen: [{command}] returned {} of {expect} bytes",
-                    reply.len()
-                );
+            Ok(_) => {
                 status = read_status(s).await;
             }
             Err(e) => {
-                log::error!("mythen: [{command}] failed: {e}");
+                // C re-reads it for a failed readout too, before the report
+                // (mythen.cpp:908-917).
+                status = read_status(s).await;
+                det.trace_error(&format!(
+                    "mythen:acquisitionTask: error using readout command status={}, nRead=0, \
+                     eomReason=0\n",
+                    e.status() as i32
+                ));
                 break;
             }
         }
@@ -134,10 +130,15 @@ async fn acquire(s: &Arc<Shared>) {
     }
 
     det.state.acquiring.store(false, Ordering::Release);
+    let image_mode = s.get_int(s.ad.image_mode).await;
     if status == ADStatus::Error {
-        // C aborts the detector on the way out (mythen.cpp:941-946).
-        if let Err(e) = det.stop() {
-            log::error!("mythen: cannot stop the detector: {e}");
+        // C aborts the detector on the way out (mythen.cpp:939-946).
+        det.trace_error("mythen:acquisitionTask: error timed out waiting for data\n");
+        let _ = det.stop();
+    } else {
+        println!("Acquisition finish");
+        if image_mode == ImageMode::Single as i32 || image_mode == ImageMode::Multiple as i32 {
+            println!("ADAcquire Callback");
         }
     }
     s.set_int(s.ad.acquire, 0).await;
@@ -147,20 +148,14 @@ async fn acquire(s: &Arc<Shared>) {
     // offers is Single or Multiple only (mythen.template re-opens the mbbo
     // without "Continuous"), so the acquisition ends here in every mode the
     // detector can be put into.
-    let image_mode = s.get_int(s.ad.image_mode).await;
-    if image_mode == ImageMode::Continuous as i32 {
-        log::warn!("mythen: the image mode Continuous is not supported; acquisition stopped");
-    }
     s.set_int(s.ad.status, ADStatus::Idle as i32).await;
 }
 
 async fn read_status(s: &Arc<Shared>) -> ADStatus {
     let status = match s.det.get_status() {
         Ok(status) => status,
-        Err(e) => {
-            log::error!("mythen: cannot read the detector status: {e}");
-            ADStatus::Error
-        }
+        // writeReadMeter has printed C's line.
+        Err(_) => ADStatus::Error,
     };
     s.set_int(s.ad.status, status as i32).await;
     status
@@ -171,25 +166,38 @@ async fn read_status(s: &Arc<Shared>) -> ADStatus {
 /// Returns false when the detector answered with an error word, which is what
 /// makes the caller re-read the status.
 async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> bool {
-    let words = words_from_bytes(reply);
-    match words.first() {
-        // C `pData[0] < 0` — the detector reports a failed readout in the
-        // first word.
-        Some(&first) if (first as i32) < 0 => return false,
-        None => return false,
-        Some(_) => {}
+    // C `pData[0] < 0` — the detector reports a failed readout in the first
+    // word.
+    match reply.first_chunk::<4>() {
+        Some(&first) if i32::from_le_bytes(first) >= 0 => {}
+        _ => return false,
     }
 
-    let channels = decode_raw_readout(nmodules, nbits, &words);
     // C declares the NDArray one module wide (`dims[0] = MAX_DIMS`) while it
     // fills 1280 * nmodules elements, so a second module is invisible to every
     // downstream plugin (mythen.cpp:965, :1044). The array is as wide as the
     // data it carries.
     let width = nmodules * CHANNELS_PER_MODULE;
-    debug_assert_eq!(channels.len(), width);
 
-    let counter = s.get_int(s.ad.base.array_counter).await + 1;
-    s.set_int(s.ad.base.array_counter, counter).await;
+    // C allocates before it decodes and counts (mythen.cpp:973-977, :993) and
+    // dereferences a refused alloc; the frame is dropped after the pool's
+    // reached-limit line.
+    let Ok(mut array) = s.pool.alloc(
+        vec![NDDimension::new(width), NDDimension::new(1)],
+        NDDataType::UInt32,
+    ) else {
+        return true;
+    };
+    // The caller passes only a whole reply, which fills every channel.
+    decode_raw_readout(
+        nbits,
+        reply,
+        array
+            .fill()
+            .data_mut()
+            .as_mut_slice::<u32>()
+            .expect("allocated as NDUInt32"),
+    );
 
     let mut attributes = NDAttributeList::new();
     attributes.add(NDAttribute::new_static(
@@ -199,19 +207,21 @@ async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> 
         NDAttrValue::Int32(NDColorMode::Mono as i32),
     ));
 
-    let mut array = NDArray::with_data(
-        vec![NDDimension::new(width), NDDimension::new(1)],
-        NDDataBuffer::U32(channels),
-    );
-    array.unique_id = counter;
-    array.timestamp = EpicsTimestamp::now();
-    array.time_stamp = array.timestamp.as_f64();
-    array.attributes = attributes;
+    let counter = s.get_int(s.ad.base.array_counter).await + 1;
+    s.set_int(s.ad.base.array_counter, counter).await;
 
+    let mut frame = array.fill();
+    frame.set_unique_id(counter);
+    frame.update_time_stamps(EpicsTimestamp::now());
+    *frame.attributes_mut() = attributes;
+
+    let array = array.share();
     if s.get_int(s.ad.base.array_callbacks).await != 0 {
         ArrayPublisher::new(s.output.clone())
-            .publish(Arc::new(array))
+            .publish(array.clone())
             .await;
     }
+    // C releases the previous pArrays[0] after the callbacks (mythen.cpp:1010-1011).
+    s.pool.owner().store_array(0, array.array().clone());
     true
 }

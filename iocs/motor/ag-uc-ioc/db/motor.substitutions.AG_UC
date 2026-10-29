@@ -1,0 +1,10 @@
+# C's iocNewport motor.substitutions.AG_UC, P and PORT from st.cmd. The
+# driver sends record steps, so VELO/MRES picks C's jog and home speed code
+# (500 steps/s → 4).
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{N,  M,        DTYP,         ADDR,  DESC,          EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)",  "asynMotor",  0,     "Horizontal",  mm,   Pos,  .5,    0.1,   .25,   0,     1,     .2,    .001,  3,     3,     -3,    ""}
+{2,  "m$(N)",  "asynMotor",  1,     "Vertical",    mm,   Pos,  .5,    0.1,   .25,   0,     1,     .2,    .001,  3,     3,     -3,    ""}
+}

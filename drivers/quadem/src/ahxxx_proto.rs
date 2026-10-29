@@ -7,6 +7,9 @@
 
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
+
 use crate::drv_quad_em::{QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat};
 
 /// C++ `AHxxx_TIMEOUT` (0.05 s).
@@ -23,58 +26,6 @@ pub const MAX_INTEGRATION_TIME: f64 = 1.0;
 /// The AH401 series always reads 4 channels of 3 bytes each.
 pub const AH401_BYTES_PER_VALUE: usize = 3;
 pub const AH401_NUM_CHANNELS: usize = 4;
-
-// ===========================================================================
-// C `strtol` emulation
-// ===========================================================================
-
-/// `strtol(nptr, &endptr, base)` restricted to bases 10 and 16.
-///
-/// Returns the converted value and the number of bytes consumed. On "no
-/// conversion" C leaves `endptr == nptr` and returns 0; the read thread calls
-/// `strtol` in a loop with `inPtr` as both input and output, so a field that
-/// fails to convert leaves the pointer parked and every later field also reads
-/// 0. That behaviour is reproduced here rather than fixed: it is what the
-/// meter's output has to avoid triggering.
-pub fn strtol(s: &str, base: u32) -> (i64, usize) {
-    debug_assert!(base == 10 || base == 16);
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let negative = match bytes.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    if base == 16
-        && bytes.get(i) == Some(&b'0')
-        && matches!(bytes.get(i + 1), Some(b'x') | Some(b'X'))
-        && bytes
-            .get(i + 2)
-            .is_some_and(|c| (*c as char).is_digit(base))
-    {
-        i += 2;
-    }
-    let digits_start = i;
-    let mut value: i64 = 0;
-    while let Some(d) = bytes.get(i).and_then(|c| (*c as char).to_digit(base)) {
-        value = value.saturating_mul(base as i64).saturating_add(d as i64);
-        i += 1;
-    }
-    if i == digits_start {
-        // No conversion performed: endptr = nptr.
-        return (0, 0);
-    }
-    (if negative { -value } else { value }, i)
-}
 
 // ===========================================================================
 // Command formatting
@@ -146,7 +97,7 @@ pub fn cmd_bias_state(on: bool) -> &'static str {
 
 /// C++ `setBiasVoltage`: `"HVS %f"` — C's `%f` is six decimals.
 pub fn cmd_bias_voltage(volts: f64) -> String {
-    format!("HVS {volts:.6}")
+    format!("HVS {volts:.6}", volts = CFloat(volts))
 }
 
 // ===========================================================================
@@ -264,7 +215,7 @@ pub fn parse_res(resp: &str) -> Option<i32> {
 fn parse_int_after(resp: &str, prefix: &str) -> Option<i32> {
     let rest = resp.strip_prefix(prefix)?.trim_start();
     let (value, consumed) = strtol(rest, 10);
-    (consumed > 0).then_some(value as i32)
+    (consumed > 0).then_some(long_to_int(value))
 }
 
 /// C++ `readStatus`: `"HVS OFF"` means the bias is off; anything else carries
@@ -341,14 +292,15 @@ pub fn accumulate_binary_ah401(
     Some(raw)
 }
 
-/// C++ `readThread`, AH401 ASCII branch: `strtol(inPtr, &inPtr, 10)` once per
-/// channel across one EOS-terminated line.
+/// C++ `readThread`, AH401 ASCII branch: `int value = strtol(inPtr, &inPtr,
+/// 10)` once per channel across one EOS-terminated line. A field that fails
+/// to convert leaves `inPtr` parked, so every later field reads 0 too.
 pub fn parse_ascii_ah401(line: &str, num_channels: usize) -> [f64; QE_MAX_INPUTS] {
     let mut raw = [0.0f64; QE_MAX_INPUTS];
     let mut rest = line;
     for r in raw.iter_mut().take(num_channels.min(QE_MAX_INPUTS)) {
         let (value, consumed) = strtol(rest, 10);
-        *r = value as f64;
+        *r = f64::from(long_to_int(value));
         rest = &rest[consumed..];
     }
     raw
@@ -457,13 +409,14 @@ pub fn starts_with_ack_preamble(data: &[u8]) -> bool {
     data.starts_with(ACK_PREAMBLE)
 }
 
-/// C++ `readThread`, AH501 ASCII branch: `strtol(inPtr, &inPtr, 16)` per
-/// channel, then the resolution's sign transform.
+/// C++ `readThread`, AH501 ASCII branch: `int value = strtol(inPtr, &inPtr,
+/// 16)` per channel, then the resolution's sign transform.
 pub fn parse_ascii_ah501(line: &str, resolution: i32, num_channels: usize) -> [f64; QE_MAX_INPUTS] {
     let mut raw = [0.0f64; QE_MAX_INPUTS];
     let mut rest = line;
     for r in raw.iter_mut().take(num_channels.min(QE_MAX_INPUTS)) {
         let (value, consumed) = strtol(rest, 16);
+        let value = i64::from(long_to_int(value));
         rest = &rest[consumed..];
         *r = if resolution == 16 {
             sign_transform_16(value) as f64
@@ -477,36 +430,6 @@ pub fn parse_ascii_ah501(line: &str, resolution: i32, num_channels: usize) -> [f
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn strtol_base10_consumes_digits_and_leading_space() {
-        assert_eq!(strtol("  123 456", 10), (123, 5));
-    }
-
-    #[test]
-    fn strtol_stops_at_non_digit_without_consuming_it() {
-        let (v, n) = strtol("42abc", 10);
-        assert_eq!((v, n), (42, 2));
-        assert_eq!(&"42abc"[n..], "abc");
-    }
-
-    #[test]
-    fn strtol_no_conversion_returns_zero_and_parks_pointer() {
-        assert_eq!(strtol(",123", 10), (0, 0));
-        assert_eq!(strtol("", 10), (0, 0));
-    }
-
-    #[test]
-    fn strtol_handles_sign() {
-        assert_eq!(strtol("-17", 10), (-17, 3));
-        assert_eq!(strtol("+17", 10), (17, 3));
-    }
-
-    #[test]
-    fn strtol_base16_parses_hex_with_optional_prefix() {
-        assert_eq!(strtol("ffffff", 16), (0xff_ffff, 6));
-        assert_eq!(strtol("0x1A", 16), (0x1a, 4));
-    }
 
     #[test]
     fn range_command_and_response() {
@@ -607,6 +530,27 @@ mod tests {
         assert_eq!(raw, [100.0, 200.0, 0.0, 0.0]);
     }
 
+    /// C `int value = strtol(inPtr, &inPtr, 10)` (`drvAHxxx.cpp:163`,
+    /// `:386`): glibc's `isspace` skip takes `\v`, and the saturated `long`
+    /// is truncated to `int`.
+    #[test]
+    fn an_ah401_field_is_strtol_truncated_to_int() {
+        use std::ffi::c_long;
+        let raw = parse_ascii_ah401(
+            "\x0b7 4294967297 -99999999999999999999 99999999999999999999",
+            4,
+        );
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        let want = [
+            7,
+            wrapped,
+            long_to_int(c_long::MIN),
+            long_to_int(c_long::MAX),
+        ]
+        .map(f64::from);
+        assert_eq!(raw, want);
+    }
+
     #[test]
     fn averaging_divides_only_when_values_per_read_exceeds_one() {
         let mut raw = [10.0, 20.0, 30.0, 40.0];
@@ -631,6 +575,8 @@ mod tests {
         assert_eq!(cmd_bias_state(true), "HVS ON");
         assert_eq!(cmd_bias_state(false), "HVS OFF");
         assert_eq!(cmd_bias_voltage(12.5), "HVS 12.500000");
+        assert_eq!(cmd_bias_voltage(f64::NAN), "HVS nan");
+        assert_eq!(cmd_bias_voltage(-f64::NAN), "HVS -nan");
     }
 
     #[test]
@@ -731,6 +677,27 @@ mod tests {
         let raw = parse_ascii_ah501("000001 FFFFFF", 24, 2);
         assert_eq!(raw[0], -1.0);
         assert_eq!(raw[1], 1.0);
+    }
+
+    /// C `int value = strtol(inPtr, &inPtr, 16)` (`drvAHxxx.cpp:365`), the
+    /// sign transform then applied to that `int`.
+    #[test]
+    fn an_ah501_field_is_strtol_truncated_to_int() {
+        use std::ffi::c_long;
+        let raw = parse_ascii_ah501("100000001 \x0b000002", 24, 2);
+        let wrapped = if c_long::BITS == 64 { 1 } else { i32::MAX };
+        assert_eq!(raw[..2], [sign_transform_24(wrapped.into()) as f64, -2.0]);
+    }
+
+    /// `sscanf("CHN %d")` is glibc's `(int) strtol`: `LONG_MIN` is in range,
+    /// and truncates.
+    #[test]
+    fn chn_is_strtol_truncated_to_int() {
+        use std::ffi::c_long;
+        assert_eq!(
+            parse_chn("CHN -9223372036854775808"),
+            Some(long_to_int(c_long::MIN))
+        );
     }
 
     #[test]

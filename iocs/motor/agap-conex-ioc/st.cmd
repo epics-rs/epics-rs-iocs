@@ -10,10 +10,8 @@
 #============================================================
 
 epicsEnvSet("P",      "AGAP:")
-epicsEnvSet("MU",     "u")
-epicsEnvSet("MV",     "v")
-epicsEnvSet("PORT",   "MOTOR1")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("PORT",   "Agilis1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 epicsEnvSet("CID",    "1")
 
@@ -27,22 +25,26 @@ asynSetOption("$(SERIAL)", 0, "baud",   "115200")
 asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
-
-# NOTE (hardware path): the AGAP driver appends the CR/LF command terminator
-# itself, so no output EOS is required. Input-response framing relies on the
-# serial read returning a complete reply; asyn-rs (published 0.21.0) exposes no
-# asynOctetSetInputEos iocsh command, so the input terminator cannot be set
-# here. Verify response framing against real hardware before production use.
+# Port EOS as the C example sets it (st.cmd.AGAP_CONEX:15-16);
+# the driver sends bare commands.
+asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- CONEX-AGAP controller (creates both U and V axes) ----
-# AGAP_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs])
-AGAP_CONEXCreateController("$(PORT)", "$(SERIAL)", $(CID), 100, 1000)
+# AGAP_CONEXCreateController(portName, serialPort, controllerID, movingPollPeriod, idlePollPeriod)
+AGAP_CONEXCreateController("$(PORT)", "$(SERIAL)", $(CID), 50, 500)
 
-dbLoadRecords("$(AGAP_CONEX_IOC)/db/agap.template", "P=$(P),MU=$(MU),MV=$(MV),PORT=$(PORT)")
+# Each axis's basic_asyn_motor.db and the serial line's asyn record, as
+# C's st.cmd.AGAP_CONEX loads them.
+dbLoadTemplate("$(AGAP_CONEX_IOC)/db/motor.substitutions.AGAP_CONEX", "P=$(P),PORT=$(PORT)")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=serial1,PORT=$(SERIAL),ADDR=0,OMAX=256,IMAX=256")
 
 iocInit()
 
+dbpf("$(P)m1.RTRY", "0")
+dbpf("$(P)m1.NTM", "0")
+
 # Example:
 #   dbl
-#   camonitor AGAP:u AGAP:u.RBV AGAP:v AGAP:v.RBV
-#   caput AGAP:u 0.5
+#   camonitor AGAP:m1 AGAP:m1.RBV AGAP:m2 AGAP:m2.RBV
+#   caput AGAP:m1 0.5   (MRES 1e-4 = the driver stepSize_)

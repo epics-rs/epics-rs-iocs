@@ -122,26 +122,28 @@ impl SimParams {
 
     /// Read the full `computeImage` input set. The geometry is returned raw and
     /// must still be [`Geometry::clamp`]ed by the caller.
-    pub async fn read_config(
-        &self,
-        handle: &PortHandle,
-        ad: &ADBaseParams,
-    ) -> AsynResult<SimConfig> {
-        Ok(SimConfig {
+    ///
+    /// C reads an unset param as 0 and never refuses a frame over one: the
+    /// geometry, colour mode and data type statuses only make it print
+    /// (simDetector.cpp:524-539), so the flag is false when one of those failed;
+    /// every other read ignores its status (simDetector.cpp:57-60,251-265,364-386).
+    pub async fn read_config(&self, handle: &PortHandle, ad: &ADBaseParams) -> (SimConfig, bool) {
+        let mut status = StatusReads { handle, ok: true };
+        let config = SimConfig {
             geometry: Geometry {
-                max_size_x: handle.read_int32(ad.max_size_x, 0).await?,
-                max_size_y: handle.read_int32(ad.max_size_y, 0).await?,
-                min_x: handle.read_int32(ad.min_x, 0).await?,
-                min_y: handle.read_int32(ad.min_y, 0).await?,
-                size_x: handle.read_int32(ad.size_x, 0).await?,
-                size_y: handle.read_int32(ad.size_y, 0).await?,
-                bin_x: handle.read_int32(ad.bin_x, 0).await?,
-                bin_y: handle.read_int32(ad.bin_y, 0).await?,
-                reverse_x: handle.read_int32(ad.reverse_x, 0).await? != 0,
-                reverse_y: handle.read_int32(ad.reverse_y, 0).await? != 0,
+                max_size_x: status.i32(ad.max_size_x).await,
+                max_size_y: status.i32(ad.max_size_y).await,
+                min_x: status.i32(ad.min_x).await,
+                min_y: status.i32(ad.min_y).await,
+                size_x: status.i32(ad.size_x).await,
+                size_y: status.i32(ad.size_y).await,
+                bin_x: status.i32(ad.bin_x).await,
+                bin_y: status.i32(ad.bin_y).await,
+                reverse_x: status.i32(ad.reverse_x).await != 0,
+                reverse_y: status.i32(ad.reverse_y).await != 0,
             },
-            color_mode: NDColorMode::from_i32(handle.read_int32(ad.base.color_mode, 0).await?),
-            data_type: u8::try_from(handle.read_int32(ad.base.data_type, 0).await?)
+            color_mode: NDColorMode::from_i32(status.i32(ad.base.color_mode).await),
+            data_type: u8::try_from(status.i32(ad.base.data_type).await)
                 .ok()
                 .and_then(NDDataType::from_ordinal)
                 // C `switch (dataType)` has no default: an out-of-range value
@@ -149,61 +151,95 @@ impl SimParams {
                 // of "do nothing with an unknown type", so fall back to the
                 // ADDriverBase default (UInt8).
                 .unwrap_or(NDDataType::UInt8),
-            sim_mode: SimMode::from_i32(handle.read_int32(self.mode, 0).await?),
+            sim_mode: SimMode::from_i32(i32_or_zero(handle, self.mode).await),
 
-            gain: handle.read_float64(ad.gain, 0).await?,
-            gain_x: handle.read_float64(self.gain_x, 0).await?,
-            gain_y: handle.read_float64(self.gain_y, 0).await?,
-            gain_red: handle.read_float64(self.gain_red, 0).await?,
-            gain_green: handle.read_float64(self.gain_green, 0).await?,
-            gain_blue: handle.read_float64(self.gain_blue, 0).await?,
+            gain: f64_or_zero(handle, ad.gain).await,
+            gain_x: f64_or_zero(handle, self.gain_x).await,
+            gain_y: f64_or_zero(handle, self.gain_y).await,
+            gain_red: f64_or_zero(handle, self.gain_red).await,
+            gain_green: f64_or_zero(handle, self.gain_green).await,
+            gain_blue: f64_or_zero(handle, self.gain_blue).await,
 
-            offset: handle.read_float64(self.offset, 0).await?,
-            noise: handle.read_float64(self.noise, 0).await?,
+            offset: f64_or_zero(handle, self.offset).await,
+            noise: f64_or_zero(handle, self.noise).await,
 
-            peak_start_x: handle.read_int32(self.peak_start_x, 0).await?,
-            peak_start_y: handle.read_int32(self.peak_start_y, 0).await?,
-            peak_width_x: handle.read_int32(self.peak_width_x, 0).await?,
-            peak_width_y: handle.read_int32(self.peak_width_y, 0).await?,
-            peak_num_x: handle.read_int32(self.peak_num_x, 0).await?,
-            peak_num_y: handle.read_int32(self.peak_num_y, 0).await?,
-            peak_step_x: handle.read_int32(self.peak_step_x, 0).await?,
-            peak_step_y: handle.read_int32(self.peak_step_y, 0).await?,
-            peak_height_variation: handle.read_float64(self.peak_height_variation, 0).await?,
+            peak_start_x: i32_or_zero(handle, self.peak_start_x).await,
+            peak_start_y: i32_or_zero(handle, self.peak_start_y).await,
+            peak_width_x: i32_or_zero(handle, self.peak_width_x).await,
+            peak_width_y: i32_or_zero(handle, self.peak_width_y).await,
+            peak_num_x: i32_or_zero(handle, self.peak_num_x).await,
+            peak_num_y: i32_or_zero(handle, self.peak_num_y).await,
+            peak_step_x: i32_or_zero(handle, self.peak_step_x).await,
+            peak_step_y: i32_or_zero(handle, self.peak_step_y).await,
+            peak_height_variation: f64_or_zero(handle, self.peak_height_variation).await,
 
             x_sine: SineParams {
                 operation: SineOperation::from_i32(
-                    handle.read_int32(self.x_sine_operation, 0).await?,
+                    i32_or_zero(handle, self.x_sine_operation).await,
                 ),
-                amplitude1: handle.read_float64(self.x_sine1_amplitude, 0).await?,
-                frequency1: handle.read_float64(self.x_sine1_frequency, 0).await?,
-                phase1: handle.read_float64(self.x_sine1_phase, 0).await?,
-                amplitude2: handle.read_float64(self.x_sine2_amplitude, 0).await?,
-                frequency2: handle.read_float64(self.x_sine2_frequency, 0).await?,
-                phase2: handle.read_float64(self.x_sine2_phase, 0).await?,
+                amplitude1: f64_or_zero(handle, self.x_sine1_amplitude).await,
+                frequency1: f64_or_zero(handle, self.x_sine1_frequency).await,
+                phase1: f64_or_zero(handle, self.x_sine1_phase).await,
+                amplitude2: f64_or_zero(handle, self.x_sine2_amplitude).await,
+                frequency2: f64_or_zero(handle, self.x_sine2_frequency).await,
+                phase2: f64_or_zero(handle, self.x_sine2_phase).await,
             },
             y_sine: SineParams {
                 operation: SineOperation::from_i32(
-                    handle.read_int32(self.y_sine_operation, 0).await?,
+                    i32_or_zero(handle, self.y_sine_operation).await,
                 ),
-                amplitude1: handle.read_float64(self.y_sine1_amplitude, 0).await?,
-                frequency1: handle.read_float64(self.y_sine1_frequency, 0).await?,
-                phase1: handle.read_float64(self.y_sine1_phase, 0).await?,
-                amplitude2: handle.read_float64(self.y_sine2_amplitude, 0).await?,
-                frequency2: handle.read_float64(self.y_sine2_frequency, 0).await?,
-                phase2: handle.read_float64(self.y_sine2_phase, 0).await?,
+                amplitude1: f64_or_zero(handle, self.y_sine1_amplitude).await,
+                frequency1: f64_or_zero(handle, self.y_sine1_frequency).await,
+                phase1: f64_or_zero(handle, self.y_sine1_phase).await,
+                amplitude2: f64_or_zero(handle, self.y_sine2_amplitude).await,
+                frequency2: f64_or_zero(handle, self.y_sine2_frequency).await,
+                phase2: f64_or_zero(handle, self.y_sine2_phase).await,
             },
+        };
+        (config, status.ok)
+    }
+}
+
+/// The reads C ORs into `computeImage`'s status.
+struct StatusReads<'a> {
+    handle: &'a PortHandle,
+    ok: bool,
+}
+
+impl StatusReads<'_> {
+    async fn i32(&mut self, reason: usize) -> i32 {
+        self.handle.read_int32(reason, 0).await.unwrap_or_else(|_| {
+            self.ok = false;
+            0
         })
     }
+}
+
+async fn i32_or_zero(handle: &PortHandle, reason: usize) -> i32 {
+    handle.read_int32(reason, 0).await.unwrap_or(0)
+}
+
+async fn f64_or_zero(handle: &PortHandle, reason: usize) -> f64 {
+    handle.read_float64(reason, 0).await.unwrap_or(0.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ADDriverBase;
+    use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
+    use epics_rs::asyn::port::InterfaceMask;
 
     fn fixture() -> (ADDriverBase, SimParams) {
-        let mut ad = ADDriverBase::new("SIMTEST", 64, 64, 0).unwrap();
+        let mut ad = ADDriverBase::new(
+            "SIMTEST",
+            1,
+            0,
+            ASYN_NONE,
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        )
+        .unwrap();
         let sim = SimParams::create(&mut ad.port_base).unwrap();
         (ad, sim)
     }

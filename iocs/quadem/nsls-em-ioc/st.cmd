@@ -2,38 +2,51 @@
 #============================================================
 # st.cmd — NSLS Precision Integrator (NSLS_EM) IOC
 #
-# Usage:
-#   cargo run -p nsls-em-ioc -- iocs/quadem/nsls-em-ioc/st.cmd
+# Usage (from this directory, as C runs from iocBoot/iocNSLS_EM):
+#   ../../../target/debug/nsls-em-ioc st.cmd
 #
-# Mirrors quadEM's iocBoot/iocNSLS_EM/NSLS_EM.cmd.
+# Port of quadEM iocBoot/iocNSLS_EM/st.cmd + NSLS_EM.cmd. dbLoadDatabase and
+# registerRecordDeviceDriver have no epics-rs counterpart; $(QUADEM) is set
+# to iocs/quadem by ioc_support.
 #============================================================
+
+errlogInit(5000)
+
+# The search path for database files
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
 
 epicsEnvSet("PREFIX",    "QE1:")
 epicsEnvSet("RECORD",    "NSLS_EM:")
 epicsEnvSet("PORT",      "NSLS_EM")
 epicsEnvSet("TEMPLATE",  "NSLS_EM")
+epicsEnvSet("QSIZE",     "20")
 epicsEnvSet("RING_SIZE", "10000")
 epicsEnvSet("TSPOINTS",  "1000")
 epicsEnvSet("BROADCAST", "164.54.160.255")
 epicsEnvSet("MODULE_ID", "0")
 
-# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
-# at IOC startup; every quadEM template lives in its db/ subdir.
+# Load asynRecord record
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(PREFIX), R=asyn1,PORT=TCP_Command_$(PORT),ADDR=0,OMAX=256,IMAX=256")
 
-# The driver broadcasts on $(BROADCAST):37747 to find the module with the
-# given ID, then opens the TCP command (4747) and data (5757) ports itself.
 drvNSLS_EMConfigure("$(PORT)", "$(BROADCAST)", $(MODULE_ID), $(RING_SIZE))
 
-# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
-# ...) resolve through the db search path; direct dbLoad paths stay explicit.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
+asynSetTraceIOMask("UDP_$(PORT)", 0, 2)
+asynSetTraceMask("UDP_$(PORT)", 0, 9)
+asynSetTraceIOMask("TCP_Command_$(PORT)", 0, 2)
+#asynSetTraceMask("TCP_Command_$(PORT)", 0, 9)
+asynSetTraceIOMask("TCP_Data_$(PORT)", 0, 2)
+#asynSetTraceMask("TCP_Data_$(PORT)", 0, 9)
 
-dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
+dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
-# Example interactive commands:
-#   dbl                             # List all PVs
-#   dbpf QE1:NSLS_EM:Acquire 1      # Start acquisition
-#   dbgf QE1:NSLS_EM:Current1:MeanValue_RBV
-#   asynReport                      # Show port/plugin status
+< $(QUADEM)/quadEM_Plugins.cmd
+
+asynSetTraceIOMask("$(PORT)",0,2)
+#asynSetTraceMask("$(PORT)",  0,0x29)
+
+< $(QUADEM)/saveRestore.cmd
+
+iocInit()
+
+# save settings every thirty seconds
+create_monitor_set("auto_settings.req",30,"P=$(PREFIX), R=$(RECORD)")

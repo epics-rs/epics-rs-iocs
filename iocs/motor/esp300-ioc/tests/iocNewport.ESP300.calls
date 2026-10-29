@@ -1,0 +1,3 @@
+# c-expansion of st.cmd, ESP300.cmd over the C sources, its controller calls:
+ESP300Setup(1, 10)
+ESP300Config(0, "serial4")

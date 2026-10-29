@@ -1,0 +1,10 @@
+# dbl of motor R7-4-5 motorSmartMotor iocBoot/iocSmartMotor st.cmd
+smartMotor:alldone
+smartMotor:alldoneBlink
+smartMotor:allstop
+smartMotor:m1
+smartMotor:m1_able
+smartMotor:m1_twCh
+smartMotor:m1_vCh
+smartMotor:moving
+smartMotor:movingDiff

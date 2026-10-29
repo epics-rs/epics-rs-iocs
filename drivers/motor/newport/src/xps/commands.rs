@@ -2,7 +2,7 @@
 //!
 //! Each method marshals the exact `FuncName (args)` string the vendor
 //! `XPS_C8_drivers.cpp` builds (note the space before `(`, and `%.13g` for
-//! doubles via [`format_g`]) and parses the reply's out-parameters. Action
+//! doubles via `g13`) and parses the reply's out-parameters. Action
 //! functions return `Ok(())` on error code `0`; getters return the parsed
 //! values. The socket's [`SocketMode`] decides whether the call waits for the
 //! reply (poll socket) or fires without waiting (per-axis move socket), so the
@@ -10,15 +10,10 @@
 //!
 //! [`SocketMode`]: super::rpc::SocketMode
 
-use super::rpc::{XpsResult, XpsSocket, format_g};
+use epics_rs::base::runtime::stdlib::strtod;
+use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
-/// Double precision used by the vendor library (`%.13g`).
-const G13: usize = 13;
-
-/// Format a double for the wire exactly as `XPS_C8_drivers.cpp` (`%.13g`).
-fn g(value: f64) -> String {
-    format_g(value, G13)
-}
+use super::rpc::{XpsResult, XpsSocket, g13 as g};
 
 /// Marshal an extended-event name list: each element is followed by its four
 /// (empty) parameters, elements joined by `,` (C
@@ -47,6 +42,19 @@ impl XpsSocket {
         Ok(r.string(1).to_string())
     }
 
+    /// C `HXPErrorStringGet` (hxp_drivers.cpp:271-303): `out` takes the
+    /// reply's string and keeps what it held when there is none, as the
+    /// move socket's timed-out `"0"`.
+    pub fn error_string_get_into(&self, code: i32, out: &mut String) {
+        let cmd = format!("ErrorStringGet ({code},char *)");
+        if let Ok(reply) = self.exec(&cmd)
+            && reply.code() == 0
+            && let Some(text) = reply.field(1)
+        {
+            *out = text.to_string();
+        }
+    }
+
     // --- Group status / position ------------------------------------------
 
     /// `GroupStatusGet(group)` → the group status code.
@@ -68,6 +76,25 @@ impl XpsSocket {
         let cmd = format!("GroupPositionCurrentGet ({positioner},double *)");
         let r = self.exec(&cmd)?.require_ok()?;
         Ok(r.double(1))
+    }
+
+    /// `GroupPositionCurrentGet(group, pos.len())` into `pos`: one encoder
+    /// position per positioner. As C (XPS_C8_drivers.cpp:3556-3600), an
+    /// element keeps what it held when its field is missing or no `%lf`.
+    pub fn group_positions_current_get(&self, group: &str, pos: &mut [f64]) -> XpsResult<()> {
+        let cmd = format!(
+            "GroupPositionCurrentGet ({group},{})",
+            vec!["double *"; pos.len()].join(",")
+        );
+        let r = self.exec(&cmd)?.require_ok()?;
+        for (i, p) in pos.iter_mut().enumerate() {
+            if let Some(read) = r.field(i + 1).map(|f| strtod(f.as_bytes()))
+                && read.len > 0
+            {
+                *p = read.value;
+            }
+        }
+        Ok(())
     }
 
     /// `GroupPositionSetpointGet(positioner, 1)` → commanded setpoint position.
@@ -197,9 +224,11 @@ impl XpsSocket {
         Ok(())
     }
 
-    /// `GroupMoveAbsolute(positioner, [target])` (one element).
-    pub fn group_move_absolute(&self, positioner: &str, target: f64) -> XpsResult<()> {
-        let cmd = format!("GroupMoveAbsolute ({positioner},{})", g(target));
+    /// `GroupMoveAbsolute(name, targets)`: one target for a positioner, one
+    /// per positioner for a group.
+    pub fn group_move_absolute(&self, name: &str, targets: &[f64]) -> XpsResult<()> {
+        let targets: Vec<String> = targets.iter().map(|&t| g(t)).collect();
+        let cmd = format!("GroupMoveAbsolute ({name},{})", targets.join(","));
         self.exec(&cmd)?.require_ok()?;
         Ok(())
     }
@@ -301,6 +330,43 @@ impl XpsSocket {
         Ok(())
     }
 
+    /// `PositionerPositionComparePulseParametersGet(positioner)` → (pulse
+    /// width, settling time).
+    pub fn positioner_position_compare_pulse_parameters_get(
+        &self,
+        positioner: &str,
+    ) -> XpsResult<(f64, f64)> {
+        let cmd =
+            format!("PositionerPositionComparePulseParametersGet ({positioner},double *,double *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok((r.double(1), r.double(2)))
+    }
+
+    /// `PositionerPositionCompareGet(positioner)` → (min, max, step, enable).
+    pub fn positioner_position_compare_get(
+        &self,
+        positioner: &str,
+    ) -> XpsResult<(f64, f64, f64, bool)> {
+        let cmd = format!(
+            "PositionerPositionCompareGet ({positioner},double *,double *,double *,bool *)"
+        );
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok((r.double(1), r.double(2), r.double(3), r.int(4) != 0))
+    }
+
+    /// `PositionerPositionCompareAquadBWindowedGet(positioner)` → (min, max,
+    /// enable).
+    pub fn positioner_position_compare_aquadb_windowed_get(
+        &self,
+        positioner: &str,
+    ) -> XpsResult<(f64, f64, bool)> {
+        let cmd = format!(
+            "PositionerPositionCompareAquadBWindowedGet ({positioner},double *,double *,bool *)"
+        );
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok((r.double(1), r.double(2), r.int(3) != 0))
+    }
+
     /// `PositionerPositionCompareSet(positioner, min, max, step)`.
     pub fn positioner_position_compare_set(
         &self,
@@ -375,19 +441,48 @@ impl XpsSocket {
         Ok(())
     }
 
-    /// `MultipleAxesPVTVerificationResultGet(positioner, file)` → the verified
-    /// trajectory's dynamic bounds `(minPos, maxPos, maxVel, maxAccel)` for one
-    /// positioner, relative to its start (used for the software-limit check).
+    /// `MultipleAxesPVTVerificationResultGet(positioner)` → the last verified
+    /// trajectory's `(file, minPos, maxPos, maxVel, maxAccel)` for one
+    /// positioner, positions relative to its start. The file name is an
+    /// out-parameter (XPS_C8_drivers.cpp:7353).
     pub fn multiple_axes_pvt_verification_result_get(
         &self,
         positioner: &str,
-        file: &str,
-    ) -> XpsResult<(f64, f64, f64, f64)> {
+    ) -> XpsResult<(String, f64, f64, f64, f64)> {
         let cmd = format!(
-            "MultipleAxesPVTVerificationResultGet ({positioner},{file},double *,double *,double *,double *)"
+            "MultipleAxesPVTVerificationResultGet ({positioner},char *,double *,double *,double *,double *)"
         );
         let r = self.exec(&cmd)?.require_ok()?;
-        Ok((r.double(1), r.double(2), r.double(3), r.double(4)))
+        Ok((
+            r.string(1).to_string(),
+            r.double(2),
+            r.double(3),
+            r.double(4),
+            r.double(5),
+        ))
+    }
+
+    /// `MultipleAxesPVTParametersGet(group)` into `file` and `element`: the
+    /// running trajectory and its current element. As C
+    /// (XPS_C8_drivers.cpp:7439-7473), each keeps what it held when its
+    /// field is missing, and `element` too when its field is no `%d`.
+    pub fn multiple_axes_pvt_parameters_get(
+        &self,
+        group: &str,
+        file: &mut String,
+        element: &mut i32,
+    ) -> XpsResult<()> {
+        let cmd = format!("MultipleAxesPVTParametersGet ({group},char *,int *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        if let Some(name) = r.field(1) {
+            *file = name.to_string();
+        }
+        if let Some((value, len)) = r.field(2).map(|f| strtol(f, 10))
+            && len > 0
+        {
+            *element = long_to_int(value);
+        }
+        Ok(())
     }
 
     /// `MultipleAxesPVTExecution(group, file, executionNumber)` — run the
@@ -420,6 +515,51 @@ impl XpsSocket {
             "MultipleAxesPVTPulseOutputSet ({group},{start_element},{end_element},{})",
             g(period)
         );
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    // --- GPIO (drvXPSAsynAux) ----------------------------------------------
+
+    /// `GPIOAnalogGet(names)` → one value per name, in order.
+    pub fn gpio_analog_get(&self, names: &[&str]) -> XpsResult<Vec<f64>> {
+        let args: Vec<String> = names.iter().map(|n| format!("{n},double *")).collect();
+        let cmd = format!("GPIOAnalogGet ({})", args.join(","));
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok((1..=names.len()).map(|n| r.double(n)).collect())
+    }
+
+    /// `GPIOAnalogSet(name, value)`.
+    pub fn gpio_analog_set(&self, name: &str, value: f64) -> XpsResult<()> {
+        let cmd = format!("GPIOAnalogSet ({name},{})", g(value));
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `GPIOAnalogGainGet(name)` → the input's gain.
+    pub fn gpio_analog_gain_get(&self, name: &str) -> XpsResult<i32> {
+        let cmd = format!("GPIOAnalogGainGet ({name},int *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok(r.int(1))
+    }
+
+    /// `GPIOAnalogGainSet(name, gain)`.
+    pub fn gpio_analog_gain_set(&self, name: &str, gain: i32) -> XpsResult<()> {
+        let cmd = format!("GPIOAnalogGainSet ({name},{gain})");
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `GPIODigitalGet(name)` → the port's bits (C `%hu`).
+    pub fn gpio_digital_get(&self, name: &str) -> XpsResult<u16> {
+        let cmd = format!("GPIODigitalGet ({name},unsigned short *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok(r.bits(1) as u16)
+    }
+
+    /// `GPIODigitalSet(name, mask, value)`.
+    pub fn gpio_digital_set(&self, name: &str, mask: u16, value: u16) -> XpsResult<()> {
+        let cmd = format!("GPIODigitalSet ({name},{mask},{value})");
         self.exec(&cmd)?.require_ok()?;
         Ok(())
     }
@@ -507,5 +647,164 @@ impl XpsSocket {
         let cmd = format!("EventExtendedRemove ({id})");
         self.exec(&cmd)?.require_ok()?;
         Ok(())
+    }
+
+    // --- Single-axis slave (gearing), xpsSlave.st -------------------------
+
+    /// `SingleAxisSlaveModeEnable(group)`.
+    pub fn single_axis_slave_mode_enable(&self, group: &str) -> XpsResult<()> {
+        self.exec(&format!("SingleAxisSlaveModeEnable ({group})"))?
+            .require_ok()?;
+        Ok(())
+    }
+
+    /// `SingleAxisSlaveModeDisable(group)`.
+    pub fn single_axis_slave_mode_disable(&self, group: &str) -> XpsResult<()> {
+        self.exec(&format!("SingleAxisSlaveModeDisable ({group})"))?
+            .require_ok()?;
+        Ok(())
+    }
+
+    /// `SingleAxisSlaveParametersSet(group, masterPositioner, ratio)`.
+    pub fn single_axis_slave_parameters_set(
+        &self,
+        group: &str,
+        master: &str,
+        ratio: f64,
+    ) -> XpsResult<()> {
+        let cmd = format!(
+            "SingleAxisSlaveParametersSet ({group},{master},{})",
+            g(ratio)
+        );
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `SingleAxisSlaveParametersGet(group)` into `master` and `ratio`. As C
+    /// (XPS_C8_drivers.cpp:7690-7705), each keeps what it held when its
+    /// field is missing, and `ratio` too when its field is no `%lf`.
+    pub fn single_axis_slave_parameters_get(
+        &self,
+        group: &str,
+        master: &mut String,
+        ratio: &mut f64,
+    ) -> XpsResult<()> {
+        let cmd = format!("SingleAxisSlaveParametersGet ({group},char *,double *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        if let Some(name) = r.field(1) {
+            *master = name.to_string();
+        }
+        if let Some(read) = r.field(2).map(|f| strtod(f.as_bytes()))
+            && read.len > 0
+        {
+            *ratio = read.value;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::fake::FakeLine;
+    use super::super::rpc::SocketMode;
+
+    /// XPS_C8_drivers.cpp:7353-7385: the file name is an out-parameter, so
+    /// the bounds are reply fields 2-5.
+    #[test]
+    fn pvt_verification_result_get_marshals_as_c() {
+        let line = FakeLine::new("xps_pvt_result", "");
+        let sock = line.socket(SocketMode::Query);
+        assert_eq!(
+            sock.multiple_axes_pvt_verification_result_get("G1.P1")
+                .unwrap(),
+            ("traj.trj".into(), -0.5, 2.5, 1.2, 3.4)
+        );
+        assert_eq!(
+            line.take_log(),
+            [
+                "MultipleAxesPVTVerificationResultGet (G1.P1,char *,double *,double *,double *,double *)"
+            ]
+        );
+    }
+
+    /// XPS_C8_drivers.cpp:3556-3600: one `double *` per element; an element
+    /// whose field is no number, or is missing, keeps its value, and a
+    /// failed call leaves them all.
+    #[test]
+    fn group_positions_current_get_marshals_as_c() {
+        let line = FakeLine::new("xps_group_positions", "");
+        let sock = line.socket(SocketMode::Query);
+        let mut pos = [9.0; 5];
+        sock.group_positions_current_get("G1", &mut pos).unwrap();
+        assert_eq!(pos, [1.5, 9.0, 3.5, 9.0, 9.0]);
+        assert_eq!(
+            line.take_log(),
+            ["GroupPositionCurrentGet (G1,double *,double *,double *,double *,double *)"]
+        );
+
+        *line.fail.lock().unwrap() = "GroupPositionCurrentGet";
+        let mut pos = [9.0; 2];
+        let err = sock
+            .group_positions_current_get("G1", &mut pos)
+            .unwrap_err();
+        assert_eq!((err.code(), pos), (-3, [9.0; 2]));
+    }
+
+    /// XPS_C8_drivers.cpp:7439-7473: the file is reply field 1 and the
+    /// element field 2; a missing or non-`%d` field keeps its value.
+    #[test]
+    fn pvt_parameters_get_marshals_as_c() {
+        let line = FakeLine::new("xps_pvt_parameters", "");
+        let sock = line.socket(SocketMode::Query);
+        let (mut file, mut element) = (String::new(), 7);
+        sock.multiple_axes_pvt_parameters_get("G1", &mut file, &mut element)
+            .unwrap();
+        assert_eq!((file.as_str(), element), ("traj.trj", 42));
+        assert_eq!(
+            line.take_log(),
+            ["MultipleAxesPVTParametersGet (G1,char *,int *)"]
+        );
+
+        let (mut file, mut element) = ("kept".to_string(), 7);
+        sock.multiple_axes_pvt_parameters_get("NOELEMENT", &mut file, &mut element)
+            .unwrap();
+        assert_eq!((file.as_str(), element), ("traj.trj", 7));
+    }
+
+    /// XPS_C8_drivers.cpp:7574-7710: the SingleAxisSlave* wire strings, and
+    /// a failed or short Get leaves its out-parameters alone.
+    #[test]
+    fn single_axis_slave_calls_marshal_as_c() {
+        let line = FakeLine::new("xps_slave_calls", "");
+        let sock = line.socket(SocketMode::Query);
+        sock.single_axis_slave_parameters_set("G2", "G1.P1", 0.1)
+            .unwrap();
+        sock.single_axis_slave_mode_enable("G2").unwrap();
+        sock.single_axis_slave_mode_disable("G2").unwrap();
+        let (mut master, mut ratio) = (String::new(), 0.0);
+        sock.single_axis_slave_parameters_get("G2", &mut master, &mut ratio)
+            .unwrap();
+        assert_eq!((master.as_str(), ratio), ("G1.P1", 2.5));
+        assert_eq!(
+            line.take_log(),
+            [
+                "SingleAxisSlaveParametersSet (G2,G1.P1,0.1)",
+                "SingleAxisSlaveModeEnable (G2)",
+                "SingleAxisSlaveModeDisable (G2)",
+                "SingleAxisSlaveParametersGet (G2,char *,double *)",
+            ]
+        );
+
+        let (mut master, mut ratio) = ("kept".to_string(), 7.0);
+        sock.single_axis_slave_parameters_get("NORATIO", &mut master, &mut ratio)
+            .unwrap();
+        assert_eq!((master.as_str(), ratio), ("G1.P1", 7.0));
+
+        *line.fail.lock().unwrap() = "SingleAxisSlaveParametersGet";
+        let (mut master, mut ratio) = ("kept".to_string(), 7.0);
+        let err = sock
+            .single_axis_slave_parameters_get("G2", &mut master, &mut ratio)
+            .unwrap_err();
+        assert_eq!((err.code(), master.as_str(), ratio), (-3, "kept", 7.0));
     }
 }

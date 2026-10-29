@@ -1,0 +1,12 @@
+# C's iocNewport motor.substitutions.CONEX-PP, P from st.cmd: an NSA12
+# stage, 6.35 um per full step, 128 micro-steps. The driver boundary is raw
+# steps of the model's stepSize_ (CC/AGP SU?/IF?, PP FRS?/FRM?/1000, DL 1e-4,
+# FCL200 1), so MRES must equal it.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{M,   DTYP,         PORT,    ADDR,  DESC,  EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,          PREC,  DHLM,  DLLM,  INIT}
+{m1,  "asynMotor",  CONEX1,  0,     "X",   mm,   Pos,  1.,    0.1,   .25,   0,     1,     .2,    4.9609375e-5,  4,     28,    -1,    ""}
+{m2,  "asynMotor",  CONEX2,  0,     "Y",   mm,   Pos,  1.,    0.1,   .25,   0,     1,     .2,    4.9609375e-5,  4,     28,    -1,    ""}
+{m3,  "asynMotor",  CONEX3,  0,     "Z",   mm,   Pos,  1.,    0.1,   .25,   0,     1,     .2,    4.9609375e-5,  4,     28,    -1,    ""}
+}

@@ -1,0 +1,4 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+PMNC87xxSetup(1, 2, 10)
+PMNC87xxConfig(0, "serial1")
+nf874xCreateController("NF1", "NF1_ETH", 3, 200, 1000)

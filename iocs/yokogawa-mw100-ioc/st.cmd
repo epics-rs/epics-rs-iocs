@@ -9,13 +9,10 @@
 # (modules -> status -> infos -> data), so the unit must be powered on and
 # network-reachable when mw100Init runs.
 #
-# Signal channel numbering is NOT module-relative like GM10's (no N*100+k
-# scheme) — drvMW100.c's load_modules/classify_module report each installed
-# module's actual channel count and the channels are numbered sequentially
-# across modules in slot order (module 0's channels first, then module 1's,
-# etc). The ADDRESS values below assume module 0 is a 6-channel analog-input
-# module (MX110/MX112-class) occupying Signal addresses 1-6; adjust to match
-# the actual installed modules and their reported channel counts.
+# Signal address = 10*slot + channel (drvMW100.c:680): slot 0 holds 1-10,
+# slot 1 holds 11-20, and so on up to 60. The ADDRESS values below assume
+# an MX110 in slot 0 and an MX114, MX115, MX120 and MX125 in slots 1-4;
+# adjust them to the installed modules.
 #============================================================
 
 epicsEnvSet("P",       "mw100:")
@@ -28,25 +25,25 @@ epicsEnvSet("HANDLE",  "mw100_0")
 mw100Init("$(HANDLE)", "192.168.1.100")
 
 # Per-instrument system records: module presence/model/code/speed/number,
-# error/alarm summary, the four 1-second poll triggers, settings/measurement/
-# compute mode.
+# error/alarm summary, the input/output/status poll triggers, operation mode
+# and computation.
 dbLoadRecords("$(MW100)/db/mw100_system.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE)")
 
 # One record set per configured Signal channel, per-model template matching
 # the channel's actual installed module type.
-dbLoadRecords("$(MW100)/db/mw100_mx110_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=1")
-dbLoadRecords("$(MW100)/db/mw100_mx110_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=2")
-dbLoadRecords("$(MW100)/db/mw100_mx114_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=7")
-dbLoadRecords("$(MW100)/db/mw100_mx115_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=8")
-dbLoadRecords("$(MW100)/db/mw100_mx120_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=9")
-dbLoadRecords("$(MW100)/db/mw100_mx125_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=10")
-dbLoadRecords("$(MW100)/db/mw100_calculation_channel.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=A1")
-dbLoadRecords("$(MW100)/db/mw100_communication_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=C1")
-dbLoadRecords("$(MW100)/db/mw100_constant_channel.template",      "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=K1")
+dbLoadRecords("$(MW100)/db/mw100_mx110_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=001")
+dbLoadRecords("$(MW100)/db/mw100_mx110_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=002")
+dbLoadRecords("$(MW100)/db/mw100_mx114_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=011")
+dbLoadRecords("$(MW100)/db/mw100_mx115_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=021")
+dbLoadRecords("$(MW100)/db/mw100_mx120_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=031")
+dbLoadRecords("$(MW100)/db/mw100_mx125_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=041")
+dbLoadRecords("$(MW100)/db/mw100_calculation_channel.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=A001")
+dbLoadRecords("$(MW100)/db/mw100_communication_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=C001")
+dbLoadRecords("$(MW100)/db/mw100_constant_channel.template",      "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=K01")
 
 iocInit()
 
 # Example:
 #   dbl
-#   camonitor mw100:dau1:1 mw100:dau1:1:Unit
-#   caput mw100:dau1:C1:Set 12.5
+#   camonitor mw100:dau1:001 mw100:dau1:001:Unit
+#   caput mw100:dau1:C001:Set 12.5

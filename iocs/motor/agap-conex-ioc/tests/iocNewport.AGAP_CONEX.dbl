@@ -1,0 +1,10 @@
+# dbl of motor R7-4-5 motorNewport iocBoot/iocNewport st.cmd.AGAP_CONEX
+IOC:m1
+IOC:m1Direction
+IOC:m1Offset
+IOC:m1Resolution
+IOC:m2
+IOC:m2Direction
+IOC:m2Offset
+IOC:m2Resolution
+IOC:serial1

@@ -11,8 +11,8 @@
 #============================================================
 
 epicsEnvSet("P",      "MMC200:")
-epicsEnvSet("PORT",   "MOTOR1")
-epicsEnvSet("SERIAL", "SERIAL1")
+epicsEnvSet("PORT",   "mmc200_1")
+epicsEnvSet("SERIAL", "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
 # ---- serial octet port ----
@@ -24,25 +24,28 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# MMC framing: the driver appends the CR terminator to each command, so only
-# the input EOS is configured here (replies are LF+CR terminated). Do not also
-# set an output EOS — the port would append it a second time.
+# Port EOS with the C example's values (motor.cmd.mmc200:6-7, left
+# commented there); the C driver sends bare commands.
 asynOctetSetInputEos("$(SERIAL)", 0, "\n\r")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- MMC-200 controller ----
-# MMC200CreateController(motorPort, serialPort, numAxes,
-#                        [movingPollMs], [idlePollMs], [ignoreLimits])
-MMC200CreateController("$(PORT)", "$(SERIAL)", 2, 500, 2000, 1)
+# MMC200CreateController(portName, MMC200PortName, numAxes,
+#                        movingPollPeriod, idlePollPeriod, ignoreLimits)
+# An idle period of 0 polls only when a move wakes the poller, as C's.
+MMC200CreateController("$(PORT)", "$(SERIAL)", 2, 500, 0, 1)
 
-# One motor record per axis (DTYP MMC200_$(PORT)_0, _1, ...).
-# Positions travel the driver boundary in EGU (controller units, mm or deg)
-# directly; MRES only sets the record's raw-count resolution. Set MRES to the
-# axis's physical resolution (the example matches a 2.44140625e-6 mm/microstep
-# stage).
-dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=2.44140625e-6,EGU=mm")
-dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m2,N=1,PORT=$(PORT),MRES=2.44140625e-6,EGU=mm")
+# motorUtil's records and one asyn_motor.db per axis, as C's st.cmd and
+# motor.cmd.mmc200 load them. The driver scales the record's steps by the
+# axis resolution read from the controller, as C; MRES in the rows is that
+# resolution, for EGU = mm.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(MICRONIX_IOC)/db/motor.substitutions.mmc200", "P=$(P),PORT=$(PORT)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
 
 # Example:
 #   dbl

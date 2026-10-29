@@ -1,0 +1,4 @@
+# c-expansion of st.cmd.CONEX-PP over the C sources, its controller calls:
+AG_CONEXCreateController("CONEX1", "serial1", 1, 50, 500)
+AG_CONEXCreateController("CONEX2", "serial1", 2, 50, 500)
+AG_CONEXCreateController("CONEX3", "serial1", 3, 50, 500)

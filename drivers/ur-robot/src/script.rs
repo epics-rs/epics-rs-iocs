@@ -19,7 +19,7 @@
 //!    immediately after them.
 
 use std::io::Write;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::error::{UrError, UrResult};
@@ -176,11 +176,6 @@ pub fn inject(script: &str, injections: &[Injection]) -> String {
     for inj in injections {
         if let Some(pos) = out.find(&inj.search) {
             out.insert_str(pos + inj.search.len(), &inj.inject);
-        } else {
-            log::debug!(
-                "ur-robot: script injection anchor [{}] not found",
-                inj.search.trim_end()
-            );
         }
     }
     out
@@ -235,13 +230,9 @@ impl ScriptClient {
     }
 
     pub fn connect(&mut self) -> UrResult<()> {
-        let addr = (self.hostname.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(|e| UrError::Connect(format!("resolve {}: {e}", self.hostname)))?
-            .next()
-            .ok_or_else(|| UrError::Connect(format!("no address for {}", self.hostname)))?;
-        let sock = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|e| UrError::Connect(format!("script server {addr}: {e}")))?;
+        // script_client.cpp has no catch: the asio system_error's what().
+        let sock = crate::net::connect_tcp(&self.hostname, self.port, None)
+            .map_err(|e| UrError::Connect(crate::net::asio_connect_what(&e)))?;
         sock.set_nodelay(true).ok();
         sock.set_write_timeout(Some(self.timeout)).ok();
         self.socket = Some(sock);

@@ -1,15 +1,17 @@
 use std::time::SystemTime;
 
-use epics_rs::base::runtime::general_time::EPICS_EPOCH_UNIX_SECS;
-
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::runtime::general_time::EPICS_EPOCH_UNIX_SECS;
 use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
-use meascomp::error::{self, MeasCompError, ScanPosition};
 use uldaq_sys::*;
 
+use crate::board_enums::map_range;
 use crate::params::*;
+use crate::trace::{DRIVER_NAME, SelfTrace};
 
 /// Waveform digitizer state.
 pub struct WaveDigState {
@@ -20,16 +22,10 @@ pub struct WaveDigState {
     pub current_point: usize,
     /// Scan buffer (f64, allocated by ulAInScan).
     pub scan_buffer: Vec<f64>,
-    /// Per-channel waveform data [channel][point], in volts.
+    /// Per-channel waveform data `[channel][point]`, in volts.
     pub channel_buffers: Vec<Vec<f64>>,
     /// Absolute time per point.
     pub abs_time_buffer: Vec<f64>,
-    /// Time waveform per point.
-    pub time_buffer: Vec<f32>,
-    pub dwell_actual: f64,
-    /// Bumped by every start, so a report that an earlier scan ended can
-    /// never end a later one.
-    pub generation: u64,
 }
 
 impl WaveDigState {
@@ -47,23 +43,20 @@ impl WaveDigState {
             scan_buffer: Vec::new(),
             channel_buffers,
             abs_time_buffer: vec![0.0; max_points],
-            time_buffer: vec![0.0; max_points],
-            dwell_actual: 0.001,
-            generation: 0,
         }
     }
 }
 
 /// Digitizer settings for [`start_wave_dig`], read from the WaveDig records.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WaveDigScan {
     pub first_chan: usize,
     pub num_chans: usize,
     pub num_points: usize,
     pub dwell: f64,
     pub input_mode: i32,
-    /// Each channel's ANALOG_IN_RANGE, by absolute channel.
-    pub ranges: [i32; MAX_ANALOG_IN],
+    /// C `gainArray`: each scanned channel's own ANALOG_IN_RANGE.
+    pub ranges: Vec<i32>,
     pub ext_trigger: bool,
     pub ext_clock: bool,
     pub continuous: bool,
@@ -71,42 +64,73 @@ pub struct WaveDigScan {
     pub burst_mode: bool,
 }
 
-/// C's WAVEDIG_DWELL_ACTUAL for a scan the device refused its rate for.
-pub const BAD_RATE_DWELL: f64 = -9999.0;
+impl WaveDigScan {
+    /// C `startWaveDig`'s parameter reads, through whichever owner of the
+    /// store the caller is: the port actor directly, the poller by request.
+    pub fn read(
+        params: &MultiFunctionParams,
+        input_mode: i32,
+        int: impl Fn(usize, i32) -> i32,
+        float: impl Fn(usize, i32) -> f64,
+    ) -> Self {
+        let first_chan = int(params.wave_dig_first_chan, 0).max(0) as usize;
+        let num_chans = int(params.wave_dig_num_chans, 0).max(0) as usize;
+        let ranges = (first_chan..first_chan + num_chans)
+            .map(|chan| int(params.analog_in_range, chan as i32))
+            .collect();
+        Self {
+            first_chan,
+            num_chans,
+            // C hands a non-positive count to ulAInScan, which refuses it.
+            num_points: int(params.wave_dig_num_points, 0).max(0) as usize,
+            dwell: float(params.wave_dig_dwell, 0),
+            input_mode,
+            ranges,
+            ext_trigger: int(params.wave_dig_ext_trigger, 0) != 0,
+            ext_clock: int(params.wave_dig_ext_clock, 0) != 0,
+            continuous: int(params.wave_dig_continuous, 0) != 0,
+            retrigger: int(params.wave_dig_retrigger, 0) != 0,
+            burst_mode: int(params.wave_dig_burst_mode, 0) != 0,
+        }
+    }
 
-/// A refused start, by the call that refused it.
-#[derive(Debug)]
-pub enum WaveDigStartError {
-    /// `ulAInLoadQueue` failed, so `ulAInScan` never ran.
-    Queue(MeasCompError),
-    /// `ulAInScan` refused the scan. C publishes the dwell it ended with, or
-    /// [`BAD_RATE_DWELL`], after any outcome of that call.
-    Scan {
-        error: MeasCompError,
-        dwell_actual: f64,
-    },
+    /// What `stopWaveDig` restarts with: the current settings, read when the
+    /// scan ends, if WAVEDIG_AUTO_RESTART is set.
+    pub fn read_restart(
+        params: &MultiFunctionParams,
+        input_mode: i32,
+        int: impl Fn(usize, i32) -> i32,
+        float: impl Fn(usize, i32) -> f64,
+    ) -> Option<Self> {
+        (int(params.wave_dig_auto_restart, 0) != 0)
+            .then(|| Self::read(params, input_mode, int, float))
+    }
+
+    /// C `rate = 1./dwell` (drvMultiFunction.cpp:1826), unguarded: uldaq
+    /// refuses a dwell <= 0 with ERR_BAD_RATE.
+    pub fn rate(&self) -> f64 {
+        1.0 / self.dwell
+    }
 }
 
-/// A started scan: the dwell the device runs at and the scan options used.
-#[derive(Debug, Clone, Copy)]
-pub struct WaveDigStarted {
-    pub dwell_actual: f64,
-    pub options: i32,
-}
-
-/// Start the waveform digitizer (analog input scan).
+/// Start the waveform digitizer (analog input scan). C `startWaveDig`:
+/// the uldaq status it reported, and the parameters it set on the way, which
+/// include DWELL_ACTUAL even when AInScan refused.
 pub fn start_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
+    params: &MultiFunctionParams,
     scan: &WaveDigScan,
-) -> Result<WaveDigStarted, WaveDigStartError> {
+    trace: &SelfTrace,
+) -> (UlError, Vec<ParamSetValue>) {
+    const FUNCTION: &str = "startWaveDig";
     let WaveDigScan {
         first_chan,
         num_chans,
         num_points,
-        dwell,
+        dwell: _,
         input_mode,
-        ranges,
+        ref ranges,
         ext_trigger,
         ext_clock,
         continuous,
@@ -121,14 +145,26 @@ pub fn start_wave_dig(
     let total_samples = num_chans * num_points;
     state.scan_buffer.resize(total_samples, 0.0);
 
-    // C startWaveDig: the queue gives every scanned channel its own range
-    // (drvMultiFunction.cpp:1787-1802).
-    let queue = scan_queue(first_chan, num_chans, input_mode, &ranges);
-    device
-        .analog_in_load_queue(&queue)
-        .map_err(WaveDigStartError::Queue)?;
+    // Load input queue for multi-channel scanning (required by uldaq)
+    let mut queue = Vec::with_capacity(num_chans);
+    for (i, &gain) in ranges.iter().enumerate() {
+        queue.push(AiQueueElement {
+            channel: (first_chan + i) as i32,
+            input_mode,
+            range: map_range(trace, gain),
+            ..AiQueueElement::default()
+        });
+    }
+    let status = trace.report(
+        &device.analog_in_load_queue(&queue),
+        FUNCTION,
+        "Calling ALoadQueue",
+    );
+    if status != 0 {
+        return (status, Vec::new());
+    }
 
-    let mut rate = if dwell > 0.0 { 1.0 / dwell } else { 1000.0 };
+    let mut rate = scan.rate();
 
     let mut options = SO_DEFAULTIO;
     if ext_trigger {
@@ -147,13 +183,12 @@ pub fn start_wave_dig(
         options |= SO_BURSTMODE;
     }
 
-    let scanned = device.analog_in_scan(
+    let result = device.analog_in_scan(
         &AInScanConfig {
             low_chan: first_chan as i32,
-            high_chan: (first_chan + num_chans - 1) as i32,
+            high_chan: first_chan as i32 + num_chans as i32 - 1,
             input_mode,
-            // The loaded queue sets each channel's range; C passes
-            // BIP10VOLTS here.
+            // The queue sets each channel's range.
             range: BIP10VOLTS,
             samples_per_chan: num_points as i32,
             options,
@@ -162,44 +197,49 @@ pub fn start_wave_dig(
         &mut rate,
         &mut state.scan_buffer,
     );
-    // C drvMultiFunction.cpp:1836-1846: the dwell the rate came back as, or
-    // -9999 when the device rejected the rate outright.
-    let dwell_actual = match &scanned {
-        Err(e) if e.code == ERR_BAD_RATE => BAD_RATE_DWELL,
-        _ => 1.0 / rate,
-    };
-    if let Err(error) = scanned {
-        return Err(WaveDigStartError::Scan {
-            error,
-            dwell_actual,
-        });
+    // C converts the rate back to the dwell whatever the scan returned, and
+    // shows a rate the device refused as -9999.
+    let dwell = 1.0 / rate;
+    let dwell_actual = ParamSetValue::new(
+        params.wave_dig_dwell_actual,
+        0,
+        ParamValue::Float64(match result {
+            Err(ref e) if e.code == ERR_BAD_RATE => -9999.0,
+            _ => dwell,
+        }),
+    );
+    let status = trace.report(&result, FUNCTION, "Calling AInScan");
+    if status != 0 {
+        return (status, vec![dwell_actual]);
     }
 
-    state.dwell_actual = dwell_actual;
     state.running = true;
-    state.generation = state.generation.wrapping_add(1);
-    Ok(WaveDigStarted {
-        dwell_actual,
-        options,
-    })
-}
+    let last_chan = first_chan as i32 + num_chans as i32 - 1;
+    trace.print(
+        TraceMask::FLOW,
+        format_args!(
+            "{DRIVER_NAME}:{FUNCTION}: called cbAInScan, firstChan={first_chan}, lastChan={last_chan}, numPoints={num_points}, dwell={:.6}, options=0x{options:x}\n",
+            CFloat(dwell)
+        ),
+    );
 
-/// The `ulAInLoadQueue` entries for `num_chans` channels from `first_chan`,
-/// each with its own range.
-fn scan_queue(
-    first_chan: usize,
-    num_chans: usize,
-    input_mode: i32,
-    ranges: &[i32; MAX_ANALOG_IN],
-) -> Vec<AiQueueElement> {
-    (first_chan..first_chan + num_chans)
-        .map(|chan| AiQueueElement {
-            channel: chan as i32,
-            input_mode,
-            range: ranges.get(chan).copied().unwrap_or(BIP10VOLTS),
-            ..AiQueueElement::default()
-        })
-        .collect()
+    (
+        0,
+        vec![
+            ParamSetValue::new(params.wave_dig_current_point, 0, ParamValue::Int32(0)),
+            dwell_actual,
+            ParamSetValue::new(params.wave_dig_run, 0, ParamValue::Int32(1)),
+            ParamSetValue::new(
+                params.wave_dig_total_time,
+                0,
+                ParamValue::Float64(dwell * num_points as f64),
+            ),
+            // C keeps the axis of the requested dwell after AInScan returns
+            // the rate it runs (drvMultiFunction.cpp:1905-1915). C defect,
+            // not copied (upstream-c-defects #230).
+            compute_wave_dig_times(params, num_points as i32, dwell),
+        ],
+    )
 }
 
 /// Number of complete scan points behind `current_index`.
@@ -215,44 +255,90 @@ pub fn points_transferred(current_index: i64, n_chans: usize, num_points: usize)
     (current_index as usize / n_chans + 1).min(num_points)
 }
 
-/// C pollerThread's digitizer block: copy the points transferred since the
-/// last poll, and tell whether the scan has gone idle -- which it also is
-/// when libuldaq reports a transfer error with the status. Ending the scan
-/// (Run back to 0, the data delivered, the scan stopped, an auto-restart)
-/// is the driver's one transition, not this read's. The status call's result
-/// comes back too, for the line C traces and, on an error, reports.
-pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> (ScanPosition, bool) {
-    let report = device.analog_in_scan_status();
-    let position = report.position();
-    let n_chans = state.num_chans;
-    let last_point = points_transferred(position.index, n_chans, state.num_points);
-    let now = current_time_secs();
-    while state.current_point < last_point {
-        let buf_offset = state.current_point * n_chans;
-        for j in 0..n_chans {
-            let ch = state.first_chan + j;
-            if ch < MAX_ANALOG_IN {
-                state.channel_buffers[ch][state.current_point] = state.scan_buffer[buf_offset + j];
-            }
+/// The digitizer half of C `pollerThread`: copy the points transferred
+/// since the last poll and, once the scan is idle, run C `stopWaveDig`.
+/// Returns the `ulAInScanStatus` code, reported once per outage as C does
+/// when `prev_status` is 0, and the array callbacks of a scan that just
+/// ended. Linux C goes on past a failed status (drvMultiFunction.cpp:2695-2711):
+/// a scan that ended on a transfer error reads SS_IDLE beside it, so its
+/// last points are copied and it is stopped.
+pub fn read_wave_dig(
+    device: &DaqDevice,
+    state: &mut WaveDigState,
+    params: &MultiFunctionParams,
+    restart: Option<&WaveDigScan>,
+    prev_status: UlError,
+    trace: &SelfTrace,
+) -> (UlError, Option<Vec<ParamSetValue>>) {
+    let polled = device.analog_in_scan_status();
+    // C reads uninitialised locals where ulc.cpp fills neither (bad handle, no subsystem, exception); 0 stops as SS_IDLE. C defect, not copied.
+    let (status, xfer) = (polled.status, &polled.xfer);
+    if polled.error.is_some() {
+        if prev_status == 0 {
+            trace.report_error(polled.code(), "pollerThread", "Calling AInScanStatus");
         }
-        state.abs_time_buffer[state.current_point] = now;
-        state.current_point += 1;
+    } else {
+        trace.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "{DRIVER_NAME}::pollerThread waveform digitizer status, aiStatus={status}, aiCount={}, aiIndex={}\n",
+                xfer.current_total_count, xfer.current_index
+            ),
+        );
     }
-    (position, position.status == SS_IDLE)
+
+    let n_chans = state.num_chans;
+    if xfer.current_total_count != 0 && n_chans != 0 && xfer.current_index >= 0 {
+        let last_point = points_transferred(xfer.current_index, n_chans, state.num_points);
+        let now = current_time_secs();
+        while state.current_point < last_point {
+            let buf_offset = state.current_point * n_chans;
+            for j in 0..n_chans {
+                let ch = state.first_chan + j;
+                if ch < MAX_ANALOG_IN {
+                    state.channel_buffers[ch][state.current_point] =
+                        state.scan_buffer[buf_offset + j];
+                }
+            }
+            state.abs_time_buffer[state.current_point] = now;
+            state.current_point += 1;
+        }
+    }
+
+    let arrays = (status == SS_IDLE).then(|| stop_wave_dig(device, state, params, restart, trace));
+    (polled.code(), arrays)
 }
 
-/// Stop the waveform digitizer: the stop call's result, which C reports as
-/// `Stopping AIn scan` -- `None` when no scan was running to stop.
-pub fn stop_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> Option<error::Result<()>> {
-    if !state.running {
-        return None;
-    }
+/// C `stopWaveDig`: clear RUN, hand the acquired points to the records
+/// (`readWaveDig`), stop the scan, and under AUTO_RESTART start it again
+/// with `restart`, the settings read as it ends.
+pub fn stop_wave_dig(
+    device: &DaqDevice,
+    state: &mut WaveDigState,
+    params: &MultiFunctionParams,
+    restart: Option<&WaveDigScan>,
+    trace: &SelfTrace,
+) -> Vec<ParamSetValue> {
     state.running = false;
-    Some(device.analog_in_scan_stop())
+    let mut updates = vec![ParamSetValue::new(
+        params.wave_dig_run,
+        0,
+        ParamValue::Int32(0),
+    )];
+    updates.extend(waveform_updates(params, state, trace));
+    trace.report(
+        &device.analog_in_scan_stop(),
+        "stopWaveDig",
+        "Stopping AIn scan",
+    );
+    if let Some(scan) = restart {
+        updates.extend(start_wave_dig(device, state, params, scan, trace).1);
+    }
+    updates
 }
 
-/// Seconds past the EPICS epoch (1990-01-01), as C's
-/// `now.secPastEpoch + now.nsec/1.e9` stamps each absolute-time point.
+/// Seconds past the EPICS epoch, as C stamps each absolute-time point with
+/// `now.secPastEpoch + now.nsec/1.e9`.
 fn current_time_secs() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -267,20 +353,31 @@ fn current_time_secs() -> f64 {
 ///
 /// Returned rather than applied so the actor thread (a WAVEDIG_READ_WF write)
 /// and the poller thread can each push them through their own owner.
-pub fn waveform_updates(params: &MultiFunctionParams, state: &WaveDigState) -> Vec<ParamSetValue> {
+pub fn waveform_updates(
+    params: &MultiFunctionParams,
+    state: &WaveDigState,
+    trace: &SelfTrace,
+) -> Vec<ParamSetValue> {
     let n = state.current_point.min(state.num_points);
     let mut updates = Vec::with_capacity(state.num_chans + 1);
     for j in 0..state.num_chans {
         let ch = state.first_chan + j;
         if ch < MAX_ANALOG_IN {
-            updates.push(ParamSetValue::new(
+            trace.print(
+                TraceMask::FLOW,
+                format_args!(
+                    "{DRIVER_NAME}:readWaveDig:, doing callbacks on input {ch}, first value={:.6}\n",
+                    CFloat(state.channel_buffers[ch][0])
+                ),
+            );
+            updates.push(ParamSetValue::array(
                 params.wave_dig_volt_wf,
                 ch as i32,
                 ParamValue::Float64Array(state.channel_buffers[ch][..n].into()),
             ));
         }
     }
-    updates.push(ParamSetValue::new(
+    updates.push(ParamSetValue::array(
         params.wave_dig_abs_time_wf,
         0,
         ParamValue::Float64Array(state.abs_time_buffer[..n].into()),
@@ -288,47 +385,113 @@ pub fn waveform_updates(params: &MultiFunctionParams, state: &WaveDigState) -> V
     updates
 }
 
-/// A time base over `num_points` at `dwell` into `buffer`, as the array
-/// callback on `reason` -- how every digitizer and generator time axis is
-/// published, from the requested dwell when one is written and from the
-/// dwell the device runs at when a scan starts (upstream-c-defects #230).
-pub fn time_update(
-    buffer: &mut [f32],
-    reason: usize,
-    num_points: usize,
+/// C `computeWaveDigTimes`: WAVEDIG_TIME_WF is `i * dwell` over the
+/// requested point count and dwell, posted when either is written.
+pub fn compute_wave_dig_times(
+    params: &MultiFunctionParams,
+    num_points: i32,
     dwell: f64,
 ) -> ParamSetValue {
-    let n = compute_times(buffer, num_points, dwell);
-    ParamSetValue::new(reason, 0, ParamValue::Float32Array(buffer[..n].into()))
+    ParamSetValue::array(
+        params.wave_dig_time_wf,
+        0,
+        ParamValue::Float32Array(time_axis(num_points, dwell).into()),
+    )
 }
 
-/// C `computeWaveDigTimes` / `computeWaveGenTimes`: the relative time base
-/// `i * dwell` over `num_points`, bounded by the buffer. Returns the number
-/// of points written, which is also the length of the array callback.
-pub fn compute_times(buffer: &mut [f32], num_points: usize, dwell: f64) -> usize {
-    let n = num_points.min(buffer.len());
-    for (i, t) in buffer[..n].iter_mut().enumerate() {
-        *t = (i as f64 * dwell) as f32;
-    }
-    n
+/// The `i * dwell` time buffers of C `computeWaveDigTimes`/`computeWaveGenTimes`.
+pub fn time_axis(num_points: i32, dwell: f64) -> Vec<f32> {
+    (0..num_points.max(0))
+        .map(|i| (f64::from(i) * dwell) as f32)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
-    #[test]
-    fn a_time_update_carries_the_axis_it_computed() {
-        let mut buf = [9.0f32; 4];
-        match time_update(&mut buf, 7, 3, 0.5) {
-            ParamSetValue::Value {
-                reason: 7,
-                addr: 0,
-                value: ParamValue::Float32Array(axis),
-            } => assert_eq!(&axis[..], &[0.0, 0.5, 1.0]),
-            _ => panic!("not a Float32Array update on reason 7"),
+    /// libuldaq's ERR_OVERRUN (uldaq.h:152), a transfer error.
+    const ERR_OVERRUN: UlError = 18;
+
+    thread_local! {
+        /// What the mocked `ulAInScanStatus` reports: code, scan state,
+        /// total count and index.
+        static AIN_STATUS: Cell<Option<(UlError, i32, u64, i64)>> = const { Cell::new(None) };
+    }
+
+    /// The test binary's definition wins over libuldaq's. Unset, it answers
+    /// as libuldaq does for the null handle: ERR_BAD_DEV_HANDLE (2), nothing
+    /// filled.
+    #[unsafe(no_mangle)]
+    extern "C" fn ulAInScanStatus(
+        _handle: uldaq_sys::DaqDeviceHandle,
+        status: *mut i32,
+        xfer: *mut TransferStatus,
+    ) -> UlError {
+        let Some((code, scan, count, index)) = AIN_STATUS.get() else {
+            return 2;
+        };
+        unsafe {
+            *status = scan;
+            (*xfer).current_total_count = count;
+            (*xfer).current_index = index;
         }
-        assert_eq!(buf, [0.0, 0.5, 1.0, 9.0]);
+        code
+    }
+
+    /// Linux C copies a failed status's points and stops on its SS_IDLE
+    /// (drvMultiFunction.cpp:2695-2732).
+    #[test]
+    fn a_scan_that_ended_on_a_transfer_error_is_copied_and_stopped() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "MFDIGERR",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let mut state = WaveDigState::new(4);
+        state.running = true;
+        state.num_chans = 2;
+        state.num_points = 3;
+        state.scan_buffer = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        AIN_STATUS.set(Some((ERR_OVERRUN, SS_IDLE, 6, 5)));
+
+        let (code, arrays) = read_wave_dig(
+            &DaqDevice::unconnected(),
+            &mut state,
+            &params,
+            None,
+            0,
+            &SelfTrace::default(),
+        );
+        assert_eq!(code, ERR_OVERRUN);
+        assert!(
+            arrays.is_some() && !state.running,
+            "the scan was not stopped"
+        );
+        assert_eq!(state.current_point, 3);
+        assert_eq!(state.channel_buffers[0][..3], [1.0, 3.0, 5.0]);
+        assert_eq!(state.channel_buffers[1][..3], [2.0, 4.0, 6.0]);
     }
 
     #[test]
@@ -342,20 +505,99 @@ mod tests {
     }
 
     #[test]
-    fn every_queued_channel_keeps_its_own_range() {
-        let mut ranges = [BIP10VOLTS; MAX_ANALOG_IN];
-        ranges[2] = BIP1VOLTS;
-        let queue = scan_queue(1, 3, AI_DIFFERENTIAL, &ranges);
-        let got: Vec<_> = queue.iter().map(|q| (q.channel, q.range)).collect();
-        assert_eq!(got, vec![(1, BIP10VOLTS), (2, BIP1VOLTS), (3, BIP10VOLTS)]);
+    fn inputs_9_to_16_get_their_waveforms() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let mut base = PortDriverBase::new(
+            "MFWAVEDIG",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let mut state = WaveDigState::new(4);
+        state.first_chan = 14;
+        state.num_chans = 2;
+        state.current_point = 3;
+        let addrs: Vec<_> = waveform_updates(&params, &state, &SelfTrace::default())
+            .into_iter()
+            .filter_map(|u| match u {
+                ParamSetValue::Array { reason, addr, .. } if reason == params.wave_dig_volt_wf => {
+                    Some(addr)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs, [14, 15]);
+    }
+
+    /// readWaveDig's trace is C's %f (drvMultiFunction.cpp:1897).
+    #[test]
+    fn a_nan_first_value_prints_as_cs_percent_f() {
+        use crate::driver::MultiFunctionDriver;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::TraceFile;
+        use std::sync::{Arc, Mutex};
+        let port = "MFNANWF";
+        let drv = MultiFunctionDriver::new(port, DaqDevice::unconnected(), 4, 4).unwrap();
+        let params = drv.params;
+        let (rt, _) =
+            create_port_runtime(&claim_port(port).unwrap(), drv, RuntimeConfig::default()).unwrap();
+        let trace = SelfTrace::default();
+        trace.bind(rt.port_handle().clone());
+        let manager = rt.port_handle().trace();
+        let log = std::env::temp_dir().join(format!("usb-2408-nanwf-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(Some(port), TraceFile::File(Arc::new(Mutex::new(file))));
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::FLOW);
+        let mut state = WaveDigState::new(4);
+        state.channel_buffers[0][0] = f64::NAN;
+        state.current_point = 1;
+        waveform_updates(&params, &state, &trace);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(
+                "MultiFunction:readWaveDig:, doing callbacks on input 0, first value=nan\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
-    fn the_time_base_follows_the_dwell_over_the_scan_length() {
-        let mut buf = [0.0f32; 8];
-        assert_eq!(compute_times(&mut buf, 3, 0.25), 3);
-        assert_eq!(&buf[..3], &[0.0, 0.25, 0.5]);
-        assert_eq!(compute_times(&mut buf, 100, 1.0), 8);
+    fn the_scan_rate_is_cs_reciprocal_dwell() {
+        let scan = |dwell| WaveDigScan {
+            first_chan: 0,
+            num_chans: 1,
+            num_points: 1,
+            dwell,
+            input_mode: 0,
+            ranges: vec![0],
+            ext_trigger: false,
+            ext_clock: false,
+            continuous: false,
+            retrigger: false,
+            burst_mode: false,
+        };
+        let rates = [1e-3, 0.0, -0.5].map(|dwell| scan(dwell).rate());
+        assert_eq!(rates, [1000.0, f64::INFINITY, -2.0]);
     }
 
     #[test]

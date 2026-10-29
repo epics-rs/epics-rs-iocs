@@ -22,6 +22,8 @@
 
 use std::collections::HashMap;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 /// Characters `cleanString` strips by default (`specsAnalyser.cpp:170`).
 pub const DEFAULT_CLEAN_CHARS: &str = ": \n";
 
@@ -100,6 +102,13 @@ pub fn strip_response_frame(raw: &str, expected_counter: u32) -> Result<&str, Fr
 pub struct ErrorInfo {
     pub code: String,
     pub message: String,
+}
+
+impl ErrorInfo {
+    /// `sendSimpleCommand`'s `ADStatusMessage` (`specsAnalyser.cpp:1329-1331`).
+    pub fn status_message(&self) -> String {
+        format!("{}: {}", self.code, self.message)
+    }
 }
 
 /// Parse an `ERROR ...` payload (payload already known to start with
@@ -377,40 +386,7 @@ pub fn parse_parameter_names(names: &str) -> Vec<(String, String)> {
 /// SPECS server expects for command arguments (`defineSpectrumFAT` etc.,
 /// e.g. `specsAnalyser.cpp:1121` `command << "StartEnergy:" << dvalue`).
 pub fn format_double(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    const PRECISION: i32 = 6;
-    let neg = value.is_sign_negative();
-    let abs = value.abs();
-
-    let sci = format!("{:.*e}", (PRECISION - 1) as usize, abs);
-    let e_pos = sci.find('e').expect("LowerExp formatting always emits 'e'");
-    let mantissa = &sci[..e_pos];
-    let exp: i32 = sci[e_pos + 1..]
-        .parse()
-        .expect("exponent is always an integer");
-
-    let body = if !(-4..PRECISION).contains(&exp) {
-        let mantissa = trim_trailing_zeros(mantissa);
-        format!(
-            "{mantissa}e{}{:02}",
-            if exp >= 0 { "+" } else { "-" },
-            exp.abs()
-        )
-    } else {
-        let decimals = (PRECISION - 1 - exp).max(0) as usize;
-        trim_trailing_zeros(&format!("{abs:.decimals$}"))
-    };
-
-    if neg { format!("-{body}") } else { body }
-}
-
-fn trim_trailing_zeros(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_string();
-    }
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    CFloat(value).g().to_string()
 }
 
 // --- Command builders (specsAnalyser.h SPECS_CMD_* strings + argument formatting) ---
@@ -852,6 +828,19 @@ mod tests {
         assert_eq!(format_double(-10.0), "-10");
         assert_eq!(format_double(1.0), "1");
         assert_eq!(format_double(0.001), "0.001");
+    }
+
+    #[test]
+    fn format_double_prints_non_finite_and_signed_zero_as_cpp_does() {
+        for (v, want) in [
+            (f64::NAN, "nan"),
+            (-f64::NAN, "-nan"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (-0.0, "-0"),
+        ] {
+            assert_eq!(format_double(v), want);
+        }
     }
 
     #[test]

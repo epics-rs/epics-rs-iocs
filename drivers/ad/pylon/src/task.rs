@@ -19,11 +19,12 @@ use parking_lot::RwLock;
 use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::color::{NDBayerPattern, NDColorMode};
 use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
-use ad_core_rs::ndarray_pool::NDArrayPool;
+use ad_core_rs::ndarray::{NDDataType, NDDimension};
+use ad_core_rs::ndarray_pool::{DriverArray, DriverPool};
 use ad_core_rs::params::ADBaseParams;
 use ad_core_rs::plugin::channel::ArrayPublisher;
 use ad_core_rs::runtime as rt;
+use ad_core_rs::timestamp::EpicsTimestamp;
 
 use ad_genicam::{FeatureIndex, FeatureValue};
 
@@ -61,7 +62,7 @@ pub(crate) struct GrabTag {
 
 pub(crate) enum Outcome {
     Frame {
-        array: NDArray,
+        array: Box<DriverArray>,
         /// The `ColorMode` and `BayerPattern` attributes, which C adds after
         /// the `NDAttributesFile` set so that they win over a same-named entry.
         layout: (NDColorMode, NDBayerPattern),
@@ -104,7 +105,7 @@ fn pixel_layout(pixel: PixelFormat) -> (NDColorMode, NDDataType, NDBayerPattern)
 /// State the grab-loop thread shares with the driver.
 pub(crate) struct GrabShared {
     pub ad: ADBaseParams,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub index: FeatureIndex,
     /// Per `EventSelector` entry, the event data features to read when that
     /// event fires.
@@ -198,7 +199,7 @@ impl GrabShared {
         &self,
         frame: &Frame<'_>,
         updates: &mut Vec<ParamSetValue>,
-    ) -> Result<(NDArray, (NDColorMode, NDBayerPattern)), NoArray> {
+    ) -> Result<(DriverArray, (NDColorMode, NDBayerPattern)), NoArray> {
         let failed = |text: String| {
             self.trace.error(&format!("ADPylon::processFrame {text}"));
             NoArray::Failed
@@ -234,33 +235,21 @@ impl GrabShared {
             );
             return Err(NoArray::PoolExhausted);
         };
-        match &mut array.data {
-            NDDataBuffer::U8(v) => {
-                v.clear();
-                v.extend_from_slice(bytes);
-            }
-            NDDataBuffer::U16(v) => {
-                v.clear();
-                v.extend(
-                    bytes
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|b| u16::from_ne_bytes(*b)),
-                );
-            }
-            _ => unreachable!("pixel_layout yields only UInt8 and UInt16"),
-        }
+        // C's memcpy of dataSize bytes (ADPylon.cpp:696).
+        let mut out = array.fill();
+        out.data_mut().as_u8_slice_mut().copy_from_slice(bytes);
 
         let driver_id = self.unique_id.fetch_add(1, Ordering::Relaxed);
-        array.unique_id = if self.unique_id_mode.load(Ordering::Relaxed) == UNIQUE_ID_CAMERA {
-            frame.id as i32
-        } else {
-            driver_id
-        };
-        array.update_time_stamps_now();
+        out.set_unique_id(
+            if self.unique_id_mode.load(Ordering::Relaxed) == UNIQUE_ID_CAMERA {
+                frame.id as i32
+            } else {
+                driver_id
+            },
+        );
+        out.update_time_stamps(EpicsTimestamp::now());
         if self.time_stamp_mode.load(Ordering::Relaxed) == TIME_STAMP_CAMERA {
-            array.time_stamp = frame.timestamp as f64 / 1e9;
+            out.set_time_stamp(frame.timestamp as f64 / 1e9);
         }
 
         let nd = &self.ad.base;
@@ -284,7 +273,7 @@ impl GrabShared {
                 }
                 ChunkValue::String(v) => (NDAttrValue::String(v.clone()), FeatureValue::String(v)),
             };
-            array.attributes.add(NDAttribute::new_static(
+            out.attributes_mut().add(NDAttribute::new_static(
                 chunk.name.as_str(),
                 chunk.display_name,
                 NDAttrSource::Driver,
@@ -317,7 +306,7 @@ impl CameraHandler for GrabHandler {
             Ok((array, layout)) => {
                 updates.extend(statistics);
                 Outcome::Frame {
-                    array,
+                    array: Box::new(array),
                     layout,
                     updates,
                 }
@@ -424,15 +413,16 @@ impl ImageTask {
             } => {
                 // C `getAttributes(pRaw->pAttributeList)`, between the chunk
                 // data and the layout attributes.
-                let mut array = Arc::new(array);
+                let mut array = *array;
                 let mut array = self
                     .port
                     .with_driver(move |driver: &mut ADPylon| {
-                        driver.ad.attach_attributes(&mut array);
+                        driver.ad.attach_attributes(array.fill().attributes_mut());
                         array
                     })
                     .await?;
-                let attributes = &mut Arc::make_mut(&mut array).attributes;
+                let mut frame = array.fill();
+                let attributes = frame.attributes_mut();
                 attributes.add(NDAttribute::new_static(
                     "ColorMode",
                     "Color mode",

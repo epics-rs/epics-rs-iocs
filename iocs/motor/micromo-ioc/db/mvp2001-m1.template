@@ -1,0 +1,22 @@
+# The model-1 MVP 2001 (drvMVP2001.cc): one motor record per controller,
+# address S+1 of chain C. The OUT parm is "ENC_CPR,MAX_mA": SET_ACCEL reads
+# the encoder counts per revolution, a PREM of "ANO" the current limit.
+#
+# Positions and speeds go to the controller in raw counts, so MRES = 1 and
+# EGU = counts.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "MVP2001")
+    field(OUT,  "#C$(C) S$(S) @$(PARM=512,1000)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=1000000.0)")
+    field(DLLM, "$(LLM=-1000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=0)")
+    field(INIT, "$(INIT=)")
+    field(PREM, "$(PREM=)")
+    field(POST, "$(POST=)")
+}

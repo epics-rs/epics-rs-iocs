@@ -1,5 +1,5 @@
-//! Per-address model table, shared between `LoveInit` (which creates the
-//! port and its [`LoveDriver`](crate::driver::LoveDriver)) and `LoveConfig`
+//! Per-address model table, shared between `drvLoveInit` (which creates the
+//! port and its [`LoveDriver`](crate::driver::LoveDriver)) and `drvLoveConfig`
 //! (a *separate* iocsh command, called afterwards, that must reach back into
 //! the already-running driver instance and set the model for one address).
 //!
@@ -12,11 +12,12 @@
 //! PortDriver>>`, no `Any` downcast, no custom-command extension point in
 //! the actor's request enum). This module is the Rust substitute: a
 //! name-keyed registry of `Arc<Mutex<[Model; K_INSTRMAX]>>` tables,
-//! constructed by `LoveInit` *before* `create_port_runtime`, with one clone
-//! held by the driver and another registered here for `LoveConfig` to find.
+//! constructed by `drvLoveInit` *before* `create_port_runtime`, with one clone
+//! held by the driver and another registered here for `drvLoveConfig` to find.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+
+use epics_rs::asyn::exception::ExceptionCallbackGuard;
 
 /// C `#define K_INSTRMAX (256)` — controller addresses are 1..=256, indexed
 /// `instr[addr-1]`.
@@ -49,23 +50,82 @@ impl Model {
 
 pub type ModelTable = Arc<Mutex<[Model; K_INSTRMAX]>>;
 
-fn registry() -> &'static Mutex<HashMap<String, ModelTable>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, ModelTable>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+/// One `pports` entry: the port's name, its model table and the serial
+/// port's exception callback (C `struct Port` keeps the serial user that
+/// carries it).
+struct Entry {
+    name: String,
+    table: ModelTable,
+    _follow: ExceptionCallbackGuard,
 }
 
-/// Register `table` under `port_name`, called once by `LoveInit`.
-pub fn register(port_name: &str, table: ModelTable) {
+/// C `pports`, newest port first.
+fn registry() -> &'static Mutex<Vec<Entry>> {
+    static REGISTRY: OnceLock<Mutex<Vec<Entry>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register `table` under `port_name`, called once by `drvLoveInit`, with
+/// the [`crate::connect::follow_serial_port`] guard it keeps alive.
+pub fn register(port_name: &str, table: ModelTable, follow: ExceptionCallbackGuard) {
+    registry().lock().unwrap().insert(
+        0,
+        Entry {
+            name: port_name.to_string(),
+            table,
+            _follow: follow,
+        },
+    );
+}
+
+/// Look up the model table for an already-`drvLoveInit`-ed port, called by
+/// `drvLoveConfig`. C: the `pports` linked-list walk in `drvLoveConfig` that
+/// fails with `"drvLoveConfig::failure to locate port %s\n"` when no match
+/// is found. The name compare is C's `epicsStrCaseCmp`.
+pub fn lookup(port_name: &str) -> Option<ModelTable> {
     registry()
         .lock()
         .unwrap()
-        .insert(port_name.to_string(), table);
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(port_name))
+        .map(|e| e.table.clone())
 }
 
-/// Look up the model table for an already-`LoveInit`-ed port, called by
-/// `LoveConfig`. C: the `pports` linked-list walk in `drvLoveConfig` that
-/// fails with `"drvLoveConfig::failure to locate port %s\n"` when no match
-/// is found.
-pub fn lookup(port_name: &str) -> Option<ModelTable> {
-    registry().lock().unwrap().get(port_name).cloned()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::port::InterfaceMask;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+    struct Bare(PortDriverBase);
+
+    impl PortDriver for Bare {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    #[test]
+    fn lookup_ignores_case_like_epics_str_case_cmp() {
+        let claim = claim_port("loveCaseS0").unwrap();
+        let base = PortDriverBase::new(
+            "loveCaseS0",
+            1,
+            PortFlags::default(),
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
+        );
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        let follow = rt.port_handle().exception_callback_add(-1, |_| {});
+        let table: ModelTable = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
+        register("loveCaseL0", table.clone(), follow);
+        let found = lookup("LOVECASEL0").expect("case-insensitive match");
+        assert!(Arc::ptr_eq(&found, &table));
+    }
 }

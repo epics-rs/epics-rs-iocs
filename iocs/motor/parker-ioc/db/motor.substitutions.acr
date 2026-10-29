@@ -1,0 +1,144 @@
+# C's iocParker motor.substitutions.acr rows of one controller, loaded once
+# per controller with P, PORT and N from st.acr.cmd. C's binary I/O rows
+# are named $(P)$(PORT):<R>, P IOC:.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{M,        DTYP,         ADDR,  DESC,          EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,     PREC,  DHLM,  DLLM,  INIT}
+{"m$(N)",  "asynMotor",  0,     "motor $(N)",  mm,   Pos,  .05,   .01,   .5,    0,     1,     .2,    1.25e-7,  5,     200,   -2,    ""}
+}
+
+file "$(PARKER_IOC)/db/ACRAux.template"
+{
+pattern
+{R,         ADDR}
+{"m$(N):",  0}
+}
+
+file "$(PARKER_IOC)/db/ACRAuxLi.template"
+{
+pattern
+{R,             SCAN}
+{"$(PORT):li",  "I/O Intr"}
+}
+
+file "$(PARKER_IOC)/db/ACRAuxRead.template"
+{
+pattern
+{R,               SCAN}
+{"$(PORT):Read",  "1 second"}
+}
+
+file "$(PARKER_IOC)/db/ACRAuxBi.template"
+{
+pattern
+{R,                  MASK,        SCAN}
+{"$(PORT):bi0",      0x00000001, "I/O Intr"}
+{"$(PORT):bi1",      0x00000002, "I/O Intr"}
+{"$(PORT):bi2",      0x00000004, "I/O Intr"}
+{"$(PORT):bi3",      0x00000008, "I/O Intr"}
+{"$(PORT):bi4",      0x00000010, "I/O Intr"}
+{"$(PORT):bi5",      0x00000020, "I/O Intr"}
+{"$(PORT):bi6",      0x00000040, "I/O Intr"}
+{"$(PORT):bi7",      0x00000080, "I/O Intr"}
+{"$(PORT):bi8",      0x00000100, "I/O Intr"}
+{"$(PORT):bi9",      0x00000200, "I/O Intr"}
+{"$(PORT):bi10",     0x00000400, "I/O Intr"}
+{"$(PORT):bi11",     0x00000800, "I/O Intr"}
+{"$(PORT):bi12",     0x00001000, "I/O Intr"}
+{"$(PORT):bi13",     0x00002000, "I/O Intr"}
+{"$(PORT):bi14",     0x00004000, "I/O Intr"}
+{"$(PORT):bi15",     0x00008000, "I/O Intr"}
+{"$(PORT):bi16",     0x00010000, "I/O Intr"}
+{"$(PORT):bi17",     0x00020000, "I/O Intr"}
+{"$(PORT):bi18",     0x00040000, "I/O Intr"}
+{"$(PORT):bi19",     0x00080000, "I/O Intr"}
+{"$(PORT):bi20",     0x00100000, "I/O Intr"}
+{"$(PORT):bi21",     0x00200000, "I/O Intr"}
+{"$(PORT):bi22",     0x00400000, "I/O Intr"}
+{"$(PORT):bi23",     0x00800000, "I/O Intr"}
+{"$(PORT):bi24",     0x01000000, "I/O Intr"}
+{"$(PORT):bi25",     0x02000000, "I/O Intr"}
+{"$(PORT):bi26",     0x04000000, "I/O Intr"}
+{"$(PORT):bi27",     0x08000000, "I/O Intr"}
+{"$(PORT):bi28",     0x10000000, "I/O Intr"}
+{"$(PORT):bi29",     0x20000000, "I/O Intr"}
+{"$(PORT):bi30",     0x40000000, "I/O Intr"}
+{"$(PORT):bi31",     0x80000000, "I/O Intr"}
+}
+
+file "$(PARKER_IOC)/db/ACRAuxBo.template"
+{
+pattern
+{R,                  MASK}
+{"$(PORT):bo0",      0x00000001}
+{"$(PORT):bo1",      0x00000002}
+{"$(PORT):bo2",      0x00000004}
+{"$(PORT):bo3",      0x00000008}
+{"$(PORT):bo4",      0x00000010}
+{"$(PORT):bo5",      0x00000020}
+{"$(PORT):bo6",      0x00000040}
+{"$(PORT):bo7",      0x00000080}
+{"$(PORT):bo8",      0x00000100}
+{"$(PORT):bo9",      0x00000200}
+{"$(PORT):bo10",     0x00000400}
+{"$(PORT):bo11",     0x00000800}
+{"$(PORT):bo12",     0x00001000}
+{"$(PORT):bo13",     0x00002000}
+{"$(PORT):bo14",     0x00004000}
+{"$(PORT):bo15",     0x00008000}
+{"$(PORT):bo16",     0x00010000}
+{"$(PORT):bo17",     0x00020000}
+{"$(PORT):bo18",     0x00040000}
+{"$(PORT):bo19",     0x00080000}
+{"$(PORT):bo20",     0x00100000}
+{"$(PORT):bo21",     0x00200000}
+{"$(PORT):bo22",     0x00400000}
+{"$(PORT):bo23",     0x00800000}
+{"$(PORT):bo24",     0x01000000}
+{"$(PORT):bo25",     0x02000000}
+{"$(PORT):bo26",     0x04000000}
+{"$(PORT):bo27",     0x08000000}
+{"$(PORT):bo28",     0x10000000}
+{"$(PORT):bo29",     0x20000000}
+{"$(PORT):bo30",     0x40000000}
+{"$(PORT):bo31",     0x80000000}
+}
+
+file "$(PARKER_IOC)/db/ACRAuxBoRBV.template"
+{
+pattern
+{R,                  MASK,        SCAN}
+{"$(PORT):boRBV0",   0x00000001, "I/O Intr"}
+{"$(PORT):boRBV1",   0x00000002, "I/O Intr"}
+{"$(PORT):boRBV2",   0x00000004, "I/O Intr"}
+{"$(PORT):boRBV3",   0x00000008, "I/O Intr"}
+{"$(PORT):boRBV4",   0x00000010, "I/O Intr"}
+{"$(PORT):boRBV5",   0x00000020, "I/O Intr"}
+{"$(PORT):boRBV6",   0x00000040, "I/O Intr"}
+{"$(PORT):boRBV7",   0x00000080, "I/O Intr"}
+{"$(PORT):boRBV8",   0x00000100, "I/O Intr"}
+{"$(PORT):boRBV9",   0x00000200, "I/O Intr"}
+{"$(PORT):boRBV10",  0x00000400, "I/O Intr"}
+{"$(PORT):boRBV11",  0x00000800, "I/O Intr"}
+{"$(PORT):boRBV12",  0x00001000, "I/O Intr"}
+{"$(PORT):boRBV13",  0x00002000, "I/O Intr"}
+{"$(PORT):boRBV14",  0x00004000, "I/O Intr"}
+{"$(PORT):boRBV15",  0x00008000, "I/O Intr"}
+{"$(PORT):boRBV16",  0x00010000, "I/O Intr"}
+{"$(PORT):boRBV17",  0x00020000, "I/O Intr"}
+{"$(PORT):boRBV18",  0x00040000, "I/O Intr"}
+{"$(PORT):boRBV19",  0x00080000, "I/O Intr"}
+{"$(PORT):boRBV20",  0x00100000, "I/O Intr"}
+{"$(PORT):boRBV21",  0x00200000, "I/O Intr"}
+{"$(PORT):boRBV22",  0x00400000, "I/O Intr"}
+{"$(PORT):boRBV23",  0x00800000, "I/O Intr"}
+{"$(PORT):boRBV24",  0x01000000, "I/O Intr"}
+{"$(PORT):boRBV25",  0x02000000, "I/O Intr"}
+{"$(PORT):boRBV26",  0x04000000, "I/O Intr"}
+{"$(PORT):boRBV27",  0x08000000, "I/O Intr"}
+{"$(PORT):boRBV28",  0x10000000, "I/O Intr"}
+{"$(PORT):boRBV29",  0x20000000, "I/O Intr"}
+{"$(PORT):boRBV30",  0x40000000, "I/O Intr"}
+{"$(PORT):boRBV31",  0x80000000, "I/O Intr"}
+}

@@ -126,6 +126,7 @@ pub const AI_VOLTAGE: i64 = 1 << 0;
 pub const AI_TC: i64 = 1 << 1;
 pub const AI_RTD: i64 = 1 << 2;
 pub const AI_THERMISTOR: i64 = 1 << 3;
+pub const AI_SEMICONDUCTOR: i64 = 1 << 4;
 pub const AI_DISABLED: i64 = 1 << 30;
 
 // ---------------------------------------------------------------------------
@@ -140,6 +141,15 @@ pub const TC_R: i32 = 5;
 pub const TC_S: i32 = 6;
 pub const TC_B: i32 = 7;
 pub const TC_N: i32 = 8;
+
+// ---------------------------------------------------------------------------
+// SensorConnectionType
+// ---------------------------------------------------------------------------
+
+pub const SCT_2_WIRE_1: i32 = 1;
+pub const SCT_2_WIRE_2: i32 = 2;
+pub const SCT_3_WIRE: i32 = 3;
+pub const SCT_4_WIRE: i32 = 4;
 
 // ---------------------------------------------------------------------------
 // TempScale
@@ -182,6 +192,18 @@ pub const BIPPT156VOLTS: i32 = 24;
 
 pub const UNI10VOLTS: i32 = 1005;
 pub const UNI5VOLTS: i32 = 1006;
+pub const UNI4VOLTS: i32 = 1007;
+pub const UNI2PT5VOLTS: i32 = 1008;
+pub const UNI2VOLTS: i32 = 1009;
+pub const UNI1PT25VOLTS: i32 = 1010;
+pub const UNI1VOLTS: i32 = 1011;
+pub const UNIPT5VOLTS: i32 = 1013;
+pub const UNIPT25VOLTS: i32 = 1014;
+pub const UNIPT2VOLTS: i32 = 1016;
+pub const UNIPT1VOLTS: i32 = 1017;
+pub const UNIPT05VOLTS: i32 = 1019;
+pub const UNIPT01VOLTS: i32 = 1020;
+pub const MA0TO20: i32 = 2000;
 
 // ---------------------------------------------------------------------------
 // DigitalPortType
@@ -377,6 +399,7 @@ pub const AO_INFO_RESOLUTION: i32 = 1;
 
 // DioInfoItem
 pub const DIO_INFO_NUM_PORTS: i32 = 1;
+pub const DIO_INFO_PORT_TYPE: i32 = 2;
 pub const DIO_INFO_PORT_IO_TYPE: i32 = 3;
 pub const DIO_INFO_NUM_BITS: i32 = 4;
 

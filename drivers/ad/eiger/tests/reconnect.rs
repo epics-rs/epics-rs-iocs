@@ -1,13 +1,6 @@
-//! No request is made while the detector is marked disconnected, and an
-//! acquisition is what brings it back.
-//!
-//! Every request costs the full 20 s `DEFAULT_TIMEOUT` against a detector that
-//! is powered off but whose address still routes, and the driver makes one per
-//! parameter: the ~80 records that process at `iocInit`, plus a fetch for every
-//! `EIG_*` parameter `drv_user_create` builds, cost minutes between them. The
-//! gate is what makes them cost nothing, and the probe is what stops "nothing"
-//! from being permanent — C never re-reads a detector that was absent when
-//! `initParams` ran (eigerDetector.cpp:229-235).
+//! Every request goes to the detector while it is away, as C's do, and an
+//! acquisition re-reads a detector that failed the constructor's state fetch
+//! — C never re-reads one (eigerDetector.cpp:229-235).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -19,7 +12,7 @@ use epics_rs::ad_core::driver::ADStatus;
 
 use eiger::driver::{EigerConfig, EigerDriver};
 use eiger::params::Model;
-use eiger::rest::{ApiVersion, RestApi, RestError, Sys};
+use eiger::rest::{ApiVersion, RestApi, Sys};
 use eiger::tasks;
 
 /// A fast-fail has to be fast enough to be visibly not a timeout: the shortest
@@ -36,17 +29,15 @@ struct Detector {
     /// Set to make it answer; while clear it accepts and hangs up.
     answering: Arc<AtomicBool>,
     /// Connections accepted — the count of times the driver reached the
-    /// network, which is what the gate has to hold at zero.
+    /// network.
     connections: Arc<AtomicUsize>,
     port: u16,
 }
 
 /// A detector that only answers while `answering` is set.
 ///
-/// Hanging up rather than staying silent: the failure mode under test is the
-/// gate, not the timeout, and a test that waited out a 20 s timeout to reach
-/// the disconnected state would be measuring the thing the gate exists to
-/// avoid.
+/// Hanging up rather than staying silent, so a failed request costs no
+/// timeout.
 fn switchable_detector() -> Detector {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let port = listener.local_addr().unwrap().port();
@@ -106,60 +97,45 @@ fn switchable_detector() -> Detector {
 }
 
 #[test]
-fn no_request_is_made_while_the_detector_is_disconnected() {
+fn every_request_reaches_the_detector_while_it_is_disconnected() {
     let det = switchable_detector();
     let rest = RestApi::new("127.0.0.1", det.port);
 
-    // The first request is the one that finds out, so it does reach the wire.
     assert!(rest.get_value(Sys::DetConfig, "description").is_err());
     assert!(!rest.is_connected());
     assert_eq!(det.connections.load(Ordering::Acquire), 1);
 
-    // The second must not: the gate answers it.
+    // C's doRequest reconnects for every request (restApi.cpp:609-620), so
+    // the next one goes to the network too, and fails fast on the hang-up.
     let start = Instant::now();
-    let refused = rest.get_value(Sys::DetConfig, "description");
-    let elapsed = start.elapsed();
-    assert!(
-        matches!(refused, Err(RestError::Disconnected(_))),
-        "expected the gate to refuse the request, got {refused:?}"
-    );
-    assert!(
-        elapsed < FAST,
-        "the request waited {elapsed:?}, so it went to the network instead of failing at the gate"
-    );
-    assert_eq!(
-        det.connections.load(Ordering::Acquire),
-        1,
-        "a request reached the network while the detector was disconnected"
-    );
+    assert!(rest.get_value(Sys::DetConfig, "description").is_err());
+    assert!(start.elapsed() < FAST);
+    assert_eq!(det.connections.load(Ordering::Acquire), 2);
 
-    // The probe is the one request allowed past the gate, and it is what puts
-    // the client back into a state where requests are made at all.
+    // The first request the detector answers marks it connected again.
     det.answering.store(true, Ordering::Release);
-    assert_eq!(rest.probe().expect("the probe"), ApiVersion::V1_6_0);
-    assert!(rest.is_connected());
     assert!(rest.get_value(Sys::DetConfig, "description").is_ok());
+    assert!(rest.is_connected());
+    assert_eq!(rest.probe().expect("the probe"), ApiVersion::V1_6_0);
 }
 
 #[test]
 fn an_acquisition_reconnects_a_detector_that_was_offline_at_boot() {
     let det = switchable_detector();
     let rest = RestApi::new("127.0.0.1", det.port);
-    let (signals, _ctl_rx, _init_rx, _restart_rx) = tasks::signals();
+    let (signals, _receivers) = tasks::signals();
     let cfg = EigerConfig {
         port_name: "EIGER_RECONNECT".to_string(),
         api: ApiVersion::V1_6_0,
         model: Model::Eiger1,
-        max_size_x: 0,
-        max_size_y: 0,
         max_memory: 0,
     };
 
     let mut driver =
         EigerDriver::new(cfg, rest, signals).expect("the port must survive an offline detector");
 
-    // The constructor's whole request sequence costs one connection: the state
-    // fetch finds out, and the gate refuses everything after it.
+    // The constructor's whole request sequence costs one connection: C
+    // abandons the constructor when the state fetch fails.
     assert_eq!(
         det.connections.load(Ordering::Acquire),
         1,

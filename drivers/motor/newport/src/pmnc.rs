@@ -11,9 +11,11 @@
 //! ## Prompt protocol
 //!
 //! Commands are terminated with CR (`\r`); the controller answers with the
-//! reply text followed by a `>` prompt. This driver appends the CR itself
-//! and expects the port input EOS to be the prompt (`asynOctetSetInputEos(">")`
-//! in st.cmd) so each [`PmncController::command`] reads exactly one reply.
+//! reply text followed by a `>` prompt. [`PmncController::new`] sets the port
+//! output EOS to CR and input EOS to the prompt, as C `motor_init` does, so
+//! each `PmncController::command` reads exactly one reply. On firmware
+//! 1.5.3/1.5.4, whose `STA` reply ends in `\n` instead, the input EOS is
+//! switched to `\n` around that one read (C `changeEOS`).
 //! Every command yields a prompt (C `cmnd_response = true`), so motion
 //! commands consume and discard their reply just like queries.
 //!
@@ -21,10 +23,8 @@
 //!
 //! Picomotor moves are integer *steps*: positions, velocities (steps/sec,
 //! clamped to 2000), and accelerations (steps/sec², clamped 16..32000) are
-//! all counts. Following the asyn-rs dial-frame-EGU boundary convention for
-//! step-native controllers (as [`crate::mm3000`]), the EGU boundary values
-//! pass through with `NINT` rounding and the template carries `MRES=1`
-//! (EGU ≡ steps).
+//! all counts: the record steps that cross the motor boundary, sent with C's
+//! `NINT`, so any MRES works as in C.
 //!
 //! ## Open-loop position tracking (8753)
 //!
@@ -37,29 +37,39 @@
 //!
 //! ## Deviations from C (documented)
 //!
-//! - **changeEOS firmware unsupported.** C temporarily switches the port
-//!   input EOS to `\n` when reading `STA` on firmware 1.5.3/1.5.4 (which do
-//!   not terminate the status reply with a prompt). `SyncIOHandle` exposes no
-//!   per-read input-EOS switch, so this port reads `STA` against the standard
-//!   `>` prompt EOS; on those two firmware revisions the status read would
-//!   block until timeout. All other revisions are unaffected.
 //! - **Homing is a no-op**, exactly as C: `HOME_FOR`/`HOME_REV` send no
 //!   command (the `FIN`/`RIN` paths are commented out upstream).
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::interfaces::motor::{
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atoi, nint};
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
 
 /// Command line terminator (C `CMND_EOS`).
-const TERMINATOR: &[u8] = b"\r";
+const CMND_EOS: &[u8] = b"\r";
+
+/// Reply terminator for every command (C `PROMPT_EOS`).
+const PROMPT_EOS: &[u8] = b">";
+
+/// `STA` reply terminator on firmware 1.5.3/1.5.4 (C `NL_EOS`).
+const NL_EOS: &[u8] = b"\n";
+
+/// C `MAX_IDENT_LEN` (motordrvCom.h:57), the size of the saved identity.
+const MAX_IDENT_LEN: usize = 100;
 
 /// Identity substring that precedes the firmware digit (C `VER_STR`).
 const VER_STR: &str = "Version 1.";
@@ -152,17 +162,11 @@ fn parse_int_after_eq(reply: &str) -> Option<i64> {
     s.get(..end)?.parse().ok()
 }
 
-/// Parse a `DRT` line `A{driver}={type}` into a driver-module model
-/// (C: type 1 → 8753, type 2 → 8751).
-fn parse_drt_line(line: &str) -> Option<(i32, PmdModel)> {
+/// Parse a `DRT` line `A{driver}={type}` (C `sscanf(buff, "A%d=%d", …)`).
+fn parse_drt_line(line: &str) -> Option<(i32, i32)> {
     let (a, rest) = line.split_once('=')?;
     let driver: i32 = a.trim().trim_start_matches('A').trim().parse().ok()?;
-    let model = match rest.trim().parse::<i32>().ok()? {
-        1 => PmdModel::Pmd8753,
-        2 => PmdModel::Pmd8751,
-        _ => return None,
-    };
-    Some((driver, model))
+    Some((driver, rest.trim().parse().ok()?))
 }
 
 /// Parse an `MPV` line `A{driver} M{motor}=...` into (driver, motor)
@@ -181,24 +185,36 @@ fn parse_mpv_line(line: &str) -> Option<(i32, i32)> {
 }
 
 /// Firmware digit after [`VER_STR`] → model, plus the changeEOS flag
-/// (firmware `1.5.3`/`1.5.4`). C: `'0'` → 8750, `'5'`/`'6'` → 8752.
-fn model_from_ident(ident: &str) -> Option<(PmncModel, bool)> {
-    let tail = &ident[ident.find(VER_STR)? + VER_STR.len()..];
-    let mut chars = tail.chars();
-    let model = match chars.next()? {
-        '0' => PmncModel::Pmnc8750,
-        '5' | '6' => PmncModel::Pmnc8752,
-        _ => return None,
+/// (firmware `1.5.3`/`1.5.4`). C: `'0'` → 8750, `'5'`/`'6'` → 8752; the
+/// error is the line C errlogs (drvPMNC87xx.cc:922, 937).
+fn model_from_ident(ident: &str) -> Result<(PmncModel, bool), String> {
+    let Some(at) = ident.find(VER_STR) else {
+        return Err(format!(
+            "drvPMNC87xx.c:motor_init() - unknown version = {ident}"
+        ));
+    };
+    let tail = &ident[at + VER_STR.len()..];
+    let model = match tail.chars().next() {
+        Some('0') => PmncModel::Pmnc8750,
+        Some('5' | '6') => PmncModel::Pmnc8752,
+        _ => {
+            return Err(format!(
+                "drvPMNC87xx:motor_init() - invalid model = {ident}"
+            ));
+        }
     };
     // C inspects the char two positions on (the sub-minor digit).
     let change_eos = matches!(tail.as_bytes().get(2), Some(b'3') | Some(b'4'));
-    Some((model, change_eos))
+    Ok((model, change_eos))
 }
 
 /// Shared controller endpoint: owns the octet handle and the cross-axis
 /// communication state. The caller holds the `Arc<Mutex<..>>` lock.
 pub struct PmncController {
+    /// C `cntrl->pasynUser`, at `PMNC87xxConfig`'s address (drvPMNC87xx.cc:853).
     handle: SyncIOHandle,
+    /// Firmware 1.5.3/1.5.4: `STA` replies end in `\n` (C `changeEOS`).
+    change_eos: bool,
     ident: String,
     model: PmncModel,
     axes: Vec<AxisDef>,
@@ -210,48 +226,54 @@ impl PmncController {
     /// identity (`VER`, up to 3 tries), decode the model, then enumerate axes
     /// — an 8750 lists its 8753 channels indirectly via `MPV`, an 8752 reads
     /// each module's type via `DRT` (8753 → 3 channels, 8751 → 1). Performs
-    /// blocking I/O. The port input EOS must already be the `>` prompt.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
+    /// blocking I/O.
+    pub fn new(port: PortHandle, addr: i32, timeout: Duration) -> AsynResult<Self> {
+        // C ignores every setInputEos/setOutputEos status
+        // (drvPMNC87xx.cc:586, 595, 720, 727, 873-874).
+        let handle = SyncIOHandle::from_handle(port, addr, timeout, InterfaceType::Octet)?;
+        let _ = handle.set_input_eos(0, PROMPT_EOS);
+        let _ = handle.set_output_eos(0, CMND_EOS);
         let mut ctrl = Self {
             handle,
+            change_eos: false,
             ident: String::new(),
             model: PmncModel::Pmnc8750,
             axes: Vec::new(),
             comm_state: CommState::Normal,
         };
+        // C strncpy's the raw reply (drvPMNC87xx.cc:914), up to MAX_IDENT_LEN.
         let mut ident = String::new();
         for _ in 0..3 {
-            if let Ok(reply) = ctrl.command("VER")
-                && !reply.trim().is_empty()
+            if let (raw, Ok(())) = ctrl.handle.write_read(0, b"VER", READ_BUF).into_parts()
+                && !raw.is_empty()
             {
-                ident = reply;
+                let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                ident = String::from_utf8_lossy(&raw[..len.min(MAX_IDENT_LEN)]).into_owned();
                 break;
             }
         }
-        if ident.trim().is_empty() {
+        if ident.is_empty() {
             return Err(pmnc_err("PMNC: no response to VER identity query".into()));
         }
-        ctrl.ident = ident.trim().to_string();
-        let (model, change_eos) = model_from_ident(&ctrl.ident)
-            .ok_or_else(|| pmnc_err(format!("PMNC: unknown version = {}", ctrl.ident)))?;
+        ctrl.ident = ident;
+        // An invalid model or driver makes C return ERROR from motor_init
+        // (drvPMNC87xx.cc:938, 987), abandoning every later card and the
+        // poll task; a C defect not copied: only this card is dropped.
+        let refuse = |line: String| {
+            errlog_vprintf(format_args!("{line}\n"));
+            pmnc_err(line)
+        };
+        let (model, change_eos) = model_from_ident(&ctrl.ident).map_err(refuse)?;
         ctrl.model = model;
-        if change_eos {
-            // Firmware 1.5.3/1.5.4 terminate STA with `\n`, not the prompt;
-            // this port cannot switch the per-read input EOS, so status polls
-            // on those revisions may time out (module Deviations).
-            eprintln!(
-                "PMNC: firmware {} needs a '\\n' EOS on STA which is unsupported; \
-                 status polling may time out",
-                ctrl.ident
-            );
-        }
+        ctrl.change_eos = change_eos;
 
-        // Axis enumeration.
+        // Axis enumeration. C reads the list without checking the exchange
+        // (drvPMNC87xx.cc:947-993): a silent one keeps the card with no axes.
         let mut axes = Vec::new();
         match model {
             PmncModel::Pmnc8750 => {
                 // Each MPV line is one 8753 channel.
-                let blob = ctrl.command("MPV")?;
+                let blob = ctrl.command("MPV").unwrap_or_default();
                 for line in blob.lines() {
                     if let Some((driver_num, motor_num)) = parse_mpv_line(line.trim()) {
                         axes.push(AxisDef {
@@ -265,14 +287,19 @@ impl PmncController {
             PmncModel::Pmnc8752 => {
                 // Each DRT line is a module; 8753 contributes 3 channels,
                 // 8751 one.
-                let blob = ctrl.command("DRT")?;
+                let blob = ctrl.command("DRT").unwrap_or_default();
                 for line in blob.lines() {
                     let Some((driver_num, driver_type)) = parse_drt_line(line.trim()) else {
                         continue;
                     };
-                    let channels = match driver_type {
-                        PmdModel::Pmd8753 => 3,
-                        PmdModel::Pmd8751 => 1,
+                    let (driver_type, channels) = match driver_type {
+                        1 => (PmdModel::Pmd8753, 3),
+                        2 => (PmdModel::Pmd8751, 1),
+                        other => {
+                            return Err(refuse(format!(
+                                "drvPMNC87xx:motor_init() - invalid driver = {other}"
+                            )));
+                        }
                     };
                     for motor_num in 0..channels {
                         axes.push(AxisDef {
@@ -283,9 +310,6 @@ impl PmncController {
                     }
                 }
             }
-        }
-        if axes.is_empty() {
-            return Err(pmnc_err("PMNC: no axes discovered".into()));
         }
         ctrl.axes = axes;
         Ok(ctrl)
@@ -306,30 +330,44 @@ impl PmncController {
         self.axes.len()
     }
 
-    fn axis_def(&self, index: usize) -> Option<AxisDef> {
-        self.axes.get(index).copied()
-    }
-
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write one command and read its one prompt-framed reply (C
-    /// `send_recv_mess`): the CR terminator is appended here, and the reply
-    /// text (everything up to the `>` prompt EOS) is returned trimmed.
+    /// `send_recv_mess`), returned trimmed.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        self.command_bytes(cmd.as_bytes())
+    }
+
+    /// [`command`](Self::command) for a record string's raw bytes.
+    fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
+        let (raw, status) = self.handle.write_read(0, cmd, READ_BUF).into_parts();
+        status?;
+        Self::trimmed(raw)
+    }
+
+    /// `STA` for one driver module (C `set_status`), read to `\n` instead of
+    /// the prompt on `changeEOS` firmware and the prompt EOS restored after.
+    fn status(&self, driver: i32) -> AsynResult<String> {
+        let cmd = format!("STA {driver}");
+        if !self.change_eos {
+            return self.command(&cmd);
+        }
+        let _ = self.handle.set_input_eos(0, NL_EOS);
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        let _ = self.handle.set_input_eos(0, PROMPT_EOS);
+        status?;
+        Self::trimmed(raw)
+    }
+
+    fn trimmed(raw: Vec<u8>) -> AsynResult<String> {
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '>', ' '])
             .to_string())
     }
 }
 
-/// One PMNC axis sharing a controller. Implements [`AsynMotor`]. Carries the
+/// One PMNC axis sharing a controller. Implements [`Model1Motor`]. Carries the
 /// per-axis software position state C keeps in `motor_info` +
 /// `cntrl->last_position`.
 pub struct PmncAxis {
@@ -346,28 +384,55 @@ pub struct PmncAxis {
     last_reading: i64,
     /// Consecutive polls without a position change (C `no_motion_count`).
     no_motion_count: u32,
+    /// What the last failed poll raises: nothing on C's first missed reply
+    /// (RETRY), `CNTRL_COMM_ERR` and `RA_PROBLEM` on the next (COMM_ERR).
+    failure: PollFailure,
     last_status: MotorStatus,
+    strings: MoveStrings,
+    /// The `VEL` written since the last motion command, which an 8753's
+    /// SET_VEL_BASE parks at max and then restores.
+    velocity_written: Option<i64>,
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl PmncAxis {
-    /// Construct the axis at discovery index `index` (0-based across all
-    /// modules). No controller I/O beyond looking up the discovered
-    /// addressing.
-    pub fn new(controller: Arc<Mutex<PmncController>>, index: usize) -> AsynResult<Self> {
-        let def = {
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            ctrl.axis_def(index)
-                .ok_or_else(|| pmnc_err(format!("PMNC: axis index {index} out of range")))?
-        };
-        Ok(Self {
+    /// One axis per discovered channel, in discovery order, each read as
+    /// `motor_init`'s `set_status` reads it (drvPMNC87xx.cc:1027).
+    pub fn all(controller: Arc<Mutex<PmncController>>) -> Vec<Self> {
+        let defs = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .axes
+            .clone();
+        defs.into_iter()
+            .map(|def| Self::new(controller.clone(), def))
+            .collect()
+    }
+
+    fn new(controller: Arc<Mutex<PmncController>>, def: AxisDef) -> Self {
+        let vbas_supported = def.driver_type == PmdModel::Pmd8753;
+        let mut axis = Self {
             controller,
             def,
             position: 0,
             encoder_position: 0,
             last_reading: 0,
             no_motion_count: 0,
-            last_status: MotorStatus::default(),
-        })
+            failure: PollFailure::NONE,
+            // drvPMNC87xx.cc:1014-1025: what motor_init prepares.
+            last_status: MotorStatus {
+                gain_support: true,
+                has_encoder: true,
+                vbas_supported,
+                ..MotorStatus::default()
+            },
+            strings: MoveStrings::default(),
+            velocity_written: None,
+            init_status: None,
+        };
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, PmncController> {
@@ -378,122 +443,141 @@ impl PmncAxis {
         self.def.driver_type == PmdModel::Pmd8753
     }
 
-    /// Velocity/acceleration preamble as separate prompt-framed messages,
-    /// matching the record's SET_VEL_BASE / SET_VELOCITY / SET_ACCEL parts.
-    /// C clamps velocity to `MAX_VELOCITY` and acceleration to
-    /// `[MIN_ACCEL, MAX_ACCEL]`; an 8753 additionally programs the minimum
-    /// profile velocity (`MPV`) after parking `VEL` at max to dodge an
-    /// out-of-range error.
-    fn send_speed(
-        &self,
-        ctrl: &PmncController,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let (d, m) = (self.def.driver_num, self.def.motor_num);
-        let vel = nint(velocity).unsigned_abs().min(MAX_VELOCITY as u32) as i64;
-        let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
-        if self.is_8753() {
-            let mpv = nint(min_velocity)
-                .unsigned_abs()
-                .min((MAX_VELOCITY - 1) as u32) as i64;
-            ctrl.command(&format!("VEL A{d} {m}={MAX_VELOCITY}"))?;
-            ctrl.command(&format!("MPV A{d} {m}={mpv}"))?;
-        }
-        ctrl.command(&format!("VEL A{d} {m}={vel}"))?;
-        ctrl.command(&format!("ACC A{d} {m}={accel}"))?;
-        Ok(())
+    /// A motion command's PREM and POST: it ends the speed writes before it.
+    fn arm(&mut self) -> Vec<u8> {
+        self.velocity_written = None;
+        self.strings.arm()
+    }
+
+    /// PREM as its own message ahead of the move's commands
+    /// (devPMNC87xx.cc:204-219); `None` when there is none to send.
+    fn send_prem(ctrl: &PmncController, prem: &[u8]) -> Option<AsynResult<()>> {
+        (!prem.is_empty()).then(|| ctrl.command_bytes(prem).map(drop))
     }
 }
 
-impl AsynMotor for PmncAxis {
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+impl Model1Motor for PmncAxis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
+    }
+
+    /// `update_delay` is 0 (`targs`, drvPMNC87xx.cc:206).
+    fn update_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// SET_VELOCITY: `VEL`, clamped to `MAX_VELOCITY` (devPMNC87xx.cc:298).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        let (d, m) = (self.def.driver_num, self.def.motor_num);
+        let vel = nint(velocity).unsigned_abs().min(MAX_VELOCITY as u32) as i64;
+        self.velocity_written = Some(vel);
+        self.lock()
+            .command(&format!("VEL A{d} {m}={vel}"))
+            .map(drop)
+    }
+
+    /// SET_VEL_BASE: on an 8753, `VEL` parked at max then `MPV`; an 8751
+    /// sends nothing. The record writes SET_VELOCITY first, so C's
+    /// VEL-at-max lands last and every 8753 move runs at 2000 steps/sec;
+    /// that defect is not copied: the velocity written is restored.
+    fn set_vel_base(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        if !self.is_8753() {
+            return Ok(());
+        }
+        let (d, m) = (self.def.driver_num, self.def.motor_num);
+        let mpv = nint(velocity).unsigned_abs().min((MAX_VELOCITY - 1) as u32) as i64;
+        let written = self.velocity_written.take();
+        let ctrl = self.lock();
+        // Each message goes out whatever the one before returned
+        // (motordrvCom.cc:397-484), and the base velocity's statuses are
+        // not the move's.
+        let _ = ctrl.command(&format!("VEL A{d} {m}={MAX_VELOCITY}"));
+        let _ = ctrl.command(&format!("MPV A{d} {m}={mpv}"));
+        if let Some(vel) = written {
+            let _ = ctrl.command(&format!("VEL A{d} {m}={vel}"));
+        }
+        Ok(())
+    }
+
+    /// SET_ACCEL: `ACC`, clamped to `[MIN_ACCEL, MAX_ACCEL]`.
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        let (d, m) = (self.def.driver_num, self.def.motor_num);
+        let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
+        self.lock()
+            .command(&format!("ACC A{d} {m}={accel}"))
+            .map(drop)
+    }
+
+    fn poll_failure(&self) -> PollFailure {
+        self.failure
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let d = self.def.driver_num;
         let target = nint(position) as i64;
+        let prem = self.arm();
         let ctrl = self.lock();
-        self.send_speed(&ctrl, min_velocity, velocity, acceleration)?;
+        let _ = Self::send_prem(&ctrl, &prem);
         if self.is_8753() {
             // Open loop: no absolute command — move relative to the
             // software-tracked position.
             let rel = target - self.position;
-            ctrl.command(&format!("REL A{d}={rel}"))?;
+            let _ = ctrl.command(&format!("REL A{d}={rel}"));
         } else {
-            ctrl.command(&format!("ABS A{d}={target}"))?;
+            let _ = ctrl.command(&format!("ABS A{d}={target}"));
         }
-        ctrl.command(&format!("GO A{d}"))?;
-        Ok(())
+        ctrl.command(&format!("GO A{d}")).map(drop)
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         let d = self.def.driver_num;
         let rel = nint(distance) as i64;
+        let prem = self.arm();
         let ctrl = self.lock();
-        self.send_speed(&ctrl, min_velocity, velocity, acceleration)?;
-        ctrl.command(&format!("REL A{d}={rel}"))?;
-        ctrl.command(&format!("GO A{d}"))?;
-        Ok(())
+        let _ = Self::send_prem(&ctrl, &prem);
+        let _ = ctrl.command(&format!("REL A{d}={rel}"));
+        ctrl.command(&format!("GO A{d}")).map(drop)
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         let (d, m) = (self.def.driver_num, self.def.motor_num);
-        let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
         let velval = nint(velocity).unsigned_abs().min(MAX_VELOCITY as u32) as i64;
         let forward = velocity >= 0.0;
+        // C hangs POST off the first jog message, and the GO message's
+        // VELOCITY node replaces it, so C never sends it; not copied.
+        let prem = self.arm();
         let ctrl = self.lock();
-        ctrl.command(&format!("ACC A{d} {m}={accel}"))?;
+        let _ = Self::send_prem(&ctrl, &prem);
         if self.is_8753() {
             // Native slew commands.
             if forward {
-                ctrl.command(&format!("FOR A{d}={velval}"))?;
+                let _ = ctrl.command(&format!("FOR A{d}={velval}"));
             } else {
-                ctrl.command(&format!("REV A{d}={velval}"))?;
+                let _ = ctrl.command(&format!("REV A{d}={velval}"));
             }
         } else {
             // 8751 slew does not report motion via FOR/REV, so C jogs with a
             // large relative move (kept bug-for-bug).
-            ctrl.command(&format!("VEL A{d} {m}={velval}"))?;
+            let _ = ctrl.command(&format!("VEL A{d} {m}={velval}"));
             let rel = if forward { 1_000_000 } else { -1_000_000 };
-            ctrl.command(&format!("REL A{d}={rel}"))?;
+            let _ = ctrl.command(&format!("REL A{d}={rel}"));
         }
-        ctrl.command(&format!("GO A{d}"))?;
-        Ok(())
+        ctrl.command(&format!("GO A{d}")).map(drop)
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-        _forward: bool,
-    ) -> AsynResult<()> {
+    fn home(&mut self, _user: &AsynUser, _forward: bool) -> AsynResult<()> {
         // C sends no command for HOME_FOR/HOME_REV (the FIN/RIN paths are
-        // commented out) — homing is a silent no-op (module Deviations).
-        Ok(())
+        // commented out) — homing is a silent no-op (module Deviations) but
+        // for its PREM. C hangs POST off a
+        // message it never sends; not copied, POST goes at the next poll
+        // that sees the axis done.
+        let prem = self.arm();
+        let ctrl = self.lock();
+        Self::send_prem(&ctrl, &prem).unwrap_or(Ok(()))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         // C STOP_AXIS: HAL (smooth stop).
         let d = self.def.driver_num;
         let ctrl = self.lock();
@@ -508,15 +592,15 @@ impl AsynMotor for PmncAxis {
         if self.is_8753() {
             // Open loop: the controller position cannot be set, so C selects
             // the channel and redefines the software-tracked position.
-            ctrl.command(&format!("CHL A{d}={m}"))?;
+            let status = ctrl.command(&format!("CHL A{d}={m}"));
             drop(ctrl);
             self.position = value;
             self.encoder_position = value;
             self.last_reading = 0;
+            status.map(drop)
         } else {
-            ctrl.command(&format!("POS {d}={value}"))?;
+            ctrl.command(&format!("POS {d}={value}")).map(drop)
         }
-        Ok(())
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -548,7 +632,23 @@ impl AsynMotor for PmncAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    /// `PRIMITIVE`: INIT as its own message.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().command_bytes(init)?;
+        Ok(())
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         // Port of C `set_status`: channel-select probe (8753), STA status
         // byte, DIAG aux byte (8751), then POS if this motor is the selected
         // channel — all under the controller lock, applying the
@@ -557,22 +657,35 @@ impl AsynMotor for PmncAxis {
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let (d, m) = (self.def.driver_num, self.def.motor_num);
 
+        // `$answered`: an earlier exchange of this pass got its reply.
         macro_rules! checked {
-            ($reply:expr) => {
+            ($reply:expr, $answered:expr) => {
                 match $reply {
                     Ok(s) if !s.is_empty() => {
                         ctrl.comm_state = CommState::Normal;
+                        self.last_status.comms_error = false;
                         s
                     }
                     _ => {
+                        // drvPMNC87xx.cc:283-292: RETRY fails the poll
+                        // raising nothing, COMM_ERR raising both bits; `exit`
+                        // stores either in motor_info->status (:541-542).
                         if ctrl.comm_state == CommState::Normal {
                             ctrl.comm_state = CommState::Retry;
-                            return Ok(self.last_status.clone());
+                            self.failure = PollFailure::NONE;
+                            if $answered {
+                                *out = self.last_status.clone();
+                            }
+                        } else {
+                            ctrl.comm_state = CommState::CommErr;
+                            self.failure = PollFailure::PROBLEM_AND_COMMS_ERROR;
+                            self.last_status.comms_error = true;
+                            self.last_status.problem = true;
                         }
-                        ctrl.comm_state = CommState::CommErr;
-                        self.last_status.comms_error = true;
-                        self.last_status.problem = true;
-                        return Ok(self.last_status.clone());
+                        return Err(AsynError::Status {
+                            status: AsynStatus::Error,
+                            message: format!("PMNC87xx driver {d}: no reply"),
+                        });
                     }
                 }
             };
@@ -580,28 +693,28 @@ impl AsynMotor for PmncAxis {
 
         // 1. Which motor is selected on this driver? (8751 has only motor 0.)
         let select_motor = if self.is_8753() {
-            let reply = checked!(ctrl.command(&format!("CHL {d}")));
+            let reply = checked!(ctrl.command(&format!("CHL {d}")), false);
             atoi(&reply)
         } else {
             0
         };
 
         // 2. Status byte.
-        let sta = checked!(ctrl.command(&format!("STA {d}")));
+        let sta = checked!(ctrl.status(d), self.is_8753());
         let mstat = parse_status_byte(&sta).unwrap_or(0);
 
         // 3. Aux status (8751 only).
         let auxstat = if self.is_8753() {
             0
         } else {
-            let diag = checked!(ctrl.command(&format!("DIAG {d}")));
+            let diag = checked!(ctrl.command(&format!("DIAG {d}")), true);
             parse_status_byte(&diag).unwrap_or(0)
         };
 
         // 4. Position, only if this motor is currently selected.
         let mut reading = self.last_reading;
         if select_motor == m {
-            let pos = checked!(ctrl.command(&format!("POS {d}")));
+            let pos = checked!(ctrl.command(&format!("POS {d}")), true);
             if let Some(v) = parse_int_after_eq(&pos) {
                 reading = v;
             }
@@ -663,17 +776,22 @@ impl AsynMotor for PmncAxis {
         // clear the controller's per-move position on the selected channel.
         if (done || ls_active) && self.is_8753() {
             self.last_reading = 0;
+            // C ignores the CHL's status and goes on to POST
+            // (drvPMNC87xx.cc:518-523).
             if select_motor == m {
-                ctrl.command(&format!("CHL A{d}={m}"))?;
+                let _ = ctrl.command(&format!("CHL A{d}={m}"));
             }
+        }
+        // drvPMNC87xx.cc:511-537; C ignores the exchange's status too.
+        if (done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.command_bytes(&post);
         }
         drop(ctrl);
 
         let vbas_supported = self.is_8753();
         self.last_status = MotorStatus {
-            position: self.position as f64,
-            encoder_position: self.encoder_position as f64,
-            velocity: 0.0, // C: "Parse motor velocity? NEEDS WORK"
             done,
             moving: !done,
             direction,
@@ -687,35 +805,330 @@ impl AsynMotor for PmncAxis {
             has_encoder: true,  // C EA_PRESENT = 1
             vbas_supported,
             ..MotorStatus::default()
+                .with_position(self.position as f64)
+                .with_encoder_position(self.encoder_position as f64)
+                // C: "Parse motor velocity? NEEDS WORK"
+                .with_velocity(0.0)
         };
-        Ok(self.last_status.clone())
+        *out = self.last_status.clone();
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use motor_common::testing::Model1Polled;
+    use motor_common::testing::RecordWrites;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// An 8752 with one 8751 module on a [`LineRig`] whose `STA` byte is
+    /// `sta`, with the construction traffic taken.
+    fn strings_rig(name: &str) -> (LineRig, PmncAxis, Arc<AtomicU8>) {
+        let sta = Arc::new(AtomicU8::new(S8751_MOVE_DONE | S8751_POWER_ON));
+        let st = sta.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "VER" => "Version 1.6.0".into(),
+            "DRT" => "A0=2>".into(),
+            "STA 0" => format!("A0=0x{:02x}>", st.load(Ordering::SeqCst)),
+            "DIAG 0" => "A0=0x04>".into(),
+            "POS 0" => "A0=0>".into(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
+        line.sent();
+        (line, axis, sta)
+    }
+
+    /// drvPMNC87xx.cc:914: the identity is the raw VER reply, not trimmed.
+    #[test]
+    fn the_ident_is_the_raw_ver_reply() {
+        let (_line, io) = LineRig::new("pmnc_raw_ver", |last| match last {
+            "VER" => " Version 1.6.0\r\n".into(),
+            "DRT" => "A0=2>".into(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        assert_eq!(ctrl.unwrap().ident(), " Version 1.6.0\r\n");
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PmncAxis) -> Vec<String> {
+        axis.polled(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| !["STA 0", "DIAG 0", "POS 0"].contains(&l.as_str()))
+            .collect()
+    }
+
+    /// devPMNC87xx.cc:200-201 and 321-326: INIT is the whole message.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pmncInit");
+        axis.primitive(&AsynUser::default(), b"SER A0").unwrap();
+        assert_eq!(line.sent(), ["SER A0"]);
+    }
+
+    #[test]
+    fn a_zero_rate_move_has_no_acc() {
+        let (line, mut axis, _) = strings_rig("pmncZeroAcc");
+        let user = AsynUser::default();
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 0.0)
+            .unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL A0 0=100",
+                "ABS A0=5",
+                "GO A0",
+                "VEL A0 0=100",
+                "REL A0=5",
+                "GO A0"
+            ]
+        );
+    }
+
+    #[test]
+    fn record_steps_go_out_with_c_nint() {
+        let (line, mut axis, _) = strings_rig("pmncSteps");
+        let user = AsynUser::default();
+        axis.record_move_absolute(&user, 4000.5, 0.0, 4000.4, 200.0)
+            .unwrap();
+        axis.record_move_relative(&user, -2.5, 0.0, 100.0, 200.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL A0 0=2000",
+                "ACC A0 0=200",
+                "ABS A0=4001",
+                "GO A0",
+                "VEL A0 0=100",
+                "ACC A0 0=200",
+                "REL A0=-3",
+                "GO A0"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_8753_jog_sends_the_vel_base_parts() {
+        let (line, io) = LineRig::new("pmnc8753Jog", |last| match last {
+            "VER" => "Version 1.6.0".into(),
+            "DRT" => "A0=1>".into(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(1);
+        line.sent();
+        axis.record_jog(&AsynUser::default(), 50.0, -100.0, 200.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL A0 1=2000",
+                "MPV A0 1=50",
+                "ACC A0 1=200",
+                "REV A0=100",
+                "GO A0"
+            ]
+        );
+    }
+
+    /// motordrvCom sends each message of a transaction and ignores what
+    /// send_mess returns (motordrvCom.cc:397-484): a refused VEL or MPV
+    /// still sends the move, and LOAD_POS sets the 8753's position whatever
+    /// its CHL returned (devPMNC87xx.cc:255-261).
+    #[test]
+    fn a_refused_message_still_sends_the_ones_after_it() {
+        let (line, io) = LineRig::failing(
+            "pmncRefused",
+            |last| match last {
+                "VER" => "Version 1.6.0".into(),
+                "DRT" => "A0=1>".into(),
+                _ => ">".into(),
+            },
+            |last| ["VEL A0 1=2000", "MPV A0 1=50", "CHL A0=1"].contains(&last),
+        );
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(1);
+        line.sent();
+        let user = AsynUser::default();
+        axis.record_move_relative(&user, 5.0, 50.0, 100.0, 200.0)
+            .unwrap();
+        axis.record_jog(&user, 50.0, -100.0, 200.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL A0 1=100",
+                "VEL A0 1=2000",
+                "MPV A0 1=50",
+                "VEL A0 1=100",
+                "ACC A0 1=200",
+                "REL A0=5",
+                "GO A0",
+                "VEL A0 1=2000",
+                "MPV A0 1=50",
+                "ACC A0 1=200",
+                "REV A0=100",
+                "GO A0"
+            ]
+        );
+        assert!(axis.set_position(&user, 7.0).is_err());
+        assert_eq!((axis.position, axis.encoder_position), (7, 7));
+    }
+
+    /// drvPMNC87xx.cc:518-534: a refused post-move CHL on the selected 8753
+    /// channel still sends POST.
+    #[test]
+    fn a_refused_post_move_chl_still_sends_post() {
+        let (line, io) = LineRig::failing(
+            "pmncChlPost",
+            |last| match last {
+                "VER" => "Version 1.6.0".into(),
+                "DRT" => "A0=1>".into(),
+                "CHL 0" => "1>".into(),
+                "STA 0" => format!("A0=0x{S8753_POWER_ON:02x}>"),
+                "POS 0" => "A0=0>".into(),
+                _ => ">".into(),
+            },
+            |last| last == "CHL A0=1",
+        );
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(1);
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"MOF A0")))
+            .unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 200.0)
+            .unwrap();
+        line.sent();
+        axis.polled(&user).unwrap();
+        let sent = line.sent();
+        assert!(
+            sent.ends_with(&["CHL A0=1".into(), "MOF A0".into()]),
+            "{sent:?}"
+        );
+    }
+
+    /// devPMNC87xx.cc:204-219: PREM is its own message ahead of each move's
+    /// command, for that move only; a home sends only the record's speed
+    /// parts ahead of it.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pmncPrem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"SER A0", None).unwrap();
+        axis.record_move_absolute(&user, 5.0, 0.0, 100.0, 200.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL A0 0=100",
+                "ACC A0 0=200",
+                "SER A0",
+                "ABS A0=5",
+                "GO A0"
+            ]
+        );
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 200.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            ["VEL A0 0=100", "ACC A0 0=200", "REL A0=5", "GO A0"]
+        );
+        axis.set_move_strings(&user, b"SER A0", None).unwrap();
+        axis.record_home(&user, 0.0, 100.0, 200.0, true).unwrap();
+        assert_eq!(line.sent(), ["VEL A0 0=100", "ACC A0 0=200", "SER A0"]);
+        axis.record_home(&user, 0.0, 100.0, 0.0, true).unwrap();
+        assert_eq!(line.sent(), ["VEL A0 0=100"]);
+        axis.set_move_strings(&user, b"SER A0", None).unwrap();
+        axis.record_jog(&user, 0.0, -100.0, 200.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "ACC A0 0=200",
+                "SER A0",
+                "VEL A0 0=100",
+                "REL A0=-1000000",
+                "GO A0"
+            ]
+        );
+    }
+
+    /// drvPMNC87xx.cc:511-537: POST once the move is done, not while it
+    /// runs; a jog's too.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, sta) = strings_rig("pmncPost");
+        let user = AsynUser::default();
+        for jog in [false, true] {
+            axis.set_move_strings(&user, b"", Some(post(b"NOS A0")))
+                .unwrap();
+            if jog {
+                axis.record_jog(&user, 0.0, 100.0, 200.0).unwrap();
+            } else {
+                axis.record_move_relative(&user, 5.0, 0.0, 100.0, 200.0)
+                    .unwrap();
+            }
+            line.sent();
+            sta.store(S8751_POWER_ON, Ordering::SeqCst);
+            assert!(poll_extra(&line, &mut axis).is_empty());
+            sta.store(S8751_MOVE_DONE | S8751_POWER_ON, Ordering::SeqCst);
+            assert_eq!(poll_extra(&line, &mut axis), ["NOS A0"]);
+            assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+        }
+    }
+
+    /// drvPMNC87xx.cc:495-496: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, sta) = strings_rig("pmncPostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"NOS A0")))
+            .unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 200.0)
+            .unwrap();
+        line.sent();
+        sta.store(S8751_POWER_ON | S8751_FOR_LIMIT, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["NOS A0"]);
+    }
 
     #[test]
     fn model_and_change_eos_from_ident() {
         assert_eq!(
             model_from_ident("New Focus Version 1.0.2"),
-            Some((PmncModel::Pmnc8750, false))
+            Ok((PmncModel::Pmnc8750, false))
         );
         assert_eq!(
             model_from_ident("Version 1.5.4"),
-            Some((PmncModel::Pmnc8752, true))
+            Ok((PmncModel::Pmnc8752, true))
         );
         assert_eq!(
             model_from_ident("Version 1.5.3"),
-            Some((PmncModel::Pmnc8752, true))
+            Ok((PmncModel::Pmnc8752, true))
         );
         assert_eq!(
             model_from_ident("Version 1.6.0"),
-            Some((PmncModel::Pmnc8752, false))
+            Ok((PmncModel::Pmnc8752, false))
         );
-        assert_eq!(model_from_ident("Version 1.9.0"), None);
-        assert_eq!(model_from_ident("no version here"), None);
+        assert_eq!(
+            model_from_ident("Version 1.9.0"),
+            Err("drvPMNC87xx:motor_init() - invalid model = Version 1.9.0".into())
+        );
+        assert_eq!(
+            model_from_ident("no version here"),
+            Err("drvPMNC87xx.c:motor_init() - unknown version = no version here".into())
+        );
     }
 
     #[test]
@@ -735,10 +1148,11 @@ mod tests {
     }
 
     #[test]
-    fn drt_line_maps_type_to_model() {
-        assert_eq!(parse_drt_line("A0=1"), Some((0, PmdModel::Pmd8753)));
-        assert_eq!(parse_drt_line("A3=2"), Some((3, PmdModel::Pmd8751)));
-        assert_eq!(parse_drt_line("A1=9"), None);
+    fn drt_line_reads_driver_and_type() {
+        assert_eq!(parse_drt_line("A0=1"), Some((0, 1)));
+        assert_eq!(parse_drt_line("A3=2"), Some((3, 2)));
+        assert_eq!(parse_drt_line("A1=9"), Some((1, 9)));
+        assert_eq!(parse_drt_line("A1"), None);
     }
 
     #[test]
@@ -746,5 +1160,210 @@ mod tests {
         assert_eq!(parse_mpv_line("A0 M0=100"), Some((0, 0)));
         assert_eq!(parse_mpv_line("A2 M1=250"), Some((2, 1)));
         assert_eq!(parse_mpv_line("junk"), None);
+    }
+    /// A 1.5.4 controller with one 8753 module, on a port with no EOS support
+    /// of its own, so every EOS set is refused.
+    struct Pmnc {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Pmnc {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.reply = match data {
+                b"VER" => b"Version 1.5.4".to_vec(),
+                b"DRT" => b"A0=1>".to_vec(),
+                b"STA 0" => b"A0=0x05\n".to_vec(),
+                _ => b">".to_vec(),
+            };
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            let reply = std::mem::take(&mut self.reply);
+            buf[..reply.len()].copy_from_slice(&reply);
+            epics_rs::asyn::interpose::OctetReadResult::ok(
+                reply.len(),
+                epics_rs::asyn::interpose::EomReason::empty(),
+            )
+        }
+    }
+
+    #[test]
+    fn a_port_refusing_every_eos_set_still_configures_and_reads_status() {
+        use epics_rs::asyn::port::InterfaceMask;
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let pmnc = Pmnc {
+            base: PortDriverBase::new(
+                "pmncEosRefused",
+                1,
+                PortFlags::default(),
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
+            ),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("pmncEosRefused").unwrap(),
+            pmnc,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let port = rt.port_handle().clone();
+        assert!(
+            port.set_input_eos_blocking(AsynUser::new(0), NL_EOS)
+                .is_err()
+        );
+        let ctrl = PmncController::new(port, 0, Duration::from_secs(1)).unwrap();
+        assert!(ctrl.change_eos);
+        assert_eq!(ctrl.num_axes(), 3);
+        assert_eq!(ctrl.status(0).unwrap(), "A0=0x05");
+    }
+
+    /// drvPMNC87xx.cc:586, :595, :873-874: every EOS set is
+    /// `pasynOctetSyncIO`'s, which prints its TRACEIO_DEVICE line.
+    #[test]
+    fn the_eos_is_set_as_asyn_octet_sync_io() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+
+        let name = "pmncSyncIoEos";
+        let (_line, io) = LineRig::new(name, |last| match last {
+            "VER" => "Version 1.5.3".into(),
+            "DRT" => "A0=2>".into(),
+            "STA 0" => "A0=0x05\n".into(),
+            _ => ">".into(),
+        });
+        let trace = io.port().unwrap().trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let ctrl = ctrl.unwrap();
+        assert!(ctrl.change_eos);
+        ctrl.status(0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // The connect's, then STA's switch to `\n` and back.
+        let set_input = "asynOctetSyncIO setInputEos eoslen 1\n";
+        assert_eq!(text.matches(set_input).count(), 3, "{text}");
+        assert!(
+            text.contains("asynOctetSyncIO setOutputEos eoslen 1\n"),
+            "{text}"
+        );
+    }
+
+    /// drvPMNC87xx.cc:277-294: a first missed `STA` is RETRY (nothing
+    /// raised, nothing posted), the next COMM_ERR, and a reply clears it.
+    #[test]
+    fn a_missed_status_is_retry_then_comm_error() {
+        use std::sync::atomic::AtomicBool;
+        let quiet = Arc::new(AtomicBool::new(false));
+        let q = quiet.clone();
+        let (_line, io) = LineRig::new("pmncRetry", move |last| match last {
+            "VER" => "Version 1.6.0".into(),
+            "DRT" => "A0=2>".into(),
+            "STA 0" if q.load(Ordering::SeqCst) => String::new(),
+            "STA 0" => format!("A0=0x{:02x}>", S8751_MOVE_DONE | S8751_POWER_ON),
+            "DIAG 0" => "A0=0x04>".into(),
+            "POS 0" => "A0=0>".into(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        quiet.store(false, Ordering::SeqCst);
+        let s = axis.polled(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        quiet.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvPMNC87xx.cc:278-292,541: a DIAG missed after a good STA is RETRY,
+    /// and `exit` stores CNTRL_COMM_ERR cleared over the COMM_ERR status,
+    /// RA_PROBLEM kept, for the next post to carry.
+    #[test]
+    fn a_retry_after_an_answer_leaves_the_comm_error_cleared() {
+        use std::sync::atomic::AtomicBool;
+        let (quiet, quiet_diag) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (q, qd) = (quiet.clone(), quiet_diag.clone());
+        let (_line, io) = LineRig::new("pmncDiagRetry", move |last| match last {
+            "VER" => "Version 1.6.0".into(),
+            "DRT" => "A0=2>".into(),
+            "STA 0" if q.load(Ordering::SeqCst) => String::new(),
+            "STA 0" => format!("A0=0x{:02x}>", S8751_MOVE_DONE | S8751_POWER_ON),
+            "DIAG 0" if qd.load(Ordering::SeqCst) => String::new(),
+            "DIAG 0" => "A0=0x04>".into(),
+            "POS 0" => "A0=0>".into(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axis = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap()))).swap_remove(0);
+        let user = AsynUser::default();
+        quiet.store(true, Ordering::SeqCst);
+        // An exit before any reply leaves the axis's status as it was.
+        let before = MotorStatus::default().with_position(99.0);
+        let mut left = before.clone();
+        assert!(axis.poll(&user, &mut left).is_err());
+        assert_eq!(left, before);
+        assert!(axis.poll(&user, &mut left).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        assert_eq!(left, before);
+        quiet.store(false, Ordering::SeqCst);
+        quiet_diag.store(true, Ordering::SeqCst);
+        let mut left = MotorStatus::default();
+        assert!(axis.poll(&user, &mut left).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(!left.comms_error && left.problem);
+    }
+
+    /// drvPMNC87xx.cc:283-292,541: a failed init read stores what
+    /// motor_init prepared (:1014-1025, EA_PRESENT and GAIN_SUPPORT), with
+    /// both COMM_ERR bits once the card is past RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("pmncInitFail", move |last| match last {
+            "VER" => "Version 1.6.0".into(),
+            "DRT" => "A0=1>".into(),
+            "CHL 0" => String::new(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), 0, Duration::from_secs(1));
+        let mut axes = PmncAxis::all(Arc::new(Mutex::new(ctrl.unwrap())));
+        let prepared = MotorStatus {
+            has_encoder: true,
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        let lost = MotorStatus {
+            problem: true,
+            comms_error: true,
+            ..prepared.clone()
+        };
+        let init: Vec<_> = axes.iter_mut().map(|a| a.take_init_status()).collect();
+        assert_eq!(init, [prepared, lost.clone(), lost]);
     }
 }

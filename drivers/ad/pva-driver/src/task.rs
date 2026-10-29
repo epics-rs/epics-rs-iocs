@@ -1,8 +1,7 @@
-use std::sync::Arc;
-
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::driver::ImageMode;
 use epics_rs::ad_core::params::ADBaseParams;
@@ -13,9 +12,10 @@ use epics_rs::pva::client_native::context::ConnectHandle;
 use epics_rs::pva::client_native::ops_v2::SubscriptionHandle;
 use epics_rs::pva::{PvField, PvaResult};
 
-use crate::convert::decode_nt_nd_array;
+use crate::convert::{ConvertError, decode_nt_nd_array};
 use crate::params::PvaParams;
 use crate::types::PvaCommand;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 
 /// Bridges the PVA client's synchronous callbacks (`pvmonitor_handle`'s data
 /// callback and `connect().on_connect`/`on_disconnect`, none of which are
@@ -33,6 +33,7 @@ pub(crate) struct MonitorContext {
     pub cmd_rx: rt::CommandReceiver<PvaCommand>,
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
+    pub pool: DriverPool,
     pub ad: ADBaseParams,
     pub pva: PvaParams,
     pub initial_pv_name: String,
@@ -116,13 +117,20 @@ async fn try_connect(
     })
 }
 
+/// `connectPv`'s exception line (pvaDriver.cpp:133).
+fn connect_error(handle: &PortHandle, e: &impl std::fmt::Display) {
+    handle.trace().output_device(
+        handle.port_name(),
+        Some(0),
+        0,
+        TraceMask::ERROR,
+        &format!("pvaDriver::connectPv exception initializing monitor: {e}\n"),
+    );
+}
+
 async fn pva_loop_async(mut ctx: MonitorContext) {
-    let client = match PvaClient::new() {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("ad-pva-driver: failed to create PVA client: {e}");
-            return;
-        }
+    let Ok(client) = PvaClient::new() else {
+        return;
     };
 
     let (event_tx, mut event_rx) = rt::command_channel::<PvaEvent>(64);
@@ -135,7 +143,7 @@ async fn pva_loop_async(mut ctx: MonitorContext) {
     let mut conn = match try_connect(&client, &current_pv_name, event_tx.clone()).await {
         Ok(c) => Some(c),
         Err(e) => {
-            log::error!("ad-pva-driver: initial connect to '{current_pv_name}' failed: {e}");
+            connect_error(&ctx.handle, &e);
             None
         }
     };
@@ -191,7 +199,7 @@ async fn handle_command(
                     *current_pv_name = new_name;
                 }
                 Err(e) => {
-                    log::error!("ad-pva-driver: reconnect to '{new_name}' failed: {e}");
+                    connect_error(&ctx.handle, &e);
                     // Mirrors `writeOctet`'s revert-on-failure: `connectPv()`
                     // left `m_pvName` untouched, so C++ reverts `PVAPvName` back
                     // to it.
@@ -202,7 +210,7 @@ async fn handle_command(
                             vec![ParamSetValue::new(
                                 ctx.pva.pv_name,
                                 0,
-                                ParamValue::Octet(current_pv_name.clone().into_bytes()),
+                                ParamValue::Octet(current_pv_name.clone().into_bytes().into()),
                             )],
                         )
                         .await;
@@ -287,10 +295,26 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
         return;
     }
 
-    let array = match decode_nt_nd_array(&raw) {
+    let array = match decode_nt_nd_array(&ctx.pool, &raw) {
         Ok(a) => a,
+        Err(ConvertError::PoolExhausted) => {
+            ctx.handle.trace().output_device(ctx.handle.port_name(), Some(0), 0,
+                TraceMask::ERROR,
+                &format!(
+                    "pvaDriver::monitorEvent failed to alloc new NDArray - memory pool exhausted? (free: {})\n",
+                    ctx.pool.num_free_buffers()
+                ),
+            );
+            return;
+        }
         Err(e) => {
-            log::error!("ad-pva-driver: failed to convert NTNDArray into NDArray: {e}");
+            ctx.handle.trace().output_device(
+                ctx.handle.port_name(),
+                Some(0),
+                0,
+                TraceMask::ERROR,
+                &format!("pvaDriver::monitorEvent failed to convert NTNDArray into NDArray: {e}\n"),
+            );
             return;
         }
     };
@@ -307,14 +331,13 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
         array.dims.get(info.y_dim),
         array.dims.get(info.color_dim),
     ) else {
-        log::error!("ad-pva-driver: NTNDArray dimension count too small for its own layout info");
         return;
     };
     let (x_size, y_size, color_size) = (x.size as i32, y.size as i32, color.size as i32);
     let (min_x, min_y) = (x.offset as i32, y.offset as i32);
     let (bin_x, bin_y) = (x.binning as i32, y.binning as i32);
     let (reverse_x, reverse_y) = (x.reverse as i32, y.reverse as i32);
-    let data_type = array.data.data_type() as u8 as i32;
+    let data_type = array.data().data_type() as u8 as i32;
     let color_mode = info.color_mode as i32;
     let total_bytes = info.total_bytes as i32;
 
@@ -350,7 +373,7 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
         .unwrap_or(0)
         != 0;
     if array_callbacks {
-        ctx.publisher.publish(Arc::new(array)).await;
+        ctx.publisher.publish(array).await;
     }
 
     // Counters are updated after the plugin callback, matching C++'s own

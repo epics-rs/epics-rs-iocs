@@ -1,0 +1,2 @@
+This directory holds the save/restore files set_savefile_path names.
+mca iocBoot/iocRontec ships none, so C autosave cannot write until one is made.

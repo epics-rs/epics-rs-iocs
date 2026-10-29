@@ -1,6 +1,6 @@
 # Shared support for the motor-controller driver crates ported from
 # epics-modules/motor. Holds the vendor-independent iocsh plumbing: the motor
-# device-support holder + poll-loop wiring, `*CreateController`/`*CreateAxis`
+# axis install + poll-loop wiring, `*CreateController`/`*CreateAxis`
 # argument parsing, octet-port connect helpers, and the C-runtime numeric
 # helpers (atof/atoi/NINT/…). Each vendor crate (motor-newport, motor-micronix,
 # …) depends on this and only implements its own protocol + iocsh commands.
@@ -12,8 +12,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# The recording line driver tests use.
+testing = []
+
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "motor"] }
-# The holder stores poll-loop command senders (tokio mpsc) created by
-# motor-rs's MotorBuilder; only the `sync` channel type is needed here.
-tokio = { version = "1", features = ["sync"] }
+epics-libcom-rs = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }

@@ -13,10 +13,9 @@
 //!
 //! ## Framing
 //!
-//! The driver owns the output terminator; `st.cmd` sets only the input EOS
-//! (`\n`). The output terminator is `\r\n` by default, but a Lexium MDrive
-//! (`LMD`) uses `\r` without a device name or `\n` with one (C
-//! `readHomeAndLimitConfig` switches `setOutputEos` after reading `PR VR`). The
+//! The port EOS is set at connect as C does ([`INPUT_EOS`]/[`OUTPUT_EOS`]); a
+//! Lexium MDrive (`LMD`) then switches the output EOS to `\r` without a device
+//! name or `\n` with one (C `readHomeAndLimitConfig` after `PR VR`). The
 //! device name, when set, is prepended to every command with no separator.
 //!
 //! ## Units
@@ -27,30 +26,87 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! - **Lexium (`LMM`/`LMD`) `PR IS` switch discovery.** The C reads the whole
-//!   `IS` I/O-setup block in one shot by temporarily forcing a NUL input EOS on
-//!   the raw octet interface. The asyn-rs `SyncIOHandle` has no per-read EOS
-//!   override, so this port discovers home/limit switch inputs only for the
-//!   MForce path (`PR S1`..`PR S4`); on a Lexium the switch inputs stay
-//!   unconfigured (no home/limit switch status is surfaced, matching a drive
-//!   with none of S1-S4 set).
-//! - **`saveToNVM` (`S`) / `clearLockedRotor` (`CF`) / locked-rotor readback
-//!   (`PR LR`).** These are asyn extra-parameter actions driven by separate PVs,
-//!   outside the motor record, so they are not part of the [`AsynMotor`]
-//!   boundary.
 //! - **Velocity / direction / power-on readback.** The C poller never sets
 //!   `motorStatusActualVelocity`, `motorStatusDirection` or `motorStatusPowerOn`,
 //!   so those are left at their defaults here too.
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
-use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::user::AsynUser;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
-use motor_common::util::{atof, atoi};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
+};
+use epics_rs::asyn::param::{ParamType, ParamValue};
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::{OctetReadOp, RequestOp};
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
+use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::{
+    AxisUser, ControllerParams, ParamWrite, has_motor_axis, index,
+};
+use epics_rs::motor::flags::MstaFlags;
+use epics_rs::motor::trace::MotorTrace;
+
+use epics_libcom_rs::cfmt::CFloat;
+use motor_common::controller_status;
+use motor_common::util::{atof, atoi, long_to_int, strtol};
 
 /// Reply read buffer size (C `MAX_BUFF_LEN`).
 const READ_BUF: usize = 80;
+
+/// Port EOS set at connect (ImsMDrivePlusMotorController.cpp:81-82).
+pub const INPUT_EOS: &[u8] = b"\n";
+pub const OUTPUT_EOS: &[u8] = b"\r\n";
+
+/// `PR IS` read buffer and timeout (C `resp[1024]`, `IMS_TIMEOUT`).
+const IS_READ_BUF: usize = 1024;
+const IS_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// C `DRIVER_NAME`, the prefix of the driver's console lines.
+pub(crate) const DRIVER_NAME: &str = "ImsMDrivePlusMotorDriver";
+
+/// Rule under the setup-config banner lines.
+const RULE: &str = "-------------------------------------------";
+
+/// `(input, function)` per line of a `PR IS` block: C turns every non-digit
+/// into a separator and scans `%d %d %d` (input, function, active level) from
+/// each LF-terminated line; text after the last LF is not scanned. The
+/// active level is never read, and C's unchecked sscanf hands
+/// set_switch_vars an uninitialised `fn` from a line of one number: a C
+/// defect, not copied.
+fn parse_input_setup(block: &[u8]) -> Vec<(i32, i32)> {
+    let mut lines: Vec<&[u8]> = block.split(|&b| b == b'\n').collect();
+    lines.pop();
+    lines
+        .into_iter()
+        .filter_map(|line| {
+            let mut nums = line
+                .split(|b| !b.is_ascii_digit())
+                .filter(|f| !f.is_empty())
+                .map(|f| long_to_int(strtol(f, 10).0));
+            Some((nums.next()?, nums.next()?))
+        })
+        .collect()
+}
+
+/// C `sscanf(resp, "%4d[^,]", &type)`'s `type`: at most four characters of
+/// an int after the blanks; `None` when none convert.
+fn scan_switch_type(resp: &str) -> Option<i32> {
+    let b = resp.as_bytes();
+    let at = b
+        .iter()
+        .take_while(|&&c| matches!(c, b' ' | b'\t'..=b'\r'))
+        .count();
+    match strtol(&b[at..b.len().min(at + 4)], 10) {
+        (_, 0) => None,
+        (value, _) => Some(long_to_int(value)),
+    }
+}
 
 fn ims_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
@@ -59,147 +115,626 @@ fn ims_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Build the on-wire command: device name (party mode) + command + terminator.
-fn frame(device_name: &str, cmd: &str, terminator: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(device_name.len() + cmd.len() + terminator.len());
+/// C `handleAxisError`'s `errCodeString` for a `PR ER` code
+/// (ImsMDrivePlusMotorAxis.cpp:589-650).
+fn error_code_string(code: i32) -> &'static str {
+    match code {
+        0 => "No Error",
+        6 => "An I/O is already set to this type. Applies to non-General Purpose I/O",
+        8 => "Tried to set an I/O to an incorrect I/O type",
+        9 => "Tried to write to I/O set as Input or is 'TYPED'",
+        10 => "Illegal I/O number",
+        11 => "Incorrect CLOCK type",
+        12 => "Illegal Trip/Capture",
+        20 => "Tried to set unknown variable or flag",
+        21 => "Tried to set an incorrect value",
+        22 => "VI is set greater than or equal to VM",
+        23 => "VM is set less than or equal to VI",
+        24 => "Illegal data entered",
+        25 => "Variable or flag is read only",
+        26 => "Variable or flag is not allowed to be incremented or decremented",
+        27 => "Trip not defined",
+        28 => "Trying to redefine a program label or variable",
+        29 => "Trying to redefine a build in command, variable, or flag",
+        30 => "Unknown label or user variable",
+        31 => "Program label or user variable table is full",
+        32 => "Trying to set a label",
+        33 => "Trying to set and instruction",
+        34 => "Trying to execute a variable or flag",
+        35 => "Trying to print illegal variable or flag",
+        36 => "Illegal motor count to encoder count ratio",
+        37 => "Command, variable, or flag not available in drive",
+        38 => "Missing parameter separator",
+        39 => "Trip on position and trip on relative distance not allowed together",
+        40 => "Program not running",
+        41 => "Stack overflow",
+        42 => "Illegal program address",
+        43 => "Tried to overflow program stack",
+        44 => "Program locked",
+        45 => "Trying to overflow program space",
+        46 => "Not in program mode",
+        47 => "Tried to write in illegal flash address",
+        48 => "Program execution stopped by I/O set as stop",
+        61 => "Trying to set illegal baud rate",
+        62 => "IV already pending or IF flag already true",
+        63 => "Character over-run",
+        64 => "Startup calibration failed",
+        70 => "Flash check sum failed",
+        71 => "Internal temperature warning, 10 C to shutdown",
+        72 => "Internal over temp fault, disabling drive",
+        73 => "Tried to save while moving",
+        74 => "Tried to initialize parameters or clear program while moving",
+        75 => "Linear over temperature error",
+        80 => "Home switch not defined",
+        81 => "Home type not defined",
+        82 => "Went to both limits and did not find home",
+        83 => "Reached plus limit switch",
+        84 => "Reached minus limit switch",
+        85 => "MA or MR isn't allowed during home and home isn't allowed while moving",
+        86 => "Stall detected",
+        87 => "In clock mode",
+        88 => "Following error",
+        90 => "Motion variables are too low switching to EE=1",
+        91 => "Motion stopped by I/O set as stop",
+        92 => "Position error in closed loop",
+        93 => "MR or MA not allowed while correcting position",
+        // C leaves errCodeString uninitialised for a code outside its table
+        // and prints whatever the stack held; this prints it empty.
+        _ => "",
+    }
+}
+
+/// MOTOR_STATUS_PROBLEM, MSTA bit 9 (RA_PROBLEM) of the MOTOR_STATUS_* run.
+const STATUS_PROBLEM: usize = index::STATUS_DIRECTION + 9;
+
+/// Build the on-wire command: device name (party mode) + command.
+fn frame(device_name: &str, cmd: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(device_name.len() + cmd.len());
     out.extend_from_slice(device_name.as_bytes());
     out.extend_from_slice(cmd.as_bytes());
-    out.extend_from_slice(terminator);
     out
+}
+
+/// The controller's IO port user and the device name C's
+/// `writeController` / `writeReadController` prefix every command with,
+/// shared by the axis and the controller port's IMS_* writes.
+pub struct ImsLine {
+    handle: SyncIOHandle,
+    /// Device name (`DN`) prepended to every command for party mode; empty when
+    /// not in party mode.
+    device_name: String,
+    /// An IO failed since the last [`Self::take_comms_failed`]: C's
+    /// `setIntegerParam(motorStatusCommsError_, 1)`, which is the
+    /// controller's addr-0 param and never reaches the axis's MSTA
+    /// (ImsMDrivePlusMotorController.cpp:371-373).
+    comms_failed: AtomicBool,
+    /// The controller's `pasynUserSelf`, which C's lines print on.
+    trace: MotorTrace,
+}
+
+impl ImsLine {
+    /// `motor_name` is the controller port.
+    pub fn new(handle: SyncIOHandle, device_name: String, motor_name: &str) -> Arc<Self> {
+        Arc::new(Self {
+            handle,
+            device_name,
+            comms_failed: AtomicBool::new(false),
+            trace: MotorTrace::new(motor_name, 0),
+        })
+    }
+
+    fn print(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
+        self.trace.print_self(mask, args);
+    }
+
+    fn take_comms_failed(&self) -> bool {
+        self.comms_failed.swap(false, Ordering::Relaxed)
+    }
+
+    fn failed<T>(&self, status: AsynResult<T>) -> AsynResult<T> {
+        if status.is_err() {
+            self.comms_failed.store(true, Ordering::Relaxed);
+        }
+        status.map_err(controller_status)
+    }
+
+    fn framed(&self, cmd: &str) -> Vec<u8> {
+        frame(&self.device_name, cmd)
+    }
+
+    /// Write a set command; the controller sends no reply (C `writeController`).
+    fn write_only(&self, cmd: &str) -> AsynResult<()> {
+        let out = self.framed(cmd);
+        let device_name = &self.device_name;
+        self.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "{DRIVER_NAME}:writeController(): deviceName={device_name}, command={}\n",
+                String::from_utf8_lossy(&out)
+            ),
+        );
+        self.failed(self.handle.write_octet(0, &out))?;
+        Ok(())
+    }
+
+    /// C `handleAxisError`'s console line for `function`'s failure to do
+    /// `what`, after its `PR ER`; `None` when `PR ER` fails, which C returns
+    /// on silently (ImsMDrivePlusMotorAxis.cpp:571-652).
+    fn axis_error(&self, function: &str, what: &str) -> Option<String> {
+        let code = atoi(&self.write_read("PR ER").ok()?);
+        let text = error_code_string(code);
+        Some(format!(
+            "{DRIVER_NAME}:handleAxisError(): {DRIVER_NAME}:{function}: ERROR {what}, {code}:'{text}'\n"
+        ))
+    }
+
+    /// Write a query and read one reply line (C `writeReadController`:
+    /// `pasynOctetSyncIO->writeRead`, which flushes a stray line first).
+    fn write_read(&self, cmd: &str) -> AsynResult<String> {
+        let (reply, status) = self.exchange_text(cmd);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::write_read`]'s reply beside its status, as C's `resp` string:
+    /// up to its first NUL and untrimmed, which the console lines print. The
+    /// EOS layer NUL-terminates `resp` on every read, so a failed read leaves
+    /// the bytes it delivered, which the callers that ignore the status parse.
+    fn exchange_text(&self, cmd: &str) -> (String, AsynResult<()>) {
+        let (raw, status) = self.exchange(cmd);
+        let resp = raw.split(|&b| b == 0).next().unwrap_or_default();
+        (String::from_utf8_lossy(resp).into_owned(), status)
+    }
+
+    /// C `writeReadController`'s writeRead and its trace line, which
+    /// prints whatever reply there is even when the exchange failed.
+    fn exchange(&self, cmd: &str) -> (Vec<u8>, AsynResult<()>) {
+        let out = self.framed(cmd);
+        let (reply, status) = self.handle.write_read(0, &out, READ_BUF).into_parts();
+        let status = self.failed(status);
+        let device_name = &self.device_name;
+        self.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "{DRIVER_NAME}:writeReadController(): deviceName={device_name}, command={}, response={}\n",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(reply.split(|&b| b == 0).next().unwrap_or_default())
+            ),
+        );
+        (reply, status)
+    }
+}
+
+/// ImsMDrivePlusMotorController's parameters (ImsMDrivePlusMotorController.cpp:
+/// 85-89) and its `writeInt32` (:310-347), which handles them without the
+/// base.
+pub struct ImsParams {
+    line: Arc<ImsLine>,
+    save_to_nvm: Option<usize>,
+    clear_lr_error: Option<usize>,
+}
+
+/// One of C `writeInt32`'s own functions: the command a 1 sends, and the
+/// lines it prints.
+struct Action {
+    command: &'static str,
+    /// The axis method's IO_DRIVER line after `command` was sent.
+    sent: &'static str,
+    /// The axis method C sends `command` from, and its handleAxisError text.
+    function: &'static str,
+    error: &'static str,
+    done: &'static str,
+    failed: &'static str,
+    not_one: &'static str,
+}
+
+const SAVE_TO_NVM: Action = Action {
+    command: "S",
+    sent: "Saved to NVM",
+    function: "saveToNVM()",
+    error: "saving to NVM",
+    done: "Successfully saved to NVM",
+    failed: "ERROR saving to NVM",
+    not_one: "ERROR, value of 1 to save to NVM",
+};
+
+const CLEAR_LR_ERROR: Action = Action {
+    command: "CF",
+    sent: "Clear Locked Rotor Error",
+    function: "clearLockedRotor()",
+    error: "clearing LF error",
+    done: "Successfully cleared LR error",
+    failed: "ERROR clearing LR error",
+    not_one: "ERROR, value of 1 to clear LR error",
+};
+
+impl ImsParams {
+    pub fn new(line: Arc<ImsLine>) -> Self {
+        Self {
+            line,
+            save_to_nvm: None,
+            clear_lr_error: None,
+        }
+    }
+}
+
+impl ControllerParams for ImsParams {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::UINT32_DIGITAL);
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32
+        .or(InterfaceMask::FLOAT64)
+        .or(InterfaceMask::UINT32_DIGITAL);
+
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.save_to_nvm = Some(base.create_param("IMS_SAVETONVM", ParamType::Int32)?);
+        // Created and stored, never acted on: "NOT SUPPORTED YET"
+        // (ImsMDrivePlusMotorController.h:56-57).
+        base.create_param("IMS_LOADMCODE", ParamType::Octet)?;
+        base.create_param("IMS_CLEARMCODE", ParamType::Octet)?;
+        base.create_param("IMS_LOCKEDROTOR", ParamType::Int32)?;
+        self.clear_lr_error = Some(base.create_param("IMS_CLEARLRERROR", ParamType::Int32)?);
+        Ok(())
+    }
+
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: i32,
+    ) -> ParamWrite {
+        // ImsMDrivePlusMotorController.cpp:317-318: no axis, no print.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::Handled(Err(ims_err("writeInt32: no axis at this address")));
+        }
+        base.trace_print(
+            TraceMask::IO_DRIVER,
+            format_args!("{DRIVER_NAME}:writeInt32: val={value}\n"),
+        );
+        let action = match Some(user.reason) {
+            r if r == self.save_to_nvm => SAVE_TO_NVM,
+            r if r == self.clear_lr_error => CLEAR_LR_ERROR,
+            _ => return ParamWrite::PassToBase(Ok(())),
+        };
+        let addr = user.addr;
+        let _ = base.set_int32_param(user.reason, addr, value);
+        let status = if value == 1 {
+            let status = self.line.write_only(action.command);
+            if status.is_ok() {
+                let (function, sent) = (action.function, action.sent);
+                base.trace_print(
+                    TraceMask::IO_DRIVER,
+                    format_args!("{DRIVER_NAME}:{function}: {sent}\n"),
+                );
+            } else {
+                // handleAxisError's asynMotorAxis::setIntegerParam: the
+                // problem bit and the status word at the axis's address.
+                let _ = base.set_int32_param(STATUS_PROBLEM, addr, 1);
+                if let Ok(word) = base.get_int32_param(index::STATUS, addr) {
+                    let _ = base.set_int32_param(index::STATUS, addr, word | 1 << 9);
+                }
+                if let Some(line) = self.line.axis_error(action.function, action.error) {
+                    base.trace_print(TraceMask::ERROR, format_args!("{line}"));
+                }
+            }
+            let (mask, line) = match &status {
+                Ok(()) => (TraceMask::FLOW, action.done),
+                Err(_) => (TraceMask::ERROR, action.failed),
+            };
+            base.trace_print(mask, format_args!("{DRIVER_NAME}:writeInt32: {line}\n"));
+            status
+        } else {
+            let not_one = action.not_one;
+            base.trace_print(
+                TraceMask::ERROR,
+                format_args!("{DRIVER_NAME}:writeInt32: {not_one}\n"),
+            );
+            Ok(())
+        };
+        if self.line.take_comms_failed() {
+            let _ = base.set_int32_param(index::STATUS_COMMS_ERROR, addr, 1);
+        }
+        let _ = base.call_param_callbacks(addr);
+        ParamWrite::Handled(status)
+    }
 }
 
 /// One IMS MDrivePlus controller/axis (1:1, C `NUM_AXES = 1`). Implements
 /// [`AsynMotor`].
 pub struct ImsMDrivePlusAxis {
-    handle: SyncIOHandle,
-    /// Device name (`DN`) prepended to every command for party mode; empty when
-    /// not in party mode.
-    device_name: String,
-    /// Output terminator (`\r\n`, or `\r`/`\n` for a Lexium MDrive).
-    terminator: Vec<u8>,
+    line: Arc<ImsLine>,
     /// I/O input number configured as the home switch (C `homeSwitchInput`).
     home_switch: Option<i32>,
     /// I/O input number configured as the positive-limit switch.
     pos_limit_switch: Option<i32>,
     /// I/O input number configured as the negative-limit switch.
     neg_limit_switch: Option<i32>,
-    has_encoder: bool,
     /// True between a `home` command and the move completing (drives the
     /// `R1=1` "homed" latch in [`Self::poll`]).
     homing: bool,
+    /// The controller port's IMS_LOCKEDROTOR, which the poll sets
+    /// (ImsMDrivePlusMotorAxis.cpp:484).
+    locked_rotor: Option<usize>,
+    /// The controller-port steps of the last write or poll, for the owner
+    /// to apply; a poll's params go out with its status.
+    sets: PortSets,
+    /// The status sets of the constructor or of the last write.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl ImsMDrivePlusAxis {
-    /// Connect an axis on `handle`, addressing it by `device_name` (empty for no
-    /// party mode). Probes the firmware version (to pick the terminator and,
-    /// on MForce, the S1-S4 switch config) and the encoder flag.
-    pub fn new(handle: SyncIOHandle, device_name: String) -> AsynResult<Self> {
+    /// Connect an axis on `line`. The line's octet port is the one whose
+    /// output EOS a Lexium MDrive switches. As in C, a failed configuration is logged and the
+    /// axis is still created. `motor_name` is the controller port, whose
+    /// `pasynUserSelf` C prints these lines on.
+    pub fn new(line: Arc<ImsLine>, motor_name: &str) -> Self {
+        line.print(
+            TraceMask::IO_DRIVER,
+            format_args!("{DRIVER_NAME}:ImsMDrivePlusMotorAxis(): Create Axis 0\n"),
+        );
         let mut axis = Self {
-            handle,
-            device_name,
-            terminator: b"\r\n".to_vec(),
+            line,
             home_switch: None,
             pos_limit_switch: None,
             neg_limit_switch: None,
-            has_encoder: false,
             homing: false,
+            locked_rotor: None,
+            sets: PortSets::default(),
+            status_writes: Vec::new(),
         };
-        axis.setup()?;
-        Ok(axis)
+        if axis.config_axis() == AsynStatus::Error {
+            axis.line.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{DRIVER_NAME}:ImsMDrivePlusMotorAxis(): controller config failed for motor port={motor_name}\n"
+                ),
+            );
+        }
+        axis.read_home_and_limit_config();
+        axis
+    }
+
+    /// Set IMS_LOCKEDROTOR on the controller port `port`.
+    pub fn post_params_to(&mut self, port: PortHandle) -> AsynResult<()> {
+        let io = SyncIOHandle::from_handle(port, 0, IS_READ_TIMEOUT, InterfaceType::Int32)?;
+        self.locked_rotor = Some(io.drv_user_create("IMS_LOCKEDROTOR")?);
+        Ok(())
     }
 
     fn framed(&self, cmd: &str) -> Vec<u8> {
-        frame(&self.device_name, cmd, &self.terminator)
+        self.line.framed(cmd)
     }
 
-    /// Write a set command; the controller sends no reply (C `writeController`).
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &self.framed(cmd))?;
-        Ok(())
+        self.line.write_only(cmd)
     }
 
-    /// Write a query and read one reply line (C `writeReadController`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &self.framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
-        let s = String::from_utf8_lossy(&raw);
-        Ok(s.trim_matches(['\r', '\n', '\0', ' ']).to_string())
+        self.line.write_read(cmd)
     }
 
-    fn setup(&mut self) -> AsynResult<()> {
-        // Firmware version: retry a few times, require a plausible reply (C
-        // requires strlen >= 2). MForce 1 answers `PR VR` with an error, so a
-        // short/failed reply is not necessarily fatal — but a total silence is.
-        let mut version = String::new();
+    /// C `configAxis`: up to three `PR VR` probes, then the `PR EE` encoder
+    /// flag. An asyn error is logged and retried; any other reply shorter than
+    /// two bytes ends the configuration without `PR EE`.
+    fn config_axis(&mut self) -> AsynStatus {
         for _ in 0..3 {
-            if let Ok(v) = self.write_read("PR VR")
-                && v.len() >= 2
-            {
-                version = v;
-                break;
-            }
-        }
-        if version.len() < 2 {
-            return Err(ims_err(
-                "ims: version inquiry failed (no response from controller)",
-            ));
-        }
-
-        let vlow = version.to_lowercase();
-        if vlow.contains("lmd") {
-            // Lexium MDrive: terminator depends on party mode.
-            self.terminator = if self.device_name.is_empty() {
-                b"\r".to_vec()
-            } else {
-                b"\n".to_vec()
+            let resp = self.line.exchange("PR VR");
+            self.line.print(
+                TraceMask::IO_DRIVER,
+                format_args!("{DRIVER_NAME}:configAxis(): Version retry.\n"),
+            );
+            let resp = match resp {
+                (_, Err(e)) if e.status() == AsynStatus::Error => {
+                    self.line.print(
+                        TraceMask::ERROR,
+                        format_args!("{DRIVER_NAME}:configAxis(): Version inquiry FAILED.\n"),
+                    );
+                    continue;
+                }
+                (raw, _) => raw,
             };
+            let resp = resp.split(|&b| b == 0).next().unwrap_or_default();
+            if resp.len() < 2 {
+                self.line.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:configAxis(): Version inquiry FAILED version={}.\n",
+                        String::from_utf8_lossy(resp)
+                    ),
+                );
+                self.status_writes.push(StatusWrite::Problem(true));
+                self.sets
+                    .axis(index::STATUS_COMMS_ERROR, ParamValue::Int32(1));
+                return AsynStatus::Error;
+            }
+            break;
         }
+        match self.write_read("PR EE") {
+            Ok(resp) => {
+                let val = atoi(&resp);
+                self.status_writes.extend([
+                    StatusWrite::HasEncoder(val != 0),
+                    StatusWrite::GainSupport(val != 0),
+                ]);
+                self.line.print(
+                    TraceMask::IO_DRIVER,
+                    format_args!(
+                        "{DRIVER_NAME}:configAxis(): set motorStatusHasEncoder_={val}, motorStatusGainSupport_={val}.\n"
+                    ),
+                );
+                AsynStatus::Success
+            }
+            Err(e) => e.status(),
+        }
+    }
 
-        if vlow.contains("lmm") || vlow.contains("lmd") {
-            // Lexium switch config comes from `PR IS`, which needs a block read
-            // this port cannot do (see module docs) — leave switches unconfigured.
+    /// C `readHomeAndLimitConfig`, console lines included.
+    fn read_home_and_limit_config(&mut self) {
+        // MForce 1 answers `PR VR` with an error, so its status is ignored
+        // and its reply parsed (ImsMDrivePlusMotorController.cpp:172-178).
+        let version = self.line.exchange_text("PR VR").0;
+        if !version.is_empty() {
+            println!("Controller version {version}");
+        }
+        println!("Setup config:");
+        // C's strstr, so a mixed-case name is an MForce (:182-188).
+        let model = |names: [&str; 2]| names.iter().any(|n| version.contains(n));
+        if model(["lmm", "LMM"]) || model(["lmd", "LMD"]) {
+            if model(["lmm", "LMM"]) {
+                println!("Lexium Motor Module detected");
+                println!("{RULE}");
+            } else {
+                // Lexium MDrive: output EOS depends on party mode.
+                println!("Lexium MDrive detected");
+                println!("{RULE}");
+                let eos: &[u8] = if self.line.device_name.is_empty() {
+                    println!("Have no device name, line ending CR.");
+                    b"\r"
+                } else {
+                    println!("Have device name going party modus, line ending LF.");
+                    b"\n"
+                };
+                let _ = self.line.handle.set_output_eos(0, eos);
+            }
+            let block = self.read_input_setup().unwrap_or_default();
+            let text = block.split(|&b| b == 0).next().unwrap_or_default();
+            println!("{}", String::from_utf8_lossy(text));
+            for (input_no, function) in parse_input_setup(&block) {
+                self.set_switch(function, input_no);
+            }
         } else {
             // MForce: read the S1-S4 I/O setup and map any home/limit inputs.
+            println!("MForce 1 driver detected");
+            println!("{RULE}");
+            println!("Checking setup for home, pos and neg limit switches:");
             for input_no in 1..=4 {
-                if let Ok(resp) = self.write_read(&format!("PR S{input_no}")) {
-                    self.set_switch(atoi(&resp), input_no);
+                // C prints and parses `resp` whatever the status (:213-216).
+                let resp = self.line.exchange_text(&format!("PR S{input_no}")).0;
+                println!("{resp}");
+                // C's unchecked sscanf leaves `type` as the last input's, or
+                // uninitialised at S1, and maps this input to it: a C defect,
+                // not copied.
+                if let Some(type_code) = scan_switch_type(&resp) {
+                    self.set_switch(type_code, input_no);
                 }
             }
         }
+        println!(
+            "    HOME limit switch input line: {}",
+            self.home_switch.unwrap_or(-1)
+        );
+        println!(
+            "POSITIVE limit switch input line: {}",
+            self.pos_limit_switch.unwrap_or(-1)
+        );
+        println!(
+            "NEGATIVE limit switch input line: {}",
+            self.neg_limit_switch.unwrap_or(-1)
+        );
+        println!("{RULE}");
+    }
 
-        // Encoder present? (`EE` echo-encoder flag.)
-        if let Ok(resp) = self.write_read("PR EE") {
-            self.has_encoder = atoi(&resp) != 0;
-        }
-        Ok(())
+    /// Lexium `PR IS`: the whole I/O-setup block, read with a NUL input EOS
+    /// under the port lock so the read runs to the timeout and gathers every
+    /// line (ImsMDrivePlusMotorController.cpp:221-237). The input EOS is put
+    /// back to `\n` as C does, on every path.
+    fn read_input_setup(&self) -> AsynResult<Vec<u8>> {
+        let port = self.line.handle.port()?;
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1 << 48);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let user = || {
+            let mut u = AsynUser::new(0).with_addr(0).with_timeout(IS_READ_TIMEOUT);
+            u.block_token = Some(token);
+            u
+        };
+        port.submit_blocking(RequestOp::BlockProcess { all_devices: true }, user())?;
+        let read = (|| -> AsynResult<Vec<u8>> {
+            port.set_input_eos_blocking(user(), b"\0")?;
+            port.submit_blocking(
+                RequestOp::OctetWrite {
+                    data: self.framed("PR IS"),
+                },
+                user(),
+            )?;
+            // C parses `resp[..nread]` whatever the read's status (:237-244).
+            let (resp, _) = port
+                .submit_octet_read_blocking(
+                    OctetReadOp::Read {
+                        buf_size: IS_READ_BUF,
+                    },
+                    user(),
+                )
+                .into_parts();
+            Ok(resp)
+        })();
+        let restored = port.set_input_eos_blocking(user(), INPUT_EOS);
+        let unblocked =
+            port.submit_blocking(RequestOp::UnblockProcess { all_devices: true }, user());
+        let block = read?;
+        restored?;
+        unblocked?;
+        Ok(block)
     }
 
     /// Map an I/O setup type code to the switch input it configures (C
     /// `set_switch_vars`: 1 = home, 2 = positive limit, 3 = negative limit).
     fn set_switch(&mut self, type_code: i32, input_no: i32) {
-        match type_code {
-            1 => self.home_switch = Some(input_no),
-            2 => self.pos_limit_switch = Some(input_no),
-            3 => self.neg_limit_switch = Some(input_no),
-            _ => {}
-        }
+        let (slot, name) = match type_code {
+            1 => (&mut self.home_switch, "HOME"),
+            2 => (&mut self.pos_limit_switch, "POSITIVE"),
+            3 => (&mut self.neg_limit_switch, "NEGATIVE"),
+            _ => return,
+        };
+        *slot = Some(input_no);
+        println!(
+            "Setup type {type_code} found: {name} limit switch input line is set to {input_no}"
+        );
     }
 
     /// Set base velocity (`VI`, only if > 0), max velocity (`VM`), acceleration
     /// and deceleration (`A`/`D`, only if non-zero), then reset the stall flag
     /// (`ST=0`). C `setAxisMoveParameters`.
     fn set_move_params(
+        &mut self,
+        min_velocity: f64,
+        max_velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        let status = self.send_move_params(min_velocity, max_velocity, acceleration);
+        self.bail(
+            "setAxisMoveParameters()",
+            "setting motor velocity and acceleration",
+            status,
+        )
+    }
+
+    /// C's "base velocity cannot be greater than max velocity" check, which
+    /// prints in the function that makes it (ImsMDrivePlusMotorAxis.cpp:127,
+    /// :310).
+    fn check_base_velocity(&self, function: &str, min: f64, max: f64) -> AsynResult<()> {
+        if min <= max {
+            return Ok(());
+        }
+        self.line.print(
+            TraceMask::ERROR,
+            format_args!(
+                "{DRIVER_NAME}:{function}: base velocity={:.6} cannot be greater than max velocity={:.6}\n",
+                CFloat(min),
+                CFloat(max)
+            ),
+        );
+        Err(ims_err(
+            "ims: base velocity cannot be greater than max velocity",
+        ))
+    }
+
+    fn send_move_params(
         &self,
         min_velocity: f64,
         max_velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
         if min_velocity > 0.0 {
-            if min_velocity > max_velocity {
-                return Err(ims_err(
-                    "ims: base velocity cannot be greater than max velocity",
-                ));
-            }
+            self.check_base_velocity("setAxisMoveParameters()", min_velocity, max_velocity)?;
             self.write_only(&format!("VI={}", min_velocity as i64))?;
         }
         self.write_only(&format!("VM={}", max_velocity as i64))?;
@@ -211,25 +746,129 @@ impl ImsMDrivePlusAxis {
         Ok(())
     }
 
+    /// C `move`: a failed setAxisMoveParameters runs handleAxisError again
+    /// for the move (ImsMDrivePlusMotorAxis.cpp:188-206).
     fn do_move(
-        &self,
+        &mut self,
         position: f64,
         relative: bool,
         min_velocity: f64,
         max_velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.set_move_params(min_velocity, max_velocity, acceleration)?;
         let cmd = if relative {
             format!("MR {}", position as i64)
         } else {
             format!("MA {}", position as i64)
         };
-        self.write_only(&cmd)
+        let status = self
+            .set_move_params(min_velocity, max_velocity, acceleration)
+            .and_then(|()| {
+                self.line.print(
+                    TraceMask::IO_DRIVER,
+                    format_args!(
+                        "{DRIVER_NAME}:move(): VBASE={:.6}, VELO={:.6}, ACCL={:.6}, position={:.6}, relative={}\n",
+                        CFloat(min_velocity),
+                        CFloat(max_velocity),
+                        CFloat(acceleration),
+                        CFloat(position),
+                        i32::from(relative)
+                    ),
+                );
+                self.write_only(&cmd)
+            });
+        self.bail("move()", "moving motor", status)
+    }
+
+    /// C's `bail:` label: a failed `function` runs handleAxisError, which
+    /// sets `motorStatusProblem_` and prints the drive's `PR ER` code.
+    fn bail<T>(&mut self, function: &str, what: &str, status: AsynResult<T>) -> AsynResult<T> {
+        if status.is_err() && self.handle_axis_error(function, what) {
+            self.sets
+                .set(0, index::STATUS_COMMS_ERROR, ParamValue::Int32(1));
+            self.sets.call_param_callbacks(0);
+        }
+        status
+    }
+
+    /// C `handleAxisError`; true when an exchange failed, which C's
+    /// writeController/writeReadController mark as COMMS_ERROR.
+    fn handle_axis_error(&mut self, function: &str, what: &str) -> bool {
+        self.status_writes.push(StatusWrite::Problem(true));
+        if let Some(line) = self.line.axis_error(function, what) {
+            self.line.print(TraceMask::ERROR, format_args!("{line}"));
+        }
+        self.line.take_comms_failed()
+    }
+
+    /// C `poll` up to its bail label, setting `status` field by field as C
+    /// sets its params; `position` is what it read of `PR P`, which its
+    /// trace line prints even when a later read fails.
+    fn poll_status(&mut self, status: &mut MotorStatus, position: &mut f64) -> AsynResult<()> {
+        *position = atof(&self.write_read("PR P")?);
+        // C updates the encoder position too, even without an encoder.
+        status.set_position(*position);
+        status.set_encoder_position(*position);
+        let moving = atoi(&self.write_read("PR MV")?) != 0;
+        status.moving = moving;
+        status.done = !moving;
+
+        // On the falling edge of a home move, latch R1 = 1 (homed).
+        if self.homing && !moving {
+            self.homing = false;
+            self.write_only("R1=1")?;
+        }
+
+        // Home / limit switch inputs (only those configured on this drive).
+        // C sets motorStatusHome_ (EA_HOME) from the home switch input.
+        if let Some(n) = self.home_switch {
+            status.encoder_home = atoi(&self.write_read(&format!("PR I{n}"))?) != 0;
+        }
+        if let Some(n) = self.pos_limit_switch {
+            status.high_limit = atoi(&self.write_read(&format!("PR I{n}"))?) != 0;
+        }
+        if let Some(n) = self.neg_limit_switch {
+            status.low_limit = atoi(&self.write_read(&format!("PR I{n}"))?) != 0;
+        }
+
+        status.homed = atoi(&self.write_read("PR R1")?) > 0;
+        // ST is the stall flag: C sets both motorStatusFollowingError_ (MSTA
+        // bit 6) and motorStatusSlip_ (bit 4) from it.
+        let stalled = atoi(&self.write_read("PR ST")?) > 0;
+        status.slip_stall = stalled;
+        status.slip = stalled;
+        status.set_encoder_position(atof(&self.write_read("PR C2")?));
+        let locked_rotor = atoi(&self.write_read("PR LR")?);
+        if let Some(reason) = self.locked_rotor {
+            self.sets.axis(reason, ParamValue::Int32(locked_rotor));
+        }
+        Ok(())
     }
 }
 
 impl AsynMotor for ImsMDrivePlusAxis {
+    /// C `ImsMDrivePlusMotorAxis::handleAxisError` sets only
+    /// `motorStatusProblem_`.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:56.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
+    /// COMMS_ERROR is the controller's own param, set by
+    /// writeController/writeReadController (ImsMDrivePlusMotorController.cpp:
+    /// 371-373, :403-406) and cleared by a good poll.
+    fn param_owned_msta_bits(&self) -> u32 {
+        MstaFlags::COMM_ERR.bits()
+    }
+
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -261,8 +900,21 @@ impl AsynMotor for ImsMDrivePlusAxis {
     ) -> AsynResult<()> {
         // C jogs with |maxVelocity| for the parameters (JOGR passes a negative
         // velocity) but the signed value in the SL slew command.
-        self.set_move_params(min_velocity, velocity.abs(), acceleration)?;
-        self.write_only(&format!("SL {}", velocity as i64))
+        let status = self
+            .set_move_params(min_velocity, velocity.abs(), acceleration)
+            .and_then(|()| {
+                self.line.print(
+                    TraceMask::IO_DRIVER,
+                    format_args!(
+                        "{DRIVER_NAME}:moveVelocity(): VBASE={:.6}, VELO={:.6}, ACCL={:.6}\n",
+                        CFloat(min_velocity),
+                        CFloat(velocity),
+                        CFloat(acceleration)
+                    ),
+                );
+                self.write_only(&format!("SL {}", velocity as i64))
+            });
+        self.bail("moveVelocity()", "jogging motor", status)
     }
 
     fn home(
@@ -273,93 +925,865 @@ impl AsynMotor for ImsMDrivePlusAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        // C reads `PR VI` to ensure a non-zero creep velocity when min_velocity
-        // is 0, but never re-sends it — the creep relies on the drive's stored
-        // VI. This port matches that (does not re-send VI).
-        self.set_move_params(min_velocity, velocity, acceleration)?;
         // HM 3 homes in the plus direction, HM 1 in the minus direction.
         let direction = if forward { 3 } else { 1 };
-        self.write_only(&format!("HM {direction}"))?;
-        // Reset the "homed" latch (R1); poll sets it once the move completes.
-        self.write_only("R1=0")?;
+        // R1=0 resets the "homed" latch; poll sets it once the move completes.
+        // C reads `PR VI` to find the creep velocity and then drops the
+        // value (:316-322); only a failed read changes what happens.
+        let checked = if min_velocity > 0.0 {
+            self.check_base_velocity("home()", min_velocity, velocity)
+        } else {
+            self.write_read("PR VI").map(drop)
+        };
+        let status = checked
+            .and_then(|()| self.set_move_params(min_velocity, velocity, acceleration))
+            .and_then(|()| {
+                self.line.print(
+                    TraceMask::IO_DRIVER,
+                    format_args!(
+                        "{DRIVER_NAME}:home(): VBASE={:.6}, VELO={:.6}, ACCL={:.6}, forwards={}\n",
+                        CFloat(min_velocity),
+                        CFloat(velocity),
+                        CFloat(acceleration),
+                        i32::from(forward)
+                    ),
+                );
+                self.write_only(&format!("HM {direction}"))
+            })
+            .and_then(|()| self.write_only("R1=0"));
+        self.bail("home()", "homing motor", status)?;
+        // C sets homing after its bail label even when the home failed
+        // (ImsMDrivePlusMotorAxis.cpp:351), so the next idle poll writes
+        // R1=1 and reports homed for a home that never ran; not copied.
         self.homing = true;
         Ok(())
     }
 
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
-        if acceleration != 0.0 {
-            self.write_only(&format!("D={}", acceleration as i64))?;
+        let status = if acceleration != 0.0 {
+            self.write_only(&format!("D={}", acceleration as i64))
+        } else {
+            Ok(())
         }
-        self.write_only("SL 0")
+        .and_then(|()| self.write_only("SL 0"));
+        self.bail("stop()", "stopping motor", status)
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.write_only(&format!("P={}", position as i64))
+        self.line.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "{DRIVER_NAME}:setPosition(): position={:.6}\n",
+                CFloat(position)
+            ),
+        );
+        let status = self.write_only(&format!("P={}", position as i64));
+        self.bail("setPosition()", "setting motor position", status)
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let position = atof(&self.write_read("PR P")?);
-        let moving = atoi(&self.write_read("PR MV")?) != 0;
-
-        // On the falling edge of a home move, latch R1 = 1 (homed).
-        if self.homing && !moving {
-            self.write_only("R1=1")?;
-            self.homing = false;
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
+        let mut position = 0.0;
+        let status = self.poll_status(out, &mut position);
+        if status.is_ok() {
+            // C resets motorStatusCommsError_ and motorStatusProblem_ on
+            // every good poll (:496-497); the problem bit a failed
+            // IMS_* write set lives only in the params.
+            self.line.take_comms_failed();
+            self.sets
+                .axis(index::STATUS_COMMS_ERROR, ParamValue::Int32(0));
+            self.sets.axis(STATUS_PROBLEM, ParamValue::Int32(0));
+            out.problem = false;
+        } else if self.handle_axis_error("poll()", "polling motor") {
+            self.sets
+                .axis(index::STATUS_COMMS_ERROR, ParamValue::Int32(1));
         }
+        let mut word = MstaFlags::from_status(out);
+        word.set(MstaFlags::PROBLEM, status.is_err());
+        let word = word.bits();
+        self.line.print(
+            TraceMask::IO_DRIVER,
+            format_args!(
+                "{DRIVER_NAME}:poll(): POS={:.6}, MSTAT={word}\n",
+                CFloat(position)
+            ),
+        );
+        status
+    }
 
-        // Home / limit switch inputs (only those configured on this drive).
-        let encoder_home = match self.home_switch {
-            Some(n) => atoi(&self.write_read(&format!("PR I{n}"))?) != 0,
-            None => false,
-        };
-        let high_limit = match self.pos_limit_switch {
-            Some(n) => atoi(&self.write_read(&format!("PR I{n}"))?) != 0,
-            None => false,
-        };
-        let low_limit = match self.neg_limit_switch {
-            Some(n) => atoi(&self.write_read(&format!("PR I{n}"))?) != 0,
-            None => false,
-        };
-
-        let homed = atoi(&self.write_read("PR R1")?) > 0;
-        // ST is the stall flag; C maps it to both following-error and slip. Only
-        // slip/stall has a MotorStatus field, so both fold into slip_stall.
-        let stall = atoi(&self.write_read("PR ST")?) > 0;
-        let encoder_position = atof(&self.write_read("PR C2")?);
-
-        Ok(MotorStatus {
-            position,
-            encoder_position,
-            done: !moving,
-            moving,
-            high_limit,
-            low_limit,
-            // C sets motorStatusHome_ (EA_HOME) from the home switch input.
-            encoder_home,
-            homed,
-            slip_stall: stall,
-            has_encoder: self.has_encoder,
-            gain_support: self.has_encoder,
-            // IMS honours a base velocity (VI).
-            vbas_supported: true,
-            ..Default::default()
-        })
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
+    use epics_rs::asyn::interfaces::motor::PortSet;
+    use motor_common::testing::Polled;
 
+    /// ImsMDrivePlusMotorController.cpp's writeController and
+    /// writeReadController return the bare status; the SyncIO errorMessage
+    /// stays on the controller's asynUser.
     #[test]
-    fn frame_prepends_device_name_and_terminator() {
-        // Party mode: device name prepended with no separator, `\r\n` terminator.
-        assert_eq!(frame("M06", "MA 100", b"\r\n"), b"M06MA 100\r\n");
+    fn a_refused_controller_exchange_carries_no_message() {
+        use motor_common::testing::{LineRig, assert_bare};
+        let (_rig, io) = LineRig::failing("imsRefusedIo", |_| "1".into(), |_| true);
+        let line = ImsLine::new(io, String::new(), "imsRefusedIo");
+        assert_bare(line.write_only("MR 1").unwrap_err(), AsynStatus::Error);
+        assert_bare(line.write_read("PR P").unwrap_err(), AsynStatus::Error);
     }
 
     #[test]
-    fn frame_no_device_name_lexium_terminator() {
-        // No party mode, Lexium MDrive `\r` terminator.
-        assert_eq!(frame("", "PR P", b"\r"), b"PR P\r");
+    fn the_constructor_calls_back() {
+        let (handle, _) =
+            SyncIOHandle::connect_port("IMS_CALLBACK", 0, Duration::ZERO, InterfaceType::Octet);
+        let axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(handle, String::new(), "IMS_CALLBACK"),
+            "IMS_CALLBACK",
+        );
+        assert!(axis.constructor_calls_param_callbacks());
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:53-54: asynUInt32Digital is added to
+    /// both the interfaces and the callback interfaces.
+    #[test]
+    fn the_port_adds_uint32_digital_to_both_masks() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::motor::controller_port::ControllerPort;
+
+        let (handle, _) =
+            SyncIOHandle::connect_port("IMS_MASK", 0, Duration::ZERO, InterfaceType::Octet);
+        let line = ImsLine::new(handle, String::new(), "IMS_MASK");
+        let port = ControllerPort::new("IMS_MASK_CTRL", 1, ImsParams::new(line)).unwrap();
+        let bit = InterfaceMask::UINT32_DIGITAL;
+        assert!(port.base().interface_mask().contains(bit));
+        assert!(port.base().interrupt_mask().contains(bit));
+    }
+
+    /// The steps one call left on the controller port, in the order made.
+    fn rendered(sets: PortSets) -> Vec<String> {
+        sets.into_iter()
+            .map(|set| match set {
+                PortSet::Set {
+                    addr,
+                    reason,
+                    value: ParamValue::Int32(v),
+                } => format!("set {addr} {reason} {v}"),
+                PortSet::Axis {
+                    reason,
+                    value: ParamValue::Int32(v),
+                } => format!("axis {reason} {v}"),
+                PortSet::Callbacks(addr) => format!("callbacks {addr}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:69-99: a missing IO port still builds
+    /// the axis; configAxis and readHomeAndLimitConfig run on the dead user.
+    #[test]
+    fn an_axis_of_a_missing_port_is_still_built() {
+        let (handle, status) = SyncIOHandle::connect_port(
+            "IMS_NONE",
+            0,
+            Duration::from_millis(10),
+            InterfaceType::Octet,
+        );
+        assert!(status.is_err());
+        let mut axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(handle, String::new(), "IMS_MOTOR"),
+            "IMS_MOTOR",
+        );
+        // C's status_ starts at 0 and only a good PR MV sets Done
+        // (ImsMDrivePlusMotorAxis.cpp:422).
+        let status = axis.constructed();
+        assert!(!status.has_encoder && !status.done, "{status:?}");
+        assert_eq!(
+            (
+                axis.home_switch,
+                axis.pos_limit_switch,
+                axis.neg_limit_switch
+            ),
+            (None, None, None)
+        );
+    }
+
+    /// An axis on line `line` whose writes `fails` refuses, answering
+    /// `PR ER` with 86, and the ERROR lines its controller port `port`
+    /// prints while `run` drives it.
+    fn axis_error_lines(
+        port: &str,
+        line: &str,
+        fails: impl Fn(&str) -> bool + Send + Sync + 'static,
+        run: impl FnOnce(&mut ImsMDrivePlusAxis),
+    ) -> (Vec<String>, Vec<String>) {
+        axis_trace_lines(port, line, TraceMask::ERROR, fails, run)
+    }
+
+    /// [`axis_error_lines`] for the lines under `mask`, from the axis's
+    /// construction on.
+    fn axis_trace_lines(
+        port: &str,
+        line: &str,
+        mask: TraceMask,
+        fails: impl Fn(&str) -> bool + Send + Sync + 'static,
+        run: impl FnOnce(&mut ImsMDrivePlusAxis),
+    ) -> (Vec<String>, Vec<String>) {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::failing(
+            line,
+            |last| match last.trim_end() {
+                "PR VR" => "1.000".into(),
+                "PR ER" => "86".into(),
+                _ => "0".into(),
+            },
+            fails,
+        );
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), mask);
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        trace.set_device_trace_file(port, 0, TraceFile::File(file));
+        let mut axis = ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), port), port);
+        rig.sent();
+        run(&mut axis);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // Each line follows asynPrint's timestamp.
+        let lines = text
+            .lines()
+            .filter_map(|l| l.splitn(3, ' ').nth(2))
+            .map(str::to_owned)
+            .collect();
+        (rig.sent(), lines)
+    }
+
+    fn error_line(function: &str, what: &str) -> String {
+        format!(
+            "{DRIVER_NAME}:handleAxisError(): {DRIVER_NAME}:{function}: ERROR {what}, 86:'Stall detected'"
+        )
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:200-206, 571-652: a failed move reads
+    /// `PR ER`, prints the code and sets motorStatusProblem_.
+    #[test]
+    fn a_failed_move_prints_the_drive_s_error_code() {
+        let mut writes = Vec::new();
+        let (sent, lines) = axis_error_lines(
+            "imsErrMove",
+            "imsErrMoveLine",
+            |l| l.starts_with("MA "),
+            |axis| {
+                let user = AsynUser::new(0);
+                axis.constructed();
+                assert!(axis.move_absolute(&user, 100.0, 0.0, 50.0, 0.0).is_err());
+                writes = axis.take_status_writes();
+            },
+        );
+        assert_eq!(sent, ["VM=50", "ST=0", "MA 100", "PR ER"]);
+        assert_eq!(lines, [error_line("move()", "moving motor")]);
+        assert_eq!(writes, [StatusWrite::Problem(true)]);
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:371-373: the failed write sets the
+    /// controller's COMMS_ERROR, which the move's callParamCallbacks posts.
+    #[test]
+    fn a_failed_move_hands_comms_error_to_the_owner() {
+        let mut sets = Vec::new();
+        axis_error_lines(
+            "imsErrComms",
+            "imsErrCommsLine",
+            |l| l.starts_with("MA "),
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.move_absolute(&user, 100.0, 0.0, 50.0, 0.0).is_err());
+                sets = rendered(axis.take_port_sets());
+            },
+        );
+        assert_eq!(
+            sets,
+            [
+                format!("set 0 {} 1", index::STATUS_COMMS_ERROR),
+                "callbacks 0".into()
+            ]
+        );
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:159-164, 199-206: a failed
+    /// setAxisMoveParameters runs handleAxisError, then move runs it again.
+    #[test]
+    fn a_failed_move_parameter_write_reports_twice() {
+        let (sent, lines) = axis_error_lines(
+            "imsErrVm",
+            "imsErrVmLine",
+            |l| l.starts_with("VM="),
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.move_relative(&user, 5.0, 0.0, 50.0, 0.0).is_err());
+            },
+        );
+        assert_eq!(sent, ["VM=50", "PR ER", "PR ER"]);
+        assert_eq!(
+            lines,
+            [
+                error_line(
+                    "setAxisMoveParameters()",
+                    "setting motor velocity and acceleration"
+                ),
+                error_line("move()", "moving motor"),
+            ]
+        );
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:464-470: the stall flag sets both
+    /// motorStatusFollowingError_ and motorStatusSlip_, MSTA bits 6 and 4.
+    /// ImsMDrivePlusMotorController.cpp:172-178 and :213-216 ignore the
+    /// status of `PR VR` and `PR S1`-`PR S4` and parse `resp`, so a reply cut
+    /// by a timeout still picks the model and maps the limit inputs.
+    #[test]
+    fn config_replies_cut_by_a_timeout_are_still_parsed() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::cut(
+            "imsCutLmm",
+            |last| match last.trim_end() {
+                "PR VR" => "LMM 3.0".into(),
+                _ => "0".into(),
+            },
+            |last| last.trim_end() == "PR VR",
+        );
+        ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsCutLmm"), "imsCutLmm");
+        // An LMM skips the MForce S1-S4 probe.
+        let sent = rig.sent();
+        assert!(!sent.iter().any(|c| c.trim_end() == "PR S1"), "{sent:?}");
+
+        let (_rig, io) = LineRig::cut(
+            "imsCutS",
+            |last| match last.trim_end() {
+                "PR VR" => "1.000".into(),
+                "PR S2" => "2,0,0".into(),
+                "PR S3" => "3,0,0".into(),
+                _ => "0".into(),
+            },
+            |last| last.trim_end().starts_with("PR S"),
+        );
+        let axis = ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsCutS"), "imsCutS");
+        assert_eq!(
+            (axis.pos_limit_switch, axis.neg_limit_switch),
+            (Some(2), Some(3))
+        );
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:191-199: a Lexium MDrive's output
+    /// EOS is `pasynOctetSyncIO->setOutputEos`'s, which prints its
+    /// TRACEIO_DEVICE line.
+    #[test]
+    fn an_lmd_sets_its_output_eos_as_asyn_octet_sync_io() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use motor_common::testing::LineRig;
+
+        let name = "imsLmdEos";
+        let (_rig, io) = LineRig::new(name, |last| match last.trim_end() {
+            "PR VR" => "LMD 1.0".into(),
+            _ => "0".into(),
+        });
+        let trace = io.port().unwrap().trace().clone();
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        trace.set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&path).unwrap(),
+            ))),
+        );
+        trace.set_trace_mask(Some(name), TraceMask::IO_DEVICE);
+        ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), name), name);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains("asynOctetSyncIO setOutputEos eoslen 1\n"),
+            "{text}"
+        );
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:182-188 match `lmm`/`LMM` and
+    /// `lmd`/`LMD` only, so `Lmm` probes the MForce S1-S4 setup.
+    #[test]
+    fn a_mixed_case_lexium_name_is_an_mforce() {
+        use motor_common::testing::LineRig;
+        let (rig, io) = LineRig::new("imsMixedLmm", |last| match last.trim_end() {
+            "PR VR" => "Lmm 3.0".into(),
+            _ => "0".into(),
+        });
+        ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsMixedLmm"),
+            "imsMixedLmm",
+        );
+        let sent = rig.sent();
+        assert!(sent.iter().any(|c| c.trim_end() == "PR S1"), "{sent:?}");
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:175-178 and :214 print the version
+    /// and S1-S4 replies as read, a CR included.
+    #[test]
+    fn config_replies_print_untrimmed() {
+        use motor_common::testing::{LineRig, child_stdout, in_child};
+        if !in_child() {
+            let out = child_stdout(module_path!(), "config_replies_print_untrimmed");
+            assert!(out.contains("Controller version 1.000\r\n"), "{out:?}");
+            assert!(out.contains("\n2,0,0\r\n"), "{out:?}");
+            return;
+        }
+        let (_rig, io) = LineRig::new("imsRawReply", |last| match last.trim_end() {
+            "PR VR" => "1.000\r".into(),
+            "PR S2" => "2,0,0\r".into(),
+            _ => "0".into(),
+        });
+        ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsRawReply"),
+            "imsRawReply",
+        );
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:215 reads `type` with `%4d`, so
+    /// `00001` is type 0 and maps no switch.
+    #[test]
+    fn a_switch_type_reads_four_characters() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("imsWidth4", |last| match last.trim_end() {
+            "PR VR" => "1.000".into(),
+            "PR S1" => "00001,0,0".into(),
+            _ => "0".into(),
+        });
+        let axis =
+            ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsWidth4"), "imsWidth4");
+        assert_eq!(axis.home_switch, None);
+    }
+
+    #[test]
+    fn a_stall_sets_following_error_and_slip() {
+        use epics_rs::motor::flags::MstaFlags;
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("imsStallLine", |last| match last.trim_end() {
+            "PR VR" => "1.000".into(),
+            "PR ST" => "1".into(),
+            _ => "0".into(),
+        });
+        let mut axis =
+            ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsStall"), "imsStall");
+        let status = axis.polled(&AsynUser::new(0)).unwrap();
+        let bits = MstaFlags::from_status(&status).bits();
+        assert_eq!(bits & 0x50, 0x50, "{bits:#x}");
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:487-492: a failed poll reports through
+    /// handleAxisError; one whose `PR ER` fails too prints nothing (:585).
+    #[test]
+    fn a_failed_poll_prints_unless_pr_er_fails_too() {
+        let (_, lines) = axis_error_lines(
+            "imsErrPoll",
+            "imsErrPollLine",
+            |l| l == "PR MV",
+            |axis| {
+                assert!(axis.polled(&AsynUser::new(0)).is_err());
+            },
+        );
+        assert_eq!(lines, [error_line("poll()", "polling motor")]);
+        let (sent, lines) = axis_error_lines(
+            "imsErrDead",
+            "imsErrDeadLine",
+            |l| l == "PR P" || l == "PR ER",
+            |axis| assert!(axis.polled(&AsynUser::new(0)).is_err()),
+        );
+        assert_eq!(sent, ["PR P", "PR ER"]);
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// The IO_DRIVER lines of ImsMDrivePlusMotorAxis.cpp and
+    /// ImsMDrivePlusMotorController.cpp:369, :403, a failed exchange's
+    /// included.
+    #[test]
+    fn each_io_driver_line_prints_where_c_prints_it() {
+        let (_, lines) = axis_trace_lines(
+            "imsIo",
+            "imsIoLine",
+            TraceMask::IO_DRIVER,
+            |l| l == "PR R1",
+            |axis| {
+                let user = AsynUser::new(0);
+                axis.move_absolute(&user, 100.0, 10.0, 50.0, 20.0).unwrap();
+                axis.move_velocity(&user, 0.0, -50.0, 0.0).unwrap();
+                axis.home(&user, 10.0, 50.0, 0.0, true).unwrap();
+                axis.set_position(&user, 7.5).unwrap();
+                assert!(axis.polled(&user).is_err());
+            },
+        );
+        let w = |cmd: &str| format!("{DRIVER_NAME}:writeController(): deviceName=, command={cmd}");
+        let wr = |cmd: &str, resp: &str| {
+            format!(
+                "{DRIVER_NAME}:writeReadController(): deviceName=, command={cmd}, response={resp}"
+            )
+        };
+        let own = |rest: &str| format!("{DRIVER_NAME}:{rest}");
+        let mut want = vec![
+            own("ImsMDrivePlusMotorAxis(): Create Axis 0"),
+            wr("PR VR", "1.000"),
+            own("configAxis(): Version retry."),
+            wr("PR EE", "0"),
+            own("configAxis(): set motorStatusHasEncoder_=0, motorStatusGainSupport_=0."),
+            wr("PR VR", "1.000"),
+        ];
+        want.extend((1..=4).map(|n| wr(&format!("PR S{n}"), "0")));
+        want.extend([
+            w("VI=10"),
+            w("VM=50"),
+            w("A=20"),
+            w("D=20"),
+            w("ST=0"),
+            own(
+                "move(): VBASE=10.000000, VELO=50.000000, ACCL=20.000000, position=100.000000, relative=0",
+            ),
+            w("MA 100"),
+            w("VM=50"),
+            w("ST=0"),
+            own("moveVelocity(): VBASE=0.000000, VELO=-50.000000, ACCL=0.000000"),
+            w("SL -50"),
+            w("VI=10"),
+            w("VM=50"),
+            w("ST=0"),
+            own("home(): VBASE=10.000000, VELO=50.000000, ACCL=0.000000, forwards=1"),
+            w("HM 3"),
+            w("R1=0"),
+            own("setPosition(): position=7.500000"),
+            w("P=7"),
+            wr("PR P", "0"),
+            wr("PR MV", "0"),
+            w("R1=1"),
+            wr("PR R1", ""),
+            wr("PR ER", "86"),
+            own("poll(): POS=0.000000, MSTAT=514"),
+        ]);
+        assert_eq!(lines, want);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:427-432: the homed latch is dropped
+    /// before its `R1=1` is written, so a failed write is not retried.
+    #[test]
+    fn a_failed_homed_latch_write_is_not_retried() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dead = Arc::new(AtomicBool::new(true));
+        let fails = {
+            let dead = dead.clone();
+            move |l: &str| l == "R1=1" && dead.load(Ordering::Relaxed)
+        };
+        let (sent, _) = axis_error_lines("imsLatch", "imsLatchLine", fails, |axis| {
+            let user = AsynUser::new(0);
+            axis.home(&user, 0.0, 50.0, 0.0, true).unwrap();
+            assert!(axis.polled(&user).is_err());
+            dead.store(false, Ordering::Relaxed);
+            axis.polled(&user).unwrap();
+        });
+        assert_eq!(sent.iter().filter(|s| *s == "R1=1").count(), 1, "{sent:?}");
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:484-501: a good poll's IMS_LOCKEDROTOR,
+    /// COMMS_ERROR and PROBLEM, and a failed exchange's COMMS_ERROR, go out
+    /// on the axis with the poll's status, in the order C sets them.
+    #[test]
+    fn a_poll_hands_its_params_to_the_poller() {
+        let mut taken = Vec::new();
+        axis_error_lines(
+            "imsPollParams",
+            "imsPollParamsLine",
+            |l| l == "PR MV",
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.polled(&user).is_err());
+                taken.push(rendered(axis.take_port_sets()));
+                assert!(axis.take_port_sets().is_empty());
+            },
+        );
+        axis_error_lines(
+            "imsPollParamsOk",
+            "imsPollParamsOkLine",
+            |_| false,
+            |axis| {
+                axis.polled(&AsynUser::new(0)).unwrap();
+                taken.push(rendered(axis.take_port_sets()));
+            },
+        );
+        assert_eq!(
+            taken,
+            [
+                vec![format!("axis {} 1", index::STATUS_COMMS_ERROR)],
+                vec![
+                    format!("axis {} 0", index::STATUS_COMMS_ERROR),
+                    format!("axis {STATUS_PROBLEM} 0"),
+                ],
+            ]
+        );
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:407-427, 486-503: a poll that bails keeps
+    /// the params it set first, here RA_DONE from `PR MV`.
+    #[test]
+    fn a_failed_poll_keeps_what_it_set_before_the_bail() {
+        let mut failed = MotorStatus::default();
+        axis_error_lines(
+            "imsPartial",
+            "imsPartialLine",
+            |l| l == "PR R1",
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.poll(&user, &mut failed).is_err());
+            },
+        );
+        assert!(
+            failed.done && !failed.moving && !failed.problem,
+            "{failed:?}"
+        );
+        assert!(failed.vbas_supported);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:407-414, 471-477: a poll sets the position
+    /// from `PR P` and the encoder position last from `PR C2`.
+    #[test]
+    fn a_poll_sets_the_position_and_encoder_position() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("imsReadbacks", |last| {
+            match last.trim_end() {
+                "PR VR" => "1.000",
+                "PR P" => "3.5",
+                "PR C2" => "7",
+                _ => "0",
+            }
+            .into()
+        });
+        let mut axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsReadbacks"),
+            "imsReadbacks",
+        );
+        let mut status = axis.polled(&AsynUser::new(0)).unwrap();
+        assert_eq!(status.readbacks.take_sets(), [Some(3.5), Some(7.0), None]);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:407-419: `PR P` sets the encoder position
+    /// too, before a failed `PR MV` goes to `bail`.
+    #[test]
+    fn a_failed_pr_mv_keeps_the_positions_pr_p_set() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing(
+            "imsMvBail",
+            |last| {
+                match last.trim_end() {
+                    "PR VR" => "1.000",
+                    "PR P" => "3.5",
+                    _ => "0",
+                }
+                .into()
+            },
+            |l| l == "PR MV",
+        );
+        let mut axis =
+            ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsMvBail"), "imsMvBail");
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
+        assert_eq!(status.readbacks.take_sets(), [Some(3.5), Some(3.5), None]);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:83-88: a version reply shorter than two
+    /// bytes ends configAxis with PROBLEM and COMMS_ERROR set.
+    #[test]
+    fn a_short_version_reply_sets_problem_and_comms_error() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("imsShortVersion", |_| "1".into());
+        let mut axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsShortVersion"),
+            "imsShortVersion",
+        );
+        assert_eq!(axis.take_status_writes(), [StatusWrite::Problem(true)]);
+        assert_eq!(
+            rendered(axis.take_port_sets()),
+            [format!("axis {} 1", index::STATUS_COMMS_ERROR)]
+        );
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:396-503 sets only what it read before a
+    /// failed read's `bail`, over the params as they stood, the Done=0 a move
+    /// start set included (asynMotorController.cpp:301).
+    #[test]
+    fn a_failed_read_leaves_the_done_a_move_start_set() {
+        use motor_common::testing::LineRig;
+        use std::sync::Mutex;
+        let refused = Arc::new(Mutex::new(String::new()));
+        let pick = refused.clone();
+        let (_rig, io) = LineRig::failing(
+            "imsMoveStartDone",
+            |last| match last.trim_end() {
+                "PR VR" => "1.000".into(),
+                _ => "0".into(),
+            },
+            move |line| *pick.lock().unwrap() == line.trim_end(),
+        );
+        let mut axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsMoveStartDone"),
+            "imsMoveStartDone",
+        );
+        let user = AsynUser::new(0);
+        // The PROBLEM the poller raised over an earlier failure; a good
+        // poll clears it (:497).
+        let mut status = MotorStatus {
+            problem: true,
+            ..MotorStatus::default()
+        };
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && !status.problem, "{status:?}");
+        status.done = false;
+        *refused.lock().unwrap() = "PR P".into();
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert!(!status.done, "{status:?}");
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:126-130, 309-313: a base velocity above
+    /// the max prints its ERROR line in the function that checks it; home
+    /// checks it itself and never reaches setAxisMoveParameters.
+    #[test]
+    fn a_base_velocity_above_the_max_is_reported_where_checked() {
+        let base = |function: &str| {
+            format!(
+                "{DRIVER_NAME}:{function}: base velocity=60.000000 cannot be greater than max \
+                 velocity=50.000000"
+            )
+        };
+        let (sent, lines) = axis_error_lines(
+            "imsVbMove",
+            "imsVbMoveLine",
+            |_| false,
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.move_absolute(&user, 1.0, 60.0, 50.0, 0.0).is_err());
+            },
+        );
+        assert_eq!(sent, ["PR ER", "PR ER"]);
+        assert_eq!(
+            lines,
+            [
+                base("setAxisMoveParameters()"),
+                error_line(
+                    "setAxisMoveParameters()",
+                    "setting motor velocity and acceleration"
+                ),
+                error_line("move()", "moving motor"),
+            ]
+        );
+        let (sent, lines) = axis_error_lines(
+            "imsVbHome",
+            "imsVbHomeLine",
+            |_| false,
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.home(&user, 60.0, 50.0, 0.0, true).is_err());
+            },
+        );
+        assert_eq!(sent, ["PR ER"]);
+        assert_eq!(
+            lines,
+            [base("home()"), error_line("home()", "homing motor")]
+        );
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:314-322: a home with no base velocity
+    /// reads `PR VI` first, and a failed read bails before any move write.
+    #[test]
+    fn a_home_without_base_velocity_reads_pr_vi() {
+        let (sent, lines) = axis_error_lines(
+            "imsViHome",
+            "imsViHomeLine",
+            |_| false,
+            |axis| {
+                assert!(axis.home(&AsynUser::new(0), 0.0, 50.0, 0.0, true).is_ok());
+            },
+        );
+        assert_eq!(sent, ["PR VI", "VM=50", "ST=0", "HM 3", "R1=0"]);
+        assert!(lines.is_empty(), "{lines:?}");
+        let (sent, lines) = axis_error_lines(
+            "imsViDead",
+            "imsViDeadLine",
+            |l| l == "PR VI",
+            |axis| {
+                assert!(axis.home(&AsynUser::new(0), 0.0, 50.0, 0.0, false).is_err());
+            },
+        );
+        assert_eq!(sent, ["PR VI", "PR ER"]);
+        assert_eq!(lines, [error_line("home()", "homing motor")]);
+    }
+
+    /// The other axis bail sites: stop (:274-279), home (:344-349),
+    /// setPosition (:375-380), moveVelocity (:238-243).
+    #[test]
+    fn each_failed_axis_write_names_its_function() {
+        let (_, lines) = axis_error_lines(
+            "imsErrAll",
+            "imsErrAllLine",
+            |l| l == "SL 0" || l.starts_with("HM ") || l.starts_with("P=") || l == "SL 7",
+            |axis| {
+                let user = AsynUser::new(0);
+                assert!(axis.stop(&user, 0.0).is_err());
+                assert!(axis.home(&user, 0.0, 50.0, 0.0, true).is_err());
+                assert!(!axis.homing);
+                assert!(axis.set_position(&user, 3.0).is_err());
+                assert!(axis.move_velocity(&user, 0.0, 7.0, 0.0).is_err());
+            },
+        );
+        assert_eq!(
+            lines,
+            [
+                error_line("stop()", "stopping motor"),
+                error_line("home()", "homing motor"),
+                error_line("setPosition()", "setting motor position"),
+                error_line("moveVelocity()", "jogging motor"),
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_prepends_device_name() {
+        // Party mode: device name prepended with no separator.
+        assert_eq!(frame("M06", "MA 100"), b"M06MA 100");
+        assert_eq!(frame("", "PR P"), b"PR P");
+    }
+
+    #[test]
+    fn input_setup_scans_each_lf_terminated_line() {
+        // Non-digits are separators; the unterminated tail is not scanned.
+        let block = b"IS = 1, 1, 0\r\nIS = 2, 2, 1\r\nIS = 3, 0, 0\r\nIS = 4, 3";
+        assert_eq!(parse_input_setup(block), vec![(1, 1), (2, 2), (3, 0)]);
+        assert_eq!(parse_input_setup(b"junk\n"), vec![]);
+    }
+
+    /// ImsMDrivePlusMotorController.cpp:251-253 read only `inputno` and
+    /// `fn`, each glibc's `(int) strtol`.
+    #[test]
+    fn input_setup_maps_two_numbers_wrapped_as_c() {
+        assert_eq!(parse_input_setup(b"IS = 5, 1\n"), vec![(5, 1)]);
+        let wrapped = if std::os::raw::c_long::BITS == 64 {
+            2
+        } else {
+            i32::MAX
+        };
+        assert_eq!(parse_input_setup(b"3 4294967298 1\n"), vec![(3, wrapped)]);
+        assert_eq!(parse_input_setup(b"7\n"), vec![]);
+    }
+
+    #[test]
+    fn switch_type_scans_as_c_width_4() {
+        assert_eq!(scan_switch_type("3,0,0"), Some(3));
+        assert_eq!(scan_switch_type(" \t12345"), Some(1234));
+        assert_eq!(scan_switch_type("-12345"), Some(-123));
+        assert_eq!(scan_switch_type("+"), None);
+        assert_eq!(scan_switch_type(""), None);
     }
 }

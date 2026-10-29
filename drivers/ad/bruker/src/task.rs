@@ -3,30 +3,31 @@
 //!
 //! Neither of them touches a parameter or a socket itself: both reach the
 //! detector port through its actor. Each runs on a current-thread runtime of
-//! its own, so every port call here is an `await` on the asynchronous
-//! `PortHandle` API — the blocking API (`SyncIOHandle`, `submit_blocking`) uses
-//! `block_in_place`, which panics outside a multi-threaded runtime.
+//! its own; the status read blocks that thread on the BIS port as C's
+//! `pasynOctetSyncIO->read` does.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{ParamSetValue, RequestOp};
-use epics_rs::asyn::user::AsynUser;
+use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::driver::{SharedState, TaskCommand};
+use crate::driver::{BrukerDetector, SharedState, TaskCommand};
 use crate::params::BrukerParams;
 use crate::protocol;
 use crate::sfrm;
@@ -35,8 +36,7 @@ use crate::types::*;
 pub(crate) struct AcquisitionContext {
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    #[allow(dead_code)] // held so plugins can be back-pressured on the queue
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub params: BrukerParams,
     pub shared: Arc<SharedState>,
@@ -47,7 +47,7 @@ pub(crate) struct AcquisitionContext {
 
 pub(crate) struct StatusContext {
     /// The `drvAsynIPPort` BIS broadcasts its status on.
-    pub status: PortHandle,
+    pub status: SyncIOHandle,
     pub handle: PortHandle,
     pub ad_params: ADBaseParams,
     pub params: BrukerParams,
@@ -78,6 +78,8 @@ struct Exposure {
     shutter_mode: Option<ShutterMode>,
     sfrm_timeout: f64,
     file_name: String,
+    /// C's `startTime`: the frame's `timeStamp`.
+    start_time: EpicsTimestamp,
 }
 
 async fn acquisition_loop(mut ctx: AcquisitionContext) {
@@ -93,7 +95,7 @@ async fn acquisition_loop(mut ctx: AcquisitionContext) {
                 ParamSetValue::new(
                     ctx.ad_params.status_message,
                     0,
-                    ParamValue::Octet("Waiting for acquire command".into()),
+                    ParamValue::Octet("Waiting for acquire command".as_bytes().into()),
                 ),
             ],
         )
@@ -191,7 +193,17 @@ async fn expose(ctx: &AcquisitionContext) -> Result<Exposure, Abort> {
     ctx.handle
         .write_int32(ctx.params.start_scan, 0, 1)
         .await
-        .map_err(|e| Abort::Error(format!("cannot start the scan: {e}")))?;
+        .map_err(|e| Abort::Error(format!("BISDetector:BISTask: cannot start the scan: {e}")))?;
+
+    set_params(
+        ctx,
+        vec![ParamSetValue::new(
+            ctx.ad_params.status_message,
+            0,
+            ParamValue::Octet("Waiting for Acquisition".as_bytes().into()),
+        )],
+    )
+    .await;
 
     let exposure = Exposure {
         frame_type: FrameType::from_i32(read_i32(ctx, ctx.ad_params.frame_type).await)
@@ -200,17 +212,8 @@ async fn expose(ctx: &AcquisitionContext) -> Result<Exposure, Abort> {
         shutter_mode: ShutterMode::from_i32(read_i32(ctx, ctx.ad_params.shutter_mode).await),
         sfrm_timeout: read_f64(ctx, ctx.params.sfrm_timeout).await,
         file_name: read_string(ctx, ctx.ad_params.base.full_file_name).await,
+        start_time: EpicsTimestamp::now(),
     };
-
-    set_params(
-        ctx,
-        vec![ParamSetValue::new(
-            ctx.ad_params.status_message,
-            0,
-            ParamValue::Octet("Waiting for Acquisition".into()),
-        )],
-    )
-    .await;
 
     // BIS drives the shutter itself when it is wired to the detector; an EPICS
     // shutter is ours to open.
@@ -266,12 +269,9 @@ async fn expose(ctx: &AcquisitionContext) -> Result<Exposure, Abort> {
     // its runtime, and it has nothing else to do until BIS answers.
     match ctx.readout.recv_timeout(READOUT_TIMEOUT) {
         Ok(()) => Ok(exposure),
-        Err(RecvTimeoutError::Timeout) => Err(Abort::Error(
-            "timeout waiting for the readout to complete".into(),
+        Err(_) => Err(Abort::Error(
+            "BISDetector:BISTask: error waiting for readout to complete".into(),
         )),
-        Err(RecvTimeoutError::Disconnected) => {
-            Err(Abort::Error("the status task is not running".into()))
-        }
     }
 }
 
@@ -287,7 +287,11 @@ async fn publish_frame(
         vec![ParamSetValue::new(
             ctx.ad_params.status_message,
             0,
-            ParamValue::Octet(format!("Reading from File {}", exposure.file_name).into_bytes()),
+            ParamValue::Octet(
+                format!("Reading from File {}", exposure.file_name)
+                    .into_bytes()
+                    .into(),
+            ),
         )],
     )
     .await;
@@ -298,63 +302,47 @@ async fn publish_frame(
     let written_after = SystemTime::now() - CLOCK_SKEW_ALLOWANCE;
     wait_for_file(ctx, path, written_after, deadline).await?;
 
-    let bytes = std::fs::read(path)
-        .map_err(|e| Abort::Error(format!("cannot read {}: {e}", path.display())))?;
-    let image = sfrm::decode(&bytes)
-        .map_err(|e| Abort::Error(format!("cannot read {}: {e}", path.display())))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        Abort::Error(format!(
+            "BISDetector:readSFRM: error reading file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let image =
+        sfrm::decode(&bytes).map_err(|e| Abort::Error(format!("BISDetector:readSFRM: {e}")))?;
 
     // C sized the array from ADSizeX/ADSizeY — the geometry BIS reported on the
     // status socket — and then let readSFRM write NROWS*NCOLS pixels into it: a
     // frame file bigger than the reported geometry ran off the end of the
     // buffer. The array is the size of the frame that was actually read.
-    let ts = EpicsTimestamp::now();
-    let data_size = image.data.len() * 4;
-    let mut array = NDArray::with_data(
+    // C dereferences a refused alloc unchecked (BISDetector.cpp:588); here the frame
+    // is dropped after the pool's limit line. C allocates NDInt32 there, though
+    // DataType says UInt32, and readSFRM stores the unsigned pixels in it.
+    let Ok(mut array) = ctx.pool.alloc(
         vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
-        NDDataBuffer::U32(image.data),
+        NDDataType::Int32,
+    ) else {
+        return Ok(());
+    };
+    let mut frame = array.fill();
+    let pixels = frame
+        .data_mut()
+        .as_mut_slice::<i32>()
+        .expect("allocated as NDInt32");
+    for (p, v) in pixels.iter_mut().zip(image.data) {
+        *p = v as i32;
+    }
+    frame.set_unique_id(unique_id);
+    frame.set_time_stamp(exposure.start_time.as_f64());
+    frame.set_timestamp(
+        ctx.handle
+            .update_time_stamp()
+            .await
+            .unwrap_or_else(|_| SystemTime::now())
+            .into(),
     );
-    array.unique_id = unique_id;
-    array.update_time_stamps(ts);
 
-    set_params(
-        ctx,
-        vec![
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size_x,
-                0,
-                ParamValue::Int32(image.cols as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size_y,
-                0,
-                ParamValue::Int32(image.rows as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size,
-                0,
-                ParamValue::Int32(data_size as i32),
-            ),
-            ParamSetValue::new(ctx.ad_params.base.n_dimensions, 0, ParamValue::Int32(2)),
-            ParamSetValue::new(
-                ctx.ad_params.base.timestamp_rbv,
-                0,
-                ParamValue::Float64(ts.as_f64()),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.epics_ts_sec,
-                0,
-                ParamValue::Int32(ts.sec as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.epics_ts_nsec,
-                0,
-                ParamValue::Int32(ts.nsec as i32),
-            ),
-        ],
-    )
-    .await;
-
-    ctx.output.publish(Arc::new(array)).await;
+    ctx.output.publish(array).await;
     Ok(())
 }
 
@@ -380,15 +368,16 @@ async fn wait_for_file(
             return Err(Abort::Stopped);
         }
         if start.elapsed() > deadline {
-            return Err(Abort::Error(if stale {
-                format!(
-                    "{} is more than {} seconds old: the clocks may not agree",
-                    path.display(),
-                    CLOCK_SKEW_ALLOWANCE.as_secs()
-                )
-            } else {
-                format!("timeout waiting for {} to be written", path.display())
-            }));
+            let mut message = format!(
+                "BISDetector::readSFRM timeout waiting for file to be created {}",
+                path.display()
+            );
+            if stale {
+                message.push_str(
+                    "\n  file exists but is more than 10 seconds old, possible clock synchronization problem",
+                );
+            }
+            return Err(Abort::Error(message));
         }
         rt::sleep(FILE_READ_DELAY).await;
     }
@@ -413,14 +402,21 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
         Some(Abort::Stopped) => updates.push(ParamSetValue::new(
             ctx.ad_params.status_message,
             0,
-            ParamValue::Octet("Acquisition aborted".into()),
+            ParamValue::Octet("Acquisition aborted".as_bytes().into()),
         )),
         Some(Abort::Error(message)) => {
-            log::error!("bruker: {message}");
+            // C's line ends in a newline; ADStatusMessage below does not.
+            ctx.handle.trace().output_device(
+                ctx.handle.port_name(),
+                Some(0),
+                0,
+                TraceMask::ERROR,
+                &format!("{message}\n"),
+            );
             updates.push(ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,
-                ParamValue::Octet(message.clone().into_bytes()),
+                ParamValue::Octet(message.clone().into_bytes().into()),
             ));
         }
     }
@@ -436,69 +432,53 @@ async fn status_loop(ctx: StatusContext) {
             // something to say.
             Err(_) => continue,
         };
-        if message.is_empty() {
+        let Ok(mut held) = ctx.handle.hold_driver_blocking::<BrukerDetector>() else {
             continue;
-        }
-
-        let report = protocol::parse_status(&message);
-        let mut updates = vec![ParamSetValue::new(
-            ctx.params.status,
-            0,
-            ParamValue::Octet(message.into_bytes()),
-        )];
-        if let Some(temperature) = report.temperature {
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.temperature,
-                0,
-                ParamValue::Float64(temperature),
-            ));
-        }
-        if let Some(frame_size) = report.frame_size {
-            // The detector is square.
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.size_x,
-                0,
-                ParamValue::Int32(frame_size),
-            ));
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.size_y,
-                0,
-                ParamValue::Int32(frame_size),
-            ));
-        }
-        if let Some(open) = report.shutter_open {
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.shutter_status,
-                0,
-                ParamValue::Int32(open),
-            ));
-        }
-        let _ = ctx.handle.set_params_and_notify(0, updates).await;
-
-        let acquiring = ctx
-            .handle
-            .read_int32(ctx.ad_params.acquire, 0)
-            .await
-            .unwrap_or(0)
-            != 0;
-        if report.processing_done && acquiring {
+        };
+        let (ad, params) = (ctx.ad_params, ctx.params);
+        let read_out = held
+            .run(move |d| {
+                let report = protocol::parse_status(&message);
+                let base = &mut d.ad.port_base;
+                let _ = base.set_string_param(params.status, 0, message);
+                let acquiring = base.get_int32_param(ad.acquire, 0).unwrap_or(0) != 0;
+                if let Some(temperature) = report.temperature {
+                    let _ = base.set_float64_param(ad.temperature, 0, temperature);
+                }
+                if let Some(frame_size) = report.frame_size {
+                    // The detector is square.
+                    let _ = base.set_int32_param(ad.size_x, 0, frame_size);
+                    let _ = base.set_int32_param(ad.size_y, 0, frame_size);
+                }
+                if let Some(open) = report.shutter_open {
+                    let _ = base.set_int32_param(ad.shutter_status, 0, open);
+                }
+                let _ = base.call_param_callbacks(0);
+                report.processing_done && acquiring
+            })
+            .unwrap_or(false);
+        if read_out {
             // The acquisition task takes this when it is done exposing; if it
             // is not waiting yet, the slot holds it until it is.
             let _ = ctx.readout.try_send(());
         }
+        // C sleeps with the lock held, so its records process before the
+        // driver takes another request.
+        std::thread::sleep(STATUS_POST_DELAY);
+        drop(held);
     }
 }
 
 async fn read_status_message(ctx: &StatusContext) -> AsynResult<String> {
-    let user = AsynUser::new(0)
-        .with_addr(0)
-        .with_timeout(STATUS_READ_TIMEOUT);
-    let op = RequestOp::OctetRead {
-        buf_size: MAX_MESSAGE_SIZE,
-    };
-    let result = ctx.status.submit_async(op, user).await?;
-    let bytes = result.data.unwrap_or_default();
-    Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
+    // C `pasynOctetSyncIO->read` (BISDetector.cpp:404): this thread waits on
+    // the port as statusTask does.
+    let (bytes, status) = ctx
+        .status
+        .with_timeout(STATUS_READ_TIMEOUT)
+        .read_octet(0, MAX_MESSAGE_SIZE)
+        .into_parts();
+    status?;
+    Ok(crate::connection::reply_text(&bytes))
 }
 
 async fn read_i32(ctx: &AcquisitionContext, reason: usize) -> i32 {
@@ -511,13 +491,9 @@ async fn read_f64(ctx: &AcquisitionContext, reason: usize) -> f64 {
 
 async fn read_string(ctx: &AcquisitionContext, reason: usize) -> String {
     ctx.handle
-        .read_octet(reason, 0, MAX_FILENAME_LEN)
+        .get_string_param(reason, 0, MAX_FILENAME_LEN)
         .await
-        .map(|bytes| {
-            String::from_utf8_lossy(&bytes)
-                .trim_end_matches('\0')
-                .to_string()
-        })
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
 }
 

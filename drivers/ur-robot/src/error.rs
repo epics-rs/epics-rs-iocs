@@ -1,9 +1,12 @@
 //! Errors raised by the UR transports.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 /// Failure from any of the UR interfaces (RTDE, dashboard, script, gripper).
 #[derive(Debug, thiserror::Error)]
 pub enum UrError {
-    #[error("connect failed: {0}")]
+    /// The transport's own connect failure text (its C++ `what()`).
+    #[error("{0}")]
     Connect(String),
 
     #[error("{0} is not connected")]
@@ -11,6 +14,10 @@ pub enum UrError {
 
     #[error("i/o error: {0}")]
     Io(String),
+
+    /// The RTDE peer closed the socket (asio's `error::eof`).
+    #[error("End of file")]
+    PeerClosed,
 
     #[error("protocol error: {0}")]
     Protocol(String),
@@ -21,27 +28,44 @@ pub enum UrError {
     #[error("RTDE data package: {0}")]
     Decode(#[from] crate::state::DecodeError),
 
-    /// The robot answered a dashboard command with something other than the
-    /// success line the command requires.
-    #[error("dashboard command '{command}' failed: {reply}")]
-    Dashboard { command: String, reply: String },
+    /// A dashboard call failed; carries ur_rtde's `what()` — for most
+    /// commands the server's reply itself (dashboard_client.cpp:95-135).
+    #[error("{0}")]
+    Dashboard(String),
 
-    /// A requested RTDE output variable is not known to this controller.
-    #[error("controller does not provide RTDE variable(s): {0}")]
+    /// Requested RTDE output variables the controller does not know, comma
+    /// separated (rtde.cpp:414-434).
+    #[error(
+        "The following variables was not found by the controller: [{0}],\n see which variables \
+         are supported by your PolyScope version here: \n\
+         https://www.universal-robots.com/articles/ur/interface-communication/real-time-data-exchange-rtde-guide/"
+    )]
     VariablesNotFound(String),
 
-    /// Another fieldbus already owns an RTDE input register we need.
+    /// Another fieldbus already owns an RTDE input register we need
+    /// (rtde.cpp:397).
     #[error(
-        "an RTDE input register is already in use; disable the EtherNet/IP adapter, \
-         PROFINET or any MODBUS unit configured on the robot"
+        "One of the RTDE input registers are already in use! Currently you must disable the \
+         EtherNet/IP adapter, PROFINET or any MODBUS unit configured on the robot. This might \
+         change in the future."
     )]
     InputRegistersInUse,
+
+    /// `RTDEControlInterface` saw no start reply before
+    /// `RTDE_START_SYNCHRONIZATION_TIMEOUT`.
+    #[error("Failed to start RTDE data synchronization, before timeout")]
+    SyncStartTimeout,
 
     #[error("timed out after {0:?}: {1}")]
     Timeout(std::time::Duration, String),
 
-    #[error("value {value} is not within [{min}; {max}]")]
-    OutOfRange { value: f64, min: f64, max: f64 },
+    /// `verifyValueIsWithin`'s `range_error`; C++ streams min and max (`%g`).
+    #[error("The value is not within [{};{}]", CFloat(*min).g(), CFloat(*max).g())]
+    OutOfRange { min: f64, max: f64 },
+
+    /// `verifyValueIsWithin`'s `invalid_argument` for a NaN value.
+    #[error("The value is considered NaN")]
+    ValueIsNan,
 
     /// The control script refused a command (C++ returns a bare `false`,
     /// indistinguishable from a query answering "no"; here the refusal is
@@ -76,8 +100,11 @@ pub type UrResult<T> = Result<T, UrError>;
 /// `verifyValueIsWithin` (rtde_control_interface.cpp:22 and
 /// rtde_io_interface.cpp:167).
 pub fn verify_within(value: f64, min: f64, max: f64) -> UrResult<()> {
-    if value.is_nan() || !(value >= min && value <= max) {
-        return Err(UrError::OutOfRange { value, min, max });
+    if value.is_nan() {
+        return Err(UrError::ValueIsNan);
+    }
+    if !(value >= min && value <= max) {
+        return Err(UrError::OutOfRange { min, max });
     }
     Ok(())
 }
@@ -96,5 +123,13 @@ mod tests {
         assert!(verify_within(-0.1, 0.0, HIGH).is_err());
         assert!(verify_within(3.15, 0.0, HIGH).is_err());
         assert!(verify_within(f64::NAN, 0.0, HIGH).is_err());
+    }
+
+    /// `verifyValueIsWithin`'s two texts; min and max go through an ostream.
+    #[test]
+    fn range_check_speaks_ur_rtde() {
+        let text = |v, min, max| verify_within(v, min, max).unwrap_err().to_string();
+        assert_eq!(text(f64::NAN, 0.0, 1.0), "The value is considered NaN");
+        assert_eq!(text(2.0, 1e-5, 1.0), "The value is not within [1e-05;1]");
     }
 }

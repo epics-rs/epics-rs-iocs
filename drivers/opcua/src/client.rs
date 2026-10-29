@@ -9,20 +9,30 @@
 //! (`devOpcuaSup/UaSdk/`, `devOpcuaSup/open62541/`) are replaced by one pure-Rust
 //! client. The open62541 backend is the behavioural reference.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_opcua::client::custom_types::DataTypeTreeBuilder;
-use async_opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, Session};
+use async_opcua::client::services::{CreateSubscription, Read, Write};
+use async_opcua::client::{
+    Client, ClientBuilder, IdentityToken, Session, SessionPollResult, Subscription,
+    SubscriptionCallbacks, UARequest,
+};
+use async_opcua::core::ResponseMessage;
+use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
-    DataValue, MessageSecurityMode, MonitoredItemCreateRequest, NodeId, ReadValueId, StatusCode,
-    TimestampsToReturn, Variant, WriteValue, custom::DataTypeTree,
+    DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
+    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, TimestampsToReturn, UserTokenType,
+    Variant, WriteValue, custom::DataTypeTree,
 };
 use async_trait::async_trait;
+use epics_rs::base::runtime::log::errlog_vprintf;
+use futures_util::TryStreamExt;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-use crate::session::SessionConfig;
+use crate::session::{SessionConfig, status_name};
 use crate::subscription::SubscriptionConfig;
 
 /// Where the PKI file store lives when neither the client nor the session says.
@@ -54,11 +64,21 @@ pub struct Notification {
     pub value: DataValue,
 }
 
+/// The server's answer to `CreateSubscription`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreatedSubscription {
+    pub id: u32,
+    pub revised_publishing_interval: f64,
+}
+
 /// A live session with a server.
 #[async_trait]
 pub trait UaConnection: Send + Sync {
-    async fn read(&self, nodes: &[ReadValueId]) -> Result<Vec<DataValue>, StatusCode>;
-    async fn write(&self, values: &[WriteValue]) -> Result<Vec<StatusCode>, StatusCode>;
+    /// The result comes with the request's transaction id, which C's debug
+    /// lines print (`requestId`, `SessionOpen62541.cpp:686-701`).
+    async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>);
+    /// As [`Self::read`].
+    async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>);
     /// `RegisterNodes` — the server may return a faster handle for each node.
     async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode>;
     async fn server_info(&self) -> Result<ServerInfo, StatusCode>;
@@ -70,29 +90,94 @@ pub trait UaConnection: Send + Sync {
         &self,
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<u32, StatusCode>;
+    ) -> Result<CreatedSubscription, StatusCode>;
     /// Returns one status per requested item, in order.
     async fn create_monitored_items(
         &self,
         subscription_id: u32,
         items: Vec<MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode>;
+    ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode>;
     async fn disconnect(&self);
+    /// Resolves when the connection is gone from under the session — open62541's
+    /// `closeSecureChannel` in `UA_Client_run_iterate`.
+    async fn closed(&self) {
+        std::future::pending::<()>().await
+    }
+    /// The endpoint the session runs on, as [`SessionConfig::connect_endpoint`]
+    /// gave it.
+    fn endpoint(&self) -> Option<EndpointDescription> {
+        None
+    }
+}
+
+/// A failed security setup: its console text, and the `connectStatus` the C's
+/// attempt leaves (`SessionOpen62541.cpp:1049`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupError {
+    /// `None` when the setup failed before any service call, which leaves
+    /// the status as it was.
+    pub status: Option<StatusCode>,
+    pub message: String,
+}
+
+impl SetupError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            message: message.into(),
+        }
+    }
+
+    fn service(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status: Some(status),
+            message: message.into(),
+        }
+    }
+}
+
+/// A failed connection as open62541 1.2's client network layer reports it:
+/// any socket failure is BadDisconnect (`UA_ClientConnectionTCP_poll`), an
+/// address that does not resolve BadConnectionClosed (`initConnect`).
+fn network_status(status: StatusCode) -> StatusCode {
+    match status {
+        StatusCode::BadCommunicationError => StatusCode::BadDisconnect,
+        StatusCode::BadTcpEndpointUrlInvalid => StatusCode::BadConnectionClosed,
+        status => status,
+    }
+}
+
+impl fmt::Display for SetupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// Opens sessions. The driver holds one; a test holds a double.
 #[async_trait]
 pub trait UaConnector: Send + Sync {
-    async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String>;
+    /// `SessionOpen62541::connect` up to `UA_Client_connect`
+    /// (`SessionOpen62541.cpp:478-574`): a client with the security the
+    /// session asks for and the identity it presents.
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError>;
+}
+
+/// The open62541 client one `SessionOpen62541::connect` sets up.
+#[async_trait]
+pub trait UaClient: Send + Sync {
+    /// What [`SessionConfig::setup_identity`] gave the setup.
+    fn identity(&self) -> &Identity;
+    /// `UA_Client_connect`. Again after a lost connection, it is open62541's
+    /// reconnect on the same client (`connectIterate`, open62541.c:45447-45560):
+    /// no setup, and no GetEndpoints once the first connect picked the endpoint.
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode>;
 }
 
 /// The `async-opcua` client.
 ///
-/// Accepted-and-documented: the C's `sec-id`/`ident-file` option selects an
-/// identity from a credentials file and its `opcuaSaveRejected` command writes
-/// rejected server certificates to a directory. `async-opcua` owns its own PKI
-/// (`pki_dir`, with `rejected/` and `trusted/` beneath it) and takes the identity
-/// directly, so the identity is configured here as an [`Identity`] and the
+/// Accepted-and-documented: the C's `opcuaSaveRejected` command writes rejected
+/// server certificates to a directory. `async-opcua` owns its own PKI
+/// (`pki_dir`, with `rejected/` and `trusted/` beneath it), so the
 /// rejected-certificate directory is fixed by the PKI layout instead of being
 /// separately settable.
 pub struct AsyncOpcuaConnector {
@@ -154,10 +239,12 @@ impl Default for AsyncOpcuaConnector {
 
 #[async_trait]
 impl UaConnector for AsyncOpcuaConnector {
-    async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
         // The session's own options win over the client-wide ones; what neither
         // sets falls back to the `async-opcua` default PKI location.
         let client = self.security();
+        // `opcuaSetupPKI` names the PKI locations (`SessionOpen62541.cpp:516-531`).
+        let client_pki_root = client.pki_root.is_some();
         let pki_dir = config
             .pki_dir
             .clone()
@@ -165,6 +252,25 @@ impl UaConnector for AsyncOpcuaConnector {
             .unwrap_or_else(|| DEFAULT_PKI_DIR.to_string());
         let certificate = config.certificate_path.clone().or(client.certificate_path);
         let private_key = config.private_key_path.clone().or(client.private_key_path);
+        let name = &config.name;
+        let debug = config.debug > 0;
+
+        // `setupClientSecurityInfo` (`SessionOpen62541.cpp:1167-1226`).
+        if debug {
+            match (&certificate, &private_key) {
+                (Some(certificate), Some(private_key)) => {
+                    println!(
+                        "Session {name}: (initClientSecurity) loading client certificate {certificate}"
+                    );
+                    println!(
+                        "Session {name}: (initClientSecurity) loading client private key {private_key}"
+                    );
+                }
+                _ => println!(
+                    "Session {name}: (setupClientSecurityInfo) no client certificate configured"
+                ),
+            }
+        }
 
         let mut builder = ClientBuilder::new()
             .application_name(&self.application_name)
@@ -182,48 +288,197 @@ impl UaConnector for AsyncOpcuaConnector {
             builder = builder.private_key_path(key);
         }
 
-        let mut client = builder
-            .client()
-            .map_err(|errors| format!("client configuration is invalid: {}", errors.join(", ")))?;
+        let client = builder.client().map_err(|errors| {
+            SetupError::new(format!(
+                "security discovery and setup failed with status {}",
+                errors.join(", ")
+            ))
+        })?;
+        if debug && (config.pki_dir.is_some() || client_pki_root) {
+            println!("Session {name}: (connect) setting up PKI provider");
+        }
 
-        let endpoint = config.endpoint_description();
-        let identity = config.identity.token()?;
-        let (session, event_loop) = client
-            .connect_to_matching_endpoint(endpoint, identity)
-            .await
-            .map_err(|e| format!("connecting to {} failed: {e}", config.url))?;
-
-        let handle = event_loop.spawn();
-        session
-            .wait_for_connection()
-            .await
-            .then_some(())
-            .ok_or_else(|| format!("session to {} did not come up", config.url))?;
-
-        Ok(Arc::new(AsyncOpcuaConnection {
-            session,
-            _event_loop: handle,
+        // `setupSecurity` (`SessionOpen62541.cpp:1020-1160`).
+        let identity = config.setup_identity();
+        let token = identity.token().map_err(SetupError::new)?;
+        let secured = if config.security_mode == SecurityMode::None {
+            if debug {
+                println!("Session {name}: (setupSecurity) no security configured ");
+            }
+            None
+        } else {
+            if !config.url.starts_with("opc.tcp") {
+                errlog_vprintf(format_args!(
+                    "OPC UA session {}: fatal - only URLs of type 'opc.tcp' supported\n",
+                    config.name
+                ));
+                return Err(SetupError::new(
+                    "security discovery and setup failed with status fatal",
+                ));
+            }
+            let url = &config.url;
+            if debug {
+                println!("Session {name}: (setupSecurity) reading endpoints from {url}");
+            }
+            let endpoints = client
+                .get_server_endpoints_from_url(url.as_str())
+                .await
+                .map_err(|e| {
+                    let status = network_status(e.status());
+                    if debug {
+                        println!(
+                            "Session {name}: (setupSecurity) UaDiscovery::getEndpoints from {url} \
+                             failed with status {}",
+                            status_name(status)
+                        );
+                    }
+                    SetupError::service(
+                        status,
+                        "security discovery and setup failed with status cantConnect",
+                    )
+                })?;
+            let Some((number, endpoint)) = config.select_endpoint(&endpoints) else {
+                if debug {
+                    println!(
+                        "Session {name}: (setupSecurity) found no endpoint that matches the \
+                         security requirements"
+                    );
+                }
+                return Err(SetupError::service(
+                    StatusCode::Good,
+                    "security discovery and setup failed with status noMatchingEndpoint",
+                ));
+            };
+            if debug {
+                println!(
+                    "Session {name}: (setupSecurity) found matching endpoint number {number}, \
+                     using mode={:?} policy={} (level {})",
+                    endpoint.security_mode,
+                    security_policy_string(endpoint.security_policy_uri.as_ref()),
+                    endpoint.security_level
+                );
+            }
+            Some(endpoint)
+        };
+        Ok(Box::new(AsyncOpcuaClient {
+            client,
+            config: config.clone(),
+            identity,
+            token,
+            secured,
+            endpoint: None,
         }))
+    }
+}
+
+struct AsyncOpcuaClient {
+    client: Client,
+    config: SessionConfig,
+    identity: Identity,
+    token: IdentityToken,
+    /// The endpoint security discovery picked, `None` without security.
+    secured: Option<EndpointDescription>,
+    /// The endpoint the first connect settled on, as open62541 keeps it in
+    /// `config.endpoint`.
+    endpoint: Option<EndpointDescription>,
+}
+
+#[async_trait]
+impl UaClient for AsyncOpcuaClient {
+    fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode> {
+        let endpoint = match &self.endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => {
+                // `UA_Client_connect` reads the endpoints again and picks the one
+                // to connect to by itself, for `sec-mode=None` as for any other.
+                let endpoints = self
+                    .client
+                    .get_server_endpoints_from_url(self.config.url.as_str())
+                    .await
+                    .map_err(|e| network_status(e.status()))?;
+                let token = match self.token {
+                    IdentityToken::Anonymous => UserTokenType::Anonymous,
+                    IdentityToken::UserName(..) => UserTokenType::UserName,
+                    IdentityToken::X509(..) => UserTokenType::Certificate,
+                    IdentityToken::IssuedToken(..) => UserTokenType::IssuedToken,
+                };
+                let endpoint = self
+                    .config
+                    .connect_endpoint(&endpoints, self.secured.as_ref(), token)
+                    .map_err(network_status)?;
+                self.endpoint.insert(endpoint).clone()
+            }
+        };
+        let (session, event_loop) = self
+            .client
+            .connect_to_endpoint_directly(endpoint, self.token.clone())
+            .map_err(|e| network_status(e.status()))?;
+
+        // The event loop makes the one attempt `session_retry_limit(0)` allows
+        // and ends with its status; the session state stays `Connecting`, so
+        // its end is the only failure signal. It also ends on a lost
+        // connection, before it would reconnect: the session worker owns
+        // reconnecting.
+        let (ended_tx, ended) = watch::channel(());
+        let mut handle = tokio::spawn(async move {
+            let _ended = ended_tx;
+            let events = event_loop.enter();
+            tokio::pin!(events);
+            loop {
+                match events.try_next().await {
+                    Ok(Some(SessionPollResult::ConnectionLost(status))) | Err(status) => {
+                        return status;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => return StatusCode::Good,
+                }
+            }
+        });
+        let failed_with = tokio::select! {
+            true = session.wait_for_connection() => None,
+            ended = &mut handle => Some(ended.unwrap_or(StatusCode::BadInternalError)),
+        };
+        if let Some(status) = failed_with {
+            return Err(network_status(status));
+        }
+
+        Ok(Arc::new(AsyncOpcuaConnection { session, ended }))
     }
 }
 
 struct AsyncOpcuaConnection {
     session: Arc<Session>,
-    /// Dropping this aborts the session's event loop, which is what closes the
-    /// connection when the driver drops the session.
-    _event_loop: tokio::task::JoinHandle<StatusCode>,
+    /// Never sent on; it closes when the session's event loop ends.
+    ended: watch::Receiver<()>,
 }
 
 #[async_trait]
 impl UaConnection for AsyncOpcuaConnection {
-    async fn read(&self, nodes: &[ReadValueId]) -> Result<Vec<DataValue>, StatusCode> {
-        self.session
-            .read(nodes, TimestampsToReturn::Both, 0.0)
-            .await
+    async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
+        let read = Read::new(&self.session)
+            .nodes_to_read(nodes.to_vec())
+            .timestamps_to_return(TimestampsToReturn::Both)
+            .max_age(0.0);
+        let id = read.header().request_handle;
+        let result = read.send(self.session.channel()).await;
+        (
+            id,
+            result.map(|response| response.results.unwrap_or_default()),
+        )
     }
 
-    async fn write(&self, values: &[WriteValue]) -> Result<Vec<StatusCode>, StatusCode> {
-        self.session.write(values).await
+    async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>) {
+        let write = Write::new(&self.session).nodes_to_write(values.to_vec());
+        let id = write.header().request_handle;
+        let result = write.send(self.session.channel()).await;
+        (
+            id,
+            result.map(|response| response.results.unwrap_or_default()),
+        )
     }
 
     async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode> {
@@ -275,45 +530,109 @@ impl UaConnection for AsyncOpcuaConnection {
         &self,
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<u32, StatusCode> {
-        self.session
-            .create_subscription(
-                Duration::from_secs_f64(config.publishing_interval / 1000.0),
-                config.lifetime_count,
-                config.max_keep_alive_count,
-                config.max_notifications_per_publish,
-                config.priority,
-                true,
-                DataChangeCallback::new(move |value, item| {
+    ) -> Result<CreatedSubscription, StatusCode> {
+        // `Session::create_subscription` sends the interval in whole
+        // milliseconds; this is its body with the C's request.
+        let header = CreateSubscription::new(&self.session).header().clone();
+        let timeout = Duration::from_millis(header.timeout_hint.into());
+        let response = match self
+            .session
+            .channel()
+            .send(config.request(header), timeout)
+            .await?
+        {
+            ResponseMessage::CreateSubscription(response) => response,
+            ResponseMessage::ServiceFault(fault) => {
+                return Err(fault.response_header.service_result);
+            }
+            _ => return Err(StatusCode::BadUnknownResponse),
+        };
+        if response.response_header.service_result.is_bad() {
+            return Err(response.response_header.service_result);
+        }
+
+        let name = config.name.clone();
+        let subscription = Subscription::new(
+            response.subscription_id,
+            Duration::from_millis(response.revised_publishing_interval.max(0.0).floor() as u64),
+            response.revised_lifetime_count,
+            response.revised_max_keep_alive_count,
+            SubscriptionConfig::MAX_NOTIFICATIONS_PER_PUBLISH,
+            config.priority,
+            true,
+            Box::new(SubscriptionCallbacks::new(
+                // `SubscriptionOpen62541::subscriptionStatusChanged`.
+                move |change| {
+                    errlog_vprintf(format_args!(
+                        "Subscription {name} status changed to {}\n",
+                        status_name(change.status)
+                    ))
+                },
+                move |value, item| {
                     // The channel is closed only when the driver is shutting the
                     // session down, so a failed send is not worth logging.
                     let _ = sink.send(Notification {
                         client_handle: item.client_handle(),
                         value,
                     });
-                }),
-            )
-            .await
+                },
+                |_, _| {},
+            )),
+        );
+        self.session
+            .subscription_state()
+            .lock()
+            .add_subscription(subscription);
+        self.session.trigger_publish_now();
+        Ok(CreatedSubscription {
+            id: response.subscription_id,
+            revised_publishing_interval: response.revised_publishing_interval,
+        })
     }
 
     async fn create_monitored_items(
         &self,
         subscription_id: u32,
         items: Vec<MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode> {
+    ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode> {
         let created = self
             .session
             .create_monitored_items(subscription_id, TimestampsToReturn::Both, items)
             .await?;
-        Ok(created.iter().map(|item| item.result.status_code).collect())
+        Ok(created.into_iter().map(|item| item.result).collect())
     }
 
     async fn disconnect(&self) {
         let _ = self.session.disconnect().await;
     }
+
+    async fn closed(&self) {
+        let mut ended = self.ended.clone();
+        while ended.changed().await.is_ok() {}
+    }
+
+    fn endpoint(&self) -> Option<EndpointDescription> {
+        Some(self.session.endpoint_info().endpoint.clone())
+    }
 }
 
-/// How the client authenticates (`sec-id`, `SessionOpen62541.cpp:159-260`).
+/// C `Session::securityPolicyString`.
+pub fn security_policy_string(uri: &str) -> String {
+    if uri.is_empty() {
+        return "None".to_string();
+    }
+    let Some((_, name)) = uri.rsplit_once('#') else {
+        return "Invalid".to_string();
+    };
+    if SecurityPolicy::from_uri(uri) == SecurityPolicy::Unknown {
+        format!("{name} (unsupported)")
+    } else {
+        name.to_string()
+    }
+}
+
+/// How the client authenticates: what
+/// [`SessionConfig::setup_identity`] read from the `sec-id` credentials file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Identity {
     #[default]
@@ -330,15 +649,6 @@ pub enum Identity {
 }
 
 impl Identity {
-    /// What `opcuaShowSecurity` prints. A password is never shown.
-    pub fn describe(&self) -> String {
-        match self {
-            Identity::Anonymous => "anonymous".to_string(),
-            Identity::UserName { user, .. } => format!("username '{user}'"),
-            Identity::Certificate { certificate, .. } => format!("certificate '{certificate}'"),
-        }
-    }
-
     fn token(&self) -> Result<IdentityToken, String> {
         Ok(match self {
             Identity::Anonymous => IdentityToken::Anonymous,
@@ -349,7 +659,7 @@ impl Identity {
                 certificate,
                 private_key,
             } => IdentityToken::new_x509_path(certificate, private_key)
-                .map_err(|e| format!("reading the identity certificate failed: {e}"))?,
+                .map_err(|e| format!("loading client certificate {certificate} failed: {e}"))?,
         })
     }
 }
@@ -367,11 +677,11 @@ pub enum SecurityMode {
 
 impl SecurityMode {
     pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
+        match s {
             "best" => Some(SecurityMode::Best),
-            "none" => Some(SecurityMode::None),
-            "sign" => Some(SecurityMode::Sign),
-            "signandencrypt" => Some(SecurityMode::SignAndEncrypt),
+            "None" => Some(SecurityMode::None),
+            "Sign" => Some(SecurityMode::Sign),
+            "SignAndEncrypt" => Some(SecurityMode::SignAndEncrypt),
             _ => None,
         }
     }

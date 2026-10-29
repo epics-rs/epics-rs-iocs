@@ -48,9 +48,13 @@ dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=I
 
 # Remaining plugin chain
 < $(NDDRIVERSTDARRAYS)/ndDriverStdArraysPlugins.cmd
+set_requestfile_path("$(NDDRIVERSTDARRAYS)/db")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
+
 # Example interactive commands:
 #   dbl                                        # List all PVs
 #   dbpf 13NDSA1:cam1:Acquire 1                # Enable array injection

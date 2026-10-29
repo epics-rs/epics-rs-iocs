@@ -8,7 +8,7 @@
 //! (`motorSimAxis` constructor), so this port is the single-axis reduction:
 //! the multi-axis `long_path`/`Tsync` machinery collapses (there is one axis,
 //! it is always the long path, and no resync occurs). The four-phase path math
-//! ([`find_path`], [`find_which_v2_sqrt`], [`route_demand`]) is transcribed
+//! (`find_path`, `find_which_v2_sqrt`, `route_demand`) is transcribed
 //! verbatim, including a latent C quirk noted at its site.
 //!
 //! Path phases (C `routeFindPath`): (1) accelerate at ±`Amax` for `t1`,

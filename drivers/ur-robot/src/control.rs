@@ -7,7 +7,7 @@
 //! (1 = ready for a command, 2 = done with the command).
 //!
 //! All 23 input recipes are registered, because the controller numbers recipes
-//! by registration order and the ones we send on (named in [`recipe`]) sit in
+//! by registration order and the ones we send on (named in `recipe`) sit in
 //! the middle of that sequence. Beyond the commands urRobot's `RTDEControl`
 //! driver issues, the surface carries the streaming commands (servoJ, speedJ,
 //! forceMode, the watchdog kick) and their support calls for planned-move
@@ -20,7 +20,7 @@ use crate::error::{RefusalReason, UrError, UrResult, verify_within};
 use crate::rtde::{CommandType, ControllerVersion, Payload, RobotCommand, default_frequency};
 use crate::script::{self, Injection, SCRIPT_PORT, ScriptClient};
 use crate::session::{DEFAULT_TIMEOUT, Session, SessionWriter};
-use crate::stream::{Snapshot, StateStream};
+use crate::stream::{Iface, Snapshot, StateStream};
 
 /// `UR_CONTROLLER_RDY_FOR_CMD` (rtde_control_interface.h:19).
 const CONTROLLER_RDY_FOR_CMD: i32 = 1;
@@ -40,6 +40,9 @@ const HANDSHAKE_POLL: Duration = Duration::from_millis(1);
 /// (`waitForProgramRunning`, 5 s).
 const PROGRAM_RUNNING_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_STATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// `RTDE_START_SYNCHRONIZATION_TIMEOUT` (5) under C++'s `duration > 5` on
+/// whole seconds, which gives up in the sixth second.
+const START_SYNCHRONIZATION_WAIT: Duration = Duration::from_secs(6);
 
 /// UR joint/tool limits the C++ range-checks commands against
 /// (rtde_control_interface.h:28).
@@ -136,6 +139,72 @@ impl AsyncOperationStatus {
     }
 }
 
+/// The output half of `setupRecipes()` (rtde_control_interface.cpp:580-643):
+/// the register offset in force afterwards and the variable names.
+fn output_recipe(
+    version: ControllerVersion,
+    use_upper_range_registers: bool,
+    register_offset: i32,
+) -> UrResult<(i32, Vec<String>)> {
+    let mut names: Vec<String> = [
+        "timestamp",
+        "robot_status_bits",
+        "safety_status_bits",
+        "runtime_state",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    fn registers(offset: i32, doubles: impl Iterator<Item = i32>) -> impl Iterator<Item = String> {
+        let ints = (0..=2).map(move |i| format!("output_int_register_{}", offset + i));
+        ints.chain(doubles.map(move |i| format!("output_double_register_{}", offset + i)))
+    }
+
+    // PolyScope X 10.9+ / 5.23+ add the direct-torque registers and use the
+    // lower range whatever was asked (:588-605).
+    if (version.major == 10 && version.minor >= 9) || (version.major == 5 && version.minor >= 23) {
+        names.extend(registers(0, (0..24).chain(36..48)));
+        return Ok((0, names));
+    }
+    let registers_supported = match version.major {
+        3 => {
+            if use_upper_range_registers {
+                version.minor >= 9
+            } else {
+                version.minor >= 4
+            }
+        }
+        // Same gate defect as in the receive interface: upstream writes the
+        // lower-range case as `major >= 3 && minor >= 4`, which is false on
+        // PolyScope 5.0-5.3 (rtde_control_interface.cpp:626). Without these
+        // registers the command handshake has nothing to read, so the
+        // interface would appear to hang.
+        m if m >= 5 => {
+            if use_upper_range_registers {
+                version.minor >= 3
+            } else {
+                true
+            }
+        }
+        _ => false,
+    };
+    if !registers_supported {
+        return Err(UrError::Protocol(format!(
+            "PolyScope {}.{} does not provide the {} range of RTDE output registers, \
+             which the control interface needs",
+            version.major,
+            version.minor,
+            if use_upper_range_registers {
+                "upper"
+            } else {
+                "lower"
+            }
+        )));
+    }
+    names.extend(registers(register_offset, 0..=5));
+    Ok((register_offset, names))
+}
+
 /// RTDE control interface.
 pub struct ControlInterface {
     hostname: String,
@@ -176,9 +245,16 @@ impl ControlInterface {
 
         self.setup_recipes(&mut session)?;
         session.send_start()?;
+        // C++ polls isStarted() for RTDE_START_SYNCHRONIZATION_TIMEOUT whole
+        // seconds; nothing reads the socket meanwhile, so the start reply is
+        // the package send_start consumed or nothing.
+        if !session.is_started() {
+            std::thread::sleep(START_SYNCHRONIZATION_WAIT);
+            return Err(UrError::SyncStartTimeout);
+        }
 
         let writer = session.writer()?;
-        let stream = StateStream::spawn(session);
+        let stream = StateStream::spawn(session, Iface::Control);
         stream.wait_first_state(FIRST_STATE_TIMEOUT)?;
         self.stream = Some(stream);
         self.writer = Some(writer);
@@ -238,58 +314,14 @@ impl ControlInterface {
 
     /// `setupRecipes()`: the output recipe plus 23 input recipes.
     fn setup_recipes(&mut self, session: &mut Session) -> UrResult<()> {
-        let mut state_names: Vec<String> = [
-            "timestamp",
-            "robot_status_bits",
-            "safety_status_bits",
-            "runtime_state",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-        let registers_supported = match self.version.major {
-            3 => {
-                if self.use_upper_range_registers {
-                    self.version.minor >= 9
-                } else {
-                    self.version.minor >= 4
-                }
-            }
-            // Same gate defect as in the receive interface: upstream writes the
-            // lower-range case as `major >= 3 && minor >= 4`, which is false on
-            // PolyScope 5.0-5.3 (rtde_control_interface.cpp:626). Without these
-            // registers the command handshake has nothing to read, so the
-            // interface would appear to hang.
-            m if m >= 5 => {
-                if self.use_upper_range_registers {
-                    self.version.minor >= 3
-                } else {
-                    true
-                }
-            }
-            _ => false,
-        };
-        if !registers_supported {
-            return Err(UrError::Protocol(format!(
-                "PolyScope {}.{} does not provide the {} range of RTDE output registers, \
-                 which the control interface needs",
-                self.version.major,
-                self.version.minor,
-                if self.use_upper_range_registers {
-                    "upper"
-                } else {
-                    "lower"
-                }
-            )));
-        }
-        for i in 0..=2 {
-            state_names.push(self.out_int_reg(i));
-        }
-        for i in 0..=5 {
-            state_names.push(self.out_double_reg(i));
-        }
-
+        // setupRecipes asks for the version again rather than using versions_.
+        let version = session.controller_version()?;
+        let (offset, state_names) = output_recipe(
+            version,
+            self.use_upper_range_registers,
+            self.register_offset,
+        )?;
+        self.register_offset = offset;
         session.send_output_setup(&state_names, default_frequency(self.version))?;
 
         // The 23 input recipes, in registration order. Recipes we never send on
@@ -386,15 +418,8 @@ impl ControlInterface {
 
         debug_assert_eq!(recipes.len(), recipe::COUNT as usize);
 
-        for (i, names) in recipes.iter().enumerate() {
-            let assigned = session.send_input_setup(names)?;
-            let expected = (i + 1) as u8;
-            if assigned != expected {
-                return Err(UrError::Protocol(format!(
-                    "controller assigned recipe id {assigned} to input recipe {expected}; \
-                     the control interface addresses recipes positionally"
-                )));
-            }
+        for names in &recipes {
+            session.send_input_setup(names)?;
         }
         Ok(())
     }
@@ -517,7 +542,9 @@ impl ControlInterface {
             // A script error (e.g. an unsolvable inverse kinematics) kills the
             // script, and then DONE never arrives.
             if !self.is_program_running()? {
-                log::error!("ur-robot: the RTDE control script stopped mid-command");
+                epics_rs::base::stderr_println!(
+                    "RTDEControlInterface: RTDE control script is not running!"
+                );
                 return self.refused(RefusalReason::NotRunning);
             }
             if self.is_stopped_by_safety()? {
@@ -539,7 +566,9 @@ impl ControlInterface {
             return self.refused(RefusalReason::NotRunning);
         }
         if !self.is_program_running()? {
-            log::error!("ur-robot: the RTDE control script is not running");
+            epics_rs::base::stderr_println!(
+                "RTDEControlInterface: RTDE control script is not running!"
+            );
             return self.refused(RefusalReason::NotRunning);
         }
         if let Some(reason) = self.wait_for_state(CONTROLLER_RDY_FOR_CMD, GET_READY_TIMEOUT)? {
@@ -626,7 +655,6 @@ impl ControlInterface {
     /// `reuploadScript()` — kill whatever is running, then send the script again.
     pub fn reupload_script(&mut self) -> UrResult<()> {
         if self.is_program_running()? {
-            log::info!("ur-robot: a script was running on the controller, stopping it");
             self.stop_script()?;
             self.dashboard.stop()?;
             std::thread::sleep(Duration::from_millis(100));
@@ -988,6 +1016,37 @@ impl ControlInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn version(major: u32, minor: u32) -> ControllerVersion {
+        ControllerVersion {
+            major,
+            minor,
+            bugfix: 0,
+            build: 0,
+        }
+    }
+
+    /// 5.23+ and X 10.9+ take the direct-torque register set in the lower
+    /// range even when the upper range was asked for.
+    #[test]
+    fn polyscope_5_23_subscribes_the_direct_torque_registers() {
+        for v in [version(5, 23), version(5, 26), version(10, 9)] {
+            let (offset, names) = output_recipe(v, true, 24).expect("supported");
+            assert_eq!(offset, 0);
+            assert_eq!(names.len(), 4 + 3 + 24 + 12);
+            assert_eq!(names[4], "output_int_register_0");
+            assert_eq!(names[7], "output_double_register_0");
+            assert_eq!(names[30], "output_double_register_23");
+            assert_eq!(names[31], "output_double_register_36");
+            assert_eq!(names.last().unwrap(), "output_double_register_47");
+        }
+        let (offset, names) = output_recipe(version(5, 22), false, 0).expect("supported");
+        assert_eq!(offset, 0);
+        assert_eq!(names.len(), 4 + 3 + 6);
+        let (offset, names) = output_recipe(version(5, 22), true, 24).expect("supported");
+        assert_eq!(offset, 24);
+        assert_eq!(names[4], "output_int_register_24");
+    }
 
     #[test]
     fn async_status_word_decodes_into_its_fields() {

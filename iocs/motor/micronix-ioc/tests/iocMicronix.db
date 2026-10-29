@@ -1,0 +1,167 @@
+# c-expansion of st.cmd over the C sources, the records of iocMicronix.dbl:
+# dbl of motor R7-4-5 motorMicronix iocBoot/iocMicronix st.cmd
+record(bi, "micronix:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "micronix:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "micronix:alldone")
+    field(INPB, "micronix:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "micronix:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(motor, "micronix:m1") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, "2")
+    field(BDST, "0")
+    field(BVEL, "1.0")
+    field(DESC, "m1")
+    field(DHLM, "0")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "2.44140625e-6")
+    field(OUT, "@asyn(mmc200_1,0)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "micronix:m1_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".05")
+    field(VELO, "3.")
+}
+record(longout, "micronix:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "micronix:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(mmc200_1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "micronix:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "micronix:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(mmc200_1,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "micronix:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "micronix:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(mmc200_1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "micronix:m1_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "micronix:m1.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "micronix:m1_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "micronix:m1.TWV")
+    field(INPC, "micronix:m1.MRES")
+    field(INPD, "micronix:m1.HLM")
+    field(INPE, "micronix:m1.LLM")
+    field(OUT, "micronix:m1.TWV")
+}
+record(calcout, "micronix:m1_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "micronix:m1.S")
+    field(INPC, "micronix:m1.SBAS")
+    field(INPD, "micronix:m1.SMAX")
+    field(OUT, "micronix:m1.S")
+}
+record(motor, "micronix:m2") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, "2")
+    field(BDST, "0")
+    field(BVEL, "1.0")
+    field(DESC, "m2")
+    field(DHLM, "0")
+    field(DIR, "Pos")
+    field(DLLM, "0")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "2.44140625e-6")
+    field(OUT, "@asyn(mmc200_1,1)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "micronix:m2_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".05")
+    field(VELO, "3.")
+}
+record(longout, "micronix:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "micronix:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(mmc200_1,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "micronix:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "micronix:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(mmc200_1,1)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "micronix:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "micronix:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(mmc200_1,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "micronix:m2_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "micronix:m2.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "micronix:m2_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "micronix:m2.TWV")
+    field(INPC, "micronix:m2.MRES")
+    field(INPD, "micronix:m2.HLM")
+    field(INPE, "micronix:m2.LLM")
+    field(OUT, "micronix:m2.TWV")
+}
+record(calcout, "micronix:m2_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "micronix:m2.S")
+    field(INPC, "micronix:m2.SBAS")
+    field(INPD, "micronix:m2.SMAX")
+    field(OUT, "micronix:m2.S")
+}
+record(longout, "micronix:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "micronix:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

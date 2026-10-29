@@ -12,7 +12,7 @@ use d435i::{D435iColorRuntime, D435iDepthRuntime, create_d435i_detector};
 /// a D435i detector. All records use standard asyn DTYPs handled by
 /// the universal asyn device support factory.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADD435I", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADD435I", env!("CARGO_MANIFEST_DIR"));
 
     let color_runtime: Arc<std::sync::Mutex<Option<D435iColorRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -33,13 +33,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 ArgDesc { name: "maxMemory", arg_type: ArgType::Int },
             ],
             "d435iConfig portName [serial] [maxSizeX] [maxSizeY] [maxMemory]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let serial = match args.get(1) {
-                    Some(ArgValue::String(s)) => s.clone(),
+                    Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                     _ => String::new(),
                 };
                 let size_x = match args.get(2) { Some(ArgValue::Int(n)) => *n as i32, _ => 1920 };
@@ -51,14 +51,23 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
                 println!("d435iConfig: port={port_name}, serial={serial}, size={size_x}x{size_y}, maxMemory={max_memory}");
 
-                let (color_rt, depth_rt) = create_d435i_detector(&port_name, &serial, size_x, size_y, max_memory)
+                let color_claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let depth_claim = match epics_rs::asyn::manager::claim_port_driver(&depth_port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+
+                let (color_rt, depth_rt) = create_d435i_detector(&color_claim, &depth_claim, &serial, size_x, size_y, max_memory)
                     .map_err(|e| format!("failed to create D435i detector: {e}"))?;
 
                 let c_port_handle = color_rt.port_handle().clone();
                 let d_port_handle = depth_rt.port_handle().clone();
 
-                epics_rs::asyn::asyn_record::register_port(&port_name, c_port_handle).map_err(|e| e.to_string())?;
-                epics_rs::asyn::asyn_record::register_port(&depth_port_name, d_port_handle).map_err(|e| e.to_string())?;
+                color_claim.publish(c_port_handle, ctx.db().scan_control().interrupt_gate()).map_err(|e| e.to_string())?;
+                depth_claim.publish(d_port_handle, ctx.db().scan_control().interrupt_gate()).map_err(|e| e.to_string())?;
 
                 // Register color port as the primary driver context (pool + fan-out).
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

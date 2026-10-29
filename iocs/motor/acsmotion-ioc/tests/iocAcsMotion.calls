@@ -1,0 +1,4 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+AcsMotionConfig("ACS1", "ACS1_ETH", 8, 0.1, 1.0, "")
+SPiiPlusCreateProfile("ACS1", 2000, 2000)
+AcsMotionAuxIOConfig("ACS1_IO", "ACS1_IO_ETH", 32, 0.1)

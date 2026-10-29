@@ -9,8 +9,8 @@
 #============================================================
 
 epicsEnvSet("P",      "oms:")
-epicsEnvSet("CTRL",   "mxaPort")
-epicsEnvSet("IPPORT", "mxaAsyn")
+epicsEnvSet("PORT",   "MXA1")
+epicsEnvSet("IPPORT", "MXA")
 epicsEnvSet("HOST",   "192.168.1.31:5001")
 
 # ---- asyn octet port ----
@@ -23,11 +23,19 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 asynOctetSetInputEos("$(IPPORT)", 0, "\n\r")
 
 # ---- MXA controller ----
-# omsMXAConfig(controllerName, asynPort, [initString], [movingPollMs],
-#              [idlePollMs], [timeoutMs]).
-omsMXAConfig("$(CTRL)", "$(IPPORT)", "", 100, 1000, 2000)
+# omsMXAConfig(portName, numAxes, serialPortName, movingPollPeriod,
+#              idlePollPeriod, initString).
+omsMXAConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "AX LH PSO; AY LH PSO; AZ LH PSO; AT LH PSO; AU LH PSO; AV LH PSO; AR LH PSO; AS LH PSO;")
 
-omsCreateAxis("$(CTRL)", 0)
-dbLoadRecords("$(OMS_ASYN_IOC)/db/oms.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
+# Each axis's asyn_motor_model2.db, as C's MXA.cmd loads them. C passes
+# P=$(PREFIX), which its st.cmd never sets, so iocsh drops the load and C
+# boots with no motor records; P here is this IOC's prefix.
+dbLoadTemplate("$(OMS_ASYN_IOC)/db/MXA.substitutions", "P=$(P),PORT=$(PORT)")
+
+# motorUtil's records, as C's st.cmd loads them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")

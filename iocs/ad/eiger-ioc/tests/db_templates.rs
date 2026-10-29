@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use epics_rs::base::server::db_loader::{DbLoadConfig, DbRecordDef, parse_db_file};
+use epics_rs::base::types::RecordName;
 
 fn db_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("db")
@@ -44,9 +45,9 @@ fn load(template: &str) -> Vec<DbRecordDef> {
 /// so an override that changed the type would take the IOC down at boot.
 fn assert_redeclarations_keep_their_type(template: &str) {
     let defs = load(template);
-    let mut types: HashMap<&str, &str> = HashMap::new();
+    let mut types: HashMap<&RecordName, &str> = HashMap::new();
     for def in &defs {
-        match types.get(def.name.as_str()) {
+        match types.get(&def.name) {
             Some(first) => assert_eq!(
                 *first, def.record_type,
                 "{template}: {} is re-declared as {} but was first declared as {first}",
@@ -63,36 +64,38 @@ fn assert_redeclarations_keep_their_type(template: &str) {
 #[test]
 fn eiger_base_loads() {
     let defs = load("eigerBase.template");
-    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     // One record from the Eiger set, one from the included ADBase.template.
-    assert!(names.contains(&"13EIG2:cam1:ThresholdEnergy"));
-    assert!(names.contains(&"13EIG2:cam1:Acquire"));
+    assert!(defs.iter().any(|d| d.name == "13EIG2:cam1:ThresholdEnergy"));
+    assert!(defs.iter().any(|d| d.name == "13EIG2:cam1:Acquire"));
     assert_redeclarations_keep_their_type("eigerBase.template");
 }
 
 #[test]
 fn eiger1_loads() {
     let defs = load("eiger1.template");
-    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    assert!(names.contains(&"13EIG2:cam1:Link0_RBV"));
-    assert!(names.contains(&"13EIG2:cam1:FWClear"));
+    assert!(defs.iter().any(|d| d.name == "13EIG2:cam1:Link0_RBV"));
+    assert!(defs.iter().any(|d| d.name == "13EIG2:cam1:FWClear"));
     assert_redeclarations_keep_their_type("eiger1.template");
 }
 
 #[test]
 fn eiger2_loads() {
     let defs = load("eiger2.template");
-    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    assert!(names.contains(&"13EIG2:cam1:Threshold2Energy"));
-    assert!(names.contains(&"13EIG2:cam1:ExtGateMode"));
+    assert!(
+        defs.iter()
+            .any(|d| d.name == "13EIG2:cam1:Threshold2Energy")
+    );
+    assert!(defs.iter().any(|d| d.name == "13EIG2:cam1:ExtGateMode"));
     assert_redeclarations_keep_their_type("eiger2.template");
 }
 
 #[test]
 fn pilatus4_loads() {
     let defs = load("pilatus4.template");
-    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    assert!(names.contains(&"13EIG2:cam1:Threshold4Energy"));
+    assert!(
+        defs.iter()
+            .any(|d| d.name == "13EIG2:cam1:Threshold4Energy")
+    );
     assert_redeclarations_keep_their_type("pilatus4.template");
 }
 

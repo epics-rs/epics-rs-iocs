@@ -1,0 +1,18 @@
+# dbl of motor R7-4-5 motorNewport iocBoot/iocNewport st.cmd with its PM500.cmd
+newport:alldone
+newport:alldoneBlink
+newport:allstop
+newport:m31
+newport:m31_able
+newport:m31_twCh
+newport:m31_vCh
+newport:m32
+newport:m32_able
+newport:m32_twCh
+newport:m32_vCh
+newport:m33
+newport:m33_able
+newport:m33_twCh
+newport:m33_vCh
+newport:moving
+newport:movingDiff

@@ -20,14 +20,6 @@
 //!
 //! # Deviations from the C driver
 //!
-//! * **Server I/O runs on a worker thread.** A Rust `PortDriver` method executes
-//!   inside its port actor's current-thread runtime and cannot block on a second
-//!   asyn port, so the two C contexts (the port thread's inline `writeInt32`
-//!   bookkeeping and `mar345Task`) are split: `writeInt32` only sets the shared
-//!   `mode` and signals an event, and a single [`task`] worker thread owns the
-//!   [`server::Server`] and performs every socket round-trip and file read —
-//!   exactly the work `mar345Task` does under the C driver lock. Command order
-//!   and the marServer byte stream are unchanged.
 //! * **The exposure timer is emulated inline.** C arms an `epicsTimer` that
 //!   signals the stop event when the exposure time expires; this port folds that
 //!   deadline into the exposure wait loop, so no separate timer thread or
@@ -45,9 +37,6 @@
 //!   only the observable `ADMaxSizeX`/`ADMaxSizeY = 3450` writes are reproduced.
 //! * **`ADAcquireBusy` is not driven.** `mar345.cpp` only ever writes
 //!   `ADAcquire` (never `ADAcquireBusy`); this port matches that exactly.
-//! * **Base-class `writeOctet` side effects are not reproduced.** mar345 does not
-//!   override `writeOctet`; the default stores the string but does not track
-//!   `NDFilePathExists` or reload `NDAttributesFile`.
 
 pub mod driver;
 pub mod file_name;

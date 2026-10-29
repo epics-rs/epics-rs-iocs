@@ -16,27 +16,30 @@
 //! register write is a single scalar `INT16` (Modbus function 6, Write Single
 //! Register).
 //!
-//! ## Not modeled (documented)
+//! ## Custom params
 //!
-//! `ANG1_JERK` is a C custom asyn `Int32` param (writes the `JERK` register,
-//! reg 9) meant for a record outside the motor record boundary — no
-//! analogous binding exists at this port's [`AsynMotor`] boundary (see
-//! `crate::anf2`'s equivalent note for `ANF2_RESET_ERRORS`/`ANF2_GET_INFO`).
+//! `ANG1_JERK` (the `JERK` register, reg 9) is ported in [`Ang1Params`].
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
+use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::{AxisUser, ParamWrite, has_motor_axis};
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::nint;
+use motor_common::{AxisReport, ControllerParams, ControllerReport, DEFAULT_CONTROLLER_TIMEOUT};
 
-use crate::regs::ModbusRegs;
-
-/// C `DEFAULT_CONTROLLER_TIMEOUT`.
-const TIMEOUT: Duration = Duration::from_millis(2000);
+use crate::regs::{ForceRead, ModbusRegs};
 
 // Input registers.
 const STATUS_1: i32 = 0;
@@ -70,18 +73,28 @@ fn unpack1000(upper: i16, lower: i16) -> i32 {
 
 /// Shared controller state: the in/out Modbus register handles.
 pub struct Ang1Controller {
+    /// The controller port, whose pasynUserSelf C traces on.
+    port: String,
+    /// C `inputDriver_`, which each axis connects its force-read user to.
+    in_port: String,
     in_regs: ModbusRegs,
     out_regs: ModbusRegs,
 }
 
 impl Ang1Controller {
     /// Connect the In/Out Modbus ports previously created by
-    /// `drvModbusAsynConfigure`.
-    pub fn new(in_port: &str, out_port: &str) -> Result<Self, String> {
-        Ok(Self {
-            in_regs: ModbusRegs::connect(in_port, TIMEOUT)?,
-            out_regs: ModbusRegs::connect(out_port, TIMEOUT)?,
-        })
+    /// `drvModbusAsynConfigure`. C keeps the controller either way; the
+    /// output connect's status, the only one C checks, is returned.
+    pub fn new(port: &str, in_port: &str, out_port: &str) -> (Self, AsynResult<()>) {
+        let (in_regs, _) = ModbusRegs::connect(in_port, DEFAULT_CONTROLLER_TIMEOUT);
+        let (out_regs, out_status) = ModbusRegs::connect(out_port, DEFAULT_CONTROLLER_TIMEOUT);
+        let ctrl = Self {
+            port: port.to_string(),
+            in_port: in_port.to_string(),
+            in_regs,
+            out_regs,
+        };
+        (ctrl, out_status)
     }
 
     fn read16(&self, reg: i32) -> AsynResult<i32> {
@@ -100,9 +113,13 @@ impl Ang1Controller {
     /// every ANG1 register write (unlike ANF2, which has no per-write
     /// delay).
     fn write16(&self, reg: i32, value: i32) -> AsynResult<()> {
-        self.out_regs.write16(reg, value)?;
+        MotorTrace::new(self.port.clone(), 0).print_self(
+            TraceMask::IO_DRIVER,
+            format_args!("writeReg16: writing {value} to register {reg}\n"),
+        );
+        let status = self.out_regs.write16(reg, value);
         sleep(Duration::from_millis(10));
-        Ok(())
+        status
     }
 
     /// C `writeReg32`: decimal base-1000 split (written as two `writeReg16`
@@ -114,19 +131,110 @@ impl Ang1Controller {
         let _ = self.write16(reg, upper);
         self.write16(reg + 1, lower)
     }
+}
 
-    fn force_read(&self) -> AsynResult<()> {
-        self.in_regs.force_read()
+/// C `JERK`, the output register `ANG1_JERK` writes.
+pub(crate) const JERK: i32 = 9;
+
+/// The ANG1 controller's `ANG1_JERK` and its poll periods, in seconds, for
+/// its report.
+pub struct Ang1Params {
+    controller: Arc<Mutex<Ang1Controller>>,
+    moving_poll: f64,
+    idle_poll: f64,
+    /// C `ANG1Jerk_`, once created.
+    jerk: Option<usize>,
+}
+
+impl Ang1Params {
+    pub fn new(controller: Arc<Mutex<Ang1Controller>>, moving_poll: f64, idle_poll: f64) -> Self {
+        Self {
+            controller,
+            moving_poll,
+            idle_poll,
+            jerk: None,
+        }
+    }
+}
+
+impl ControllerParams for Ang1Params {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
+
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.jerk = Some(base.create_param("ANG1_JERK", ParamType::Int32)?);
+        Ok(())
+    }
+
+    /// C `ANG1Controller::writeInt32` (ANG1Driver.cpp:161-185): the value is
+    /// stored, then written to the `JERK` register whatever it is.
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: i32,
+    ) -> ParamWrite {
+        // C dereferences the null axis there (ANG1Driver.cpp:165-169); refused as the base does.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        if Some(user.reason) != self.jerk {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let addr = user.addr;
+        let _ = base.set_int32_param(user.reason, addr, value);
+        println!("Jerk = {value}");
+        let status = self
+            .controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write16(JERK, value);
+        let _ = base.call_param_callbacks(addr);
+        if let Err(e) = &status {
+            MotorTrace::new(base.port_name.to_string(), user.asyn().addr).print(
+                TraceMask::ERROR,
+                user.reason as i32,
+                format_args!(
+                    "ANG1MotorDriver:writeInt32: error, status={} function={}, value={value}\n",
+                    e.status() as i32,
+                    user.reason,
+                ),
+            );
+        }
+        ParamWrite::Handled(status)
+    }
+
+    /// C `ANG1Controller::report` (ANG1Driver.cpp:127-134).
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "ANG1 motor driver {}, numAxes={}, moving poll period={:.6}, idle poll period={:.6}",
+            ctx.port_name(),
+            ctx.num_axes(),
+            CFloat(self.moving_poll),
+            CFloat(self.idle_poll),
+        );
+        ctx.report(out, level);
+    }
+}
+
+/// C `ANG1Axis::report` (ANG1Driver.cpp:313-322) for axis `.0`.
+pub struct Ang1AxisReport(pub i32);
+
+impl AxisReport for Ang1AxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let _ = writeln!(out, "  axis {}", self.0);
+        }
     }
 }
 
 /// One ANG1 axis. Implements [`AsynMotor`].
 pub struct Ang1Axis {
     controller: Arc<Mutex<Ang1Controller>>,
-    /// Last published status. C's poll reuses a single stale `read_val` on a
-    /// failed read and always publishes; this carries forward the last value
-    /// field-by-field for any read that fails in a cycle (see [`Self::poll`]).
-    last: MotorStatus,
+    force_read: ForceRead,
+    /// What `set_closed_loop` set, for the loop to apply.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl Ang1Axis {
@@ -138,12 +246,25 @@ impl Ang1Axis {
     /// ignores its status, so a transient link error at IOC boot cannot abort
     /// `ANG1CreateController` (which C always returns `asynSuccess` from).
     pub fn new(controller: Arc<Mutex<Ang1Controller>>, _axis_no: i32) -> Self {
+        let in_port = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_port
+            .clone();
+        let force_read = ForceRead::connect(&in_port, 0, DEFAULT_CONTROLLER_TIMEOUT);
+        if !force_read.connected() {
+            println!(
+                "{in_port}: Error, unable to connect pasynUserForceRead_ to Modbus input driver"
+            );
+        }
+        println!(
+            "ANG1Axis::ANG1Axis : pasynUserForceRead_->reason={}",
+            force_read.reason()
+        );
         let mut ax = Self {
             controller,
-            last: MotorStatus {
-                gain_support: true,
-                ..MotorStatus::default()
-            },
+            force_read,
+            status_writes: Vec::new(),
         };
         let _ = ax.set_position(&AsynUser::new(0), 0.0);
         ax
@@ -223,6 +344,11 @@ impl Ang1Axis {
 }
 
 impl AsynMotor for Ang1Axis {
+    /// C `ANG1Axis::poll` ignores each read's status and sets no status bit.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -297,8 +423,14 @@ impl AsynMotor for Ang1Axis {
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.do_set_closed_loop(&ctrl, enable)
+        let result = self.do_set_closed_loop(&self.lock(), enable);
+        // Whatever the writes returned (ANG1Driver.cpp:518, :523).
+        self.status_writes.push(StatusWrite::PowerOn(enable));
+        result
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
     }
 
     fn set_pid_gain(&mut self, _user: &AsynUser, _kind: PidGainKind, _gain: f64) -> AsynResult<()> {
@@ -306,65 +438,158 @@ impl AsynMotor for Ang1Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // C presses on through every read and always publishes: each read's
-        // status is discarded (the base poller ignores poll()'s return) and
-        // callParamCallbacks fires unconditionally. Mirror that — attempt each
-        // read, carry forward the last published value for any field whose read
-        // fails this cycle, and always return Ok so the framework publishes.
-        // (C reuses a single stale `read_val` on failure; last-known is the
-        // defined, safe equivalent.)
-        let last = self.last.clone();
-
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+        // C presses on through every read and the base poller ignores poll()'s
+        // return. A failed read sets C's params from a stale `read_val` (the
+        // previous register's value); here the field keeps what it holds. C
+        // defect, not copied.
         let ctrl = self.lock();
-        let _ = ctrl.force_read();
+        let _ = self.force_read.write();
 
-        let position = ctrl.read32(POS_RD_UPR).map_or(last.position, |v| v as f64);
-
-        // Status word 1 bit 3 set to 1 when the motor is not in motion.
-        let done = ctrl.read16(STATUS_1).map_or(last.done, |v| v & 0x8 != 0);
-
-        let (high_limit, low_limit, powered) = match ctrl.read16(STATUS_2) {
-            Ok(status2) => (
-                status2 & 0x1 != 0,
-                status2 & 0x2 != 0,
-                status2 & 0x8000 != 0,
-            ),
-            Err(_) => (last.high_limit, last.low_limit, last.powered),
-        };
-
-        // A CW limit reached: reset the error and set position so the axis
-        // can move off the limit (errors discarded, matching C).
-        if high_limit {
-            let _ = self.do_set_closed_loop(&ctrl, true);
-            let _ = self.do_set_position(&ctrl, position);
+        if let Ok(v) = ctrl.read32(POS_RD_UPR) {
+            status.set_position(v as f64);
         }
 
-        // A CCW limit reached: same reset.
-        if low_limit {
+        // Status word 1 bit 3 set to 1 when the motor is not in motion.
+        if let Ok(v) = ctrl.read16(STATUS_1) {
+            status.done = v & 0x8 != 0;
+        }
+        status.moving = !status.done;
+
+        let status2 = ctrl.read16(STATUS_2);
+        if let Ok(v) = status2 {
+            status.high_limit = v & 0x1 != 0;
+        }
+        // A CW limit reached: reset the error and set position so the axis
+        // can move off the limit (errors discarded, matching C).
+        if status.high_limit {
             let _ = self.do_set_closed_loop(&ctrl, true);
-            let _ = self.do_set_position(&ctrl, position);
+            let _ = self.do_set_position(&ctrl, status.position());
+        }
+
+        if let Ok(v) = status2 {
+            status.low_limit = v & 0x2 != 0;
+        }
+        // A CCW limit reached: same reset.
+        if status.low_limit {
+            let _ = self.do_set_closed_loop(&ctrl, true);
+            let _ = self.do_set_position(&ctrl, status.position());
         }
         drop(ctrl);
 
-        let status = MotorStatus {
-            position,
-            done,
-            moving: !done,
-            high_limit,
-            low_limit,
-            powered,
-            gain_support: true,
-            ..MotorStatus::default()
-        };
-        self.last = status.clone();
-        Ok(status)
+        status.gain_support = true;
+        if let Ok(v) = status2 {
+            status.powered = v & 0x8000 != 0;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_controller_of_missing_ports_keeps_its_axes() {
+        let (ctrl, out_status) =
+            Ang1Controller::new("ang1Missing", "ang1MissingIn", "ang1MissingOut");
+        assert!(out_status.is_err());
+        let ax = Ang1Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        assert!(ax.lock().read16(STATUS_1).is_err());
+    }
+
+    /// C `writeReg16` prints each register write on pasynUserSelf before it
+    /// is tried (ANG1Driver.cpp:203).
+    #[test]
+    fn a_register_write_prints_its_traceio_driver_line() {
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::asyn::trace::TraceFile;
+        let port = "ang1RegTrace";
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), TraceMask::IO_DRIVER);
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        trace.set_device_trace_file(port, 0, TraceFile::File(file));
+        let (ctrl, _) = Ang1Controller::new(port, "ang1RegTraceIn", "ang1RegTraceOut");
+        assert!(ctrl.write32(SPD_UPR, 12_345).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            text.matches("writeReg16: writing 12 to register 4\n")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("writeReg16: writing 345 to register 5\n")
+                .count(),
+            1,
+            "{text}"
+        );
+    }
+
+    /// C `writeReg16` sleeps after the write whatever it returned
+    /// (ANG1Driver.cpp:204-205).
+    #[test]
+    fn a_failed_register_write_still_waits_10_ms() {
+        let (ctrl, _) = Ang1Controller::new("ang1FailWait", "ang1FailWaitIn", "ang1FailWaitOut");
+        let started = std::time::Instant::now();
+        assert!(ctrl.write16(CMD_MSW, 0).is_err());
+        assert!(started.elapsed() >= Duration::from_millis(10));
+    }
+
+    /// The loop clears DONE when a move starts (asynMotorController.cpp:301);
+    /// a failed STATUS_1 read must not put back the done the last poll read.
+    #[test]
+    fn a_failed_status_1_read_keeps_the_done_a_move_cleared() {
+        use crate::regs::fake;
+        fake::publish("ang1KeepDoneIn");
+        fake::publish("ang1KeepDoneOut");
+        fake::set_read("ang1KeepDoneIn", STATUS_1, Some(0x8));
+        fake::set_read("ang1KeepDoneIn", STATUS_2, Some(0x8000));
+        let (ctrl, _) = Ang1Controller::new("ang1KeepDone", "ang1KeepDoneIn", "ang1KeepDoneOut");
+        let mut ax = Ang1Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::new(0);
+        let mut status = MotorStatus::default();
+        ax.poll(&user, &mut status).unwrap();
+        assert!(status.done);
+
+        status.done = false;
+        fake::set_read("ang1KeepDoneIn", STATUS_1, None);
+        ax.poll(&user, &mut status).unwrap();
+        assert!(!status.done);
+        assert!(status.moving);
+        assert!(status.powered);
+        assert!(status.gain_support);
+        assert_eq!(status.position(), 2003.0);
+    }
+
+    /// C `setClosedLoop` sets POWER_ON whatever its writes returned
+    /// (ANG1Driver.cpp:518, :523); a failed STATUS_2 read then keeps it.
+    #[test]
+    fn set_closed_loop_sets_power_on() {
+        use crate::regs::fake;
+        fake::publish("ang1CnenIn");
+        fake::set_read("ang1CnenIn", STATUS_2, Some(0x8000));
+        let (ctrl, _) = Ang1Controller::new("ang1Cnen", "ang1CnenIn", "ang1CnenOut");
+        let mut ax = Ang1Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::new(0);
+        let mut status = MotorStatus::default();
+        ax.poll(&user, &mut status).unwrap();
+        assert!(status.powered);
+
+        assert!(ax.set_closed_loop(&user, false).is_err());
+        let writes = ax.take_status_writes();
+        assert_eq!(writes, [StatusWrite::PowerOn(false)]);
+        for write in writes {
+            write.apply(&mut status);
+        }
+        fake::set_read("ang1CnenIn", STATUS_2, None);
+        ax.poll(&user, &mut status).unwrap();
+        assert!(!status.powered);
+    }
 
     #[test]
     fn pack1000_exact_multiple() {

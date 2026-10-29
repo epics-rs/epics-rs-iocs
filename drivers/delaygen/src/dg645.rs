@@ -2,10 +2,8 @@
 //!
 //! Ported from `drvAsynDG645.cpp`. Every parameter is exposed as a tag
 //! (asyn drvInfo string, e.g. `@asyn(DG0) TRIG_LEVEL`) resolved to a
-//! reason via the default [`PortDriver::drv_user_create`] (lookup by
-//! parameter name), matching the C driver's own tag-based `create()`
-//! (`asynDrvUser::create`, `epicsStrCaseCmp` against `commandTable[].tag`)
-//! — no override needed here.
+//! reason by C's own `create()`: a case-insensitive `epicsStrCaseCmp` scan
+//! of `commandTable[].tag`.
 //!
 //! # EOS ownership
 //! Like the other two delaygen drivers, DG645 never appends a terminator
@@ -40,19 +38,27 @@
 //!   the next line): STATUS_CODE always reads back `error`, regardless of
 //!   check_errors state. See [`Dg645Driver::error`] usage in `read_int32`.
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::port::InterfaceMask;
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
-use crate::wire::{atof, atoi, write_only, write_read};
+use crate::connect::OctetLink;
+use crate::wire::{self, atof, atoi};
 
 /// C `commandTable[].readConv` — how a reply (or cached state) becomes the
 /// value returned to device support.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Conv {
-    /// `cvtSink`: no meaningful value; write-only tag.
+    /// `cvtSink`: no meaningful value; write-only tag. C's writes nothing
+    /// (drvAsynDG645.cpp:604-608), so an output record's init read takes the
+    /// caller's uninitialised local (devAsynInt32.c:1176-1187); a C defect,
+    /// not copied: reads return zero.
     Sink,
     /// `cvtIdent`: `*IDN?` reply, chopped after the first comma and
     /// prefixed `"SRS "`.
@@ -376,32 +382,19 @@ static STATUS_MSG: &[(i32, &str)] = &[
     (170, "Communication Error"), (171, "Over run"), (254, "Too Many Errors"),
 ];
 
-/// Mimic C `printf("%e", value)`: one leading digit, 6-digit mantissa,
-/// signed at-least-2-digit exponent (e.g. `1.234568e+03`, `0.000000e+00`).
-/// Rust's `{:.6e}` gives the correctly-rounded mantissa (`1.234568e3`);
-/// only the exponent needs reformatting to match C's convention.
-fn fmt_e(value: f64) -> String {
-    let s = format!("{value:.6e}");
-    let (mantissa, exp) = s
-        .split_once('e')
-        .expect("format!(\"{:e}\") always emits 'e'");
-    let exp_n: i32 = exp.parse().expect("exponent is always a valid integer");
-    format!(
-        "{mantissa}e{}{:02}",
-        if exp_n < 0 { "-" } else { "+" },
-        exp_n.abs()
-    )
-}
-
 fn format_int_cmd(template: &str, value: i32) -> String {
     template.replacen("%d", &value.to_string(), 1)
 }
 
 fn format_float_cmd(template: &str, fmt: FloatFmt, value: f64) -> String {
     match fmt {
-        FloatFmt::F2 => template.replacen("%-.2f", &format!("{value:.2}"), 1),
-        FloatFmt::F6 => template.replacen("%-.6f", &format!("{value:.6}"), 1),
-        FloatFmt::E => template.replacen("%e", &fmt_e(value), 1),
+        FloatFmt::F2 => {
+            template.replacen("%-.2f", &format!("{value:.2}", value = CFloat(value)), 1)
+        }
+        FloatFmt::F6 => {
+            template.replacen("%-.6f", &format!("{value:.6}", value = CFloat(value)), 1)
+        }
+        FloatFmt::E => template.replacen("%e", &format!("{:e}", CFloat(value)), 1),
     }
 }
 
@@ -412,13 +405,13 @@ fn format_str_cmd(template: &str, value: &str) -> String {
 /// C `writeChannelRef`: `sprintf(writeCommand, new_chan, old_delay)`.
 fn format_channel_ref_cmd(template: &str, new_chan: i32, old_delay: f64) -> String {
     let s = template.replacen("%d", &new_chan.to_string(), 1);
-    s.replacen("%e", &fmt_e(old_delay), 1)
+    s.replacen("%e", &format!("{:e}", CFloat(old_delay)), 1)
 }
 
 /// C `writeChannelDelay`: `sprintf(writeCommand, chan, new_delay)`.
 fn format_channel_delay_cmd(template: &str, chan: i32, new_delay: f64) -> String {
     let s = template.replacen("%d", &chan.to_string(), 1);
-    s.replacen("%e", &fmt_e(new_delay), 1)
+    s.replacen("%e", &format!("{:e}", CFloat(new_delay)), 1)
 }
 
 /// C `sscanf(inpBuf, "%d,%lf", &chan, &delay)`. Falls back to `(atoi, 0.0)`
@@ -444,7 +437,7 @@ fn cvt_ident(reply: &str) -> String {
 fn chan_delay_text(reply: &str) -> String {
     let (chan, delay) = parse_chan_delay_pair(reply);
     let name = CHAN_NAMES.get(chan as usize).copied().unwrap_or("?");
-    format!("{name} + {delay:.12}")
+    format!("{name} + {delay:.12}", delay = CFloat(delay))
 }
 
 /// C `cvtErrorText`. doc/upstream-c-defects.md #34: upstream's
@@ -465,16 +458,18 @@ fn status_text(error: i32, check_errors: bool) -> &'static str {
 /// registers with `ASYN_CANBLOCK` only, no `ASYN_MULTIDEVICE`).
 pub struct Dg645Driver {
     base: PortDriverBase,
-    handle: SyncIOHandle,
+    handle: OctetLink,
     error: i32,
     check_errors: bool,
     status_code_reason: usize,
+    /// C `pport->init`: every transfer refuses until [`Self::initialize`]
+    /// has run all three steps.
+    init: bool,
 }
 
 impl Dg645Driver {
-    /// C `drvAsynDG645`: registers every tag, then runs the same
-    /// three-step init sequence (`*IDN?`, `LERR?`, `*CLS`).
-    pub fn new(port_name: &str, handle: SyncIOHandle) -> AsynResult<Self> {
+    /// C `drvAsynDG645` up to `registerPort`: every tag, no traffic yet.
+    pub fn new(port_name: &str, handle: OctetLink) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
             1,
@@ -483,33 +478,90 @@ impl Dg645Driver {
                 can_block: true,
                 destructible: true,
             },
+            InterfaceMask::COMMON
+                | InterfaceMask::DRV_USER
+                | InterfaceMask::OCTET
+                | InterfaceMask::INT32
+                | InterfaceMask::FLOAT64,
+            InterfaceMask::INT32,
         );
         for spec in COMMANDS {
-            // The stored ParamType is never read back through a typed
-            // getter for any tag but STATUS_CODE — every other tag exists
-            // purely so `find_param`/the default `drv_user_create` can
-            // resolve it to a reason index, mirroring C's `create()`
-            // tag-table scan.
+            // Param index == COMMANDS index, the reason `drv_user_create`
+            // hands out; only STATUS_CODE's value is ever read.
             base.create_param(spec.tag, ParamType::Int32)?;
         }
         let status_code_reason = base
             .find_param("STATUS_CODE")
             .expect("STATUS_CODE is registered above");
 
-        let mut driver = Self {
+        let driver = Self {
             base,
             handle,
             error: 0,
             check_errors: true,
             status_code_reason,
+            init: false,
         };
-
-        write_read(&driver.handle, "*IDN?")?;
-        let lerr = write_read(&driver.handle, "LERR?")?;
-        driver.error = atoi(&lerr);
-        write_only(&driver.handle, "*CLS")?;
-
         Ok(driver)
+    }
+
+    /// The rest of C `drvAsynDG645` (drvAsynDG645.cpp:566-594): `*IDN?`,
+    /// `LERR?` and `*CLS`. A failed step is C's errlog phrase; the port
+    /// stays registered and uninitialised.
+    pub fn initialize(&mut self) -> Result<(), &'static str> {
+        self.write_read("*IDN?")
+            .map_err(|_| "failed to acquire identification")?;
+        let lerr = self
+            .write_read("LERR?")
+            .map_err(|_| "failed to acquire error status")?;
+        self.error = atoi(&lerr);
+        self.write_only("*CLS")
+            .map_err(|_| "failed to clear status")?;
+        self.init = true;
+        Ok(())
+    }
+
+    /// C `writeRead`: the transaction and its `asynPrint` lines, which C
+    /// sends through `pasynUserTrace` on this driver's own port.
+    fn write_read(&self, cmd: &str) -> AsynResult<String> {
+        use std::fmt::Write as _;
+        let port = &self.base.port_name;
+        let (raw, result) = wire::exchange(&self.handle, cmd);
+        if let Err(f) = &result {
+            self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!("{port} writeRead: error {} wrote \"{cmd}\"\n", f.status()),
+            );
+        }
+        // C's `%s` of inpBuf: the bytes read, also by a failed read, up to a
+        // NUL. C defect not copied: after a failed write inpBuf is
+        // uninitialised.
+        let read = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
+        self.base
+            .trace_write_at(0, 0, TraceMask::IO_FILTER, file!(), line!(), |out| {
+                write!(out, "{port} writeRead: wrote \"{cmd}\" read \"")?;
+                out.write_bytes(read)?;
+                out.write_str("\"\n")
+            });
+        result?;
+        Ok(String::from_utf8_lossy(&raw).into_owned())
+    }
+
+    /// C `writeOnly`; see [`Self::write_read`].
+    fn write_only(&self, cmd: &str) -> AsynResult<()> {
+        let port = &self.base.port_name;
+        let result = wire::write_only(&self.handle, cmd);
+        if let Err(f) = &result {
+            self.base.trace_print(
+                TraceMask::ERROR,
+                format_args!("{port} writeOnly: error {} wrote \"{cmd}\"\n", f.status()),
+            );
+        }
+        self.base.trace_print(
+            TraceMask::IO_FILTER,
+            format_args!("{port} writeOnly: wrote \"{cmd}\"\n"),
+        );
+        Ok(result?)
     }
 
     fn spec(&self, reason: usize) -> AsynResult<&'static CommandSpec> {
@@ -523,7 +575,7 @@ impl Dg645Driver {
     /// actually changes, replicating C's explicit
     /// `if(old_error != pport->error) signalStatusUpdate(pport)` gate.
     fn check_error(&mut self) -> AsynResult<()> {
-        let reply = write_read(&self.handle, "LERR?")?;
+        let reply = self.write_read("LERR?")?;
         self.error = atoi(&reply);
         self.base
             .set_int32_param(self.status_code_reason, 0, self.error)?;
@@ -543,29 +595,26 @@ impl Dg645Driver {
 
     /// C `writeChannelRef`.
     fn write_channel_ref(&mut self, spec: &CommandSpec, new_chan: i32) -> AsynResult<()> {
-        let reply = write_read(&self.handle, spec.read_cmd)?;
+        let reply = self.write_read(spec.read_cmd)?;
         let (_old_chan, old_delay) = parse_chan_delay_pair(&reply);
         let wire = format_channel_ref_cmd(spec.write_cmd, new_chan, old_delay);
-        let status = write_only(&self.handle, &wire);
+        let status = self.write_only(&wire);
         self.after_write(status)
     }
 
     /// C `writeChannelDelay`.
     fn write_channel_delay(&mut self, spec: &CommandSpec, new_delay: f64) -> AsynResult<()> {
-        let reply = write_read(&self.handle, spec.read_cmd)?;
+        let reply = self.write_read(spec.read_cmd)?;
         let (chan, _old_delay) = parse_chan_delay_pair(&reply);
         let wire = format_channel_delay_cmd(spec.write_cmd, chan, new_delay);
-        let status = write_only(&self.handle, &wire);
+        let status = self.write_only(&wire);
         self.after_write(status)
     }
 
     /// C `statusChecking`.
     fn write_status_checking(&mut self, value: i32) -> AsynResult<()> {
         if !(0..=1).contains(&value) {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "STATUS_CHECKING must be 0 or 1".into(),
-            });
+            return Err(wire::record_error(AsynStatus::Error));
         }
         let new_enabled = value != 0;
         if new_enabled == self.check_errors {
@@ -580,7 +629,7 @@ impl Dg645Driver {
             self.base.call_param_callbacks(0)?;
             Ok(())
         } else {
-            write_only(&self.handle, "*CLS")?;
+            self.write_only("*CLS")?;
             self.check_errors = true;
             self.check_error()
         }
@@ -596,7 +645,76 @@ impl PortDriver for Dg645Driver {
         &mut self.base
     }
 
+    /// C `create()` (drvAsynDG645.cpp:983-1001).
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        match COMMANDS
+            .iter()
+            .position(|c| c.tag.eq_ignore_ascii_case(&req.drv_info))
+        {
+            Some(reason) => Ok(DrvUserInfo::from_reason(reason)),
+            None => {
+                errlog_vprintf(format_args!(
+                    "drvAsynDG645::create port {} failed to find tag {}\n",
+                    self.base.port_name, req.drv_info
+                ));
+                Err(wire::record_error(AsynStatus::Error))
+            }
+        }
+    }
+
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+        self.do_read_int32(user)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    /// drvAsynDG645.cpp:185 registers asynInt32 with no getBounds, so C's
+    /// is asynInt32Base's (asynInt32Base.c:88-103).
+    fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "{} {} getBounds setting low=high=0\n",
+                self.base.port_name, user.addr
+            ),
+        );
+        Ok((0, 0))
+    }
+
+    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        self.do_write_int32(user, value)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        self.do_read_float64(user)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        self.do_write_float64(user, value)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+        match self.do_read_octet(user, buf) {
+            Ok(n) => OctetReadResult::ok(n, EomReason::empty()),
+            Err(e) => OctetReadResult::failed(wire::record_error(e.status())),
+        }
+    }
+
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.do_write_octet(user, data)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+}
+
+/// The C transfers; [`PortDriver`] hands their errors to the record as
+/// [`wire::record_error`].
+impl Dg645Driver {
+    fn do_read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.conv {
             Conv::Sink => Ok(0),
@@ -606,28 +724,29 @@ impl PortDriver for Dg645Driver {
             // back `error`, regardless of check_errors.
             Conv::ErrorCode => Ok(self.error),
             Conv::StrInt => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 Ok(atoi(&reply))
             }
             Conv::ChanRef => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 Ok(parse_chan_delay_pair(&reply).0)
             }
             _ => Err(AsynError::InterfaceNotSupported(spec.tag.to_string())),
         }
     }
 
-    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+    fn do_write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.write_kind {
             WriteKind::Sink => Ok(()),
             WriteKind::Int => {
                 let wire = format_int_cmd(spec.write_cmd, value);
-                let status = write_only(&self.handle, &wire);
+                let status = self.write_only(&wire);
                 self.after_write(status)
             }
             WriteKind::CommandOnly => {
-                let status = write_only(&self.handle, spec.write_cmd);
+                let status = self.write_only(spec.write_cmd);
                 self.after_write(status)
             }
             WriteKind::ChannelRef => self.write_channel_ref(spec, value),
@@ -636,29 +755,31 @@ impl PortDriver for Dg645Driver {
         }
     }
 
-    fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+    fn do_read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.conv {
             Conv::Sink => Ok(0.0),
             Conv::StrFloat => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 Ok(atof(&reply))
             }
             Conv::ChanDelay => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 Ok(parse_chan_delay_pair(&reply).1)
             }
             _ => Err(AsynError::InterfaceNotSupported(spec.tag.to_string())),
         }
     }
 
-    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+    fn do_write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.write_kind {
             WriteKind::Sink => Ok(()),
             WriteKind::Float(fmt) => {
                 let wire = format_float_cmd(spec.write_cmd, fmt, value);
-                let status = write_only(&self.handle, &wire);
+                let status = self.write_only(&wire);
                 self.after_write(status)
             }
             WriteKind::ChannelDelay => self.write_channel_delay(spec, value),
@@ -666,18 +787,19 @@ impl PortDriver for Dg645Driver {
         }
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn do_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         let text = match spec.conv {
             Conv::Sink => String::new(),
             Conv::Ident => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 cvt_ident(&reply)
             }
             Conv::ErrorText => status_text(self.error, self.check_errors).to_string(),
-            Conv::CopyText => write_read(&self.handle, spec.read_cmd)?,
+            Conv::CopyText => self.write_read(spec.read_cmd)?,
             Conv::ChanDelay => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 chan_delay_text(&reply)
             }
             _ => return Err(AsynError::InterfaceNotSupported(spec.tag.to_string())),
@@ -688,7 +810,8 @@ impl PortDriver for Dg645Driver {
         Ok(n)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+    fn do_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.write_kind {
             WriteKind::Sink => Ok(0),
@@ -699,7 +822,7 @@ impl PortDriver for Dg645Driver {
                 let n = data.iter().position(|&b| b == 0).unwrap_or(data.len());
                 let text = String::from_utf8_lossy(&data[..n]);
                 let wire = format_str_cmd(spec.write_cmd, &text);
-                let status = write_only(&self.handle, &wire);
+                let status = self.write_only(&wire);
                 self.after_write(status)?;
                 Ok(n)
             }
@@ -749,12 +872,27 @@ mod tests {
     }
 
     #[test]
-    fn fmt_e_matches_c_printf_e() {
-        assert_eq!(fmt_e(0.0), "0.000000e+00");
-        assert_eq!(fmt_e(1234.5678), "1.234568e+03");
-        assert_eq!(fmt_e(-0.0005), "-5.000000e-04");
-        assert_eq!(fmt_e(1.0), "1.000000e+00");
-        assert_eq!(fmt_e(9.9999999e2), "1.000000e+03"); // rounds up a digit
+    fn e_rows_print_as_c_printf_e() {
+        for (v, want) in [
+            (0.0, "0.000000e+00"),
+            (1234.5678, "1.234568e+03"),
+            (-0.0005, "-5.000000e-04"),
+            (1.0, "1.000000e+00"),
+            (9.9999999e2, "1.000000e+03"), // rounds up a digit
+            (f64::NAN, "nan"),
+            (-f64::NAN, "-nan"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            assert_eq!(
+                format_float_cmd("HOLD%e", FloatFmt::E, v),
+                format!("HOLD{want}")
+            );
+            assert_eq!(
+                format_channel_delay_cmd("DLAY 2,%d,%e", 2, v),
+                format!("DLAY 2,2,{want}")
+            );
+        }
     }
 
     #[test]
@@ -774,6 +912,14 @@ mod tests {
         assert_eq!(
             format_float_cmd("HOLD%e", FloatFmt::E, 0.001),
             "HOLD1.000000e-03"
+        );
+        assert_eq!(
+            format_float_cmd("TLVL%-.2f", FloatFmt::F2, f64::NAN),
+            "TLVLnan"
+        );
+        assert_eq!(
+            format_float_cmd("TRAT%-.6f", FloatFmt::F6, -f64::NAN),
+            "TRAT-nan"
         );
     }
 
@@ -835,5 +981,146 @@ mod tests {
         // doc/upstream-c-defects.md #34: upstream cvtErrorText spelled
         // this "ckecking".
         assert_eq!(status_text(0, false), "Status checking disabled");
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+    use crate::connect::mute_link;
+
+    /// C leaves `init == 0` when `*IDN?` fails, and every transfer refuses.
+    #[test]
+    fn a_failed_identification_leaves_every_transfer_refusing() {
+        let link = mute_link("DG645_MUTE_IO");
+        let mut dg = Dg645Driver::new("DG645_MUTE", link).unwrap();
+        assert_eq!(dg.initialize(), Err("failed to acquire identification"));
+
+        let reason = dg.base.find_param("STATUS_CODE").unwrap();
+        assert!(dg.read_int32(&AsynUser::new(reason)).is_err());
+    }
+
+    /// drvAsynDG645.cpp:542: `int32CanInterrupt` is the port's only
+    /// interrupt source, so only an asynInt32 interrupt user is accepted.
+    #[test]
+    fn only_an_int32_interrupt_user_is_accepted() {
+        use epics_rs::asyn::asyn_record::claim_port;
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let dg = Dg645Driver::new("DG645_INTR", mute_link("DG645_INTR_IO")).unwrap();
+        let claim = claim_port("DG645_INTR").unwrap();
+        let (runtime, _actor) = create_port_runtime(&claim, dg, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        for iface in [InterfaceType::Int32, InterfaceType::Float64] {
+            let filter = InterruptFilter {
+                iface: Some(iface),
+                ..Default::default()
+            };
+            let accepted = runtime
+                .port_handle()
+                .interrupts()
+                .register_interrupt_user(filter, 0)
+                .is_ok();
+            assert_eq!(accepted, iface == InterfaceType::Int32, "{iface}");
+        }
+        std::mem::forget(runtime);
+    }
+
+    /// C's `epicsStrCaseCmp` tag scan; a miss is asynError with no text.
+    #[test]
+    fn a_tag_resolves_without_case_and_a_miss_carries_no_text() {
+        let mut dg = Dg645Driver::new("DG645_TAGS", mute_link("DG645_TAGS_IO")).unwrap();
+        let req = |tag: &str| DrvUserRequest::new(tag, 0);
+        let info = dg.drv_user_create(&req("trig_level")).unwrap();
+        assert_eq!(Some(info.reason), dg.base.find_param("TRIG_LEVEL"));
+        let e = dg.drv_user_create(&req("NO_SUCH_TAG")).unwrap_err();
+        assert_eq!(e.message(), "");
+        assert_eq!(e.status(), AsynStatus::Error);
+    }
+
+    /// C's `%s` of the reply prints its bytes as sent, up to a NUL
+    /// (drvAsynDG645.cpp:1206-1208).
+    #[test]
+    fn write_read_traces_the_raw_reply() {
+        use crate::connect::replying_link;
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let dg =
+            Dg645Driver::new("DG645_RAW", replying_link("DG645_RAW_IO", b"\xff7\0tail")).unwrap();
+        let path = std::env::temp_dir().join(format!("dg645-raw-{}.trace", std::process::id()));
+        let file =
+            std::sync::Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        let services = PortServices::global();
+        let trace = services.trace();
+        trace.set_trace_mask(Some("DG645_RAW"), TraceMask::IO_FILTER);
+        trace.set_trace_file(Some("DG645_RAW"), TraceFile::File(file));
+
+        assert_eq!(dg.write_read("LERR?").unwrap(), "\u{fffd}7\0tail");
+        let out = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let want: &[u8] = b"DG645_RAW writeRead: wrote \"LERR?\" read \"\xff7\"\n";
+        assert!(
+            out.windows(want.len()).any(|w| w == want),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// drvAsynDG645.cpp:1206-1208 prints inpBuf after a failed read too,
+    /// where it holds the bytes that read delivered.
+    #[test]
+    fn write_read_traces_a_reply_cut_by_a_timeout() {
+        use crate::connect::cut_link;
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let dg = Dg645Driver::new("DG645_CUT", cut_link("DG645_CUT_IO", b"7")).unwrap();
+        let path = std::env::temp_dir().join(format!("dg645-cut-{}.trace", std::process::id()));
+        let file =
+            std::sync::Arc::new(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()));
+        let services = PortServices::global();
+        let trace = services.trace();
+        trace.set_trace_mask(Some("DG645_CUT"), TraceMask::IO_FILTER);
+        trace.set_trace_file(Some("DG645_CUT"), TraceFile::File(file));
+
+        assert!(dg.write_read("LERR?").is_err());
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.contains("DG645_CUT writeRead: wrote \"LERR?\" read \"7\"\n"),
+            "{out}"
+        );
+    }
+
+    /// drvAsynDG645.cpp:185 registers asynInt32 with no getBounds, so C's
+    /// is asynInt32Base's `*low = *high = 0` (asynInt32Base.c:99).
+    #[test]
+    fn int32_bounds_are_asyn_int32_base_defaults() {
+        let dg = Dg645Driver::new("DG645_BOUNDS", mute_link("DG645_BOUNDS_IO")).unwrap();
+        assert_eq!(dg.get_bounds_int32(&AsynUser::default()).unwrap(), (0, 0));
+    }
+
+    /// C never writes the record's errorMessage: a failed transfer carries
+    /// its status and no text.
+    #[test]
+    fn a_failed_transfer_reaches_the_record_without_text() {
+        let mut dg = Dg645Driver::new("DG645_MUTE2", mute_link("DG645_MUTE2_IO")).unwrap();
+        dg.init = true;
+        let reason = dg.base.find_param("TRIG_LEVEL").unwrap();
+        let e = dg
+            .write_float64(&mut AsynUser::new(reason), 1.0)
+            .unwrap_err();
+        assert_eq!(e.message(), "");
+        assert_eq!(e.status(), AsynStatus::Error);
+        let reason = dg.base.find_param("STATUS_CHECKING").unwrap();
+        let e = dg.write_int32(&mut AsynUser::new(reason), 2).unwrap_err();
+        assert_eq!(e.message(), "");
     }
 }

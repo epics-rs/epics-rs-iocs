@@ -1,0 +1,2 @@
+# c-expansion of st.cmd, no MoCo.cmd, no motor.cmd.SMChydra over the C sources, its controller calls:
+SMCcorvusCreateController("Corvus1", "corvusPort", 3, 100, 500)

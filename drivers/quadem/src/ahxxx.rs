@@ -7,10 +7,9 @@
 //! The AH501BE in external-gate trigger mode needs the partial bytes of a
 //! *timed-out* binary read: upstream recognises the meter's `ACK\r\n`
 //! preamble either there or at the front of a completed frame
-//! (`drvAHxxx.cpp:252-283`). `asyn-rs` 0.22.1 discarded a timed-out read's
-//! partial bytes, so the port used to refuse the mode outright;
-//! `AsynError::partial_read` (asyn-rs 0.24.0+) carries them, so `read_thread`'s
-//! binary branch now detects the preamble the same way upstream does.
+//! (`drvAHxxx.cpp:252-283`). An asyn-rs octet read returns its bytes beside
+//! its status, so `read_thread`'s binary branch detects the preamble the same
+//! way upstream does.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +20,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -30,32 +30,23 @@ use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat,
     QeTriggerMode, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
 };
-use crate::octet::{OctetIo, connect_octet};
+use crate::octet::{OctetIo, connect_octet, outcome, reply_text};
+use crate::{asyn_print, trace};
 
 /// Poll interval of C++'s `epicsThreadSleep(0.01)` handshake loop.
 const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
 /// C++ `epicsThreadSleep(1.0)` after an unexpected read error.
 const READ_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
-/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
-/// the bytes transferred before it. A bare `AsynError::Status` variant match
-/// would miss that wrapper and misclassify every partial-transfer timeout —
-/// routine on this port, since it installs the EOS interpose — as an
-/// unexpected error.
 fn is_timeout(e: &AsynError) -> bool {
     e.status() == AsynStatus::Timeout
 }
 
 /// `read_thread`'s binary-read error arm (C++ `drvAHxxx.cpp:252-259`): trigger
-/// callbacks only when the failure was a genuine timeout. `status` must be
-/// checked first — `AsynError::PartialRead` also wraps non-timeout failures
-/// (an ECONNRESET, say) that could happen to carry the same 5 bytes, and C++
-/// reaches this trigger only inside `status != asynTimeout`'s `else`.
-fn is_ext_gate_ack_timeout(e: &AsynError, ext_gate: bool) -> bool {
-    ext_gate
-        && is_timeout(e)
-        && e.partial_read()
-            .is_some_and(|partial| proto::is_ack_preamble_only(&partial.data))
+/// callbacks only when a timeout, not any failure that happens to carry the
+/// same 5 bytes, ended the read on the ACK preamble.
+fn is_ext_gate_ack_timeout(data: &[u8], e: &AsynError, ext_gate: bool) -> bool {
+    ext_gate && is_timeout(e) && proto::is_ack_preamble_only(data)
 }
 
 fn error(message: impl Into<String>) -> AsynError {
@@ -78,6 +69,8 @@ pub struct AhxxxDriver {
     /// known. Shared with the read thread, which decodes accordingly.
     ah401_series: Arc<AtomicBool>,
     firmware_version: String,
+    /// C++ `QEPortName_`, printed by [`PortDriver::report`].
+    qe_port_name: String,
 }
 
 impl AhxxxDriver {
@@ -90,10 +83,28 @@ impl AhxxxDriver {
         ah401_series: Arc<AtomicBool>,
     ) -> AsynResult<Self> {
         let mut base = QuadEmBase::new(port_name, max_memory)?;
-        let io = connect_octet(qe_port_name, proto::AHXXX_TIMEOUT)?;
-        // C++ sets the input EOS in setAcquire; it is constant for the port's
-        // whole life, so it is set once here. See `octet`.
-        io.set_input_eos(b"\r\n")?;
+        let (io, status) = connect_octet(qe_port_name, proto::AHXXX_TIMEOUT);
+        // C++ returns from its constructor here and keeps the port, with no
+        // meter link and no read thread.
+        if let Err(e) = status {
+            println!(
+                "drvAHxxx:drvAHxxx: error calling pasynOctetSyncIO->connect, status={}, error={}",
+                e.c_status_code(),
+                e.message_display()
+            );
+            return Ok(Self {
+                base,
+                io,
+                shared,
+                model,
+                ah401_series,
+                firmware_version: String::new(),
+                qe_port_name: qe_port_name.to_string(),
+            });
+        }
+        // C++ sets the input EOS only in setAcquire, where a refusal fails the
+        // acquire; it is set here too so the firmware query frames on it.
+        let _ = io.set_input_eos(b"\r\n");
 
         // C++ constructor: resolution_ = 24, model from the modelName argument.
         base.port_base
@@ -111,22 +122,17 @@ impl AhxxxDriver {
             model,
             ah401_series,
             firmware_version: String::new(),
+            qe_port_name: qe_port_name.to_string(),
         };
 
-        // C++ constructor calls reset() under the port lock. The meter may be
-        // offline at IOC start, so a failure is logged, not fatal.
-        if let Err(e) = this.reset() {
-            log::warn!("drvAHxxx: reset at startup failed: {e}");
-        }
+        // C++ constructor calls reset() under the port lock and ignores its
+        // status: the meter may be offline at IOC start.
+        let _ = this.reset();
         Ok(this)
     }
 
     fn params(&self) -> QuadEmParams {
         self.base.params
-    }
-
-    fn acquire_param(&self) -> usize {
-        self.base.nd_params.acquire
     }
 
     /// C++ `AH401Series_`.
@@ -137,7 +143,8 @@ impl AhxxxDriver {
     // --- I/O helpers (C++ writeReadMeter / sendCommand) ---
 
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
-        self.io.write_read(out, proto::MAX_COMMAND_LEN)
+        let (raw, status) = self.io.write_read(out, proto::MAX_COMMAND_LEN).into_parts();
+        status.map(|()| reply_text(&raw))
     }
 
     /// C++ `sendCommand`: stop acquisition around the command, require an
@@ -147,93 +154,67 @@ impl AhxxxDriver {
     /// both for every command, so this does too.
     fn send_command(&mut self, out: &str) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring {
-            self.set_acquire(0)?;
-        }
-        let resp = self.write_read_meter(out)?;
-        if resp != "ACK" && resp != "AK" {
-            log::error!("drvAHxxx: outString={out} expected ACK, received {resp}");
-            return Err(error(format!("AHxxx: {out} -> {resp}, expected ACK")));
-        }
-        if prev_acquiring {
-            self.set_acquire(1)?;
-        }
-        Ok(())
-    }
-
-    /// C++ `drvAHxxx::reset`.
-    fn reset(&mut self) -> AsynResult<()> {
-        self.set_acquire(0)?;
-        self.firmware_version = "Unknown".into();
-        if let Ok(resp) = self.write_read_meter("VER ?") {
-            self.firmware_version = resp;
-        }
-        let p = self.params();
-        self.base
-            .port_base
-            .set_string_param(p.firmware, 0, self.firmware_version.clone())?;
-
-        if self.model == QeModel::Unknown {
-            match proto::model_from_firmware(&self.firmware_version) {
-                Some(m) => {
-                    self.model = m;
-                    self.base.port_base.set_int32_param(p.model, 0, m as i32)?;
-                }
-                None => {
-                    log::error!(
-                        "drvAHxxx: unknown firmware version = {}",
-                        self.firmware_version
-                    );
-                    return Err(error(format!(
-                        "AHxxx: unknown firmware version {}",
-                        self.firmware_version
-                    )));
-                }
+        self.with_acquire_paused(prev_acquiring, prev_acquiring, |this| {
+            let resp = this.write_read_meter(out)?;
+            if resp != "ACK" && resp != "AK" {
+                asyn_print!(
+                    this.base.port_base,
+                    ERROR,
+                    "drvAHxxx:sendCommand: error, outString={out} expected ACK, received {resp}\n"
+                );
+                return Err(error(format!("AHxxx: {out} -> {resp}, expected ACK")));
             }
-        }
-        self.ah401_series
-            .store(proto::is_ah401_series(self.model), Ordering::Release);
-        self.base_reset()
+            Ok(())
+        })
     }
 
     /// C++ `drvAHxxx::readStatus`.
     ///
-    /// As in `drvTetrAMM`, the `goto error` path skips the `setAcquire(1)`
-    /// restore, so a status read that fails leaves the meter stopped.
-    fn read_status_inner(&mut self) -> AsynResult<()> {
+    /// A failed exchange's reply is still parsed ([`trace::Reply::parse`]);
+    /// one that does not parse returns its own status. C discards each
+    /// `writeReadMeter` status (drvAHxxx.cpp:697-772) and reports the empty
+    /// reply as asynError (:801), which `drvQuadEM::writeFloat64` ORs with the
+    /// setter's asynDisconnected into status=7: a disconnected meter alarms
+    /// WRITE there and COMM here. C defect, not copied.
+    fn read_status_inner(&mut self, last: &mut trace::StatusExchange) -> AsynResult<()> {
         let p = self.params();
         let bad = |what: &str, resp: &str| error(format!("AHxxx: bad {what} response: {resp}"));
 
-        let resp = self.write_read_meter("RNG ?")?;
-        let range = proto::parse_range(&resp).ok_or_else(|| bad("RNG", &resp))?;
+        let range = last
+            .query(&self.io, "RNG ?", proto::MAX_COMMAND_LEN)
+            .parse(proto::parse_range, |r| bad("RNG", r))?;
         self.base.port_base.set_int32_param(p.range, 0, range)?;
 
         let read_format =
-            QeReadFormat::from_i32(self.base.port_base.get_int32_param(p.read_format, 0)?);
+            QeReadFormat::from_i32(qe::int_param(&self.base.port_base, p.read_format, 0));
         let mut sample_time;
         if self.is_ah401() {
-            let resp = self.write_read_meter("HLF ?")?;
-            let ping_pong = proto::parse_hlf(&resp).ok_or_else(|| bad("HLF", &resp))?;
+            let ping_pong = last
+                .query(&self.io, "HLF ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_hlf, |r| bad("HLF", r))?;
             self.base
                 .port_base
                 .set_int32_param(p.ping_pong, 0, ping_pong)?;
 
-            let resp = self.write_read_meter("ITM ?")?;
-            let integration_time = proto::parse_itm(&resp).ok_or_else(|| bad("ITM", &resp))?;
+            let integration_time = last
+                .query(&self.io, "ITM ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_itm, |r| bad("ITM", r))?;
             self.base
                 .port_base
                 .set_float64_param(p.integration_time, 0, integration_time)?;
             sample_time = proto::sample_time_ah401(ping_pong, integration_time);
         } else {
-            let resp = self.write_read_meter("CHN ?")?;
-            let num_channels = proto::parse_chn(&resp).ok_or_else(|| bad("CHN", &resp))?;
+            let num_channels = last
+                .query(&self.io, "CHN ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_chn, |r| bad("CHN", r))?;
             self.base
                 .port_base
                 .set_int32_param(p.num_channels, 0, num_channels)?;
             self.shared.acq.lock().num_channels = num_channels;
 
-            let resp = self.write_read_meter("RES ?")?;
-            let resolution = proto::parse_res(&resp).ok_or_else(|| bad("RES", &resp))?;
+            let resolution = last
+                .query(&self.io, "RES ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_res, |r| bad("RES", r))?;
             self.base
                 .port_base
                 .set_int32_param(p.resolution, 0, resolution)?;
@@ -243,8 +224,10 @@ impl AhxxxDriver {
         }
 
         if proto::reads_bias_status(self.model) {
-            let resp = self.write_read_meter("HVS ?")?;
-            match proto::parse_hvs(&resp).ok_or_else(|| bad("HVS", &resp))? {
+            match last
+                .query(&self.io, "HVS ?", proto::MAX_COMMAND_LEN)
+                .parse(proto::parse_hvs, |r| bad("HVS", r))?
+            {
                 None => self.base.port_base.set_int32_param(p.bias_state, 0, 0)?,
                 Some(volts) => {
                     self.base.port_base.set_int32_param(p.bias_state, 0, 1)?;
@@ -262,7 +245,7 @@ impl AhxxxDriver {
             .port_base
             .set_float64_param(p.sample_time, 0, sample_time)?;
 
-        let averaging_time = self.base.port_base.get_float64_param(p.averaging_time, 0)?;
+        let averaging_time = qe::double_param(&self.base.port_base, p.averaging_time, 0);
         let num_average = num_average_from(averaging_time, sample_time);
         self.base
             .port_base
@@ -289,12 +272,13 @@ impl QuadEmDevice for AhxxxDriver {
     fn set_acquire(&mut self, value: i32) -> AsynResult<()> {
         let p = self.params();
         let trigger_mode =
-            QeTriggerMode::from_i32(self.base.port_base.get_int32_param(p.trigger_mode, 0)?);
+            QeTriggerMode::from_i32(qe::int_param(&self.base.port_base, p.trigger_mode, 0));
         let acquire_mode =
-            QeAcquireMode::from_i32(self.base.port_base.get_int32_param(p.acquire_mode, 0)?);
-        let num_average = self.base.port_base.get_int32_param(p.num_average, 0)?;
+            QeAcquireMode::from_i32(qe::int_param(&self.base.port_base, p.acquire_mode, 0));
+        let num_average = qe::int_param(&self.base.port_base, p.num_average, 0);
         let read_format =
-            QeReadFormat::from_i32(self.base.port_base.get_int32_param(p.read_format, 0)?);
+            QeReadFormat::from_i32(qe::int_param(&self.base.port_base, p.read_format, 0));
+        trace::ensure_input_eos(&self.io, &self.base.port_base, "drvAHxxx:setAcquire")?;
 
         if value == 0 {
             // A one-shot acquisition that already finished stopped the meter
@@ -310,6 +294,8 @@ impl QuadEmDevice for AhxxxDriver {
             while self.shared.is_reading_active() {
                 thread::sleep(HANDSHAKE_POLL);
             }
+            // C++ returns the last `TRG OFF` exchange's status.
+            let mut status = Ok(());
             loop {
                 // Both meter families are stopped: which one is on the far end
                 // is not known until the firmware string has been read.
@@ -319,53 +305,60 @@ impl QuadEmDevice for AhxxxDriver {
                 // C++ tests only this last command's status and gives up on
                 // any failure, a timeout included.
                 if let Err(e) = self.write_read_meter("TRG OFF") {
-                    log::error!("drvAHxxx: error calling writeRead: {e}");
+                    asyn_print!(
+                        self.base.port_base,
+                        ERROR,
+                        "drvAHxxx:setAcquire: error calling pasynOctetSyncIO->writeRead, status={}\n",
+                        e.c_status_code()
+                    );
+                    status = Err(e);
                     break;
                 }
-                // Flush, then read with a short timeout to drain any responses.
+                // Flush, then read with a short timeout to drain any responses;
+                // only a timeout that read nothing ends the loop.
                 let _ = self.io.flush();
-                match self.io.read_line(proto::MAX_COMMAND_LEN) {
-                    Ok(_) => {}
-                    Err(e) if is_timeout(&e) => break,
-                    Err(e) => {
-                        log::error!("drvAHxxx: error draining meter responses: {e}");
-                        break;
-                    }
+                let (drained, status) = outcome(self.io.read_line(proto::MAX_COMMAND_LEN));
+                if let (AsynStatus::Timeout, 0, _) = trace::read_result(&drained, &status) {
+                    break;
                 }
             }
-            self.base_set_acquire(0)?;
-            return Ok(());
+            self.base_set_acquire(0);
+            return status;
         }
 
-        self.base_set_acquire(1)?;
+        self.base_set_acquire(1);
 
         let num_acquire = proto::naq_value(acquire_mode, num_average);
-        let is_ah401 = self.is_ah401();
         let model = self.model;
-        let result = (|| -> AsynResult<()> {
-            // Put the device in the appropriate mode.
-            self.write_read_meter(proto::cmd_read_format(read_format))?;
+        // Put the device in the appropriate mode. As in C++ only the command
+        // that starts the meter decides the status.
+        let _ = self.write_read_meter(proto::cmd_read_format(read_format));
 
-            // In one-shot mode ask the meter for a specific number of samples.
-            // On the AH501BE the NAQ command starts the acquisition and is not
-            // echoed, so it is sent below instead.
-            if model != QeModel::Ah501be {
-                self.write_read_meter(&proto::cmd_naq(num_acquire))?;
-            }
+        // In one-shot mode ask the meter for a specific number of samples.
+        // On the AH501BE the NAQ command starts the acquisition and is not
+        // echoed, so it is sent below instead.
+        if model != QeModel::Ah501be {
+            let _ = self.write_read_meter(&proto::cmd_naq(num_acquire));
+        }
 
-            if trigger_mode == QeTriggerMode::ExtTrigger || trigger_mode == QeTriggerMode::ExtGate {
-                // External trigger mode: the meter waits for the trigger.
-                self.write_read_meter("TRG ON")?;
-            } else if is_ah401 {
-                // The AH401 series echoes an ACK after ACQ ON; the AH501s do not.
-                self.write_read_meter("ACQ ON")?;
-            } else if acquire_mode == QeAcquireMode::Single && model == QeModel::Ah501be {
-                self.io.write(&proto::cmd_naq(num_acquire))?;
-            } else {
-                self.io.write("ACQ ON")?;
-            }
-            Ok(())
-        })();
+        let started = if trigger_mode == QeTriggerMode::ExtTrigger
+            || trigger_mode == QeTriggerMode::ExtGate
+        {
+            // External trigger mode: the meter waits for the trigger.
+            self.write_read_meter("TRG ON").map(drop)
+        } else if self.is_ah401() {
+            // The AH401 series echoes an ACK after ACQ ON; the AH501s do not.
+            self.write_read_meter("ACQ ON").map(drop)
+        } else if acquire_mode == QeAcquireMode::Single && model == QeModel::Ah501be {
+            self.io.write(&proto::cmd_naq(num_acquire)).map(drop)
+        } else {
+            self.io.write("ACQ ON").map(drop)
+        };
+        // Binary mode overwrites it with the input-EOS call's status.
+        let status = match read_format {
+            QeReadFormat::Binary => Ok(()),
+            _ => started,
+        };
 
         {
             let mut acq = self.shared.acq.lock();
@@ -374,18 +367,15 @@ impl QuadEmDevice for AhxxxDriver {
             acq.read_format = read_format as i32;
         }
 
-        if let Err(e) = result {
-            // C++ `if (status) acquiring_ = 0;`
-            self.shared.set_acquiring(false);
-            return Err(e);
-        }
-
         // Setting the flag before the signal keeps the read thread from going
         // straight back to sleep; C++ orders it the other way because both
         // sides run under the port lock.
         self.shared.set_acquiring(true);
         self.shared.acquire_start.signal();
-        Ok(())
+        if status.is_err() {
+            self.shared.set_acquiring(false);
+        }
+        status
     }
 
     /// C++ `drvAHxxx::setRange`: `"RNG %d"`.
@@ -456,17 +446,69 @@ impl QuadEmDevice for AhxxxDriver {
     /// C++ `drvAHxxx::readStatus`.
     fn read_status(&mut self) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring {
-            self.set_acquire(0)?;
+        self.with_acquire_paused(prev_acquiring, prev_acquiring, |this| {
+            let mut last = trace::StatusExchange::default();
+            this.read_status_inner(&mut last).inspect_err(|_| {
+                asyn_print!(
+                    this.base.port_base,
+                    ERROR,
+                    "drvAHxxx:getStatus: error, outString={}, inString={}\n",
+                    last.out,
+                    last.inp
+                );
+            })
+        })
+    }
+
+    /// C++ `drvAHxxx::reset`.
+    fn reset(&mut self) -> AsynResult<()> {
+        let _ = self.set_acquire(0);
+        self.firmware_version = "Unknown".into();
+        // C copies `inString_` whatever the `VER ?` status
+        // (drvAHxxx.cpp:408-411): a reply cut by a failed read is kept. One
+        // that delivered nothing would publish a stale or empty buffer; that
+        // C defect is not copied.
+        let (raw, status) = self
+            .io
+            .write_read("VER ?", proto::MAX_COMMAND_LEN)
+            .into_parts();
+        if status.is_ok() || !raw.is_empty() {
+            self.firmware_version = reply_text(&raw);
         }
-        if let Err(e) = self.read_status_inner() {
-            log::error!("drvAHxxx: readStatus failed: {e}");
-            return Err(e);
+        let p = self.params();
+        self.base
+            .port_base
+            .set_string_param(p.firmware, 0, self.firmware_version.clone())?;
+
+        if self.model == QeModel::Unknown {
+            match proto::model_from_firmware(&self.firmware_version) {
+                Some(m) => {
+                    self.model = m;
+                    self.base.port_base.set_int32_param(p.model, 0, m as i32)?;
+                }
+                None => {
+                    asyn_print!(
+                        self.base.port_base,
+                        ERROR,
+                        "drvAHxxx:reset: unknown firmware version = {}\n",
+                        self.firmware_version
+                    );
+                    return Err(error(format!(
+                        "AHxxx: unknown firmware version {}",
+                        self.firmware_version
+                    )));
+                }
+            }
         }
-        if prev_acquiring {
-            self.set_acquire(1)?;
-        }
-        Ok(())
+        self.ah401_series
+            .store(proto::is_ah401_series(self.model), Ordering::Release);
+        self.base_reset()
+    }
+
+    /// C++ `drvAHxxx::exitHandler` (drvAHxxx.cpp:805-810): the meter stops
+    /// streaming when the IOC goes.
+    fn exit_handler(&mut self) {
+        let _ = self.set_acquire(0);
     }
 }
 
@@ -483,140 +525,26 @@ impl PortDriver for AhxxxDriver {
         &mut self.base.port_base
     }
 
-    /// C++ `drvQuadEM::writeInt32` with the AHxxx overrides bound in.
+    /// C++ `drvAHxxx::report`, which ends in the base report.
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "drvAHxxx: port={}, IP port={}, firmware version={}",
+            self.base.port_base.port_name, self.qe_port_name, self.firmware_version
+        );
+        self.asyn_port_driver_report(out, level);
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_int32_param(reason, channel, value)?;
-
-        if reason == self.acquire_param() {
-            if value != 0 {
-                self.shared.ring.lock().flush();
-            }
-            self.set_acquire(value)?;
-        } else if reason == p.acquire_mode {
-            if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
-                self.set_acquire(0)?;
-                self.base
-                    .port_base
-                    .set_int32_param(self.acquire_param(), 0, 0)?;
-            }
-            self.shared.acq.lock().acquire_mode = value;
-            self.read_status()?;
-        } else if reason == p.geometry {
-            self.shared.pos.lock().geometry = value;
-        } else if reason == p.bias_state {
-            self.set_bias_state(value)?;
-            self.read_status()?;
-        } else if reason == p.num_channels {
-            self.set_num_channels(value)?;
-            self.read_status()?;
-        } else if reason == p.resolution {
-            self.set_resolution(value)?;
-            self.read_status()?;
-        } else if reason == p.bias_interlock
-            || reason == p.trigger_mode
-            || reason == p.trigger_polarity
-        {
-            // setBiasInterlock, setTriggerMode and setTriggerPolarity are
-            // drvQuadEM dummies for this driver: only readStatus runs.
-            self.read_status()?;
-        } else if reason == p.num_acquire {
-            self.shared.acq.lock().num_acquire = value;
-            self.read_status()?;
-        } else if reason == p.ping_pong {
-            self.set_ping_pong(value)?;
-            self.read_status()?;
-        } else if reason == p.range {
-            // drvQuadEM::writeInt32 calls the per-channel setRange for a
-            // non-zero address; drvAHxxx does not override it, so only the
-            // whole-meter range reaches the wire.
-            if channel == 0 {
-                self.set_range(value)?;
-            }
-            self.read_status()?;
-        } else if reason == p.read_data {
-            self.shared.trigger_callbacks();
-        } else if reason == p.values_per_read {
-            self.shared.acq.lock().values_per_read = value;
-            self.read_status()?;
-        } else if reason == p.read_format {
-            self.set_read_format(value)?;
-            self.read_status()?;
-        } else if reason == p.read_status {
-            // C++ skips this while acquiring: too disruptive.
-            if !self.shared.is_acquiring() {
-                self.read_status()?;
-            }
-        } else if reason == p.reset {
-            self.reset()?;
-            self.read_status()?;
-        } else if self.base.write_int32_pool(reason)? {
-            // Handled by the NDArray pool controls.
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_int32(user, value)
     }
 
-    /// C++ `drvQuadEM::writeFloat64` with the AHxxx overrides bound in.
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_float64_param(reason, channel, value)?;
-        self.cache_position_param(reason, channel, value);
-
-        if reason == p.averaging_time {
-            self.shared.ring.lock().flush();
-            self.read_status()?;
-        } else if reason == p.bias_voltage {
-            self.set_bias_voltage(value)?;
-            self.read_status()?;
-        } else if reason == p.integration_time {
-            self.set_integration_time(value)?;
-            self.read_status()?;
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_float64(user, value)
     }
 }
 
-impl AhxxxDriver {
-    /// Mirror a parameter write into the shared position snapshot the read
-    /// thread consumes.
-    fn cache_position_param(&mut self, reason: usize, addr: i32, value: f64) {
-        let p = self.params();
-        let i = addr.clamp(0, QE_MAX_INPUTS as i32 - 1) as usize;
-        let j = addr.clamp(0, 1) as usize;
-        let mut pos = self.shared.pos.lock();
-        if reason == p.current_offset {
-            pos.current_offset[i] = value;
-        } else if reason == p.current_scale {
-            pos.current_scale[i] = value;
-        } else if reason == p.position_offset {
-            pos.position_offset[j] = value;
-        } else if reason == p.position_scale {
-            pos.position_scale[j] = value;
-        } else if reason == p.weight_xsum {
-            pos.weight_xsum[i] = value;
-        } else if reason == p.weight_ysum {
-            pos.weight_ysum[i] = value;
-        } else if reason == p.weight_xdelta {
-            pos.weight_xdelta[i] = value;
-        } else if reason == p.weight_ydelta {
-            pos.weight_ydelta[i] = value;
-        }
-    }
-}
+impl AhxxxDriver {}
 
 // ===========================================================================
 // Read thread
@@ -686,35 +614,42 @@ fn read_thread(ctx: ReadContext) {
                     && QeTriggerMode::from_i32(ctx.shared.acq.lock().trigger_mode)
                         == QeTriggerMode::ExtGate;
 
-                let mut outcome = match ctx.io.read_binary(n_requested) {
-                    Ok(o) => o,
-                    Err(e) => {
+                let mut outcome = match outcome(ctx.io.locked_read_binary(n_requested)) {
+                    (o, Ok(()))
+                        if o.data.len() == n_requested && o.eom.contains(EomReason::CNT) =>
+                    {
+                        o
+                    }
+                    (o, status @ Ok(())) => {
+                        trace::print_read_error(&ctx.handle, "drvAHxxx:readThread", &o, &status);
+                        thread::sleep(READ_ERROR_BACKOFF);
+                        continue;
+                    }
+                    (o, Err(e)) => {
                         // C++ `readThread` (drvAHxxx.cpp:252-259): in Ext.
                         // Gate mode the AH501BE answers its `ACK\r\n`
                         // preamble and then goes quiet waiting for the
                         // external gate pulse, so the binary read times out
-                        // after exactly those 5 bytes. Only
-                        // `AsynError::partial_read` still carries them.
-                        if is_ext_gate_ack_timeout(&e, ext_gate) {
-                            ctx.shared.trigger_callbacks();
-                        }
+                        // after exactly those 5 bytes.
                         if !is_timeout(&e) {
-                            log::error!("drvAHxxx: unexpected error reading meter: {e}");
+                            trace::print_read_error(
+                                &ctx.handle,
+                                "drvAHxxx:readThread",
+                                &o,
+                                &Err(e),
+                            );
                             thread::sleep(READ_ERROR_BACKOFF);
+                        } else if is_ext_gate_ack_timeout(&o.data, &e, ext_gate) {
+                            asyn_print!(
+                                ctx.handle,
+                                IO_DRIVER,
+                                "drvAHxxx::readThread timeout with nRead=5, triggering callbacks\n"
+                            );
+                            let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                         }
                         continue;
                     }
                 };
-
-                if outcome.data.len() != n_requested || !outcome.eom.contains(EomReason::CNT) {
-                    log::error!(
-                        "drvAHxxx: unexpected error reading meter, nRead={} expected {n_requested}, eom={:?}",
-                        outcome.data.len(),
-                        outcome.eom
-                    );
-                    thread::sleep(READ_ERROR_BACKOFF);
-                    continue;
-                }
 
                 // C++ `readThread` (drvAHxxx.cpp:265-283): a full, correctly
                 // terminated read can still start with the ACK preamble if
@@ -724,16 +659,39 @@ fn read_thread(ctx: ReadContext) {
                 // below already rejects a too-short buffer, so a failed or
                 // short refill is caught there rather than re-checked here.
                 if ext_gate && proto::starts_with_ack_preamble(&outcome.data) {
-                    ctx.shared.trigger_callbacks();
+                    asyn_print!(
+                        ctx.handle,
+                        IO_DRIVER,
+                        "drvAHxxx::readThread found ACK\\r\\n at start of data, triggering callbacks\n"
+                    );
+                    let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                     let preamble_len = proto::ACK_PREAMBLE.len();
                     outcome.data.drain(0..preamble_len);
-                    match ctx.io.read_binary(preamble_len) {
-                        Ok(extra) => outcome.data.extend_from_slice(&extra.data),
-                        Err(e) => log::error!(
-                            "drvAHxxx: unexpected error reading additional {preamble_len} bytes from meter: {e}"
-                        ),
+                    let (extra, status) =
+                        crate::octet::outcome(ctx.io.locked_read_binary(preamble_len));
+                    match &status {
+                        Ok(())
+                            if extra.data.len() == preamble_len
+                                && extra.eom.contains(EomReason::CNT) => {}
+                        _ => {
+                            let (status, n_read, eom) = trace::read_result(&extra, &status);
+                            asyn_print!(
+                                ctx.handle,
+                                ERROR,
+                                "drvAHxxx:readThread: unexpected error reading additional {preamble_len} bytes from meter status={}, nRead={n_read}, eomReason={eom}\n",
+                                status as i32
+                            );
+                        }
                     }
+                    // C reads the refill into the frame whatever its status.
+                    outcome.data.extend_from_slice(&extra.data);
                 }
+                trace::print_io(
+                    &ctx.handle,
+                    trace::TraceMask::IO_DRIVER,
+                    &outcome.data,
+                    format_args!("drvAHxxx::readThread buffer read\n"),
+                );
 
                 let decoded = if ah401_series {
                     proto::accumulate_binary_ah401(&outcome.data, values_per_read as usize)
@@ -752,19 +710,21 @@ fn read_thread(ctx: ReadContext) {
             }
             QeReadFormat::Ascii => {
                 for _ in 0..values_per_read {
-                    let outcome = match ctx.io.read_line(proto::ASCII_BUFFER_SIZE) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            if !is_timeout(&e) {
-                                log::error!("drvAHxxx: unexpected error reading meter: {e}");
+                    let outcome = match outcome(ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE)) {
+                        (o, Ok(())) if o.eom.contains(EomReason::EOS) => o,
+                        (o, status) => {
+                            if trace::read_result(&o, &status).0 != AsynStatus::Timeout {
+                                trace::print_read_error(
+                                    &ctx.handle,
+                                    "drvAHxxx:readThread",
+                                    &o,
+                                    &status,
+                                );
                                 thread::sleep(READ_ERROR_BACKOFF);
                             }
                             continue;
                         }
                     };
-                    if !outcome.eom.contains(EomReason::EOS) {
-                        continue;
-                    }
                     let line = outcome.as_str();
                     let values = if ah401_series {
                         proto::parse_ascii_ah401(&line, proto::AH401_NUM_CHANNELS)
@@ -776,8 +736,10 @@ fn read_thread(ctx: ReadContext) {
                         }
                         let n_expected = proto::ah501_ascii_expected_len(resolution, num_channels);
                         if outcome.data.len() != n_expected {
-                            log::error!(
-                                "drvAHxxx: error reading meter nRead={}, expected {n_expected}, input={line}",
+                            asyn_print!(
+                                ctx.handle,
+                                ERROR,
+                                "drvAHxxx:readThread: error reading meter nRead={}, expected {n_expected}, input={line}\n",
                                 outcome.data.len()
                             );
                             continue;
@@ -805,9 +767,10 @@ pub struct AhxxxRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub params: QuadEmParams,
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
-    pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
+    pub pool: epics_rs::ad_core::ndarray_pool::DriverPool,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
-    _read_thread: thread::JoinHandle<()>,
+    /// `None` when the constructor found no QE port.
+    _read_thread: Option<thread::JoinHandle<()>>,
     _callback_thread: thread::JoinHandle<()>,
 }
 
@@ -823,19 +786,16 @@ impl AhxxxRuntime {
 /// Rust `NDArrayPool`. `model_name` is one of `AH401B`, `AH401D`, `AH501`,
 /// `AH501BE`, `AH501C`, `AH501D`.
 pub fn create_ahxxx(
-    port_name: &str,
+    claim: &PortClaim,
     qe_port_name: &str,
     ring_buffer_size: usize,
     max_memory: usize,
     model_name: &str,
 ) -> AsynResult<AhxxxRuntime> {
+    let port_name = claim.name();
+    // Any other name is C++'s QE_ModelUnknown, which reset() resolves from
+    // the meter's firmware version.
     let model = proto::model_from_name(model_name);
-    if model == QeModel::Unknown {
-        return Err(error(format!(
-            "drvAHxxxConfigure: unknown model '{model_name}'; use one of \
-             AH401B, AH401D, AH501, AH501BE, AH501C, AH501D"
-        )));
-    }
 
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
     let ah401_series = Arc::new(AtomicBool::new(proto::is_ah401_series(model)));
@@ -855,7 +815,7 @@ pub fn create_ahxxx(
     let io = driver.io.clone();
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let read_ctx = ReadContext {
@@ -866,17 +826,20 @@ pub fn create_ahxxx(
         ah401_series,
         is_ah501be: model == QeModel::Ah501be,
     };
-    let read_thread_handle = thread::Builder::new()
-        .name("drvAHxxxTask".into())
-        .spawn(move || read_thread(read_ctx))
-        .expect("failed to spawn drvAHxxxTask");
+    let read_thread_handle = read_ctx.io.handle().is_some().then(|| {
+        thread::Builder::new()
+            .name("drvAHxxxTask".into())
+            .spawn(move || read_thread(read_ctx))
+            .expect("failed to spawn drvAHxxxTask")
+    });
 
-    let callback_thread = qe::start_callback_task(CallbackContext {
+    let callback_thread = qe::start_callback_task::<AhxxxDriver>(CallbackContext {
         trigger_rx,
         handle,
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });
@@ -895,26 +858,305 @@ pub fn create_ahxxx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::asyn::interpose::PartialOctetRead;
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
-    /// `AsynError::PartialRead` is how `asyn-rs` 0.24+ carries a timed-out
-    /// read's transferred bytes (see the module docs); a bare
-    /// `AsynError::Status` match would miss it entirely.
+    /// C++ prints the connect failure and returns from its constructor: the
+    /// port stays, with no read thread, and a meter command fails on the
+    /// unbound asynUser.
     #[test]
-    fn is_timeout_recognizes_a_partial_read_wrapped_timeout() {
-        let e = AsynError::Status {
-            status: AsynStatus::Timeout,
-            message: "read timeout".into(),
-        }
-        .with_partial_read(PartialOctetRead {
-            data: proto::ACK_PREAMBLE.to_vec(),
-            eom_reason: EomReason::empty(),
-        });
-        assert!(is_timeout(&e));
+    fn a_missing_qe_port_keeps_the_port_without_a_link() {
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_NOQE").unwrap(),
+            "QE_AH_NOQE_IP",
+            4,
+            0,
+            "AH501",
+        )
+        .unwrap();
+        assert!(rt._read_thread.is_none());
+        let err = rt
+            .port_handle()
+            .submit_blocking(
+                epics_rs::asyn::request::RequestOp::Int32Write { value: 1 },
+                epics_rs::asyn::user::AsynUser::new(rt.params.range),
+            )
+            .unwrap_err();
         assert_eq!(
-            e.partial_read().map(|p| p.data.as_slice()),
-            Some(proto::ACK_PREAMBLE)
+            err.message(),
+            format!(
+                "drvQuadEM:writeInt32: status=3, function={}, name=QE_RANGE, value=1",
+                rt.params.range
+            )
         );
+    }
+
+    /// C++ keeps an unrecognised model name as QE_ModelUnknown and lets
+    /// reset() take the model from `VER ?`.
+    #[test]
+    fn an_unknown_model_name_is_resolved_from_the_firmware() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let reply: &[u8] = if buf[..n].starts_with(b"VER") {
+                    b"AH501D 3.0\r\n"
+                } else {
+                    b"ACK\r\n"
+                };
+                if sock.write_all(reply).is_err() {
+                    break;
+                }
+            }
+        });
+        let (_io, _meter) = crate::octet::create_ip_port(
+            "QE_AH_UNKMODEL_IP",
+            &addr.to_string(),
+            proto::AHXXX_TIMEOUT,
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_UNKMODEL").unwrap(),
+            "QE_AH_UNKMODEL_IP",
+            4,
+            0,
+            "AH999",
+        )
+        .unwrap();
+        let model = rt
+            .port_handle()
+            .read_int32_blocking(rt.params.model, 0)
+            .unwrap();
+        assert_eq!(model, QeModel::Ah501d as i32);
+    }
+
+    /// C++ `drvAHxxx::exitHandler` is `setAcquire(0)` (drvAHxxx.cpp:805-810),
+    /// so the hook drvQuadEM arms at IOC exit sends the meter `ACQ OFF`.
+    #[test]
+    fn the_exit_handler_stops_the_meter() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let reply: &[u8] = if buf[..n].starts_with(b"VER") {
+                    b"AH401D 2.0\r\n"
+                } else {
+                    b"ACK\r\n"
+                };
+                if sock.write_all(reply).is_err() {
+                    break;
+                }
+            }
+        });
+        let (_io, _meter) = crate::octet::create_ip_port(
+            "QE_AH_EXIT_IP",
+            &addr.to_string(),
+            proto::AHXXX_TIMEOUT,
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_EXIT").unwrap(),
+            "QE_AH_EXIT_IP",
+            4,
+            0,
+            "AH401D",
+        )
+        .unwrap();
+        // reset() already stopped the meter once.
+        let _ = rx.try_iter().count();
+
+        rt.port_handle()
+            .with_driver_blocking(|d: &mut AhxxxDriver| d.exit_handler())
+            .unwrap();
+        let sent: String = rx.try_iter().collect();
+        assert!(sent.starts_with("ACQ OFF"), "{sent:?}");
+    }
+
+    /// C++ sets the input EOS only in setAcquire (drvAHxxx.cpp:465-472): a
+    /// port that refuses it keeps the driver and fails the acquire instead.
+    #[test]
+    fn an_input_eos_refusal_fails_the_acquire_not_the_port() {
+        let (_meter, _runtime) = crate::octet::tests::eos_refusing_port("QE_AH_NOEOS_IP");
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_NOEOS").unwrap(),
+            "QE_AH_NOEOS_IP",
+            4,
+            0,
+            "AH501D",
+        )
+        .unwrap();
+        let err = rt
+            .port_handle()
+            .write_int32_blocking(rt.nd_params.acquire, 0, 1)
+            .unwrap_err();
+        assert_eq!(err.status(), epics_rs::asyn::error::AsynStatus::Error);
+        assert_eq!(
+            err.message(),
+            format!(
+                "drvQuadEM:writeInt32: status=3, function={}, name=ACQUIRE, value=1",
+                rt.nd_params.acquire
+            )
+        );
+    }
+
+    /// A `VER ?` that fails publishes "Unknown", not C's stale `inString_`.
+    #[test]
+    fn a_failed_version_query_publishes_unknown() {
+        let (_io, _meter) = crate::octet::create_ip_port(
+            "QE_AH_NOVER_IP",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_NOVER").unwrap(),
+            "QE_AH_NOVER_IP",
+            4,
+            0,
+            "AH401B",
+        )
+        .unwrap();
+        let fw = rt
+            .port_handle()
+            .get_string_param_blocking(rt.params.firmware, 0, 256)
+            .unwrap();
+        assert_eq!(fw, b"Unknown");
+    }
+
+    /// A meter whose `VER ?` reply is cut by a timeout.
+    struct CutVersion {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: &'static [u8],
+        cut: bool,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for CutVersion {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> AsynResult<usize> {
+            self.cut = data.starts_with(b"VER");
+            self.reply = if self.cut { b"AH501D 3.0" } else { b"ACK" };
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            buf: &mut [u8],
+        ) -> epics_rs::asyn::interpose::OctetReadResult {
+            use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+            let n = self.reply.len();
+            buf[..n].copy_from_slice(self.reply);
+            if !self.cut {
+                return OctetReadResult::ok(n, EomReason::empty());
+            }
+            OctetReadResult {
+                status: Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "read timeout".into(),
+                }),
+                ..OctetReadResult::ok(n, EomReason::empty())
+            }
+        }
+    }
+
+    /// drvAHxxx.cpp:408-411 copies `inString_` whatever the `VER ?` status,
+    /// so a reply cut by a timeout still names the firmware and the model.
+    #[test]
+    fn a_version_cut_by_a_timeout_is_still_read() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        let (_io, _meter) = crate::octet::tests::published_port(
+            "QE_AH_CUTVER_IP",
+            CutVersion {
+                base: PortDriverBase::new(
+                    "QE_AH_CUTVER_IP",
+                    1,
+                    PortFlags::default(),
+                    InterfaceMask::OCTET_TRANSPORT,
+                    InterfaceMask::OCTET,
+                ),
+                reply: b"",
+                cut: false,
+            },
+        );
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_CUTVER").unwrap(),
+            "QE_AH_CUTVER_IP",
+            4,
+            0,
+            "AH999",
+        )
+        .unwrap();
+        let fw = rt
+            .port_handle()
+            .get_string_param_blocking(rt.params.firmware, 0, 256)
+            .unwrap();
+        assert_eq!(fw, b"AH501D 3.0");
+        let model = rt
+            .port_handle()
+            .read_int32_blocking(rt.params.model, 0)
+            .unwrap();
+        assert_eq!(model, QeModel::Ah501d as i32);
+    }
+
+    /// A down meter link fails a write with the link's asynDisconnected, not
+    /// C's asynError from parsing an empty status reply.
+    #[test]
+    fn a_status_read_on_a_down_meter_keeps_the_link_status() {
+        let (_io, _meter) = crate::octet::create_ip_port(
+            "QE_AH_DOWN_IP",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_DOWN").unwrap(),
+            "QE_AH_DOWN_IP",
+            4,
+            0,
+            "AH401B",
+        )
+        .unwrap();
+        // The AH401B has no bias supply, so only readStatus talks to the meter.
+        let err = rt
+            .port_handle()
+            .write_float64_blocking(rt.params.bias_voltage, 0, 0.0)
+            .unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Disconnected, "{err:?}");
     }
 
     #[test]
@@ -922,28 +1164,25 @@ mod tests {
         assert!(!is_timeout(&error("boom")));
     }
 
-    /// `AsynError::PartialRead` wraps non-timeout failures too (`error.rs`
-    /// cites a mid-transfer ECONNRESET). One that happens to carry exactly
-    /// the 5-byte ACK preamble must NOT trigger callbacks — only a genuine
-    /// timeout carrying it should.
+    /// A mid-transfer ECONNRESET that happens to leave exactly the 5-byte
+    /// ACK preamble must NOT trigger callbacks — only a genuine timeout
+    /// carrying it should.
     #[test]
     fn ext_gate_ack_trigger_requires_a_genuine_timeout() {
-        let ack_payload = PartialOctetRead {
-            data: proto::ACK_PREAMBLE.to_vec(),
-            eom_reason: EomReason::empty(),
-        };
         let non_timeout = AsynError::Status {
             status: AsynStatus::Error,
             message: "read error: ECONNRESET".into(),
-        }
-        .with_partial_read(ack_payload.clone());
-        assert!(!is_ext_gate_ack_timeout(&non_timeout, true));
+        };
+        assert!(!is_ext_gate_ack_timeout(
+            proto::ACK_PREAMBLE,
+            &non_timeout,
+            true
+        ));
 
         let timeout = AsynError::Status {
             status: AsynStatus::Timeout,
             message: "read timeout".into(),
-        }
-        .with_partial_read(ack_payload);
-        assert!(is_ext_gate_ack_timeout(&timeout, true));
+        };
+        assert!(is_ext_gate_ack_timeout(proto::ACK_PREAMBLE, &timeout, true));
     }
 }

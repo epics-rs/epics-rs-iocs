@@ -1,0 +1,5 @@
+file "BIS_settings.req",          P=$(P),  R=cam1:
+# C has "ffile" here, which readReqFile takes as a PV named ffile, so
+# NDStdArrays' settings were never saved.
+file "NDStdArrays_settings.req",  P=$(P),  R=image1:
+file "commonPlugin_settings.req", P=$(P)

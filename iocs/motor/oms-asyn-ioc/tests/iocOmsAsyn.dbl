@@ -1,0 +1,20 @@
+# dbl of motor R7-4-5 motorOmsAsyn iocBoot/iocOmsAsyn st.cmd
+omsAsyn:alldone
+omsAsyn:alldoneBlink
+omsAsyn:allstop
+omsAsyn:m1
+omsAsyn:m1_able
+omsAsyn:m1Direction
+omsAsyn:m1Offset
+omsAsyn:m1Resolution
+omsAsyn:m1_twCh
+omsAsyn:m1_vCh
+omsAsyn:m2
+omsAsyn:m2_able
+omsAsyn:m2Direction
+omsAsyn:m2Offset
+omsAsyn:m2Resolution
+omsAsyn:m2_twCh
+omsAsyn:m2_vCh
+omsAsyn:moving
+omsAsyn:movingDiff

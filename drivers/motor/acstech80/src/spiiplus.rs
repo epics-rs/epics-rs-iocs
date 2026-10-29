@@ -2,8 +2,7 @@
 //!
 //! Ported from `motorAcsTech80/acsTech80App/src/drvSPiiPlus.cc` +
 //! `devSPiiPlus.cc` (the model-1 dev/drv pair). Commands are ACSPL+ text
-//! terminated by CR (`\r`, the driver owns output framing; the startup script
-//! sets only the input EOS). Query commands begin with `?` and return a value;
+//! terminated by CR (`\r`, the port EOS set both ways at connect as C does). Query commands begin with `?` and return a value;
 //! a reply containing `?` signals a controller error. Set/motion commands do
 //! not return a value, but the framework reads an acknowledgment after every
 //! command, so this port reads (and discards) a reply after each command to
@@ -35,30 +34,36 @@
 //!
 //! Positions are read with `?APOS`/`?FPOS` and commanded with `ptp`/`target_pos`
 //! in controller counts, with no resolution scaling, so the asyn-rs motor
-//! boundary is counts: positions pass through with `NINT` rounding, the record's
-//! `MRES` is 1, and its `EGU` is counts.
+//! boundary is counts: a commanded position is rounded with `NINT`, a read one
+//! truncated by C's `(long)` cast, the record's `MRES` is 1, and its `EGU` is
+//! counts.
 //!
 //! ## Deviations from C (documented)
 //!
 //! - The C poller is a background thread; here the per-mode query set runs
-//!   inside [`poll`](AsynMotor::poll).
+//!   inside [`poll`](Model1Motor::poll).
 //! - The C `set_status` velocity readback is marked `NEEDS WORK` and reports the
 //!   feedback velocity `?FVEL`; this port reports the same.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{
+    Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::{MoveStrings, init_poll, init_read};
 use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
 
-/// Command terminator (C `ACS_EOS`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
+/// Port EOS set at connect (C `ACS_EOS`, drvSPiiPlus.cc:690-691).
+pub const INPUT_EOS: &[u8] = b"\r";
+pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Motor-status (`MST`) bit masks (C `MOTOR_STATUS`).
 const MST_ENABLED: i32 = 0x01;
@@ -78,8 +83,19 @@ const OP_ABS_MOVE: i32 = 1;
 const OP_REL_MOVE: i32 = 2;
 const OP_JOG_MOVE: i32 = 3;
 
+/// C `MAX_AXIS` (motor.h:129): the axes a model-1 card holds.
+const MAX_AXIS: usize = 32;
+
 /// ACSPL kinematic axis letters, indexed by 0-based axis (C `ACSPL_axis`).
 const AXIS_LETTERS: [&str; 8] = ["X", "Y", "Z", "T", "A", "B", "C", "D"];
+
+/// C `CommStatus`, kept per card.
+#[derive(Clone, Copy, PartialEq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
+}
 
 /// Controller command-interface mode (C `enum CMND_MODES`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,6 +135,7 @@ pub struct SpiiPlusController {
     ident: String,
     mode: CommandMode,
     num_axes: usize,
+    comm_state: CommState,
 }
 
 impl SpiiPlusController {
@@ -131,39 +148,42 @@ impl SpiiPlusController {
             ident: String::new(),
             mode,
             num_axes: 0,
+            comm_state: CommState::Normal,
         };
 
-        // Probe the controller (retry up to 3 times), then stop all motion.
-        let mut probed = false;
-        for _ in 0..3 {
-            let reply = ctrl.command("?VR")?;
-            if !reply.is_empty() && !reply.contains('?') {
-                probed = true;
-                break;
-            }
+        // C's send_recv_mess returns the bytes read, so any reply makes the
+        // card present and only a silent one is probed again
+        // (drvSPiiPlus.cc:692-701); halt and ident statuses are ignored.
+        let answered = (0..3).any(|_| {
+            ctrl.handle
+                .write_read(0, b"?VR", READ_BUF)
+                .nbytes_transferred()
+                > 0
+        });
+        if !answered {
+            return Err(spiiplus_err("SPiiPlus: no response to ?VR probe"));
         }
-        if !probed {
-            return Err(spiiplus_err("SPiiPlus: no valid response to ?VR probe"));
-        }
-        ctrl.command("halt all")?;
-        ctrl.ident = ctrl.command("?VR")?;
+        let _ = ctrl.command("halt all");
+        ctrl.ident = ctrl.command("?VR").unwrap_or_default();
 
-        // Auto-detect the axis count: ?APOS(n) succeeds until n is out of range.
-        let mut n = 0usize;
-        loop {
-            let reply = ctrl.command(&format!("?APOS({n})"))?;
-            if reply.is_empty() || reply.contains('?') {
-                break;
-            }
-            n += 1;
-            if n > AXIS_LETTERS.len() {
-                break;
-            }
-        }
-        if n == 0 {
-            return Err(spiiplus_err("SPiiPlus: no axes detected (?APOS(0) failed)"));
-        }
-        ctrl.num_axes = n;
+        // Auto-detect the axis count: ?APOS(n) succeeds until n is out of
+        // range. A failed one only ends the count (drvSPiiPlus.cc:711-721),
+        // so a card that answered ?VR stays, with no axes at worst.
+        // C defects not copied: C keeps every axis that answers, past its
+        // MAX_AXIS motor_info slots and, in CONNECT mode, past the 8
+        // ACSPL_axis[] letters ?FPOS reads (:260). The probes are C's up
+        // to ?APOS(MAX_AXIS); the count stops at the mode's bound.
+        let bound = match mode {
+            CommandMode::Connect => AXIS_LETTERS.len(),
+            _ => MAX_AXIS,
+        };
+        ctrl.num_axes = (0..=MAX_AXIS)
+            .take_while(|n| {
+                let reply = ctrl.command(&format!("?APOS({n})")).unwrap_or_default();
+                !reply.is_empty() && !reply.contains('?')
+            })
+            .count()
+            .min(bound);
         Ok(ctrl)
     }
 
@@ -182,21 +202,37 @@ impl SpiiPlusController {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and return its reply (trimmed). Every command produces an
     /// acknowledgment or value, so this is used for both queries and set
     /// commands (whose reply is discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        self.command_bytes(cmd.as_bytes())
+    }
+
+    /// [`command`](Self::command) for a record string's raw bytes.
+    fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
+        // C send_mess/send_recv_mess flush the input before every write;
+        // write_read is that flush, write and read as one exchange.
+        let (raw, status) = self.handle.write_read(0, cmd, READ_BUF).into_parts();
+        status?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
+    }
+
+    /// A `set_status` query: the reply, or `None` for C's command error
+    /// (drvSPiiPlus.cc:266-267), a failed or empty read or a `?` in the
+    /// reply's C string.
+    fn query(&self, cmd: &str) -> Option<String> {
+        let (raw, status) = self
+            .handle
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
+        let c_str = raw.split(|&b| b == 0).next().unwrap_or_default();
+        if status.is_err() || raw.is_empty() || c_str.contains(&b'?') {
+            return None;
+        }
+        let text = String::from_utf8_lossy(c_str);
+        Some(text.trim_matches(['\r', '\n', ' ']).to_string())
     }
 }
 
@@ -248,137 +284,171 @@ fn decode_status(
     }
 }
 
-/// One SPiiPlus axis sharing a controller. Implements [`AsynMotor`].
+/// One SPiiPlus axis sharing a controller. Implements [`Model1Motor`].
 pub struct SpiiPlusAxis {
     controller: Arc<Mutex<SpiiPlusController>>,
     /// 0-based axis index (used directly on the wire).
     axis: usize,
     prev_position: i32,
+    /// What the last failed poll raises: nothing on C `set_status`'s first
+    /// failed pass (RETRY, drvSPiiPlus.cc:276), `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` on the next (COMM_ERR, :278). Per axis, as the card's
+    /// state can move on under another axis's poll.
+    failure: PollFailure,
     last_status: MotorStatus,
+    strings: MoveStrings,
+    /// SET_VELOCITY and SET_ACCEL the record wrote since the last message,
+    /// which C `build_trans` appends ahead of PREM in the move's message.
+    speeds: (Option<f64>, Option<f64>),
+    /// What `motor_init`'s `set_status` read, until the motor task takes it.
+    init_status: Option<AsynResult<MotorStatus>>,
 }
 
 impl SpiiPlusAxis {
-    /// Construct axis `index` (0-based; used directly as the wire axis number).
+    /// Construct axis `index` (0-based; used directly as the wire axis
+    /// number) and read its status, as `motor_init` does for each axis in
+    /// turn (drvSPiiPlus.cc:749).
     pub fn new(controller: Arc<Mutex<SpiiPlusController>>, index: usize) -> Self {
-        Self {
+        let mut axis = Self {
             controller,
             axis: index,
             prev_position: 0,
+            failure: PollFailure::NONE,
             last_status: MotorStatus {
-                done: true,
                 has_encoder: true,
+                gain_support: true,
                 ..MotorStatus::default()
             },
-        }
+            strings: MoveStrings::default(),
+            speeds: (None, None),
+            init_status: None,
+        };
+        axis.init_status = Some(init_poll(&mut axis, &AsynUser::new(0)));
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, SpiiPlusController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// One record transaction as devSPiiPlus.cc builds it into one message:
+    /// SET_VELOCITY's `VEL` when the record sends it, SET_ACCEL's `ACC` in
+    /// Buffer mode when the record sends it, PREM and `;`
+    /// (devSPiiPlus.cc:187-203), then `body`. In Buffer mode `start` follows
+    /// alone, as GO or JOG end the message there.
+    fn transaction(&mut self, body: &str, start: &str) -> AsynResult<()> {
+        let prem = self.strings.arm();
+        let (velocity, acceleration) = std::mem::take(&mut self.speeds);
+        let ctrl = self.lock();
+        let a = self.axis;
+        let buffer = matches!(ctrl.mode, CommandMode::Buffer);
+        let mut msg = Vec::new();
+        if let Some(v) = velocity {
+            msg.extend(format!("VEL{a}={};", nint(v)).into_bytes());
+        }
+        if let Some(acc) = acceleration.filter(|_| buffer) {
+            msg.extend(format!("ACC{a}={};", nint(acc)).into_bytes());
+        }
+        if !prem.is_empty() {
+            msg.extend(prem);
+            msg.push(b';');
+        }
+        msg.extend(body.as_bytes());
+        let sent = ctrl.command_bytes(&msg);
+        if !buffer {
+            return sent.map(drop);
+        }
+        // GO's `start` is a message of its own, sent whatever the move's
+        // returned (devSPiiPlus.cc:256-266, motordrvCom.cc:397-484).
+        ctrl.command(start).map(drop)
+    }
 }
 
-impl AsynMotor for SpiiPlusAxis {
-    fn move_absolute(
-        &mut self,
-        _user: &AsynUser,
-        position: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let ctrl = self.lock();
+impl Model1Motor for SpiiPlusAxis {
+    fn take_init_status(&mut self) -> MotorStatus {
+        let read = self.init_status.take().expect("taken once");
+        init_read(read, self.last_status.clone(), self.poll_failure())
+    }
+
+    /// `update_delay` is 0.010 s in `thread_args` (drvSPiiPlus.cc).
+    fn update_delay(&self) -> Duration {
+        Duration::from_millis(10)
+    }
+
+    /// SET_VELOCITY: `VEL` leads the move's message (devSPiiPlus.cc:250).
+    fn set_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
+        self.speeds.0 = Some(velocity);
+        Ok(())
+    }
+
+    /// SET_VEL_BASE: SPiiPlus does not use base velocity.
+    fn set_vel_base(&mut self, _user: &AsynUser, _velocity: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// SET_ACCEL: `ACC` in Buffer mode only, left to the controller MMI in
+    /// Direct mode (devSPiiPlus.cc:253-258).
+    fn set_accel(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.speeds.1 = Some(acceleration);
+        Ok(())
+    }
+
+    fn poll_failure(&self) -> PollFailure {
+        self.failure
+    }
+
+    fn move_absolute(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let a = self.axis;
-        let v = nint(velocity);
         let p = nint(position);
-        match ctrl.mode {
+        let body = match self.lock().mode {
             CommandMode::Buffer => {
-                let acc = nint(acceleration);
-                ctrl.command(&format!(
-                    "VEL{a}={v};ACC{a}={acc};Done({a})=0;target_pos({a})={p};opReq({a})={OP_ABS_MOVE};"
-                ))?;
-                ctrl.command(&format!("start {a}, 1"))?;
+                format!("Done({a})=0;target_pos({a})={p};opReq({a})={OP_ABS_MOVE};")
             }
-            CommandMode::Connect | CommandMode::Direct => {
-                ctrl.command(&format!("VEL{a}={v};ptp ({a}), {p};"))?;
-            }
-        }
-        Ok(())
+            CommandMode::Connect | CommandMode::Direct => format!("ptp ({a}), {p};"),
+        };
+        self.transaction(&body, &format!("start {a}, 1"))
     }
 
-    fn move_relative(
-        &mut self,
-        _user: &AsynUser,
-        distance: f64,
-        _min_velocity: f64,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
-        let ctrl = self.lock();
+    fn move_relative(&mut self, _user: &AsynUser, distance: f64) -> AsynResult<()> {
         let a = self.axis;
-        let v = nint(velocity);
         let d = nint(distance);
-        match ctrl.mode {
+        let body = match self.lock().mode {
             CommandMode::Buffer => {
-                let acc = nint(acceleration);
-                ctrl.command(&format!(
-                    "VEL{a}={v};ACC{a}={acc};Done({a})=0;target_pos({a})={d};opReq({a})={OP_REL_MOVE};"
-                ))?;
-                ctrl.command(&format!("start {a}, 1"))?;
+                format!("Done({a})=0;target_pos({a})={d};opReq({a})={OP_REL_MOVE};")
             }
-            CommandMode::Connect | CommandMode::Direct => {
-                ctrl.command(&format!("VEL{a}={v};ptp/r ({a}), {d};"))?;
-            }
-        }
-        Ok(())
+            CommandMode::Connect | CommandMode::Direct => format!("ptp/r ({a}), {d};"),
+        };
+        self.transaction(&body, &format!("start {a}, 1"))
     }
 
-    fn move_velocity(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        velocity: f64,
-        _acceleration: f64,
-    ) -> AsynResult<()> {
-        let ctrl = self.lock();
+    fn move_velocity(&mut self, _user: &AsynUser, velocity: f64) -> AsynResult<()> {
         let a = self.axis;
         let v = nint(velocity);
-        match ctrl.mode {
+        let body = match self.lock().mode {
             CommandMode::Buffer => {
-                ctrl.command(&format!(
-                    "Done({a})=0;jog_vel({a})={v}; opReq({a})={OP_JOG_MOVE};"
-                ))?;
-                ctrl.command(&format!("start {a},1"))?;
+                format!("Done({a})=0;jog_vel({a})={v}; opReq({a})={OP_JOG_MOVE};")
             }
-            CommandMode::Connect | CommandMode::Direct => {
-                ctrl.command(&format!("jog/v ({a}), {v};"))?;
-            }
-        }
-        Ok(())
+            CommandMode::Connect | CommandMode::Direct => format!("jog/v ({a}), {v};"),
+        };
+        self.transaction(&body, &format!("start {a},1"))
     }
 
-    fn home(
-        &mut self,
-        _user: &AsynUser,
-        _min_velocity: f64,
-        _velocity: f64,
-        _acceleration: f64,
-        forward: bool,
-    ) -> AsynResult<()> {
-        let ctrl = self.lock();
+    fn home(&mut self, _user: &AsynUser, forward: bool) -> AsynResult<()> {
+        // The record's home ends in GO: in Buffer mode it starts the axis
+        // buffer; in Direct/Connect mode HOME adds nothing, so C sends only
+        // VEL and PREM and the axis reports done in place.
         let a = self.axis;
-        match ctrl.mode {
+        let body = match self.lock().mode {
             CommandMode::Buffer => {
                 let op = if forward { OP_HOME_F } else { OP_HOME_R };
-                ctrl.command(&format!("Done({a})=0;opReq({a})={op};"))?;
-                Ok(())
+                format!("Done({a})=0;opReq({a})={op};")
             }
-            CommandMode::Connect | CommandMode::Direct => Err(spiiplus_err(
-                "SPiiPlus: homing is only available in Buffer command mode",
-            )),
-        }
+            CommandMode::Connect | CommandMode::Direct => String::new(),
+        };
+        self.transaction(&body, &format!("start {a}, 1"))
     }
 
-    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+    fn stop(&mut self, _user: &AsynUser) -> AsynResult<()> {
         let ctrl = self.lock();
         let a = self.axis;
         match ctrl.mode {
@@ -414,57 +484,107 @@ impl AsynMotor for SpiiPlusAxis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+    /// `PRIMITIVE`: INIT and a CR ahead of the port's own, so an empty line
+    /// follows it on the wire (devSPiiPlus.cc:182-186).
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut msg = init.to_vec();
+        msg.push(b'\r');
+        self.lock().command_bytes(&msg)?;
+        Ok(())
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let a = self.axis;
         let mode = ctrl.mode;
 
-        let mst = atoi(&ctrl.command(&format!("?D/MST({a})"))?);
-        let fault = atoi(&ctrl.command(&format!("?D/FAULT({a})"))?);
-        let apos = atof(&ctrl.command(&format!("?APOS({a})"))?);
-        let fpos_reply = match mode {
-            CommandMode::Connect => ctrl.command(&format!("?FPOS{}", AXIS_LETTERS[a]))?,
-            _ => ctrl.command(&format!("?FPOS({a})"))?,
-        };
-        let fpos = atof(&fpos_reply);
-        let velocity = atof(&ctrl.command(&format!("?FVEL({a})"))?);
-
-        // Done and the home request are only read back in Buffer mode.
-        let (done_val, opreq_val) = match mode {
-            CommandMode::Buffer => (
-                atoi(&ctrl.command(&format!("?Done({a})"))?),
-                atoi(&ctrl.command(&format!("?opReq({a})"))?),
-            ),
+        // C `queryCmnds[cmndMode]` in order, the pass ending at the first
+        // failed reply (drvSPiiPlus.cc:94-98, :252-269); Buffer mode alone
+        // reads opReq, then Done.
+        let mut queries = vec![
+            format!("?D/MST({a})"),
+            format!("?D/FAULT({a})"),
+            format!("?APOS({a})"),
+            match mode {
+                CommandMode::Connect => format!("?FPOS{}", AXIS_LETTERS[a]),
+                _ => format!("?FPOS({a})"),
+            },
+            format!("?FVEL({a})"),
+        ];
+        if mode == CommandMode::Buffer {
+            queries.extend([format!("?opReq({a})"), format!("?Done({a})")]);
+        }
+        let replies: Vec<String> = queries.iter().map_while(|q| ctrl.query(q)).collect();
+        if let Some(failed) = queries.get(replies.len()) {
+            (ctrl.comm_state, self.failure) = match ctrl.comm_state {
+                CommState::Normal => (CommState::Retry, PollFailure::NONE),
+                _ => (CommState::CommErr, PollFailure::PROBLEM_AND_COMMS_ERROR),
+            };
+            return Err(spiiplus_err(format!("SPiiPlus axis {a}: {failed} failed")));
+        }
+        ctrl.comm_state = CommState::Normal;
+        let mst = atoi(&replies[0]);
+        let fault = atoi(&replies[1]);
+        let apos = atof(&replies[2]);
+        let fpos = atof(&replies[3]);
+        let velocity = atof(&replies[4]);
+        let (opreq_val, done_val) = match &replies[5..] {
+            [opreq, done] => (atoi(opreq), atoi(done)),
             _ => (0, 0),
         };
-        drop(ctrl);
 
         let d = decode_status(mode, mst, fault, done_val, opreq_val, velocity);
+        // drvSPiiPlus.cc:403-409.
+        let ls_active = (d.plus_ls && d.direction) || (d.minus_ls && !d.direction);
+        if (d.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.command_bytes(&post);
+        }
+        drop(ctrl);
 
-        let position = nint(apos);
-        self.prev_position = position;
+        // C reads both through `(long)atof` (drvSPiiPlus.cc:369, :386).
+        let position = apos.trunc();
+        self.prev_position = position as i32;
 
         let status = MotorStatus {
-            position: position as f64,
-            encoder_position: nint(fpos) as f64,
-            velocity,
             done: d.done,
             moving: d.moving,
+            msta_moving: d.moving,
             high_limit: d.plus_ls,
             low_limit: d.minus_ls,
             direction: d.direction,
             powered: d.powered,
             has_encoder: true,
+            // C motor_init sets GAIN_SUPPORT, so CNEN drives enable/disable.
+            gain_support: true,
             ..MotorStatus::default()
-        };
+        }
+        .with_position(position)
+        .with_encoder_position(fpos.trunc())
+        // C `(int)vel` (drvSPiiPlus.cc:397), the record's RVEL.
+        .with_velocity(velocity.trunc());
         self.last_status = status.clone();
-        Ok(status)
+        *out = status;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::RecordWrites;
 
     #[test]
     fn mode_parse_is_case_insensitive_and_defaults_to_buffer() {
@@ -474,6 +594,115 @@ mod tests {
         assert!(matches!(CommandMode::parse("BUF"), CommandMode::Buffer));
         assert!(matches!(CommandMode::parse("xyz"), CommandMode::Buffer));
         assert!(matches!(CommandMode::parse(""), CommandMode::Buffer));
+    }
+
+    #[test]
+    fn inmotion_sets_the_msta_moving_bit() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let mst = Arc::new(AtomicI32::new(MST_INMOTION));
+        let read = mst.clone();
+        let (_rig, io) =
+            motor_common::testing::LineRig::new("acsT80Msta", move |sent| match sent {
+                "?VR" => "v1".into(),
+                "?APOS(0)" => "0".into(),
+                s if s.starts_with("?APOS(") => "?".into(),
+                "?D/MST(0)" => read.load(Ordering::Relaxed).to_string(),
+                _ => "0".into(),
+            });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        assert!(axis.polled(&user).unwrap().msta_moving);
+        mst.store(MST_INPOSITION, Ordering::Relaxed);
+        assert!(!axis.polled(&user).unwrap().msta_moving);
+    }
+
+    /// C reads `?APOS` and `?FPOS` through `(long)atof`, which truncates
+    /// toward zero (drvSPiiPlus.cc:369, :386).
+    #[test]
+    fn positions_truncate_as_c_casts() {
+        let sign = Arc::new(Mutex::new(1.0));
+        let at = sign.clone();
+        let (_rig, io) = motor_common::testing::LineRig::new("acsT80Trunc", move |sent| {
+            let sign = *at.lock().unwrap();
+            match sent {
+                "?VR" => "v1".into(),
+                "?APOS(0)" => format!("{}", 12.7 * sign),
+                s if s.starts_with("?APOS(") => "?".into(),
+                "?FPOS(0)" => format!("{}", -12.7 * sign),
+                _ => "0".into(),
+            }
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let status = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!(
+            (status.position(), status.encoder_position()),
+            (12.0, -12.0)
+        );
+        *sign.lock().unwrap() = -1.0;
+        let status = axis.polled(&AsynUser::default()).unwrap();
+        assert_eq!(
+            (status.position(), status.encoder_position()),
+            (-12.0, 12.0)
+        );
+    }
+
+    /// `motor_init` probes `?APOS(n)` until one fails and keeps that many
+    /// axes (drvSPiiPlus.cc:712-721), past 8 outside CONNECT mode. The count
+    /// stops at C's `MAX_AXIS` motor_info slots, and at the 8 `?FPOS`
+    /// letters in CONNECT mode, which C overruns; the probes are C's up to
+    /// `?APOS(32)`.
+    #[test]
+    fn axis_count_follows_the_probe_up_to_the_mode_s_bound() {
+        let count = |name: &str, axes: usize, mode| {
+            let (rig, io) = motor_common::testing::LineRig::new(name, move |sent| {
+                let n = sent
+                    .strip_prefix("?APOS(")
+                    .and_then(|s| s.strip_suffix(')'))
+                    .and_then(|s| s.parse::<usize>().ok());
+                match (sent, n) {
+                    ("?VR", _) => "v1".into(),
+                    (_, Some(n)) if n >= axes => "?".into(),
+                    _ => "0".into(),
+                }
+            });
+            let num_axes = SpiiPlusController::new(io, mode).unwrap().num_axes();
+            let probes = rig
+                .sent()
+                .iter()
+                .filter(|s| s.starts_with("?APOS("))
+                .count();
+            (num_axes, probes)
+        };
+        assert_eq!(count("acsT80Ax12B", 12, CommandMode::Buffer), (12, 13));
+        assert_eq!(count("acsT80Ax12C", 12, CommandMode::Connect), (8, 13));
+        assert_eq!(count("acsT80Ax8C", 8, CommandMode::Connect), (8, 9));
+        assert_eq!(count("acsT80Ax40D", 40, CommandMode::Direct), (32, 33));
+    }
+
+    /// C keeps `?FVEL` as `(int)vel` (drvSPiiPlus.cc:397), which the record
+    /// shows as RVEL: -10.7 is -10 where the record's floor makes -11. The
+    /// direction is read from the double first (:311-312), so -0.5 reads 0
+    /// and minus.
+    #[test]
+    fn velocity_truncates_as_c_casts() {
+        let vel = Arc::new(Mutex::new("-10.7"));
+        let read = vel.clone();
+        let (_rig, io) = motor_common::testing::LineRig::new("acsT80Vel", move |sent| match sent {
+            "?VR" => "v1".into(),
+            "?APOS(0)" => "0".into(),
+            s if s.starts_with("?APOS(") => "?".into(),
+            "?FVEL(0)" => read.lock().unwrap().to_string(),
+            _ => "0".into(),
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let user = AsynUser::default();
+        assert_eq!(axis.polled(&user).unwrap().velocity(), -10.0);
+        *vel.lock().unwrap() = "-0.5";
+        let status = axis.polled(&user).unwrap();
+        assert_eq!((status.velocity(), status.direction), (0.0, false));
     }
 
     #[test]
@@ -519,5 +748,270 @@ mod tests {
     fn direction_follows_velocity_sign() {
         assert!(decode_status(CommandMode::Direct, 0, 0, 0, 0, 5.0).direction);
         assert!(!decode_status(CommandMode::Direct, 0, 0, 0, 0, -5.0).direction);
+    }
+
+    use motor_common::testing::LineRig;
+    use motor_common::testing::Model1Polled;
+
+    /// Axis 0 of a controller in `mode` on a [`LineRig`].
+    fn rig(name: &str, mode: CommandMode) -> (LineRig, SpiiPlusAxis) {
+        refusing_rig(name, mode, |_| false)
+    }
+
+    /// [`rig`], with the writes `refused` picks refused.
+    fn refusing_rig(
+        name: &str,
+        mode: CommandMode,
+        refused: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> (LineRig, SpiiPlusAxis) {
+        let reply = |last: &str| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            "?APOS(0)" => "0".into(),
+            _ => String::new(),
+        };
+        let (line, io) = LineRig::failing(name, reply, refused);
+        let ctrl = SpiiPlusController::new(io, mode).unwrap();
+        let axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        (line, axis)
+    }
+
+    /// A controller answering every `?APOS(n)` gets one axis per
+    /// `ACSPL_axis[]` letter, and its last axis polls in Connect mode.
+    #[test]
+    fn the_apos_count_stops_at_the_axis_letters() {
+        let (_line, io) = LineRig::new("spiiAllApos", |last| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            l if l.starts_with("?APOS") || l.starts_with("?FPOS") => "0".into(),
+            _ => "0".into(),
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Connect).unwrap();
+        let num_axes = ctrl.num_axes();
+        assert_eq!(num_axes, AXIS_LETTERS.len());
+        let mut last = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), num_axes - 1);
+        let _ = last.polled(&AsynUser::default());
+    }
+
+    /// motorRecord.cc:872-884: VEL, ACC, HOME, GO; GO's `start` goes alone.
+    #[test]
+    fn a_buffer_home_programs_and_starts_the_axis_buffer() {
+        let (line, mut axis) = rig("spiiHome", CommandMode::Buffer);
+        axis.record_home(&AsynUser::default(), 0.0, 100.0, 50.0, true)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            ["VEL0=100;ACC0=50;Done(0)=0;opReq(0)=4;", "start 0, 1"]
+        );
+    }
+
+    /// GO's `start` is a transaction of its own and motordrvCom ignores
+    /// what send_mess returns (devSPiiPlus.cc:256-266, motordrvCom.cc:
+    /// 397-484): a refused move message still sends the `start`.
+    #[test]
+    fn a_refused_move_message_still_sends_the_start() {
+        let (line, mut axis) = refusing_rig("spiiRefused", CommandMode::Buffer, |cmd| {
+            cmd.starts_with("VEL0=") || cmd == "start 0,1"
+        });
+        let user = AsynUser::default();
+        axis.record_move_absolute(&user, 7.0, 0.0, 100.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL0=100;Done(0)=0;target_pos(0)=7;opReq(0)=1;",
+                "start 0, 1"
+            ]
+        );
+        assert!(axis.record_jog(&user, 0.0, 10.0, 0.0).is_err());
+        assert_eq!(
+            line.sent(),
+            ["ACC0=0;Done(0)=0;jog_vel(0)=10; opReq(0)=3;", "start 0,1"]
+        );
+    }
+
+    /// The record sends no SET_ACCEL for a zero acceleration.
+    #[test]
+    fn a_zero_acceleration_sends_no_acc() {
+        let (line, mut axis) = rig("spiiNoAcc", CommandMode::Buffer);
+        axis.record_move_absolute(&AsynUser::default(), 7.0, 0.0, 100.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL0=100;Done(0)=0;target_pos(0)=7;opReq(0)=1;",
+                "start 0, 1"
+            ]
+        );
+    }
+
+    /// SET_ACCEL ahead of the jog in Buffer mode; none in Direct mode.
+    #[test]
+    fn a_jog_carries_the_records_acc_in_buffer_mode_only() {
+        let (line, mut axis) = rig("spiiJogBuf", CommandMode::Buffer);
+        axis.record_jog(&AsynUser::default(), 0.0, -20.0, 5.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            ["ACC0=5;Done(0)=0;jog_vel(0)=-20; opReq(0)=3;", "start 0,1"]
+        );
+        let (line, mut axis) = rig("spiiJogDir", CommandMode::Direct);
+        axis.record_jog(&AsynUser::default(), 0.0, -20.0, 5.0)
+            .unwrap();
+        assert_eq!(line.sent(), ["jog/v (0), -20;"]);
+    }
+
+    /// motorRecord.cc:2141, :3068: a jog's SET_ACCEL goes out at any rate,
+    /// a move's only at a positive one (:874).
+    #[test]
+    fn a_jog_sends_acc_at_a_zero_rate() {
+        let (line, mut axis) = rig("spiiJogZeroAcc", CommandMode::Buffer);
+        axis.record_jog(&AsynUser::default(), 0.0, -20.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            ["ACC0=0;Done(0)=0;jog_vel(0)=-20; opReq(0)=3;", "start 0,1"]
+        );
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// devSPiiPlus.cc:182-186.
+    #[test]
+    fn init_goes_out_alone() {
+        let (line, mut axis) = rig("spiiInit", CommandMode::Direct);
+        axis.primitive(&AsynUser::default(), b"enable(0)").unwrap();
+        assert_eq!(line.sent(), ["enable(0)\r"]);
+    }
+
+    /// devSPiiPlus.cc:187-203 and drvSPiiPlus.cc:403-409: PREM after the
+    /// record's VEL and ACC, POST once at the next done poll.
+    #[test]
+    fn prem_joins_the_move_message_and_post_follows_done() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        let (line, io) = LineRig::new("spiiPrem", move |last| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            "?APOS(0)" => "0".into(),
+            "?Done(0)" => u8::from(d.load(Ordering::SeqCst)).to_string(),
+            _ => "0".into(),
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Buffer).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        let user = AsynUser::default();
+        let polled = |line: &LineRig| {
+            line.sent()
+                .into_iter()
+                .filter(|l| !l.starts_with('?'))
+                .collect::<Vec<_>>()
+        };
+
+        axis.set_move_strings(&user, b"P=1", Some(post(b"P=0")))
+            .unwrap();
+        axis.record_move_relative(&user, 5.0, 0.0, 100.0, 50.0)
+            .unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL0=100;ACC0=50;P=1;Done(0)=0;target_pos(0)=5;opReq(0)=2;",
+                "start 0, 1"
+            ]
+        );
+        axis.polled(&user).unwrap();
+        assert!(polled(&line).is_empty());
+        done.store(true, Ordering::SeqCst);
+        axis.polled(&user).unwrap();
+        assert_eq!(polled(&line), ["P=0"]);
+        axis.polled(&user).unwrap();
+        assert!(polled(&line).is_empty());
+    }
+
+    /// drvSPiiPlus.cc:252-298: a reply holding `?` ends the pass, which is
+    /// RETRY (nothing raised, nothing posted) on a NORMAL card, COMM_ERR
+    /// after, and a full pass clears it.
+    #[test]
+    fn a_question_mark_reply_is_retry_then_comm_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let refuse = Arc::new(AtomicBool::new(false));
+        let r = refuse.clone();
+        let (line, io) = LineRig::new("spiiRetry", move |last| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            "?D/FAULT(0)" if r.load(Ordering::SeqCst) => "?1004".into(),
+            _ => "0".into(),
+        });
+        let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
+        let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+        line.sent();
+        let user = AsynUser::default();
+        refuse.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(line.sent(), ["?D/MST(0)", "?D/FAULT(0)"]);
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
+        refuse.store(false, Ordering::SeqCst);
+        line.sent();
+        let s = axis.polled(&user).unwrap();
+        assert!(!s.comms_error && !s.problem);
+        assert_eq!(
+            line.sent(),
+            [
+                "?D/MST(0)",
+                "?D/FAULT(0)",
+                "?APOS(0)",
+                "?FPOS(0)",
+                "?FVEL(0)"
+            ]
+        );
+        refuse.store(true, Ordering::SeqCst);
+        assert!(axis.polled(&user).is_err());
+        assert_eq!(axis.poll_failure(), PollFailure::NONE);
+    }
+
+    /// drvSPiiPlus.cc:282-295 exit stores what motor_init prepared
+    /// (:727-737, EA_PRESENT and GAIN_SUPPORT), with both COMM_ERR bits once
+    /// past RETRY.
+    #[test]
+    fn a_failed_init_read_keeps_the_encoder_bits() {
+        let (_line, io) = LineRig::new("spiiInitFail", |last| match last {
+            "?VR" => "ACS SPiiPlus".into(),
+            _ => String::new(),
+        });
+        let ctrl = Arc::new(Mutex::new(
+            SpiiPlusController::new(io, CommandMode::Buffer).unwrap(),
+        ));
+        let mut first = SpiiPlusAxis::new(ctrl.clone(), 0);
+        let mut second = SpiiPlusAxis::new(ctrl, 1);
+        let prepared = MotorStatus {
+            has_encoder: true,
+            gain_support: true,
+            ..MotorStatus::default()
+        };
+        assert_eq!(first.take_init_status(), prepared);
+        assert_eq!(
+            second.take_init_status(),
+            MotorStatus {
+                problem: true,
+                comms_error: true,
+                ..prepared
+            }
+        );
+    }
+
+    /// devSPiiPlus.cc: Direct-mode HOME builds nothing, so the home is the
+    /// record's VEL and PREM alone, and succeeds.
+    #[test]
+    fn a_direct_home_sends_vel_and_prem_only() {
+        let (line, mut axis) = rig("spiiHomeDir", CommandMode::Direct);
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"P=1", None).unwrap();
+        axis.record_home(&user, 0.0, 100.0, 50.0, false).unwrap();
+        assert_eq!(line.sent(), ["VEL0=100;P=1;"]);
     }
 }

@@ -6,11 +6,12 @@ use std::sync::Arc;
 use epics_rs::ad_core::ioc::GenericDriverContext;
 use epics_rs::base::server::iocsh::registry::*;
 
+use timepix3::driver::MAX_ADDR;
 use timepix3::{TimePix3Runtime, create_timepix3_detector};
 
 /// Register the TimePix3 configure command on an `AdIoc`.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADTIMEPIX", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADTIMEPIX", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Vec<TimePix3Runtime>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -42,13 +43,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 },
             ],
             "ADTimePixConfig portName serverURL [maxMemory]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let server_url = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("serverURL required".into()),
                 };
                 let max_memory = match args.get(2) {
@@ -56,24 +57,36 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "ADTimePixConfig: port={port_name}, serverURL={server_url}, maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let runtime = create_timepix3_detector(&port_name, &server_url, max_memory)
+                let runtime = create_timepix3_detector(&claim, &server_url, max_memory)
                     .map_err(|e| format!("failed to create the TimePix3 detector: {e}"))?;
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime.port_handle().clone(),
-                ).map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     runtime.pool.clone(),
-                    runtime.array_output().clone(),
+                    runtime.array_output(0).clone(),
                     &port_name,
                     mgr.wiring(),
                 )));
+                // C publishes NDArrays on addresses 1..maxAddr as well
+                // (ADTimePix.cpp:1424-1429).
+                for addr in 1..MAX_ADDR {
+                    mgr.wiring().register_output_at(
+                        &port_name,
+                        addr as i32,
+                        runtime.array_output(addr).clone(),
+                    );
+                }
 
                 rt.lock().unwrap().push(runtime);
                 Ok(CommandOutcome::Continue)

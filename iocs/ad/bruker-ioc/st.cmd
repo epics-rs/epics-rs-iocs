@@ -56,15 +56,19 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
 
 dbLoadRecords("$(ADBRUKER)/db/BIS.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,BIS_PORT=$(COMMAND_PORT)")
 
-# Standard arrays plugin fed from the BIS port. The driver publishes 32-bit
-# unsigned pixels, so TYPE/FTVL are Int32/LONG.
+# Standard arrays plugin fed from the BIS port. The driver publishes NDInt32
+# frames, so TYPE/FTVL are Int32/LONG.
 NDStdArraysConfigure("Image1", $(QSIZE), 0, "$(PORT)", 0)
 dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
 
 < $(ADCORE)/ioc/commonPlugins.cmd
+set_requestfile_path("$(ADBRUKER)/db")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30,"P=$(PREFIX)")
+
 # Example interactive commands:
 #   dbl                                # List all PVs
 #   dbpf BIS:cam1:FilePath /data/      # Where BIS writes the frames

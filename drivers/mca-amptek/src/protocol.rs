@@ -19,11 +19,11 @@ pub const SYNC1: u8 = 0xF5;
 pub const SYNC2: u8 = 0xFA;
 
 /// `DP5Protocol.h enum PID1_TYPE` -- only the values the packets below use.
-mod pid1 {
+pub(crate) mod pid1 {
     pub const REQ_STATUS: u8 = 0x01;
     pub const REQ_SPECTRUM: u8 = 0x02;
     /// `PID1_REQ_SCOPE_MISC` (`DP5Protocol.h:101`) -- used for the
-    /// NetFinder direct-query request ([`build_netfinder_direct_request`]).
+    /// NetFinder direct-query request ([`super::build_netfinder_direct_request`]).
     pub const REQ_SCOPE_MISC: u8 = 0x03;
     pub const REQ_CONFIG: u8 = 0x20;
     pub const VENDOR_REQ: u8 = 0xF0;
@@ -36,9 +36,9 @@ mod pid1 {
 /// NetFinder-specific PID2 values, kept separate from [`pid2_rcv`] since
 /// they live under a different PID1 namespace
 /// (`PID1_REQ_SCOPE_MISC`/`PID1_RCV_SCOPE_MISC`) and are used only by
-/// [`build_netfinder_direct_request`]/[`parse_netfinder_direct_response_header`]
+/// [`build_netfinder_direct_request`] and `net_finder::parse_direct_response`
 /// (`doAmptekNetFinderPacket`, `ConsoleHelper.cpp:199-261`).
-mod pid2_netfinder {
+pub(crate) mod pid2_netfinder {
     /// `PID2_SEND_NETFINDER_READBACK` (`DP5Protocol.h:137`): the outbound
     /// direct-query request's PID2.
     pub const READBACK_REQUEST: u8 = 0x07;
@@ -47,7 +47,7 @@ mod pid2_netfinder {
     pub const READBACK_RESPONSE: u8 = 0x08;
 }
 
-/// `DP5Protocol.h`: the receive-side PID2 values [`ReceivedPacket::classify`]
+/// `DP5Protocol.h`: the receive-side PID2 values [`parse_packet`]
 /// routes on, restricted to what `CConsoleHelper::ReceiveData` (and
 /// therefore `drvAmptek.cpp`) actually handles.
 mod pid2_rcv {
@@ -55,10 +55,13 @@ mod pid2_rcv {
     pub const SPECTRUM_256_LO: u8 = 0x01;
     pub const SPECTRUM_8192_HI: u8 = 0x0C;
     pub const CONFIG_READBACK: u8 = 0x07;
+    /// `RCVPT_SCOPE_DATA`..`RCVPT_DIAGNOSTIC_DATA` and
+    /// `RCVPT_OPTION_PA_CALIBRATION` (`DP5Protocol.h:219-230`).
+    pub const UNPROCESSED_MISC: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x0C];
 }
 
 /// `DP5Protocol.h enum PID2_ACK_TYPE` -- the status byte
-/// [`parse_packet_status`] can produce. `Ok` is C's `PID2_ACK_OK` (0x00);
+/// `parse_packet_status` can produce. `Ok` is C's `PID2_ACK_OK` (0x00);
 /// C's ad-hoc "packet invalid, will be overwritten" sentinel `0xFF`
 /// (`ConsoleHelper.cpp:408,457`) has no wire meaning here, so it is not a
 /// variant -- callers represent "no response received" as `Err`/`None` at
@@ -118,19 +121,20 @@ impl AckStatus {
 /// `sendCommandString` via `sendConfigurationFile`/`sendSCAs`/
 /// `sendConfiguration`, and `readConfigurationFromHardware`). See the
 /// module doc's "Restructuring vs. C" note on why this is a small subset
-/// of C's `TRANSMIT_PACKET_TYPE`.
+/// of C's `TRANSMIT_PACKET_TYPE`. The discriminants are C's enum values,
+/// which `drvAmptek::sendCommand` prints with `%d` (`DP5Protocol.h:5-50`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransmitPacketType {
     /// `XMTPT_SEND_STATUS` (`drvAmptek.cpp:331,874`).
-    SendStatus,
+    SendStatus = 0,
     /// `XMTPT_SEND_SPECTRUM_STATUS` (`drvAmptek.cpp:1006`).
-    SendSpectrumStatus,
+    SendSpectrumStatus = 3,
     /// `XMTPT_SEND_CLEAR_SPECTRUM_STATUS` (`drvAmptek.cpp:870`).
-    SendClearSpectrumStatus,
+    SendClearSpectrumStatus = 4,
     /// `XMTPT_ENABLE_MCA_MCS` (`drvAmptek.cpp:860`).
-    EnableMcaMcs,
+    EnableMcaMcs = 40,
     /// `XMTPT_DISABLE_MCA_MCS` (`drvAmptek.cpp:867,941`).
-    DisableMcaMcs,
+    DisableMcaMcs = 41,
 }
 
 /// Build the fixed-shape (no ASCII payload) request packets
@@ -204,48 +208,6 @@ pub fn build_netfinder_direct_request() -> Vec<u8> {
     pack_out(pid1::REQ_SCOPE_MISC, pid2_netfinder::READBACK_REQUEST, &[])
 }
 
-/// `doAmptekNetFinderPacket`'s inbound-response validation
-/// (`ConsoleHelper.cpp:232-252`): check `SYNC1 SYNC2
-/// PID1_RCV_SCOPE_MISC RCVPT_NETFINDER_READBACK`, then return the `LEN`
-/// bytes of DATA following the 6-byte header.
-///
-/// # Preserved upstream quirk
-/// Unlike [`parse_packet`], this does **not** verify the trailing
-/// checksum -- C's `doAmptekNetFinderPacket` never calls
-/// `ParsePacketStatus`/`TestPacketCkSumOK` on this response, it only
-/// checks the 4-byte header and the `LEN < iSize` bound
-/// (`ConsoleHelper.cpp:236-237`) before trusting the payload. Reproduced
-/// as-is rather than silently adding a check the vendor's own reference
-/// client skips, since a firmware quirk that fails this checksum but
-/// still carries a valid discovery reply cannot be ruled out without
-/// hardware to test against.
-///
-/// # Restructuring vs. C
-/// Requires `6 + LEN <= raw.len()` before slicing out the DATA region.
-/// C's equivalent check is only `LEN < iSize` (`ConsoleHelper.cpp:237`)
-/// against a fixed, zero-initialized 1024-byte buffer, so a claimed LEN
-/// that runs past the bytes actually received there silently reads
-/// zero-padding rather than crashing; a Rust slice has no such padding,
-/// so this returns `None` instead -- for every real NetFinder readback
-/// (always well over 24 bytes) the two conditions coincide.
-pub fn parse_netfinder_direct_response_header(raw: &[u8]) -> Option<&[u8]> {
-    if raw.len() < 6 {
-        return None;
-    }
-    if raw[0] != SYNC1
-        || raw[1] != SYNC2
-        || raw[2] != pid1::RCV_SCOPE_MISC
-        || raw[3] != pid2_netfinder::READBACK_RESPONSE
-    {
-        return None;
-    }
-    let len = usize::from(raw[4]) * 256 + usize::from(raw[5]);
-    if 6 + len > raw.len() {
-        return None;
-    }
-    Some(&raw[6..6 + len])
-}
-
 /// A parsed response packet: `ParsePacketStatus` + `ParsePacket`'s outcome
 /// (`ParsePacket.cpp:11-49,119-168`) collapsed into one type -- C keeps the
 /// status byte and the routed `ReqProcess` bitmask in two separate
@@ -276,7 +238,7 @@ pub enum ReceivedPacket {
     /// (`bDataReceived = true`) for an error ack too; distinguishing a real
     /// failure from a bare success is `ParseCmd`'s job
     /// (`ParsePacket.cpp:179-199`), which only `sendCommandString` bothers
-    /// to call -- see [`offending_command_text`]. `data` is `PIN->DATA`,
+    /// to call -- see [`parse_cmd`]. `data` is `PIN->DATA`,
     /// needed by that same check.
     Ack { status: AckStatus, data: Vec<u8> },
     /// A packet whose framing/checksum itself failed (`ParsePacketStatus`,
@@ -286,6 +248,11 @@ pub enum ReceivedPacket {
     /// (`ParsePacket.cpp:156-159`). Never produced for an ack packet --
     /// see [`ReceivedPacket::Ack`].
     Error { status: AckStatus },
+    /// A misc packet `ParsePacket` routes somewhere `ReceiveData` does not
+    /// handle (scope, text, diagnostic, PA calibration, Ethernet settings,
+    /// `ParsePacket.cpp:131-153`): `ReceiveData` returns false without the
+    /// error print.
+    Unprocessed,
 }
 
 /// `CConsoleHelper::ProcessSpectrumEx` (`ConsoleHelper.cpp:736-754`):
@@ -340,53 +307,107 @@ pub fn decode_spectrum(pid2: u8, data: &[u8]) -> (usize, Vec<i32>) {
 /// the `LEN` the header claims (C indexes straight past the buffer end in
 /// that case, `ParsePacket.cpp:23-26` -- an upstream defect, not
 /// reproduced; see the crate-level defect list).
-fn parse_packet_status(raw: &[u8]) -> Result<(u8, u8, Vec<u8>), AckStatus> {
-    if raw.len() < 2 || raw[0] != SYNC1 {
-        return Err(AckStatus::SyncError);
+fn parse_packet_status(raw: &[u8], pin: &mut PacketHeader) -> Result<(u8, u8, Vec<u8>), AckStatus> {
+    let status = match framing(raw, pin) {
+        Ok(parsed) => return Ok(parsed),
+        Err(status) => status,
+    };
+    // `ParsePacket.cpp:47-48`: LEN/PID1/PID2 are whatever the last header
+    // that passed sync left in `PIN`.
+    println!(
+        "CParsePacket::ParsePacketStatus PIN->STATUS={}, PIN->LEN={}, PIN->PID1={}, PIN->PID2={}",
+        status, pin.len, pin.pid1, pin.pid2
+    );
+    Err(AckStatus::from_byte(status))
+}
+
+/// `PID2_ACK_*` codes: sync 1, length 3, checksum 4 (`DP5Protocol.h:237-256`).
+fn framing(raw: &[u8], pin: &mut PacketHeader) -> Result<(u8, u8, Vec<u8>), u8> {
+    if raw.len() < 2 || raw[0] != SYNC1 || raw[1] != SYNC2 {
+        return Err(1);
     }
-    if raw[1] != SYNC2 {
-        return Err(AckStatus::SyncError);
-    }
-    if raw.len() < 6 {
-        return Err(AckStatus::LenError);
-    }
-    if raw[4] >= 128 {
-        return Err(AckStatus::LenError);
+    if raw.len() < 6 || raw[4] >= 128 {
+        return Err(3);
     }
     let len = usize::from(raw[4]) * 256 + usize::from(raw[5]);
-    let pid1 = raw[2];
-    let pid2 = raw[3];
+    pin.len = len as u16;
+    pin.pid1 = raw[2];
+    pin.pid2 = raw[3];
     // header(6) + data(len) + checksum(2)
     if raw.len() < 6 + len + 2 {
-        return Err(AckStatus::LenError);
+        return Err(3);
     }
     let header_and_data = &raw[0..6 + len];
     let sum: u32 = header_and_data.iter().map(|&b| u32::from(b)).sum();
     let wire_checksum = u32::from(raw[6 + len]) * 256 + u32::from(raw[6 + len + 1]);
     if (sum.wrapping_add(wire_checksum)) & 0xFFFF != 0 {
-        return Err(AckStatus::ChecksumError);
+        return Err(4);
     }
-    Ok((pid1, pid2, raw[6..6 + len].to_vec()))
+    Ok((raw[2], raw[3], raw[6..6 + len].to_vec()))
 }
 
-/// `CParsePacket::ParseCmd` (`ParsePacket.cpp:179-199`): extract the
-/// offending command text C's firmware echoes back in `DATA` for
-/// `BadParam`/`Pc5NotPresent`/`Unrecognized` responses. Callable on any
-/// [`ReceivedPacket::Ack`], matching `sendCommandString`
-/// (`drvAmptek.cpp:437-477`), the only caller that checks this -- it is
-/// the sole way to tell a real error ack from a bare success, since
-/// [`ReceivedPacket::Ack`] itself makes no such distinction.
-pub fn offending_command_text(status: AckStatus, data: &[u8]) -> Option<String> {
-    if !data.is_empty()
-        && matches!(
-            status,
-            AckStatus::BadParam | AckStatus::Pc5NotPresent | AckStatus::Unrecognized
-        )
-    {
-        Some(String::from_utf8_lossy(data).into_owned())
-    } else {
-        None
+/// The header fields of C's persistent `CH_.DP5Proto.PIN`
+/// (`DP5Protocol.h Packet_In`), kept across packets because
+/// `ParsePacketStatus` only overwrites them when sync and LEN pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PacketHeader {
+    pub len: u16,
+    pub pid1: u8,
+    pub pid2: u8,
+}
+
+/// `CParsePacket::PID2_TextToString` (`ParsePacket.cpp:51-117`).
+pub fn pid2_text_to_string(source: &str, status: AckStatus) -> String {
+    let text = match status {
+        AckStatus::Ok => return String::new(),
+        AckStatus::SyncError => ": Sync Error\t",
+        AckStatus::PidError => ": PID Error\t",
+        AckStatus::LenError => ": Length Error\t",
+        AckStatus::ChecksumError => ": Checksum Error\t",
+        AckStatus::BadParam => ": Bad Parameter\t",
+        AckStatus::BadHexRec => ": Bad HEX Record\t",
+        AckStatus::FpgaError => ": FPGA not initialized\t",
+        AckStatus::Cp2201NotFound => ": CP2201 not found\t",
+        AckStatus::ScopeDataNotAvail => ": No scope data\t",
+        AckStatus::Pc5NotPresent => ": PC5 not present\t",
+        AckStatus::OkEthernetShareReq | AckStatus::EthernetBusy => ": Ethernet sharing request\t",
+        AckStatus::CalDataNotPresent => ": Calibration data not present\t",
+        AckStatus::Unrecognized => ": Unrecognized Command\t",
+        AckStatus::I2cError
+        | AckStatus::OkFpgaUploadAddr
+        | AckStatus::FeatureNotFpgaSupported
+        | AckStatus::Other(_) => ": Unrecognized Error\t",
+    };
+    format!("{source}{text}")
+}
+
+/// `CParsePacket::ParseCmd` (`ParsePacket.cpp:179-199`): the error text
+/// for a `BadParam`/`Pc5NotPresent`/`Unrecognized` ack, empty for any
+/// other. `source` is [`pid2_text_to_string`]'s result. The offending
+/// command is C's `snprintf(data, 255, "%.*s", LEN, DATA)`: at most 254
+/// bytes, cut at a NUL.
+///
+/// Called only on a [`ReceivedPacket::Ack`]; C switches on `PID2` alone,
+/// where a config readback's 0x07 would read as `PID2_ACK_UNRECOG`.
+pub fn parse_cmd(source: &str, status: AckStatus, data: &[u8]) -> String {
+    if !matches!(
+        status,
+        AckStatus::BadParam | AckStatus::Pc5NotPresent | AckStatus::Unrecognized
+    ) {
+        return String::new();
     }
+    if data.is_empty() {
+        return format!("{source}I2C packet");
+    }
+    let end = data
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(data.len())
+        .min(254);
+    format!(
+        "{source}(Last) Offending command: {}",
+        String::from_utf8_lossy(&data[..end])
+    )
 }
 
 /// `CParsePacket::ParsePacket` (`ParsePacket.cpp:119-168`): validate the
@@ -398,8 +419,8 @@ pub fn offending_command_text(status: AckStatus, data: &[u8]) -> Option<String> 
 /// triggers them, so a packet on one of those routes here classifies as
 /// [`ReceivedPacket::Error`] with `AckStatus::PidError`, matching C's own
 /// unmatched-PID fallthrough (`ParsePacket.cpp:156-158`).
-pub fn parse_packet(raw: &[u8]) -> ReceivedPacket {
-    let (pid1, pid2, data) = match parse_packet_status(raw) {
+pub fn parse_packet(raw: &[u8], pin: &mut PacketHeader) -> ReceivedPacket {
+    let (pid1, pid2, data) = match parse_packet_status(raw, pin) {
         Ok(parsed) => parsed,
         Err(status) => {
             return ReceivedPacket::Error { status };
@@ -412,6 +433,8 @@ pub fn parse_packet(raw: &[u8]) -> ReceivedPacket {
         && (pid2_rcv::SPECTRUM_256_LO..=pid2_rcv::SPECTRUM_8192_HI).contains(&pid2)
     {
         ReceivedPacket::Spectrum { pid2, data }
+    } else if pid1 == pid1::RCV_SCOPE_MISC && pid2_rcv::UNPROCESSED_MISC.contains(&pid2) {
+        ReceivedPacket::Unprocessed
     } else if pid1 == pid1::RCV_SCOPE_MISC && pid2 == pid2_rcv::CONFIG_READBACK {
         ReceivedPacket::ConfigReadback { data }
     } else if pid1 == pid1::ACK {
@@ -454,17 +477,46 @@ mod tests {
     fn pack_and_parse_round_trip() {
         let payload = b"CLCK=AUTO;TPEA=12.500000;";
         let buf = pack_out(0x20, 0x02, payload);
-        let (pid1, pid2, data) = parse_packet_status(&buf).unwrap();
+        let (pid1, pid2, data) = parse_packet_status(&buf, &mut PacketHeader::default()).unwrap();
         assert_eq!(pid1, 0x20);
         assert_eq!(pid2, 0x02);
         assert_eq!(data, payload);
+    }
+
+    /// `ParsePacket.cpp:18-21`: a sync error leaves the previous header in
+    /// `PIN`; a checksum error still records the new one.
+    #[test]
+    fn packet_header_persists_across_sync_errors() {
+        let mut pin = PacketHeader::default();
+        let mut bad_cs = pack_out(0x82, 0x0C, &[1, 2]);
+        bad_cs[7] ^= 1;
+        assert_eq!(
+            parse_packet_status(&bad_cs, &mut pin),
+            Err(AckStatus::ChecksumError)
+        );
+        let seen = PacketHeader {
+            len: 2,
+            pid1: 0x82,
+            pid2: 0x0C,
+        };
+        assert_eq!(pin, seen);
+        let mut bad_sync = pack_out(0x01, 0x01, &[]);
+        bad_sync[1] = 0;
+        assert_eq!(
+            parse_packet_status(&bad_sync, &mut pin),
+            Err(AckStatus::SyncError)
+        );
+        assert_eq!(pin, seen);
     }
 
     #[test]
     fn parse_packet_status_rejects_bad_sync() {
         let mut buf = pack_out(0x01, 0x01, &[]);
         buf[0] = 0x00;
-        assert_eq!(parse_packet_status(&buf), Err(AckStatus::SyncError));
+        assert_eq!(
+            parse_packet_status(&buf, &mut PacketHeader::default()),
+            Err(AckStatus::SyncError)
+        );
     }
 
     #[test]
@@ -472,14 +524,17 @@ mod tests {
         let mut buf = pack_out(0x01, 0x01, &[]);
         let last = buf.len() - 1;
         buf[last] ^= 0xFF;
-        assert_eq!(parse_packet_status(&buf), Err(AckStatus::ChecksumError));
+        assert_eq!(
+            parse_packet_status(&buf, &mut PacketHeader::default()),
+            Err(AckStatus::ChecksumError)
+        );
     }
 
     #[test]
     fn parse_packet_status_rejects_truncated_buffer() {
         let buf = pack_out(0x20, 0x02, b"CLCK=AUTO;");
         assert_eq!(
-            parse_packet_status(&buf[..buf.len() - 3]),
+            parse_packet_status(&buf[..buf.len() - 3], &mut PacketHeader::default()),
             Err(AckStatus::LenError)
         );
     }
@@ -490,7 +545,7 @@ mod tests {
     fn parse_packet_routes_status() {
         let raw_status = vec![0u8; 64];
         let buf = pack_out(0x80, 0x01, &raw_status);
-        match parse_packet(&buf) {
+        match parse_packet(&buf, &mut PacketHeader::default()) {
             ReceivedPacket::Status { data } => assert_eq!(data, raw_status),
             other => panic!("expected Status, got {other:?}"),
         }
@@ -502,7 +557,7 @@ mod tests {
     fn parse_packet_routes_spectrum_across_the_full_pid2_range() {
         for pid2 in 0x01..=0x0Cu8 {
             let buf = pack_out(0x81, pid2, &[1, 2, 3]);
-            match parse_packet(&buf) {
+            match parse_packet(&buf, &mut PacketHeader::default()) {
                 ReceivedPacket::Spectrum { pid2: got, data } => {
                     assert_eq!(got, pid2);
                     assert_eq!(data, vec![1, 2, 3]);
@@ -571,7 +626,7 @@ mod tests {
     #[test]
     fn parse_packet_routes_config_readback() {
         let buf = pack_out(0x82, 0x07, b"CLCK=AUTO;");
-        match parse_packet(&buf) {
+        match parse_packet(&buf, &mut PacketHeader::default()) {
             ReceivedPacket::ConfigReadback { data } => assert_eq!(data, b"CLCK=AUTO;"),
             other => panic!("expected ConfigReadback, got {other:?}"),
         }
@@ -582,7 +637,7 @@ mod tests {
     fn parse_packet_routes_bare_ack() {
         let buf = pack_out(0xFF, 0x00, &[]);
         assert_eq!(
-            parse_packet(&buf),
+            parse_packet(&buf, &mut PacketHeader::default()),
             ReceivedPacket::Ack {
                 status: AckStatus::Ok,
                 data: vec![],
@@ -592,24 +647,49 @@ mod tests {
 
     /// An ACK carrying an error status still routes to `Ack`, not `Error`
     /// -- `ParsePacket` doesn't look at the ack code, only `PID1_ACK`
-    /// (`ParsePacket.cpp:154-155`); `offending_command_text` is the
+    /// (`ParsePacket.cpp:154-155`); `parse_cmd` is the
     /// separate, caller-invoked check that actually distinguishes it
     /// (`CParsePacket::ParseCmd`, `ParsePacket.cpp:179-199`).
     #[test]
     fn parse_packet_routes_error_ack_to_ack_not_error() {
         let buf = pack_out(0xFF, 0x05, b"BADCMD=1;");
-        match parse_packet(&buf) {
+        match parse_packet(&buf, &mut PacketHeader::default()) {
             ReceivedPacket::Ack {
                 status: AckStatus::BadParam,
                 data,
             } => {
                 assert_eq!(
-                    offending_command_text(AckStatus::BadParam, &data),
-                    Some("BADCMD=1;".to_string())
+                    parse_cmd("Send config: Bad Parameter\t", AckStatus::BadParam, &data),
+                    "Send config: Bad Parameter\t(Last) Offending command: BADCMD=1;"
                 );
             }
             other => panic!("expected BadParam Ack, got {other:?}"),
         }
+    }
+
+    /// `ParseCmd` with `LEN == 0` (`ParsePacket.cpp:194-195`).
+    #[test]
+    fn parse_cmd_empty_payload_is_i2c_packet() {
+        let source = pid2_text_to_string("Send config", AckStatus::Pc5NotPresent);
+        assert_eq!(source, "Send config: PC5 not present\t");
+        assert_eq!(
+            parse_cmd(&source, AckStatus::Pc5NotPresent, &[]),
+            "Send config: PC5 not present\tI2C packet"
+        );
+        assert_eq!(parse_cmd(&source, AckStatus::Ok, &[]), "");
+        assert_eq!(pid2_text_to_string("Send config", AckStatus::Ok), "");
+    }
+
+    /// `snprintf(data, 255, "%.*s", ...)` keeps at most 254 bytes, up to a NUL.
+    #[test]
+    fn parse_cmd_truncates_like_snprintf() {
+        let long = vec![b'A'; 300];
+        let text = parse_cmd("", AckStatus::Unrecognized, &long);
+        assert_eq!(text.len(), "(Last) Offending command: ".len() + 254);
+        assert_eq!(
+            parse_cmd("", AckStatus::Unrecognized, b"AB\0CD"),
+            "(Last) Offending command: AB"
+        );
     }
 
     /// An unmatched `(pid1, pid2)` combination C's `ParsePacket` falls
@@ -618,11 +698,25 @@ mod tests {
     fn parse_packet_unmatched_pid_is_pid_error() {
         let buf = pack_out(0x03, 0x01, &[]);
         assert_eq!(
-            parse_packet(&buf),
+            parse_packet(&buf, &mut PacketHeader::default()),
             ReceivedPacket::Error {
                 status: AckStatus::PidError,
             }
         );
+    }
+
+    #[test]
+    fn parse_packet_scope_misc_is_unprocessed() {
+        for pid2 in [0x01, 0x02, 0x03, 0x04, 0x05, 0x0C] {
+            assert_eq!(
+                parse_packet(&pack_out(0x82, pid2, &[]), &mut PacketHeader::default()),
+                ReceivedPacket::Unprocessed
+            );
+        }
+        assert!(matches!(
+            parse_packet(&pack_out(0x82, 0x06, &[]), &mut PacketHeader::default()),
+            ReceivedPacket::Error { .. }
+        ));
     }
 
     /// `doAmptekNetFinderPacket`'s hardcoded 8-byte literal
@@ -634,28 +728,13 @@ mod tests {
         assert_eq!(build_netfinder_direct_request(), C_LITERAL);
     }
 
+    /// `TRANSMIT_PACKET_TYPE` positions (`DP5Protocol.h:5-50`).
     #[test]
-    fn netfinder_direct_response_header_extracts_data() {
-        let mut raw = vec![SYNC1, SYNC2, 0x82, 0x08, 0x00, 0x04];
-        raw.extend_from_slice(&[1, 2, 3, 4]);
-        raw.extend_from_slice(&[0xAA, 0xBB]); // unverified trailer
-        assert_eq!(
-            parse_netfinder_direct_response_header(&raw),
-            Some(&[1, 2, 3, 4][..])
-        );
-    }
-
-    #[test]
-    fn netfinder_direct_response_header_rejects_wrong_pid() {
-        let mut raw = vec![SYNC1, SYNC2, 0x80, 0x01, 0x00, 0x00];
-        raw.extend_from_slice(&[0, 0]);
-        assert_eq!(parse_netfinder_direct_response_header(&raw), None);
-    }
-
-    #[test]
-    fn netfinder_direct_response_header_rejects_len_exceeding_received_bytes() {
-        // Header claims 4 bytes of data but none were actually received.
-        let raw = vec![SYNC1, SYNC2, 0x82, 0x08, 0x00, 0x04];
-        assert_eq!(parse_netfinder_direct_response_header(&raw), None);
+    fn transmit_packet_type_values_match_c_enum() {
+        assert_eq!(TransmitPacketType::SendStatus as i32, 0);
+        assert_eq!(TransmitPacketType::SendSpectrumStatus as i32, 3);
+        assert_eq!(TransmitPacketType::SendClearSpectrumStatus as i32, 4);
+        assert_eq!(TransmitPacketType::EnableMcaMcs as i32, 40);
+        assert_eq!(TransmitPacketType::DisableMcaMcs as i32, 41);
     }
 }

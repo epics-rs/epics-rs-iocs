@@ -1,0 +1,237 @@
+# c-expansion of st.cmd, C300.cmd, no LC400.cmd over the C sources, the records of C300.dbl:
+# dbl of motor R7-4-5 motorNPoint iocBoot/iocNPoint st.cmd with < C300.cmd
+record(bi, "nPoint:alldone") {
+    field(DESC, "All IOC motors done moving.")
+    field(INP, "1")
+    field(ONAM, "done")
+    field(ZNAM, "moving")
+}
+record(calc, "nPoint:alldoneBlink") {
+    field(CALC, "A?0:!B")
+    field(INPA, "nPoint:alldone")
+    field(INPB, "nPoint:alldoneBlink")
+    field(SCAN, ".5 second")
+}
+record(bo, "nPoint:allstop") {
+    field(DESC, "Stop All IOC motors.")
+    field(ONAM, "stop")
+    field(ZNAM, "release")
+}
+record(motor, "nPoint:m1") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 1")
+    field(DHLM, "50")
+    field(DIR, "Pos")
+    field(DLLM, "-50")
+    field(DTYP, "asynMotor")
+    field(EGU, "um")
+    field(INIT, "")
+    field(MRES, "9.5367431641e-5")
+    field(OUT, "@asyn(C300,0)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "nPoint:m1_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(longout, "nPoint:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "nPoint:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(C300,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "nPoint:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "nPoint:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(C300,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "nPoint:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "nPoint:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(C300,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "nPoint:m1_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "nPoint:m1.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "nPoint:m1_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "nPoint:m1.TWV")
+    field(INPC, "nPoint:m1.MRES")
+    field(INPD, "nPoint:m1.HLM")
+    field(INPE, "nPoint:m1.LLM")
+    field(OUT, "nPoint:m1.TWV")
+}
+record(calcout, "nPoint:m1_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "nPoint:m1.S")
+    field(INPC, "nPoint:m1.SBAS")
+    field(INPD, "nPoint:m1.SMAX")
+    field(OUT, "nPoint:m1.S")
+}
+record(motor, "nPoint:m2") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 2")
+    field(DHLM, "50")
+    field(DIR, "Pos")
+    field(DLLM, "-50")
+    field(DTYP, "asynMotor")
+    field(EGU, "um")
+    field(INIT, "")
+    field(MRES, "9.5367431641e-5")
+    field(OUT, "@asyn(C300,1)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "nPoint:m2_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(longout, "nPoint:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "nPoint:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(C300,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "nPoint:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "nPoint:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(C300,1)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "nPoint:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "nPoint:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(C300,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "nPoint:m2_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "nPoint:m2.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "nPoint:m2_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "nPoint:m2.TWV")
+    field(INPC, "nPoint:m2.MRES")
+    field(INPD, "nPoint:m2.HLM")
+    field(INPE, "nPoint:m2.LLM")
+    field(OUT, "nPoint:m2.TWV")
+}
+record(calcout, "nPoint:m2_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "nPoint:m2.S")
+    field(INPC, "nPoint:m2.SBAS")
+    field(INPD, "nPoint:m2.SMAX")
+    field(OUT, "nPoint:m2.S")
+}
+record(motor, "nPoint:m3") {
+    field(ACCL, ".2")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 3")
+    field(DHLM, "12.5")
+    field(DIR, "Pos")
+    field(DLLM, "-12.5")
+    field(DTYP, "asynMotor")
+    field(EGU, "um")
+    field(INIT, "")
+    field(MRES, "2.384185791e-5")
+    field(OUT, "@asyn(C300,2)")
+    field(PREC, "5")
+    field(RSTM, "NearZero")
+    field(RTRY, "10")
+    field(SDIS, "nPoint:m3_able.VAL")
+    field(TWV, "1")
+    field(VBAS, ".1")
+    field(VELO, "1")
+}
+record(longout, "nPoint:m3Direction") {
+    field(DESC, "m3 direction")
+    field(DOL, "nPoint:m3.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(C300,2)MOTOR_REC_DIRECTION")
+}
+record(ao, "nPoint:m3Offset") {
+    field(DESC, "m3 offset")
+    field(DOL, "nPoint:m3.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(C300,2)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "nPoint:m3Resolution") {
+    field(DESC, "m3 resolution")
+    field(DOL, "nPoint:m3.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(C300,2)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(bo, "nPoint:m3_able") {
+    field(DESC, "motor enable")
+    field(ONAM, "Disable")
+    field(OUT, "nPoint:m3.DISP")
+    field(PINI, "YES")
+    field(ZNAM, "Enable")
+}
+record(calcout, "nPoint:m3_twCh") {
+    field(CALC, "min(max(a*b,c),d-e)")
+    field(DESC, "change TWV")
+    field(INPB, "nPoint:m3.TWV")
+    field(INPC, "nPoint:m3.MRES")
+    field(INPD, "nPoint:m3.HLM")
+    field(INPE, "nPoint:m3.LLM")
+    field(OUT, "nPoint:m3.TWV")
+}
+record(calcout, "nPoint:m3_vCh") {
+    field(CALC, "min(max(a*b,c),d)")
+    field(DESC, "change velocity")
+    field(INPB, "nPoint:m3.S")
+    field(INPC, "nPoint:m3.SBAS")
+    field(INPD, "nPoint:m3.SMAX")
+    field(OUT, "nPoint:m3.S")
+}
+record(longout, "nPoint:moving") {
+    field(DESC, "Motors moving count.")
+}
+record(waveform, "nPoint:movingDiff") {
+    field(DESC, "Motor w/ last dmov change")
+    field(FTVL, "CHAR")
+    field(NELM, "62")
+}

@@ -1,0 +1,26 @@
+# dbl of motor R7-4-5 motorPI iocBoot/iocPI st.cmd
+pi:alldone
+pi:alldoneBlink
+pi:allstop
+pi:m1
+pi:m1_able
+pi:m1_twCh
+pi:m1_vCh
+pi:m2
+pi:m2_able
+pi:m2_twCh
+pi:m2_vCh
+pi:m3
+pi:m3_able
+pi:m3_twCh
+pi:m3_vCh
+pi:m4
+pi:m4_able
+pi:m4_twCh
+pi:m4_vCh
+pi:m5
+pi:m5_able
+pi:m5_twCh
+pi:m5_vCh
+pi:moving
+pi:movingDiff

@@ -1,0 +1,11 @@
+# C's iocPI PI_E816.substitutions, P and C from st.cmd.
+#
+# PI E-816: one motor record per axis. DTYP is "PIE816", OUT #C$(C) S$(S); signal 0..11 = command letters A..L,
+# in the order they responded to the connect-time POS? probe. Closed-loop
+# piezo (NTM=No, no home, no set-position; stop is a zero relative move).
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{N,  M,        DTYP,      S,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{5,  "m$(N)",  "PIE816",  0,  "motor $(N)",  mm,       Pos,  1,     .1,    .2,    0,     1,     .2,    2.5e-4, 5,     100,   -100,  ""}
+}

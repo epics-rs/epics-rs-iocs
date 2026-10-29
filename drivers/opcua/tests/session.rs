@@ -13,12 +13,21 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use opcua::client::{Notification, ServerInfo, UaConnection, UaConnector};
+use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
+use opcua::client::{
+    CreatedSubscription, Identity, Notification, ServerInfo, SetupError, UaClient, UaConnection,
+    UaConnector,
+};
 use opcua::item::{Item, Leaf};
 use opcua::link::{InfoDefaults, LinkInfo, NodeIdentifier, RecordKind, parse_link};
 use opcua::queue::{ConnectionStatus, ProcessReason, Update};
 use opcua::session::{self, Control, Priority, Request, SessionConfig, SessionHandle};
 use opcua::subscription::SubscriptionConfig;
+
+#[cfg(unix)]
+mod console;
+#[cfg(unix)]
+use console::Console;
 
 // -------------------------------------------------------------- the test double
 
@@ -29,8 +38,17 @@ struct Behaviour {
     write_error: Option<StatusCode>,
     /// The per-value status the write results carry.
     write_status: Option<StatusCode>,
+    /// Every Value read answers with this status and no value.
+    value_status: Option<StatusCode>,
     /// Return one result short of what was asked for — a server that under-answers.
     truncate_read: bool,
+    /// The per-item status `CreateMonitoredItems` answers with.
+    monitor_status: Option<StatusCode>,
+    /// `CreateSubscription` fails with this.
+    subscription_error: Option<StatusCode>,
+    /// The publishing interval `CreateSubscription` revises to; the requested
+    /// one when unset.
+    revised_interval: Option<f64>,
 }
 
 #[derive(Default)]
@@ -41,6 +59,8 @@ struct Calls {
     subscriptions: Vec<SubscriptionConfig>,
     monitored: Vec<async_opcua::types::MonitoredItemCreateRequest>,
     disconnects: usize,
+    /// The read and subscription service calls, in the order they were made.
+    events: Vec<String>,
 }
 
 #[derive(Default)]
@@ -51,7 +71,16 @@ struct Mock {
     /// Value attribute per node, defaulting to Int32(42).
     values: Mutex<HashMap<NodeId, Variant>>,
     sink: Mutex<Option<mpsc::UnboundedSender<Notification>>>,
+    /// The configuration each `UA_Client_connect` ran with: the one its
+    /// client was set up with.
     connects: Mutex<Vec<SessionConfig>>,
+    setups: Mutex<usize>,
+    /// Refuse this many connect attempts before accepting one.
+    refuse_connects: Mutex<usize>,
+    /// Fail this many security setups before one succeeds.
+    fail_setups: Mutex<usize>,
+    /// The server drops the connection.
+    lost: tokio::sync::Notify,
 }
 
 impl Mock {
@@ -70,26 +99,70 @@ struct MockConnector(Arc<Mock>);
 
 #[async_trait]
 impl UaConnector for MockConnector {
-    async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
-        self.0.connects.lock().push(config.clone());
-        Ok(self.0.clone())
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+        *self.0.setups.lock() += 1;
+        let mut fail = self.0.fail_setups.lock();
+        if *fail > 0 {
+            *fail -= 1;
+            return Err(SetupError::new(
+                "security discovery and setup failed with status fatal",
+            ));
+        }
+        Ok(Box::new(MockClient {
+            mock: self.0.clone(),
+            config: config.clone(),
+            identity: config.setup_identity(),
+        }))
+    }
+}
+
+struct MockClient {
+    mock: Arc<Mock>,
+    config: SessionConfig,
+    identity: Identity,
+}
+
+#[async_trait]
+impl UaClient for MockClient {
+    fn identity(&self) -> &Identity {
+        &self.identity
+    }
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode> {
+        self.mock.connects.lock().push(self.config.clone());
+        let mut refuse = self.mock.refuse_connects.lock();
+        if *refuse > 0 {
+            *refuse -= 1;
+            return Err(StatusCode::BadNotConnected);
+        }
+        Ok(self.mock.clone())
     }
 }
 
 #[async_trait]
 impl UaConnection for Mock {
-    async fn read(&self, nodes: &[ReadValueId]) -> Result<Vec<DataValue>, StatusCode> {
-        self.calls.lock().reads.push(nodes.to_vec());
+    async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
+        let id = {
+            let mut calls = self.calls.lock();
+            calls.reads.push(nodes.to_vec());
+            calls.events.push("read".to_string());
+            calls.reads.len() as u32
+        };
         if let Some(status) = self.behaviour.lock().read_error {
-            return Err(status);
+            return (id, Err(status));
         }
         let values = self.values.lock();
+        let value_status = self.behaviour.lock().value_status;
         let mut results: Vec<DataValue> = nodes
             .iter()
             .map(|node| {
                 if node.attribute_id == AttributeId::DataType as u32 {
                     // Int32 — i=6.
                     DataValue::value_only(Variant::NodeId(Box::new(NodeId::new(0, 6u32))))
+                } else if let Some(status) = value_status {
+                    DataValue {
+                        status: Some(status),
+                        ..Default::default()
+                    }
                 } else {
                     let value = values
                         .get(&node.node_id)
@@ -106,17 +179,21 @@ impl UaConnection for Mock {
         if self.behaviour.lock().truncate_read {
             results.pop();
         }
-        Ok(results)
+        (id, Ok(results))
     }
 
-    async fn write(&self, values: &[WriteValue]) -> Result<Vec<StatusCode>, StatusCode> {
-        self.calls.lock().writes.push(values.to_vec());
+    async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>) {
+        let id = {
+            let mut calls = self.calls.lock();
+            calls.writes.push(values.to_vec());
+            calls.writes.len() as u32
+        };
         let behaviour = self.behaviour.lock().clone();
         if let Some(status) = behaviour.write_error {
-            return Err(status);
+            return (id, Err(status));
         }
         let status = behaviour.write_status.unwrap_or(StatusCode::Good);
-        Ok(vec![status; values.len()])
+        (id, Ok(vec![status; values.len()]))
     }
 
     async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode> {
@@ -142,24 +219,57 @@ impl UaConnection for Mock {
         &self,
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<u32, StatusCode> {
-        self.calls.lock().subscriptions.push(config.clone());
+    ) -> Result<CreatedSubscription, StatusCode> {
+        let id = {
+            let mut calls = self.calls.lock();
+            calls.subscriptions.push(config.clone());
+            calls.events.push(format!("create {}", config.name));
+            calls.subscriptions.len() as u32
+        };
+        if let Some(status) = self.behaviour.lock().subscription_error {
+            return Err(status);
+        }
         *self.sink.lock() = Some(sink);
-        Ok(7)
+        Ok(CreatedSubscription {
+            id,
+            revised_publishing_interval: self
+                .behaviour
+                .lock()
+                .revised_interval
+                .unwrap_or(config.publishing_interval),
+        })
     }
 
     async fn create_monitored_items(
         &self,
-        _subscription_id: u32,
+        subscription_id: u32,
         items: Vec<async_opcua::types::MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode> {
-        let n = items.len();
-        self.calls.lock().monitored.extend(items);
-        Ok(vec![StatusCode::Good; n])
+    ) -> Result<Vec<async_opcua::types::MonitoredItemCreateResult>, StatusCode> {
+        let results = items
+            .iter()
+            .map(|item| async_opcua::types::MonitoredItemCreateResult {
+                status_code: self
+                    .behaviour
+                    .lock()
+                    .monitor_status
+                    .unwrap_or(StatusCode::Good),
+                revised_sampling_interval: item.requested_parameters.sampling_interval,
+                revised_queue_size: item.requested_parameters.queue_size,
+                ..Default::default()
+            })
+            .collect();
+        let mut calls = self.calls.lock();
+        calls.events.push(format!("monitor {subscription_id}"));
+        calls.monitored.extend(items);
+        Ok(results)
     }
 
     async fn disconnect(&self) {
         self.calls.lock().disconnects += 1;
+    }
+
+    async fn closed(&self) {
+        self.lost.notified().await
     }
 }
 
@@ -169,7 +279,7 @@ struct Names;
 
 impl opcua::link::NameResolver for Names {
     fn subscription_session(&self, name: &str) -> Option<String> {
-        (name == "subs").then(|| "sess".to_string())
+        matches!(name, "subs" | "early").then(|| "sess".to_string())
     }
     fn is_session(&self, name: &str) -> bool {
         name == "sess"
@@ -186,7 +296,7 @@ const OUTPUT: RecordKind = RecordKind {
 };
 
 fn link(text: &str, kind: RecordKind) -> LinkInfo {
-    parse_link(text, kind, &InfoDefaults::default(), &Names)
+    parse_link("rec", text, kind, &InfoDefaults::default(), &Names)
         .unwrap_or_else(|e| panic!("parsing '{text}' failed: {e}"))
 }
 
@@ -198,7 +308,7 @@ fn node_id_of(link: &LinkInfo) -> NodeId {
 }
 
 /// One item with one record bound to the whole node. The item is adopted — given
-/// its node, its client handle and its session — when [`spawn`] puts it on a
+/// its node, its index and its session — when [`spawn`] puts it on a
 /// session, which is where a `Registry` adopts one too.
 fn item(text: &str, kind: RecordKind) -> (Arc<Mutex<Item>>, Arc<Mutex<Leaf>>) {
     let info = link(text, kind);
@@ -206,7 +316,7 @@ fn item(text: &str, kind: RecordKind) -> (Arc<Mutex<Item>>, Arc<Mutex<Leaf>>) {
     // A capacity of one is all a test needs; the record end of the channel is
     // dropped, so a pulse that finds no room is simply dropped.
     let (notify, _rx) = mpsc::channel(1);
-    let leaf = Arc::new(Mutex::new(Leaf::new("rec".to_string(), info, notify)));
+    let leaf = Arc::new(Mutex::new(Leaf::new("rec".to_string(), "ai", info, notify)));
     item.leaves.push(leaf.clone());
     (Arc::new(Mutex::new(item)), leaf)
 }
@@ -217,14 +327,15 @@ fn spawn(
     items: Vec<Arc<Mutex<Item>>>,
 ) -> Arc<SessionHandle> {
     let (handle, worker) = session::create(config, Arc::new(MockConnector(mock.clone())));
-    for (client_handle, item) in items.iter().enumerate() {
+    for (index, item) in items.iter().enumerate() {
         let mut item = item.lock();
         let info = item.leaves[0].lock().link.clone();
         let node_id = node_id_of(&info);
-        item.adopt(info, node_id, client_handle as u32, handle.clone());
+        item.adopt(info, node_id, index as u32, handle.clone());
     }
     *handle.items.lock() = items;
-    tokio::spawn(worker.run());
+    worker.spawn();
+    handle.autoconnect();
     handle
 }
 
@@ -241,17 +352,13 @@ async fn until(f: impl Fn() -> bool) {
 }
 
 fn pop(leaf: &Arc<Mutex<Leaf>>) -> Update {
-    leaf.lock()
-        .queue
-        .pop()
-        .map(|(update, _)| update)
-        .expect("the leaf has an update")
+    leaf.lock().pop().expect("the leaf has an update")
 }
 
 fn drain(leaf: &Arc<Mutex<Leaf>>) -> Vec<Update> {
     let mut leaf = leaf.lock();
     let mut updates = Vec::new();
-    while let Some((update, _)) = leaf.queue.pop() {
+    while let Some(update) = leaf.pop() {
         updates.push(update);
     }
     updates
@@ -262,7 +369,7 @@ fn drain(leaf: &Arc<Mutex<Leaf>>) -> Vec<Update> {
 #[test]
 fn a_batch_is_bounded_by_the_smaller_of_the_two_limits() {
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config.nodes_max = 10;
+    config.set_option("nodes-max", "10").unwrap();
     let server = ServerInfo {
         max_nodes_per_read: 4,
         max_nodes_per_write: 20,
@@ -285,19 +392,53 @@ fn a_limit_only_one_side_sets_is_the_one_that_holds() {
     assert_eq!(config.write_batch_size(&server), 3);
 }
 
+/// `nodes-max` sets both limits when it is applied, so of it and a
+/// service-specific limit the later option wins (`SessionOpen62541.cpp:418-429`).
 #[test]
-fn the_service_specific_limit_beats_the_general_one() {
-    let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config.nodes_max = 8;
-    config.read_nodes_max = 2;
-    assert_eq!(config.read_batch_size(&ServerInfo::default()), 2);
-    assert_eq!(config.write_batch_size(&ServerInfo::default()), 8);
+fn the_later_of_nodes_max_and_a_service_limit_wins() {
+    let sizes = |options: &[(&str, &str)]| {
+        let mut config = SessionConfig::new("sess", "opc.tcp://host");
+        for (key, value) in options {
+            config.set_option(key, value).unwrap();
+        }
+        (
+            config.read_batch_size(&ServerInfo::default()),
+            config.write_batch_size(&ServerInfo::default()),
+        )
+    };
+    assert_eq!(
+        sizes(&[("nodes-max", "8"), ("read-nodes-max", "2")]),
+        (2, 8)
+    );
+    assert_eq!(
+        sizes(&[("read-nodes-max", "2"), ("nodes-max", "8")]),
+        (8, 8)
+    );
+    assert_eq!(
+        sizes(&[("write-nodes-max", "3"), ("batch-nodes", "5")]),
+        (5, 5)
+    );
 }
 
 #[test]
 fn no_limit_anywhere_means_no_limit() {
     let config = SessionConfig::new("sess", "opc.tcp://host");
     assert_eq!(config.read_batch_size(&ServerInfo::default()), usize::MAX);
+}
+
+/// C exports `opcua_MaxOperationsPerServiceCall` (`iocshIntegration.cpp:45`)
+/// but no session reads it.
+#[test]
+fn the_max_operations_variable_does_not_bound_a_batch() {
+    assert!(opcua::defaults::set_variable(
+        "opcua_MaxOperationsPerServiceCall",
+        "1"
+    ));
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    assert_eq!(config.read_batch_size(&ServerInfo::default()), usize::MAX);
+    config.set_option("nodes-max", "10").unwrap();
+    assert_eq!(config.read_batch_size(&ServerInfo::default()), 10);
+    assert_eq!(config.write_batch_size(&ServerInfo::default()), 10);
 }
 
 // ----------------------------------------------------------------- session options
@@ -308,60 +449,220 @@ fn session_options_are_parsed() {
     config.set_option("debug", "2").unwrap();
     config.set_option("autoconnect", "no").unwrap();
     config.set_option("nodes-max", "100").unwrap();
-    config.set_option("read-timeout-min", "5.5").unwrap();
+    config.set_option("read-timeout-min", "5").unwrap();
     config.set_option("sec-mode", "SignAndEncrypt").unwrap();
-    config.set_option("sec-id", "user:secret").unwrap();
+    config.set_option("sec-id", "/etc/opcua/creds").unwrap();
     config.set_option("pki-dir", "/etc/pki").unwrap();
 
     assert_eq!(config.debug, 2);
     assert!(!config.autoconnect);
-    assert_eq!(config.nodes_max, 100);
-    assert_eq!(config.read_timeout_min, 5.5);
+    assert_eq!((config.read_nodes_max, config.write_nodes_max), (100, 100));
+    assert_eq!(config.read_timeout_min, 5.0);
     assert_eq!(
         config.security_mode,
         opcua::client::SecurityMode::SignAndEncrypt
     );
-    assert_eq!(
-        config.identity,
-        opcua::client::Identity::UserName {
-            user: "user".into(),
-            password: "secret".into()
-        }
-    );
+    assert_eq!(config.identity_file.as_deref(), Some("/etc/opcua/creds"));
     assert_eq!(config.pki_dir.as_deref(), Some("/etc/pki"));
 }
 
 #[test]
-fn an_unknown_session_option_is_rejected() {
+fn a_bad_session_option_is_passed_over() {
+    // C reports an unknown name or bad mode and goes on; strtoul reads "x"
+    // as 0 and "0x10" as 16.
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    assert!(config.set_option("nonsense", "1").is_err());
-    assert!(config.set_option("nodes-max", "x").is_err());
+    config.set_option("nonsense", "1").unwrap();
+    config.set_option("sec-mode", "Bogus").unwrap();
+    config.set_option("nodes-max", "0x10").unwrap();
+    assert_eq!(config.read_nodes_max, 16);
+    config.set_option("nodes-max", "x").unwrap();
+    assert_eq!(config.read_nodes_max, 0);
+    assert_eq!(config.security_mode, opcua::client::SecurityMode::Best);
+}
+
+/// `std::strtoul(value, nullptr, 0)`, narrowed (`SessionOpen62541.cpp:420-452`,
+/// `SubscriptionOpen62541.cpp:64-67`): g++'s `_GNU_SOURCE` gives glibc's C23
+/// `0b`, only C `isspace` is skipped, and an overflow is `ULONG_MAX` whatever
+/// the sign.
+#[test]
+fn an_option_count_is_glibc_strtoul() {
+    use std::ffi::c_ulong;
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    let mut nodes = |value: &str| {
+        config.set_option("nodes-max", value).unwrap();
+        config.read_nodes_max
+    };
+    assert_eq!(nodes("0b101"), 5);
+    assert_eq!(nodes("\u{a0}7"), 0);
+    assert_eq!(nodes("-99999999999999999999"), u32::MAX);
+    let wrapped = if c_ulong::BITS == 64 { 1 } else { u32::MAX };
+    assert_eq!(nodes("4294967297"), wrapped);
+
+    let mut subscription = SubscriptionConfig::new("subs", "sess");
+    subscription.set_option("priority", "0b11");
+    assert_eq!(subscription.priority, 3);
+}
+
+/// C compares the mode with `==` (`SessionOpen62541.cpp:378-389`).
+#[test]
+fn sec_mode_is_matched_case_exactly() {
+    use opcua::client::SecurityMode;
+
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    for value in ["none", "NONE", "sign", "signandencrypt", "Best"] {
+        config.set_option("sec-mode", value).unwrap();
+        assert_eq!(config.security_mode, SecurityMode::Best, "{value}");
+    }
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert_eq!(
+        *lines.lock(),
+        vec!["invalid security-mode (valid: best None Sign SignAndEncrypt)\n"; 5]
+    );
+    for (value, mode) in [
+        ("None", SecurityMode::None),
+        ("Sign", SecurityMode::Sign),
+        ("SignAndEncrypt", SecurityMode::SignAndEncrypt),
+        ("best", SecurityMode::Best),
+    ] {
+        config.set_option("sec-mode", value).unwrap();
+        assert_eq!(config.security_mode, mode, "{value}");
+    }
 }
 
 #[test]
-fn an_x509_identity_names_a_certificate_and_a_key() {
+fn sec_policy_takes_the_short_name_and_keeps_the_uri() {
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config
-        .set_option("sec-id", "cert:/tmp/id.der:/tmp/id.pem")
-        .unwrap();
+    config.set_option("sec-policy", "Basic256Sha256").unwrap();
     assert_eq!(
-        config.identity,
+        config.security_policy.as_deref(),
+        Some("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256")
+    );
+    // An unknown name is reported and leaves the policy alone.
+    config.set_option("sec-policy", "Rot13").unwrap();
+    assert_eq!(
+        config.security_policy.as_deref(),
+        Some("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256")
+    );
+}
+
+#[test]
+fn an_illegal_autoconnect_is_the_one_option_error() {
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    assert_eq!(
+        config.set_option("autoconnect", "maybe"),
+        Err("illegal value 'm'".to_string())
+    );
+    assert!(config.autoconnect);
+}
+
+/// `setupIdentity` on a credentials file holding `contents`.
+fn identity_from(contents: &str) -> opcua::client::Identity {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file = std::env::temp_dir().join(format!("opcua-creds-{}-{n}", std::process::id()));
+    std::fs::write(&file, contents).unwrap();
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.identity_file = Some(file.to_string_lossy().into_owned());
+    let identity = config.setup_identity();
+    std::fs::remove_file(file).unwrap();
+    identity
+}
+
+#[test]
+fn no_credentials_file_is_the_anonymous_token() {
+    let config = SessionConfig::new("sess", "opc.tcp://host");
+    assert_eq!(config.setup_identity(), opcua::client::Identity::Anonymous);
+}
+
+#[test]
+fn an_empty_sec_id_is_no_credentials_file() {
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("sec-id", "/etc/opcua/creds").unwrap();
+    config.set_option("sec-id", "").unwrap();
+    assert_eq!(config.identity_file, None);
+    assert_eq!(config.setup_identity(), opcua::client::Identity::Anonymous);
+}
+
+#[test]
+fn a_credentials_file_with_user_and_pass_is_a_username_token() {
+    assert_eq!(
+        identity_from("# operator\nuser=op\npass=se=cret\n"),
+        opcua::client::Identity::UserName {
+            user: "op".into(),
+            password: "se=cret".into()
+        }
+    );
+}
+
+#[test]
+fn a_credentials_file_with_cert_and_key_is_a_certificate_token() {
+    let cert = std::env::temp_dir().join(format!("opcua-id-{}.der", std::process::id()));
+    std::fs::write(&cert, b"der").unwrap();
+    let identity = identity_from(&format!("cert={}\nkey=/tmp/id.pem\n", cert.display()));
+    std::fs::remove_file(&cert).unwrap();
+    assert_eq!(
+        identity,
         opcua::client::Identity::Certificate {
-            certificate: "/tmp/id.der".into(),
+            certificate: cert.to_string_lossy().into_owned(),
             private_key: "/tmp/id.pem".into()
         }
     );
-    assert!(config.set_option("sec-id", "cert:only-one").is_err());
+}
+
+#[test]
+fn an_unusable_credentials_file_falls_back_to_the_anonymous_token() {
+    use opcua::client::Identity::Anonymous;
+    // A commented-out setting, a lone user, a certificate that cannot be loaded.
+    assert_eq!(identity_from("#user=op\n#pass=secret\n"), Anonymous);
+    assert_eq!(identity_from("user=op\n"), Anonymous);
+    assert_eq!(
+        identity_from("cert=/nonexistent/id.der\nkey=/tmp/id.pem\n"),
+        Anonymous
+    );
+    // A directory opens for metadata but cannot be read as a certificate.
+    assert_eq!(
+        identity_from(&format!(
+            "cert={}\nkey=/tmp/id.pem\n",
+            std::env::temp_dir().display()
+        )),
+        Anonymous
+    );
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.identity_file = Some("/nonexistent/creds".into());
+    assert_eq!(config.setup_identity(), Anonymous);
 }
 
 #[test]
 fn subscription_options_are_parsed() {
     let mut config = SubscriptionConfig::new("subs", "sess");
-    config.set_option("priority", "5").unwrap();
-    config.set_option("debug", "1").unwrap();
+    config.set_option("priority", "5");
+    config.set_option("debug", "1");
     assert_eq!(config.priority, 5);
     assert_eq!(config.debug, 1);
-    assert!(config.set_option("nonsense", "1").is_err());
+    // Reported and passed over, as in the C.
+    config.set_option("nonsense", "1");
+    config.set_option("priority", "256");
+    assert_eq!(config.priority, 5);
+}
+
+#[test]
+fn a_subscription_requests_its_interval_unrounded() {
+    let mut config = SubscriptionConfig::new("subs", "sess");
+    config.publishing_interval = 33.3;
+    config.priority = 4;
+    let request = config.request(Default::default());
+    assert_eq!(request.requested_publishing_interval, 33.3);
+    assert_eq!(request.requested_lifetime_count, 150_150);
+    assert_eq!(request.requested_max_keep_alive_count, 10);
+    assert_eq!(request.max_notifications_per_publish, 0);
+    assert!(request.publishing_enabled);
+    assert_eq!(request.priority, 4);
 }
 
 // -------------------------------------------------------------------- connecting
@@ -428,6 +729,32 @@ async fn a_session_that_does_not_autoconnect_waits_for_the_connect_command() {
     assert_eq!(mock.connects.lock().len(), 1);
 }
 
+/// An `opcuaConnect` while an autoconnecting session waits out its retry
+/// interval is C's `connect(true)`: it tries at once.
+#[tokio::test]
+async fn opcua_connect_cuts_the_autoconnect_retry_short() {
+    let mock = Mock::arc();
+    *mock.refuse_connects.lock() = 1;
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0],
+    );
+    until(|| mock.connects.lock().len() == 1).await;
+
+    // The retry interval is opcua_ConnectTimeout, 5 s; `until` gives up first.
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    assert_eq!(mock.connects.lock().len(), 2);
+
+    // Connected, opcuaConnect only reports it; no further attempt.
+    handle.control(Control::Connect);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(handle.is_connected());
+    assert_eq!(mock.connects.lock().len(), 2);
+}
+
 /// `bini=write` does not use the value just read: the item queues a write request
 /// for the record, which answers it by writing its own value back
 /// (`manageStateAndBiniProcessing`, `devOpcua.cpp:186-199`).
@@ -442,7 +769,7 @@ async fn bini_write_asks_the_record_to_write_after_the_initial_read() {
         vec![item0],
     );
     until(|| handle.is_connected()).await;
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     let updates = drain(&leaf0);
     assert_eq!(updates.len(), 1);
@@ -527,7 +854,7 @@ async fn the_namespace_map_moves_an_item_onto_the_servers_index() {
 
     let (item0, _leaf0) = item("sess ns=4;s=Sensor monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config.namespace_map.insert(4, "urn:sensors".to_string());
+    config.add_namespace_mapping(4, "urn:sensors");
 
     let handle = spawn(config, &mock, vec![item0.clone()]);
     until(|| handle.is_connected()).await;
@@ -536,12 +863,92 @@ async fn the_namespace_map_moves_an_item_onto_the_servers_index() {
     assert_eq!(item0.lock().configured_node_id, NodeId::new(4, "Sensor"));
 }
 
+/// The C's map is keyed by URI (`std::map<std::string, unsigned short>`), so
+/// the mappings the server lacks are reported in URI order
+/// (`SessionOpen62541::updateNamespaceMap`).
+#[tokio::test]
+async fn namespaces_the_server_lacks_are_reported_in_uri_order() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mut mock = Mock::default();
+    mock.server.namespace_array = vec!["http://opcfoundation.org/UA/".to_string()];
+    let mock = Arc::new(mock);
+    let handle = spawn(SessionConfig::new("sess", "opc.tcp://host"), &mock, vec![]);
+    for (index, uri) in (10..).zip(["urn:f", "urn:e", "urn:d", "urn:c", "urn:b", "urn:a"]) {
+        handle.add_namespace_mapping(index, uri);
+    }
+    until(|| handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    let reported: Vec<String> = lines
+        .lock()
+        .iter()
+        .filter(|l| l.contains("not found on server"))
+        .cloned()
+        .collect();
+    let expected: Vec<String> = ["urn:a", "urn:b", "urn:c", "urn:d", "urn:e", "urn:f"]
+        .iter()
+        .map(|uri| {
+            format!("OPC UA session sess: locally mapped namespace '{uri}' not found on server\n")
+        })
+        .collect();
+    assert_eq!(reported, expected);
+}
+
+/// `SessionOpen62541.cpp:879-883`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_read_namespace_array_is_reported_at_debug() {
+    let mut mock = Mock::default();
+    mock.server.namespace_array = vec![
+        "http://opcfoundation.org/UA/".to_string(),
+        "urn:server".to_string(),
+        "urn:sensors".to_string(),
+    ];
+    let mock = Arc::new(mock);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("debug", "1").unwrap();
+    config.add_namespace_mapping(4, "urn:sensors");
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 1 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 1);
+        saved
+    };
+    let handle = spawn(config, &mock, vec![]);
+    until(|| handle.is_connected()).await;
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 1);
+        libc::close(saved);
+    }
+
+    let out = std::fs::read_to_string(sink.path()).unwrap();
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("(updateNamespaceMap)"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Session sess: (updateNamespaceMap) namespace array with 3 elements read; \
+          updating index map with 1 entries"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn an_item_whose_namespace_the_server_does_not_have_keeps_its_index() {
     let mock = Mock::arc();
     let (item0, _leaf0) = item("sess ns=4;s=Sensor monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config.namespace_map.insert(4, "urn:absent".to_string());
+    config.add_namespace_mapping(4, "urn:absent");
 
     let handle = spawn(config, &mock, vec![item0.clone()]);
     until(|| handle.is_connected()).await;
@@ -567,7 +974,7 @@ async fn a_records_read_request_reaches_the_server() {
         .lock()
         .insert(NodeId::new(2, "Sensor"), Variant::Int32(99));
     handle.request(Priority::Low, Request::Read { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     let update = pop(&leaf0);
     assert_eq!(update.reason, ProcessReason::ReadComplete);
@@ -610,7 +1017,7 @@ async fn a_failed_write_reaches_the_record_as_a_write_failure() {
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
         &mock,
-        vec![item0],
+        vec![item0.clone()],
     );
     until(|| handle.is_connected()).await;
     drain(&leaf0);
@@ -621,11 +1028,13 @@ async fn a_failed_write_reaches_the_record_as_a_write_failure() {
         leaf.dirty = true;
     }
     handle.request(Priority::Low, Request::Write { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     let update = pop(&leaf0);
     assert_eq!(update.reason, ProcessReason::WriteFailure);
-    assert_eq!(update.status, StatusCode::BadTypeMismatch);
+    // A write result is an event: the item keeps the status of its last read
+    // (`ItemOpen62541::setIncomingEvent`).
+    assert_eq!(item0.lock().last_status, StatusCode::Good);
     // The session stays up: a bad value is not a bad connection.
     assert!(handle.is_connected());
 }
@@ -638,19 +1047,98 @@ async fn a_failed_read_reaches_the_record_as_a_read_failure() {
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
         &mock,
-        vec![item0],
+        vec![item0.clone()],
     );
     until(|| handle.is_connected()).await;
     drain(&leaf0);
 
     mock.behave(|b| b.read_error = Some(StatusCode::BadNodeIdUnknown));
     handle.request(Priority::Low, Request::Read { handle: 0 });
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
     let update = pop(&leaf0);
     assert_eq!(update.reason, ProcessReason::ReadFailure);
-    assert_eq!(update.status, StatusCode::BadNodeIdUnknown);
+    // A failed service is an event; only a value carries a status onto the item.
+    assert_eq!(item0.lock().last_status, StatusCode::Good);
     assert!(handle.is_connected());
+}
+
+/// A value the server refuses is still `setIncomingData`: its status lands on
+/// the item (`ItemOpen62541.cpp:184`).
+#[tokio::test]
+async fn a_refused_value_reaches_the_record_and_the_item_status() {
+    let mock = Mock::arc();
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    until(|| handle.is_connected()).await;
+    drain(&leaf0);
+
+    mock.behave(|b| b.value_status = Some(StatusCode::BadNodeIdUnknown));
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !leaf0.lock().queue().is_empty()).await;
+
+    assert_eq!(pop(&leaf0).reason, ProcessReason::ReadFailure);
+    assert_eq!(item0.lock().last_status, StatusCode::BadNodeIdUnknown);
+}
+
+/// `ItemOpen62541::setIncomingData` reports a node the server does not know when
+/// it is the item's first answer since it was connected (`ItemOpen62541.cpp:175-182`).
+#[tokio::test]
+async fn an_unknown_node_is_reported_on_the_first_answer_after_a_connect() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    mock.behave(|b| b.value_status = Some(StatusCode::BadNodeIdUnknown));
+    let (item0, leaf0) = item("sess ns=2;s=Missing monitor=n", INPUT);
+    let (item1, _leaf1) = item("sess ns=3;i=1234 monitor=n", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone(), item1],
+    );
+    until(|| handle.is_connected()).await;
+    drain(&leaf0);
+
+    // Refused again: the item's status is no longer BadServerNotConnected.
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !leaf0.lock().queue().is_empty()).await;
+
+    // A data change after a connection loss is the same first answer.
+    let mut item = item0.lock();
+    item.set_incoming_event(ProcessReason::ConnectionLoss);
+    let refused = DataValue {
+        value: Some(Variant::Int32(1)),
+        status: Some(StatusCode::BadNodeIdUnknown),
+        ..Default::default()
+    };
+    item.set_incoming_data(refused.clone(), ProcessReason::IncomingData);
+    item.set_incoming_data(refused, ProcessReason::IncomingData);
+    drop(item);
+
+    errlog_flush();
+    errlog_remove_listener(id);
+    let reported: Vec<String> = lines
+        .lock()
+        .iter()
+        .filter(|l| l.starts_with("OPC UA session sess: item "))
+        .cloned()
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            "OPC UA session sess: item ns=2;s=Missing : BadNodeIdUnknown\n",
+            "OPC UA session sess: item ns=3;i=1234 : BadNodeIdUnknown\n",
+            "OPC UA session sess: item ns=2;s=Missing : BadNodeIdUnknown\n",
+        ]
+    );
 }
 
 /// Upstream C defect fixed at source: `SessionOpen62541::readComplete` bounds-checks
@@ -668,11 +1156,113 @@ async fn a_server_that_returns_too_few_results_does_not_read_past_the_end() {
         vec![item0],
     );
     until(|| handle.is_connected()).await;
-    until(|| !leaf0.lock().queue.is_empty()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
 
-    let update = pop(&leaf0);
-    assert_eq!(update.reason, ProcessReason::ReadFailure);
-    assert_eq!(update.status, StatusCode::BadUnexpectedError);
+    assert_eq!(pop(&leaf0).reason, ProcessReason::ReadFailure);
+}
+
+/// C's `readComplete` reports a short answer before handling it
+/// (`SessionOpen62541.cpp:2549-2554`).
+#[tokio::test]
+async fn a_short_read_answer_is_reported() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    mock.behave(|b| b.truncate_read = true);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0],
+    );
+    until(|| handle.is_connected()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    let reported: Vec<String> = lines
+        .lock()
+        .iter()
+        .filter(|l| l.contains("(readComplete)"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            "OPC UA session sess: (readComplete) received a callback with 1 values for a request containing 1 items\n"
+        ]
+    );
+}
+
+/// The request and completion debug lines carry the service call's
+/// transaction id (`SessionOpen62541.cpp:696-701`, `:774-779`, `:2543-2547`,
+/// `:2587-2592`, `:2618-2622`, `:2641-2646`).
+#[cfg(unix)]
+#[tokio::test]
+async fn read_and_write_debug_lines_name_the_transaction() {
+    let mock = Mock::arc();
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", OUTPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("debug", "5").unwrap();
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 1 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 1);
+        saved
+    };
+    let handle = spawn(config, &mock, vec![item0]);
+    until(|| handle.is_connected()).await;
+    until(|| !leaf0.lock().queue().is_empty()).await;
+    drain(&leaf0);
+    let write = || {
+        let mut leaf = leaf0.lock();
+        leaf.outgoing = Some(Variant::Int32(7));
+        leaf.dirty = true;
+    };
+    write();
+    handle.request(Priority::Low, Request::Write { handle: 0 });
+    until(|| !leaf0.lock().queue().is_empty()).await;
+    drain(&leaf0);
+
+    mock.behave(|b| {
+        b.read_error = Some(StatusCode::BadNodeIdUnknown);
+        b.write_error = Some(StatusCode::BadNodeIdUnknown);
+    });
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !leaf0.lock().queue().is_empty()).await;
+    drain(&leaf0);
+    write();
+    handle.request(Priority::Low, Request::Write { handle: 0 });
+    until(|| !leaf0.lock().queue().is_empty()).await;
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 1);
+        libc::close(saved);
+    }
+
+    let out = std::fs::read_to_string(sink.path()).unwrap();
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("Read)") || l.contains("Write)") || l.contains("Complete)"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Session sess: (requestRead) beginRead service ok (transaction id 1; retrieving 1 nodes)",
+            "Session sess: (readComplete) getting data for read service (transaction id 1; data for 2 items)",
+            "Session sess: (requestWrite) beginWrite service ok (transaction id 1; writing 1 nodes)",
+            "Session sess: (writeComplete) getting results for write service (transaction id 1; results for 1 items)",
+            "Session sess: (requestRead) beginRead service ok (transaction id 2; retrieving 1 nodes)",
+            "Session sess: (readComplete) for read service (transaction id 2) failed with status BadNodeIdUnknown",
+            "Session sess: (requestWrite) beginWrite service ok (transaction id 2; writing 1 nodes)",
+            "Session sess: (writeComplete) for write service (transaction id 2) failed with status BadNodeIdUnknown",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -744,6 +1334,7 @@ async fn a_connection_error_takes_the_session_down_and_tells_every_record() {
     until(|| handle.is_connected()).await;
     drain(&leaf0);
 
+    *mock.refuse_connects.lock() = 1;
     mock.behave(|b| b.read_error = Some(StatusCode::BadConnectionClosed));
     handle.request(Priority::Low, Request::Read { handle: 0 });
     until(|| !handle.is_connected()).await;
@@ -751,9 +1342,201 @@ async fn a_connection_error_takes_the_session_down_and_tells_every_record() {
     let updates = drain(&leaf0);
     assert_eq!(updates[0].reason, ProcessReason::ReadFailure);
     assert_eq!(updates[1].reason, ProcessReason::ConnectionLoss);
-    assert_eq!(updates[1].status, StatusCode::BadConnectionClosed);
+    // `ItemOpen62541::setIncomingEvent` (`ItemOpen62541.cpp:215-216`).
+    assert_eq!(item0.lock().last_status, StatusCode::BadServerNotConnected);
     assert_eq!(item0.lock().state, ConnectionStatus::Down);
     assert_eq!(mock.calls.lock().disconnects, 1);
+}
+
+/// C prints the ACTIVATED -> CREATED transition (`SessionOpen62541.cpp:2520-2523`).
+#[tokio::test]
+async fn a_lost_connection_prints_disconnected() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+
+    *mock.refuse_connects.lock() = 1;
+    mock.behave(|b| b.read_error = Some(StatusCode::BadConnectionClosed));
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert!(
+        lines
+            .lock()
+            .iter()
+            .any(|l| l == "OPC UA session sess: disconnected\n")
+    );
+}
+
+/// `opcuaDisconnect` ends C's session in CLOSED, not CREATED, so the
+/// `disconnected` line of `SessionOpen62541.cpp:2520-2523` is not printed.
+#[tokio::test]
+async fn a_requested_disconnect_prints_nothing() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+
+    errlog_flush();
+    lines.lock().clear();
+    handle.control(Control::Disconnect);
+    until(|| !handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert_eq!(mock.calls.lock().disconnects, 1);
+    assert_eq!(*lines.lock(), Vec::<String>::new());
+}
+
+/// The connection fields of the `opcuaShow` line, and `registered=`.
+fn shown_state(handle: &SessionHandle) -> String {
+    let mut out = Vec::new();
+    handle.show(0, &mut out, &mut Vec::new()).unwrap();
+    let line = String::from_utf8(out).unwrap();
+    let field = |key: &str| {
+        let start = line.find(key).expect(key) + key.len();
+        line[start..].split(' ').next().unwrap().to_string()
+    };
+    format!(
+        "{} {} {} registered={}",
+        field("connect status="),
+        field("sessionState="),
+        field("channelState="),
+        field("registered="),
+    )
+}
+
+/// The states the C oracle IOC shows (`SessionOpen62541::show`): unconnected,
+/// a refused connect, connected, disconnected on request, and lost.
+#[tokio::test]
+async fn the_shown_connection_state_follows_the_client() {
+    let mock = Mock::arc();
+    *mock.refuse_connects.lock() = 1;
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor register=y monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    assert_eq!(
+        shown_state(&handle),
+        "BadInvalidState Closed Closed registered=0"
+    );
+
+    handle.control(Control::Connect);
+    until(|| mock.connects.lock().len() == 1).await;
+    until(|| shown_state(&handle) == "BadNotConnected Closed Closed registered=0").await;
+
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    assert_eq!(shown_state(&handle), "Good Activated Open registered=1");
+
+    handle.control(Control::Disconnect);
+    until(|| !handle.is_connected()).await;
+    assert_eq!(shown_state(&handle), "Good Closed Closed registered=0");
+
+    // The lost session's one reconnect attempt is refused, so its status is
+    // the connect status (the C shows BadDisconnect for a refused TCP connect).
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    *mock.refuse_connects.lock() = 1;
+    mock.behave(|b| b.read_error = Some(StatusCode::BadConnectionClosed));
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| mock.connects.lock().len() == 4).await;
+    until(|| shown_state(&handle) == "BadNotConnected Created Fresh registered=0").await;
+}
+
+/// open62541 notices a dropped connection in `UA_Client_run_iterate` with no
+/// request outstanding, takes the session to CREATED/FRESH and makes one
+/// reconnect attempt at once, autoconnect or not (`connectIterate`).
+#[tokio::test]
+async fn a_connection_the_server_drops_is_lost_and_retried_once() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, leaf0) = item("sess ns=2;s=Sensor register=y monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    drain(&leaf0);
+    let reads = mock.calls.lock().reads.len();
+
+    *mock.refuse_connects.lock() = 1;
+    mock.lost.notify_one();
+    until(|| shown_state(&handle) == "BadNotConnected Created Fresh registered=0").await;
+    assert!(!handle.is_connected());
+    assert_eq!(drain(&leaf0)[0].reason, ProcessReason::ConnectionLoss);
+    assert_eq!(mock.calls.lock().reads.len(), reads);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(mock.connects.lock().len(), 2);
+
+    errlog_flush();
+    errlog_remove_listener(id);
+    let lines = lines.lock();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| *l == "OPC UA session sess: disconnected\n")
+            .count(),
+        1
+    );
+    assert!(!lines.iter().any(|l| l.contains("connect service failed")));
+}
+
+#[tokio::test]
+async fn a_connection_the_server_drops_reconnects_at_once() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+
+    mock.lost.notify_one();
+    until(|| mock.connects.lock().len() == 2).await;
+    until(|| handle.is_connected()).await;
+    assert_eq!(mock.calls.lock().disconnects, 1);
+    assert_eq!(shown_state(&handle), "Good Activated Open registered=0");
+}
+
+/// open62541 reconnects a lost session on the client `connect` set up, with
+/// no security setup and no identity read again (`connectIterate`,
+/// open62541.c:45447-45560).
+#[tokio::test]
+async fn a_lost_session_reconnects_on_the_client_its_connect_set_up() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+
+    mock.lost.notify_one();
+    until(|| mock.connects.lock().len() == 2).await;
+    until(|| handle.is_connected()).await;
+    assert_eq!(*mock.setups.lock(), 1);
 }
 
 #[tokio::test]
@@ -832,7 +1615,7 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
         request.item_to_monitor.attribute_id,
         AttributeId::Value as u32
     );
-    assert_eq!(request.requested_parameters.client_handle, 0);
+    assert_eq!(request.requested_parameters.client_handle, 1);
     assert_eq!(request.requested_parameters.sampling_interval, 250.0);
     assert_eq!(request.requested_parameters.queue_size, 8);
     assert!(!request.requested_parameters.discard_oldest);
@@ -845,6 +1628,197 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
         .clone();
     assert_eq!(filter.deadband_type, DeadbandType::Absolute as u32);
     assert_eq!(filter.deadband_value, 0.5);
+}
+
+/// The `ACTIVATED` arm creates every subscription, in name order, before the
+/// initial read, and adds their monitored items only after it
+/// (`SessionOpen62541.cpp:2493-2516`).
+#[cfg(unix)]
+#[tokio::test]
+async fn subscriptions_are_created_before_the_initial_read_and_monitor_after_it() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("subs ns=2;s=A", INPUT);
+    let (item1, _leaf1) = item("early ns=2;s=B", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("debug", "1").unwrap();
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 1 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 1);
+        saved
+    };
+    let handle = spawn(config, &mock, vec![item0, item1]);
+    for name in ["subs", "early"] {
+        let mut subscription = SubscriptionConfig::new(name, "sess");
+        subscription.debug = 1;
+        handle.subscriptions.lock().push(subscription);
+    }
+    until(|| mock.calls.lock().monitored.len() == 2).await;
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 1);
+        libc::close(saved);
+    }
+
+    assert_eq!(
+        mock.calls.lock().events[..5],
+        [
+            "create early",
+            "create subs",
+            "read",
+            "monitor 1",
+            "monitor 2"
+        ]
+    );
+    let out = std::fs::read_to_string(sink.path()).unwrap();
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("triggering") || l.starts_with("Subscription "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "Session sess: triggering initial read for all 2 items",
+            "Subscription early@sess: created 1 monitored items (Good)",
+            "Subscription subs@sess: created 1 monitored items (Good)",
+        ]
+    );
+}
+
+/// `SubscriptionOpen62541::addMonitoredItems` makes one CreateMonitoredItems
+/// call per item, and open62541 numbers the session's monitored items from 1 in
+/// the order they are created (`++client->monitoredItemHandles`).
+#[tokio::test]
+async fn each_monitored_item_is_its_own_call_under_a_session_wide_handle() {
+    let mock = Mock::arc();
+    let (unmonitored, _l0) = item("sess ns=2;s=U monitor=n", INPUT);
+    let (item_a, _la) = item("subs ns=2;s=A", INPUT);
+    let (item_b, _lb) = item("early ns=2;s=B", INPUT);
+    let (item_c, _lc) = item("subs ns=2;s=C", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![unmonitored, item_a, item_b, item_c],
+    );
+    for name in ["subs", "early"] {
+        handle
+            .subscriptions
+            .lock()
+            .push(SubscriptionConfig::new(name, "sess"));
+    }
+    until(|| mock.calls.lock().monitored.len() == 3).await;
+
+    let calls = mock.calls.lock();
+    let monitors: Vec<&str> = calls
+        .events
+        .iter()
+        .filter(|e| e.starts_with("monitor"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(monitors, ["monitor 1", "monitor 2", "monitor 2"]);
+    let created: Vec<(NodeId, u32)> = calls
+        .monitored
+        .iter()
+        .map(|r| {
+            (
+                r.item_to_monitor.node_id.clone(),
+                r.requested_parameters.client_handle,
+            )
+        })
+        .collect();
+    assert_eq!(
+        created,
+        [
+            (NodeId::new(2, "B"), 1),
+            (NodeId::new(2, "A"), 2),
+            (NodeId::new(2, "C"), 3),
+        ]
+    );
+}
+
+/// C still runs `addMonitoredItems` for a subscription whose create failed, so
+/// each of its items is told the connection is lost.
+#[tokio::test]
+async fn a_refused_subscription_still_fails_its_items() {
+    let mock = Mock::arc();
+    mock.behave(|b| b.subscription_error = Some(StatusCode::BadTooManySubscriptions));
+    let (item0, leaf0) = item("subs ns=2;s=Sensor", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0.clone()]);
+    handle
+        .subscriptions
+        .lock()
+        .push(SubscriptionConfig::new("subs", "sess"));
+    handle.control(Control::Connect);
+    until(|| !mock.calls.lock().subscriptions.is_empty()).await;
+    until(|| item0.lock().state == ConnectionStatus::Down).await;
+
+    assert!(mock.calls.lock().monitored.is_empty());
+    let last = drain(&leaf0).pop().expect("the leaf has an update");
+    assert_eq!(last.reason, ProcessReason::ConnectionLoss);
+    assert_eq!(item0.lock().last_status, StatusCode::BadServerNotConnected);
+}
+
+/// `SubscriptionOpen62541::show` prints the server's revised interval beside
+/// the requested one: the requested one until a create answers, and 0 once one
+/// fails, as the reinitialised response leaves it (`SubscriptionOpen62541.cpp:48`,
+/// `:127`).
+#[tokio::test]
+async fn a_subscription_shows_the_interval_the_server_revised() {
+    for (error, shown) in [
+        (None, "300(250)"),
+        (Some(StatusCode::BadTooManySubscriptions), "0(250)"),
+    ] {
+        let mock = Mock::arc();
+        mock.behave(|b| {
+            b.subscription_error = error;
+            b.revised_interval = Some(300.0);
+        });
+        let mut config = SessionConfig::new("sess", "opc.tcp://host");
+        config.autoconnect = false;
+        let handle = spawn(config, &mock, vec![]);
+        let mut subscription = SubscriptionConfig::new("subs", "sess");
+        subscription.publishing_interval = 250.0;
+        handle.subscriptions.lock().push(subscription.clone());
+        let line = |interval: &str| {
+            format!(
+                "subscription=subs session=sess interval={interval} prio=0 enable=?(Y) \
+                 debug=0 items=0\n"
+            )
+        };
+        assert_eq!(subscription.show(&handle, 0), line("250(250)"));
+
+        handle.control(Control::Connect);
+        until(|| subscription.show(&handle, 0) == line(shown)).await;
+    }
+}
+
+/// `SubscriptionOpen62541::addMonitoredItems` files a connection loss for an
+/// item the server refuses to monitor.
+#[tokio::test]
+async fn a_refused_monitored_item_is_told_the_connection_is_lost() {
+    let mock = Mock::arc();
+    mock.behave(|b| b.monitor_status = Some(StatusCode::BadNodeIdUnknown));
+    let (item0, leaf0) = item("subs ns=2;s=Sensor", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    handle
+        .subscriptions
+        .lock()
+        .push(SubscriptionConfig::new("subs", "sess"));
+    until(|| !mock.calls.lock().monitored.is_empty()).await;
+    until(|| item0.lock().state == ConnectionStatus::Down).await;
+
+    let last = drain(&leaf0).pop().expect("the leaf has an update");
+    assert_eq!(last.reason, ProcessReason::ConnectionLoss);
+    assert_eq!(item0.lock().last_status, StatusCode::BadServerNotConnected);
 }
 
 #[tokio::test]
@@ -885,14 +1859,488 @@ async fn a_value_the_server_pushes_reaches_the_item_its_handle_names() {
 
     let sink = mock.sink.lock().clone().expect("the subscription is up");
     sink.send(Notification {
-        client_handle: 1,
+        client_handle: 2,
         value: DataValue::value_only(Variant::Int32(64)),
     })
     .unwrap();
-    until(|| !leaf1.lock().queue.is_empty()).await;
+    until(|| !leaf1.lock().queue().is_empty()).await;
 
     let update = pop(&leaf1);
     assert_eq!(update.reason, ProcessReason::IncomingData);
     assert_eq!(update.data, Some(Variant::Int32(64)));
-    assert!(leaf0.lock().queue.is_empty());
+    assert!(leaf0.lock().queue().is_empty());
+}
+
+#[test]
+fn an_item_shows_itself_as_item_open62541_show_does() {
+    let (item0, _leaf0) = item("subs ns=2;s=Sensor register=y", INPUT);
+    let (handle, _worker) = session::create(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        Arc::new(MockConnector(Mock::arc())),
+    );
+    let mut item = item0.lock();
+    let info = item.leaves[0].lock().link.clone();
+    item.adopt(info, NodeId::new(2, "Sensor"), 0, handle);
+
+    assert_eq!(
+        item.show_line(),
+        "item ns=0(2);s=Sensor record=rec state=down status=BadServerNotConnected dataDirty=n context=subs@sess \
+         sampling=0(-1) deadband=0 qsize=0(1) cqsize=3 discard=old timestamp=server \
+         bini=read output=n monitor=y registered=-(y)"
+    );
+}
+
+#[tokio::test]
+async fn an_item_shows_what_the_server_revised() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("subs ns=2;s=Sensor sampling=250 qsize=4", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    handle
+        .subscriptions
+        .lock()
+        .push(SubscriptionConfig::new("subs", "sess"));
+    until(|| item0.lock().revised_queue_size == 4).await;
+
+    let line = item0.lock().show_line();
+    assert!(line.contains(" sampling=250(250) "), "{line}");
+    assert!(line.contains(" qsize=4(4) "), "{line}");
+}
+
+/// C++ streams print a double with 6 significant digits (`%g`), in
+/// `ItemOpen62541::show` and in the monitored-item debug line
+/// (`SubscriptionOpen62541.cpp:186-191`).
+#[cfg(unix)]
+#[tokio::test]
+async fn sampling_and_deadband_print_as_a_cpp_stream_does() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item(
+        "subs ns=2;s=Sensor sampling=33.3333333 deadband=1e20 qsize=4",
+        INPUT,
+    );
+    let mut subscription = SubscriptionConfig::new("subs", "sess");
+    subscription.set_option("debug", "5");
+
+    let sink = tempfile::NamedTempFile::new().unwrap();
+    // SAFETY: nextest runs each test in its own process, so fd 1 is this
+    // test's alone.
+    let saved = unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(std::os::fd::AsRawFd::as_raw_fd(sink.as_file()), 1);
+        saved
+    };
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    handle.subscriptions.lock().push(subscription);
+    until(|| item0.lock().revised_queue_size == 4).await;
+    // SAFETY: restoring what this test replaced.
+    unsafe {
+        libc::dup2(saved, 1);
+        libc::close(saved);
+    }
+
+    let line = item0.lock().show_line();
+    assert!(
+        line.contains(" sampling=33.3333(33.3333) deadband=1e+20 "),
+        "{line}"
+    );
+    let out = std::fs::read_to_string(sink.path()).unwrap();
+    assert!(
+        out.contains(" revised sampling interval 33.3333 revised queue size 4"),
+        "{out}"
+    );
+}
+
+#[test]
+fn an_item_shows_the_size_of_its_element_tree() {
+    const ITEM: RecordKind = RecordKind {
+        is_output: false,
+        is_item_record: true,
+    };
+    let mut item = Item::pending();
+    let (notify, _rx) = mpsc::channel(1);
+    for (record, text, kind) in [
+        ("ITEM", "subs ns=2;s=Struct", ITEM),
+        ("A_B", "ITEM element=a.b", INPUT),
+        ("A_C", "ITEM element=a.c", INPUT),
+        ("D", "ITEM element=d", INPUT),
+    ] {
+        let leaf = Leaf::new(record.to_string(), "ai", link(text, kind), notify.clone());
+        item.leaves.push(Arc::new(Mutex::new(leaf)));
+    }
+
+    let line = item.show_line();
+    assert!(line.ends_with(" dataNodes=2 dataLeafs=3"), "{line}");
+}
+
+/// From level 1 an item shows its data tree below its line: nodes named by
+/// the element paths, in the order the records added them, and a leaf per
+/// element record (`DataElementOpen62541Node::show`,
+/// `DataElementOpen62541Leaf::show`).
+#[test]
+fn an_item_shows_its_element_tree_from_level_one() {
+    const ITEM: RecordKind = RecordKind {
+        is_output: false,
+        is_item_record: true,
+    };
+    let mut item = Item::pending();
+    let (notify, _rx) = mpsc::channel(1);
+    for (record, rtyp, text, kind) in [
+        ("ITEM", "opcuaItem", "subs ns=2;s=Struct", ITEM),
+        ("A_B", "ai", "ITEM element=a.b", INPUT),
+        ("D", "stringin", "ITEM element=d monitor=n", INPUT),
+        ("A_C", "longout", "ITEM element=a.c", OUTPUT),
+    ] {
+        let leaf = Leaf::new(record.to_string(), rtyp, link(text, kind), notify.clone());
+        item.leaves.push(Arc::new(Mutex::new(leaf)));
+    }
+    item.leaves[2].lock().incoming = Some(Variant::from("text"));
+
+    let line = item.show_line();
+    assert_eq!(item.show(0), format!("{line}\n"));
+    assert_eq!(
+        item.show(1),
+        format!(
+            "{line}\n\
+             \x20 node=[ROOT] children=2 mapped=n\n\
+             \x20   node=a children=2 mapped=n\n\
+             \x20     leaf=b record(ai)=A_B type=Null timestamp=server bini=read monitor=y\n\
+             \x20     leaf=c record(longout)=A_C type=Null timestamp=server bini=read monitor=y\n\
+             \x20   leaf=d record(stringin)=D type=String timestamp=server bini=read monitor=n\n"
+        )
+    );
+}
+
+/// An item with one record bound to the whole node has that record's leaf
+/// as its root.
+#[test]
+fn a_single_record_is_the_root_leaf() {
+    let (item0, leaf0) = item("subs ns=2;s=Sensor", INPUT);
+    leaf0.lock().incoming = Some(Variant::Double(1.5));
+    let item = item0.lock();
+    assert_eq!(
+        item.show(1),
+        format!(
+            "{}\n  leaf=[ROOT] record(ai)=rec type=Double timestamp=server bini=read monitor=y\n",
+            item.show_line()
+        )
+    );
+}
+
+#[test]
+fn the_element_map_reports_what_the_structure_cannot_supply() {
+    use async_opcua::types::custom::{
+        DataTypeTree, DynamicStructure, EncodingIds, ParentIds, ParsedStructureField,
+        StructTypeInfo,
+    };
+    use async_opcua::types::{ExtensionObject, StructureType, VariantScalarTypeId};
+
+    let field = |name: &str| ParsedStructureField {
+        name: name.into(),
+        type_id: async_opcua::types::DataTypeId::Int32.into(),
+        value_rank: -1,
+        array_dimensions: None,
+        is_optional: false,
+        scalar_type: VariantScalarTypeId::Int32,
+    };
+    let type_id = NodeId::new(2, 3000);
+    let info = Arc::new(StructTypeInfo {
+        structure_type: StructureType::Structure,
+        fields: vec![field("x"), field("y")],
+        index_by_name: [("x".to_string(), 0), ("y".to_string(), 1)].into(),
+        encoding_ids: EncodingIds {
+            binary_id: NodeId::new(2, 3001),
+            json_id: NodeId::new(2, 3002),
+            xml_id: NodeId::new(2, 3003),
+        },
+        is_abstract: false,
+        node_id: type_id.clone(),
+        name: "Point".into(),
+    });
+    let mut tree = DataTypeTree::new(ParentIds::new());
+    tree.add_type(
+        type_id,
+        async_opcua::types::custom::TypeInfo::Struct(info.clone()),
+    );
+    let tree = Arc::new(tree);
+    let point = DynamicStructure::new_struct(
+        info,
+        tree.clone(),
+        vec![Variant::Int32(1), Variant::Int32(2)],
+    )
+    .unwrap();
+    let value = Variant::ExtensionObject(ExtensionObject::from_message(point));
+
+    let mut item = Item::pending();
+    item.node_id = NodeId::new(2, "Pt");
+    item.type_tree = Some(tree);
+    let (notify, _rx) = mpsc::channel(1);
+    for (record, text) in [
+        ("Y", "PT element=y"),
+        ("Z", "PT element=z"),
+        ("XQ", "PT element=x.q"),
+    ] {
+        let leaf = Leaf::new(record.to_string(), "ai", link(text, INPUT), notify.clone());
+        item.leaves.push(Arc::new(Mutex::new(leaf)));
+    }
+
+    assert_eq!(
+        item.element_report(&value),
+        vec![
+            "Item ns=2;s=Pt: element z not found in Point".to_string(),
+            "Error: ns=2;s=Pt element x is no structured data but a Int32".to_string(),
+        ]
+    );
+}
+
+/// open62541's 1 s connectivity check on an idle session
+/// (`SessionOpen62541::connectionInactive`).
+#[tokio::test]
+async fn an_idle_session_whose_server_stops_answering_goes_inactive() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    mock.calls.lock().reads.clear();
+
+    // A check that is answered keeps the session up.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(handle.is_connected());
+    let state = NodeId::new(0, 2259u32);
+    assert!(
+        mock.calls
+            .lock()
+            .reads
+            .iter()
+            .any(|r| r.len() == 1 && r[0].node_id == state)
+    );
+
+    *mock.refuse_connects.lock() = 1;
+    mock.behave(|b| b.read_error = Some(StatusCode::BadTimeout));
+    until(|| !handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert!(
+        lines
+            .lock()
+            .iter()
+            .any(|l| l == "OPC UA Session sess: server inactive\n")
+    );
+}
+
+// ------------------------------------------------------------- console lines
+
+/// The lines C prints from the session's connection handling.
+#[cfg(unix)]
+fn state_lines(console: Console) -> Vec<String> {
+    console
+        .lines()
+        .into_iter()
+        .filter(|l| {
+            l.starts_with("Session sess")
+                && [
+                    "state changed",
+                    "irrecoverably",
+                    "worker thread",
+                    "connect service",
+                    "already",
+                    "(setupIdentity)",
+                ]
+                .iter()
+                .any(|part| l.contains(part))
+        })
+        .collect()
+}
+
+/// A session at debug 1 whose control orders resolve — the sender dropped —
+/// once the worker has carried them out.
+#[cfg(unix)]
+fn debug_session(mock: &Arc<Mock>) -> Arc<SessionHandle> {
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    config.set_option("debug", "1").unwrap();
+    spawn(config, mock, vec![])
+}
+
+#[cfg(unix)]
+const IDENTITY: &str = "Session sess: (setupIdentity) setting Anonymous token";
+
+/// The states open62541 1.2 reports through `stateCallback` on the way up, as
+/// `connectionStatusChanged` prints them (`SessionOpen62541.cpp:2384-2408`).
+#[cfg(unix)]
+const CONNECTED: [&str; 8] = [
+    "Session sess: secure channel state changed from Closed to HelSent",
+    "Session sess: secure channel state changed from HelSent to AckReceived",
+    "Session sess: secure channel state changed from AckReceived to OPNSent",
+    "Session sess: secure channel state changed from OPNSent to Open",
+    "Session sess: session state changed from Closed to CreateRequested",
+    "Session sess: session state changed from CreateRequested to Created",
+    "Session sess: session state changed from Created to ActivateRequested",
+    "Session sess: session state changed from ActivateRequested to Activated",
+];
+
+#[cfg(unix)]
+const LOST: [&str; 3] = [
+    "Session sess: secure channel state changed from Open to Closed",
+    "Session sess: session state changed from Activated to Created",
+    "Session sess: secure channel state changed from Closed to Fresh",
+];
+
+/// `connect` (`SessionOpen62541.cpp:577-584`), then `run` (`:1466-1467`).
+#[cfg(unix)]
+const STARTED: [&str; 2] = [
+    "Session sess: connect service succeeded",
+    "Session sess worker thread starts",
+];
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_connect_and_a_requested_disconnect_print_the_c_state_lines() {
+    let mock = Mock::arc();
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Connect).unwrap().await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let lines = state_lines(console);
+
+    let mut expected = vec![IDENTITY];
+    expected.extend(CONNECTED);
+    expected.extend(STARTED);
+    expected.extend([
+        "Session sess: session state changed from Activated to Closing",
+        "Session sess: secure channel state changed from Open to Closed",
+        "Session sess: session state changed from Closing to Closed",
+        "Session sess worker thread: client destroyed. Exiting.",
+    ]);
+    assert_eq!(lines, expected);
+}
+
+/// open62541 re-activates the session it kept on the client it kept
+/// (`connectIterate`, `responseActivateSession`): no setup, and no
+/// `connect service` or `worker thread starts` line.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lost_session_that_reconnects_prints_the_reactivation() {
+    let mock = Mock::arc();
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Connect).unwrap().await;
+    mock.lost.notify_one();
+    until(|| mock.connects.lock().len() == 2).await;
+    until(|| handle.is_connected()).await;
+    let lines = state_lines(console);
+
+    let mut expected = vec![IDENTITY];
+    expected.extend(CONNECTED);
+    expected.extend(STARTED);
+    expected.extend(LOST);
+    expected.extend([
+        "Session sess: secure channel state changed from Fresh to HelSent",
+        "Session sess: secure channel state changed from HelSent to AckReceived",
+        "Session sess: secure channel state changed from AckReceived to OPNSent",
+        "Session sess: secure channel state changed from OPNSent to Open",
+        "Session sess: session state changed from Created to ActivateRequested",
+        "Session sess: session state changed from ActivateRequested to Activated",
+    ]);
+    assert_eq!(lines, expected);
+}
+
+/// The reconnect inside `UA_Client_run_iterate` fails: the bad state status,
+/// then `run` gives up (`:1487-1491`) and `disconnect` deletes the client,
+/// which reports the status again. A later connect starts from the states
+/// the lost session left, and a disconnect then finds no client (`:607-612`).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lost_session_whose_reconnect_fails_prints_the_worker_error() {
+    let mock = Mock::arc();
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Connect).unwrap().await;
+    *mock.refuse_connects.lock() = 1;
+    mock.lost.notify_one();
+    until(|| mock.connects.lock().len() == 2).await;
+    until(|| shown_state(&handle) == "BadNotConnected Created Fresh registered=0").await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let _ = handle.control(Control::Connect).unwrap().await;
+    let lines = state_lines(console);
+
+    let mut expected = vec![IDENTITY];
+    expected.extend(CONNECTED);
+    expected.extend(STARTED);
+    expected.extend(LOST);
+    expected.extend([
+        "Session sess irrecoverably failed: BadNotConnected",
+        "Session sess worker thread error: status:BadNotConnected",
+        "Session sess irrecoverably failed: BadNotConnected",
+        "Session sess already disconnected",
+        IDENTITY,
+        "Session sess: secure channel state changed from Fresh to HelSent",
+        "Session sess: session state changed from Created to Closed",
+    ]);
+    expected.extend(&CONNECTED[1..]);
+    expected.extend(STARTED);
+    assert_eq!(lines, expected);
+}
+
+/// `UA_Client_connect` fails: the bad status from inside it, then once more
+/// from `UA_Client_delete` (`:586-592`); no worker thread was started, and
+/// the client is gone.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_connect_prints_its_status_twice_and_leaves_no_client() {
+    let mock = Mock::arc();
+    *mock.refuse_connects.lock() = 1;
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Connect).unwrap().await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let lines = state_lines(console);
+
+    assert_eq!(
+        lines,
+        [
+            IDENTITY,
+            "Session sess irrecoverably failed: BadNotConnected",
+            "Session sess irrecoverably failed: BadNotConnected",
+            "Session sess already disconnected",
+        ]
+    );
+}
+
+/// A failed security setup leaves C's client in place (`:545-553`), so a
+/// disconnect deletes it without a line; one with no client says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_disconnect_after_a_failed_setup_is_silent() {
+    let mock = Mock::arc();
+    *mock.fail_setups.lock() = 1;
+    let console = Console::capture();
+    let handle = debug_session(&mock);
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let _ = handle.control(Control::Connect).unwrap().await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let _ = handle.control(Control::Disconnect).unwrap().await;
+    let lines = state_lines(console);
+
+    assert_eq!(
+        lines,
+        [
+            "Session sess already disconnected",
+            "Session sess already disconnected",
+        ]
+    );
 }

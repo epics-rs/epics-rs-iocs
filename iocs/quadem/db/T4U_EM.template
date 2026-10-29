@@ -4,7 +4,7 @@ include "quadEM.template"
 include "gc_t4u.db"
 
 record(mbbi, "$(P)$(R)Model") {
-    field(VAL, "13")
+    field(VAL, "14")
 }
 
 record(bo, "$(P)$(R)BiasPEn")
@@ -391,6 +391,7 @@ record(longin, "$(P)$(R)SampleFreq_RBV")
     field(SCAN, "I/O Intr")
 }
 
+# WaitStateMode and ReadsPerPacket are in T4UDirect_EM.template.
 
 #--------------------------
 # Overrides

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 
@@ -17,7 +18,7 @@ use photonii::{PII_UTIL, PhotonIIRuntime, create_photonii_detector};
 /// ignored: the Rust pool is bounded by memory alone and the runtime schedules
 /// the port actors itself.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADPHOTONII", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADPHOTONII", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<PhotonIIRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -54,13 +55,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 },
             ],
             "PhotonIIConfig portName commandPort [maxBuffers] [maxMemory] [priority] [stackSize]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) if !s.is_empty() => s.clone(),
+                    ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let command_port = match &args[1] {
-                    ArgValue::String(s) if !s.is_empty() => s.clone(),
+                    ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("commandPort required".into()),
                 };
                 // 0 means "unlimited" in the C startup scripts.
@@ -69,19 +70,28 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                let cmd = get_port(&command_port).ok_or_else(|| {
-                    format!(
-                        "command port '{command_port}' not found \
-                         (call drvAsynIPPortConfigure first)"
-                    )
-                })?;
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                println!("PhotonIIConfig: port={port_name}, p2util={command_port}");
+                // C ignores the connect status (PhotonII.cpp:112): a missing
+                // command port leaves a user whose every command fails.
+                let (cmd, _) = SyncIOHandle::connect_port(
+                    &command_port,
+                    0,
+                    Duration::ZERO,
+                    InterfaceType::Octet,
+                );
 
-                let rt = create_photonii_detector(&port_name, cmd.handle.clone(), max_memory)
+                let rt = create_photonii_detector(&claim, cmd, max_memory)
                     .map_err(|e| format!("failed to create the PhotonII detector: {e}"))?;
 
-                epics_rs::asyn::asyn_record::register_port(&port_name, rt.port_handle().clone())
+                claim
+                    .publish(
+                        rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
                     .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
@@ -118,18 +128,24 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
         "p2util portName command",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match &args[0] {
-                ArgValue::String(s) if !s.is_empty() => s.clone(),
+                ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let command = match &args[1] {
-                ArgValue::String(s) if !s.is_empty() => s.clone(),
+                ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                 _ => return Err("command required".into()),
             };
 
             let port = get_port(&port_name).ok_or_else(|| {
                 format!("port '{port_name}' not found (call PhotonIIConfig first)")
             })?;
-            let sync = SyncIOHandle::from_handle(port.handle.clone(), 0, Duration::from_secs(5));
+            let sync = SyncIOHandle::from_handle(
+                port.handle.clone(),
+                0,
+                Duration::from_secs(5),
+                InterfaceType::Octet,
+            )
+            .map_err(|e| format!("port '{port_name}' is not a PhotonII driver: {e}"))?;
             let reason = sync
                 .drv_user_create(PII_UTIL)
                 .map_err(|e| format!("port '{port_name}' is not a PhotonII driver: {e}"))?;

@@ -1,9 +1,13 @@
 use meascomp::analog_out::AOutScanConfig;
 use meascomp::device::DaqDevice;
-use meascomp::error::{self, ScanPosition};
 use uldaq_sys::*;
 
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::asyn::trace::TraceMask;
+
+use crate::board_enums::map_range;
 use crate::params::*;
+use crate::trace::{DRIVER_NAME, SelfTrace};
 
 /// Waveform generator state.
 pub struct WaveGenState {
@@ -13,28 +17,16 @@ pub struct WaveGenState {
     pub current_point: usize,
     /// Output buffer for ulAOutScan.
     pub scan_buffer: Vec<f64>,
-    /// DAC value of each channel the running scan drives, saved at start and
-    /// written back at stop. `None` for a channel not in the scan, which the
-    /// stop therefore never touches.
-    pub saved_outputs: [Option<f64>; MAX_ANALOG_OUT],
-    pub dwell_actual: f64,
-    /// Per-channel user-defined waveform in volts, C `waveGenUserBuffer_`:
-    /// `max_points` long and zero until written; a write replaces only the
-    /// points it carries. Used when a channel's WAVEGEN_WAVE_TYPE is `User`.
-    pub user_buffers: Vec<Vec<f32>>,
-    /// Capacity the port was configured with; a user waveform is truncated to
-    /// it so it can never outrun the scan buffer.
+    /// Saved output values to restore after stop.
+    pub saved_outputs: [f64; MAX_ANALOG_OUT],
+    /// C `waveGenUserBuffer_`: per channel, `max_points` volts; a
+    /// WAVEGEN_USER_WF write overwrites its first elements and keeps the rest.
+    pub user_waveforms: Vec<Vec<f32>>,
+    /// C `waveGenIntBuffer_`: per channel, the waveform `define_waveform`
+    /// last built.
+    pub int_waveforms: Vec<Vec<f32>>,
+    /// Capacity the port was configured with (C `maxOutputPoints_`).
     pub max_points: usize,
-    /// Per-channel internal waveform in volts, C `waveGenIntBuffer_`, as the
-    /// last `define_waveform` computed it.
-    pub int_buffers: Vec<Vec<f32>>,
-    /// Relative time bases for the user-defined and internal timing pairs,
-    /// C `waveGenUserTimeBuffer_` / `waveGenIntTimeBuffer_`.
-    pub user_time_buffer: Vec<f32>,
-    pub int_time_buffer: Vec<f32>,
-    /// Bumped by every start, so a report that an earlier scan ended can
-    /// never end a later one.
-    pub generation: u64,
 }
 
 impl WaveGenState {
@@ -45,31 +37,24 @@ impl WaveGenState {
             num_points: max_points,
             current_point: 0,
             scan_buffer: Vec::new(),
-            saved_outputs: [None; MAX_ANALOG_OUT],
-            dwell_actual: 0.001,
-            user_buffers: vec![vec![0.0; max_points]; MAX_ANALOG_OUT],
+            saved_outputs: [0.0; MAX_ANALOG_OUT],
+            user_waveforms: vec![vec![0.0; max_points]; MAX_ANALOG_OUT],
+            int_waveforms: vec![vec![0.0; max_points]; MAX_ANALOG_OUT],
             max_points,
-            int_buffers: vec![vec![0.0; max_points]; MAX_ANALOG_OUT],
-            user_time_buffer: vec![0.0; max_points],
-            int_time_buffer: vec![0.0; max_points],
-            generation: 0,
         }
     }
 }
 
-/// Convert voltage waveform to raw 16-bit DAC units for ±10V range.
-/// Matches C++ drvMultiFunction: offset=10.0, scale=65535/20.0
-pub fn volts_to_dac(data: &mut [f64]) {
+/// C `startWaveGen`'s volts-to-D/A conversion: 16-bit DAC, ±10 V, with a
+/// user waveform's amplitude and offset applied first.
+pub fn volts_to_dac(volts: f32, amplitude: f64, offset: f64) -> f64 {
     const DAC_OFFSET: f64 = 10.0; // mid-scale for ±10V
     const DAC_SCALE: f64 = 65535.0 / 20.0; // 16-bit DAC units per volt
-    for v in data.iter_mut() {
-        // C casts to epicsUInt16 after the +0.5, i.e. rounds to the nearest
-        // DAC count. Without the truncation every sample kept a half-count
-        // bias and the clamp was applied to the un-rounded value.
-        *v = ((*v + DAC_OFFSET) * DAC_SCALE + 0.5)
-            .floor()
-            .clamp(0.0, 65535.0);
-    }
+    // C casts to epicsUInt16 after the +0.5: the nearest count, which the
+    // clamp keeps in range where the C cast would be undefined.
+    ((f64::from(volts) * amplitude + offset + DAC_OFFSET) * DAC_SCALE + 0.5)
+        .floor()
+        .clamp(0.0, 65535.0)
 }
 
 /// Waveform type selection.
@@ -80,71 +65,55 @@ pub const WAVE_TYPE_SAWTOOTH: i32 = 3;
 pub const WAVE_TYPE_PULSE: i32 = 4;
 pub const WAVE_TYPE_RANDOM: i32 = 5;
 
-/// One channel's internal-waveform settings, read from its WaveGen records.
+/// One channel's internal waveform settings (C `defineWaveform`'s reads).
 #[derive(Clone, Copy, Debug)]
-pub struct WaveShape {
+pub struct InternalWave {
     pub wave_type: i32,
-    /// Peak-to-peak volts.
-    pub amplitude: f64,
+    pub num_points: usize,
+    pub dwell: f64,
     pub offset: f64,
-    /// Pulse width and delay, in seconds.
+    pub amplitude: f64,
     pub pulse_width: f64,
     pub pulse_delay: f64,
-    /// WAVEGEN_INT_DWELL: the pulse times are counted in samples of it.
-    pub dwell: f64,
 }
 
-/// Generate an internal waveform of the given type.
-///
-/// `amplitude` is peak-to-peak, as C `defineWaveform` takes it: sin, square,
-/// sawtooth and random span `offset +/- amplitude/2`; the pulse goes from
-/// `offset` to `offset + amplitude`. Samples are `f32`, C's
-/// `waveGenIntBuffer_` precision, so the DAC codes they convert to match.
-pub fn generate_waveform(shape: &WaveShape, num_points: usize) -> Vec<f32> {
-    let WaveShape {
+/// C `defineWaveform`'s internal shapes, written over the first
+/// `num_points` of `out` (which holds at least that many).
+pub fn define_internal(out: &mut [f32], wave: &InternalWave) {
+    let InternalWave {
         wave_type,
-        amplitude,
+        num_points,
+        dwell,
         offset,
+        amplitude,
         pulse_width,
         pulse_delay,
-        dwell,
-    } = *shape;
-    let mut data = vec![0.0f32; num_points];
-    let base = offset - amplitude / 2.0;
-    // C divides by numPoints-1 so the sine's last point closes the period and
-    // the sawtooth ends exactly at base + amplitude; a 1-point waveform keeps
-    // a well-defined 0 phase instead of C's 0/0.
-    let span = num_points.saturating_sub(1).max(1) as f64;
-
+    } = *wave;
+    let n = num_points as i64;
+    let out = &mut out[..num_points];
+    let base = offset - amplitude / 2.;
     match wave_type {
         WAVE_TYPE_SIN => {
-            let scale = 2.0 * std::f64::consts::PI / span;
-            for (i, d) in data.iter_mut().enumerate() {
-                *d = (offset + amplitude / 2.0 * (i as f64 * scale).sin()) as f32;
+            let scale = 2. * std::f64::consts::PI / (n - 1) as f64;
+            for (i, v) in out.iter_mut().enumerate() {
+                *v = (offset + amplitude / 2. * (i as f64 * scale).sin()) as f32;
             }
         }
         WAVE_TYPE_SQUARE => {
-            for (i, d) in data.iter_mut().enumerate() {
-                *d = if i < num_points / 2 {
-                    (base + amplitude) as f32
-                } else {
-                    base as f32
-                };
+            for (i, v) in out.iter_mut().enumerate() {
+                let high = (i as i64) < n / 2;
+                *v = (if high { base + amplitude } else { base }) as f32;
             }
         }
         WAVE_TYPE_SAWTOOTH => {
-            let scale = 1.0 / span;
-            for (i, d) in data.iter_mut().enumerate() {
-                *d = (base + amplitude * i as f64 * scale) as f32;
+            let scale = 1. / (n - 1) as f64;
+            for (i, v) in out.iter_mut().enumerate() {
+                *v = (base + amplitude * i as f64 * scale) as f32;
             }
         }
         WAVE_TYPE_PULSE => {
-            // C: width and delay are times, rounded to whole samples of the
-            // internal dwell, and at least one sample is left low
-            // (drvMultiFunction.cpp:1556-1566).
-            let n = num_points as i64;
-            let mut n_pulse = (pulse_width / dwell + 0.5) as i64;
-            let mut n_delay = (pulse_delay / dwell + 0.5) as i64;
+            let mut n_pulse = ((pulse_width / dwell) + 0.5) as i64;
+            let mut n_delay = ((pulse_delay / dwell) + 0.5) as i64;
             if n_pulse < 1 {
                 n_pulse = 1;
             }
@@ -157,72 +126,65 @@ pub fn generate_waveform(shape: &WaveShape, num_points: usize) -> Vec<f32> {
             if n_delay < 0 {
                 n_delay = 0;
             }
-            for (i, d) in data.iter_mut().enumerate() {
+            for (i, v) in out.iter_mut().enumerate() {
                 let i = i as i64;
-                *d = if i >= n_delay && i < n_delay + n_pulse {
-                    (offset + amplitude) as f32
-                } else {
-                    offset as f32
-                };
+                let high = i >= n_delay && i < n_delay + n_pulse;
+                *v = (if high { offset + amplitude } else { offset }) as f32;
             }
         }
         WAVE_TYPE_RANDOM => {
-            // C: srand(1) then rand() per point, so every run -- and every
-            // C IOC -- emits the same sequence.
-            let mut rng = GlibcRand::new(1);
-            let scale = amplitude / GlibcRand::RAND_MAX as f64;
-            for d in &mut data {
-                *d = (base + rng.next() as f64 * scale) as f32;
+            let scale = amplitude / f64::from(GLIBC_RAND_MAX);
+            let mut rand = GlibcRand::seeded(1);
+            for v in out.iter_mut() {
+                *v = (base + f64::from(rand.next()) * scale) as f32;
             }
         }
-        _ => {
-            // WAVE_TYPE_USER: the caller fills this in from the channel's
-            // WAVEGEN_USER_WF; zeros only if nothing was ever written.
-        }
+        // C leaves the buffer as it was for any other type.
+        _ => {}
     }
-    data
 }
 
-/// glibc's `rand()` (the TYPE_3 additive-feedback generator `srand` seeds),
-/// the one C `defineWaveform` draws its random waveform from on Linux.
+const GLIBC_RAND_MAX: i32 = 2147483647;
+
+/// glibc `srand(seed)` / `rand()` (the TYPE_3 additive feedback
+/// generator), which C's random waveform draws from after `srand(1)`.
 struct GlibcRand {
-    r: [u32; 34],
-    i: usize,
+    r: Vec<i32>,
 }
 
 impl GlibcRand {
-    const RAND_MAX: u32 = 0x7FFF_FFFF;
-
-    fn new(seed: u32) -> Self {
-        let mut r = [0u32; 34];
-        r[0] = seed;
-        for i in 1..31 {
-            // r[i] = (16807 * r[i-1]) % 2147483647, as a signed 32-bit word.
-            let v = (16807 * r[i - 1] as i32 as i64) % 2_147_483_647;
-            r[i] = if v < 0 { v + 2_147_483_647 } else { v } as u32;
+    fn seeded(seed: u32) -> Self {
+        let mut r = Vec::with_capacity(344 + 64);
+        let mut word = if seed == 0 { 1 } else { seed as i32 };
+        r.push(word);
+        for _ in 1..31 {
+            let hi = word / 127773;
+            let lo = word % 127773;
+            word = 16807 * lo - 2836 * hi;
+            if word < 0 {
+                word += GLIBC_RAND_MAX;
+            }
+            r.push(word);
         }
         for i in 31..34 {
-            r[i] = r[i - 31];
+            r.push(r[i - 31]);
         }
-        let mut rng = Self { r, i: 0 };
-        // glibc discards the first 310 outputs of a fresh seed.
-        for _ in 0..310 {
-            rng.step();
+        let mut rand = Self { r };
+        for _ in 34..344 {
+            rand.step();
         }
-        rng
+        rand
     }
 
-    /// r[k] = r[k-31] + r[k-3] over a 34-word ring.
-    fn step(&mut self) -> u32 {
-        let k = self.i;
-        let v = self.r[(k + 34 - 31) % 34].wrapping_add(self.r[(k + 34 - 3) % 34]);
-        self.r[k % 34] = v;
-        self.i = (k + 1) % 34;
+    fn step(&mut self) -> i32 {
+        let i = self.r.len();
+        let v = self.r[i - 31].wrapping_add(self.r[i - 3]);
+        self.r.push(v);
         v
     }
 
-    fn next(&mut self) -> u32 {
-        self.step() >> 1
+    fn next(&mut self) -> i32 {
+        ((self.step() as u32) >> 1) as i32
     }
 }
 
@@ -232,7 +194,7 @@ pub struct WaveGenScan {
     pub first_chan: i32,
     pub last_chan: i32,
     pub num_points: usize,
-    pub freq: f64,
+    pub dwell: f64,
     pub range: i32,
     pub ext_trigger: bool,
     pub ext_clock: bool,
@@ -240,20 +202,29 @@ pub struct WaveGenScan {
     pub retrigger: bool,
 }
 
-/// Start the waveform generator (analog output scan), returning the scan
-/// options it runs with.
+impl WaveGenScan {
+    /// C `rate = 1./dwell` (drvMultiFunction.cpp:1682).
+    pub fn rate(&self) -> f64 {
+        1.0 / self.dwell
+    }
+}
+
+/// Start the waveform generator (analog output scan). C `startWaveGen`
+/// from `ulAOutScan` on; the error is the uldaq status it reported.
 pub fn start_wave_gen(
     device: &DaqDevice,
     state: &mut WaveGenState,
     scan: &WaveGenScan,
     waveform_data: &[f64],
-    saved_outputs: [Option<f64>; MAX_ANALOG_OUT],
-) -> error::Result<i32> {
+    saved_outputs: &[f64],
+    trace: &SelfTrace,
+) -> Result<f64, UlError> {
+    const FUNCTION: &str = "startWaveGen";
     let WaveGenScan {
         first_chan,
         last_chan,
         num_points,
-        freq,
+        dwell: _,
         range,
         ext_trigger,
         ext_clock,
@@ -265,8 +236,13 @@ pub fn start_wave_gen(
     state.num_points = num_points;
     state.current_point = 0;
 
-    // The outputs to put back when the scan ends.
-    state.saved_outputs = saved_outputs;
+    // Save current outputs for restore on stop
+    for ch in first_chan..=last_chan {
+        let idx = ch as usize;
+        if idx < MAX_ANALOG_OUT && idx < saved_outputs.len() {
+            state.saved_outputs[idx] = saved_outputs[idx];
+        }
+    }
 
     let total = num_chans * num_points;
     state.scan_buffer = if waveform_data.len() >= total {
@@ -277,7 +253,7 @@ pub fn start_wave_gen(
         buf
     };
 
-    let mut rate = freq * num_points as f64;
+    let mut rate = scan.rate();
 
     let mut options = SO_DEFAULTIO;
     if ext_trigger {
@@ -293,7 +269,7 @@ pub fn start_wave_gen(
         options |= SO_RETRIGGER;
     }
 
-    device.analog_out_scan(
+    let result = device.analog_out_scan(
         &AOutScanConfig {
             low_chan: first_chan,
             high_chan: last_chan,
@@ -304,189 +280,198 @@ pub fn start_wave_gen(
         },
         &mut rate,
         &mut state.scan_buffer,
-    )?;
+    );
+    let status = trace.report(&result, FUNCTION, "Calling AOutScan");
+    if status != 0 {
+        return Err(status);
+    }
 
-    state.dwell_actual = if rate > 0.0 { 1.0 / rate } else { 0.001 };
+    let dwell = 1.0 / rate;
     state.running = true;
-    state.generation = state.generation.wrapping_add(1);
-    Ok(options)
+    trace.print(
+        TraceMask::FLOW,
+        format_args!(
+            "{DRIVER_NAME}:{FUNCTION}: called cbAOutScan, firstChan={first_chan}, lastChan={last_chan}, numPoints*numWaveGenChans_={}, dwell={:.6}, options=0x{options:x}\n",
+            num_chans * num_points,
+            CFloat(dwell)
+        ),
+    );
+    Ok(dwell)
 }
 
-/// C pollerThread's generator block: the current point, and whether the scan
-/// has gone idle -- with what the status call returned, which C traces and,
-/// on an error, reports. Ending the scan (Run back to 0, the outputs put
-/// back) is the driver's transition, not this read's.
-pub fn read_wave_gen(device: &DaqDevice, state: &mut WaveGenState) -> (ScanPosition, bool) {
-    let report = device.analog_out_scan_status();
-    let position = report.position();
-    // C skips the rest of the cycle on a status error (goto error).
-    if report.error.is_some() {
-        return (position, false);
+/// The generator half of C `pollerThread`. `Err` is the failed
+/// `ulAOutScanStatus` status, for the poller's once-per-outage report.
+pub fn read_wave_gen(
+    device: &DaqDevice,
+    state: &mut WaveGenState,
+    restore: &[(i32, i32)],
+    trace: &SelfTrace,
+) -> Result<(), UlError> {
+    let polled = device.analog_out_scan_status();
+    // C `goto error`s on a failed status (drvMultiFunction.cpp:2666-2670).
+    if let Some(e) = polled.error {
+        return Err(e.code);
     }
-    if state.num_chans > 0 && position.index >= 0 {
-        state.current_point = (position.index as usize / state.num_chans) + 1;
+    let (status, xfer) = (polled.status, polled.xfer);
+    trace.print(
+        TraceMask::IO_DRIVER,
+        format_args!(
+            "{DRIVER_NAME}::pollerThread waveform generator status, aoStatus={status}, aoCount={}, aoIndex={}\n",
+            xfer.current_total_count, xfer.current_index
+        ),
+    );
+
+    if state.num_chans > 0 && xfer.current_index >= 0 {
+        state.current_point = (xfer.current_index as usize / state.num_chans) + 1;
     }
-    (position, position.status == SS_IDLE)
+
+    if status == SS_IDLE {
+        stop_wave_gen(device, state, restore, trace);
+    }
+    Ok(())
 }
 
-/// Stop the waveform generator and restore saved output values. Returns the
-/// scan stop's result and each put-back channel's `ulAOut` result, which C
-/// reports one by one as `calling AOut`; a generator that is not running is
-/// left alone.
+/// Stop the waveform generator and restore saved output values. C
+/// `stopWaveGen`; returns the `ulAOutScanStop` status, which C does not
+/// print.
 pub fn stop_wave_gen(
     device: &DaqDevice,
     state: &mut WaveGenState,
-) -> (error::Result<()>, Vec<error::Result<()>>) {
-    if !state.running {
-        return (Ok(()), Vec::new());
-    }
-    let stopped = device.analog_out_scan_stop();
-    // C stopWaveGen puts back only the channels the scan drove
-    // (drvMultiFunction.cpp:1721-1733); any other output keeps its value.
-    let restored = state
-        .saved_outputs
-        .iter_mut()
-        .enumerate()
-        .filter_map(|(ch, saved)| {
-            let value = saved.take()?;
-            Some(device.analog_out(ch as i32, BIP10VOLTS, AOUT_FF_NOSCALEDATA, value))
-        })
-        .collect();
+    restore: &[(i32, i32)],
+    trace: &SelfTrace,
+) -> UlError {
     state.running = false;
-    (stopped, restored)
+    let err = device.analog_out_scan_stop().err().map_or(0, |e| e.code);
+    for &(ch, gain) in restore {
+        trace.report(
+            &device.analog_out(
+                ch,
+                map_range(trace, gain),
+                AOUT_FF_NOSCALEDATA,
+                state.saved_outputs[ch as usize],
+            ),
+            "stopWaveGen",
+            "calling AOut",
+        );
+    }
+    err
+}
+
+/// The outputs C `stopWaveGen` puts back: each enabled channel, with its
+/// ANALOG_OUT_RANGE.
+pub fn restore_outputs(
+    params: &MultiFunctionParams,
+    int: impl Fn(usize, i32) -> i32,
+) -> Vec<(i32, i32)> {
+    (0..MAX_ANALOG_OUT as i32)
+        .filter(|&ch| int(params.wave_gen_enable, ch) != 0)
+        .map(|ch| (ch, int(params.analog_out_range, ch)))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn shape(
-        wave_type: i32,
-        amplitude: f64,
-        offset: f64,
-        pulse_width: f64,
-        pulse_delay: f64,
-        dwell: f64,
-    ) -> WaveShape {
-        WaveShape {
+    #[test]
+    fn the_scan_rate_is_cs_reciprocal_dwell() {
+        let scan = WaveGenScan {
+            first_chan: 0,
+            last_chan: 0,
+            num_points: 10,
+            dwell: 1e-5,
+            range: BIP10VOLTS,
+            ext_trigger: false,
+            ext_clock: false,
+            continuous: false,
+            retrigger: false,
+        };
+        assert_eq!(scan.rate(), 1.0 / 1e-5);
+    }
+
+    fn wave(wave_type: i32, num_points: usize) -> InternalWave {
+        InternalWave {
             wave_type,
-            amplitude,
-            offset,
-            pulse_width,
-            pulse_delay,
-            dwell,
+            num_points,
+            dwell: 1.0,
+            offset: 1.0,
+            amplitude: 2.0,
+            pulse_width: 2.0,
+            pulse_delay: 1.0,
         }
     }
 
-    #[test]
-    fn a_pulse_is_timed_in_samples_of_the_dwell_after_its_delay() {
-        // 0.25 s wide after 0.2 s at 0.1 s per sample: 2 low, 3 high, rest low.
-        let data = generate_waveform(&shape(WAVE_TYPE_PULSE, 1.0, 0.0, 0.25, 0.2, 0.1), 10);
-        assert_eq!(data, vec![0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn a_delay_never_pushes_the_pulse_off_the_end() {
-        let data = generate_waveform(&shape(WAVE_TYPE_PULSE, 1.0, 0.0, 2.0, 10.0, 1.0), 6);
-        assert_eq!(data, vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+    fn defined(wave: &InternalWave) -> Vec<f32> {
+        let mut out = vec![-7.0; wave.num_points + 1];
+        define_internal(&mut out, wave);
+        out
     }
 
     #[test]
     fn dac_conversion_spans_the_bipolar_range() {
-        let mut data = [-10.0, 0.0, 10.0];
-        volts_to_dac(&mut data);
-        assert_eq!(data[0], 0.0);
-        assert_eq!(data[1], 32768.0);
-        assert_eq!(data[2], 65535.0);
+        assert_eq!(volts_to_dac(-10.0, 1.0, 0.0), 0.0);
+        assert_eq!(volts_to_dac(0.0, 1.0, 0.0), 32768.0);
+        assert_eq!(volts_to_dac(10.0, 1.0, 0.0), 65535.0);
+        // A user waveform's amplitude and offset come first.
+        assert_eq!(volts_to_dac(1.0, 2.0, -2.0), 32768.0);
     }
 
     #[test]
     fn dac_conversion_clamps_beyond_the_range() {
-        let mut data = [-25.0, 25.0];
-        volts_to_dac(&mut data);
-        assert_eq!(data[0], 0.0);
-        assert_eq!(data[1], 65535.0);
+        assert_eq!(volts_to_dac(-25.0, 1.0, 0.0), 0.0);
+        assert_eq!(volts_to_dac(25.0, 1.0, 0.0), 65535.0);
     }
 
     #[test]
-    fn an_unset_wave_type_is_all_zeros() {
-        // WAVE_TYPE_USER has no internal shape: the driver fills it from
-        // WAVEGEN_USER_WF, and an unwritten one must stay at 0 V.
-        let data = generate_waveform(&shape(WAVE_TYPE_USER, 5.0, 1.0, 0.5, 0.0, 1.0), 8);
-        assert_eq!(data, vec![0.0; 8]);
-    }
-
-    #[test]
-    fn the_random_sequence_is_glibc_rand_after_srand_1() {
-        let mut rng = GlibcRand::new(1);
-        let first: Vec<u32> = (0..5).map(|_| rng.next()).collect();
+    fn a_square_wave_is_base_plus_amplitude_then_base() {
+        // base = offset - amplitude/2 = 0.
         assert_eq!(
-            first,
-            vec![1804289383, 846930886, 1681692777, 1714636915, 1957747793]
+            defined(&wave(WAVE_TYPE_SQUARE, 4)),
+            vec![2.0, 2.0, 0.0, 0.0, -7.0]
         );
     }
 
     #[test]
-    fn a_sawtooth_ends_at_the_top_of_its_span() {
-        let data = generate_waveform(&shape(WAVE_TYPE_SAWTOOTH, 2.0, 0.0, 0.5, 0.0, 1.0), 4);
-        assert_eq!(data[0], -1.0);
-        assert_eq!(data[3], 1.0);
+    fn a_sawtooth_climbs_from_base_to_base_plus_amplitude() {
+        assert_eq!(
+            defined(&wave(WAVE_TYPE_SAWTOOTH, 3)),
+            vec![0.0, 1.0, 2.0, -7.0]
+        );
     }
 
     #[test]
-    fn a_sine_period_closes_on_its_last_point() {
-        let data = generate_waveform(&shape(WAVE_TYPE_SIN, 2.0, 0.0, 0.5, 0.0, 1.0), 5);
-        assert!(data[4].abs() < 1e-6, "last point {}", data[4]);
-        assert!((data[1] - 1.0).abs() < 1e-6, "quarter period {}", data[1]);
+    fn a_sine_is_half_amplitude_about_the_offset_over_n_minus_one() {
+        let out = defined(&wave(WAVE_TYPE_SIN, 5));
+        assert_eq!(out[0], 1.0);
+        assert!((out[1] - 2.0).abs() < 1e-6);
+        assert!((out[3] - 0.0).abs() < 1e-6);
+        assert!((out[4] - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn a_square_wave_is_half_high_half_low_around_the_offset() {
-        // 2 V peak-to-peak about 1 V: 2 V then 0 V (C base + amplitude, base).
-        let data = generate_waveform(&shape(WAVE_TYPE_SQUARE, 2.0, 1.0, 0.5, 0.0, 1.0), 4);
-        assert_eq!(data, vec![2.0, 2.0, 0.0, 0.0]);
+    fn a_pulse_is_delayed_and_counted_in_dwells() {
+        // width 2 dwells, delay 1 dwell, over 6 points.
+        assert_eq!(
+            defined(&wave(WAVE_TYPE_PULSE, 6)),
+            vec![1.0, 3.0, 3.0, 1.0, 1.0, 1.0, -7.0]
+        );
+        // A pulse that would run off the end is pulled back to end one short.
+        let mut late = wave(WAVE_TYPE_PULSE, 4);
+        late.pulse_delay = 5.0;
+        assert_eq!(defined(&late), vec![1.0, 3.0, 3.0, 1.0, -7.0]);
     }
 
     #[test]
-    fn a_sine_swings_half_the_amplitude_about_the_offset() {
-        let data = generate_waveform(&shape(WAVE_TYPE_SIN, 2.0, 0.0, 0.5, 0.0, 1.0), 5);
-        let peak = data.iter().cloned().fold(f32::MIN, f32::max);
-        assert!((peak - 1.0).abs() < 1e-6, "peak {peak}");
+    fn the_random_wave_is_glibcs_srand_1_sequence() {
+        let mut rand = GlibcRand::seeded(1);
+        assert_eq!(
+            [rand.next(), rand.next(), rand.next()],
+            [1804289383, 846930886, 1681692777]
+        );
     }
 
     #[test]
-    fn a_sawtooth_starts_half_the_amplitude_below_the_offset() {
-        let data = generate_waveform(&shape(WAVE_TYPE_SAWTOOTH, 2.0, 0.0, 0.5, 0.0, 1.0), 4);
-        assert!(data.iter().all(|v| (-1.0..=1.0).contains(v)));
-    }
-
-    #[test]
-    fn a_pulse_is_at_least_one_sample_wide() {
-        // A pulse width that rounds to zero samples must still produce a
-        // pulse, not a flat line at the offset.
-        let data = generate_waveform(&shape(WAVE_TYPE_PULSE, 1.0, 0.0, 0.0, 0.0, 1.0), 10);
-        assert_eq!(data[0], 1.0);
-        assert_eq!(&data[1..], &[0.0; 9]);
-    }
-
-    #[test]
-    fn a_pulse_wider_than_the_waveform_leaves_one_sample_low() {
-        let data = generate_waveform(&shape(WAVE_TYPE_PULSE, 1.0, 0.0, 10.0, 0.0, 1.0), 4);
-        assert_eq!(data, vec![1.0, 1.0, 1.0, 0.0]);
-    }
-
-    #[test]
-    fn a_single_point_waveform_is_well_defined() {
-        for wave_type in [
-            WAVE_TYPE_SIN,
-            WAVE_TYPE_SQUARE,
-            WAVE_TYPE_SAWTOOTH,
-            WAVE_TYPE_PULSE,
-            WAVE_TYPE_RANDOM,
-        ] {
-            let data = generate_waveform(&shape(wave_type, 1.0, 0.0, 0.5, 0.0, 1.0), 1);
-            assert_eq!(data.len(), 1);
-            assert!(data[0].is_finite());
-        }
+    fn an_unknown_type_leaves_the_buffer_alone() {
+        assert_eq!(defined(&wave(WAVE_TYPE_USER, 2)), vec![-7.0; 3]);
     }
 }

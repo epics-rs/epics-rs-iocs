@@ -18,10 +18,7 @@ epicsEnvSet("XSIZE",  "1024")
 epicsEnvSet("YSIZE",  "1024")
 epicsEnvSet("NCHANS", "2048")
 epicsEnvSet("CBUFFS", "500")
-
-# NELEMENTS for the NDStdArrays output waveform: XSIZE * YSIZE * 3, so an RGB
-# frame at the full detector size fits.
-epicsEnvSet("NELEMENTS", "3145728")
+epicsEnvSet("MAX_THREADS", "8")
 
 # $(ADSIMDETECTOR) is set to this crate's root by ioc_support at IOC startup.
 # The templates live in its db/ subdir.
@@ -36,10 +33,31 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
 
 dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
+# Create a standard arrays plugin, set it to get data from first simDetector driver.
+NDStdArraysConfigure("Image1", 20, 0, "$(PORT)", 0, 0, 0, 0, 0, 5)
+
+# This creates a waveform large enough for 2000x2000x3 (e.g. RGB color) arrays.
+# This waveform only allows transporting 8-bit images
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int8,FTVL=UCHAR,NELEMENTS=12000000")
+
 # Plugin chain
 < $(ADSIMDETECTOR)/simDetectorPlugins.cmd
 
-# iocInit is called automatically by IocApplication after this script completes.
+# Create a standard arrays plugin, set it to get data from FFT plugin.
+NDStdArraysConfigure("Image2", 3, 0, "FFT1", 0)
+
+# This waveform allows transporting 64-bit images, so it can handle any detector data type at the expense of more memory and bandwidth
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image2:,PORT=Image2,ADDR=0,TIMEOUT=1,NDARRAY_PORT=FFT1,TYPE=Float64,FTVL=DOUBLE,NELEMENTS=12000000")
+
+set_requestfile_path("$(ADSIMDETECTOR)/db")
+
+asynSetTraceIOMask("$(PORT)",0,2)
+
+iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
+
 #
 # Example interactive commands:
 #   dbl                                  # List all PVs

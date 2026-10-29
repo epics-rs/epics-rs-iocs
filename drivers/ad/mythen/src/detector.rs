@@ -6,11 +6,14 @@
 //! asyn's per-port request queue.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::trace::{TraceManager, TraceMask};
 use parking_lot::Mutex;
 
 use crate::protocol::{self, READ_MODE_RAW};
@@ -62,16 +65,60 @@ pub struct Detector {
     /// outcome of a real command is the only thing that may change it.
     connected: AtomicBool,
     pub state: DetState,
+    /// The mythen port C's `pasynUserSelf` prints on.
+    port_name: String,
+    /// C's `outString_`: the last command written to it, which C's
+    /// refusal lines print whether or not it was sent.
+    out_string: Mutex<String>,
+    trace: Arc<TraceManager>,
 }
 
 impl Detector {
-    pub fn new(transport: Transport) -> Self {
+    pub fn new(transport: Transport, port_name: &str) -> Self {
         Self {
+            trace: transport.trace(),
             transport: Mutex::new(transport),
             // Optimistic: the first command is what finds out.
             connected: AtomicBool::new(true),
             state: DetState::default(),
+            port_name: port_name.to_string(),
+            out_string: Mutex::default(),
         }
+    }
+
+    pub fn out_string(&self) -> String {
+        self.out_string.lock().clone()
+    }
+
+    /// C's `"<check> (outString = %s)"` refusal on `pasynUserSelf` and the
+    /// asynError that follows it (mythen.cpp:365, :392, :414).
+    pub fn refused(&self, check: &str) -> AsynError {
+        self.trace_error(&format!("{check} (outString = {})", self.out_string()));
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        }
+    }
+
+    /// An `ASYN_TRACE_ERROR` line on the mythen port.
+    pub fn trace_error(&self, message: &str) {
+        self.trace
+            .output_device(&self.port_name, Some(0), 0, TraceMask::ERROR, message);
+    }
+
+    /// C `writeReadMeter`, mythen.cpp:239, which prints on every failed
+    /// exchange — including one the asyn port refused while disconnected.
+    fn meter<T>(
+        &self,
+        what: &str,
+        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
+    ) -> AsynResult<T> {
+        *self.out_string.lock() = what.to_string();
+        let result = self.exchange(exchange);
+        if result.is_err() {
+            self.trace_error("mythen:writeReadMeter: error!\n");
+        }
+        result
     }
 
     /// Whether the detector is currently believed to be answering.
@@ -79,68 +126,33 @@ impl Detector {
         self.connected.load(Ordering::Acquire)
     }
 
-    /// The gate every detector command passes through.
-    ///
-    /// INVARIANT: while the detector is marked disconnected no command reaches
-    /// the socket. Each one would otherwise sit out the full 5 s
-    /// [`M1K_TIMEOUT`](crate::transport::M1K_TIMEOUT), and they are serialized
-    /// through the port's single request queue — the 37 records that process at
-    /// `iocInit` cost minutes between them instead of nothing at all.
-    ///
-    /// The caller gets [`AsynStatus::Disconnected`] instead, which is the
-    /// record layer's own word for it.
-    fn io<T>(
-        &self,
-        what: &str,
-        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
-    ) -> AsynResult<T> {
-        if !self.is_connected() {
-            return Err(disconnected(what));
-        }
-        self.exchange(what, exchange)
-    }
-
     /// Run one command and let its outcome own the connection state.
     ///
-    /// The only writer of `connected`, and the only path to the socket. Every
+    /// The only writer of `connected`, and the only path to the socket. There
+    /// is no gate in front of it: as in C, a detector that does not answer is
+    /// refused by the asyn port itself, asynError for the send that fails and
+    /// asynDisconnected while the port is down (asynManager.c:1549-1553). Every
     /// error inside here is the detector failing to answer in full — a timeout
     /// with nothing in hand, or a reply too short to decode — so every one of
     /// them means disconnected. Replies the detector *did* send and the driver
     /// rejects (`-get tau` out of range, a negative module count) are checked by
     /// the callers, above this line, and leave the state alone.
-    fn exchange<T>(
-        &self,
-        what: &str,
-        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
-    ) -> AsynResult<T> {
+    fn exchange<T>(&self, exchange: impl FnOnce(&Transport) -> AsynResult<T>) -> AsynResult<T> {
         let result = exchange(&self.transport.lock());
-        match &result {
-            Ok(_) => {
-                if !self.connected.swap(true, Ordering::AcqRel) {
-                    log::warn!("mythen: [{what}] answered; the detector is connected again");
-                }
-            }
-            Err(e) => {
-                if self.connected.swap(false, Ordering::AcqRel) {
-                    log::error!(
-                        "mythen: [{what}] got no answer ({e}); the detector is marked \
-                         disconnected and no further command will be sent until an acquisition \
-                         probes it"
-                    );
-                }
-            }
-        }
+        self.connected.store(result.is_ok(), Ordering::Release);
         result
     }
 
-    /// The one command allowed past the gate: the probe that can bring the
-    /// detector back.
+    /// The probe that brings a detector that stopped answering back.
     ///
     /// C has no such path — a detector that was off when the IOC booted stays
     /// unusable until the IOC is restarted, because C's constructor is the only
     /// place that reads the module count (mythen.cpp:1363).
     pub fn probe(&self) -> AsynResult<String> {
-        let version = self.exchange("-get version", Transport::get_version)?;
+        *self.out_string.lock() = "-get version".to_string();
+        let version = self
+            .exchange(Transport::get_version)
+            .inspect_err(|_| self.trace_error("mythen:writeReadMeter: error!\n"))?;
         self.store_firmware(&version);
         Ok(version)
     }
@@ -163,23 +175,30 @@ impl Detector {
         self.state.firmware_major.load(Ordering::Acquire)
     }
 
-    /// Send a command and check the status integer it replies with.
+    /// Send a command and check the status integer it replies with
+    /// (C `sendCommand`, mythen.cpp:221, which reports a negative one and
+    /// carries on).
     pub fn send(&self, command: &str) -> AsynResult<()> {
-        self.io(command, |t| t.send_command(command))?;
+        let value = self.meter(command, |t| t.send_command(command))?;
+        if value < 0 {
+            self.trace_error(&format!(
+                "mythen:sendCommand: error, expected 0, received {value}\n"
+            ));
+        }
         Ok(())
     }
 
     fn get_int(&self, command: &str) -> AsynResult<i32> {
-        self.io(command, |t| t.get_int(command))
+        self.meter(command, |t| t.get_int(command))
     }
 
     fn get_float(&self, command: &str) -> AsynResult<f32> {
-        self.io(command, |t| t.get_float(command))
+        self.meter(command, |t| t.get_float(command))
     }
 
     /// C `getFirmware`, mythen.cpp:497.
     pub fn get_firmware(&self) -> AsynResult<String> {
-        let version = self.io("-get version", Transport::get_version)?;
+        let version = self.meter("-get version", Transport::get_version)?;
         self.store_firmware(&version);
         Ok(version)
     }
@@ -192,6 +211,8 @@ impl Detector {
 
     /// C `-get nmodules` in the constructor, mythen.cpp:1363.
     pub fn read_nmodules(&self) -> AsynResult<i32> {
+        // UPSTREAM DEFECT (mythen.cpp:1364-1373): C tests `aux < 0` on the
+        // leftover inString_ of a failed read and sets SDNModules from it.
         let n = self.get_int("-get nmodules")?;
         if n > 0 {
             self.state.nmodules.store(n, Ordering::Release);
@@ -205,6 +226,8 @@ impl Detector {
     /// increasing amount of time — up to about a minute in total — and reports
     /// [`ADStatus::Error`] if the trigger never arrives.
     pub fn get_status(&self) -> AsynResult<ADStatus> {
+        // UPSTREAM DEFECT (mythen.cpp:515-516): C decodes a failed read's
+        // leftover inString_ as the status word; rs returns the error.
         let mut bits = protocol::status_bits(self.get_int("-get status")?);
 
         if protocol::is_idle(bits) {
@@ -243,7 +266,10 @@ impl Detector {
     /// the command carries its own length.
     pub fn stop(&self) -> AsynResult<()> {
         self.state.acquiring.store(false, Ordering::Release);
-        self.io("-stop", |t| t.send_command("-stop"))?;
+        // C sends `-stop` straight through pasynOctetSyncIO, not
+        // writeReadMeter, and prints its own line.
+        self.exchange(|t| t.send_command("-stop"))
+            .inspect_err(|_| self.trace_error("mythen:setAcquire: error!\n"))?;
         Ok(())
     }
 
@@ -272,7 +298,7 @@ impl Detector {
     /// constants are legal.
     pub fn set_tau(&self, value: f64) -> AsynResult<bool> {
         if value == -1.0 || value > 0.0 {
-            self.send(&format!("-tau {value:.6}"))?;
+            self.send(&format!("-tau {value:.6}", value = CFloat(value)))?;
             Ok(true)
         } else {
             Ok(false)
@@ -281,7 +307,7 @@ impl Detector {
 
     /// C `setKthresh`, mythen.cpp:374 — set on every module in turn.
     pub fn set_kthresh(&self, value: f64) -> AsynResult<()> {
-        self.for_each_module(&format!("-kthresh {value:.6}"))
+        self.for_each_module(&format!("-kthresh {value:.6}", value = CFloat(value)))
     }
 
     /// C `setEnergy`, mythen.cpp:401 — firmware 3 and later only.
@@ -289,7 +315,7 @@ impl Detector {
         if self.firmware_major() < 3 {
             return Ok(());
         }
-        self.for_each_module(&format!("-energy {value:.6}"))
+        self.for_each_module(&format!("-energy {value:.6}", value = CFloat(value)))
     }
 
     /// C `loadSettings`, mythen.cpp:599.
@@ -306,17 +332,16 @@ impl Detector {
     /// `-module N` followed by `command`, for every module (C repeats this
     /// pattern in setKthresh / setEnergy / loadSettings / setReset).
     ///
-    /// Refuses when the module count is unknown rather than looping zero times:
-    /// a silent no-op here is a threshold the operator believes was applied.
+    /// Like C it runs zero times while the module count is unknown, carries on
+    /// past a failed command and returns the last command's status.
     fn for_each_module(&self, command: &str) -> AsynResult<()> {
-        let nmodules = self
-            .nmodules()
-            .ok_or_else(|| unknown_nmodules(&format!("send [{command}] to every module")))?;
+        let nmodules = self.nmodules().unwrap_or(0);
+        let mut status = Ok(());
         for module in 0..nmodules {
-            self.send(&format!("-module {module}"))?;
-            self.send(command)?;
+            let _ = self.send(&format!("-module {module}"));
+            status = self.send(command);
         }
-        Ok(())
+        status
     }
 
     pub fn set_exposure_time(&self, seconds: f64) -> AsynResult<()> {
@@ -356,19 +381,25 @@ impl Detector {
     /// A reply outside the range C checks for (`goto error`) fails the whole
     /// read, exactly as in C.
     pub fn get_settings(&self) -> AsynResult<Settings> {
+        // UPSTREAM DEFECT (mythen.cpp:696-712): C ignores writeReadMeter's
+        // status and decodes whatever a failed read left in inString_, so a
+        // silent detector publishes these as 0. rs fails the read instead.
         let use_flat_field = self.get_bool("-get flatfieldcorrection")?;
         let use_bad_chan_intrpl = self.get_bool("-get badchannelinterpolation")?;
         let use_count_rate = self.get_bool("-get ratecorrection")?;
 
         let nbits = self.get_int("-get nbits")?;
+        // UPSTREAM DEFECT (mythen.cpp:717-719): C accepts 0 here and then
+        // divides by it (`chanperline_ = 32/aux`, SIGFPE). 0 is kept as C
+        // keeps it; `protocol::channels_per_word` reads it as one channel.
         if nbits < 0 {
-            return Err(settings_error("-get nbits", nbits.to_string()));
+            return Err(self.settings_error("-get nbits", nbits.to_string()));
         }
         self.state.nbits.store(nbits, Ordering::Release);
 
         let time = self.get_int("-get time")?;
         if time < 0 {
-            return Err(settings_error("-get time", time.to_string()));
+            return Err(self.settings_error("-get time", time.to_string()));
         }
         let acquire_time = protocol::from_hundred_ns(time);
 
@@ -377,12 +408,14 @@ impl Detector {
 
         let tau = self.get_float("-get tau")?;
         if !(tau == -1.0 || tau > 0.0) {
-            return Err(settings_error("-get tau", tau.to_string()));
+            return Err(self.settings_error("-get tau", CFloat(f64::from(tau)).g().to_string()));
         }
 
         let threshold = self.get_float("-get kthresh")?;
         if threshold < 0.0 {
-            return Err(settings_error("-get kthresh", threshold.to_string()));
+            return Err(
+                self.settings_error("-get kthresh", CFloat(f64::from(threshold)).g().to_string())
+            );
         }
 
         let mut settings = Settings {
@@ -402,7 +435,9 @@ impl Detector {
         if self.firmware_major() >= 3 {
             let energy = self.get_float("-get energy")?;
             if energy < 0.0 {
-                return Err(settings_error("-get energy", energy.to_string()));
+                return Err(
+                    self.settings_error("-get energy", CFloat(f64::from(energy)).g().to_string())
+                );
             }
             settings.energy = Some(f64::from(energy));
 
@@ -415,20 +450,20 @@ impl Detector {
             // and `-get version`: the reply is four bytes by construction.
             let delay = self.get_int("-get delafter")?;
             if delay < 0 {
-                return Err(settings_error("-get delafter", delay.to_string()));
+                return Err(self.settings_error("-get delafter", delay.to_string()));
             }
             settings.delay_time = Some(protocol::from_hundred_ns(delay));
 
             let cont = self.get_int("-get conttrig")?;
             if cont < 0 {
-                return Err(settings_error("-get conttrig", cont.to_string()));
+                return Err(self.settings_error("-get conttrig", cont.to_string()));
             }
             settings.trigger = Some(if cont == 1 {
                 protocol::TRIGGER_CONTINUOUS
             } else {
                 let single = self.get_int("-get trig")?;
                 if single < 0 {
-                    return Err(settings_error("-get trig", single.to_string()));
+                    return Err(self.settings_error("-get trig", single.to_string()));
                 }
                 if single == 1 {
                     protocol::TRIGGER_SINGLE
@@ -445,7 +480,7 @@ impl Detector {
     fn get_bool(&self, command: &str) -> AsynResult<i32> {
         let value = self.get_int(command)?;
         if value != 0 && value != 1 {
-            return Err(settings_error(command, value.to_string()));
+            return Err(self.settings_error(command, value.to_string()));
         }
         Ok(value)
     }
@@ -472,37 +507,160 @@ impl Detector {
         } else {
             "-readout"
         };
-        self.io(command, |t| t.readout(command, expect, timeout))
+        *self.out_string.lock() = command.to_string();
+        self.exchange(|t| t.readout(command, expect, timeout))
     }
 }
 
-/// The error a caller gets while the detector is marked disconnected: the
-/// command was never sent.
-fn disconnected(what: &str) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Disconnected,
-        message: format!(
-            "mythen: [{what}] not sent: the detector is disconnected — write ADAcquire to probe \
-             it again"
-        ),
+impl Detector {
+    /// C `getSettings`' `goto error`, mythen.cpp:791.
+    fn settings_error(&self, command: &str, got: String) -> AsynError {
+        self.trace_error(&format!(
+            "mythen:getSettings: error, outString={command}, inString={got}\n"
+        ));
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("mythen: [{command}] unexpected reply: {got}"),
+        }
     }
 }
 
-/// The error a caller gets when it asks for detector work whose size depends on
-/// a module count the detector has never reported.
-pub fn unknown_nmodules(what: &str) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!(
-            "mythen: cannot {what}: the module count is unknown — `-get nmodules` has not \
-             answered since the IOC started"
-        ),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+    use epics_rs::asyn::user::AsynUser;
 
-fn settings_error(command: &str, got: String) -> epics_rs::asyn::error::AsynError {
-    epics_rs::asyn::error::AsynError::Status {
-        status: epics_rs::asyn::error::AsynStatus::Error,
-        message: format!("mythen: [{command}] unexpected reply: {got}"),
+    /// A mythen that answers every command with status 0.
+    struct Ok0(PortDriverBase);
+
+    impl PortDriver for Ok0 {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            buf[..4].fill(0);
+            OctetReadResult::ok(4, EomReason::CNT)
+        }
+    }
+
+    /// A mythen that answers each `-get` float query with its scripted value
+    /// and every other query with 0.
+    struct Floats {
+        base: PortDriverBase,
+        last: Vec<u8>,
+        floats: [(&'static str, f32); 3],
+    }
+
+    impl PortDriver for Floats {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.last = data.to_vec();
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> OctetReadResult {
+            let reply = self
+                .floats
+                .iter()
+                .find(|(command, _)| command.as_bytes() == self.last)
+                .map_or([0; 4], |(_, v)| v.to_le_bytes());
+            buf[..4].copy_from_slice(&reply);
+            OctetReadResult::ok(4, EomReason::CNT)
+        }
+    }
+
+    /// mythen.cpp:793 traces a refused reply with C's raw `inString`; rs
+    /// names the float it decoded, as %g since that text has no C spelling.
+    #[test]
+    fn refused_float_reply_names_the_value_as_c_percent_g() {
+        for (i, (refused, value, text)) in [
+            ("-get tau", f32::NAN, "nan"),
+            ("-get tau", -f32::NAN, "-nan"),
+            ("-get kthresh", -1e-5, "-1e-05"),
+            ("-get energy", -2.5e-7, "-2.5e-07"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("MYTHEN_DET_REFUSED_FLOAT_{i}");
+            let base = PortDriverBase::new(
+                &name,
+                1,
+                PortFlags::default(),
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
+            );
+            let mut floats = [
+                ("-get tau", -1.0),
+                ("-get kthresh", 0.0),
+                ("-get energy", 0.0),
+            ];
+            floats.iter_mut().find(|(c, _)| *c == refused).unwrap().1 = value;
+            let driver = Floats {
+                base,
+                last: Vec::new(),
+                floats,
+            };
+            let (runtime, _) = create_port_runtime(
+                &claim_port(&name).unwrap(),
+                driver,
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let det = Detector::new(Transport::new(runtime.port_handle().clone()), &name);
+            det.state.firmware_major.store(3, Ordering::Release);
+            match det.get_settings() {
+                Err(AsynError::Status { message, .. }) => {
+                    assert_eq!(
+                        message,
+                        format!("mythen: [{refused}] unexpected reply: {text}")
+                    );
+                }
+                other => panic!("{refused}: {other:?}"),
+            }
+        }
+    }
+
+    /// mythen.cpp:381/:410 write `-kthresh %f` / `-energy %f`.
+    #[test]
+    fn module_float_commands_print_as_c_percent_f() {
+        let name = "MYTHEN_DET_FLOAT_CMD";
+        let base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags::default(),
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
+        );
+        let (runtime, _) = create_port_runtime(
+            &claim_port(name).unwrap(),
+            Ok0(base),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let det = Detector::new(Transport::new(runtime.port_handle().clone()), name);
+        det.state.nmodules.store(1, Ordering::Release);
+        det.state.firmware_major.store(3, Ordering::Release);
+        for (v, text) in [(f64::NAN, "nan"), (-f64::NAN, "-nan")] {
+            det.set_kthresh(v).unwrap();
+            assert_eq!(det.out_string(), format!("-kthresh {text}"));
+            det.set_energy(v).unwrap();
+            assert_eq!(det.out_string(), format!("-energy {text}"));
+        }
     }
 }

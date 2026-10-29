@@ -6,17 +6,28 @@
 
 use std::sync::Arc;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
-use crate::drivers::asyn_error;
+use crate::drivers::refused;
 use crate::io::IoInterface;
+use crate::spdlog::{self, FmtDouble};
 
 /// Digital outputs 0..7 and analog outputs 0..1 are addressed by asyn address.
 pub const NUM_CHANNELS: usize = 8;
+
+/// The interfaces this port registers; its db binds records to them.
+pub const INTERFACES: InterfaceMask = InterfaceMask::INT32
+    .or(InterfaceMask::FLOAT64)
+    .or(InterfaceMask::DRV_USER);
+
+/// The interfaces that post interrupts: [`INTERFACES`] without `asynDrvUser`.
+pub const INTERRUPTS: InterfaceMask = InterfaceMask::INT32.or(InterfaceMask::FLOAT64);
 
 #[derive(Clone, Copy)]
 pub struct IoParams {
@@ -62,6 +73,8 @@ impl IoDriver {
                 can_block: true,
                 destructible: true,
             },
+            INTERFACES,
+            INTERRUPTS,
         );
         let params = IoParams::create(&mut base)?;
         let mut me = Self {
@@ -83,22 +96,21 @@ impl IoDriver {
         match slot.as_mut() {
             Some(iface) => match iface.reconnect() {
                 Ok(()) => {
-                    log::info!("ur-robot: reconnected to the RTDE I/O interface");
+                    spdlog::info(format_args!("Reconnecting to UR RTDE I/O interface"));
                     true
                 }
-                Err(e) => {
-                    log::error!("ur-robot: RTDE I/O reconnect failed: {e}");
-                    false
-                }
+                Err(_) => false,
             },
             None => match IoInterface::connect(&self.robot_ip, false) {
                 Ok(iface) => {
-                    log::info!("ur-robot: connected to the RTDE I/O interface");
+                    spdlog::info(format_args!("Connected to UR RTDE IO interface"));
                     *slot = Some(iface);
                     true
                 }
                 Err(e) => {
-                    log::error!("ur-robot: RTDE I/O connect failed: {e}");
+                    spdlog::error(format_args!(
+                        "Failed to connected to UR RTDE I/O interface\n{e}"
+                    ));
                     false
                 }
             },
@@ -121,27 +133,43 @@ impl PortDriver for IoDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_int32(reason, addr, value)?;
+            self.base.set_int32_param(reason, addr, value)?;
 
-            let channel = u8::try_from(addr)
-                .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;
+            let channel = u8::try_from(addr).map_err(|_| {
+                spdlog::error(format_args!("I/O channel {addr} is out of range"));
+                refused()
+            })?;
             let level = value != 0;
 
             let mut slot = self.iface.lock();
             let Some(iface) = slot.as_mut() else {
-                return Err(asyn_error("the RTDE I/O interface is not initialised"));
+                spdlog::error(format_args!("RTDE IO interface not initialized"));
+                return Err(refused());
             };
 
+            let state = if value == 1 { "high" } else { "low" };
             let result = if reason == p.set_standard_digital_out {
+                spdlog::debug(format_args!(
+                    "Setting standard digital output {addr} {state}"
+                ));
                 iface.set_standard_digital_out(channel, level)
             } else if reason == p.set_config_digital_out {
+                spdlog::debug(format_args!(
+                    "Setting configurable digital output {addr} {state}"
+                ));
                 iface.set_configurable_digital_out(channel, level)
             } else if reason == p.set_tool_digital_out {
+                spdlog::debug(format_args!("Setting tool digital output {addr} {state}"));
                 iface.set_tool_digital_out(channel, level)
             } else {
                 return Ok(());
             };
-            result.map_err(|e| asyn_error(format!("RTDE I/O write failed: {e}")))
+            result.map_err(|_| {
+                spdlog::error(format_args!(
+                    "RTDE communication error in RTDEInOut::writeInt32"
+                ));
+                refused()
+            })
         })();
         crate::drivers::flush_after(&mut self.base, addr, result)
     }
@@ -152,26 +180,49 @@ impl PortDriver for IoDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_float64(reason, addr, value)?;
+            self.base.set_float64_param(reason, addr, value)?;
 
-            let channel = u8::try_from(addr)
-                .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;
+            let channel = u8::try_from(addr).map_err(|_| {
+                spdlog::error(format_args!("I/O channel {addr} is out of range"));
+                refused()
+            })?;
 
             let mut slot = self.iface.lock();
             let Some(iface) = slot.as_mut() else {
-                return Err(asyn_error("the RTDE I/O interface is not initialised"));
+                spdlog::error(format_args!("RTDE IO interface not initialized"));
+                return Err(refused());
             };
 
             let result = if reason == p.speed_slider {
+                // C prints only every 0.01, "so we don't print too many values".
+                if ((value * 1000.0) as i32) % 10 == 0 {
+                    spdlog::debug(format_args!(
+                        "Setting speed slider to {value:.2}",
+                        value = CFloat(value)
+                    ));
+                }
                 iface.set_speed_slider(value)
             } else if reason == p.set_voltage_analog_out {
+                spdlog::debug(format_args!(
+                    "Setting analog output voltage {addr} to {}",
+                    FmtDouble(value)
+                ));
                 iface.set_analog_output_voltage(channel, value)
             } else if reason == p.set_current_analog_out {
+                spdlog::debug(format_args!(
+                    "Setting analog output current {addr} to {}",
+                    FmtDouble(value)
+                ));
                 iface.set_analog_output_current(channel, value)
             } else {
                 return Ok(());
             };
-            result.map_err(|e| asyn_error(format!("RTDE I/O write failed: {e}")))
+            result.map_err(|_| {
+                spdlog::error(format_args!(
+                    "RTDE communication error in RTDEInOut::writeFloat64"
+                ));
+                refused()
+            })
         })();
         crate::drivers::flush_after(&mut self.base, addr, result)
     }

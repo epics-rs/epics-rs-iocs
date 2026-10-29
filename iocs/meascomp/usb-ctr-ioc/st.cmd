@@ -1,101 +1,68 @@
-# USB-CTR08 IOC startup script
+# USB-CTR08 IOC startup script, ported from iocBoot/iocUSBCTR/st.cmd
+#
+# main.rs sets MEASCOMP to iocs/meascomp, whose db/ holds measComp's
+# templates, substitutions and _settings.req files verbatim, SCALER to
+# scaler-rs and MCA to drivers/mca.
 
-epicsEnvSet("PREFIX", "USBCTR:")
-epicsEnvSet("PORT",   "USBCTR_1")
-epicsEnvSet("UNIQUE_ID", "01DAB0FB")
-epicsEnvSet("MAX_POINTS", "2048")
+epicsEnvSet("PREFIX",             "USBCTR:")
+epicsEnvSet("PORT",               "USBCTR_1")
+epicsEnvSet("UNIQUE_ID",          "01DAB0FB")
+epicsEnvSet("MCS_PREFIX",         "$(PREFIX)MCS:")
+epicsEnvSet("SCALER_PREFIX",      "$(PREFIX)")
+epicsEnvSet("SCALER_NAME",        "scaler1")
+epicsEnvSet("RNAME",              "mca")
+epicsEnvSet("MAX_COUNTERS",       "9")
+epicsEnvSet("MAX_POINTS",         "2048")
+# For MCA records FIELD=READ, for waveform records FIELD=PROC
+epicsEnvSet("FIELD",              "PROC")
 
-# Create the USB-CTR08 driver
+## Set the minimum sleep time to 1 ms
+asynSetMinTimerPeriod(0.001)
+
+## Configure port driver
+# USBCTRConfig(portName,       # The name to give to this asyn port driver
+#              uniqueID,       # Device serial number.
+#              maxTimePoints)  # Maximum number of time points for MCS
 USBCTRConfig("$(PORT)", "$(UNIQUE_ID)", $(MAX_POINTS))
 
-# Device info
-dbLoadRecords("$(MEASCOMP)/db/meascomp_device.template", "P=$(PREFIX),PORT=$(PORT)")
+#asynSetTraceMask($(PORT), -1, ERROR|FLOW|DRIVER)
 
-# Pulse generators (4 timers)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_pulse_gen.template", "P=$(PREFIX),R=PulseGen1,PORT=$(PORT),ADDR=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_pulse_gen.template", "P=$(PREFIX),R=PulseGen2,PORT=$(PORT),ADDR=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_pulse_gen.template", "P=$(PREFIX),R=PulseGen3,PORT=$(PORT),ADDR=2")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_pulse_gen.template", "P=$(PREFIX),R=PulseGen4,PORT=$(PORT),ADDR=3")
+dbLoadTemplate("$(MEASCOMP)/db/USBCTR.substitutions", "P=$(PREFIX), PORT=$(PORT)")
 
-# Counters (8)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter1,PORT=$(PORT),ADDR=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter2,PORT=$(PORT),ADDR=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter3,PORT=$(PORT),ADDR=2")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter4,PORT=$(PORT),ADDR=3")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter5,PORT=$(PORT),ADDR=4")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter6,PORT=$(PORT),ADDR=5")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter7,PORT=$(PORT),ADDR=6")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter8,PORT=$(PORT),ADDR=7")
+# This loads the scaler record and supporting records
+dbLoadRecords("$(SCALER)/db/scaler.db", "P=$(SCALER_PREFIX), S=$(SCALER_NAME), DTYP=Asyn Scaler, OUT=@asyn($(PORT)), FREQ=10000000")
 
-# Digital I/O (8 bits)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi1,PORT=$(PORT),ADDR=0,MASK=0x01")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi2,PORT=$(PORT),ADDR=0,MASK=0x02")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi3,PORT=$(PORT),ADDR=0,MASK=0x04")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi4,PORT=$(PORT),ADDR=0,MASK=0x08")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi5,PORT=$(PORT),ADDR=0,MASK=0x10")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi6,PORT=$(PORT),ADDR=0,MASK=0x20")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi7,PORT=$(PORT),ADDR=0,MASK=0x40")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi8,PORT=$(PORT),ADDR=0,MASK=0x80")
+# This database provides the support for the MCS functions
+dbLoadRecords("$(MEASCOMP)/db/measCompMCS.template", "P=$(MCS_PREFIX), PORT=$(PORT), MAX_POINTS=$(MAX_POINTS)")
 
-# Whole-port digital I/O
-dbLoadRecords("$(MEASCOMP)/db/meascomp_long_in.template",  "P=$(PREFIX),R=Li,PORT=$(PORT),ADDR=0,MASK=0xFF")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_long_out.template", "P=$(PREFIX),R=Lo,PORT=$(PORT),ADDR=0,MASK=0xFF")
+# Load either MCA or waveform records below
+# The number of records loaded must be the same as MAX_COUNTERS defined above
 
-# Digital I/O bit directions (0=input, 1=output); bits 0-3 in, 4-7 out as in
-# upstream USBCTR.substitutions.
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd1,PORT=$(PORT),ADDR=0,MASK=0x01,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd2,PORT=$(PORT),ADDR=0,MASK=0x02,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd3,PORT=$(PORT),ADDR=0,MASK=0x04,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd4,PORT=$(PORT),ADDR=0,MASK=0x08,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd5,PORT=$(PORT),ADDR=0,MASK=0x10,VAL=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd6,PORT=$(PORT),ADDR=0,MASK=0x20,VAL=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd7,PORT=$(PORT),ADDR=0,MASK=0x40,VAL=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd8,PORT=$(PORT),ADDR=0,MASK=0x80,VAL=1")
+# This loads the waveform records
+dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)1,  INP=@asyn($(PORT) 0),  CHANS=$(MAX_POINTS)")
+dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)2,  INP=@asyn($(PORT) 1),  CHANS=$(MAX_POINTS)")
+dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)3,  INP=@asyn($(PORT) 2),  CHANS=$(MAX_POINTS)")
+dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)4,  INP=@asyn($(PORT) 3),  CHANS=$(MAX_POINTS)")
+dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)5,  INP=@asyn($(PORT) 4),  CHANS=$(MAX_POINTS)")
+dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)6,  INP=@asyn($(PORT) 5),  CHANS=$(MAX_POINTS)")
+dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)7,  INP=@asyn($(PORT) 6),  CHANS=$(MAX_POINTS)")
+dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)8,  INP=@asyn($(PORT) 7),  CHANS=$(MAX_POINTS)")
+dbLoadRecords("$(MCA)/db/SIS38XX_waveform.template", "P=$(MCS_PREFIX), R=$(RNAME)9,  INP=@asyn($(PORT) 8),  CHANS=$(MAX_POINTS)")
 
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo1,PORT=$(PORT),ADDR=0,MASK=0x01")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo2,PORT=$(PORT),ADDR=0,MASK=0x02")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo3,PORT=$(PORT),ADDR=0,MASK=0x04")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo4,PORT=$(PORT),ADDR=0,MASK=0x08")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo5,PORT=$(PORT),ADDR=0,MASK=0x10")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo6,PORT=$(PORT),ADDR=0,MASK=0x20")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo7,PORT=$(PORT),ADDR=0,MASK=0x40")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo8,PORT=$(PORT),ADDR=0,MASK=0x80")
+save_restoreSet_Debug(0)
+save_restoreSet_IncompleteSetsOk(1)
+save_restoreSet_DatedBackupFiles(1)
+save_restoreSet_NumSeqFiles(3)
+save_restoreSet_SeqPeriodInSeconds(300)
+set_savefile_path("$(MEASCOMP)/usb-ctr-ioc", "autosave")
+set_pass0_restoreFile("auto_settings.sav")
+set_pass1_restoreFile("auto_settings.sav")
+set_requestfile_path("$(MEASCOMP)/usb-ctr-ioc", "")
+set_requestfile_path("$(SCALER)", "db")
+set_requestfile_path("$(MEASCOMP)", "db")
 
-# scalerRecord over the 8 counters (scaler.db ships with scaler-rs)
-dbLoadRecords("$(SCALER)/db/scaler.db", "P=$(PREFIX),S=scaler1,DTYP=Asyn Scaler,OUT=@asyn($(PORT)),FREQ=10000000")
+iocInit
 
-# MCS (Multi-Channel Scaler)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs.template", "P=$(PREFIX),PORT=$(PORT),MAX_POINTS=$(MAX_POINTS)")
+seq(USBCTR_SNL, "P=$(MCS_PREFIX), R=$(RNAME), NUM_COUNTERS=$(MAX_COUNTERS), FIELD=$(FIELD)")
 
-# Per-counter MCS spectra (counters 1-8 plus the digital I/O channel), either
-# as mca records ...
-#dbLoadRecords("$(MEASCOMP)/db/meascomp_mca.template", "P=$(PREFIX),R=MCS:mca1,PORT=$(PORT),ADDR=0,MAX_POINTS=$(MAX_POINTS)")
-#dbLoadRecords("$(MEASCOMP)/db/meascomp_mca.template", "P=$(PREFIX),R=MCS:mca2,PORT=$(PORT),ADDR=1,MAX_POINTS=$(MAX_POINTS)")
-#dbLoadRecords("$(MEASCOMP)/db/meascomp_mca.template", "P=$(PREFIX),R=MCS:mca3,PORT=$(PORT),ADDR=2,MAX_POINTS=$(MAX_POINTS)")
-#dbLoadRecords("$(MEASCOMP)/db/meascomp_mca.template", "P=$(PREFIX),R=MCS:mca4,PORT=$(PORT),ADDR=3,MAX_POINTS=$(MAX_POINTS)")
-#dbLoadRecords("$(MEASCOMP)/db/meascomp_mca.template", "P=$(PREFIX),R=MCS:mca5,PORT=$(PORT),ADDR=4,MAX_POINTS=$(MAX_POINTS)")
-#dbLoadRecords("$(MEASCOMP)/db/meascomp_mca.template", "P=$(PREFIX),R=MCS:mca6,PORT=$(PORT),ADDR=5,MAX_POINTS=$(MAX_POINTS)")
-#dbLoadRecords("$(MEASCOMP)/db/meascomp_mca.template", "P=$(PREFIX),R=MCS:mca7,PORT=$(PORT),ADDR=6,MAX_POINTS=$(MAX_POINTS)")
-#dbLoadRecords("$(MEASCOMP)/db/meascomp_mca.template", "P=$(PREFIX),R=MCS:mca8,PORT=$(PORT),ADDR=7,MAX_POINTS=$(MAX_POINTS)")
-#dbLoadRecords("$(MEASCOMP)/db/meascomp_mca.template", "P=$(PREFIX),R=MCS:mca9,PORT=$(PORT),ADDR=8,MAX_POINTS=$(MAX_POINTS)")
-# ... or as waveforms, the upstream default:
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca1,PORT=$(PORT),ADDR=0,MAX_POINTS=$(MAX_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca2,PORT=$(PORT),ADDR=1,MAX_POINTS=$(MAX_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca3,PORT=$(PORT),ADDR=2,MAX_POINTS=$(MAX_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca4,PORT=$(PORT),ADDR=3,MAX_POINTS=$(MAX_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca5,PORT=$(PORT),ADDR=4,MAX_POINTS=$(MAX_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca6,PORT=$(PORT),ADDR=5,MAX_POINTS=$(MAX_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca7,PORT=$(PORT),ADDR=6,MAX_POINTS=$(MAX_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca8,PORT=$(PORT),ADDR=7,MAX_POINTS=$(MAX_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca9,PORT=$(PORT),ADDR=8,MAX_POINTS=$(MAX_POINTS)")
-
-
-# Autosave: request files live next to this script, saved state under
-# ./autosave. set_pass1_restoreFile is a no-op until the first save has run.
-set_requestfile_path("$(USB_CTR_IOC)")
-set_savefile_path("$(USB_CTR_IOC)/autosave")
-set_pass1_restoreFile("auto_settings.sav", "P=$(PREFIX)")
-
-iocInit()
-
-create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
+create_monitor_set("auto_settings.req",30,"P=$(PREFIX), MP=$(MCS_PREFIX)")

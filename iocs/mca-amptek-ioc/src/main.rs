@@ -8,41 +8,42 @@
 //!
 //! iocsh commands:
 //! * `drvAmptekConfigure(portName, interface, addressInfo, directMode)` — C
-//!   `drvAmptekConfigure` (`drvAmptek.cpp:1095-1098`). `interface` must be
-//!   `0` (Ethernet); USB (`1`) is feasibility-gated (see the `mca-amptek`
-//!   crate doc) and rejected by [`mca_amptek::driver::AmptekDriver::new`].
+//!   `drvAmptekConfigure` (`drvAmptek.cpp:1095-1098`). `interface` `0` is
+//!   Ethernet and `1` USB (`addressInfo` empty for the first DP5, else its
+//!   serial number); Serial (`2`) builds a port that never connects, as in C.
 //!   `directMode` is optional, defaulting to `0` (broadcast-discovery
 //!   connect) like the upstream iocsh call, which omits it entirely in
 //!   `st_base.cmd`.
 
 use std::sync::{Arc, Mutex};
 
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::base::error::CaResult;
-use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
-use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
+use epics_rs::ca::server::ioc_app::IocApplication;
 
 use mca::dev_mca_asyn;
-use mca::interface::ASYN_MCA_DTYP;
 use mca_amptek::driver::AmptekDriver;
 
 /// Every asyn port this IOC creates, kept alive for the life of the process
 /// (mirrors `mca-ioc`'s `Ports`; see its `main.rs`).
 type Ports = Arc<Mutex<Vec<PortRuntimeHandle>>>;
 
-fn arg_string(args: &[ArgValue], i: usize) -> Option<String> {
+fn arg_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
+        _ => Ok(None),
     }
 }
 
-fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
+/// `iocshArgBuf::ival`: C iocsh passes 0 for a missing Int arg, and
+/// `configCallFunc` forwards it unchecked (`drvAmptek.cpp:1111-1114`).
+fn arg_ival(args: &[ArgValue], i: usize) -> i64 {
     match args.get(i) {
-        Some(ArgValue::Int(n)) => Some(*n),
-        _ => None,
+        Some(ArgValue::Int(n)) => *n,
+        _ => 0,
     }
 }
 
@@ -52,11 +53,11 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: mca-amptek-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: mca-amptek-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("MCA_AMPTEK_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("MCA_AMPTEK_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let ports: Ports = Arc::new(Mutex::new(Vec::new()));
 
@@ -66,7 +67,18 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(asyn_name, move || asyn_factory());
     let (mca_name, mca_factory) = mca_rs::mca_record_factory();
     app = app.register_record_type(mca_name, move || mca_factory());
+    // mca.db's busy and transform records: opt-in in epics-rs, as a C IOC
+    // links busy and std's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+    app = app.register_record_type("transform", || {
+        Box::new(epics_rs::base::server::records::transform::TransformRecord::default())
+    });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+
+    let autosave_config = Arc::new(Mutex::new(
+        epics_rs::base::server::autosave::startup::AutosaveStartupConfig::new(),
+    ));
+    app = app.autosave_startup(autosave_config);
 
     // drvAmptekConfigure(portName, interface, addressInfo, directMode)
     {
@@ -93,22 +105,25 @@ async fn main() -> CaResult<()> {
             ],
             "drvAmptekConfigure portName interface addressInfo [directMode] - \
              create an Amptek DP5 asyn port (interface must be 0, Ethernet)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let port_name = arg_string(args, 0).ok_or("portName required")?;
-                let interface = arg_int(args, 1).ok_or("interface required")? as i32;
-                let address_info = arg_string(args, 2).ok_or("addressInfo required")?;
-                let direct_mode = arg_int(args, 3).unwrap_or(0) != 0;
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let port_name = arg_string(args, 0)?.ok_or("portName required")?;
+                let interface = arg_ival(args, 1) as i32;
+                let address_info = arg_string(args, 2)?.ok_or("addressInfo required")?;
+                let direct_mode = arg_ival(args, 3) != 0;
 
+                let claim =
+                    claim_port(&port_name).map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 let driver = AmptekDriver::new(&port_name, interface, &address_info, direct_mode)
                     .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 let (runtime_handle, _actor) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime_handle.port_handle().clone(),
-                )
-                .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 ports
                     .lock()
                     .expect("port list poisoned")
@@ -118,17 +133,20 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    // Binds every mca record with DTYP "asynMCA" to the asyn port its own
-    // INP link (`@asyn(portName,addr)`) names.
-    app = app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-        if ctx.dtyp != ASYN_MCA_DTYP {
-            return None;
-        }
-        let dev = dev_mca_asyn::connect(ctx.inp)?;
-        Some(Box::new(dev) as Box<dyn DeviceSupport>)
-    });
+    app = dev_mca_asyn::register_dev_mca_asyn(app);
 
-    app.startup_script(&script)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_int_args_read_as_zero() {
+        let args = [ArgValue::String("P".into()), ArgValue::Missing];
+        assert_eq!(arg_ival(&args, 1), 0);
+        assert_eq!(arg_ival(&args, 3), 0);
+        assert_eq!(arg_ival(&[ArgValue::Int(1)], 0), 1);
+    }
 }

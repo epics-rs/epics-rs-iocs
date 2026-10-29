@@ -1,0 +1,264 @@
+# c-expansion of st.cmd.oem over the C sources, the records of st.cmd.oem.dbl:
+# dbl of motor R7-4-5 motorParker iocBoot/iocParker st.cmd.oem
+record(asyn, "IOC:asyn1") {
+    field(ADDR, "0")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "256")
+    field(OMAX, "256")
+    field(PORT, "PORT")
+}
+record(motor, "IOC:m1") {
+    field(ACCL, "5")
+    field(ACCU, "0")
+    field(BACC, "0")
+    field(BDST, "0")
+    field(BVEL, "0")
+    field(DESC, "motor 1")
+    field(DHLM, "20")
+    field(DIR, "Pos")
+    field(DLLM, "-20")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "4.92125984e-5")
+    field(OUT, "@asyn(OEM,0)")
+    field(PREC, "5")
+    field(TWV, "1")
+    field(VBAS, "1")
+    field(VELO, "5")
+}
+record(longout, "IOC:m1:Resolution") {
+    field(DESC, "Set the number of steps/revolution")
+    field(DTYP, "asynInt32")
+    field(EGU, "step/rev")
+    field(OUT, "@asyn(OEM,0)OEM_RESOLUTION")
+    field(PINI, "YES")
+    field(VAL, "50800")
+}
+record(longin, "IOC:m1:Resolution_RBV") {
+    field(DESC, "Read the number of steps/revolution")
+    field(DTYP, "asynInt32")
+    field(EGU, "step/rev")
+    field(INP, "@asyn(OEM,0)OEM_RESOLUTION")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:m1:SelectSwitch") {
+    field(DESC, "Set Limit Switch to Reset Position")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Switch CW")
+    field(OUT, "@asyn(OEM,0)OEM_SELECT_SWITCH")
+    field(ZNAM, "Switch CCW")
+}
+record(bi, "IOC:m1:SelectSwitch_RBV") {
+    field(DESC, "Read Limit Switch to Reset Position")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(OEM,0)OEM_SELECT_SWITCH")
+    field(ONAM, "Switch CW")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Switch CCW")
+}
+record(mbbi, "IOC:m1:SwitchDetected_RBV") {
+    field(DESC, "Read Limit Switch Detected")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(OEM,0)OEM_SWITCH_DETEC")
+    field(ONST, "Limit CCW")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(TWST, "Limit CW")
+    field(TWVL, "2")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(longout, "IOC:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "IOC:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(OEM,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "IOC:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(OEM,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "IOC:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "IOC:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(OEM,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(motor, "IOC:m2") {
+    field(ACCL, "5")
+    field(ACCU, "0")
+    field(BACC, "0")
+    field(BDST, "0")
+    field(BVEL, "0")
+    field(DESC, "motor 2")
+    field(DHLM, "20")
+    field(DIR, "Pos")
+    field(DLLM, "-20")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "4.92125984e-5")
+    field(OUT, "@asyn(OEM,1)")
+    field(PREC, "5")
+    field(TWV, "1")
+    field(VBAS, "1")
+    field(VELO, "5")
+}
+record(longout, "IOC:m2:Resolution") {
+    field(DESC, "Set the number of steps/revolution")
+    field(DTYP, "asynInt32")
+    field(EGU, "step/rev")
+    field(OUT, "@asyn(OEM,1)OEM_RESOLUTION")
+    field(PINI, "YES")
+    field(VAL, "50800")
+}
+record(longin, "IOC:m2:Resolution_RBV") {
+    field(DESC, "Read the number of steps/revolution")
+    field(DTYP, "asynInt32")
+    field(EGU, "step/rev")
+    field(INP, "@asyn(OEM,1)OEM_RESOLUTION")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:m2:SelectSwitch") {
+    field(DESC, "Set Limit Switch to Reset Position")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Switch CW")
+    field(OUT, "@asyn(OEM,1)OEM_SELECT_SWITCH")
+    field(ZNAM, "Switch CCW")
+}
+record(bi, "IOC:m2:SelectSwitch_RBV") {
+    field(DESC, "Read Limit Switch to Reset Position")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(OEM,1)OEM_SELECT_SWITCH")
+    field(ONAM, "Switch CW")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Switch CCW")
+}
+record(mbbi, "IOC:m2:SwitchDetected_RBV") {
+    field(DESC, "Read Limit Switch Detected")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(OEM,1)OEM_SWITCH_DETEC")
+    field(ONST, "Limit CCW")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(TWST, "Limit CW")
+    field(TWVL, "2")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(longout, "IOC:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "IOC:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(OEM,1)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "IOC:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(OEM,1)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "IOC:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "IOC:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(OEM,1)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(motor, "IOC:m3") {
+    field(ACCL, "5")
+    field(ACCU, "0")
+    field(BACC, "0")
+    field(BDST, "0")
+    field(BVEL, "0")
+    field(DESC, "motor 3")
+    field(DHLM, "20")
+    field(DIR, "Pos")
+    field(DLLM, "-20")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "4.92125984e-5")
+    field(OUT, "@asyn(OEM,2)")
+    field(PREC, "5")
+    field(TWV, "1")
+    field(VBAS, "1")
+    field(VELO, "5")
+}
+record(longout, "IOC:m3:Resolution") {
+    field(DESC, "Set the number of steps/revolution")
+    field(DTYP, "asynInt32")
+    field(EGU, "step/rev")
+    field(OUT, "@asyn(OEM,2)OEM_RESOLUTION")
+    field(PINI, "YES")
+    field(VAL, "50800")
+}
+record(longin, "IOC:m3:Resolution_RBV") {
+    field(DESC, "Read the number of steps/revolution")
+    field(DTYP, "asynInt32")
+    field(EGU, "step/rev")
+    field(INP, "@asyn(OEM,2)OEM_RESOLUTION")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:m3:SelectSwitch") {
+    field(DESC, "Set Limit Switch to Reset Position")
+    field(DTYP, "asynInt32")
+    field(ONAM, "Switch CW")
+    field(OUT, "@asyn(OEM,2)OEM_SELECT_SWITCH")
+    field(ZNAM, "Switch CCW")
+}
+record(bi, "IOC:m3:SelectSwitch_RBV") {
+    field(DESC, "Read Limit Switch to Reset Position")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(OEM,2)OEM_SELECT_SWITCH")
+    field(ONAM, "Switch CW")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Switch CCW")
+}
+record(mbbi, "IOC:m3:SwitchDetected_RBV") {
+    field(DESC, "Read Limit Switch Detected")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn(OEM,2)OEM_SWITCH_DETEC")
+    field(ONST, "Limit CCW")
+    field(ONVL, "1")
+    field(SCAN, "I/O Intr")
+    field(TWST, "Limit CW")
+    field(TWVL, "2")
+    field(ZRST, "None")
+    field(ZRVL, "0")
+}
+record(longout, "IOC:m3Direction") {
+    field(DESC, "m3 direction")
+    field(DOL, "IOC:m3.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(OEM,2)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m3Offset") {
+    field(DESC, "m3 offset")
+    field(DOL, "IOC:m3.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(OEM,2)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "IOC:m3Resolution") {
+    field(DESC, "m3 resolution")
+    field(DOL, "IOC:m3.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(OEM,2)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}

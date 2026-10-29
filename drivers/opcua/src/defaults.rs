@@ -29,7 +29,8 @@ impl AtomicF64 {
 
 /// Connect timeout / reconnect attempt interval [s].
 pub static CONNECT_TIMEOUT: AtomicF64 = AtomicF64::new(5.0);
-/// Batch size for operations (0 = no limit, don't batch).
+/// Batch size for operations (0 = no limit, don't batch). C exports it
+/// (`iocshIntegration.cpp:45`) but no session reads it.
 pub static MAX_OPERATIONS_PER_SERVICE_CALL: AtomicI64 = AtomicI64::new(0);
 /// Subscription publishing interval [ms].
 pub static DEFAULT_PUBLISH_INTERVAL: AtomicF64 = AtomicF64::new(100.0);

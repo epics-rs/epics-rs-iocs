@@ -6,6 +6,6 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn"] }
+epics-libcom-rs = { workspace = true }
 asyn-rs = { workspace = true }
 parking_lot = "0.12"
-log = "0.4"

@@ -1,31 +1,34 @@
 //! The three threads behind the driver (C `udpDataListenerTask`, `dataTask`
 //! and `statusTask`).
 
-use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDataViewMut, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::connection::PixiradServer;
 use crate::decode::Decoder;
-use crate::driver::SharedState;
+use crate::driver::{PixiradDetector, SharedState};
 use crate::params::PixiradParams;
 use crate::protocol;
-use crate::types::{FrameType, MAX_UDP_PACKET_LEN, Sensor};
-use crate::udp::{Frame, FrameAssembler};
+use crate::types::{
+    FrameType, MAX_UDP_DATA_BUFFER, MAX_UDP_PACKET_LEN, PACKET_SENSOR_DATA_BYTES, Sensor,
+};
+use crate::udp::{self, Frame, FrameAssembler, strerror};
 
 /// The box sends the colours in the order thresh2, thresh1, thresh4, thresh3
 /// (C `colorOffsetMap`).
@@ -35,7 +38,8 @@ const COLOR_OFFSET_MAP: [usize; 4] = [1, 0, 3, 2];
 
 /// Read packets and hand complete frames on (C `udpDataListenerTask`).
 pub(crate) fn start_udp_listener(
-    socket: UdpSocket,
+    data_port: u16,
+    handle: PortHandle,
     sensor: Sensor,
     frames: SyncSender<Frame>,
     shared: Arc<SharedState>,
@@ -43,6 +47,28 @@ pub(crate) fn start_udp_listener(
     std::thread::Builder::new()
         .name("PixiradUDPDataTask".into())
         .spawn(move || {
+            let trace_error = |message: &str| {
+                handle.trace().output_device(
+                    handle.port_name(),
+                    Some(0),
+                    0,
+                    TraceMask::ERROR,
+                    message,
+                );
+            };
+            let (socket, rcvbuf) = match udp::bind_data_socket(data_port) {
+                Ok(bound) => bound,
+                Err(e) => {
+                    trace_error(&format!("pixirad:udpDataListenerTask: {e}\n"));
+                    return;
+                }
+            };
+            if rcvbuf != MAX_UDP_DATA_BUFFER {
+                trace_error(&format!(
+                    "pixirad:udpDataListenerTask: Unable to set requested buffer size for \
+                     SO_RCVBUF, actual={rcvbuf}\n"
+                ));
+            }
             let mut assembler = FrameAssembler::new(sensor);
             let mut packet = vec![0u8; MAX_UDP_PACKET_LEN];
             let mut started_at: Option<Instant> = None;
@@ -51,29 +77,39 @@ pub(crate) fn start_udp_listener(
                 let n = match socket.recv(&mut packet) {
                     Ok(n) => n,
                     Err(e) => {
-                        log::error!("pixirad: error reading the UDP data port: {e}");
+                        trace_error(&format!(
+                            "pixirad:udpDataListenerTask: Error calling recvfrom = {}\n",
+                            strerror(&e)
+                        ));
                         continue;
                     }
                 };
-                let started = *started_at.get_or_insert_with(Instant::now);
+                // C times a frame from its first full-length packet
+                // (pixirad.cpp:1174).
+                if n == MAX_UDP_PACKET_LEN {
+                    started_at.get_or_insert_with(Instant::now);
+                }
 
                 let Some(frame) = assembler.accept(&packet[..n]) else {
                     continue;
                 };
 
-                let seconds = started.elapsed().as_secs_f64();
-                if seconds > 0.0 {
-                    let bytes = frame.payload.len() as f64;
-                    shared.set_speed(bytes / (seconds * 1024.0 * 1024.0));
-                }
-                started_at = None;
+                let seconds = started_at
+                    .take()
+                    .expect("only a full-length packet completes a frame")
+                    .elapsed()
+                    .as_secs_f64();
+                // C counts whole packets (pixirad.cpp:1207).
+                let packets = frame.payload.len() / PACKET_SENSOR_DATA_BYTES;
+                let speed = (packets * MAX_UDP_PACKET_LEN) as f64 / (seconds * 1024.0 * 1024.0);
 
-                shared.udp_buffers_read.fetch_add(1, Ordering::AcqRel);
                 shared.queued_frames.fetch_add(1, Ordering::AcqRel);
                 if frames.send(frame).is_err() {
                     // The data task is gone; so is the point of reading.
                     return;
                 }
+                let _ = handle
+                    .with_driver_blocking(move |d: &mut PixiradDetector| d.post_udp_frame(speed));
             }
         })
         .expect("failed to spawn the Pixirad UDP thread")
@@ -84,8 +120,7 @@ pub(crate) fn start_udp_listener(
 pub(crate) struct DataContext {
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    #[allow(dead_code)] // held so plugins can be back-pressured on the queue
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub params: PixiradParams,
     pub sensor: Sensor,
@@ -99,19 +134,37 @@ pub(crate) fn start_data_task(ctx: DataContext) -> std::thread::JoinHandle<()> {
 
 /// The image being built out of one frame per colour.
 struct Image {
-    pixels: Vec<u16>,
+    array: DriverArray,
     colors: usize,
-    timestamp: EpicsTimestamp,
+}
+
+/// C's `dims` at the colour-0 alloc (pixirad.cpp:1026-1033).
+fn image_dims(sensor: Sensor, colors: usize) -> Vec<NDDimension> {
+    let mut dims = vec![
+        NDDimension::new(sensor.rows),
+        NDDimension::new(sensor.cols * sensor.modules),
+    ];
+    if colors > 1 {
+        dims.push(NDDimension::new(colors));
+    }
+    dims
 }
 
 async fn data_loop(ctx: DataContext) {
-    let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(30));
+    let sync = SyncIOHandle::from_handle(
+        ctx.handle.clone(),
+        0,
+        Duration::from_secs(30),
+        InterfaceType::Int32,
+    )
+    .expect("an areaDetector port registers asynInt32");
     let mut decoder = Decoder::new(ctx.sensor);
     let pixels_per_color = ctx.sensor.image_pixels();
-    // C allocated the NDArray only when ColorsCollected was 0 and memcpy'd into
-    // it whatever the count was, so a first frame that arrived with a stale
-    // non-zero count wrote through a null pointer. The image being assembled is
-    // owned here instead: there is no path on which a frame has nowhere to go.
+    // C allocates the NDArray only when ColorsCollected is 0 and memcpys into
+    // it whatever the count is (pixirad.cpp:1023-1044), so a frame with no
+    // image to go into (a refused colour-0 alloc, a stale count) wrote
+    // through a null pointer. Here it is dropped and still takes its colour
+    // slot: an image starts only at colour 0.
     let mut image: Option<Image> = None;
 
     loop {
@@ -123,7 +176,13 @@ async fn data_loop(ctx: DataContext) {
         ctx.shared.queued_frames.fetch_sub(1, Ordering::AcqRel);
 
         if frame.align_errors {
-            log::error!("pixirad: frame has alignment errors");
+            ctx.handle.trace().output_device(
+                ctx.handle.port_name(),
+                Some(0),
+                0,
+                TraceMask::ERROR,
+                "pixirad:dataTask: frame has alignment errors\n",
+            );
         }
 
         let auto_calibrate = sync.read_int32(ctx.params.auto_calibrate).unwrap_or(0) != 0;
@@ -148,134 +207,105 @@ async fn data_loop(ctx: DataContext) {
 
         let decoded = match decoder.decode(frame.is_autocal, &frame.payload) {
             Ok(pixels) => pixels,
-            Err(e) => {
-                log::error!("pixirad: cannot decode the frame: {e}");
-                continue;
-            }
+            Err(_) => continue,
         };
+        // dataTask's own UDP param (pixirad.cpp:1012-1013).
+        let udp_buffers_free =
+            ctx.shared.max_buffers - ctx.shared.queued_frames.load(Ordering::Acquire);
 
-        let image = image.get_or_insert_with(|| Image {
-            pixels: vec![0u16; pixels_per_color * num_colors],
-            colors: num_colors,
-            timestamp: EpicsTimestamp::now(),
-        });
-        if image.colors != num_colors {
-            image.pixels = vec![0u16; pixels_per_color * num_colors];
-            image.colors = num_colors;
-            image.timestamp = EpicsTimestamp::now();
+        if image.as_ref().is_some_and(|i| i.colors != num_colors) {
+            image = None;
         }
-
-        let offset = if num_colors == 1 {
-            0
-        } else {
-            COLOR_OFFSET_MAP[colors_collected] * pixels_per_color
-        };
-        image.pixels[offset..offset + pixels_per_color].copy_from_slice(decoded);
+        if colors_collected == 0 {
+            // C allocates whether or not NDArrayCallbacks is set
+            // (pixirad.cpp:1033); a refusal has printed the pool's limit line.
+            image = ctx
+                .pool
+                .alloc(image_dims(ctx.sensor, num_colors), NDDataType::UInt16)
+                .ok()
+                .map(|mut array| {
+                    array.fill().set_timestamp(EpicsTimestamp::now());
+                    Image {
+                        array,
+                        colors: num_colors,
+                    }
+                });
+        }
+        if let Some(building) = image.as_mut() {
+            let mut frame = building.array.fill();
+            let NDDataViewMut::U16(pixels) = frame.data_mut().view_mut() else {
+                unreachable!("allocated as NDUInt16")
+            };
+            let offset = if num_colors == 1 {
+                0
+            } else {
+                COLOR_OFFSET_MAP[colors_collected] * pixels_per_color
+            };
+            pixels[offset..offset + pixels_per_color].copy_from_slice(decoded);
+        }
         colors_collected += 1;
 
-        let udp_updates = vec![
-            ParamSetValue::new(
-                ctx.params.udp_buffers_read,
-                0,
-                ParamValue::Int32(ctx.shared.udp_buffers_read.load(Ordering::Acquire)),
-            ),
-            ParamSetValue::new(
-                ctx.params.udp_buffers_free,
-                0,
-                ParamValue::Int32(
-                    ctx.shared.max_buffers - ctx.shared.queued_frames.load(Ordering::Acquire),
-                ),
-            ),
-            ParamSetValue::new(
-                ctx.params.udp_speed,
-                0,
-                ParamValue::Float64(ctx.shared.speed()),
-            ),
-            ParamSetValue::new(
-                ctx.params.colors_collected,
-                0,
-                ParamValue::Int32((colors_collected % num_colors) as i32),
-            ),
-        ];
-        let _ = ctx.handle.set_params_and_notify(0, udp_updates).await;
-
-        if colors_collected < num_colors {
-            continue;
-        }
-
-        // Every colour is in: this is an image.
-        let unique_id = sync
-            .read_int32(ctx.ad_params.base.array_counter)
-            .unwrap_or(0)
-            + 1;
-        let images_taken = sync
-            .read_int32(ctx.ad_params.num_images_counter)
-            .unwrap_or(0)
-            + 1;
-        let num_images = sync.read_int32(ctx.ad_params.num_images).unwrap_or(1);
-        let array_callbacks = sync
-            .read_int32(ctx.ad_params.base.array_callbacks)
-            .unwrap_or(1)
-            != 0;
-
-        let ts = image.timestamp;
-        let taken = image.pixels.clone();
-        let colors = image.colors;
-
-        let mut updates = vec![
-            ParamSetValue::new(
+        // C posts one pass per frame and stores Acquire=0 only once the
+        // finished image is on the plugins (pixirad.cpp:1053-1083), so
+        // WaitForPlugins finds it queued.
+        let mut updates = vec![ParamSetValue::new(
+            ctx.params.udp_buffers_free,
+            0,
+            ParamValue::Int32(udp_buffers_free),
+        )];
+        // A finished image whose colour-0 alloc was refused counts nothing.
+        if let Some(Image { array, colors }) = image.take_if(|_| colors_collected >= num_colors) {
+            let unique_id = sync
+                .read_int32(ctx.ad_params.base.array_counter)
+                .unwrap_or(0)
+                + 1;
+            let images_taken = sync
+                .read_int32(ctx.ad_params.num_images_counter)
+                .unwrap_or(0)
+                + 1;
+            updates.push(ParamSetValue::new(
                 ctx.ad_params.base.array_counter,
                 0,
                 ParamValue::Int32(unique_id),
-            ),
-            ParamSetValue::new(
+            ));
+            updates.push(ParamSetValue::new(
                 ctx.ad_params.num_images_counter,
                 0,
                 ParamValue::Int32(images_taken),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.array_size,
-                0,
-                ParamValue::Int32((taken.len() * 2) as i32),
-            ),
-        ];
-        if images_taken >= num_images {
-            updates.push(ParamSetValue::new(
-                ctx.ad_params.acquire,
-                0,
-                ParamValue::Int32(0),
             ));
+            if sync
+                .read_int32(ctx.ad_params.base.array_callbacks)
+                .unwrap_or(1)
+                != 0
+            {
+                publish(&ctx, array, colors, unique_id).await;
+            }
+            if images_taken >= sync.read_int32(ctx.ad_params.num_images).unwrap_or(1) {
+                updates.push(ParamSetValue::new(
+                    ctx.ad_params.acquire,
+                    0,
+                    ParamValue::Int32(0),
+                ));
+            }
+            if auto_calibrate {
+                updates.push(ParamSetValue::new(
+                    ctx.params.auto_calibrate,
+                    0,
+                    ParamValue::Int32(0),
+                ));
+            }
         }
-        if auto_calibrate {
-            updates.push(ParamSetValue::new(
-                ctx.params.auto_calibrate,
-                0,
-                ParamValue::Int32(0),
-            ));
-        }
+        updates.push(ParamSetValue::new(
+            ctx.params.colors_collected,
+            0,
+            ParamValue::Int32((colors_collected % num_colors) as i32),
+        ));
         let _ = ctx.handle.set_params_and_notify(0, updates).await;
-
-        if array_callbacks {
-            publish(&ctx, taken, colors, unique_id, ts).await;
-        }
     }
 }
 
-async fn publish(
-    ctx: &DataContext,
-    pixels: Vec<u16>,
-    colors: usize,
-    unique_id: i32,
-    ts: EpicsTimestamp,
-) {
-    let mut dims = vec![
-        NDDimension::new(ctx.sensor.rows),
-        NDDimension::new(ctx.sensor.cols * ctx.sensor.modules),
-    ];
-    if colors > 1 {
-        dims.push(NDDimension::new(colors));
-    }
-    let n_dims = dims.len();
+async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, unique_id: i32) {
+    let ts = array.timestamp;
 
     let mut attributes = NDAttributeList::new();
     attributes.add(NDAttribute {
@@ -286,80 +316,94 @@ async fn publish(
         source_impl: None,
     });
 
-    let data = NDDataBuffer::U16(pixels);
-    let mut array = NDArray::with_data(dims, data);
-    array.unique_id = unique_id;
-    array.update_time_stamps(ts);
-    array.attributes = attributes;
-
-    let _ = ctx
+    let mut frame = array.fill();
+    frame.set_unique_id(unique_id);
+    // C: timeStamp is the first colour's startTime, epicsTS the port's
+    // updateTimeStamp (pixirad.cpp:1063-1064).
+    let epics_ts: EpicsTimestamp = ctx
         .handle
-        .set_params_and_notify(
-            0,
-            vec![
-                ParamSetValue::new(
-                    ctx.ad_params.base.n_dimensions,
-                    0,
-                    ParamValue::Int32(n_dims as i32),
-                ),
-                ParamSetValue::new(
-                    ctx.ad_params.base.timestamp_rbv,
-                    0,
-                    ParamValue::Float64(ts.as_f64()),
-                ),
-                ParamSetValue::new(
-                    ctx.ad_params.base.epics_ts_sec,
-                    0,
-                    ParamValue::Int32(ts.sec as i32),
-                ),
-                ParamSetValue::new(
-                    ctx.ad_params.base.epics_ts_nsec,
-                    0,
-                    ParamValue::Int32(ts.nsec as i32),
-                ),
-            ],
-        )
-        .await;
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| std::time::SystemTime::now())
+        .into();
+    frame.set_timestamp(epics_ts);
+    frame.set_time_stamp(ts.as_f64());
+    *frame.attributes_mut() = attributes;
 
-    ctx.output.publish(Arc::new(array)).await;
+    // C stores no array size, dimension or time-stamp param per image; the
+    // constructor's values stand (pixirad.cpp:1051-1079).
+    ctx.output.publish(array).await;
 }
 
 // ────────────────────────────────── status ───────────────────────────────────
 
 pub(crate) struct StatusContext {
-    pub socket: UdpSocket,
-    pub server: PixiradServer,
     pub handle: PortHandle,
     pub ad_params: ADBaseParams,
     pub params: PixiradParams,
 }
 
-pub(crate) fn start_status_task(ctx: StatusContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PixiradStatusTask", move || status_loop(ctx))
+impl StatusContext {
+    fn trace_error(&self, message: &str) {
+        self.handle.trace().output_device(
+            self.handle.port_name(),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            message,
+        );
+    }
+}
+
+pub(crate) fn start_status_task(
+    status_port: u16,
+    ctx: StatusContext,
+) -> std::thread::JoinHandle<()> {
+    rt::run_thread_named("PixiradStatusTask", move || async move {
+        match udp::bind_status_socket(status_port) {
+            Ok(socket) => status_loop(socket, ctx).await,
+            // C returns here still holding the port lock, which wedges the
+            // port; only the task stops.
+            Err(e) => ctx.trace_error(&format!("pixirad:statusTask: {e}\n")),
+        }
+    })
+}
+
+/// The status task on a socket the caller already holds, so no other socket
+/// can take the port between a bind and the task's own.
+#[cfg(test)]
+pub(crate) fn start_status_task_on(
+    socket: std::net::UdpSocket,
+    ctx: StatusContext,
+) -> std::thread::JoinHandle<()> {
+    rt::run_thread_named("PixiradStatusTask", move || status_loop(socket, ctx))
 }
 
 /// Read the environmental broadcast, work out the dew point, and switch the
 /// cooling off if the box is in trouble (C `statusTask`).
-async fn status_loop(ctx: StatusContext) {
-    let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(30));
+async fn status_loop(socket: std::net::UdpSocket, ctx: StatusContext) {
     // C blocked in `recvfrom` for ever; a timeout keeps the loop alive when the
     // box stops broadcasting.
-    let _ = ctx.socket.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buffer = [0u8; 256];
 
     loop {
         rt::sleep(Duration::from_secs(1)).await;
 
-        let n = match ctx.socket.recv(&mut buffer) {
+        let n = match socket.recv(&mut buffer) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => {
-                log::error!("pixirad: error reading the status broadcast: {e}");
+                ctx.trace_error(&format!(
+                    "pixirad:statusTask: error reading status broadcast message: {}\n",
+                    strerror(&e)
+                ));
                 continue;
             }
         };
-        let message = String::from_utf8_lossy(&buffer[..n]).to_string();
+        let datagram = &buffer[..n];
+        let message = String::from_utf8_lossy(protocol::c_string(datagram)).to_string();
 
         let readings = [
             ("READ_TCOLD", ctx.ad_params.temperature_actual),
@@ -371,14 +415,21 @@ async fn status_loop(ctx: StatusContext) {
             ("READ_HV_CURRENT", ctx.params.hv_current),
         ];
 
-        let mut updates = Vec::new();
+        let mut found = Vec::new();
         let mut cold_temp = None;
         let mut hot_temp = None;
         let mut box_temp = None;
         let mut humidity = None;
         for (key, reason) in readings {
-            let Some(value) = protocol::status_value(&message, key) else {
-                log::error!("pixirad: no {key} in the status broadcast '{message}'");
+            let Some(value) = protocol::status_value(datagram, key) else {
+                ctx.trace_error(&format!(
+                    "pixirad:statusTask: {} {key} in status broadcast message={message}\n",
+                    if message.contains(key) {
+                        "error parsing"
+                    } else {
+                        "cannot find string"
+                    }
+                ));
                 continue;
             };
             match key {
@@ -388,55 +439,25 @@ async fn status_loop(ctx: StatusContext) {
                 "READ_BOX_HUM" => humidity = Some(value),
                 _ => {}
             }
-            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)));
+            found.push((reason, value));
         }
 
         // C computed the dew point from whatever was last in the parameter
         // library, so a broadcast that was missing the humidity produced a dew
         // point from a stale reading and could switch the cooling off on it.
-        let (Some(cold_temp), Some(hot_temp), Some(box_temp), Some(humidity)) =
-            (cold_temp, hot_temp, box_temp, humidity)
-        else {
-            let _ = ctx.handle.set_params_and_notify(0, updates).await;
-            continue;
+        let cooling = match (cold_temp, hot_temp, box_temp, humidity) {
+            (Some(cold_temp), Some(hot_temp), Some(box_temp), Some(humidity)) => {
+                let dew_point = protocol::dew_point(humidity, box_temp);
+                Some((
+                    dew_point,
+                    protocol::cooling_status(cold_temp, hot_temp, dew_point),
+                ))
+            }
+            _ => None,
         };
-
-        let dew_point = protocol::dew_point(humidity, box_temp);
-        let cooling_status = protocol::cooling_status(cold_temp, hot_temp, dew_point);
-        updates.push(ParamSetValue::new(
-            ctx.params.dew_point,
-            0,
-            ParamValue::Float64(dew_point),
-        ));
-        updates.push(ParamSetValue::new(
-            ctx.params.cooling_status,
-            0,
-            ParamValue::Int32(cooling_status as i32),
-        ));
-        if cooling_status.is_error() {
-            updates.push(ParamSetValue::new(
-                ctx.params.cooling_state,
-                0,
-                ParamValue::Int32(0),
-            ));
-        }
-        let _ = ctx.handle.set_params_and_notify(0, updates).await;
-
-        if !cooling_status.is_error() {
-            continue;
-        }
-
-        // Switch the cooling off at the box. Every parameter it needs is read
-        // before the command socket is taken — see the invariant in
-        // `crate::connection`.
-        log::error!("pixirad: {cooling_status:?}, switching the cooling off");
-        let temperature = sync.read_float64(ctx.ad_params.temperature).unwrap_or(0.0);
-        let hv_value = sync.read_float64(ctx.params.hv_value).unwrap_or(0.0);
-        let hv_state = sync.read_int32(ctx.params.hv_state).unwrap_or(0);
-        let command = protocol::init(temperature, 0, hv_value, hv_state);
-        let exchange = ctx.server.command(&command);
-        if let Err(e) = exchange.result {
-            log::error!("pixirad: '{command}': {e}");
-        }
+        let _ = ctx
+            .handle
+            .with_driver(move |d: &mut PixiradDetector| d.post_status(&found, cooling))
+            .await;
     }
 }

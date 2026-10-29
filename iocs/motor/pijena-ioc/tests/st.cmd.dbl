@@ -1,0 +1,14 @@
+# dbl of motor R7-4-5 motorPiJena iocBoot/iocPiJena st.cmd
+piJena:alldone
+piJena:alldoneBlink
+piJena:allstop
+piJena:m1
+piJena:m1_able
+piJena:m1_twCh
+piJena:m1_vCh
+piJena:m2
+piJena:m2_able
+piJena:m2_twCh
+piJena:m2_vCh
+piJena:moving
+piJena:movingDiff

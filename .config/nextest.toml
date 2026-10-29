@@ -1,0 +1,7 @@
+# cargo-nextest configuration for the iocs workspace.
+
+[profile.default]
+# A hung test is killed and named instead of stalling the run: SLOW after
+# each 30 s, terminated at the 4th (120 s). epics-rs's `profile.default`
+# value; the slowest iocs test runs in about 13 s.
+slow-timeout = { period = "30s", terminate-after = 4 }

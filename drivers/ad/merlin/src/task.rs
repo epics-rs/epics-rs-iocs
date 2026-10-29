@@ -8,22 +8,25 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::param::ParamValue;
-use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port_handle::{DriverHold, PortHandle};
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
-use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
 use crate::connection::{ChannelError, MpxConnection};
-use crate::driver::SharedState;
+use crate::driver::{MerlinDetector, SharedState};
 use crate::image;
 use crate::params::MerlinParams;
 use crate::protocol;
@@ -34,8 +37,7 @@ pub(crate) struct AcquisitionContext {
     pub data: MpxConnection,
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    #[allow(dead_code)] // held so plugins can be back-pressured on the queue
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub params: MerlinParams,
     pub init_param: usize,
@@ -71,10 +73,14 @@ async fn status_loop(handle: PortHandle, ad: ADBaseParams, init_param: usize) {
 
     // Run the startup sequence on the port actor: it owns the command channel,
     // so this is the only way to touch the device without a second owner.
-    let sync = SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_secs(60));
-    if let Err(e) = sync.write_int32(init_param, 1) {
-        log::error!("merlin: startup sequence failed: {e}");
-    }
+    let sync = SyncIOHandle::from_handle(
+        handle.clone(),
+        0,
+        Duration::from_secs(60),
+        InterfaceType::Int32,
+    )
+    .expect("an areaDetector port registers asynInt32");
+    let _ = sync.write_int32(init_param, 1);
 
     loop {
         rt::sleep(STATUS_POLL).await;
@@ -88,7 +94,7 @@ async fn status_loop(handle: PortHandle, ad: ADBaseParams, init_param: usize) {
                     vec![ParamSetValue::new(
                         ad.status_message,
                         0,
-                        ParamValue::Octet("Waiting for acquire command".into()),
+                        ParamValue::Octet("Waiting for acquire command".as_bytes().into()),
                     )],
                 )
                 .await;
@@ -103,7 +109,6 @@ async fn data_loop(ctx: AcquisitionContext) {
         rt::sleep(Duration::from_millis(500)).await;
     }
 
-    let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(5));
     let timeout = Duration::from_secs_f64(DATA_READ_TIMEOUT_SEC);
     // The most recent acquisition header, attached to every frame that follows
     // it (string attributes are global in the HDF5 plugin, so the file gets the
@@ -116,115 +121,151 @@ async fn data_loop(ctx: AcquisitionContext) {
             // An idle detector sends nothing; that is not an error.
             Err(ChannelError::Timeout) => continue,
             Err(e) => {
-                log::error!("merlin: error on the Labview data channel: {e}");
-                let _ = ctx
-                    .handle
-                    .set_params_and_notify(
-                        0,
-                        vec![ParamSetValue::new(
-                            ctx.ad_params.status_message,
-                            0,
-                            ParamValue::Octet("Error in Labview data channel response".into()),
-                        )],
-                    )
-                    .await;
+                ctx.data.trace(&format!(
+                    "merlinDetector:merlinTask: error in Labview data channel response, status={}\n",
+                    e.code()
+                ));
+                if let Ok(mut held) = ctx.handle.hold_driver_blocking() {
+                    set_status_message(
+                        &mut held,
+                        ctx.ad_params,
+                        "Error in Labview data channel response",
+                    );
+                }
                 rt::sleep(ERROR_BACKOFF).await;
                 continue;
             }
         };
 
-        let start = EpicsTimestamp::now();
-        let header = protocol::data_header(&body);
+        handle_frame(&ctx, &body, &mut acquisition_header).await;
+    }
+}
 
-        // The acquisition header is not an image, so it advances no counter.
-        let mut array_counter = sync
-            .read_int32(ctx.ad_params.base.array_counter)
-            .unwrap_or(0);
-        if header != DataHeader::Acquisition {
-            let images = sync
-                .read_int32(ctx.ad_params.num_images_counter)
-                .unwrap_or(0)
-                + 1;
-            array_counter += 1;
-            let _ =
-                ctx.shared
-                    .images_remaining
-                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                        if n > 0 { Some(n - 1) } else { None }
-                    });
-            let _ = ctx
-                .handle
-                .set_params_and_notify(
-                    0,
-                    vec![ParamSetValue::new(
-                        ctx.ad_params.num_images_counter,
-                        0,
-                        ParamValue::Int32(images),
-                    )],
-                )
-                .await;
+/// The driver lock merlinTask holds through a frame's pass.
+type Held = DriverHold<MerlinDetector>;
+
+/// [`DriverHold::run`] on the port's param library; a stopped port yields
+/// `R::default()`.
+fn step<R: Default + Send + 'static>(
+    held: &mut Held,
+    f: impl FnOnce(&mut PortDriverBase) -> R + Send + 'static,
+) -> R {
+    held.run(move |d| f(&mut d.ad.port_base))
+        .unwrap_or_default()
+}
+
+/// One frame of C `merlinTask`, under the driver lock C holds from the
+/// read's end to the next read (merlinDetector.cpp:137-305). A data frame
+/// that yields no NDArray ends the pass there, as C's `continue` does, so it
+/// neither clears the software trigger nor completes the acquisition, and
+/// posts nothing it stored.
+pub(crate) async fn handle_frame(
+    ctx: &AcquisitionContext,
+    body: &[u8],
+    acquisition_header: &mut String,
+) {
+    let Ok(mut held) = ctx.handle.hold_driver_blocking::<MerlinDetector>() else {
+        return;
+    };
+    let start = EpicsTimestamp::now();
+    let header = protocol::data_header(body);
+    let (ad, params) = (ctx.ad_params, ctx.params);
+
+    // The acquisition header is not an image, so it advances no counter.
+    let counted = header != DataHeader::Acquisition;
+    let (array_counter, array_callbacks) = step(&mut held, move |base| {
+        let mut counter = base.get_int32_param(ad.base.array_counter, 0).unwrap_or(0);
+        if counted {
+            let images = base.get_int32_param(ad.num_images_counter, 0).unwrap_or(0) + 1;
+            let _ = base.set_int32_param(ad.num_images_counter, 0, images);
+            counter += 1;
+            let _ = base.set_int32_param(ad.base.array_counter, 0, counter);
         }
+        let callbacks = base
+            .get_int32_param(ad.base.array_callbacks, 0)
+            .unwrap_or(1);
+        (counter, callbacks != 0)
+    });
+    if counted {
+        let _ = ctx
+            .shared
+            .images_remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n > 0 { Some(n - 1) } else { None }
+            });
+    }
 
-        let array_callbacks = sync
-            .read_int32(ctx.ad_params.base.array_callbacks)
-            .unwrap_or(1)
-            != 0;
-
-        if array_callbacks {
-            match header {
-                DataHeader::Acquisition => {
-                    let text = String::from_utf8_lossy(&body);
-                    let end = text.len().min(MPX_ACQUISITION_HEADER_LEN);
-                    acquisition_header = text[..end].to_string();
-                }
-                DataHeader::QuadData => {
-                    publish_image(&ctx, &body, array_counter, start, &acquisition_header).await;
-                }
-                DataHeader::Profile => {
-                    publish_profiles(&ctx, &body, array_counter, start, &acquisition_header).await;
-                }
-                DataHeader::Unknown => {
-                    log::error!(
-                        "merlin: unknown data frame type '{}'",
-                        String::from_utf8_lossy(&body[..body.len().min(MPX_MSG_DATATYPE_LEN)])
-                    );
-                }
+    if array_callbacks {
+        let published = match header {
+            DataHeader::Acquisition => {
+                let text = String::from_utf8_lossy(body);
+                let end = text.len().min(MPX_ACQUISITION_HEADER_LEN);
+                *acquisition_header = text[..end].to_string();
+                true
             }
-        }
-
-        // A software trigger is one-shot: clear it once its frame arrives.
-        let trigger = sync.read_int32(ctx.ad_params.trigger_mode).unwrap_or(0);
-        if trigger == TriggerMode::SoftwareTrigger as i32 {
-            let _ = ctx
-                .handle
-                .set_params_and_notify(
-                    0,
-                    vec![ParamSetValue::new(
-                        ctx.params.software_trigger,
-                        0,
-                        ParamValue::Int32(0),
-                    )],
+            DataHeader::QuadData => {
+                publish_image(
+                    ctx,
+                    &mut held,
+                    body,
+                    array_counter,
+                    start,
+                    acquisition_header,
                 )
-                .await;
-        }
-
-        if ctx.shared.images_remaining.load(Ordering::Acquire) == 0 {
-            let _ = ctx
-                .handle
-                .set_params_and_notify(
-                    0,
-                    vec![
-                        ParamSetValue::new(ctx.ad_params.acquire, 0, ParamValue::Int32(0)),
-                        ParamSetValue::new(
-                            ctx.ad_params.status,
-                            0,
-                            ParamValue::Int32(ADStatus::Idle as i32),
-                        ),
-                    ],
+                .await
+            }
+            DataHeader::Profile => {
+                publish_profiles(
+                    ctx,
+                    &mut held,
+                    body,
+                    array_counter,
+                    start,
+                    acquisition_header,
                 )
-                .await;
+                .await
+            }
+            DataHeader::Unknown => {
+                trace(&ctx.handle, "Unknown header type 3\n");
+                true
+            }
+        };
+        if !published {
+            return;
         }
     }
+
+    let done = ctx.shared.images_remaining.load(Ordering::Acquire) == 0;
+    step(&mut held, move |base| {
+        // A software trigger is one-shot: clear it once its frame arrives.
+        if base.get_int32_param(ad.trigger_mode, 0).unwrap_or(0)
+            == TriggerMode::SoftwareTrigger as i32
+        {
+            let _ = base.set_int32_param(params.software_trigger, 0, 0);
+        }
+        if done {
+            let _ = base.set_int32_param(ad.acquire, 0, 0);
+            let _ = base.set_int32_param(ad.status, 0, ADStatus::Idle as i32);
+        }
+        let _ = base.call_param_callbacks(0);
+    });
+}
+
+/// C prints these on `pasynUserSelf`, the detector port.
+fn trace(handle: &PortHandle, msg: &str) {
+    handle
+        .trace()
+        .output_device(handle.port_name(), Some(0), 0, TraceMask::ERROR, msg);
+}
+
+/// C `setStringParam(ADStatusMessage, ...)` without `callParamCallbacks`:
+/// the pass's one post is at its end (merlinDetector.cpp:305), and a pass
+/// that ends early posts nothing, so the message waits for the next driver
+/// callback.
+fn set_status_message(held: &mut Held, ad: ADBaseParams, msg: &'static str) {
+    step(held, move |base| {
+        let _ = base.set_string_param(ad.status_message, 0, msg);
+    });
 }
 
 fn build_attributes(parsed: &[(String, NDAttrValue)], acquisition_header: &str) -> NDAttributeList {
@@ -248,21 +289,28 @@ fn build_attributes(parsed: &[(String, NDAttrValue)], acquisition_header: &str) 
     attrs
 }
 
+/// False when no NDArray went out (C's `pImage == NULL`).
 async fn publish_image(
     ctx: &AcquisitionContext,
+    held: &mut Held,
     body: &[u8],
     array_counter: i32,
     start: EpicsTimestamp,
     acquisition_header: &str,
-) {
+) -> bool {
     let header = match protocol::parse_mq_header(body) {
         Ok(h) => h,
-        Err(e) => {
-            log::error!("merlin: bad MQ1 frame header: {e}");
-            return;
-        }
+        Err(_) => return false,
     };
-    let data = match image::decode_image(
+    if !matches!(header.pixel_depth, 8 | 16 | 32) {
+        trace(
+            &ctx.handle,
+            &format!("Unsupported bit depth {}\n", header.pixel_depth),
+        );
+        set_status_message(held, ctx.ad_params, "Error: Unsupported bit depth");
+        return false;
+    }
+    let payload = match image::image_payload(
         body,
         header.offset,
         header.x_size,
@@ -270,65 +318,77 @@ async fn publish_image(
         header.pixel_depth,
         ctx.det_type.swaps_pixels(),
     ) {
-        Ok(d) => d,
-        Err(e) => {
-            log::error!(
-                "merlin: cannot decode a {}-bit {}x{} frame: {e}",
-                header.pixel_depth,
-                header.x_size,
-                header.y_size
-            );
-            let _ = ctx
-                .handle
-                .set_params_and_notify(
-                    0,
-                    vec![ParamSetValue::new(
-                        ctx.ad_params.status_message,
-                        0,
-                        ParamValue::Octet("Error: unsupported frame".into()),
-                    )],
-                )
-                .await;
-            return;
+        Ok(p) => p,
+        Err(_) => {
+            set_status_message(held, ctx.ad_params, "Error: unsupported frame");
+            return false;
         }
     };
 
-    let mut array = NDArray::with_data(
+    let Ok(mut array) = ctx.pool.alloc(
         vec![
             NDDimension::new(header.x_size),
             NDDimension::new(header.y_size),
         ],
-        data,
-    );
-    array.unique_id = array_counter;
-    array.update_time_stamps(start);
-    array.attributes = build_attributes(&header.attrs, acquisition_header);
-    publish(ctx, array).await;
+        payload.data_type(),
+    ) else {
+        // merlinDetector.cpp:436-442 (copyToNDArray8, and its 16/32 twins).
+        trace(
+            &ctx.handle,
+            &format!(
+                "merlinDetector:copyToNDArray{}: unable to allocate NDArray from pool\n",
+                header.pixel_depth
+            ),
+        );
+        set_status_message(
+            held,
+            ctx.ad_params,
+            "Error: run out of buffers in detector driver",
+        );
+        return false;
+    };
+    let mut frame = array.fill();
+    payload.decode_into(frame.data_mut().view_mut());
+    frame.set_unique_id(array_counter);
+    frame.set_time_stamp(start.as_f64());
+    // C merlinTask never stamps epicsTS (merlinDetector.cpp:255-258).
+    frame.set_timestamp(step(held, |base| {
+        EpicsTimestamp::from(base.update_time_stamp())
+    }));
+    *frame.attributes_mut() = build_attributes(&header.attrs, acquisition_header);
+    // C stores no array size, type or time-stamp param per frame; the
+    // constructor's values stand (merlinDetector.cpp:1494-1497).
+    ctx.output.publish(array).await;
+    true
 }
 
+/// False when no NDArray went out (C's `pImage == NULL`).
 async fn publish_profiles(
     ctx: &AcquisitionContext,
+    held: &mut Held,
     body: &[u8],
     array_counter: i32,
     start: EpicsTimestamp,
     acquisition_header: &str,
-) {
+) -> bool {
     let header = match protocol::parse_mq_header(body) {
         Ok(h) => h,
-        Err(e) => {
-            log::error!("merlin: bad PR1 frame header: {e}");
-            return;
-        }
+        Err(_) => return false,
     };
     // The device echoes the PROFILES mask it acquired with; we can only lay
-    // out a frame that carries both profiles and the sum.
+    // out a frame that carries both profiles and the sum. C never parses the
+    // mask, so it refuses every profile frame as mode 0
+    // (merlinDetector.cpp:217-235); that defect is not copied.
     let expected = MPXPROFILES_XPROFILE | MPXPROFILES_YPROFILE | MPXPROFILES_SUM;
     if header.profile_select != expected {
-        log::error!(
-            "merlin: unsupported PROFILES mode {}",
-            header.profile_select
+        trace(
+            &ctx.handle,
+            &format!(
+                "merlinDetector:merlinTask: unsupported PROFILES mode {}\n",
+                header.profile_select
+            ),
         );
-        return;
+        return false;
     }
 
     let profiles = match image::decode_profiles(
@@ -339,79 +399,49 @@ async fn publish_profiles(
         ctx.det_type.swaps_pixels(),
     ) {
         Ok(p) => p,
-        Err(e) => {
-            log::error!("merlin: cannot decode a profile frame: {e}");
-            return;
-        }
+        Err(_) => return false,
     };
-
-    let _ = ctx
-        .handle
-        .set_params_and_notify(
-            0,
-            vec![
-                ParamSetValue::new(
-                    ctx.params.profile_x,
-                    0,
-                    ParamValue::Int32Array(profiles.x.into()),
-                ),
-                ParamSetValue::new(
-                    ctx.params.profile_y,
-                    0,
-                    ParamValue::Int32Array(profiles.y.into()),
-                ),
-            ],
-        )
-        .await;
 
     let stride = header.x_size.max(header.y_size);
-    let NDDataBuffer::U32(_) = &profiles.image else {
-        unreachable!("decode_profiles always returns U32")
-    };
-    let mut array = NDArray::with_data(
+    // C fills the profile waveforms only once the array is allocated
+    // (merlinDetector.cpp:384-391).
+    let Ok(mut array) = ctx.pool.alloc(
         vec![NDDimension::new(stride), NDDimension::new(2)],
-        profiles.image,
+        NDDataType::UInt32,
+    ) else {
+        ctx.data
+            .trace("merlinDetector:copyProfileToNDArray32: unable to allocate NDArray from pool\n");
+        set_status_message(
+            held,
+            ctx.ad_params,
+            "Error: run out of buffers in detector driver",
+        );
+        return false;
+    };
+    let mut frame = array.fill();
+    profiles.pack_into(
+        frame
+            .data_mut()
+            .as_mut_slice::<u32>()
+            .expect("allocated NDUInt32"),
     );
-    array.unique_id = array_counter;
-    array.update_time_stamps(start);
-    array.attributes = build_attributes(&header.attrs, acquisition_header);
-    publish(ctx, array).await;
-}
 
-/// Update the NDArray metadata parameters and hand the array to the plugins.
-async fn publish(ctx: &AcquisitionContext, array: NDArray) {
-    let base = &ctx.ad_params.base;
-    let ts = array.timestamp;
-    let size_x = array.dims[0].size as i32;
-    let size_y = array.dims[1].size as i32;
-    let data_type = array.data.data_type();
-    let num_elements: i64 = array.dims.iter().map(|d| d.size as i64).product();
-    let array_size = num_elements
-        .saturating_mul(data_type.element_size() as i64)
-        .min(i32::MAX as i64) as i32;
+    // doCallbacksInt32Array, Y then X (merlinDetector.cpp:415-416).
+    let (x, y) = (ctx.params.profile_x, ctx.params.profile_y);
+    step(held, move |base| {
+        let _ = base.do_callbacks_array(y, 0, ParamValue::Int32Array(profiles.y.into()));
+        let _ = base.do_callbacks_array(x, 0, ParamValue::Int32Array(profiles.x.into()));
+    });
 
-    let _ = ctx
-        .handle
-        .set_params_and_notify(
-            0,
-            vec![
-                ParamSetValue::new(base.array_counter, 0, ParamValue::Int32(array.unique_id)),
-                ParamSetValue::new(base.timestamp_rbv, 0, ParamValue::Float64(ts.as_f64())),
-                ParamSetValue::new(base.epics_ts_sec, 0, ParamValue::Int32(ts.sec as i32)),
-                ParamSetValue::new(base.epics_ts_nsec, 0, ParamValue::Int32(ts.nsec as i32)),
-                ParamSetValue::new(base.array_size_x, 0, ParamValue::Int32(size_x)),
-                ParamSetValue::new(base.array_size_y, 0, ParamValue::Int32(size_y)),
-                ParamSetValue::new(base.array_size, 0, ParamValue::Int32(array_size)),
-                ParamSetValue::new(base.n_dimensions, 0, ParamValue::Int32(2)),
-                ParamSetValue::new(
-                    base.color_mode,
-                    0,
-                    ParamValue::Int32(NDColorMode::Mono as i32),
-                ),
-                ParamSetValue::new(base.data_type, 0, ParamValue::Int32(data_type as u8 as i32)),
-            ],
-        )
-        .await;
-
-    ctx.output.publish(Arc::new(array)).await;
+    frame.set_unique_id(array_counter);
+    frame.set_time_stamp(start.as_f64());
+    // C merlinTask never stamps epicsTS (merlinDetector.cpp:255-258).
+    frame.set_timestamp(step(held, |base| {
+        EpicsTimestamp::from(base.update_time_stamp())
+    }));
+    *frame.attributes_mut() = build_attributes(&header.attrs, acquisition_header);
+    // C stores no array size, type or time-stamp param per frame; the
+    // constructor's values stand (merlinDetector.cpp:1494-1497).
+    ctx.output.publish(array).await;
+    true
 }

@@ -11,12 +11,14 @@ use crate::cache::*;
 use crate::codec::*;
 use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
+use epics_rs::base::server::database::DeviceDone;
+use epics_rs::base::server::driver_support::DriverSupport;
 use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::io;
-use std::net::TcpStream;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::io::{self, Write as _};
+use std::net::{SocketAddrV4, TcpStream};
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 
 const PORT: u16 = 34318;
 
@@ -86,52 +88,67 @@ pub enum Command {
     SetComm(u32, f64),
     SetConst(u32, f64),
     SetBinaryOutput(u32, bool),
-    SetOpMode(bool),
-    SetCompute(u8),
+    SetOpMode(i32),
+    SetCompute(i32),
     ClearError,
     AcknowledgeAlarms,
 }
 
-struct Job {
-    command: Command,
-    done: mpsc::Sender<io::Result<()>>,
+/// Who `queue_func` hands the finished command back to: a blocking caller,
+/// or the record whose `process()` it re-runs (drvMW100.c:1418-1424).
+enum Done {
+    Wait(mpsc::Sender<()>),
+    Process(DeviceDone),
+    NoRecord,
 }
 
-/// Handle to a connected MW100 unit. Cheap to clone (`Arc`-backed); one
-/// instance per `mw100Init` handle, looked up by name from [`connect`]'s
-/// registry.
+struct Job {
+    command: Command,
+    done: Done,
+}
+
+/// One `mw100Init` handle (C `struct devqueue`), looked up by name from the
+/// [`Registry`].
 pub struct Instrument {
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
-    tx: mpsc::Sender<Job>,
+    /// The `queue_func` thread's queue; unset when the connect or load
+    /// failed, which leaves C's `dq` listed with no thread to drain it.
+    tx: OnceLock<mpsc::Sender<Job>>,
     /// `mw100_system_info(which=0, ...)` (`drvMW100.c:1731-1742`): the
-    /// address this handle connected to, formatted once at connect time.
+    /// configured address, as `inet_ntop` prints it.
     pub peer_address: String,
 }
 
 impl Instrument {
-    /// `init_mw100` (`drvMW100.c:1465-1561`): connect, read the unsolicited
-    /// post-connect `E0` greeting, negotiate binary byte order, then run the
-    /// fixed load sequence — modules must load first, everything else
-    /// indexes off it.
-    pub fn connect(address: &str) -> io::Result<Arc<Self>> {
-        let stream = TcpStream::connect((address, PORT))?;
-        Self::connect_stream(stream)
+    fn new(peer_address: String) -> Arc<Self> {
+        Arc::new(Self {
+            cache: Arc::default(),
+            interrupts: Arc::default(),
+            tx: OnceLock::new(),
+            peer_address,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn connect_to(addr: std::net::SocketAddr) -> io::Result<Arc<Self>> {
-        Self::connect_stream(TcpStream::connect(addr)?)
+        let instrument = Self::new(addr.ip().to_string());
+        instrument.start(TcpStream::connect(addr)?)?;
+        Ok(instrument)
     }
 
-    fn connect_stream(stream: TcpStream) -> io::Result<Arc<Self>> {
-        let peer_address = stream.peer_addr()?.ip().to_string();
-        let cache = Arc::new(Mutex::new(Cache::default()));
-        let interrupts = Arc::new(Interrupts::default());
+    /// The tail of `init_mw100` (`drvMW100.c:1531-1556`): read the
+    /// unsolicited post-connect `E0` greeting, negotiate binary byte order,
+    /// run the fixed load sequence (the cache keeps whatever loaded if a
+    /// step fails), then start the queue thread.
+    fn start(&self, stream: TcpStream) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel::<Job>();
         let mut actor = Actor {
             stream,
-            cache: cache.clone(),
-            interrupts: interrupts.clone(),
+            cache: self.cache.clone(),
+            interrupts: self.interrupts.clone(),
+            rx,
+            backlog: VecDeque::new(),
         };
 
         match wire::read_response(&mut actor.stream)? {
@@ -154,18 +171,11 @@ impl Instrument {
         actor.load_input_values(None)?;
         actor.load_output_values(None)?;
 
-        let (tx, rx) = mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("mw100-instrument".to_string())
-            .spawn(move || actor.run(rx))
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        Ok(Arc::new(Self {
-            cache,
-            interrupts,
-            tx,
-            peer_address,
-        }))
+            .spawn(move || actor.run())?;
+        let _ = self.tx.set(tx);
+        Ok(())
     }
 
     pub fn register_interrupt(
@@ -176,19 +186,27 @@ impl Instrument {
     }
 
     /// Block until the actor thread has finished processing `command`.
-    pub fn submit(&self, command: Command) -> io::Result<()> {
+    /// Returns nothing: C's queue reports no status to the record
+    /// (`queue_func`, drvMW100.c:1398-1424), so a device or wire error cannot alarm.
+    pub fn submit(&self, command: Command) {
         let (done_tx, done_rx) = mpsc::channel();
+        if self.send(command, Done::Wait(done_tx)) {
+            let _ = done_rx.recv();
+        }
+    }
+
+    /// C `qmesg(dq, precord, ...)`: queue `command` and return at once; the
+    /// actor completes `done` when it has run. On a device with no queue
+    /// thread `done` is dropped un-run and the record stays in PACT, as C's
+    /// packet sits on a list nobody drains.
+    pub fn submit_write(&self, command: Command, done: DeviceDone) {
+        self.send(command, Done::Process(done));
+    }
+
+    fn send(&self, command: Command, done: Done) -> bool {
         self.tx
-            .send(Job {
-                command,
-                done: done_tx,
-            })
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "instrument actor thread is gone")
-            })?;
-        done_rx.recv().map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "instrument actor thread is gone")
-        })?
+            .get()
+            .is_some_and(|tx| tx.send(Job { command, done }).is_ok())
     }
 
     fn cache(&self) -> parking_lot::MutexGuard<'_, Cache> {
@@ -265,8 +283,8 @@ impl Instrument {
             ChannelFamily::Math => {
                 scaled_value(cache.calc_data[idx].value, cache.calc_info[idx].scale)
             }
-            ChannelFamily::Comm => cache.comm_input[idx],
-            ChannelFamily::Const => cache.constant[idx],
+            ChannelFamily::Comm => f64::from(cache.comm_input[idx]),
+            ChannelFamily::Const => f64::from(cache.constant[idx]),
         }
     }
 
@@ -293,16 +311,16 @@ impl Instrument {
 
     /// `mw100_channel_get_egu` (`drvMW100.c:1918-1935`): only `Signal`/`Math`
     /// have a case at all — `UNIT`'s own link grammar never reaches Comm/Const.
-    pub fn channel_get_egu(&self, family: ChannelFamily, channel: u32) -> String {
+    pub fn channel_get_egu(&self, family: ChannelFamily, channel: u32) -> Vec<u8> {
         let cache = self.cache();
         let idx = (channel - 1) as usize;
         match family {
             ChannelFamily::Signal => match cache.ch_type[idx] {
-                ChannelType::None | ChannelType::Unknown => String::new(),
+                ChannelType::None | ChannelType::Unknown => Vec::new(),
                 _ => cache.ch_info[idx].unit.clone(),
             },
             ChannelFamily::Math => cache.calc_info[idx].unit.clone(),
-            ChannelFamily::Comm | ChannelFamily::Const => String::new(),
+            ChannelFamily::Comm | ChannelFamily::Const => Vec::new(),
         }
     }
 
@@ -311,7 +329,7 @@ impl Instrument {
     /// port's single `Vec<ExprInfo>` (sized for the full 300-channel range)
     /// deliberately does not reproduce — see [`crate::codec`] docs on the
     /// buffer-overflow defect that split caused.
-    pub fn channel_get_expr(&self, channel: u32) -> String {
+    pub fn channel_get_expr(&self, channel: u32) -> Vec<u8> {
         self.cache().calc_expr[(channel - 1) as usize].expr.clone()
     }
 
@@ -422,13 +440,13 @@ impl Instrument {
     /// Two-way "empty"-or-string, simpler than GM10's three-way scheme —
     /// `sprintf(str,"empty")` is the C source's literal fallback
     /// (`drvMW100.c:1702-1703`).
-    pub fn module_string(&self, module: usize) -> String {
+    pub fn module_string(&self, module: usize) -> Vec<u8> {
         let cache = self.cache();
         let m = &cache.modules[module];
         if m.use_flag {
             m.module_string.clone()
         } else {
-            "empty".to_string()
+            b"empty".to_vec()
         }
     }
 
@@ -440,10 +458,10 @@ impl Instrument {
         cache.modules[module].model
     }
 
-    pub fn module_code(&self, module: usize) -> String {
+    pub fn module_code(&self, module: usize) -> Vec<u8> {
         let cache = self.cache();
         if !cache.modules[module].use_flag {
-            return String::new();
+            return Vec::new();
         }
         cache.modules[module].code.clone()
     }
@@ -467,7 +485,7 @@ impl Instrument {
     /// `mw100_channel_start` (`drvMW100.c:1832-1866`): the first-scan async
     /// read-refresh for a single channel, collapsed to a blocking round
     /// trip. Signal channels with no recognized type are a silent no-op.
-    pub fn channel_start(&self, family: ChannelFamily, channel: u32) -> io::Result<()> {
+    pub fn channel_start(&self, family: ChannelFamily, channel: u32) {
         let command = match family {
             ChannelFamily::Signal => match self.channel_type(channel) {
                 ChannelType::InputAnalog | ChannelType::InputInteger | ChannelType::InputBinary => {
@@ -476,7 +494,7 @@ impl Instrument {
                 ChannelType::OutputBinary | ChannelType::OutputAnalog => {
                     Command::ReadSignalOutput(channel)
                 }
-                ChannelType::None | ChannelType::Unknown => return Ok(()),
+                ChannelType::None | ChannelType::Unknown => return,
             },
             ChannelFamily::Math => Command::ReadMath(channel),
             ChannelFamily::Comm => Command::ReadComm(channel),
@@ -490,14 +508,35 @@ pub struct Actor {
     stream: TcpStream,
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
+    rx: mpsc::Receiver<Job>,
+    /// Jobs taken off `rx` ahead of one the actor queued itself, in order.
+    backlog: VecDeque<Job>,
 }
 
 impl Actor {
-    fn run(mut self, rx: mpsc::Receiver<Job>) {
-        while let Ok(job) = rx.recv() {
-            let result = self.process(job.command);
-            let _ = job.done.send(result);
+    fn run(mut self) {
+        while let Some(job) = self.backlog.pop_front().or_else(|| self.rx.recv().ok()) {
+            let _ = self.process(job.command);
+            match job.done {
+                Done::Wait(tx) => {
+                    let _ = tx.send(());
+                }
+                Done::Process(done) => {
+                    let _ = done.complete(done.priority());
+                }
+                Done::NoRecord => {}
+            }
         }
+    }
+
+    /// C `qmesg(dq, NULL, ...)` from the queue thread: the job goes behind
+    /// everything already queued.
+    fn queue_self(&mut self, command: Command) {
+        self.backlog.extend(self.rx.try_iter());
+        self.backlog.push_back(Job {
+            command,
+            done: Done::NoRecord,
+        });
     }
 
     fn process(&mut self, command: Command) -> io::Result<()> {
@@ -519,8 +558,8 @@ impl Actor {
             Command::SetComm(ch, value) => self.expect_ok(&cmd_cmc_set(ch, value)),
             Command::SetConst(ch, value) => self.expect_ok(&cmd_skk_set(ch, value)),
             Command::SetBinaryOutput(ch, on) => self.set_binary_value(ch, on),
-            Command::SetOpMode(on) => self.expect_ok(&cmd_ds_set(on)),
-            Command::SetCompute(mode) => self.expect_ok(&cmd_ex_set(mode)),
+            Command::SetOpMode(value) => self.expect_ok_if(cmd_ds_set(value)),
+            Command::SetCompute(value) => self.expect_ok_if(cmd_ex_set(value)),
             Command::ClearError => self.clear_error(),
             Command::AcknowledgeAlarms => self.acknowledge_alarms(),
         }
@@ -548,8 +587,7 @@ impl Actor {
         match &raw {
             RawResponse::Error(bytes) => {
                 self.cache.lock().error.flag = true;
-                let text = String::from_utf8_lossy(bytes);
-                let Some(code) = parse_error_code(&text) else {
+                let Some(code) = parse_error_code(bytes) else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "malformed E1 error header",
@@ -564,6 +602,14 @@ impl Actor {
             _ => {}
         }
         Ok(raw)
+    }
+
+    /// `set_mode`'s `return 1` before writing: no command, nothing sent.
+    fn expect_ok_if(&mut self, command: Option<String>) -> io::Result<()> {
+        match command {
+            Some(command) => self.expect_ok(&command),
+            None => Ok(()),
+        }
     }
 
     fn expect_ok(&mut self, command: &str) -> io::Result<()> {
@@ -626,18 +672,17 @@ impl Actor {
             }
             {
                 let module = &mut cache.modules[line.index];
-                module.set_message = line.set_message.clone();
-                module.status_message = line.status_message.clone();
+                module.set_message = line.set_message;
+                module.status_message = line.status_message;
                 module.error_message = line.error_message.clone();
             }
             if !module_line_ok(line) {
                 continue;
             }
-            let module_string = line.set_message.clone();
-            let (model, code, speed, number) = classify_module_string(&module_string);
+            let (model, code, speed, number) = classify_module_string(&line.set_message);
             let module = &mut cache.modules[line.index];
             module.use_flag = true;
-            module.module_string = module_string;
+            module.module_string = line.set_message.to_vec();
             module.model = model;
             module.code = code;
             module.speed = speed;
@@ -660,31 +705,30 @@ impl Actor {
     }
 
     /// `load_status` (`drvMW100.c:686-728`): only `status[4]`'s bottom 3
-    /// bits are used. On a settings-mode 1-to-0 transition, immediately
-    /// refreshes infos (C fire-and-forgets this via `qmesg`; this single
-    /// actor thread just runs it inline).
+    /// bits are used. A settings-mode 1-to-0 transition queues an info
+    /// reload (`drvMW100.c:704-713`).
     fn load_status(&mut self) -> io::Result<()> {
         let payload = self.expect_ascii(&cmd_is0())?;
         let status = parse_is0(&payload)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed IS0 body"))?;
         let s4 = status[4];
-        let should_refresh_infos;
+        let settings_ended;
         {
             let mut cache = self.cache.lock();
             if s4 & 1 != 0 {
                 cache.settings_mode = true;
-                should_refresh_infos = false;
+                settings_ended = false;
             } else {
-                should_refresh_infos = cache.settings_mode;
+                settings_ended = cache.settings_mode;
                 cache.settings_mode = false;
             }
             cache.measurement_mode = s4 & 2 != 0;
             cache.compute_mode = s4 & 4 != 0;
         }
-        self.interrupts.fire(InterruptCategory::Status);
-        if should_refresh_infos {
-            self.load_infos()?;
+        if settings_ended {
+            self.queue_self(Command::ReadAllInfos);
         }
+        self.interrupts.fire(InterruptCategory::Status);
         Ok(())
     }
 
@@ -706,6 +750,16 @@ impl Actor {
                     info.ch_status = ch_status;
                     info.unit = line.unit.clone();
                     info.scale = line.scale;
+                }
+                // drvMW100.c:799: FD1 never reports a skipped channel.
+                if ch_status == ChStatus::Skip {
+                    let data = match line.family {
+                        InfoFamily::Signal => cache.ch_data.get_mut(line.index),
+                        InfoFamily::Math => cache.calc_data.get_mut(line.index),
+                    };
+                    if let Some(data) = data {
+                        data.data_status = DataStatus::SkipOff;
+                    }
                 }
             }
         }
@@ -866,7 +920,7 @@ impl Actor {
             let mut cache = self.cache.lock();
             for line in &lines {
                 if let Some(slot) = cache.comm_input.get_mut(line.index) {
-                    *slot = line.value;
+                    *slot = line.value as f32;
                 }
             }
         }
@@ -881,7 +935,7 @@ impl Actor {
             let mut cache = self.cache.lock();
             for line in &lines {
                 if let Some(slot) = cache.constant.get_mut(line.index) {
-                    *slot = line.value;
+                    *slot = line.value as f32;
                 }
             }
         }
@@ -961,31 +1015,119 @@ fn ch_status_to_wire(status: ChStatus) -> u8 {
     }
 }
 
-/// `mw100_connect` (`drvMW100.c:1628-1641`): a name-keyed registry populated
-/// by the `mw100Init` iocsh command.
+/// One `mw100Init` entry (C `struct queue_link` plus its `devqueue`).
+struct Device {
+    name: String,
+    instrument: Arc<Instrument>,
+}
+
+/// `mw100_queue_list` (`drvMW100.c:449`): every `mw100Init` device,
+/// newest first.
 #[derive(Default)]
 pub struct Registry {
-    instruments: Mutex<HashMap<String, Arc<Instrument>>>,
+    devices: Mutex<Vec<Device>>,
 }
 
 impl Registry {
     pub fn new() -> Self {
-        Self {
-            instruments: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
-    pub fn insert(&self, name: String, instrument: Arc<Instrument>) -> Result<(), &'static str> {
-        let mut instruments = self.instruments.lock();
-        if instruments.contains_key(&name) {
-            return Err("device already exists");
-        }
-        instruments.insert(name, instrument);
-        Ok(())
+    /// `init_mw100` (`drvMW100.c:1465-1561`), which reports nothing; `false`
+    /// is its `return 1`. A device whose connect or load fails stays listed
+    /// and resolves records, which park on a queue no thread serves, as in
+    /// C. A bad address registers nothing, where C leaves a freed
+    /// `devqueue` in the list (`drvMW100.c:1525-1529`).
+    pub fn init_mw100(&self, device: Option<&[u8]>, address: Option<&[u8]>) -> bool {
+        self.init_on_port(device, address, PORT)
     }
 
+    /// [`Self::init_mw100`] connecting to `port`, C's `PORT` there; a test's
+    /// fake unit listens on a port of its own.
+    fn init_on_port(&self, device: Option<&[u8]>, address: Option<&[u8]>, port: u16) -> bool {
+        let Some(name) = device.filter(|d| valid_device_name(d)) else {
+            return false;
+        };
+        // ASCII by valid_device_name, so nothing is lost.
+        let name = String::from_utf8_lossy(name).into_owned();
+        if self.devices.lock().iter().any(|d| d.name == name) {
+            return false;
+        }
+        let Some(address) = address.and_then(inet_aton) else {
+            return false;
+        };
+        let instrument = Instrument::new(address.to_string());
+        self.devices.lock().insert(
+            0,
+            Device {
+                name,
+                instrument: instrument.clone(),
+            },
+        );
+        TcpStream::connect(SocketAddrV4::new(address, port))
+            .and_then(|stream| instrument.start(stream))
+            .is_ok()
+    }
+
+    /// `mw100_connect` (`drvMW100.c:1628-1641`).
     pub fn get(&self, name: &str) -> Option<Arc<Instrument>> {
-        self.instruments.lock().get(name).cloned()
+        self.devices
+            .lock()
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.instrument.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_connected(&self, name: &str, instrument: Arc<Instrument>) {
+        self.devices.lock().insert(
+            0,
+            Device {
+                name: name.to_string(),
+                instrument,
+            },
+        );
+    }
+}
+
+/// `init_mw100`'s name check (`drvMW100.c:1477-1490`): a letter, then
+/// letters, digits or `_`.
+fn valid_device_name(name: &[u8]) -> bool {
+    match name.split_first() {
+        Some((first, rest)) => {
+            first.is_ascii_alphabetic()
+                && rest.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_')
+        }
+        None => false,
+    }
+}
+
+/// `mw100_report` (`drvMW100.c:459-505`).
+impl DriverSupport for Registry {
+    fn report(&self, level: i32) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        for (cnt, device) in self.devices.lock().iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "    Yokogawa MW100 #{}: {} @ {}",
+                cnt + 1,
+                device.name,
+                device.instrument.peer_address
+            );
+            if level != 0 {
+                out.extend_from_slice(b"        Modules:\n");
+                for (i, module) in device.instrument.cache().modules.iter().take(6).enumerate() {
+                    if module.use_flag {
+                        let _ = write!(out, "        #{}: ", i + 1);
+                        out.extend_from_slice(&module.module_string);
+                        out.push(b'\n');
+                    } else {
+                        let _ = writeln!(out, "        #{}: empty", i + 1);
+                    }
+                }
+            }
+        }
+        Some(out)
     }
 }
 
@@ -995,7 +1137,7 @@ impl Registry {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Read as _;
     use std::net::TcpListener;
 
     pub(crate) fn ascii_frame(body: &[u8]) -> Vec<u8> {
@@ -1078,11 +1220,20 @@ pub(crate) mod test_support {
         listener: TcpListener,
         responses: Vec<Vec<u8>>,
     ) -> std::thread::JoinHandle<Vec<String>> {
+        spawn_gated_fake_device(listener, responses, None)
+    }
+
+    /// [`spawn_fake_device`], holding reply `n` back until `gate` fires.
+    pub(crate) fn spawn_gated_fake_device(
+        listener: TcpListener,
+        responses: Vec<Vec<u8>>,
+        gate: Option<(usize, mpsc::Receiver<()>)>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream.write_all(b"E0\r\n").unwrap();
             let mut received = Vec::new();
-            for response in responses {
+            for (n, response) in responses.into_iter().enumerate() {
                 let mut line = Vec::new();
                 let mut byte = [0u8; 1];
                 loop {
@@ -1095,6 +1246,11 @@ pub(crate) mod test_support {
                     }
                 }
                 received.push(String::from_utf8(line).unwrap());
+                if let Some((at, gate)) = &gate
+                    && *at == n
+                {
+                    gate.recv().unwrap();
+                }
                 stream.write_all(&response).unwrap();
             }
             received
@@ -1107,9 +1263,19 @@ pub(crate) mod test_support {
     /// channel (e.g. 7) is `ChannelType::None` — "channel does not exist"
     /// gate tests use it directly.
     pub(crate) fn connect_default_fixture() -> Arc<Instrument> {
+        let (instrument, device) = connect_fixture_then(Vec::new());
+        device.join().unwrap();
+        instrument
+    }
+
+    /// [`connect_default_fixture`], with the device then answering `extra`
+    /// in order; join the handle for every command line it received.
+    pub(crate) fn connect_fixture_then(
+        extra: Vec<Vec<u8>>,
+    ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let responses = vec![
+        let mut responses = vec![
             b"E0\r\n".to_vec(),             // BO1
             cf0_one_input_analog_module(),  // CF0
             is0_all_zero(),                 // IS0
@@ -1123,10 +1289,10 @@ pub(crate) mod test_support {
             ascii_frame(b"xxx001,-7.5\nE"), // CM?
             ascii_frame(b"xxx01,12.5\nE"),  // SK?
         ];
+        responses.extend(extra);
         let device = spawn_fake_device(listener, responses);
         let instrument = Instrument::connect_to(addr).unwrap();
-        device.join().unwrap();
-        instrument
+        (instrument, device)
     }
 }
 
@@ -1135,6 +1301,86 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn settings_end_queues_the_info_reload_behind_queued_jobs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut settings = b"000x".repeat(8);
+        settings[16..19].copy_from_slice(b"001");
+        let responses = vec![
+            b"E0\r\n".to_vec(),
+            cf0_one_input_analog_module(),
+            ascii_frame(&settings), // IS0: settings mode
+            fe1_one_signal_channel(),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            one_record_fd1_binary(),
+            empty_fo1_binary(),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            is0_all_zero(),          // IS0: settings mode ended
+            one_record_fd1_binary(), // the job queued behind it
+            fe1_one_signal_channel(),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+        ];
+        let (release, gate) = mpsc::channel();
+        let device = spawn_gated_fake_device(listener, responses, Some((12, gate)));
+        let instrument = Instrument::connect_to(addr).unwrap();
+        assert!(instrument.get_settings_mode());
+        assert!(instrument.send(Command::ReadStatus, Done::NoRecord));
+        assert!(instrument.send(Command::ReadAllInputs, Done::NoRecord));
+        release.send(()).unwrap();
+        let received = device.join().unwrap();
+        assert_eq!(
+            received[12..],
+            [
+                "IS0\r\n",
+                "FD1,001,A300\r\n",
+                "FE1,001,A300\r\n",
+                "FO0,001,060\r\n",
+                "AO?\r\n",
+                "XD?\r\n",
+                "SO?\r\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn fe1_skipped_channel_reads_skip_off() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responses = vec![
+            b"E0\r\n".to_vec(),
+            cf0_one_input_analog_module(),
+            is0_all_zero(),
+            ascii_frame(b"N 0001DEGC ,003\nS A001\n"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            one_record_fd1_binary(),
+            empty_fo1_binary(),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+        ];
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        device.join().unwrap();
+        assert_eq!(
+            instrument.get_data_status(ChannelFamily::Math, 1),
+            DataStatus::SkipOff
+        );
+        assert_eq!(
+            instrument.get_data_status(ChannelFamily::Math, 2),
+            DataStatus::Normal
+        );
+    }
 
     #[test]
     fn connect_runs_full_init_sequence_then_error_round_trip() {
@@ -1151,8 +1397,8 @@ mod tests {
             ascii_frame(b"E"),
             one_record_fd1_binary(),
             empty_fo1_binary(),
-            ascii_frame(b"xxx001,-7.5\nE"),
-            ascii_frame(b"xxx01,12.5\nE"),
+            ascii_frame(b"xxx001,-0.1\nE"),
+            ascii_frame(b"xxx01,0.3\nE"),
             b"E1 205 x\r\n".to_vec(), // CE0 -> device error
         ];
         let device = spawn_fake_device(listener, responses);
@@ -1160,14 +1406,24 @@ mod tests {
         let instrument = Instrument::connect_to(addr).unwrap();
 
         assert!(instrument.module_presence(0));
-        assert_eq!(instrument.channel_get_egu(ChannelFamily::Signal, 1), "DEGC");
+        assert_eq!(
+            instrument.channel_get_egu(ChannelFamily::Signal, 1),
+            b"DEGC"
+        );
         assert_eq!(instrument.analog_get(ChannelFamily::Signal, 1), 1.234);
-        assert_eq!(instrument.analog_get(ChannelFamily::Const, 1), 12.5);
-        assert_eq!(instrument.analog_get(ChannelFamily::Comm, 1), -7.5);
+        // float comm_input[]/constant[] (drvMW100.c:436-437) round atof.
+        assert_eq!(
+            instrument.analog_get(ChannelFamily::Const, 1),
+            f64::from(0.3f32)
+        );
+        assert_eq!(
+            instrument.analog_get(ChannelFamily::Comm, 1),
+            f64::from(-0.1f32)
+        );
         assert!(!instrument.get_error_flag());
 
         let mut error_rx = instrument.register_interrupt(InterruptCategory::Error);
-        assert!(instrument.submit(Command::ClearError).is_err());
+        instrument.submit(Command::ClearError);
         assert!(instrument.get_error_flag());
         assert_eq!(
             instrument.get_error(1),
@@ -1193,6 +1449,129 @@ mod tests {
                 "SK?\r\n",
                 "CE0\r\n",
             ]
+        );
+    }
+
+    /// C copies the unit's text into the module string, code, unit and
+    /// expression byte for byte (drvMW100.c:587-631, :796-800, :984-988),
+    /// and the report and stringin records print those bytes.
+    #[test]
+    fn device_text_reaches_records_and_the_report_byte_for_byte() {
+        fn bytes(v: impl AsRef<[u8]>) -> Vec<u8> {
+            v.as_ref().to_vec()
+        }
+        let module = b"MX110-U\xffV-M06";
+        let mut cf0 = b"0xxx".to_vec();
+        cf0.extend_from_slice(module);
+        cf0.extend_from_slice(b"xxx");
+        cf0.extend_from_slice(module);
+        cf0.extend_from_slice(b"x\r\nE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(
+            listener,
+            vec![
+                b"E0\r\n".to_vec(),
+                ascii_frame(&cf0),
+                is0_all_zero(),
+                ascii_frame(b"N 0001DEG\xff ,003\n"),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                ascii_frame(b"xxx001xxxxA\xff1,\nE"),
+                one_record_fd1_binary(),
+                empty_fo1_binary(),
+                ascii_frame(b"xxx001,-7.5\nE"),
+                ascii_frame(b"xxx01,12.5\nE"),
+            ],
+        );
+        let instrument = Instrument::connect_to(addr).unwrap();
+        device.join().unwrap();
+
+        assert_eq!(bytes(instrument.module_string(0)), module);
+        assert_eq!(bytes(instrument.module_code(0)), b"U\xffV");
+        assert_eq!(
+            bytes(instrument.channel_get_egu(ChannelFamily::Signal, 1)),
+            b"DEG\xff"
+        );
+        assert_eq!(bytes(instrument.channel_get_expr(1)), b"A\xff1");
+
+        let registry = Registry::new();
+        registry.insert_connected("dau1", instrument);
+        let report = registry.report(1).unwrap();
+        let line = b"        #1: MX110-U\xffV-M06\n";
+        assert!(
+            report.windows(line.len()).any(|w| w == line),
+            "{}",
+            String::from_utf8_lossy(&report)
+        );
+    }
+
+    #[test]
+    fn init_mw100_rejects_bad_names_and_addresses_without_registering() {
+        let registry = Registry::new();
+        for name in [
+            None,
+            Some(&b""[..]),
+            Some(b"1dau"),
+            Some(b"dau-1"),
+            Some(b"_dau"),
+        ] {
+            assert!(!registry.init_mw100(name, Some(b"127.0.0.1")));
+        }
+        assert!(!registry.init_mw100(Some(b"dau1"), None));
+        assert!(!registry.init_mw100(Some(b"dau1"), Some(b"localhost")));
+        assert_eq!(registry.report(1).as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn init_mw100_duplicate_check_runs_before_connect() {
+        let registry = Registry::new();
+        registry.insert_connected("dau1", connect_default_fixture());
+        // Nothing listens at 192.0.2.1 (TEST-NET-1); a connect would hang.
+        assert!(!registry.init_mw100(Some(b"dau1"), Some(b"192.0.2.1")));
+        assert_eq!(
+            registry.report(0).as_deref(),
+            Some(&b"    Yokogawa MW100 #1: dau1 @ 127.0.0.1\n"[..])
+        );
+    }
+
+    #[test]
+    fn failed_init_stays_listed_and_resolves_with_no_queue_thread() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // E0 greeting, BO1, CF0, then EOF during the IS0 status load.
+        let device = spawn_fake_device(
+            listener,
+            vec![b"E0\r\n".to_vec(), cf0_one_input_analog_module()],
+        );
+        let registry = Registry::new();
+        registry.insert_connected("first", connect_default_fixture());
+        assert!(!registry.init_on_port(Some(b"dau2"), Some(b"127.0.0.1"), port));
+        device.join().unwrap();
+
+        let dau2 = registry.get("dau2").unwrap();
+        assert!(dau2.tx.get().is_none());
+        assert_eq!(dau2.module_string(0), b"MX110-UNV-M06");
+        assert!(!registry.init_mw100(Some(b"dau2"), Some(b"192.0.2.1")));
+        assert_eq!(
+            registry.report(1).unwrap(),
+            b"    Yokogawa MW100 #1: dau2 @ 127.0.0.1\n\
+             \x20       Modules:\n\
+             \x20       #1: MX110-UNV-M06\n\
+             \x20       #2: empty\n\
+             \x20       #3: empty\n\
+             \x20       #4: empty\n\
+             \x20       #5: empty\n\
+             \x20       #6: empty\n\
+             \x20   Yokogawa MW100 #2: first @ 127.0.0.1\n\
+             \x20       Modules:\n\
+             \x20       #1: MX110-UNV-M06\n\
+             \x20       #2: empty\n\
+             \x20       #3: empty\n\
+             \x20       #4: empty\n\
+             \x20       #5: empty\n\
+             \x20       #6: empty\n"
         );
     }
 }

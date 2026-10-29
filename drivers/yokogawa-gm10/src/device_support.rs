@@ -8,15 +8,16 @@
 //! factory's only input) carries `dtyp`/`inp`/`out` but no record-type
 //! field, so [`GmDevice`] defers command resolution to
 //! [`DeviceSupport::init`], which does receive the concrete `&mut dyn
-//! Record` and can call `record.record_type()`. [`resolve_operation`] is
+//! Record` and can call `record.record_type()`. `resolve_operation` is
 //! the single place that mirrors every `devGM10_*.c::init_record`'s
 //! command/address validation.
 
 use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
 };
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
@@ -25,6 +26,12 @@ use std::sync::Arc;
 
 /// Upstream DTYP shared by every GM10 record type (`gm10Support.dbd`).
 pub const DTYP: &str = "Yokogawa GM10";
+
+/// Every devGM10_* dset's `init(pass)` (devGM10_ai.c:73-79 and siblings):
+/// pass 0 `scanIoInit`s the dset's `dummy_ioscanpvt`. The port has no
+/// per-source I/O Intr list to create; the dummy is the per-record channel
+/// `io_intr_receiver` hands an invalid input record.
+pub fn dev_init(_after: bool) {}
 
 /// One variant per legal `(record type, link command)` pair validated by
 /// a `devGM10_*.c::init_record`.
@@ -134,9 +141,7 @@ fn parse_module_index(arg: Option<&str>, record_type: &str, command: &str) -> Ca
             format!("{command} argument must be numeric"),
         ));
     }
-    let i: i32 = arg
-        .parse()
-        .map_err(|_| bad(record_type, format!("{command} argument must be numeric")))?;
+    let (i, _) = link::strtol(arg);
     if !(0..=9).contains(&i) {
         return Err(bad(
             record_type,
@@ -232,6 +237,10 @@ fn resolve_operation(
             let arg = arg.ok_or_else(|| bad(record_type, "VAL requires an address argument"))?;
             let addr = link::parse_channel_address(arg)
                 .ok_or_else(|| bad(record_type, format!("bad channel address '{arg}'")))?;
+            // devGM10_ao.c:99-139 has no `A` arm.
+            if addr.family == ChannelFamily::Math {
+                return Err(bad(record_type, "Math addresses are read-only"));
+            }
             if addr.family == ChannelFamily::Signal
                 && instrument.test_output_analog_signal(addr.index)
             {
@@ -366,10 +375,8 @@ fn resolve_operation(
             Ok(Operation::IntegerVal(channel))
         }
         "stringin" => match command {
-            "IP_ADDR" => {
-                require_no_arg(arg, record_type, command)?;
-                Ok(Operation::IpAddr)
-            }
+            // devGM10_stringin.c:102-107 ignores any argument.
+            "IP_ADDR" => Ok(Operation::IpAddr),
             "MODULE_STRING" => Ok(Operation::ModuleString(parse_module_index(
                 arg,
                 record_type,
@@ -378,13 +385,11 @@ fn resolve_operation(
             "ERROR" => {
                 let arg =
                     arg.ok_or_else(|| bad(record_type, "ERROR requires a channel argument"))?;
-                let channel: u32 = arg
-                    .parse()
-                    .map_err(|_| bad(record_type, "ERROR channel must be numeric"))?;
-                if channel == 0 || channel > 3 {
+                let (channel, _) = link::strtol(arg);
+                if channel <= 0 || channel > 3 {
                     return Err(bad(record_type, "ERROR channel must be 1-3"));
                 }
-                Ok(Operation::ErrorText(channel))
+                Ok(Operation::ErrorText(channel as u32))
             }
             "UNIT" => {
                 let arg =
@@ -424,8 +429,7 @@ fn resolve_operation(
 
 /// Records whose C `init_record` seeds an initial value directly
 /// (`devGM10_ao.c`: VAL via `gm10_analog_get`; `devGM10_bo.c`: RVAL via
-/// `gm10_binary_get`, asymmetrically — VAL is left at the record's
-/// default since C's `init_record` never calls `process()`).
+/// `gm10_binary_get`; the record's status-0 tail derives VAL from it).
 fn seed_initial_value(
     instrument: &Instrument,
     op: Operation,
@@ -456,36 +460,27 @@ struct Resolved {
 pub struct GmDevice {
     registry: Arc<Registry>,
     link_text: String,
+    /// The C dset of this record type has `get_ioint_info` (input records).
+    has_ioint_info: bool,
     is_io_intr: bool,
     resolved: Option<Resolved>,
+    /// Keeps the never-fired `dummy_ioscanpvt` receiver open.
+    dummy_ioscan: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl GmDevice {
-    fn new(registry: Arc<Registry>, link_text: String) -> Self {
+    fn new(registry: Arc<Registry>, link_text: String, record_type: &str) -> Self {
         Self {
             registry,
             link_text,
+            has_ioint_info: matches!(record_type, "ai" | "bi" | "longin" | "mbbi" | "stringin"),
             is_io_intr: false,
             resolved: None,
+            dummy_ioscan: None,
         }
     }
 
-    fn resolved(&self) -> CaResult<&Resolved> {
-        self.resolved
-            .as_ref()
-            .ok_or_else(|| CaError::LinkError("GM10 device support not initialized".into()))
-    }
-}
-
-impl DeviceSupport for GmDevice {
-    fn dtyp(&self) -> &str {
-        DTYP
-    }
-
-    // Every C init_record failure here is a bare `return 1` — no pact,
-    // no alarm (`devGM10_ai.c:104-169`) — so the record scans on: that is the
-    // `Err` shape, and every `?` below keeps it.
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+    fn resolve(&self, record: &mut dyn Record) -> CaResult<Resolved> {
         let parsed = link::parse_link(&self.link_text).ok_or_else(|| {
             CaError::LinkError(format!("malformed GM10 link: '{}'", self.link_text))
         })?;
@@ -499,8 +494,34 @@ impl DeviceSupport for GmDevice {
             &instrument,
         )?;
         seed_initial_value(&instrument, op, record)?;
-        self.resolved = Some(Resolved { instrument, op });
-        Ok(DeviceInitOutcome::Live)
+        Ok(Resolved { instrument, op })
+    }
+}
+
+impl DeviceSupport for GmDevice {
+    fn dtyp(&self) -> &str {
+        DTYP
+    }
+
+    /// A failed C `init_record` returns 1 with `invalid_flag` set and prints
+    /// nothing; read and write then return 0 untouched and the record has
+    /// no I/O Intr source (`devGM10_ai.c:104-187`). `resolved == None` is
+    /// that state.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        self.resolved = self.resolve(record).ok();
+        let Some(Resolved { op, .. }) = self.resolved else {
+            // C's status 1 converts nothing (boRecord.c:159, mbboRecord.c:143).
+            return Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched));
+        };
+        // devGM10_ao.c:92-99 returns 2 and defines the VAL it seeded.
+        if record.record_type() == "ao" {
+            let udf = match op {
+                Operation::AnalogSet(_) => DeviceUdf::Defined,
+                _ => DeviceUdf::Untouched,
+            };
+            return Ok(DeviceInitOutcome::DoNotConvert(udf));
+        }
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn set_record_info(&mut self, _name: &str, scan: ScanType) {
@@ -508,18 +529,28 @@ impl DeviceSupport for GmDevice {
     }
 
     fn io_intr_receiver(&mut self) -> Option<epics_rs::base::runtime::sync::mpsc::Receiver<()>> {
-        let resolved = self.resolved.as_ref()?;
+        let Some(resolved) = self.resolved.as_ref() else {
+            // An invalid input record gets `dummy_ioscanpvt` (`devGM10_ai.c:179-180`).
+            if !self.has_ioint_info {
+                return None;
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            self.dummy_ioscan = Some(tx);
+            return Some(rx);
+        };
         let category = operation_interrupt_category(resolved.op)?;
         Some(resolved.instrument.register_interrupt(category))
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let Resolved { instrument, op } = self.resolved()?;
+        let Some(Resolved { instrument, op }) = &self.resolved else {
+            return Ok(DeviceReadOutcome::ok());
+        };
         let is_io_intr = self.is_io_intr;
         match *op {
             Operation::AnalogVal(addr) => {
                 if !is_io_intr {
-                    instrument.channel_start(addr.family, addr.index)?;
+                    instrument.channel_start(addr.family, addr.index);
                 }
                 let v = instrument.analog_get(addr.family, addr.index);
                 record.put_field("VAL", EpicsValue::Double(v))?;
@@ -527,7 +558,7 @@ impl DeviceSupport for GmDevice {
             }
             Operation::IntegerVal(channel) => {
                 if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel)?;
+                    instrument.channel_start(ChannelFamily::Signal, channel);
                 }
                 let v = instrument.integer_get(channel);
                 record.put_field("VAL", EpicsValue::Long(v))?;
@@ -535,7 +566,7 @@ impl DeviceSupport for GmDevice {
             }
             Operation::BinaryVal(channel) => {
                 if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel)?;
+                    instrument.channel_start(ChannelFamily::Signal, channel);
                 }
                 let v = instrument.binary_get(channel);
                 record.put_field("RVAL", EpicsValue::ULong(v as u32))?;
@@ -639,14 +670,68 @@ impl DeviceSupport for GmDevice {
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        let Resolved { instrument, op } = self.resolved()?;
-        match *op {
+        let Some(command) = self.output_command(record)? else {
+            return Ok(());
+        };
+        if let Some(Resolved { instrument, .. }) = &self.resolved {
+            instrument.submit(command);
+        }
+        Ok(())
+    }
+
+    /// C `write_*` sets PACT and `qmesg`s the command; `queue_func` ends the
+    /// cycle once it ran (`drvGM10.c:1311-1338`).
+    fn write_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
+        let (Some(Resolved { instrument, .. }), Some(command)) =
+            (&self.resolved, self.output_command(record)?)
+        else {
+            return Ok(WriteStart::Completed);
+        };
+        let (write_done, priority) = (done.device_done(), done.priority());
+        instrument.enqueue(
+            command,
+            Box::new(move || {
+                let _ = write_done.complete(priority);
+            }),
+        );
+        Ok(WriteStart::Pending)
+    }
+
+    // devGM10_bo.c:192-197: the completing pass drops a REC_TRIG or
+    // REC_ERROR bo's VAL back to 0.
+    fn async_write_completed(&mut self, record: &mut dyn Record) {
+        if let Some(Resolved {
+            op:
+                Operation::ChanTrig
+                | Operation::MiscTrig
+                | Operation::InfoTrig
+                | Operation::StatTrig
+                | Operation::ErrorClearSet,
+            ..
+        }) = self.resolved
+        {
+            let _ = record.put_field("VAL", EpicsValue::Enum(0));
+        }
+    }
+}
+
+impl GmDevice {
+    /// The command an output record's write queues; `None` while invalid.
+    fn output_command(&self, record: &mut dyn Record) -> CaResult<Option<Command>> {
+        let Some(Resolved { op, .. }) = &self.resolved else {
+            return Ok(None);
+        };
+        Ok(Some(match *op {
             Operation::AnalogSet(addr) => {
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::Double(v)) => v,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                let command = match addr.family {
+                match addr.family {
                     ChannelFamily::Signal => Command::SetSignalOutput(addr.index, val),
                     ChannelFamily::Comm => Command::SetComm(addr.index, val),
                     ChannelFamily::Const => Command::SetConst(addr.index, val),
@@ -656,35 +741,34 @@ impl DeviceSupport for GmDevice {
                             "ao does not support Math addresses".into(),
                         ));
                     }
-                };
-                instrument.submit(command)?;
+                }
             }
             Operation::BinarySet(channel) => {
                 let on = match record.get_field("VAL") {
                     Some(EpicsValue::Enum(v)) => v != 0,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                instrument.submit(Command::SetBinaryOutput(channel, on))?;
+                Command::SetBinaryOutput(channel, on)
             }
-            Operation::ChanTrig => instrument.submit(Command::ReadAllData)?,
-            Operation::MiscTrig => instrument.submit(Command::ReadAllMisc)?,
-            Operation::InfoTrig => instrument.submit(Command::ReadAllInfos)?,
-            Operation::StatTrig => instrument.submit(Command::ReadStatus)?,
+            Operation::ChanTrig => Command::ReadAllData,
+            Operation::MiscTrig => Command::ReadAllMisc,
+            Operation::InfoTrig => Command::ReadAllInfos,
+            Operation::StatTrig => Command::ReadStatus,
             Operation::RecordingModeSet => {
-                let on = match record.get_field("VAL") {
-                    Some(EpicsValue::Enum(v)) => v != 0,
+                let v = match record.get_field("VAL") {
+                    Some(EpicsValue::Enum(v)) => v,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                instrument.submit(Command::SetOpMode(on))?;
+                Command::SetOpMode(v)
             }
-            Operation::ErrorClearSet => instrument.submit(Command::ClearError)?,
-            Operation::AlarmAckSet => instrument.submit(Command::AcknowledgeAlarms)?,
+            Operation::ErrorClearSet => Command::ClearError,
+            Operation::AlarmAckSet => Command::AcknowledgeAlarms,
             Operation::ComputeCmdSet => {
                 let v = match record.get_field("VAL") {
-                    Some(EpicsValue::Enum(v)) => v as u8,
+                    Some(EpicsValue::Enum(v)) => v,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                instrument.submit(Command::SetCompute(v))?;
+                Command::SetCompute(v)
             }
             Operation::AnalogVal(_)
             | Operation::IntegerVal(_)
@@ -709,8 +793,7 @@ impl DeviceSupport for GmDevice {
                     "GM10 device support: this operation is read-only".into(),
                 ));
             }
-        }
-        Ok(())
+        }))
     }
 }
 
@@ -735,10 +818,11 @@ pub fn factory(
         // has its leading `@` marker. Same strip-and-trim as the framework's
         // own builtin INST_IO devices (e.g. builtin_devices::stdio).
         let link_text = raw.strip_prefix('@').unwrap_or(raw).trim();
-        Some(
-            Box::new(GmDevice::new(registry.clone(), link_text.to_string()))
-                as Box<dyn DeviceSupport>,
-        )
+        Some(Box::new(GmDevice::new(
+            registry.clone(),
+            link_text.to_string(),
+            ctx.record_type,
+        )) as Box<dyn DeviceSupport>)
     }
 }
 
@@ -851,6 +935,12 @@ mod tests {
     fn ao_val_rejects_nonexistent_signal_channel() {
         let instrument = connect_default_fixture();
         assert!(resolve_operation("ao", "VAL", Some("2"), &instrument).is_err());
+    }
+
+    #[test]
+    fn ao_val_rejects_math_address() {
+        let instrument = connect_default_fixture();
+        assert!(resolve_operation("ao", "VAL", Some("A1"), &instrument).is_err());
     }
 
     // -- resolve_operation: bi --
@@ -981,13 +1071,32 @@ mod tests {
     // -- resolve_operation: stringin --
 
     #[test]
-    fn stringin_ip_addr_is_bare() {
+    fn stringin_ip_addr_ignores_argument() {
+        let instrument = connect_default_fixture();
+        for arg in [None, Some("x")] {
+            assert!(matches!(
+                resolve_operation("stringin", "IP_ADDR", arg, &instrument).unwrap(),
+                Operation::IpAddr
+            ));
+        }
+    }
+
+    #[test]
+    fn numeric_arguments_read_like_c_atoi() {
         let instrument = connect_default_fixture();
         assert!(matches!(
-            resolve_operation("stringin", "IP_ADDR", None, &instrument).unwrap(),
-            Operation::IpAddr
+            resolve_operation("stringin", "ERROR", Some("2x"), &instrument).unwrap(),
+            Operation::ErrorText(2)
         ));
-        assert!(resolve_operation("stringin", "IP_ADDR", Some("x"), &instrument).is_err());
+        assert!(matches!(
+            resolve_operation("bi", "MODULE_PRESENCE", Some("3z"), &instrument).unwrap(),
+            Operation::ModulePresence(3)
+        ));
+        assert!(matches!(
+            resolve_operation("mbbi", "ALARM", Some("1.2"), &instrument).unwrap(),
+            Operation::Alarm(_, 2)
+        ));
+        assert!(resolve_operation("mbbi", "ALARM", Some("1.2x"), &instrument).is_err());
     }
 
     #[test]
@@ -1143,5 +1252,165 @@ mod tests {
 
         let received = device_thread.join().unwrap();
         assert_eq!(received.last().unwrap(), "FData,1\r\n");
+    }
+
+    /// C ao init_record returns 2 with the seeded VAL defined; bo returns 0
+    /// so the record converts the RVAL the dset left.
+    #[test]
+    fn init_status_is_c_ao_two_and_bo_zero() {
+        use epics_rs::base::server::device_support::DeviceUdf;
+        let f = factory(registry_with("gm10dev", connect_default_fixture()));
+        let init = |record_type: &'static str, out: &'static str| {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp: DTYP,
+                inp: "",
+                out,
+            };
+            let mut device = f(&ctx).unwrap();
+            device.init(&mut FakeRecord::new(record_type)).unwrap()
+        };
+        assert_eq!(
+            init("ao", "gm10dev VAL:W1"),
+            DeviceInitOutcome::DoNotConvert(DeviceUdf::Defined)
+        );
+        assert_eq!(init("bo", "gm10dev CHAN_TRIG"), DeviceInitOutcome::ok());
+    }
+
+    #[test]
+    fn bo_val_init_derives_val_from_seeded_rval() {
+        use crate::cache::ChannelType;
+        use epics_rs::base::runtime::task::test_block_on;
+        use epics_rs::base::server::database::PvDatabase;
+        use epics_rs::base::server::device_support::wire_device_to_record;
+        use epics_rs::base::server::records::bo::BoRecord;
+        test_block_on(async {
+            let instrument = connect_default_fixture();
+            crate::instrument::test_support::set_signal(
+                &instrument,
+                2,
+                ChannelType::OutputBinary,
+                1,
+            );
+            let f = factory(registry_with("gm10dev", instrument));
+            let ctx = DeviceSupportContext {
+                record_type: "bo",
+                dtyp: DTYP,
+                inp: "",
+                out: "gm10dev VAL:2",
+            };
+            let device = f(&ctx).unwrap();
+            let db = PvDatabase::new();
+            db.add_record("TEST", Box::new(BoRecord::new(0)))
+                .await
+                .unwrap();
+            let rec = db.get_record("TEST").unwrap();
+            rec.write().common.dtyp = DTYP.into();
+            // The framework's init, so boRecord's status-0 RVAL->VAL arm runs.
+            wire_device_to_record(&db, &rec, device);
+            let inst = rec.read();
+            assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Enum(1)));
+            assert_eq!(inst.record.get_field("RVAL"), Some(EpicsValue::ULong(1)));
+        });
+    }
+
+    #[test]
+    fn bo_error_clear_device_error_reply_is_not_a_write_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = crate::instrument::test_support::default_init_responses();
+        responses.push(b"E1,205:1:12\r\n".to_vec());
+        responses.push(ascii_frame(b"junk 'Something broke' junk"));
+        let device_thread = spawn_fake_device(listener, responses);
+        let instrument = crate::instrument::Instrument::connect_to(addr).unwrap();
+        let f = factory(registry_with("gm10dev", instrument));
+        let ctx = DeviceSupportContext {
+            record_type: "bo",
+            dtyp: DTYP,
+            inp: "",
+            out: "gm10dev ERROR_CLEAR",
+        };
+        let mut device = f(&ctx).unwrap();
+        let mut record = FakeRecord::new("bo").with("VAL", EpicsValue::Enum(1));
+        device.init(&mut record).unwrap();
+        device.write(&mut record).unwrap();
+        let received = device_thread.join().unwrap();
+        assert_eq!(received.last().unwrap(), "_ERR,205\r\n");
+    }
+
+    #[test]
+    fn bo_write_begin_queues_the_command_and_stays_pending() {
+        use epics_rs::base::server::database::{DeviceDone, PvDatabase};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = crate::instrument::test_support::default_init_responses();
+        responses.push(one_record_fdata_binary());
+        let device_thread = spawn_fake_device(listener, responses);
+        let instrument = crate::instrument::Instrument::connect_to(addr).unwrap();
+        let f = factory(registry_with("gm10dev", instrument));
+        let ctx = DeviceSupportContext {
+            record_type: "bo",
+            dtyp: DTYP,
+            inp: "",
+            out: "gm10dev CHAN_TRIG",
+        };
+        let mut device = f(&ctx).unwrap();
+        let mut record = FakeRecord::new("bo");
+        device.init(&mut record).unwrap();
+        record.fields.insert("VAL", EpicsValue::Enum(1));
+        let db = PvDatabase::new();
+        let done = DeviceDone::new(
+            &db,
+            &epics_rs::base::server::record::RecordInstance::new(
+                "GM10:TRIG",
+                epics_rs::base::server::records::bo::BoRecord::default(),
+            ),
+        );
+        let start = device
+            .write_begin(&mut record, &DeviceDoneSource::new(&done))
+            .unwrap();
+        assert!(matches!(start, WriteStart::Pending));
+        // VAL drops to 0 on the completing pass, not while PACT holds.
+        assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(1)));
+        device.async_write_completed(&mut record);
+        assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
+        let received = device_thread.join().unwrap();
+        assert_eq!(received.last().unwrap(), "FData,1\r\n");
+    }
+
+    #[test]
+    fn failed_init_is_silent_and_inert() {
+        use tokio::sync::mpsc::error::TryRecvError;
+        let registry = registry_with("gm10dev", connect_default_fixture());
+        let f = factory(registry);
+        for (record_type, inp, out) in [
+            ("ai", "gm10dev VAL:7", ""),
+            ("ai", "nosuchdev VAL:1", ""),
+            ("bo", "", "gm10dev BOGUS"),
+        ] {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp: DTYP,
+                inp,
+                out,
+            };
+            let mut device = f(&ctx).unwrap();
+            let mut record = FakeRecord::new(record_type);
+            assert_eq!(
+                device.init(&mut record).unwrap(),
+                DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched)
+            );
+            let mut io_intr = device.io_intr_receiver();
+            assert_eq!(io_intr.is_some(), record_type == "ai");
+            if let Some(rx) = io_intr.as_mut() {
+                assert!(rx.try_recv().is_err_and(|e| e == TryRecvError::Empty));
+            }
+            if record_type == "ai" {
+                assert!(!device.read(&mut record).unwrap().did_compute());
+            } else {
+                device.write(&mut record).unwrap();
+            }
+            assert!(record.fields.is_empty(), "{inp}{out}");
+        }
     }
 }

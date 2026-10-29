@@ -1,0 +1,3 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+SPiiPlusSetup(1, 60)
+SPiiPlusConfig(0, "serial61", "BUF")

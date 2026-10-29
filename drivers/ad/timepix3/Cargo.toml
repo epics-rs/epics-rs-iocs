@@ -6,11 +6,15 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "ad"] }
+epics-libcom-rs = { workspace = true }
 parking_lot = "0.12"
-log = "0.4"
 # nlohmann/json in the C driver.
-serde_json = "1.0"
+serde_json = { workspace = true }
 # cpr (libcurl) in the C driver. Serval speaks plain HTTP, so no TLS stack.
 ureq = { version = "3.3", default-features = false }
 # The background threads run on the ad-core runtime's tokio threads.
 tokio = { version = "1", features = ["rt", "time", "macros"] }
+
+[target.'cfg(unix)'.dependencies]
+# close(2), whose error std's File drop discards.
+libc = "0.2"

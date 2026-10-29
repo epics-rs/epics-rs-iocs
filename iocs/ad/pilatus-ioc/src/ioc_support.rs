@@ -14,7 +14,7 @@ use ad_pilatus::{PilatusRuntime, create_pilatus_detector};
 /// memory-bounded and the worker threads are plain OS threads); they are
 /// accepted and ignored so the C `st.cmd` line works unchanged.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADPILATUS", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADPILATUS", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<PilatusRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -60,13 +60,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             ],
             "pilatusDetectorConfig portName camserverPort maxSizeX maxSizeY \
              [maxBuffers] [maxMemory] [priority] [stackSize]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let camserver_port = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("camserverPort required".into()),
                 };
                 let size_x = match &args[2] {
@@ -84,20 +84,19 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 100_000_000,
                 };
 
-                println!(
-                    "pilatusDetectorConfig: port={port_name}, camserver={camserver_port}, \
-                     size={size_x}x{size_y}, maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let det = create_pilatus_detector(
-                    &port_name,
-                    &camserver_port,
-                    size_x,
-                    size_y,
-                    max_memory,
-                )?;
+                let det =
+                    create_pilatus_detector(&claim, &camserver_port, size_x, size_y, max_memory)?;
 
-                epics_rs::asyn::asyn_record::register_port(&port_name, det.port_handle().clone())
+                claim
+                    .publish(
+                        det.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
                     .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

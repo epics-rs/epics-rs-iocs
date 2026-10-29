@@ -4,43 +4,34 @@
 //! through the controller because they arrive as asyn parameters rather than
 //! `asynMotorAxis` methods).
 //!
-//! ## Units (deviation, deliberate)
-//!
-//! C carries a per-axis `scale_` (set by `pmacSetAxisScale`) and multiplies every
-//! position read by it, dividing every demand by it — with `motorRecord.MRES`
-//! configured as `1/scale`. The two cancel at the record boundary: the record
-//! sends `demand_egu`, C divides by `scale`, the controller moves
-//! `demand_egu/scale` counts, and the readback is multiplied back up. The
-//! asyn-rs motor interface speaks EGU on both sides, and the record's MRES
-//! already performs exactly that division, so a driver-side scale would apply it
-//! twice. This port therefore works in controller counts (`scale = 1`) and
-//! `pmacSetAxisScale` is not provided: an IOC that used it sets `MRES` in the
-//! record instead. Silently accepting the command and ignoring it would be worse
-//! than not having it.
-//!
-//! ## Initial status (framework gap, not ported)
+//! ## Initial status (framework gap, half ported)
 //!
 //! `pmacAxis::getAxisInitialStatus` reads `I{n}13 I{n}14 I{n}30 I{n}31 I{n}33`
 //! and pushes the controller's soft limits and PID gains *up* into the motor
 //! record (`motorHighLimit_`, `motorLowLimit_`, `motorPGain_` …). The asyn-rs
 //! [`MotorStatus`] carries no limit or gain readback fields, so there is no
-//! boundary to push them through; [`crate::protocol::parse_initial_status`] is
-//! kept and tested for the day there is one. The record-to-controller direction
-//! (`set_high_limit` / `set_low_limit`) is ported and does work.
+//! boundary to push them through. The exchange is still sent, because only its
+//! success sets C's `motorStatusHasEncoder_`. The record-to-controller
+//! direction (`set_high_limit` / `set_low_limit`) is ported and does work.
 
 use std::sync::{Arc, Mutex};
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PollFailure, PortSets, StatusWrite,
+};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
-use crate::controller::{PmacController, pmac_err};
+use crate::controller::{ErrorThrottle, PmacController, pmac_err};
 use crate::cs_groups::{AxisPoll, DeferredMove};
 use crate::protocol::{
     AXIS_GENERAL_PROB2, CID_GEOBRICK, CID_PMAC, IX24_LIMITS_DISABLED, STATUS1_AMP_ENABLED,
     STATUS1_DESIRED_VELOCITY_ZERO, STATUS1_MOTOR_ON, STATUS1_NEG_LIMIT_SET, STATUS1_POS_LIMIT_SET,
     STATUS2_ERR_FOLLOW_ERR, STATUS2_HOME_COMPLETE, STATUS2_IN_POSITION, may_disable_limits,
-    parse_axis_status, parse_cid, parse_home_flags_geobrick, parse_home_flags_pmac, parse_ix24,
+    parse_axis_status, parse_cid, parse_home_flags_geobrick, parse_home_flags_pmac,
+    parse_initial_status, parse_ix24,
 };
 
 pub struct PmacAxis {
@@ -55,6 +46,12 @@ pub struct PmacAxis {
     /// C `amp_enabled_` / `fatal_following_`, read by `stop`.
     amp_enabled: bool,
     fatal_following: bool,
+    /// What the constructor set on the axis's status (pmacAxis.cpp:144-148).
+    status_writes: Vec<StatusWrite>,
+    /// C's per-axis `printErrors` / `printNextError_`.
+    throttle: ErrorThrottle,
+    /// The controller-port steps not yet handed to the owner.
+    sets: PortSets,
 }
 
 /// Lock the shared controller. Taken as a free function on the field rather than
@@ -75,15 +72,18 @@ fn enable_limits_command(axis: i32) -> String {
 /// The velocity/acceleration preamble every move shares (C `vel_buff` +
 /// `acc_buff`): `I{n}22` is the jog speed in counts/msec, `I{n}20` the jog
 /// acceleration *time* in msec.
-fn speed_preamble(axis: i32, velocity: f64, acceleration: f64) -> String {
+fn speed_preamble(axis: i32, scale: f64, velocity: f64, acceleration: f64) -> String {
     let mut preamble = String::new();
     if velocity != 0.0 {
-        preamble.push_str(&format!("I{axis}22={:.6} ", velocity.abs() / 1000.0));
+        preamble.push_str(&format!(
+            "I{axis}22={:.6} ",
+            CFloat(velocity.abs() / (scale * 1000.0))
+        ));
     }
     if velocity != 0.0 && acceleration != 0.0 {
         preamble.push_str(&format!(
             "I{axis}20={:.6} ",
-            (velocity / acceleration).abs() * 1000.0
+            CFloat((velocity / acceleration).abs() * 1000.0)
         ));
     }
     preamble
@@ -91,6 +91,44 @@ fn speed_preamble(axis: i32, velocity: f64, acceleration: f64) -> String {
 
 impl PmacAxis {
     pub fn new(controller: Arc<Mutex<PmacController>>, axis: i32) -> Self {
+        // C getAxisInitialStatus; axis 0 skips it.
+        let mut sets = PortSets::default();
+        let has_encoder = axis != 0 && {
+            let c = lock(&controller);
+            let status = c
+                .write_read(&format!(
+                    "I{axis}13 I{axis}14 I{axis}30 I{axis}31 I{axis}33"
+                ))
+                .ok()
+                .and_then(|resp| parse_initial_status(&resp));
+            if let Some(status) = &status {
+                sets = c.initial_status_sets(axis, status);
+            } else {
+                c.trace().print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "pmacAxis::getAxisInitialStatus: Error: initial status poll failed on \
+                         axis {axis}.\n"
+                    ),
+                );
+                c.trace().print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "pmacAxis::pmacAxis: getAxisInitialStatus failed to return asynSuccess. \
+                         Controller: {}, Axis: {axis}.\n",
+                        c.port_name()
+                    ),
+                );
+            }
+            status.is_some()
+        };
+        let mut status_writes = Vec::new();
+        if has_encoder {
+            status_writes.push(StatusWrite::HasEncoder(true));
+        }
+        if axis != 0 {
+            status_writes.push(StatusWrite::GainSupport(true));
+        }
         Self {
             controller,
             axis,
@@ -99,6 +137,9 @@ impl PmacAxis {
             previous_direction: false,
             amp_enabled: false,
             fatal_following: false,
+            status_writes,
+            throttle: ErrorThrottle::default(),
+            sets,
         }
     }
 
@@ -115,8 +156,9 @@ impl PmacAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let axis = self.axis;
-        let mut command = speed_preamble(axis, velocity, acceleration);
         let mut controller = lock(&self.controller);
+        let scale = f64::from(controller.axis_scale(axis));
+        let mut command = speed_preamble(axis, scale, velocity, acceleration);
 
         if controller.moves_deferred() {
             let distance = if relative {
@@ -127,7 +169,7 @@ impl PmacAxis {
             controller.defer_move(
                 axis,
                 DeferredMove {
-                    position,
+                    position: position / scale,
                     relative,
                     time_ms: if velocity != 0.0 {
                         (distance / velocity).abs() * 1000.0
@@ -138,7 +180,10 @@ impl PmacAxis {
             );
         } else {
             let jog = if relative { "J^" } else { "J=" };
-            command.push_str(&format!("#{axis} {jog}{position:.2}"));
+            command.push_str(&format!(
+                "#{axis} {jog}{position:.2}",
+                position = CFloat(position / scale)
+            ));
         }
 
         if self.limits_disabled {
@@ -167,8 +212,21 @@ impl PmacAxis {
         forward: bool,
     ) -> AsynResult<String> {
         let axis = self.axis;
-        let cid = parse_cid(&controller.write_read("cid")?)
-            .ok_or_else(|| pmac_err("could not read controller type (cid)"))?;
+        let error = |what: std::fmt::Arguments<'_>| {
+            controller.trace().print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "Controller {} Addr {axis}. pmacAxis::home: ERROR {what}.\n",
+                    controller.port_name()
+                ),
+            );
+            pmac_err(what.to_string())
+        };
+        let cid = controller
+            .reply("cid")
+            .map_err(|_| error(format_args!("Reading Controller Type")))?;
+        // C's controller_type stays 0 when the reply does not scan.
+        let cid = parse_cid(&cid).unwrap_or(0);
 
         let flags = match cid {
             CID_GEOBRICK => {
@@ -180,17 +238,27 @@ impl PmacAxis {
                     let n = axis - 4;
                     format!("I71{n}2 I71{n}3 i{axis}24 i{axis}23 i{axis}26")
                 };
-                parse_home_flags_geobrick(&controller.write_read(&query)?)
+                controller
+                    .reply(&query)
+                    .ok()
+                    .as_deref()
+                    .and_then(parse_home_flags_geobrick)
             }
             CID_PMAC => {
                 // VME Turbo PMAC 2: the flags live on the MACRO station.
                 let ms = ((axis - 1) / 2) * 4 + (axis - 1) % 2;
                 let query = format!("ms{ms},i912 ms{ms},i913 i{axis}24 i{axis}23 i{axis}26");
-                parse_home_flags_pmac(&controller.write_read(&query)?)
+                controller
+                    .reply(&query)
+                    .ok()
+                    .as_deref()
+                    .and_then(parse_home_flags_pmac)
             }
-            other => return Err(pmac_err(format!("unknown controller type cid={other}"))),
+            other => {
+                return Err(error(format_args!("Unknown controller type = {other}")));
+            }
         };
-        let flags = flags.ok_or_else(|| pmac_err("could not read home flags"))?;
+        let flags = flags.ok_or_else(|| error(format_args!("Cannot Read Home Flags")))?;
 
         // The record's home velocity wins over the axis's configured i{n}23.
         let home_velocity = if velocity != 0.0 {
@@ -203,14 +271,47 @@ impl PmacAxis {
             self.limits_disabled = true;
             Ok(format!(" i{axis}24=i{axis}24|$20000"))
         } else {
-            // C logs this at ASYN_TRACE_ERROR and homes anyway: an axis that does
-            // not home onto a limit simply keeps its limits.
+            // C homes anyway: an axis that does not home onto a limit simply
+            // keeps its limits. C prints `type` in hex and `flag` in decimal.
+            controller.trace().print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "pmacAxis::home: Error: Cannot disable limits to home PMAC controller {}, \
+                     axis {axis}, type:{:x}, flag:${}, vel:{home_velocity:.6}, mode:0x{:x}, \
+                     offset: {}\n",
+                    controller.port_name(),
+                    flags.home_type as i32,
+                    flags.home_flag as i32,
+                    flags.flag_mode,
+                    flags.home_offset as i32,
+                    home_velocity = CFloat(home_velocity)
+                ),
+            );
             Ok(String::new())
         }
     }
 }
 
 impl AsynMotor for PmacAxis {
+    /// C `pmacAxis::getAxisStatus` sets no status bit on a failed read; the
+    /// failure goes to the controller's `PMAC_C_COMMSERROR`.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
+    /// pmacAxis.cpp:100.
+    fn constructor_calls_param_callbacks(&self) -> bool {
+        true
+    }
+
+    fn take_port_sets(&mut self) -> PortSets {
+        std::mem::take(&mut self.sets)
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -242,7 +343,13 @@ impl AsynMotor for PmacAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let axis = self.axis;
-        let mut command = speed_preamble(axis, velocity, acceleration);
+        let controller = lock(&self.controller);
+        let mut command = speed_preamble(
+            axis,
+            f64::from(controller.axis_scale(axis)),
+            velocity,
+            acceleration,
+        );
         let jog = if velocity < 0.0 { "J-" } else { "J+" };
         command.push_str(&format!("#{axis} {jog}"));
         if self.limits_disabled {
@@ -250,7 +357,7 @@ impl AsynMotor for PmacAxis {
             command.push_str(&enable_limits_command(axis));
             self.limits_disabled = false;
         }
-        lock(&self.controller).command(&command)
+        controller.command(&command)
     }
 
     /// C `pmacAxis::home`.
@@ -277,7 +384,9 @@ impl AsynMotor for PmacAxis {
         let mut controller = lock(&self.controller);
         controller.clear_deferred(axis);
         if self.amp_enabled || self.fatal_following {
-            controller.abort_cs_motion(axis)?;
+            // C drops the CS abort's status and still sends the jog stop
+            // (pmacAxis.cpp:381-390).
+            let _ = controller.abort_cs_motion(axis);
             controller.command(&format!("#{axis} J/ M{axis}40=1"))
         } else {
             // Just set the in-position bit, so the record stops waiting.
@@ -291,11 +400,15 @@ impl AsynMotor for PmacAxis {
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
         let controller = lock(&self.controller);
-        let counts = (position * 32.0 + 0.5).floor() as i64;
+        let scale = f64::from(controller.axis_scale(axis));
+        let counts = (position * 32.0 / scale + 0.5).floor() as i64;
 
         controller.command(&format!(
             "#{axis}K M{axis}61={counts}*I{axis}08 M{axis}62={counts}*I{axis}08"
         ))?;
+        // C defect not copied: with no encoder axis `command` still holds
+        // this J/ when the closing write meant for the encoder's J/ runs, so
+        // C sends it twice (pmacController.cpp:423-427, :448-449, :469-471).
         controller.command(&format!("#{axis}J/"))?;
 
         let config = controller.axis_config(axis);
@@ -324,27 +437,43 @@ impl AsynMotor for PmacAxis {
     /// C `pmacController::writeFloat64`, `motorHighLimit_` branch.
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
-        lock(&self.controller).command(&format!("I{axis}13={position:.6}"))
+        let controller = lock(&self.controller);
+        let scale = f64::from(controller.axis_scale(axis));
+        controller.command(&format!(
+            "I{axis}13={position:.6}",
+            position = CFloat(position / scale)
+        ))
     }
 
     /// C `pmacController::writeFloat64`, `motorLowLimit_` branch.
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
-        lock(&self.controller).command(&format!("I{axis}14={position:.6}"))
+        let controller = lock(&self.controller);
+        let scale = f64::from(controller.axis_scale(axis));
+        controller.command(&format!(
+            "I{axis}14={position:.6}",
+            position = CFloat(position / scale)
+        ))
     }
 
-    /// C `pmacController::writeInt32`, `motorDeferMoves_` branch. Every axis of a
-    /// controller shares one deferral flag, so the first axis the record defers
-    /// arms the controller and the release executes all the pending moves.
+    /// C `pmacController::writeInt32`, `motorDeferMoves_` branch, which C takes
+    /// at every address: the motor record defers with 1, releases with 0.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
-        lock(&self.controller).set_deferred_moves(defer)
+        let mut controller = lock(&self.controller);
+        let release = controller.set_moves_deferred(i32::from(defer));
+        if let Some(value) = release.comms_error {
+            self.sets.append(controller.comms_error_sets(value));
+        }
+        release.status
     }
 
     /// C `pmacAxis::getAxisStatus`.
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let axis = self.axis;
         let mut controller = lock(&self.controller);
         let config = controller.axis_config(axis);
+        let controller_problem = controller.controller_problem();
+        let print_errors = self.throttle.print_errors();
 
         // One round trip for the two status words, the following error and the
         // position. With an open-loop axis the encoder position comes back from
@@ -355,9 +484,30 @@ impl AsynMotor for PmacAxis {
         } else {
             format!("#{axis} ? F P")
         };
-        let response = controller.write_read(&query)?;
-        let (status1, status2, first, second) = parse_axis_status(&response)
-            .ok_or_else(|| pmac_err(format!("could not parse axis status: {response:?}")))?;
+        // C parses `response` whatever the status and prints it on failure:
+        // a failed read leaves what it delivered there (pmacAxis.cpp:493-499).
+        let (response, read) = controller.exchange(&query);
+        let parsed = read.is_ok().then(|| parse_axis_status(&response)).flatten();
+        let Some((status1, status2, first, second)) = parsed else {
+            // C's poll returns before the read with no low-level user.
+            if controller.connected() {
+                let status = read.as_ref().map_or_else(|e| e.c_status_code(), |()| 0);
+                controller.trace().print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "drvPmacAxisGetStatus: not all status values returned. Status: \
+                         {status}\nCommand :{query}\nResponse:{response}"
+                    ),
+                );
+            }
+            // C keeps every status parameter but the power-on bit, which it
+            // reads from the zeroed status words, and returns success
+            // (pmacAxis.cpp:494-498, 606-613).
+            self.amp_enabled = false;
+            out.powered = false;
+            out.moving = false;
+            return Ok(());
+        };
 
         // Closed-loop axis: the third field is the following error and the
         // position is the sum of the two. Open-loop axis: they are the two
@@ -367,6 +517,8 @@ impl AsynMotor for PmacAxis {
         } else {
             (first + second, second)
         };
+        let scale = f64::from(controller.axis_scale(axis));
+        let (position, encoder_position) = (position * scale, encoder_position * scale);
 
         let direction = if position > self.previous_position {
             true
@@ -382,18 +534,33 @@ impl AsynMotor for PmacAxis {
         self.amp_enabled = flags.amp_enabled;
         self.fatal_following = flags.following_error;
 
-        let mut problem = flags.general_problem;
-        if controller.controller_problem() {
-            problem = true;
-        }
+        let mut problem = flags.general_problem || controller_problem;
         // If the hardware limits are off and *we* did not turn them off to home,
         // something else did: that is a problem the operator must see.
         if !config.limits_check_disabled
             && !self.limits_disabled
-            && let Some(ix24) = parse_ix24(&controller.write_read(&format!("i{axis}24"))?)
+            // C skips the check when the read fails (pmacAxis.cpp:578-579).
+            && let Some(ix24) = controller
+                .write_read(&format!("i{axis}24"))
+                .ok()
+                .as_deref()
+                .and_then(parse_ix24)
             && ix24 & IX24_LIMITS_DISABLED != 0
         {
             problem = true;
+            if print_errors {
+                controller.trace().print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "*** WARNING *** Limits are disabled on controller {}, axis {axis}\n",
+                        controller.port_name()
+                    ),
+                );
+                self.throttle.print_next = false;
+            }
+        }
+        if !problem {
+            self.throttle.print_next = true;
         }
 
         // The home move that borrowed the limits has finished: give them back.
@@ -413,22 +580,22 @@ impl AsynMotor for PmacAxis {
             },
         );
 
-        Ok(MotorStatus {
-            position,
-            encoder_position,
-            done: flags.done,
-            moving: flags.moving,
-            high_limit: flags.high_limit,
-            low_limit: flags.low_limit,
-            homed: flags.home_complete,
-            powered: flags.amp_enabled,
-            problem,
-            direction,
-            slip_stall: flags.following_error,
-            gain_support: true,
-            has_encoder: true,
-            ..MotorStatus::default()
-        })
+        out.set_position(position);
+        out.set_encoder_position(encoder_position);
+        out.direction = direction;
+        // C paces on `!done` (pmacAxis.cpp:538-542) and sets
+        // motorStatusMoving_ from the velocity/amp bits (548).
+        out.moving = !flags.done;
+        out.done = flags.done;
+        out.high_limit = flags.high_limit;
+        out.homed = flags.home_complete;
+        out.msta_moving = flags.moving;
+        out.low_limit = flags.low_limit;
+        out.slip_stall = flags.following_error;
+        out.gain_support = true;
+        out.problem = problem;
+        out.powered = flags.amp_enabled;
+        Ok(())
     }
 }
 
@@ -479,26 +646,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_constructor_calls_back() {
+        let controller = PmacController::new("pmacCallback", "pmacCallbackLow", 0, None);
+        let axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        assert!(axis.constructor_calls_param_callbacks());
+    }
+
+    /// pmacAxis.cpp:493-498, :617: a failed status read sets only the
+    /// power-on bit, so it keeps the DONE a move start cleared.
+    #[test]
+    fn a_failed_status_read_keeps_the_done_a_move_cleared() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fail = Arc::new(AtomicBool::new(false));
+        let fails = fail.clone();
+        let (_rig, handle) = motor_common::testing::LineRig::failing(
+            "pmacFailedRead",
+            |cmd| {
+                match cmd.trim_end() {
+                    "#1 ? F P" => "880000000401\r0\r1000\r\x06",
+                    "i124" => "$0\r\x06",
+                    _ => "100\r-100\r2000\r1000\r500\r\x06",
+                }
+                .into()
+            },
+            move |cmd| fails.load(Ordering::SeqCst) && cmd.trim_end() == "#1 ? F P",
+        );
+        let controller =
+            PmacController::new("pmacFailedReadCtl", "pmacFailedRead", 0, Some(handle));
+        let mut axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        let user = AsynUser::new(0).with_addr(1);
+        let mut status = MotorStatus::default();
+        axis.poll(&user, &mut status).unwrap();
+        assert!(status.done && status.powered);
+        // What the poll loop does when a move starts.
+        status.done = false;
+        fail.store(true, Ordering::SeqCst);
+        axis.poll(&user, &mut status).unwrap();
+        assert!(!status.done && !status.powered);
+    }
+
+    /// pmacAxis.cpp:148: the constructor sets GAIN_SUPPORT on a real axis
+    /// whether or not the initial status read succeeded.
+    #[test]
+    fn the_constructor_sets_gain_support_without_an_initial_status() {
+        let controller = PmacController::new("pmacCtorGain", "pmacCtorGainLow", 0, None);
+        let mut axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        assert_eq!(axis.take_status_writes(), [StatusWrite::GainSupport(true)]);
+    }
+
+    #[test]
     fn speed_preamble_matches_c_format() {
         // I{n}22 is counts/msec, I{n}20 the acceleration time in msec.
         assert_eq!(
-            speed_preamble(3, 2000.0, 1000.0),
+            speed_preamble(3, 1.0, 2000.0, 1000.0),
             "I322=2.000000 I320=2000.000000 "
         );
     }
 
     #[test]
     fn speed_preamble_omits_unset_fields() {
-        assert_eq!(speed_preamble(1, 0.0, 500.0), "");
+        assert_eq!(speed_preamble(1, 1.0, 0.0, 500.0), "");
         // C only emits the acceleration when a velocity came with it: I{n}20 is
         // a *time*, and without the velocity there is nothing to divide by.
-        assert_eq!(speed_preamble(1, 1000.0, 0.0), "I122=1.000000 ");
+        assert_eq!(speed_preamble(1, 1.0, 1000.0, 0.0), "I122=1.000000 ");
     }
 
     #[test]
     fn speed_preamble_uses_the_magnitude_of_a_reverse_jog() {
         assert_eq!(
-            speed_preamble(2, -2000.0, 1000.0),
+            speed_preamble(2, 1.0, -2000.0, 1000.0),
             "I222=2.000000 I220=2000.000000 "
         );
     }
@@ -518,6 +734,15 @@ mod tests {
         assert!(!flags.done);
         assert!(flags.moving);
         assert!(flags.amp_enabled);
+    }
+
+    /// Desired velocity zero but not yet in position: C keeps polling fast
+    /// (`!done`) with motorStatusMoving_ already 0.
+    #[test]
+    fn a_settling_axis_is_not_done_and_not_moving() {
+        let flags = decode_axis_status(MOVING1 | STATUS1_DESIRED_VELOCITY_ZERO, 0, false);
+        assert!(!flags.done);
+        assert!(!flags.moving);
     }
 
     #[test]

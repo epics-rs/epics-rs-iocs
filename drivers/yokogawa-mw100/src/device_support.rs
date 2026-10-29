@@ -2,7 +2,7 @@
 //! (`devMW100_{ai,ao,bi,bo,mbbi,mbbo,longin,stringin}.c`).
 //!
 //! Structurally this mirrors `yokogawa-gm10`'s `device_support.rs` (one
-//! shared DTYP string, [`resolve_operation`] as the single owner of every
+//! shared DTYP string, `resolve_operation` as the single owner of every
 //! `devMW100_*.c::init_record`'s command/address grammar, lazy resolution in
 //! `DeviceSupport::init` since only there is the concrete record type
 //! known) — but the grammar itself is NOT a copy of GM10's: every rule below
@@ -12,21 +12,24 @@
 //! - `ao`'s address switch (`devMW100_ao.c::init_record`) has no `A` (Math)
 //!   arm at all, falling through to `default: return 1` — unlike GM10's
 //!   `ao`, which accepts Math at `init_record` and only rejects it later, in
-//!   `write()`. [`parse_address_no_math`] rejects Math structurally at
+//!   `write()`. `parse_address_no_math` rejects Math structurally at
 //!   resolve time to match.
 //! - IOSCANPVT routing goes through ONE family-generic dispatcher,
 //!   `mw100_channel_io_handler(dq, family, channel)` (`drvMW100.c:1643-1660`),
 //!   shared by `ai`'s VAL (all 4 families) and `mbbi`'s VAL_STATUS/ALARM/
 //!   ALARMS/CH_STATUS's *read* path (Signal-or-Math only) — Signal routes
 //!   dynamically via [`Instrument::signal_interrupt_category`], Math is
-//!   always Input, Comm/Const are always Output. [`family_category`] is that
+//!   always Input, Comm/Const are always Output. `family_category` is that
 //!   one dispatcher, reused everywhere the C source reuses it.
 
+use crate::codec;
 use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::sync::mpsc::{self, Receiver, Sender};
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
 };
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
@@ -35,6 +38,12 @@ use std::sync::Arc;
 
 /// Upstream DTYP shared by every MW100 record type (`mw100Support.dbd`).
 pub const DTYP: &str = "Yokogawa MW100";
+
+/// Every devMW100_* dset's `init(pass)` (devMW100_ai.c:73-79 and siblings):
+/// pass 0 `scanIoInit`s the dset's `dummy_ioscanpvt`. The port has no
+/// per-source I/O Intr list to create; the dummy is the per-record channel
+/// `io_intr_receiver` hands an invalid input record.
+pub fn dev_init(_after: bool) {}
 
 /// One variant per legal `(record type, link command)` pair validated by a
 /// `devMW100_*.c::init_record`.
@@ -156,21 +165,19 @@ fn require_no_arg(arg: Option<&str>, record_type: &str, command: &str) -> CaResu
 }
 
 /// `MODULE_PRESENCE` (bi) / `MODULE_STRING` (stringin): a bare 0-5 module
-/// index (`MAX_MODULES`), with the same defensive first-byte digit check
+/// index (`MAX_MODULES`), with the same first-byte 0-5 check
 /// every `devMW100_*.c::init_record` applies before `atoi` (`atoi` returning
 /// 0 on a non-numeric argument is ambiguous with the genuinely valid address
 /// 0).
 fn parse_module_index(arg: Option<&str>, record_type: &str, command: &str) -> CaResult<usize> {
     let arg = arg.ok_or_else(|| bad(record_type, format!("{command} requires an argument")))?;
-    if !arg.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+    if !matches!(arg.as_bytes().first(), Some(b'0'..=b'5')) {
         return Err(bad(
             record_type,
-            format!("{command} argument must be numeric"),
+            format!("{command} argument must start with 0-5"),
         ));
     }
-    let i: i32 = arg
-        .parse()
-        .map_err(|_| bad(record_type, format!("{command} argument must be numeric")))?;
+    let i = codec::c_atoi(arg.as_bytes());
     if !(0..=5).contains(&i) {
         return Err(bad(
             record_type,
@@ -481,13 +488,11 @@ fn resolve_operation(
             "ERROR" => {
                 let arg =
                     arg.ok_or_else(|| bad(record_type, "ERROR requires a channel argument"))?;
-                let channel: u32 = arg
-                    .parse()
-                    .map_err(|_| bad(record_type, "ERROR channel must be numeric"))?;
-                if channel == 0 || channel > 3 {
+                let channel = codec::c_atoi(arg.as_bytes());
+                if !(1..=3).contains(&channel) {
                     return Err(bad(record_type, "ERROR channel must be 1-3"));
                 }
-                Ok(Operation::ErrorText(channel))
+                Ok(Operation::ErrorText(channel as u32))
             }
             "UNIT" => Ok(Operation::Unit(parse_signal_or_math_address(
                 arg,
@@ -515,9 +520,9 @@ fn resolve_operation(
 }
 
 /// Records whose C `init_record` seeds an initial value directly
-/// (`devMW100_ao.c`: VAL via `mw100_analog_get`; `devMW100_bo.c`: RVAL via
-/// `mw100_binary_get`, asymmetrically — VAL is left at the record's default
-/// since C's `init_record` never calls `process()`).
+/// (`devMW100_ao.c:146-150`: VAL via `mw100_analog_get`;
+/// `devMW100_bo.c:178-185`: RVAL via `mw100_binary_get`, then `return 0`,
+/// so `boRecord.c:156-161` sets `val = rval ? 1 : 0`).
 fn seed_initial_value(
     instrument: &Instrument,
     op: Operation,
@@ -537,6 +542,20 @@ fn seed_initial_value(
     Ok(())
 }
 
+fn resolve_link(registry: &Registry, link_text: &str, record: &mut dyn Record) -> Option<Resolved> {
+    let parsed = link::parse_link(link_text)?;
+    let instrument = registry.get(parsed.device)?;
+    let op = resolve_operation(
+        record.record_type(),
+        parsed.command,
+        parsed.arg,
+        &instrument,
+    )
+    .ok()?;
+    seed_initial_value(&instrument, op, record).ok()?;
+    Some(Resolved { instrument, op })
+}
+
 struct Resolved {
     instrument: Arc<Instrument>,
     op: Operation,
@@ -550,6 +569,9 @@ pub struct MwDevice {
     link_text: String,
     is_io_intr: bool,
     resolved: Option<Resolved>,
+    record_type: &'static str,
+    /// Senders of the dummy IOSCANPVT an invalid input record scans on.
+    dummy_scan: Vec<Sender<()>>,
 }
 
 impl MwDevice {
@@ -559,13 +581,9 @@ impl MwDevice {
             link_text,
             is_io_intr: false,
             resolved: None,
+            record_type: "",
+            dummy_scan: Vec::new(),
         }
-    }
-
-    fn resolved(&self) -> CaResult<&Resolved> {
-        self.resolved
-            .as_ref()
-            .ok_or_else(|| CaError::LinkError("MW100 device support not initialized".into()))
     }
 }
 
@@ -574,44 +592,60 @@ impl DeviceSupport for MwDevice {
         DTYP
     }
 
-    // Every C init_record failure here is a bare `return 1` — no pact,
-    // no alarm (`devMW100_ai.c`) — so the record scans on: that is the
-    // `Err` shape, and every `?` below keeps it.
+    // C init_record failures are a silent `return 1` that leave
+    // `invalid_flag` set (devMW100_ai.c:94-160): read/write then return 0
+    // and get_ioint_info hands out a dummy IOSCANPVT. `resolved == None` is
+    // that flag; `Err` would print and alarm.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        let parsed = link::parse_link(&self.link_text).ok_or_else(|| {
-            CaError::LinkError(format!("malformed MW100 link: '{}'", self.link_text))
-        })?;
-        let instrument = self.registry.get(parsed.device).ok_or_else(|| {
-            CaError::LinkError(format!("unknown MW100 device '{}'", parsed.device))
-        })?;
-        let op = resolve_operation(
-            record.record_type(),
-            parsed.command,
-            parsed.arg,
-            &instrument,
-        )?;
-        seed_initial_value(&instrument, op, record)?;
-        self.resolved = Some(Resolved { instrument, op });
-        Ok(DeviceInitOutcome::Live)
+        self.record_type = record.record_type();
+        self.resolved = resolve_link(&self.registry, &self.link_text, record);
+        let Some(Resolved { op, .. }) = self.resolved else {
+            // C's status 1 converts nothing (boRecord.c:159, mbboRecord.c:143).
+            return Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched));
+        };
+        // devMW100_ao.c:146-152 returns 2 and defines the VAL it seeded.
+        if record.record_type() == "ao" {
+            let udf = match op {
+                Operation::AnalogSet(_) => DeviceUdf::Defined,
+                _ => DeviceUdf::Untouched,
+            };
+            return Ok(DeviceInitOutcome::DoNotConvert(udf));
+        }
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn set_record_info(&mut self, _name: &str, scan: ScanType) {
         self.is_io_intr = matches!(scan, ScanType::IoIntr);
     }
 
-    fn io_intr_receiver(&mut self) -> Option<epics_rs::base::runtime::sync::mpsc::Receiver<()>> {
-        let resolved = self.resolved.as_ref()?;
+    fn io_intr_receiver(&mut self) -> Option<Receiver<()>> {
+        let Some(resolved) = self.resolved.as_ref() else {
+            // The input dsets hand an invalid record `dummy_ioscanpvt`, which
+            // nothing requests (devMW100_ai.c:171-172); ao/bo/mbbo have no
+            // get_ioint_info at all.
+            if !matches!(
+                self.record_type,
+                "ai" | "bi" | "longin" | "mbbi" | "stringin"
+            ) {
+                return None;
+            }
+            let (tx, rx) = mpsc::channel(1);
+            self.dummy_scan.push(tx);
+            return Some(rx);
+        };
         let category = operation_interrupt_category(resolved.op, &resolved.instrument)?;
         Some(resolved.instrument.register_interrupt(category))
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let Resolved { instrument, op } = self.resolved()?;
+        let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
+            return Ok(DeviceReadOutcome::ok());
+        };
         let is_io_intr = self.is_io_intr;
         match *op {
             Operation::AnalogVal(addr) => {
                 if !is_io_intr {
-                    instrument.channel_start(addr.family, addr.index)?;
+                    instrument.channel_start(addr.family, addr.index);
                 }
                 let v = instrument.analog_get(addr.family, addr.index);
                 record.put_field("VAL", EpicsValue::Double(v))?;
@@ -619,7 +653,7 @@ impl DeviceSupport for MwDevice {
             }
             Operation::IntegerVal(channel) => {
                 if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel)?;
+                    instrument.channel_start(ChannelFamily::Signal, channel);
                 }
                 let v = instrument.integer_get(channel);
                 record.put_field("VAL", EpicsValue::Long(v))?;
@@ -627,7 +661,7 @@ impl DeviceSupport for MwDevice {
             }
             Operation::BinaryVal(channel) => {
                 if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel)?;
+                    instrument.channel_start(ChannelFamily::Signal, channel);
                 }
                 let v = instrument.binary_get(channel);
                 record.put_field("RVAL", EpicsValue::ULong(v as u32))?;
@@ -750,81 +784,117 @@ impl DeviceSupport for MwDevice {
         }
     }
 
-    fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        let Resolved { instrument, op } = self.resolved()?;
-        match *op {
-            Operation::AnalogSet(addr) => {
-                let val = match record.get_field("VAL") {
-                    Some(EpicsValue::Double(v)) => v,
-                    _ => return Err(CaError::FieldNotFound("VAL".into())),
-                };
-                let command = match addr.family {
-                    ChannelFamily::Signal => Command::SetSignalOutput(addr.index, val),
-                    ChannelFamily::Comm => Command::SetComm(addr.index, val),
-                    ChannelFamily::Const => Command::SetConst(addr.index, val),
-                    ChannelFamily::Math => {
-                        unreachable!("ao resolve_operation rejects Math via parse_address_no_math")
-                    }
-                };
-                instrument.submit(command)?;
-            }
-            Operation::BinarySet(channel) => {
-                let on = match record.get_field("VAL") {
-                    Some(EpicsValue::Enum(v)) => v != 0,
-                    _ => return Err(CaError::FieldNotFound("VAL".into())),
-                };
-                instrument.submit(Command::SetBinaryOutput(channel, on))?;
-            }
-            Operation::InputTrig => instrument.submit(Command::ReadAllInputs)?,
-            Operation::OutputTrig => instrument.submit(Command::ReadAllOutputs)?,
-            Operation::InfoTrig => instrument.submit(Command::ReadAllInfos)?,
-            Operation::StatTrig => instrument.submit(Command::ReadStatus)?,
-            Operation::OpModeSet => {
-                let on = match record.get_field("VAL") {
-                    Some(EpicsValue::Enum(v)) => v != 0,
-                    _ => return Err(CaError::FieldNotFound("VAL".into())),
-                };
-                instrument.submit(Command::SetOpMode(on))?;
-            }
-            Operation::ErrorClearSet => instrument.submit(Command::ClearError)?,
-            Operation::AlarmAckSet => instrument.submit(Command::AcknowledgeAlarms)?,
-            Operation::ComputeCmdSet => {
-                let v = match record.get_field("VAL") {
-                    Some(EpicsValue::Enum(v)) => v as u8,
-                    _ => return Err(CaError::FieldNotFound("VAL".into())),
-                };
-                instrument.submit(Command::SetCompute(v))?;
-            }
-            Operation::AnalogVal(_)
-            | Operation::IntegerVal(_)
-            | Operation::BinaryVal(_)
-            | Operation::ModulePresence(_)
-            | Operation::SettingsMode
-            | Operation::MeasurementModeFlag
-            | Operation::ComputeModeFlag
-            | Operation::ErrorFlag
-            | Operation::AlarmFlag
-            | Operation::ModuleSpeed(_)
-            | Operation::ChStatus(_)
-            | Operation::ChMode(_)
-            | Operation::ValStatus(_)
-            | Operation::Alarm(_, _)
-            | Operation::Alarms(_)
-            | Operation::IpAddr
-            | Operation::ModuleModel(_)
-            | Operation::ModuleNumber(_)
-            | Operation::ModuleCode(_)
-            | Operation::ModuleString(_)
-            | Operation::Unit(_)
-            | Operation::ErrorText(_)
-            | Operation::Expr(_) => {
-                return Err(CaError::LinkError(
-                    "MW100 device support: this operation is read-only".into(),
-                ));
-            }
-        }
+    // write_begin always answers, so the framework never calls this.
+    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         Ok(())
     }
+
+    // C write_* queues the command with the record and returns PACT; the
+    // queue thread re-processes the record once it ran (drvMW100.c:1418-1424).
+    fn write_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
+        let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
+            return Ok(WriteStart::Completed);
+        };
+        let command = output_command(*op, record)?;
+        instrument.submit_write(command, done.device_done());
+        Ok(WriteStart::Pending)
+    }
+
+    // devMW100_bo.c:192-197: the completing pass drops a REC_TRIG or
+    // REC_ERROR bo's VAL back to 0.
+    fn async_write_completed(&mut self, record: &mut dyn Record) {
+        if let Some(Resolved {
+            op:
+                Operation::InputTrig
+                | Operation::OutputTrig
+                | Operation::InfoTrig
+                | Operation::StatTrig
+                | Operation::ErrorClearSet,
+            ..
+        }) = self.resolved
+        {
+            let _ = record.put_field("VAL", EpicsValue::Enum(0));
+        }
+    }
+}
+
+fn output_command(op: Operation, record: &dyn Record) -> CaResult<Command> {
+    let command = match op {
+        Operation::AnalogSet(addr) => {
+            let val = match record.get_field("VAL") {
+                Some(EpicsValue::Double(v)) => v,
+                _ => return Err(CaError::FieldNotFound("VAL".into())),
+            };
+            match addr.family {
+                ChannelFamily::Signal => Command::SetSignalOutput(addr.index, val),
+                ChannelFamily::Comm => Command::SetComm(addr.index, val),
+                ChannelFamily::Const => Command::SetConst(addr.index, val),
+                ChannelFamily::Math => {
+                    unreachable!("ao resolve_operation rejects Math via parse_address_no_math")
+                }
+            }
+        }
+        Operation::BinarySet(channel) => {
+            let on = match record.get_field("VAL") {
+                Some(EpicsValue::Enum(v)) => v != 0,
+                _ => return Err(CaError::FieldNotFound("VAL".into())),
+            };
+            Command::SetBinaryOutput(channel, on)
+        }
+        Operation::InputTrig => Command::ReadAllInputs,
+        Operation::OutputTrig => Command::ReadAllOutputs,
+        Operation::InfoTrig => Command::ReadAllInfos,
+        Operation::StatTrig => Command::ReadStatus,
+        Operation::OpModeSet => {
+            let v = match record.get_field("VAL") {
+                Some(EpicsValue::Enum(v)) => i32::from(v),
+                _ => return Err(CaError::FieldNotFound("VAL".into())),
+            };
+            Command::SetOpMode(v)
+        }
+        Operation::ErrorClearSet => Command::ClearError,
+        Operation::AlarmAckSet => Command::AcknowledgeAlarms,
+        Operation::ComputeCmdSet => {
+            // An mbbo without states serves VAL as DBF_USHORT.
+            let v = match record.get_field("VAL") {
+                Some(EpicsValue::Enum(v) | EpicsValue::UShort(v)) => i32::from(v),
+                _ => return Err(CaError::FieldNotFound("VAL".into())),
+            };
+            Command::SetCompute(v)
+        }
+        Operation::AnalogVal(_)
+        | Operation::IntegerVal(_)
+        | Operation::BinaryVal(_)
+        | Operation::ModulePresence(_)
+        | Operation::SettingsMode
+        | Operation::MeasurementModeFlag
+        | Operation::ComputeModeFlag
+        | Operation::ErrorFlag
+        | Operation::AlarmFlag
+        | Operation::ModuleSpeed(_)
+        | Operation::ChStatus(_)
+        | Operation::ChMode(_)
+        | Operation::ValStatus(_)
+        | Operation::Alarm(_, _)
+        | Operation::Alarms(_)
+        | Operation::IpAddr
+        | Operation::ModuleModel(_)
+        | Operation::ModuleNumber(_)
+        | Operation::ModuleCode(_)
+        | Operation::ModuleString(_)
+        | Operation::Unit(_)
+        | Operation::ErrorText(_)
+        | Operation::Expr(_) => {
+            return Err(CaError::LinkError(
+                "MW100 device support: this operation is read-only".into(),
+            ));
+        }
+    };
+    Ok(command)
 }
 
 /// Dynamic device-support factory for `DTYP == "Yokogawa MW100"`. Registered
@@ -859,12 +929,19 @@ pub fn factory(
 mod tests {
     use super::*;
     use crate::instrument::test_support::{
-        ascii_frame, cf0_one_input_analog_module, connect_default_fixture, empty_fo1_binary,
+        ascii_frame, connect_default_fixture, connect_fixture_then, empty_fo1_binary,
         fe1_one_signal_channel, is0_all_zero, one_record_fd1_binary, spawn_fake_device,
     };
-    use epics_rs::base::server::record::FieldDesc;
+    use epics_rs::base::runtime::task::test_block_on;
+    use epics_rs::base::server::database::{DeviceDone, PvDatabase};
+    use epics_rs::base::server::device_support::wire_device_to_record;
+    use epics_rs::base::server::recgbl::alarm_status;
+    use epics_rs::base::server::record::{AlarmSeverity, FieldDesc};
+    use epics_rs::base::server::records::bo::BoRecord;
+    use epics_rs::base::server::records::mbbo::MbboRecord;
     use std::collections::HashMap;
     use std::net::TcpListener;
+    use std::time::Duration;
 
     struct FakeRecord {
         record_type: &'static str,
@@ -877,11 +954,6 @@ mod tests {
                 record_type,
                 fields: HashMap::new(),
             }
-        }
-
-        fn with(mut self, name: &'static str, value: EpicsValue) -> Self {
-            self.fields.insert(name, value);
-            self
         }
     }
 
@@ -913,7 +985,7 @@ mod tests {
 
     fn registry_with(name: &str, instrument: Arc<Instrument>) -> Arc<Registry> {
         let registry = Arc::new(Registry::new());
-        registry.insert(name.to_string(), instrument).unwrap();
+        registry.insert_connected(name, instrument);
         registry
     }
 
@@ -1173,6 +1245,29 @@ mod tests {
         ));
         assert!(resolve_operation("stringin", "ERROR", Some("0"), &instrument).is_err());
         assert!(resolve_operation("stringin", "ERROR", Some("4"), &instrument).is_err());
+        // atoi: trailing text is ignored.
+        assert!(matches!(
+            resolve_operation("stringin", "ERROR", Some("3x"), &instrument).unwrap(),
+            Operation::ErrorText(3)
+        ));
+    }
+
+    #[test]
+    fn module_index_is_first_byte_gated_atoi() {
+        let instrument = connect_default_fixture();
+        assert!(matches!(
+            resolve_operation("stringin", "MODULE_STRING", Some("2x"), &instrument).unwrap(),
+            Operation::ModuleString(2)
+        ));
+        assert!(matches!(
+            resolve_operation("stringin", "MODULE_STRING", Some("004"), &instrument).unwrap(),
+            Operation::ModuleString(4)
+        ));
+        // First byte must be '0'..'5' (devMW100_stringin.c:122), even when
+        // atoi would land in range.
+        assert!(resolve_operation("stringin", "MODULE_STRING", Some("6"), &instrument).is_err());
+        assert!(resolve_operation("stringin", "MODULE_STRING", Some("+1"), &instrument).is_err());
+        assert!(resolve_operation("stringin", "MODULE_STRING", Some("06"), &instrument).is_err());
     }
 
     #[test]
@@ -1240,6 +1335,40 @@ mod tests {
         device.init(&mut record).unwrap();
     }
 
+    #[test]
+    fn failed_init_is_silent_and_record_is_a_no_op() {
+        let registry = registry_with("mw100dev", connect_default_fixture());
+        let f = factory(registry);
+        for (record_type, inp, out) in [
+            ("ai", "nosuchdev VAL:1", ""),
+            ("ai", "mw100dev VAL:7", ""),
+            ("bo", "", "mw100dev INP_TRIG:1"),
+            ("ai", "", ""),
+        ] {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp: DTYP,
+                inp,
+                out,
+            };
+            let mut device = f(&ctx).unwrap();
+            let mut record = FakeRecord::new(record_type);
+            assert!(matches!(
+                device.init(&mut record),
+                Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched))
+            ));
+            assert_eq!(
+                device.io_intr_receiver().is_some(),
+                record_type == "ai",
+                "{record_type}: dummy IOSCANPVT only for an input dset"
+            );
+            let outcome = device.read(&mut record).unwrap();
+            assert!(!outcome.did_compute());
+            device.write(&mut record).unwrap();
+            assert!(record.fields.is_empty());
+        }
+    }
+
     // -- end-to-end: read (cache-only, I/O Intr scan) --
 
     #[test]
@@ -1262,44 +1391,252 @@ mod tests {
         assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Double(1.234)));
     }
 
-    // -- end-to-end: write (one live wire round trip) --
+    // -- end-to-end: write (queued, completed by the actor) --
 
-    #[test]
-    fn bo_inp_trig_write_end_to_end_submits_read_all_inputs() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let responses = vec![
-            b"E0\r\n".to_vec(), // BO1
-            cf0_one_input_analog_module(),
-            is0_all_zero(),
-            fe1_one_signal_channel(),
-            ascii_frame(b"E"),              // FO0
-            ascii_frame(b"E"),              // AO?
-            ascii_frame(b"E"),              // XD?
-            ascii_frame(b"E"),              // SO?
-            one_record_fd1_binary(),        // FD1 (initial load)
-            empty_fo1_binary(),             // FO1 (initial load)
-            ascii_frame(b"xxx001,-7.5\nE"), // CM?
-            ascii_frame(b"xxx01,12.5\nE"),  // SK?
-            one_record_fd1_binary(),        // FD1 triggered by INP_TRIG write
-        ];
-        let device_thread = spawn_fake_device(listener, responses);
-        let instrument = crate::instrument::Instrument::connect_to(addr).unwrap();
+    /// A record named `TEST` carrying `link` as its OUT, wired to a device
+    /// whose fixture then answers `extra`.
+    async fn wired_output(
+        record: Box<dyn Record>,
+        link: &str,
+        extra: Vec<Vec<u8>>,
+    ) -> (PvDatabase, std::thread::JoinHandle<Vec<String>>) {
+        let (instrument, device_thread) = connect_fixture_then(extra);
+        (wire_record(record, link, instrument).await, device_thread)
+    }
 
-        let registry = registry_with("mw100dev", instrument);
-        let f = factory(registry);
+    async fn wire_record(
+        record: Box<dyn Record>,
+        link: &str,
+        instrument: Arc<Instrument>,
+    ) -> PvDatabase {
+        let f = factory(registry_with("mw100dev", instrument));
         let ctx = DeviceSupportContext {
-            record_type: "bo",
+            record_type: record.record_type(),
             dtyp: DTYP,
             inp: "",
-            out: "mw100dev INP_TRIG",
+            out: link,
         };
-        let mut device = f(&ctx).unwrap();
-        let mut record = FakeRecord::new("bo").with("VAL", EpicsValue::Enum(1));
-        device.init(&mut record).unwrap();
-        device.write(&mut record).unwrap();
+        let device = f(&ctx).unwrap();
+        // C `callbackInit`: no build arms the bands for a bare database.
+        epics_rs::base::runtime::task::background_arm();
+        let db = PvDatabase::new();
+        db.add_record("TEST", record).await.unwrap();
+        let rec = db.get_record("TEST").unwrap();
+        rec.write().common.dtyp = DTYP.into();
+        // The framework's init, so the record's own status-0 arm runs.
+        wire_device_to_record(&db, &rec, device);
+        db
+    }
 
-        let received = device_thread.join().unwrap();
-        assert_eq!(received.last().unwrap(), "FD1,001,A300\r\n");
+    #[test]
+    fn relay_bo_seeds_val_from_the_relay_state() {
+        test_block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let cf0 = b"0xxxMX125-MKC-M10xxxMX125-MKC-M10x\r\nE";
+            // FO1: channel 1 relay on.
+            let mut fo1 = vec![b'E', b'B', 0, 0];
+            fo1.extend_from_slice(&30u32.to_le_bytes());
+            fo1.extend_from_slice(&[0u8; 20]);
+            fo1.extend_from_slice(&1u16.to_le_bytes());
+            fo1.extend_from_slice(&[0u8; 2]);
+            fo1.extend_from_slice(&1u32.to_le_bytes());
+            fo1.extend_from_slice(&[0u8; 2]);
+            let responses = vec![
+                b"E0\r\n".to_vec(),
+                ascii_frame(cf0),
+                is0_all_zero(),
+                fe1_one_signal_channel(),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                empty_fo1_binary(), // FD1: no input records
+                fo1,
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+            ];
+            let device_thread = spawn_fake_device(listener, responses);
+            let instrument = Instrument::connect_to(addr).unwrap();
+            device_thread.join().unwrap();
+            let db = wire_record(Box::new(BoRecord::new(0)), "mw100dev VAL:1", instrument).await;
+            let rec = db.get_record("TEST").unwrap();
+            let inst = rec.read();
+            assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Enum(1)));
+            assert_eq!(inst.record.get_field("RVAL"), Some(EpicsValue::ULong(1)));
+        });
+    }
+
+    /// Put `val` and wait for the queued write to end the cycle.
+    async fn put_and_complete(db: &PvDatabase, val: EpicsValue) -> (u16, AlarmSeverity) {
+        db.put_record_field_from_ca_no_notify("TEST", "VAL", val)
+            .await
+            .unwrap();
+        for _ in 0..500 {
+            {
+                let rec = db.get_record("TEST").unwrap();
+                let inst = rec.read();
+                if !inst.is_processing() {
+                    return (inst.common.stat, inst.common.sevr);
+                }
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the queued write never completed");
+    }
+
+    #[test]
+    fn bo_inp_trig_write_is_queued_and_completes() {
+        test_block_on(async {
+            let (db, device_thread) = wired_output(
+                Box::new(BoRecord::new(0)),
+                "mw100dev INP_TRIG",
+                vec![one_record_fd1_binary()],
+            )
+            .await;
+            let (_, sevr) = put_and_complete(&db, EpicsValue::Enum(1)).await;
+            assert_eq!(sevr, AlarmSeverity::NoAlarm);
+            assert_eq!(
+                device_thread.join().unwrap().last().unwrap(),
+                "FD1,001,A300\r\n"
+            );
+        });
+    }
+
+    #[test]
+    fn write_begin_queues_the_write() {
+        test_block_on(async {
+            let (instrument, device_thread) = connect_fixture_then(vec![one_record_fd1_binary()]);
+            let f = factory(registry_with("mw100dev", instrument));
+            let ctx = DeviceSupportContext {
+                record_type: "bo",
+                dtyp: DTYP,
+                inp: "",
+                out: "mw100dev INP_TRIG",
+            };
+            let mut device = f(&ctx).unwrap();
+            let mut record = FakeRecord::new("bo");
+            device.init(&mut record).unwrap();
+            record.fields.insert("VAL", EpicsValue::Enum(1));
+            let db = PvDatabase::new();
+            let cell = DeviceDone::new(
+                &db,
+                &epics_rs::base::server::record::RecordInstance::new(
+                    "TEST",
+                    epics_rs::base::server::records::bo::BoRecord::default(),
+                ),
+            );
+            let start = device
+                .write_begin(&mut record, &DeviceDoneSource::new(&cell))
+                .unwrap();
+            assert!(matches!(start, WriteStart::Pending));
+            // VAL drops to 0 on the completing pass, not while PACT holds.
+            assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(1)));
+            device.async_write_completed(&mut record);
+            assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
+            assert_eq!(
+                device_thread.join().unwrap().last().unwrap(),
+                "FD1,001,A300\r\n"
+            );
+        });
+    }
+
+    #[test]
+    fn trigger_and_error_clear_reset_val_alarm_ack_does_not() {
+        test_block_on(async {
+            for (link, reply, expect) in [
+                ("mw100dev INP_TRIG", one_record_fd1_binary(), 0),
+                ("mw100dev OUT_TRIG", empty_fo1_binary(), 0),
+                ("mw100dev ERROR_CLEAR", b"E0\r\n".to_vec(), 0),
+                ("mw100dev OPMODE", b"E0\r\n".to_vec(), 1),
+            ] {
+                let (db, device_thread) =
+                    wired_output(Box::new(BoRecord::new(0)), link, vec![reply]).await;
+                put_and_complete(&db, EpicsValue::Enum(1)).await;
+                device_thread.join().unwrap();
+                let rec = db.get_record("TEST").unwrap();
+                let val = rec.read().record.get_field("VAL");
+                assert_eq!(val, Some(EpicsValue::Enum(expect)), "{link}");
+            }
+        });
+    }
+
+    #[test]
+    fn compute_cmd_out_of_range_sends_nothing_and_completes() {
+        test_block_on(async {
+            // mw100_system.template's ComputationSet defines its states.
+            let mut record = MbboRecord::new(0);
+            record
+                .put_field("ZRST", EpicsValue::String("Start".into()))
+                .unwrap();
+            let (db, device_thread) = wired_output(
+                Box::new(record),
+                "mw100dev COMPUTE_CMD",
+                vec![b"E0\r\n".to_vec()],
+            )
+            .await;
+            let (_, sevr) = put_and_complete(&db, EpicsValue::Enum(4)).await;
+            assert_eq!(sevr, AlarmSeverity::NoAlarm);
+            put_and_complete(&db, EpicsValue::Enum(2)).await;
+            let received = device_thread.join().unwrap();
+            assert_eq!(received.last().unwrap(), "EX2\r\n");
+            assert!(!received.iter().any(|l| l.starts_with("EX4")));
+        });
+    }
+
+    #[test]
+    fn compute_cmd_without_states_writes() {
+        test_block_on(async {
+            let (db, device_thread) = wired_output(
+                Box::new(MbboRecord::new(0)),
+                "mw100dev COMPUTE_CMD",
+                vec![b"E0\r\n".to_vec()],
+            )
+            .await;
+            let (_, sevr) = put_and_complete(&db, EpicsValue::UShort(1)).await;
+            assert_eq!(sevr, AlarmSeverity::NoAlarm);
+            assert_eq!(device_thread.join().unwrap().last().unwrap(), "EX1\r\n");
+        });
+    }
+
+    #[test]
+    fn device_error_reply_does_not_alarm_the_write() {
+        test_block_on(async {
+            let (db, device_thread) = wired_output(
+                Box::new(BoRecord::new(0)),
+                "mw100dev ERROR_CLEAR",
+                vec![b"E1 205 x\r\n".to_vec()],
+            )
+            .await;
+            let (stat, sevr) = put_and_complete(&db, EpicsValue::Enum(1)).await;
+            assert_eq!(
+                (stat, sevr),
+                (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm)
+            );
+            assert_eq!(device_thread.join().unwrap().last().unwrap(), "CE0\r\n");
+        });
+    }
+
+    /// C ao init_record returns 2 with the seeded VAL defined; bo returns 0
+    /// so the record converts the RVAL the dset left.
+    #[test]
+    fn init_status_is_c_ao_two_and_bo_zero() {
+        use epics_rs::base::server::device_support::DeviceUdf;
+        let f = factory(registry_with("mw100dev", connect_default_fixture()));
+        let init = |record_type: &'static str, out: &'static str| {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp: DTYP,
+                inp: "",
+                out,
+            };
+            let mut device = f(&ctx).unwrap();
+            device.init(&mut FakeRecord::new(record_type)).unwrap()
+        };
+        assert_eq!(
+            init("ao", "mw100dev VAL:K1"),
+            DeviceInitOutcome::DoNotConvert(DeviceUdf::Defined)
+        );
+        assert_eq!(init("bo", "mw100dev INP_TRIG"), DeviceInitOutcome::ok());
     }
 }

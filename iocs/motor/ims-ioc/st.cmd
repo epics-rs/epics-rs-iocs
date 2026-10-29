@@ -10,8 +10,8 @@
 #============================================================
 
 epicsEnvSet("P",      "ims:")
-epicsEnvSet("MPORT",  "M06")
-epicsEnvSet("IPPORT", "imsAsyn")
+epicsEnvSet("MPORT",  "M1")
+epicsEnvSet("IPPORT", "P1")
 epicsEnvSet("HOST",   "192.168.1.60:2101")
 epicsEnvSet("DEVNAME", "")
 
@@ -20,23 +20,25 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "9600")
 
-# IMS framing: queries reply terminated by "\n"; the driver owns the output
-# terminator (\r\n, or \r/\n for a Lexium MDrive), so only the input EOS is set
-# here. Do NOT set an output EOS.
-asynOctetSetInputEos("$(IPPORT)", 0, "\n")
-
 # ---- IMS controller ----
-# ImsMDrivePlusCreateController(motorPort, ioPort, [deviceName], [movingPollMs],
-#                              [idlePollMs], [timeoutMs]). One axis; DTYP is the
-#                              motorPort string. Empty deviceName = no party mode.
-ImsMDrivePlusCreateController("$(MPORT)", "$(IPPORT)", "$(DEVNAME)", 100, 1000, 2000)
+# ImsMDrivePlusCreateController(motorPortName, IOPortName, devName,
+#                              movingPollPeriod, idlePollPeriod), periods in ms.
+#                              One axis; empty devName = no party mode.
+ImsMDrivePlusCreateController("$(MPORT)", "$(IPPORT)", "$(DEVNAME)", 100, 1000)
 
-# The single motor record. DTYP matches the motorPort.
-dbLoadRecords("$(IMS_IOC)/db/ims.template", "P=$(P),M=m1,MPORT=$(MPORT)")
+# motorUtil's records, the single axis's basic_asyn_motor.db, IMS_extra.db
+# and the IP port's asyn record, as C's st.cmd and MDrive-Eth.cmd load them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
+dbLoadTemplate("$(IMS_IOC)/db/motor.substitutions.ims", "P=$(P),PORT=$(MPORT)")
+dbLoadRecords("$(IMS_IOC)/db/IMS_extra.db", "P=$(P),R={Slt:1-Ax:T},PORT=$(MPORT),ADDR=0,TIMEOUT=1.0")
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R={MC:1}Asyn,PORT=$(IPPORT),ADDR=80,OMAX=100,IMAX=100")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
-#   camonitor ims:m1 ims:m1.RBV
-#   caput ims:m1 10000
+#   camonitor ims:1 ims:1.RBV
+#   caput ims:1 1

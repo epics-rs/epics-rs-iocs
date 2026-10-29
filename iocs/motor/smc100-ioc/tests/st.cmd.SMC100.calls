@@ -1,0 +1,2 @@
+# c-expansion of st.cmd.SMC100 over the C sources, its controller calls:
+SMC100CreateController("SMC100_1", "serial1", 1, 100, 0, 0.00005)

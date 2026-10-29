@@ -5,19 +5,24 @@
 use std::time::Duration;
 
 use ad_std_arrays_driver::create_nd_std_arrays;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDataView};
 use epics_rs::ad_core::plugin::channel::ndarray_channel;
 
 fn f64s(data: &NDDataBuffer) -> Vec<f64> {
-    match data {
-        NDDataBuffer::F64(v) => v.clone(),
+    match data.view() {
+        NDDataView::F64(v) => v.to_vec(),
         other => panic!("expected F64, got {:?}", other.data_type()),
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_waveform_write_is_published_as_an_ndarray() {
-    let rt = create_nd_std_arrays("NDSA_E2E", 0, 0).unwrap();
+    let rt = create_nd_std_arrays(
+        &epics_rs::asyn::registry::claim_port("NDSA_E2E").unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
     let handle = rt.port_handle().clone();
     let params = rt.params;
     let ndsa = rt.ndsa;
@@ -26,6 +31,11 @@ async fn a_waveform_write_is_published_as_an_ndarray() {
     rt.connect_downstream(sender);
 
     // Configure a 1-D Float64 array of length 8, non-append, OnUpdate.
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    handle
+        .write_int32(params.base.array_callbacks, 0, 1)
+        .await
+        .unwrap();
     handle
         .write_int32(params.base.data_type, 0, NDDataType::Float64 as u8 as i32)
         .await
@@ -54,7 +64,7 @@ async fn a_waveform_write_is_published_as_an_ndarray() {
 
     assert_eq!(array.dims.len(), 1);
     assert_eq!(array.dims[0].size, 8);
-    assert_eq!(f64s(&array.data), data);
+    assert_eq!(f64s(array.data()), data);
     assert_eq!(array.unique_id, 1);
 
     // Single image mode: acquisition self-clears after the complete array.
@@ -70,7 +80,12 @@ async fn a_waveform_write_is_published_as_an_ndarray() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn append_mode_publishes_a_growing_array_on_each_write() {
-    let rt = create_nd_std_arrays("NDSA_E2E_APPEND", 0, 0).unwrap();
+    let rt = create_nd_std_arrays(
+        &epics_rs::asyn::registry::claim_port("NDSA_E2E_APPEND").unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
     let handle = rt.port_handle().clone();
     let params = rt.params;
     let ndsa = rt.ndsa;
@@ -78,6 +93,11 @@ async fn append_mode_publishes_a_growing_array_on_each_write() {
     let (sender, mut receiver) = ndarray_channel("SINK", 8);
     rt.connect_downstream(sender);
 
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    handle
+        .write_int32(params.base.array_callbacks, 0, 1)
+        .await
+        .unwrap();
     handle
         .write_int32(params.base.data_type, 0, NDDataType::Float64 as u8 as i32)
         .await
@@ -110,7 +130,7 @@ async fn append_mode_publishes_a_growing_array_on_each_write() {
         .await
         .expect("timed out")
         .expect("closed");
-    assert_eq!(f64s(&first.data), vec![1.0, 2.0, 3.0, -1.0, -1.0, -1.0]);
+    assert_eq!(f64s(first.data()), vec![1.0, 2.0, 3.0, -1.0, -1.0, -1.0]);
 
     // Second append: elements 3..5.
     handle
@@ -121,6 +141,6 @@ async fn append_mode_publishes_a_growing_array_on_each_write() {
         .await
         .expect("timed out")
         .expect("closed");
-    assert_eq!(f64s(&second.data), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(f64s(second.data()), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     assert_eq!(second.unique_id, 2, "NDArrayCounter increments per publish");
 }

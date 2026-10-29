@@ -5,8 +5,24 @@
 .caucus/sessions/
 
 # autosave state written at runtime by create_monitor_set
-/iocs/*/autosave/
-/iocs/*/*/autosave/
+/iocs/*/autosave/*
+!/iocs/*/autosave/README
+# d435i keeps one save dir per camera prefix
+!/iocs/d435i-ioc/autosave/*/
+/iocs/d435i-ioc/autosave/*/*
+!/iocs/d435i-ioc/autosave/*/README
+# quadEM ships each IOC its autosave dir with a README placeholder, as C does
+/iocs/quadem/*/autosave/*
+!/iocs/quadem/*/autosave/README
+# so do the areaDetector IOCs, as C's iocBoot dirs do
+/iocs/ad/*/autosave/*
+!/iocs/ad/*/autosave/README
+# and the measComp IOCs, as C's iocBoot dirs do
+/iocs/meascomp/*/autosave/*
+!/iocs/meascomp/*/autosave/README.txt
+# and the motor IOCs whose C iocBoot autosaves
+/iocs/motor/*/autosave/*
+!/iocs/motor/*/autosave/README
 
 # procServ console log written at runtime by the systemd units
 /iocs/*/procServ-*.log

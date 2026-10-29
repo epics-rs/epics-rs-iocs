@@ -1,6 +1,7 @@
 pub mod driver;
 pub mod params;
 pub mod task;
+pub mod trace;
 pub mod types;
 
 pub use driver::{

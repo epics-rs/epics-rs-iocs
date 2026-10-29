@@ -21,12 +21,15 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use epics_rs::base::server::device_support::DeviceSupport;
+use epics_rs::base::server::device_support::{DeviceAlarm, DeviceSupport};
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::server::records::longout::LongoutRecord;
 use epics_rs::base::types::EpicsValue;
 
-use opcua::client::{Notification, ServerInfo, UaConnection, UaConnector};
+use opcua::client::{
+    CreatedSubscription, Identity, Notification, ServerInfo, SetupError, UaClient, UaConnection,
+    UaConnector,
+};
 use opcua::device_support::OpcuaDevice;
 use opcua::item::Leaf;
 use opcua::queue::{ConnectionStatus, ProcessReason, Update};
@@ -53,17 +56,36 @@ struct MockConnector(Arc<Mock>);
 
 #[async_trait]
 impl UaConnector for MockConnector {
-    async fn connect(&self, _config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn setup(&self, config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+        Ok(Box::new(MockClient(
+            self.0.clone(),
+            config.setup_identity(),
+        )))
+    }
+}
+
+struct MockClient(Arc<Mock>, Identity);
+
+#[async_trait]
+impl UaClient for MockClient {
+    fn identity(&self) -> &Identity {
+        &self.1
+    }
+    async fn connect(&mut self) -> Result<Arc<dyn UaConnection>, StatusCode> {
         Ok(self.0.clone())
     }
 }
 
 #[async_trait]
 impl UaConnection for Mock {
-    async fn read(&self, nodes: &[ReadValueId]) -> Result<Vec<DataValue>, StatusCode> {
-        self.calls.lock().reads.push(nodes.to_vec());
+    async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
+        let id = {
+            let mut calls = self.calls.lock();
+            calls.reads.push(nodes.to_vec());
+            calls.reads.len() as u32
+        };
         let values = self.values.lock();
-        Ok(nodes
+        let results = nodes
             .iter()
             .map(|node| {
                 if node.attribute_id == AttributeId::DataType as u32 {
@@ -82,12 +104,17 @@ impl UaConnection for Mock {
                     }
                 }
             })
-            .collect())
+            .collect();
+        (id, Ok(results))
     }
 
-    async fn write(&self, values: &[WriteValue]) -> Result<Vec<StatusCode>, StatusCode> {
-        self.calls.lock().writes.push(values.to_vec());
-        Ok(vec![StatusCode::Good; values.len()])
+    async fn write(&self, values: &[WriteValue]) -> (u32, Result<Vec<StatusCode>, StatusCode>) {
+        let mut calls = self.calls.lock();
+        calls.writes.push(values.to_vec());
+        (
+            calls.writes.len() as u32,
+            Ok(vec![StatusCode::Good; values.len()]),
+        )
     }
 
     async fn register_nodes(&self, nodes: &[NodeId]) -> Result<Vec<NodeId>, StatusCode> {
@@ -104,18 +131,21 @@ impl UaConnection for Mock {
 
     async fn create_subscription(
         &self,
-        _config: &SubscriptionConfig,
+        config: &SubscriptionConfig,
         _sink: mpsc::UnboundedSender<Notification>,
-    ) -> Result<u32, StatusCode> {
-        Ok(1)
+    ) -> Result<CreatedSubscription, StatusCode> {
+        Ok(CreatedSubscription {
+            id: 1,
+            revised_publishing_interval: config.publishing_interval,
+        })
     }
 
     async fn create_monitored_items(
         &self,
         _subscription_id: u32,
         items: Vec<async_opcua::types::MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode> {
-        Ok(vec![StatusCode::Good; items.len()])
+    ) -> Result<Vec<async_opcua::types::MonitoredItemCreateResult>, StatusCode> {
+        Ok(vec![Default::default(); items.len()])
     }
 
     async fn disconnect(&self) {}
@@ -129,8 +159,8 @@ fn offline() -> Arc<Registry> {
     struct Offline;
     #[async_trait]
     impl UaConnector for Offline {
-        async fn connect(&self, _config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
-            Err("no server".to_string())
+        async fn setup(&self, _config: &SessionConfig) -> Result<Box<dyn UaClient>, SetupError> {
+            Err(SetupError::new("no server"))
         }
     }
     let registry = Registry::new(Arc::new(Offline));
@@ -150,9 +180,10 @@ fn live(mock: &Arc<Mock>) -> Arc<Registry> {
 
 fn bind(registry: &Arc<Registry>, name: &str, record: &mut dyn Record, link: &str) -> OpcuaDevice {
     record.init_record(0).expect("the record initialises");
-    let mut device = OpcuaDevice::new(registry.clone(), link.to_string());
+    let mut device = OpcuaDevice::new(registry.clone(), link.to_string(), record.record_type());
     device.set_record_info(name, ScanType::IoIntr);
     device.init(record).expect("the link binds");
+    record.after_dset_init();
     device
 }
 
@@ -170,10 +201,20 @@ fn process(device: &mut OpcuaDevice, record: &mut OpcuaItemRecord) {
     record.process().expect("the record processes");
 }
 
+/// The pass an update's pulse brings: [`process`], armed and reconciled as
+/// `process_record_readback` does.
+fn pulse(device: &mut OpcuaDevice, record: &mut OpcuaItemRecord) {
+    device.arm_readback_callback();
+    process(device, record);
+    device.reconcile_readback_callback();
+}
+
 /// A put from a client: the field, then the `special()` the framework calls.
 fn put(record: &mut OpcuaItemRecord, field: &str, value: EpicsValue) {
     record.put_field(field, value).expect("the field takes it");
-    record.special(field, true).expect("special runs");
+    record
+        .special(field, true, &Default::default())
+        .expect("special runs");
 }
 
 fn up(leaf: &Arc<Mutex<Leaf>>) {
@@ -181,7 +222,7 @@ fn up(leaf: &Arc<Mutex<Leaf>>) {
 }
 
 fn queue(leaf: &Arc<Mutex<Leaf>>, reason: ProcessReason, status: StatusCode) {
-    leaf.lock().queue.push(Update::new(
+    leaf.lock().push(Update::new(
         reason,
         None,
         status,
@@ -200,12 +241,20 @@ async fn until(f: impl Fn() -> bool) {
 }
 
 /// Wait for the session's initial read of the item to reach the record, and take
-/// the update it queued — every test below is about what the record does *next*,
-/// so the queue must start from the state a live IOC reaches right after
-/// `iocInit`: connected, read once, nothing outstanding.
+/// every update queued up to it — the connectionLoss each item takes before its
+/// session connects (`SessionOpen62541.cpp:2701`), then the read's. Every test
+/// below is about what the record does *next*, so the queue must start from the
+/// state a live IOC reaches right after `iocInit`: connected, read once,
+/// nothing outstanding.
 async fn settled(mock: &Arc<Mock>, leaf: &Arc<Mutex<Leaf>>) {
     until(|| !mock.calls.lock().reads.is_empty()).await;
-    until(|| leaf.lock().queue.pop().is_some()).await;
+    until(|| {
+        matches!(
+            leaf.lock().pop(),
+            Some(update) if update.reason == ProcessReason::ReadComplete
+        )
+    })
+    .await;
 }
 
 // ------------------------------------------------------------------------- init
@@ -219,6 +268,46 @@ fn init_shows_the_session_the_link_named() {
     assert_eq!(record.sess, "S");
     assert_eq!(record.subs, "");
     assert!(record.binding().is_some());
+}
+
+/// `strncpy(prec->sess, .., MAX_STRING_SIZE)` (`opcuaItemRecord.cpp:67-70`).
+#[test]
+fn init_cuts_a_long_session_name_at_the_field_size() {
+    let name = format!("S{}", "x".repeat(44));
+    let registry = offline();
+    registry
+        .add_session(SessionConfig::new(&name, "opc.tcp://server:4840"))
+        .unwrap();
+    let mut record = OpcuaItemRecord::default();
+    bind(
+        &registry,
+        "ITEM",
+        &mut record,
+        &format!("{name} ns=2;s=Struct monitor=n"),
+    );
+
+    assert_eq!(
+        record.get_field("SESS"),
+        Some(EpicsValue::String(name.as_bytes()[..40].into()))
+    );
+}
+
+/// A DBF_STRING field holds bytes: a client's put that is not UTF-8 is kept as
+/// it came, as the C's `char[41]` keeps it.
+#[test]
+fn a_string_field_keeps_the_bytes_a_client_put() {
+    let mut record = OpcuaItemRecord::default();
+    let bytes = vec![0xff; 14];
+    for field in ["SESS", "SUBS", "STATTEXT"] {
+        record
+            .put_field(field, EpicsValue::String(bytes.clone().into()))
+            .expect("the field takes it");
+        assert_eq!(
+            record.get_field(field),
+            Some(EpicsValue::String(bytes.clone().into())),
+            "{field}"
+        );
+    }
 }
 
 #[test]
@@ -251,6 +340,76 @@ fn a_bini_the_database_set_is_not_overwritten_by_the_link() {
     assert_eq!(record.bini, 1);
 }
 
+// --------------------------------------------------------- one pass per update
+
+/// The item's pass, like every record's, wakes the record again when it leaves
+/// an update queued, and not when it takes the last one.
+#[test]
+fn an_item_pass_that_leaves_an_update_queued_wakes_the_record_again() {
+    let registry = offline();
+    let mut record = OpcuaItemRecord::default();
+    let mut device = bind(&registry, "ITEM", &mut record, "S ns=2;s=Struct monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf_of(&mut record);
+    up(&leaf);
+    leaf.lock().request_processing(ProcessReason::ReadFailure);
+    leaf.lock().request_processing(ProcessReason::WriteFailure);
+    assert!(wake.try_recv().is_ok(), "the first update wakes the record");
+    assert!(
+        wake.try_recv().is_err(),
+        "the second finds it already woken"
+    );
+
+    pulse(&mut device, &mut record);
+    assert!(wake.try_recv().is_ok(), "one update is still queued");
+
+    pulse(&mut device, &mut record);
+    assert!(wake.try_recv().is_err(), "nothing is left to wake for");
+}
+
+/// A pass no pulse brought (a put to VAL, a scan, a `.PROC`) is the C's
+/// `reason == none` (`devOpcua.cpp:1313`): DEFACTN acts, and the update stays
+/// queued for its pulse's pass.
+#[test]
+fn a_bare_process_leaves_a_queued_update_to_its_pulse() {
+    let registry = offline();
+    let mut record = OpcuaItemRecord::default();
+    let mut device = bind(&registry, "ITEM", &mut record, "S ns=2;s=Struct monitor=n");
+    let leaf = leaf_of(&mut record);
+    up(&leaf);
+    queue(&leaf, ProcessReason::ReadFailure, StatusCode::BadTimeout);
+
+    process(&mut device, &mut record);
+
+    assert_eq!(device.last_alarm(), None);
+    assert_eq!(leaf.lock().queue().len(), 1);
+}
+
+/// A pulse's pass that a put to READ took leaves the update it was for queued
+/// with no wake-up; the next update wakes the record for it.
+#[test]
+fn a_pulse_pass_a_read_put_took_leaves_its_wake_to_the_next_update() {
+    let registry = offline();
+    let mut record = OpcuaItemRecord::default();
+    let mut device = bind(&registry, "ITEM", &mut record, "S ns=2;s=Struct monitor=n");
+    let mut wake = device.io_intr_receiver().expect("the record has a wake-up");
+    let leaf = leaf_of(&mut record);
+    up(&leaf);
+    queue(&leaf, ProcessReason::ReadFailure, StatusCode::BadTimeout);
+    assert!(wake.try_recv().is_ok());
+
+    put(&mut record, "READ", EpicsValue::Char(1));
+    pulse(&mut device, &mut record);
+    assert_eq!(leaf.lock().queue().len(), 1, "the read took the pass");
+    assert!(wake.try_recv().is_err());
+
+    queue(&leaf, ProcessReason::WriteFailure, StatusCode::BadTimeout);
+    assert!(
+        wake.try_recv().is_ok(),
+        "the next update wakes for the first"
+    );
+}
+
 // ---------------------------------------------------------------------- failures
 
 #[test]
@@ -262,10 +421,17 @@ fn a_connection_loss_is_a_comm_alarm_and_leaves_the_record_undefined() {
     up(&leaf);
     queue(&leaf, ProcessReason::ConnectionLoss, StatusCode::Good);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     // COMM_ALARM, INVALID_ALARM.
-    assert_eq!(device.last_alarm(), Some((9, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 9,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert!(record.value_is_undefined());
 }
 
@@ -278,10 +444,17 @@ fn a_read_failure_is_a_read_alarm() {
     up(&leaf);
     queue(&leaf, ProcessReason::ReadFailure, StatusCode::BadTimeout);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     // READ_ALARM, INVALID_ALARM.
-    assert_eq!(device.last_alarm(), Some((1, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert!(record.value_is_undefined());
 }
 
@@ -294,10 +467,17 @@ fn a_write_failure_is_a_write_alarm() {
     up(&leaf);
     queue(&leaf, ProcessReason::WriteFailure, StatusCode::BadTimeout);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     // WRITE_ALARM, INVALID_ALARM.
-    assert_eq!(device.last_alarm(), Some((2, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 2,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert!(record.value_is_undefined());
 }
 
@@ -310,7 +490,14 @@ fn a_session_that_is_down_is_a_comm_alarm() {
     // No reason, and the session never came up.
     process(&mut device, &mut record);
 
-    assert_eq!(device.last_alarm(), Some((9, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 9,
+            sevr: 3,
+            msg: ""
+        })
+    );
 }
 
 // ------------------------------------------------------------------- the status
@@ -329,7 +516,7 @@ fn the_nodes_status_lands_in_statcode_and_stattext() {
     }
     queue(&leaf, ProcessReason::ReadComplete, StatusCode::Good);
 
-    process(&mut device, &mut record);
+    pulse(&mut device, &mut record);
 
     assert_eq!(record.statcode, StatusCode::BadNodeIdUnknown.bits());
     assert_eq!(record.stattext, "BadNodeIdUnknown");
@@ -345,11 +532,13 @@ fn the_nodes_status_lands_in_statcode_and_stattext() {
 
 #[tokio::test]
 async fn an_element_record_may_bind_before_the_item_record_it_belongs_to() {
-    // The framework wires device support in `HashMap` order, so this is the order
-    // half the runs will take. The item exists from whichever record binds first;
-    // the item record's binding is the one that gives it its node and its session.
+    // Every record attaches (and so declares itself) at load, before any init;
+    // the inits may then run in either order. The item exists from whichever
+    // record binds first; the item record's binding is the one that gives it its
+    // node and its session.
     let mock = Arc::new(Mock::default());
     let registry = live(&mock);
+    registry.declare_record("ITEM", "opcuaItem");
 
     let mut element = LongoutRecord::new(0);
     let mut element_device = bind(&registry, "EL", &mut element, "ITEM");
@@ -375,14 +564,65 @@ async fn an_element_record_may_bind_before_the_item_record_it_belongs_to() {
     assert_eq!(writes[0][0].value.value, Some(Variant::Int32(5)));
 }
 
-#[tokio::test]
-async fn an_element_record_whose_item_record_is_not_in_the_database_is_reported() {
-    // The C refuses the link at load; this port cannot tell "not bound yet" from
-    // "not in the database" until every record has bound, so `start` is where it
-    // is found. The element must not take the IOC down, and must not be adopted.
-    let registry = offline();
+/// Init an element record whose link names `target`, expecting C's refusal.
+fn refused(registry: &Arc<Registry>, target: &str) -> String {
     let mut element = LongoutRecord::new(0);
-    let device = bind(&registry, "EL", &mut element, "MISSING");
+    element.init_record(0).expect("the record initialises");
+    let mut device = OpcuaDevice::new(registry.clone(), target.to_string(), "longout");
+    device.set_record_info("EL", ScanType::IoIntr);
+    device
+        .init(&mut element)
+        .expect_err("linkParser.cpp refuses the link")
+        .to_string()
+}
+
+#[test]
+fn an_element_record_naming_no_opc_ua_record_is_refused() {
+    let registry = offline();
+    let err = refused(&registry, "MISSING");
+    assert!(
+        err.contains("unknown subscription/session/opcuaItemRecord 'MISSING'"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_element_record_naming_a_record_of_another_type_is_refused() {
+    let registry = offline();
+    registry.declare_record("AI", "ai");
+    let err = refused(&registry, "AI");
+    assert!(
+        err.contains("record 'AI' is not of type opcuaItem"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_element_record_naming_an_item_record_whose_init_failed_is_refused() {
+    let registry = offline();
+    let mut item = OpcuaItemRecord::default();
+    let mut item_device =
+        OpcuaDevice::new(registry.clone(), "NOSESSION ns=2;s=X".into(), "opcuaItem");
+    item_device.set_record_info("ITEM", ScanType::Passive);
+    item_device
+        .init(&mut item)
+        .expect_err("the item record names no session");
+
+    let err = refused(&registry, "ITEM");
+    assert!(
+        err.contains("opcuaItemRecord 'ITEM' was not initialized correctly"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn an_element_record_bound_before_its_item_record_failed_is_left_unadopted() {
+    // The element's init ran first, so only `start` can report it. It must not
+    // take the IOC down, and must not be adopted.
+    let registry = offline();
+    registry.declare_record("ITEM", "opcuaItem");
+    let mut element = LongoutRecord::new(0);
+    let device = bind(&registry, "EL", &mut element, "ITEM");
 
     registry.start();
 
@@ -494,9 +734,9 @@ async fn woc_immediate_sends_what_the_elements_have_already_written() {
 
     // Switching WOC to immediate sends the dirty element there and then — the
     // item asks its own record to process for a write (`requestWriteIfDirty`),
-    // and that request is the update the record's next process pass pops.
+    // and that request is the update its pulse's pass pops.
     put(&mut item, "WOC", EpicsValue::Enum(1));
-    process(&mut item_device, &mut item);
+    pulse(&mut item_device, &mut item);
 
     until(|| !mock.calls.lock().writes.is_empty()).await;
 }
@@ -515,7 +755,7 @@ async fn woc_immediate_with_nothing_dirty_sends_nothing() {
 
     put(&mut item, "WOC", EpicsValue::Enum(1));
     assert!(
-        leaf.lock().queue.pop().is_none(),
+        leaf.lock().pop().is_none(),
         "no element has written, so the item asks for no write"
     );
 

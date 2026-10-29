@@ -1,0 +1,12 @@
+# The basic_asyn_motor.db block of C's iocIms motor.substitutions.ims, P and
+# PORT from st.cmd. MDrive-Eth.cmd, which C's st.cmd runs, loads
+# ../../db/motor.db, which imsApp/Db/Makefile never builds, so C loads no
+# motor record; st.cmd.ims loads this file. Its IMS_extra.db block passes DEV,
+# AREA and LOC, which that file does not use; st.cmd loads IMS_extra.db as
+# MDrive-Eth.cmd does.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{M, DTYP,        ADDR, DESC,       EGU, DIR, VELO, VBAS,  ACCL, BDST, BVEL,  BACC, MRES,     PREC, DHLM, DLLM, INIT}
+{1, "asynMotor", 0,    "MDrive23", mm,  Pos, 3.0,  0.017, 2.0,  0,    0.017, 2.0,  0.000083, 4,    100,  -100, ""}
+}

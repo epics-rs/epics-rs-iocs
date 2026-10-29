@@ -8,14 +8,11 @@
 
 use std::time::Duration;
 
-use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
-use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
-use scaler974::connect::connect_octet;
 use scaler974::driver::Scaler974Driver;
 
 /// C `sendCommand`'s local `double timeout = 1.0` (`drvScaler974.cpp`) —
@@ -23,13 +20,22 @@ use scaler974::driver::Scaler974Driver;
 /// macro is dead code, see `driver`'s module doc).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// `scalerSupport.dbd`'s `device(scaler,INST_IO,devScalerAsyn,"Asyn Scaler")`.
+static SCALER_DEVICES: &[epics_rs::base::server::record::DevSup] =
+    &[epics_rs::base::server::record::DevSup {
+        name: "devScalerAsyn",
+        choice: "Asyn Scaler",
+        link_type: epics_rs::base::server::record::DbLinkType::InstIo,
+        dset: epics_rs::base::server::record::Dset::new(7, &[2, 4, 5, 6], false),
+    }];
+
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: scaler974-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: scaler974-ioc <st.cmd>");
         std::process::exit(1);
     };
 
@@ -40,7 +46,7 @@ async fn main() -> CaResult<()> {
     let scaler_dir = std::path::Path::new(epics_rs::scaler::SCALER_DB_DIR)
         .parent()
         .expect("SCALER_DB_DIR is <crate>/db");
-    epics_rs::base::runtime::env::set_default(
+    epics_rs::base::runtime::env::set_default_path(
         "SCALER",
         scaler_dir.to_str().expect("cargo paths are UTF-8"),
     );
@@ -65,99 +71,13 @@ async fn main() -> CaResult<()> {
     // script runs, so the put resolves against the record type's live device
     // menu instead of failing S_db_noRSET. (asyn contributes its own menus via
     // register_asyn_device_support; the dynamic scaler support has no such hook.)
-    epics_rs::base::server::record::register_device_menu(scaler_name, &["Asyn Scaler"]);
+    epics_rs::base::server::record::register_device_menu(scaler_name, SCALER_DEVICES);
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides drvAsynSerialPortConfigure /
     // drvAsynIPPortConfigure / asynOctetSetInputEos / asynOctetSetOutputEos.
     let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager.clone());
-
-    // Same asyn-rs 0.22.1 startup-command / dual-registry framework gap
-    // already worked around in delaygen-ioc/love-ioc (see love-ioc's
-    // main.rs for the full explanation): register_asyn_commands's set is
-    // startup-command-visible only via this rebuild, and
-    // drvAsynSerialPortConfigure needs shadowing so PortManager-resolved
-    // commands (asynSetOption etc.) can find a port it created.
-    for def in epics_rs::asyn::iocsh::build_asyn_commands(port_manager.clone()) {
-        app = app.register_startup_command(def);
-    }
-
-    {
-        let mgr_c = port_manager.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "drvAsynSerialPortConfigure",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "ttyName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "priority",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "noAutoConnect",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "noProcessEos",
-                    arg_type: ArgType::Int,
-                },
-            ],
-            "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
-             - create a serial octet port",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = match args.first() {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
-                    _ => return Err("portName required".into()),
-                };
-                let tty = match args.get(1) {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
-                    _ => return Err("ttyName required".into()),
-                };
-                let no_auto_connect = matches!(args.get(3), Some(ArgValue::Int(n)) if *n != 0);
-                let no_process_eos = matches!(args.get(4), Some(ArgValue::Int(n)) if *n != 0);
-
-                let driver = match DrvAsynSerialPort::configure(
-                    &port,
-                    &tty,
-                    no_auto_connect,
-                    no_process_eos,
-                ) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                        return Ok(CommandOutcome::Continue);
-                    }
-                };
-
-                // `register_port_with_config` is the sole registration owner:
-                // it publishes the port into both the PortManager's own map
-                // (so PortManager-resolved commands like asynSetOption find
-                // it directly) and the process-wide asyn_record registry
-                // (asyn-rs 0.24.0 manager.rs) in one atomic call. A second
-                // manual `asyn_record::register_port` on the same name used
-                // to be required (asyn-rs 0.22.1: register_port_with_config
-                // did not touch asyn_record and PortManager::find_port_handle
-                // had no registry fallback) but is now a duplicate that the
-                // registry rejects with "port already registered", failing
-                // this command's very first invocation.
-                if let Err(e) = mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
-                    ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                    return Ok(CommandOutcome::Continue);
-                }
-                ctx.println(&format!(
-                    "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
-                ));
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
+    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // initScaler974(portName,serialPort,serialAddr,poll)
     // -- C `initScaler974(const char *portName, const char *serialPort,
@@ -188,11 +108,11 @@ async fn main() -> CaResult<()> {
         "initScaler974 portName serialPort serialAddr poll",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match &args[0] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let serial_port = match &args[1] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("serialPort required".into()),
             };
             let serial_addr = match &args[2] {
@@ -204,17 +124,13 @@ async fn main() -> CaResult<()> {
                 _ => return Err("poll required".into()),
             };
 
-            // Two independent SyncIOHandles onto the same underlying octet
-            // port: one for the synchronous command path (reset/arm/
-            // write_preset), one moved into the background SHOW_COUNTS
-            // poll thread (see driver::Scaler974Driver::new's doc — a
-            // SyncIOHandle is not Clone).
-            let handle = connect_octet(&serial_port, serial_addr, COMMAND_TIMEOUT)
-                .map_err(|e| format!("initScaler974: {e}"))?;
-            let poll_handle = connect_octet(&serial_port, serial_addr, COMMAND_TIMEOUT)
-                .map_err(|e| format!("initScaler974: {e}"))?;
-
-            let driver = Scaler974Driver::new(handle, poll_handle, poll);
+            // C prints and keeps going when the octet port is missing; no
+            // driver is left for a scaler record to bind.
+            let Some(driver) =
+                Scaler974Driver::create(&serial_port, serial_addr, poll, COMMAND_TIMEOUT)
+            else {
+                return Ok(CommandOutcome::Continue);
+            };
             scaler974::registry::register(&port_name, Box::new(driver))
                 .map_err(|e| format!("initScaler974: {e}"))?;
 
@@ -228,17 +144,23 @@ async fn main() -> CaResult<()> {
     // does -- see scaler974::registry's module doc for why
     // DeviceSupportContext::out is unusable for a scalerRecord, and why
     // this crate's registry is deliberately single-instance-only.
-    app = app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-        if ctx.dtyp != "Asyn Scaler" {
-            return None;
-        }
-        let driver = scaler974::registry::take()?;
-        Some(Box::new(
-            epics_rs::scaler::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(driver),
-        ) as Box<dyn DeviceSupport>)
-    });
+    app = app.register_dynamic_device_support(
+        &[(
+            "scaler",
+            std::slice::from_ref(
+                &epics_rs::scaler::device_support::scaler_asyn::ASYN_SCALER_DEVICE,
+            ),
+        )],
+        |ctx: &DeviceSupportContext| {
+            if ctx.dtyp != "Asyn Scaler" {
+                return None;
+            }
+            let driver = scaler974::registry::take()?;
+            Some(Box::new(
+                epics_rs::scaler::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(driver),
+            ) as Box<dyn DeviceSupport>)
+        },
+    );
 
-    app.startup_script(&script)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

@@ -18,6 +18,11 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::c_parse::{
+    NumericField, epics_parse_uint16, parse_auto_base_units_null,
+};
+
 use crate::defaults;
 
 /// Default element-path delimiter (`linkParser.h:24`).
@@ -295,15 +300,6 @@ impl InfoDefaults {
             element: get("opcua:ELEMENT"),
         }
     }
-
-    fn any(&self) -> bool {
-        self.sampling.is_some()
-            || self.qsize.is_some()
-            || self.discard.is_some()
-            || self.timestamp.is_some()
-            || self.readback.is_some()
-            || self.element.is_some()
-    }
 }
 
 /// What the parser needs to know about the record the link belongs to.
@@ -320,6 +316,7 @@ pub struct RecordKind {
 /// `link` is the INST_IO text *without* the leading `@` (the framework hands it
 /// over with the `@` still attached; the caller strips it).
 pub fn parse_link(
+    record: &str,
     link: &str,
     kind: RecordKind,
     info: &InfoDefaults,
@@ -354,13 +351,7 @@ pub fn parse_link(
         monitor: defaults::DEFAULT_OUTPUT_READBACK.load(Ordering::Relaxed) != 0,
     };
 
-    if info.any() {
-        log::warn!(
-            "DEPRECATION WARNING: setting parameters through info items is deprecated; \
-             use link parameters instead."
-        );
-    }
-    apply_info_defaults(&mut pinfo, info)?;
+    apply_info_defaults(record, &mut pinfo, info)?;
 
     let link = link.trim_start();
     let (name, rest) = match link.find([' ', '\t', ';']) {
@@ -405,23 +396,37 @@ pub fn parse_link(
     Ok(pinfo)
 }
 
-fn apply_info_defaults(pinfo: &mut LinkInfo, info: &InfoDefaults) -> Result<(), LinkError> {
-    if let Some(s) = &info.sampling {
+/// C `linkParser.cpp:104-185`: each tag set prints its deprecation line just
+/// before it is parsed, so a bad tag stops the lines at its own.
+fn apply_info_defaults(
+    record: &str,
+    pinfo: &mut LinkInfo,
+    info: &InfoDefaults,
+) -> Result<(), LinkError> {
+    fn deprecated<'a>(record: &str, tag: &'a Option<String>) -> Option<&'a str> {
+        tag.as_deref().inspect(|_| {
+            epics_rs::base::stderr_println!(
+                "{record} DEPRECATION WARNING: setting parameters through info items is deprecated; \
+                 use link parameters instead."
+            )
+        })
+    }
+    if let Some(s) = deprecated(record, &info.sampling) {
         pinfo.sampling_interval = parse_f64(s)?;
     }
-    if let Some(s) = &info.qsize {
+    if let Some(s) = deprecated(record, &info.qsize) {
         pinfo.queue_size = parse_u32(s)?;
     }
-    if let Some(s) = &info.discard {
+    if let Some(s) = deprecated(record, &info.discard) {
         pinfo.discard_oldest = parse_discard(s)?;
     }
-    if let Some(s) = &info.timestamp {
+    if let Some(s) = deprecated(record, &info.timestamp) {
         parse_timestamp(pinfo, s)?;
     }
-    if let Some(s) = &info.readback {
+    if let Some(s) = deprecated(record, &info.readback) {
         pinfo.monitor = yes_no(first_char(s, "readback")?)?;
     }
-    if let Some(s) = &info.element {
+    if let Some(s) = deprecated(record, &info.element) {
         set_element(pinfo, s);
     }
     Ok(())
@@ -531,37 +536,17 @@ fn first_char(value: &str, name: &str) -> Result<char, LinkError> {
         .ok_or_else(|| LinkError(format!("no value for option '{name}'")))
 }
 
-/// `epicsParseUInt32`/`epicsParseUInt16` accept a `0x`/`0` base prefix (base 0).
-fn parse_int_base0(value: &str) -> Option<u64> {
-    let (negative, digits) = match value.strip_prefix('-') {
-        Some(rest) => (true, rest.trim()),
-        None => (false, value.strip_prefix('+').unwrap_or(value).trim()),
-    };
-    if negative {
-        return None;
-    }
-    let parsed = if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()?
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        u64::from_str_radix(&digits[1..], 8).ok()?
-    } else {
-        digits.parse().ok()?
-    };
-    Some(parsed)
-}
-
+/// `epicsParseUInt32(value, &v, 0, NULL)`.
 fn parse_u32(value: &str) -> Result<u32, LinkError> {
-    parse_int_base0(value)
-        .and_then(|v| u32::try_from(v).ok())
-        .ok_or_else(|| LinkError(format!("error converting '{value}' to UInt32")))
+    match parse_auto_base_units_null(NumericField::ULong, value) {
+        Some(EpicsValue::ULong(v)) => Ok(v),
+        _ => Err(LinkError(format!("error converting '{value}' to UInt32"))),
+    }
 }
 
+/// `epicsParseUInt16(value, &v, 0, NULL)`.
 fn parse_u16(value: &str) -> Result<u16, LinkError> {
-    parse_int_base0(value)
-        .and_then(|v| u16::try_from(v).ok())
+    epics_parse_uint16(value)
         .ok_or_else(|| LinkError(format!("error converting '{value}' to UInt16")))
 }
 

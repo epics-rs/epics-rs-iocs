@@ -1,0 +1,18 @@
+# dbl of motor R7-4-5 motorAcs iocBoot/iocAcs st.cmd.mcb4b
+IOC:m1
+IOC:m1Direction
+IOC:m1Offset
+IOC:m1Resolution
+IOC:m2
+IOC:m2Direction
+IOC:m2Offset
+IOC:m2Resolution
+IOC:m3
+IOC:m3Direction
+IOC:m3Offset
+IOC:m3Resolution
+IOC:m4
+IOC:m4Direction
+IOC:m4Offset
+IOC:m4Resolution
+IOC:serial1

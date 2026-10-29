@@ -7,14 +7,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use love::connect::connect_octet;
+use love::connect::{follow_serial_port, init_serial_port, set_default_eos};
 use love::driver::{INPUT_EOS, LoveDriver, OUTPUT_EOS};
 use love::registry::{K_INSTRMAX, Model};
 
@@ -28,11 +28,11 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: love-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: love-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("LOVE", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("LOVE", env!("CARGO_MANIFEST_DIR"));
 
     let mut app = IocApplication::new();
 
@@ -43,98 +43,12 @@ async fn main() -> CaResult<()> {
     // Standard asyn iocsh commands — provides drvAsynSerialPortConfigure /
     // drvAsynIPPortConfigure / asynOctetSetInputEos / asynOctetSetOutputEos.
     let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager.clone());
+    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // Same asyn-rs 0.22.1 startup-command / dual-registry framework gap
-    // already worked around in delaygen-ioc (see its main.rs for the full
-    // explanation): register_asyn_commands's set is startup-command-visible
-    // only via this rebuild, and drvAsynSerialPortConfigure needs shadowing
-    // so PortManager-resolved commands (asynSetOption etc.) can find a port
-    // it created.
-    for def in epics_rs::asyn::iocsh::build_asyn_commands(port_manager.clone()) {
-        app = app.register_startup_command(def);
-    }
-
-    {
-        let mgr_c = port_manager.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "drvAsynSerialPortConfigure",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "ttyName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "priority",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "noAutoConnect",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "noProcessEos",
-                    arg_type: ArgType::Int,
-                },
-            ],
-            "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
-             - create a serial octet port",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = match args.first() {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
-                    _ => return Err("portName required".into()),
-                };
-                let tty = match args.get(1) {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
-                    _ => return Err("ttyName required".into()),
-                };
-                let no_auto_connect = matches!(args.get(3), Some(ArgValue::Int(n)) if *n != 0);
-                let no_process_eos = matches!(args.get(4), Some(ArgValue::Int(n)) if *n != 0);
-
-                let driver = match DrvAsynSerialPort::configure(
-                    &port,
-                    &tty,
-                    no_auto_connect,
-                    no_process_eos,
-                ) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                        return Ok(CommandOutcome::Continue);
-                    }
-                };
-
-                // `register_port_with_config` is the sole registration owner:
-                // it publishes the port into both the PortManager's own map
-                // (so PortManager-resolved commands like asynSetOption find
-                // it directly) and the process-wide asyn_record registry
-                // (asyn-rs 0.24.0 manager.rs) in one atomic call. A second
-                // manual `asyn_record::register_port` on the same name used
-                // to be required (asyn-rs 0.22.1: register_port_with_config
-                // did not touch asyn_record and PortManager::find_port_handle
-                // had no registry fallback) but is now a duplicate that the
-                // registry rejects with "port already registered", failing
-                // this command's very first invocation.
-                if let Err(e) = mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
-                    ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                    return Ok(CommandOutcome::Continue);
-                }
-                ctx.println(&format!(
-                    "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
-                ));
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // LoveInit(lovPort,serPort,serAddr) -- C drvLoveInit(lovPort,serPort,serAddr)
+    // C drvLoveInit(lovPort,serPort,serAddr)
     {
         app = app.register_startup_command(CommandDef::new(
-            "LoveInit",
+            "drvLoveInit",
             vec![
                 ArgDesc {
                     name: "lovPort",
@@ -149,14 +63,14 @@ async fn main() -> CaResult<()> {
                     arg_type: ArgType::Int,
                 },
             ],
-            "LoveInit lovPort serPort serAddr",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            "drvLoveInit lovPort serPort serAddr",
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let lov_port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("lovPort required".into()),
                 };
                 let ser_port = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("serPort required".into()),
                 };
                 let ser_addr = match &args[2] {
@@ -164,77 +78,186 @@ async fn main() -> CaResult<()> {
                     _ => return Err("serAddr required".into()),
                 };
 
-                let handle =
-                    connect_octet(&ser_port, ser_addr, COMMAND_TIMEOUT, INPUT_EOS, OUTPUT_EOS)
-                        .map_err(|e| format!("LoveInit: {e}"))?;
+                // C drvLoveInit prints each failure and returns -1 without
+                // iocshSetError (drvLove.c:354-381).
+                let port = match init_serial_port(&ser_port, ser_addr) {
+                    Ok(port) => port,
+                    Err(line) => {
+                        ctx.println(&line);
+                        ctx.println(&format!(
+                            "drvLoveInit::failure to initialize serial port {ser_port}"
+                        ));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
 
                 let models = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
-                let driver = LoveDriver::new(&lov_port, handle, models.clone())
-                    .map_err(|e| format!("LoveInit: failed to initialize {lov_port}: {e}"))?;
-                love::registry::register(&lov_port, models);
-
-                let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default())
-                        .map_err(|e| format!("LoveInit: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &lov_port,
-                    runtime_handle.port_handle().clone(),
-                )
-                .map_err(|e| e.to_string())?;
-
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
-
-    // LoveConfig(lovPort,addr,model) -- C drvLoveConfig(lovPort,addr,model)
-    {
-        app = app.register_startup_command(CommandDef::new(
-            "LoveConfig",
-            vec![
-                ArgDesc {
-                    name: "lovPort",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "addr",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "model",
-                    arg_type: ArgType::String,
-                },
-            ],
-            "LoveConfig lovPort addr model",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let lov_port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
-                    _ => return Err("lovPort required".into()),
+                let registered = claim_port(&lov_port).and_then(|claim| {
+                    let driver = LoveDriver::new(
+                        &lov_port,
+                        &ser_port,
+                        port.clone(),
+                        ser_addr,
+                        COMMAND_TIMEOUT,
+                        models.clone(),
+                    )?;
+                    let (runtime_handle, _actor_jh) =
+                        create_port_runtime(&claim, driver, RuntimeConfig::default())?;
+                    let love = runtime_handle.port_handle().clone();
+                    claim.publish(love.clone(), ctx.db().scan_control().interrupt_gate())?;
+                    Ok(love)
+                });
+                let Ok(love) = registered else {
+                    ctx.println(&format!(
+                        "drvLoveInit::failure to register love port {lov_port}"
+                    ));
+                    return Ok(CommandOutcome::Continue);
                 };
-                let addr = match &args[1] {
-                    ArgValue::Int(n) => *n as i32,
-                    _ => return Err("addr required".into()),
-                };
-                let model_str = match &args[2] {
-                    ArgValue::String(s) => s.clone(),
-                    _ => return Err("model required".into()),
-                };
+                // C `exceptionCallbackAdd(pser->pasynUser,exceptCallback)` (drvLove.c:442).
+                let follow = follow_serial_port(&port, ser_addr, &love);
+                love::registry::register(&lov_port, models, follow);
 
-                let table = love::registry::lookup(&lov_port)
-                    .ok_or_else(|| format!("LoveConfig::failure to locate port {lov_port}"))?;
-                let model = Model::parse(&model_str)
-                    .ok_or_else(|| format!("LoveConfig::unsupported model \"{model_str}\""))?;
-                if !(1..=K_INSTRMAX as i32).contains(&addr) {
-                    return Err(format!("LoveConfig: addr {addr} out of range"));
+                // C `setDefaultEos` (drvLove.c:640-660).
+                let (lines, ok) = set_default_eos(&port, ser_addr, INPUT_EOS, OUTPUT_EOS);
+                for line in &lines {
+                    ctx.println(line);
                 }
-                table.lock().unwrap()[(addr - 1) as usize] = model;
+                if !ok {
+                    ctx.println(&format!("drvLoveInit::failure to set {lov_port} EOS"));
+                }
 
                 Ok(CommandOutcome::Continue)
             },
         ));
     }
 
-    app.startup_script(&script)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    app = app.register_startup_command(drv_love_config_command());
+
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
+}
+
+/// C drvLoveConfig(lovPort,addr,model)
+fn drv_love_config_command() -> CommandDef {
+    CommandDef::new(
+        "drvLoveConfig",
+        vec![
+            ArgDesc {
+                name: "lovPort",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "addr",
+                arg_type: ArgType::Int,
+            },
+            ArgDesc {
+                name: "model",
+                arg_type: ArgType::String,
+            },
+        ],
+        "drvLoveConfig lovPort addr model",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let lov_port = match &args[0] {
+                ArgValue::String(s) => s.to_str()?.to_owned(),
+                _ => return Err("lovPort required".into()),
+            };
+            let addr = match &args[1] {
+                ArgValue::Int(n) => *n as i32,
+                _ => return Err("addr required".into()),
+            };
+            let ArgValue::String(model_arg) = &args[2] else {
+                return Err("model required".into());
+            };
+
+            // C drvLoveConfig prints and returns -1 without iocshSetError
+            // (drvLove.c:458-480).
+            let Some(table) = love::registry::lookup(&lov_port) else {
+                ctx.println(&format!("drvLoveConfig::failure to locate port {lov_port}"));
+                return Ok(CommandOutcome::Continue);
+            };
+            // A non-UTF-8 model matches neither name, as in C.
+            let Some(model) = Model::parse(&model_arg.to_str_lossy()) else {
+                // C's printf has no newline (drvLove.c:472).
+                ctx.print_bytes(
+                    &[
+                        b"drvLoveConfig::unsupported model \"",
+                        model_arg.as_bytes(),
+                        b"\"",
+                    ]
+                    .concat(),
+                );
+                return Ok(CommandOutcome::Continue);
+            };
+            // C indexes instr[addr-1] unchecked.
+            if !(1..=K_INSTRMAX as i32).contains(&addr) {
+                ctx.println(&format!("drvLoveConfig: addr {addr} out of range"));
+                return Ok(CommandOutcome::Continue);
+            }
+            table.lock().unwrap()[(addr - 1) as usize] = model;
+
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::port::{InterfaceMask, PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::base::runtime::task::BlockingBridge;
+    use epics_rs::base::server::database::PvDatabase;
+    use epics_rs::base::server::iocsh::IocShell;
+
+    struct Bare(PortDriverBase);
+
+    impl PortDriver for Bare {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    /// drvLove.c:472 prints the unsupported model without a newline, so a
+    /// redirected line leaves the file unterminated.
+    #[epics_rs::base::epics_test]
+    async fn unsupported_model_line_has_no_newline() {
+        let claim = claim_port("loveCfgS0").unwrap();
+        let base = PortDriverBase::new(
+            "loveCfgS0",
+            1,
+            PortFlags::default(),
+            InterfaceMask::OCTET_TRANSPORT,
+            InterfaceMask::OCTET,
+        );
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        let follow = rt.port_handle().exception_callback_add(-1, |_| {});
+        let models = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
+        love::registry::register("loveCfgL0", models, follow);
+
+        let out = std::env::temp_dir().join(format!("love-cfg-model-{}", std::process::id()));
+        // iocsh takes an unquoted `\` as an escape (iocsh.cpp:275).
+        let redirect = out.display().to_string().replace('\\', "/");
+        let shell = IocShell::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
+        shell.register(drv_love_config_command());
+        for (model, printed) in [
+            (
+                &b"1700"[..],
+                &b"drvLoveConfig::unsupported model \"1700\""[..],
+            ),
+            (b"16\xff", b"drvLoveConfig::unsupported model \"16\xff\""),
+        ] {
+            let line = [
+                b"drvLoveConfig(\"loveCfgL0\", 1, \"",
+                model,
+                b"\") > ",
+                redirect.as_bytes(),
+            ]
+            .concat();
+            shell.execute_line(line).unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), printed);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
 }

@@ -19,7 +19,7 @@ use ad_url::{URLRuntime, create_url_detector};
 /// same framework limitation the rest of this workspace's AD ports (e.g.
 /// d435i) already accept.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADURLIOC", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADURLIOC", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<URLRuntime>>> = Arc::new(std::sync::Mutex::new(None));
 
@@ -51,9 +51,9 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 },
             ],
             "URLDriverConfig portName [maxBuffers] [maxMemory] [priority] [stackSize]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let max_memory = match args.get(2) {
@@ -61,13 +61,17 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!("URLDriverConfig: port={port_name}, maxMemory={max_memory}");
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let det_runtime = create_url_detector(&port_name, max_memory)
+                let det_runtime = create_url_detector(&claim, max_memory)
                     .map_err(|e| format!("failed to create URL detector: {e}"))?;
 
                 let port_handle = det_runtime.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle)
+                claim
+                    .publish(port_handle, ctx.db().scan_control().interrupt_gate())
                     .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

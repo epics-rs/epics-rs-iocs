@@ -12,18 +12,21 @@ pub mod axis;
 pub mod commands;
 pub mod controller;
 pub mod corrector;
+#[cfg(test)]
+pub(crate) mod fake;
 pub mod ftp;
 pub mod gathering;
+pub mod gpio;
 pub mod pco;
 pub mod profile;
+pub mod profile_move;
 pub mod rpc;
+pub mod sftp;
 
 pub use axis::XpsAxis;
-pub use controller::{ExecutionPlan, XpsController};
-pub use corrector::{CorrectorType, XpsCorrectorInfo};
-pub use gathering::{GatheringReadback, parse_gathering_buffer, readback_csv};
-pub use pco::PcoParams;
-pub use profile::{
-    MoveMode, Profile, ProfileAxis, ProfileError, TrajectoryFile, pulse_output_window,
-};
+pub use controller::{SetPositionFailure, XpsController, XpsParams};
+pub use corrector::{CorrectorType, PidFailure, XpsCorrectorInfo};
+pub use gathering::{GatheringReadback, parse_gathering_buffer};
+pub use pco::{PcoParams, PcoSettings, RecordUnits};
+pub use profile::{Profile, ProfileAxis, ProfileError, TrajectoryFile, pulse_output_window};
 pub use rpc::{SocketMode, XPS_TERMINATOR, XpsError, XpsReply, XpsResult, XpsSocket};

@@ -1,27 +1,31 @@
 use std::time::SystemTime;
 
-use epics_rs::base::runtime::general_time::EPICS_EPOCH_UNIX_SECS;
-
+use epics_libcom_rs::cfmt::CFloat;
 use meascomp::counter::CounterScanConfig;
 use meascomp::device::DaqDevice;
-use meascomp::error::{MeasCompError, ScanPosition};
 use uldaq_sys::*;
 
+use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::runtime::general_time::EPICS_EPOCH_UNIX_SECS;
+
 use crate::params::*;
-use crate::trace::DRIVER;
+use crate::scaler::print_get_status;
+use crate::trace::SelfTrace;
 
 /// MCS (Multi-Channel Scaler) acquisition state.
 pub struct McsState {
+    /// C `MCSRunning_`.
     pub running: bool,
     pub num_counters_enabled: usize,
     pub max_points: usize,
     pub current_point: usize,
     pub start_time: f64,
-    pub dwell_time: f64,
+    pub preset_real_time: f64,
 
     /// Scan buffer for ulDaqInScan (f64 values).
     pub scan_buffer: Vec<f64>,
-    /// Per-counter MCS data [counter][point].
+    /// Per-counter MCS data `[counter][point]`.
     pub mcs_buffers: Vec<Vec<i32>>,
     /// Absolute time per point.
     pub abs_time_buffer: Vec<f64>,
@@ -31,12 +35,9 @@ pub struct McsState {
     pub counter_enable: u32,
     /// Mapping from scan channel index to counter number.
     pub chan_map: Vec<usize>,
-    /// Points the running scan transfers: the requested ones, plus the
-    /// leading point [`Point0Action::Skip`] throws away.
-    pub scan_points: usize,
-    /// 1 when the scan's first point is skipped, else 0.
-    pub skip: usize,
-    /// C `MCSErased_`: set by an erase, cleared by a start. Reported only.
+    /// C `MCSPoint0Skip`: the scan's first point is not stored.
+    pub point0_skip: bool,
+    /// C `MCSErased_`, which only `report` reads.
     pub erased: bool,
 }
 
@@ -52,15 +53,14 @@ impl McsState {
             max_points,
             current_point: 0,
             start_time: 0.0,
-            dwell_time: 0.001,
+            preset_real_time: 0.0,
             scan_buffer: Vec::new(),
             mcs_buffers,
             abs_time_buffer: vec![0.0; max_points],
             time_buffer: vec![0.0; max_points],
             counter_enable: 0x1FF, // all 9 enabled by default
             chan_map: Vec::new(),
-            scan_points: 0,
-            skip: 0,
+            point0_skip: false,
             erased: false,
         }
     }
@@ -73,121 +73,67 @@ impl McsState {
     }
 }
 
-/// Erase all MCS buffers.
-///
-/// C `eraseMCS`: the spectra go back to zero and the elapsed-time clock
-/// restarts -- also mid-scan, so an erase during a run restarts PresetReal.
-/// The time bases are left as they are; they depend on the dwell, not on
-/// the data. The caller publishes MCS_CURRENT_POINT and the zeroed elapsed
-/// times.
-pub fn erase_mcs(state: &mut McsState) {
+/// Clear the first `num_points` of every spectrum and restart the elapsed
+/// clock, which an acquisition in progress keeps counting from. C
+/// `USBCTR::eraseMCS`; the time bases are left alone.
+pub fn erase_mcs(state: &mut McsState, num_points: usize) {
+    state.erased = true;
     for buf in &mut state.mcs_buffers {
-        buf.iter_mut().for_each(|v| *v = 0);
+        let n = num_points.min(buf.len());
+        buf[..n].fill(0);
     }
     state.current_point = 0;
     state.start_time = current_time_secs();
-    state.erased = true;
 }
 
-/// C `computeMCSTimes`: the relative time base `i * dwell` over the
-/// `num_points` the scan is set to (bounded by the buffer). Returns how many
-/// points it wrote, which is also how many the MCS_TIME_WF callback carries.
-pub fn compute_times(state: &mut McsState, num_points: usize, dwell: f64) -> usize {
+/// Fill the first `num_points` of the time base with `i * dwell` and return
+/// them. C `USBCTR::computeMCSTimes`.
+pub fn compute_times(state: &mut McsState, num_points: usize, dwell: f64) -> &[f32] {
     let n = num_points.min(state.time_buffer.len());
     for (i, t) in state.time_buffer[..n].iter_mut().enumerate() {
         *t = (i as f64 * dwell) as f32;
     }
-    n
+    &state.time_buffer[..n]
 }
 
-/// What happens to the first time point, C `MCSPoint0Action_t`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Point0Action {
-    /// The counters are cleared at the start, so point 0 counts from there.
-    Clear,
-    /// Not cleared: point 0 holds everything counted since the last clear.
-    NoClear,
-    /// One extra point is acquired and thrown away, so every stored point
-    /// spans a full channel-advance interval.
-    Skip,
-}
+/// C `MCSPoint0Action_t`.
+pub const MCS_POINT0_NO_CLEAR: i32 = 1;
+pub const MCS_POINT0_SKIP: i32 = 2;
 
-impl Point0Action {
-    /// MCS_POINT0_ACTION's value; C treats anything but 1 and 2 as Clear.
-    pub fn from_param(value: i32) -> Self {
-        match value {
-            1 => Self::NoClear,
-            2 => Self::Skip,
-            _ => Self::Clear,
-        }
-    }
-}
-
-/// External channel advance, as MCA_CH_ADV_SOURCE encodes it.
-pub const CHANNEL_ADVANCE_EXTERNAL: i32 = 1;
+/// C `SINGLEIO_THRESHOLD_TIME`: dwell times from here up read one sample at
+/// a time.
+const SINGLEIO_THRESHOLD_TIME: f64 = 0.01;
 
 /// Acquisition settings for [`start_mcs`], read from the MCA/MCS records.
 #[derive(Clone, Copy, Debug)]
 pub struct McsScan {
+    /// C `numCounters_`.
+    pub num_counters: usize,
     pub num_points: usize,
     pub dwell_time: f64,
     pub counter_enable: u32,
     pub ch_advance_source: i32,
-    /// With external channel advance and a prescale above 1, the advance
-    /// is divided down by `prescale_counter`.
+    /// C `mcaPrescale_`: with external channel advance, divide the advance
+    /// pulses by this on `prescale_counter`.
     pub prescale: i32,
+    /// C `MCSPrescaleCounter_`.
     pub prescale_counter: i32,
-    pub point0_action: Point0Action,
+    /// C `MCSPoint0Action_`.
+    pub point0_action: i32,
 }
 
-/// Dwell at and above which C reads the scan one sample at a time
-/// (drvUSBCTR.cpp:101); below it libuldaq picks block transfers, which a
-/// short-dwell, high-rate scan needs to keep up.
-pub const SINGLEIO_THRESHOLD_TIME: f64 = 0.01;
-
-/// The transfer, clock and trigger options C `startMCS` gives `ulDaqInScan`
-/// (drvUSBCTR.cpp:674-681). The scan is always triggered; TRIGGER_MODE
-/// chooses the condition, and "Low level" with nothing wired to the trigger
-/// input is how an untriggered scan is run.
-pub fn scan_options(dwell_time: f64, external_advance: bool) -> i32 {
-    let mut options = SO_DEFAULTIO | SO_EXTTRIGGER;
-    if external_advance {
-        options |= SO_EXTCLOCK;
-    }
-    if dwell_time >= SINGLEIO_THRESHOLD_TIME {
-        options |= SO_SINGLEIO;
-    }
-    options
-}
-
-/// C's TRIGGER_MODE values (the UL for Windows codes) mapped to uldaq's
-/// trigger types (drvUSBCTR.cpp:1133-1144).
-pub fn trigger_type(mode: i32) -> Option<i32> {
-    match mode {
-        0 => Some(TRIG_POS_EDGE),
-        1 => Some(TRIG_NEG_EDGE),
-        6 => Some(TRIG_HIGH),
-        7 => Some(TRIG_LOW),
-        _ => None,
-    }
-}
-
-/// Start MCS acquisition using DaqInScan.
-///
-/// C `startMCS`: every uldaq failure is logged and the start carries on, and
-/// the scan is marked running whatever `ulDaqInScan` returned. A scan that
-/// did not start is idle from the first `read_mcs`, which ends it like any
-/// finished one -- so MCA_ACQUIRING always comes back to 0. Returns C's
-/// ASYN_TRACE_ERROR line for each failure, for the caller to print.
+/// Start MCS acquisition using DaqInScan and return the dwell time the
+/// hardware clock gave. C `USBCTR::startMCS` (drvUSBCTR.cpp:520), which
+/// marks the scan running even when ulDaqInScan fails: readMCS then finds it
+/// idle and stops it.
 pub fn start_mcs(
     device: &DaqDevice,
     state: &mut McsState,
     scan: &McsScan,
-    num_counters: usize,
-) -> Vec<String> {
-    let mut failures = Vec::new();
-    let mut fail = |line: String| failures.push(line);
+    trace: &SelfTrace,
+) -> f64 {
     let McsScan {
+        num_counters,
         num_points,
         dwell_time,
         counter_enable,
@@ -196,123 +142,77 @@ pub fn start_mcs(
         prescale_counter,
         point0_action,
     } = *scan;
-    state.dwell_time = dwell_time;
     state.counter_enable = counter_enable;
-    // C sets startTime_ before starting the hardware.
-    state.start_time = current_time_secs();
-    state.erased = false;
-    let max_pts = state.max_points.min(num_points);
-    // C Skip acquires numPoints+1 and never stores the first.
-    state.skip = usize::from(point0_action == Point0Action::Skip);
-    state.scan_points = max_pts + state.skip;
 
-    // Build channel descriptor list from enabled counters
     let mut chan_descs = Vec::new();
     let mut chan_map = Vec::new();
-
-    // The board's counters, then the digital I/O channel: C scans only the
-    // counters the model has (numCounters_), whatever the enable mask says.
-    let channels = (0..num_counters).chain(std::iter::once(DIGITAL_IO_COUNTER));
-    for i in channels {
-        if counter_enable & (1 << i) != 0 {
-            // Configure counter for MCS (matches C++ drvUSBCTR startMCS)
-            let mode = CMM_OUTPUT_ON
-                | CMM_OUTPUT_INITIAL_STATE_HIGH
-                | CMM_CLEAR_ON_READ
-                | CMM_GATING_ON
-                | CMM_INVERT_GATE;
-            if i < num_counters
-                && let Err(e) = device.counter_config_scan(
-                    i as i32,
-                    &CounterScanConfig {
-                        measurement_type: CMT_COUNT,
-                        measurement_mode: mode,
-                        edge_detection: CED_RISING_EDGE,
-                        tick_size: CTS_TICK_20PT83ns,
-                        debounce_mode: CDM_NONE,
-                        debounce_time: CDT_DEBOUNCE_0ns,
-                        flags: CF_DEFAULT,
-                    },
-                )
-            {
-                fail(format!(
-                    "{DRIVER}::startMCS error calling cbCConfigScan, counter={i}, mode=0x{mode:x}, {}",
-                    status_error(&e)
-                ));
-            }
-
-            let (channel, chan_type) = if i == DIGITAL_IO_COUNTER {
-                (AUXPORT, DAQI_DIGITAL)
-            } else {
-                (i as i32, DAQI_CTR32)
-            };
-
-            chan_descs.push(DaqInChanDescriptor {
-                channel,
-                chan_type,
-                range: 0,
-                ..DaqInChanDescriptor::default()
-            });
-            chan_map.push(i);
+    for i in 0..num_counters.min(MAX_COUNTERS) {
+        if counter_enable & (1 << i) == 0 {
+            continue;
         }
+        let mode = CMM_OUTPUT_ON
+            | CMM_CLEAR_ON_READ
+            | CMM_GATING_ON
+            | CMM_INVERT_GATE
+            | CMM_OUTPUT_INITIAL_STATE_HIGH;
+        if let Err(e) = device.counter_config_scan(
+            i as i32,
+            &CounterScanConfig {
+                measurement_type: CMT_COUNT,
+                measurement_mode: mode,
+                edge_detection: CED_RISING_EDGE,
+                tick_size: CTS_TICK_20PT83ns,
+                debounce_mode: CDM_NONE,
+                debounce_time: CDT_DEBOUNCE_0ns,
+                flags: CF_DEFAULT,
+            },
+        ) {
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "USBCTR::startMCS error calling cbCConfigScan, counter={i}, mode=0x{mode:x}, status={}, error={}\n",
+                    e.code, e.message()
+                ),
+            );
+        }
+        chan_descs.push(DaqInChanDescriptor {
+            channel: i as i32,
+            chan_type: DAQI_CTR32,
+            range: BIP10VOLTS,
+            ..DaqInChanDescriptor::default()
+        });
+        chan_map.push(i);
     }
-
-    state.num_counters_enabled = chan_descs.len();
-    state.chan_map = chan_map;
-
-    // Allocate scan buffer
-    let total_samples = state.num_counters_enabled * state.scan_points;
-    state.scan_buffer.resize(total_samples, 0.0);
-
-    // C passes 1/dwell as is; a zero or negative dwell is libuldaq's to
-    // reject, not a cue to run at some other rate.
-    let mut rate = 1.0 / dwell_time;
-
-    let options = scan_options(dwell_time, ch_advance_source != 0);
-
-    let mut flags = DAQINSCAN_FF_DEFAULT;
-    if point0_action == Point0Action::NoClear {
-        flags |= DAQINSCAN_FF_NOCLEAR;
+    if counter_enable & (1 << DIGITAL_IO_COUNTER) != 0 {
+        chan_descs.push(DaqInChanDescriptor {
+            channel: AUXPORT,
+            chan_type: DAQI_DIGITAL,
+            range: BIP10VOLTS,
+            ..DaqInChanDescriptor::default()
+        });
+        chan_map.push(DIGITAL_IO_COUNTER);
     }
 
     // Clear counter 0 output registers to prevent scaler presets from
-    // interfering with MCS acquisition (matches C++ drvUSBCTR.cpp).
-    for (register, value) in [(CRT_OUTPUT_VAL0, 0), (CRT_OUTPUT_VAL1, 0xFFFF_FFFF)] {
-        if let Err(e) = device.counter_load(0, register, value) {
-            fail(format!(
-                "{DRIVER}::startMCS error calling cbCLoad32, reg=OUTPUTVALREG, value=0, {}",
-                status_error(&e)
-            ));
-        }
+    // interfering with MCS acquisition. C checks only the second load.
+    let _ = device.counter_load(0, CRT_OUTPUT_VAL0, 0);
+    if let Err(e) = device.counter_load(0, CRT_OUTPUT_VAL1, 0xFFFFFFFF) {
+        trace.print(
+            TraceMask::ERROR,
+            format_args!(
+                "USBCTR::startMCS error calling cbCLoad32, reg=OUTPUTVALREG, value=0, status={}, error={}\n",
+                e.code, e.message()
+            ),
+        );
     }
 
-    // C: with external channel advance the advance input can be divided
-    // down -- the prescale counter counts it, and its output (wired to the
-    // channel-advance input) pulses every `prescale` edges
-    // (drvUSBCTR.cpp:579-603).
-    if ch_advance_source == CHANNEL_ADVANCE_EXTERNAL && prescale > 1 {
-        let top = (prescale - 1) as u64;
-        // C keeps only the configure call's status here (drvUSBCTR.cpp:
-        // 583-602); the clear and loads are reported in the same form.
-        if let Err(e) = device.counter_clear(prescale_counter) {
-            fail(format!(
-                "{DRIVER}::startMCS error calling ulCClear, counter={prescale_counter}, {}",
-                status_error(&e)
-            ));
-        }
-        for (register, value) in [
-            (CRT_OUTPUT_VAL0, 0),
-            (CRT_OUTPUT_VAL1, top),
-            (CRT_MAX_LIMIT, top),
-        ] {
-            if let Err(e) = device.counter_load(prescale_counter, register, value) {
-                fail(format!(
-                    "{DRIVER}::startMCS error calling ulCLoad, counter={prescale_counter}, \
-                     reg={register}, value={value}, {}",
-                    status_error(&e)
-                ));
-            }
-        }
+    if ch_advance_source != 0 && prescale > 1 {
+        // C keeps only the configScan status.
+        let limit = (prescale - 1) as u64;
+        let _ = device.counter_clear(prescale_counter);
+        let _ = device.counter_load(prescale_counter, CRT_OUTPUT_VAL0, 0);
+        let _ = device.counter_load(prescale_counter, CRT_OUTPUT_VAL1, limit);
+        let _ = device.counter_load(prescale_counter, CRT_MAX_LIMIT, limit);
         let mode = CMM_OUTPUT_ON | CMM_RANGE_LIMIT_ON;
         if let Err(e) = device.counter_config_scan(
             prescale_counter,
@@ -326,48 +226,63 @@ pub fn start_mcs(
                 flags: CF_DEFAULT,
             },
         ) {
-            fail(format!(
-                "{DRIVER}::startMCS error calling cbCConfigScan, counter={prescale_counter}, \
-                 mode=0x{mode:x}, {}",
-                status_error(&e)
-            ));
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "USBCTR::startMCS error calling cbCConfigScan, counter={prescale_counter}, mode=0x{mode:x}, status={}, error={}\n",
+                    e.code, e.message()
+                ),
+            );
         }
     }
 
-    let started = device.daq_in_scan(
+    // A skipped point 0 is acquired, then dropped by read_mcs.
+    let num_points = num_points + usize::from(point0_action == MCS_POINT0_SKIP);
+    let mut rate = 1.0 / dwell_time;
+    let mut options = SO_DEFAULTIO;
+    if ch_advance_source != 0 {
+        options |= SO_EXTCLOCK;
+    }
+    if dwell_time >= SINGLEIO_THRESHOLD_TIME {
+        options |= SO_SINGLEIO;
+    }
+    options |= SO_EXTTRIGGER;
+    let mut flags = DAQINSCAN_FF_DEFAULT;
+    if point0_action == MCS_POINT0_NO_CLEAR {
+        flags |= DAQINSCAN_FF_NOCLEAR;
+    }
+
+    state.num_counters_enabled = chan_descs.len();
+    state.chan_map = chan_map;
+    state.point0_skip = point0_action == MCS_POINT0_SKIP;
+    state
+        .scan_buffer
+        .resize(state.num_counters_enabled * num_points, 0.0);
+
+    if let Err(e) = device.daq_in_scan(
         &chan_descs,
-        state.scan_points as i32,
+        num_points as i32,
         &mut rate,
         options,
         flags,
         &mut state.scan_buffer,
-    );
-    // The clock divides the dwell down to what it can do; C writes that
-    // actual dwell back to MCA_DWELL_TIME whether or not the scan started.
-    state.dwell_time = 1.0 / rate;
-    match started {
-        Ok(()) => log::info!(
-            "MCS started: {} counters, {} points, dwell={dwell_time:.6}s, rate={rate:.0}",
-            state.num_counters_enabled,
-            max_pts
-        ),
-        Err(e) => fail(format!(
-            "{DRIVER}::startMCS error calling ulDaqInScan, numChans={}, numPoints={}, \
-             rate={rate:.6}, options=0x{options:x}, flags=0x{flags:x}, {}",
-            chan_descs.len(),
-            state.scan_points,
-            status_error(&e)
-        )),
+    ) {
+        // C passes `options, status, flags` to `options=, flags=, status=`.
+        trace.print(
+            TraceMask::ERROR,
+            format_args!(
+                "USBCTR::startMCS error calling ulDaqInScan, numChans={}, numPoints={num_points}, rate={rate:.6}, options=0x{options:x}, flags=0x{:x}, status={flags}, error={}\n",
+                chan_descs.len(),
+                e.code,
+                e.message(), rate = CFloat(rate)
+            ),
+        );
     }
 
     state.running = true;
     state.current_point = 0;
-    failures
-}
-
-/// C's `status=%d, error=%s` tail, from libuldaq's code and message.
-pub(crate) fn status_error(e: &MeasCompError) -> String {
-    format!("status={}, error={}", e.code, e.message)
+    state.start_time = current_time_secs();
+    1.0 / rate
 }
 
 /// Number of complete scan points behind `current_index`; see
@@ -380,97 +295,120 @@ pub fn points_transferred(current_index: i64, n_chans: usize, max_points: usize)
     (current_index as usize / n_chans + 1).min(max_points)
 }
 
-/// What one poll of the scan found, for the poller to publish (C `readMCS`
-/// sets these parameters itself; here the owner of the parameters applies
-/// them).
-#[derive(Clone, Debug, PartialEq)]
-pub struct McsReadout {
+/// What one [`read_mcs`] pass leaves for the driver to publish.
+#[derive(Clone, Copy, Debug)]
+pub struct McsPass {
+    /// C `MCSCurrentPoint_`.
     pub current_point: usize,
-    /// Seconds since the scan was started or last erased.
+    /// C `mcaElapsedRealTime_`/`LiveTime_`, set on every counter address.
     pub elapsed: f64,
-    /// The scan ended during this read: MCA_ACQUIRING goes back to 0.
-    pub finished: bool,
-    /// What the status call returned, which C `readMCS` traces.
-    pub position: ScanPosition,
-    /// C `stopMCS`'s ASYN_TRACE_ERROR line, when the scan ended here and
-    /// stopping it failed.
-    pub stop_error: Option<String>,
+    /// The scan ended this pass: C sets `mcaAcquiring_` 0 on each counter.
+    pub stopped: bool,
 }
 
-/// C `readMCS`: copy every point transferred since the last read, then end
-/// the scan if the hardware has gone idle or PresetReal has run out.
-///
-/// Both end conditions are checked on every read, whether or not the scan
-/// has transferred anything yet -- a scan still waiting for its external
-/// trigger or clock must still stop at PresetReal, and one that libuldaq
-/// rejected at start is idle from the first read.
-pub fn read_mcs(device: &DaqDevice, state: &mut McsState, preset_real: f64) -> McsReadout {
-    // C uses the scan state whatever the status call returned: a scan that
-    // ended on a transfer error is idle, and ends like any other. C prints
-    // no error for the call; its status is in the FLOW line.
-    let report = device.daq_in_scan_status();
-    if report.status == SS_IDLE {
+impl McsPass {
+    /// The param sets C readMCS makes for this pass, for whichever side
+    /// (poller or port driver) applies them.
+    pub fn updates(
+        &self,
+        params: &CtrParams,
+        num_counters: usize,
+    ) -> Vec<(usize, i32, ParamValue)> {
+        let mut updates = vec![(
+            params.mcs_current_point,
+            0,
+            ParamValue::Int32(self.current_point as i32),
+        )];
+        for addr in 0..MAX_MCS_COUNTERS as i32 {
+            updates.push((
+                params.mca_elapsed_real,
+                addr,
+                ParamValue::Float64(self.elapsed),
+            ));
+            updates.push((
+                params.mca_elapsed_live,
+                addr,
+                ParamValue::Float64(self.elapsed),
+            ));
+        }
+        if self.stopped {
+            for addr in 0..num_counters as i32 {
+                updates.push((params.mca_acquiring, addr, ParamValue::Int32(0)));
+            }
+        }
+        updates
+    }
+}
+
+/// Copy the points the scan has transferred and stop it once the hardware
+/// is idle or the preset real time has passed. C `USBCTR::readMCS`.
+pub fn read_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) -> McsPass {
+    // C reads the state and index whatever the call returned
+    // (drvUSBCTR.cpp:743-754): a scan that ended on a transfer error
+    // reports SS_IDLE and its last index beside the error.
+    let polled = device.daq_in_scan_status();
+    // C reads uninitialised locals where ulc.cpp fills neither (bad handle, no subsystem, exception); 0 stops as SS_IDLE. C defect, not copied.
+    print_get_status(trace, "readMCS", &polled);
+    let current_index = polled.xfer.current_index;
+    if polled.status == SS_IDLE {
         state.running = false;
     }
-    copy_transferred_points(state, report.xfer.current_index);
+
+    let n_chans = state.num_counters_enabled;
+    if current_index >= 0 && n_chans > 0 {
+        let skip = usize::from(state.point0_skip);
+        let last_point = points_transferred(current_index, n_chans, state.max_points + skip);
+        let now = current_time_secs();
+        // A skipped point 0 shifts the scan buffer by one.
+        let mut in_ptr = state.current_point + skip;
+        while in_ptr < last_point && state.current_point < state.max_points {
+            let buf_offset = in_ptr * n_chans;
+            for (scan_idx, &ctr_idx) in state.chan_map.iter().enumerate() {
+                state.mcs_buffers[ctr_idx][state.current_point] =
+                    state.scan_buffer[buf_offset + scan_idx] as i32;
+            }
+            state.abs_time_buffer[state.current_point] = now;
+            state.current_point += 1;
+            in_ptr += 1;
+        }
+    }
 
     let elapsed = state.elapsed_secs();
-    if state.running && preset_real > 0.0 && elapsed >= preset_real {
+    if state.running && state.preset_real_time > 0.0 && elapsed >= state.preset_real_time {
         state.running = false;
     }
-    let finished = !state.running;
-    let stop_error = if finished { scan_stop(device) } else { None };
-    McsReadout {
+    let stopped = !state.running;
+    if stopped {
+        stop_mcs(device, state, trace);
+    }
+    McsPass {
         current_point: state.current_point,
         elapsed,
-        finished,
-        position: report.position(),
-        stop_error,
+        stopped,
     }
 }
 
-/// Copy the points behind `current_index` that have not been copied yet into
-/// the per-counter spectra, stamping each with the time it was read.
-/// With [`Point0Action::Skip`] scan point `k + 1` is stored as point `k`,
-/// as C's `inPtr = currentPoint + 1` does.
-fn copy_transferred_points(state: &mut McsState, current_index: i64) {
-    let n_chans = state.num_counters_enabled;
-    let last_point = points_transferred(current_index, n_chans, state.scan_points);
-    let now = current_time_secs();
-    while state.current_point + state.skip < last_point && state.current_point < state.max_points {
-        let buf_offset = (state.current_point + state.skip) * n_chans;
-        for (scan_idx, &ctr_idx) in state.chan_map.iter().enumerate() {
-            state.mcs_buffers[ctr_idx][state.current_point] =
-                state.scan_buffer[buf_offset + scan_idx] as i32;
-        }
-        state.abs_time_buffer[state.current_point] = now;
-        state.current_point += 1;
+/// C `USBCTR::stopMCS`: a running scan is marked stopped and given a final
+/// [`read_mcs`] pass, which comes back here to stop the hardware.
+pub fn stop_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) -> Option<McsPass> {
+    if state.running {
+        state.running = false;
+        return Some(read_mcs(device, state, trace));
     }
-}
-
-/// C `stopMCS`'s stop call; its ASYN_TRACE_ERROR line if it failed.
-fn scan_stop(device: &DaqDevice) -> Option<String> {
-    device.daq_in_scan_stop().err().map(|e| {
-        format!(
-            "{DRIVER}::stopMCS ERROR calling cbStopBackground(CTRFUNCTION), {}",
-            status_error(&e)
-        )
-    })
-}
-
-/// C `stopMCS` on a forced stop: the scan is marked stopped first, then one
-/// last [`read_mcs`] collects every point transferred since the previous
-/// poll and stops the hardware. `None` if no scan was running.
-pub fn stop_mcs(device: &DaqDevice, state: &mut McsState) -> Option<McsReadout> {
-    if !state.running {
-        return None;
+    if let Err(e) = device.daq_in_scan_stop() {
+        trace.print(
+            TraceMask::ERROR,
+            format_args!(
+                "USBCTR::stopMCS ERROR calling cbStopBackground(CTRFUNCTION), status={}, error={}\n",
+                e.code, e.message()
+            ),
+        );
     }
-    state.running = false;
-    Some(read_mcs(device, state, 0.0))
+    None
 }
 
-/// Seconds past the EPICS epoch (1990-01-01), as C's
-/// `now.secPastEpoch + now.nsec/1.e9` stamps each absolute-time point.
+/// Seconds past the EPICS epoch, as C stamps each absolute-time point with
+/// `now.secPastEpoch + now.nsec/1.e9`.
 fn current_time_secs() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -481,7 +419,56 @@ fn current_time_secs() -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    /// libuldaq's ERR_OVERRUN (uldaq.h:152), a transfer error.
+    const ERR_OVERRUN: UlError = 18;
+
+    thread_local! {
+        /// What the mocked `ulDaqInScanStatus` reports: code, scan state,
+        /// total count and index.
+        static DAQ_IN_STATUS: Cell<Option<(UlError, i32, u64, i64)>> = const { Cell::new(None) };
+    }
+
+    /// The test binary's definition wins over libuldaq's. Unset, it answers
+    /// as libuldaq does for the null handle: ERR_BAD_DEV_HANDLE (2), nothing
+    /// filled.
+    #[unsafe(no_mangle)]
+    extern "C" fn ulDaqInScanStatus(
+        _handle: uldaq_sys::DaqDeviceHandle,
+        status: *mut i32,
+        xfer: *mut TransferStatus,
+    ) -> UlError {
+        let Some((code, scan, count, index)) = DAQ_IN_STATUS.get() else {
+            return 2;
+        };
+        unsafe {
+            *status = scan;
+            (*xfer).current_total_count = count;
+            (*xfer).current_index = index;
+        }
+        code
+    }
+
+    /// C reads a failed status's state and index and copies the last
+    /// points (drvUSBCTR.cpp:743-754).
+    #[test]
+    fn a_scan_that_ended_on_a_transfer_error_keeps_its_last_points() {
+        let mut state = McsState::new(4);
+        state.running = true;
+        state.num_counters_enabled = 2;
+        state.chan_map = vec![0, 1];
+        state.scan_buffer = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        DAQ_IN_STATUS.set(Some((ERR_OVERRUN, SS_IDLE, 6, 5)));
+
+        let pass = read_mcs(&DaqDevice::unconnected(), &mut state, &SelfTrace::default());
+        assert!(pass.stopped);
+        assert_eq!(pass.current_point, 3);
+        assert_eq!(state.mcs_buffers[0][..3], [1, 3, 5]);
+        assert_eq!(state.mcs_buffers[1][..3], [2, 4, 6]);
+    }
 
     #[test]
     fn absolute_time_counts_from_the_epics_epoch() {
@@ -491,100 +478,6 @@ mod tests {
             .as_secs_f64();
         let offset = unix - current_time_secs();
         assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
-    }
-
-    #[test]
-    fn a_skipped_first_point_is_never_stored() {
-        let mut st = McsState::new(2);
-        st.num_counters_enabled = 1;
-        st.chan_map = vec![0];
-        st.skip = 1;
-        st.scan_points = 3;
-        st.scan_buffer = vec![100.0, 1.0, 2.0];
-        // Only the leading point has arrived: nothing to store yet.
-        copy_transferred_points(&mut st, 0);
-        assert_eq!(st.current_point, 0);
-        copy_transferred_points(&mut st, 2);
-        assert_eq!(st.current_point, 2);
-        assert_eq!(st.mcs_buffers[0], vec![1, 2]);
-    }
-
-    #[test]
-    fn point0_action_follows_the_c_values() {
-        assert_eq!(Point0Action::from_param(0), Point0Action::Clear);
-        assert_eq!(Point0Action::from_param(1), Point0Action::NoClear);
-        assert_eq!(Point0Action::from_param(2), Point0Action::Skip);
-        assert_eq!(Point0Action::from_param(9), Point0Action::Clear);
-    }
-
-    #[test]
-    fn transferred_points_are_copied_once_per_counter() {
-        let mut st = McsState::new(4);
-        st.num_counters_enabled = 2;
-        st.scan_points = 4;
-        st.chan_map = vec![0, 8];
-        st.scan_buffer = vec![10.0, 1.0, 20.0, 2.0, 30.0, 3.0];
-        // Index 3 is the last sample of point 1: two points are complete.
-        copy_transferred_points(&mut st, 3);
-        assert_eq!(st.current_point, 2);
-        assert_eq!(&st.mcs_buffers[0][..2], &[10, 20]);
-        assert_eq!(&st.mcs_buffers[8][..2], &[1, 2]);
-        // A later read picks up where this one stopped.
-        copy_transferred_points(&mut st, 5);
-        assert_eq!(st.current_point, 3);
-        assert_eq!(st.mcs_buffers[0][2], 30);
-    }
-
-    #[test]
-    fn nothing_transferred_copies_nothing() {
-        let mut st = McsState::new(4);
-        st.num_counters_enabled = 2;
-        copy_transferred_points(&mut st, -1);
-        assert_eq!(st.current_point, 0);
-    }
-
-    #[test]
-    fn an_erase_clears_the_spectra_but_keeps_the_time_base() {
-        let mut st = McsState::new(4);
-        compute_times(&mut st, 4, 0.5);
-        st.mcs_buffers[0][2] = 7;
-        st.current_point = 3;
-        st.start_time = 0.0;
-        erase_mcs(&mut st);
-        assert_eq!(st.mcs_buffers[0], vec![0; 4]);
-        assert_eq!(st.current_point, 0);
-        assert_eq!(&st.time_buffer[..], &[0.0, 0.5, 1.0, 1.5]);
-        assert!(st.elapsed_secs() < 1.0, "the elapsed clock restarted");
-    }
-
-    #[test]
-    fn the_time_base_follows_the_dwell_over_the_scan_length() {
-        let mut st = McsState::new(8);
-        assert_eq!(compute_times(&mut st, 4, 0.5), 4);
-        assert_eq!(&st.time_buffer[..4], &[0.0, 0.5, 1.0, 1.5]);
-        // Never past the buffer, however many points are asked for.
-        assert_eq!(compute_times(&mut st, 100, 1.0), 8);
-    }
-
-    #[test]
-    fn a_long_dwell_is_read_one_sample_at_a_time() {
-        assert_eq!(scan_options(0.01, false), SO_EXTTRIGGER | SO_SINGLEIO);
-        assert_eq!(scan_options(1.0, false), SO_EXTTRIGGER | SO_SINGLEIO);
-    }
-
-    #[test]
-    fn a_short_dwell_leaves_the_transfer_mode_to_libuldaq() {
-        assert_eq!(scan_options(0.001, false), SO_EXTTRIGGER);
-        assert_eq!(scan_options(1e-6, true), SO_EXTTRIGGER | SO_EXTCLOCK);
-    }
-
-    #[test]
-    fn each_trigger_mode_selects_its_condition() {
-        assert_eq!(trigger_type(0), Some(TRIG_POS_EDGE));
-        assert_eq!(trigger_type(1), Some(TRIG_NEG_EDGE));
-        assert_eq!(trigger_type(6), Some(TRIG_HIGH));
-        assert_eq!(trigger_type(7), Some(TRIG_LOW));
-        assert_eq!(trigger_type(2), None);
     }
 
     #[test]

@@ -2,21 +2,22 @@
 //! serializing every wire operation through one OS thread (mirrors C's
 //! single-consumer `queue_func`/`qmesg` pair, `drvGM10.c:1311-1375` —
 //! `qmesg` enqueues from any EPICS scan thread, `queue_func` is the sole
-//! socket owner). `DeviceSupport::read`/`write` collapse C's PACT-then-
-//! completed-by-`queue_func` two-phase dance into one blocking round trip
-//! on [`Instrument::submit`] — legitimate since nothing else here depends
-//! on interleaving with other records' scans mid-flight.
+//! socket owner). Writes queue through [`Instrument::enqueue`] and complete
+//! the record from the actor, as C does. Reads block on
+//! [`Instrument::submit`]: the framework has no asynchronous read completion.
 
 use crate::cache::*;
 use crate::codec::*;
 use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
+use epics_rs::base::server::driver_support::DriverSupport;
+use epics_rs::base::types::c_parse::strtoul_errno;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 
 const PORT: u16 = 34434;
 
@@ -85,54 +86,64 @@ pub enum Command {
     SetConst(u32, f64),
     SetVarConst(u32, f64),
     SetBinaryOutput(u32, bool),
-    SetOpMode(bool),
-    SetCompute(u8),
+    SetOpMode(u16),
+    SetCompute(u16),
     ClearError,
     AcknowledgeAlarms,
 }
 
+/// Run by the actor once its command was processed — C `queue_func`'s
+/// `rset->process` call (`drvGM10.c:1327-1332`).
+pub type Completion = Box<dyn FnOnce() + Send>;
+
 struct Job {
     command: Command,
-    done: mpsc::Sender<io::Result<()>>,
+    done: Completion,
 }
 
-/// Handle to a connected GM10 unit. Cheap to clone (`Arc`-backed); one
-/// instance per `gm10Init` handle, looked up by name from [`connect`]'s
-/// registry.
+/// One `gm10Init` handle (C `struct devqueue`), looked up by name from the
+/// [`Registry`].
 pub struct Instrument {
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
-    tx: mpsc::Sender<Job>,
+    /// The `queue_func` thread's queue; unset when `init_gm10` failed after
+    /// registering, which leaves C's `dq` with no thread to drain it.
+    tx: OnceLock<mpsc::Sender<Job>>,
     /// `gm10_system_info(which=0, ...)` (`drvGM10.c:1620-1631`): the
-    /// address this handle connected to, formatted once at connect time.
+    /// configured address, as `inet_ntop` prints it.
     pub peer_address: String,
 }
 
 impl Instrument {
-    /// `init_gm10` (`drvGM10.c:1378-1465`): connect, read the unsolicited
-    /// post-connect `E0` greeting, then run the fixed load sequence —
-    /// modules must load first, everything else indexes off it.
-    pub fn connect(address: &str) -> io::Result<Arc<Self>> {
-        let stream = TcpStream::connect((address, PORT))?;
-        Self::connect_stream(stream)
+    fn new(peer_address: String) -> Arc<Self> {
+        Arc::new(Self {
+            cache: Arc::new(Mutex::new(Cache::default())),
+            interrupts: Arc::new(Interrupts::default()),
+            tx: OnceLock::new(),
+            peer_address,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn connect_to(addr: std::net::SocketAddr) -> io::Result<Arc<Self>> {
-        Self::connect_stream(TcpStream::connect(addr)?)
+        let instrument = Self::new(addr.ip().to_string());
+        instrument.start(TcpStream::connect(addr)?)?;
+        Ok(instrument)
     }
 
-    fn connect_stream(stream: TcpStream) -> io::Result<Arc<Self>> {
-        let peer_address = stream.peer_addr()?.ip().to_string();
-        let cache = Arc::new(Mutex::new(Cache::default()));
-        let interrupts = Arc::new(Interrupts::default());
+    /// The tail of `init_gm10` (`drvGM10.c:1446-1461`): read the unsolicited
+    /// post-connect `E0` greeting, run the fixed load sequence (modules
+    /// first, everything else indexes off it), then start the queue thread.
+    fn start(&self, stream: TcpStream) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel::<Job>();
         let mut actor = Actor {
             stream,
-            cache: cache.clone(),
-            interrupts: interrupts.clone(),
+            cache: self.cache.clone(),
+            interrupts: self.interrupts.clone(),
+            requeue: tx.clone(),
         };
 
-        match wire::read_response(&mut actor.stream)? {
+        match actor.read_response()? {
             RawResponse::Ok => {}
             _ => {
                 return Err(io::Error::new(
@@ -148,18 +159,11 @@ impl Instrument {
         actor.load_data_values(None)?;
         actor.load_misc_values(true, true, None)?;
 
-        let (tx, rx) = mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("gm10-instrument".to_string())
-            .spawn(move || actor.run(rx))
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        Ok(Arc::new(Self {
-            cache,
-            interrupts,
-            tx,
-            peer_address,
-        }))
+            .spawn(move || actor.run(rx))?;
+        let _ = self.tx.set(tx);
+        Ok(())
     }
 
     pub fn register_interrupt(
@@ -169,20 +173,26 @@ impl Instrument {
         self.interrupts.register(category)
     }
 
-    /// Block until the actor thread has finished processing `command`.
-    pub fn submit(&self, command: Command) -> io::Result<()> {
+    /// C `qmesg` (`drvGM10.c:1342-1373`): queue `command` behind every
+    /// earlier one; `done` runs after it. A gone actor drops `done` un-run.
+    pub fn enqueue(&self, command: Command, done: Completion) {
+        if let Some(tx) = self.tx.get() {
+            let _ = tx.send(Job { command, done });
+        }
+    }
+
+    /// Block until the actor thread has finished processing `command`. C's
+    /// `command_process` discards every handler's status (`drvGM10.c:1263-1309`),
+    /// so there is none to return.
+    pub fn submit(&self, command: Command) {
         let (done_tx, done_rx) = mpsc::channel();
-        self.tx
-            .send(Job {
-                command,
-                done: done_tx,
-            })
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "instrument actor thread is gone")
-            })?;
-        done_rx.recv().map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "instrument actor thread is gone")
-        })?
+        self.enqueue(
+            command,
+            Box::new(move || {
+                let _ = done_tx.send(());
+            }),
+        );
+        let _ = done_rx.recv();
     }
 
     fn cache(&self) -> parking_lot::MutexGuard<'_, Cache> {
@@ -250,8 +260,8 @@ impl Instrument {
             ChannelFamily::Comm => {
                 scaled_value(cache.comm_data[idx].value, cache.comm_info[idx].scale)
             }
-            ChannelFamily::Const => cache.constant[idx],
-            ChannelFamily::VarConst => cache.varconstant[idx],
+            ChannelFamily::Const => f64::from(cache.constant[idx]),
+            ChannelFamily::VarConst => f64::from(cache.varconstant[idx]),
         }
     }
 
@@ -277,22 +287,22 @@ impl Instrument {
     }
 
     /// `gm10_channel_get_egu` (`drvGM10.c:1831-1853`).
-    pub fn channel_get_egu(&self, family: ChannelFamily, channel: u32) -> String {
+    pub fn channel_get_egu(&self, family: ChannelFamily, channel: u32) -> Vec<u8> {
         let cache = self.cache();
         let idx = (channel - 1) as usize;
         match family {
             ChannelFamily::Signal => match cache.meas_type[idx] {
-                ChannelType::None | ChannelType::Unknown => String::new(),
+                ChannelType::None | ChannelType::Unknown => Vec::new(),
                 _ => cache.meas_info[idx].unit.clone(),
             },
             ChannelFamily::Math => cache.calc_info[idx].unit.clone(),
             ChannelFamily::Comm => cache.comm_info[idx].unit.clone(),
-            ChannelFamily::Const | ChannelFamily::VarConst => String::new(),
+            ChannelFamily::Const | ChannelFamily::VarConst => Vec::new(),
         }
     }
 
     /// `gm10_channel_get_expr` (`drvGM10.c:1855-1861`).
-    pub fn channel_get_expr(&self, channel: u32) -> String {
+    pub fn channel_get_expr(&self, channel: u32) -> Vec<u8> {
         let cache = self.cache();
         let mut expr = cache.calc_expr[(channel - 1) as usize].expr.clone();
         expr.truncate(39);
@@ -367,12 +377,12 @@ impl Instrument {
     }
 
     /// `gm10_get_error` (`drvGM10.c:1968-1977`): `channel` is 1-3.
-    pub fn get_error(&self, channel: u32) -> String {
+    pub fn get_error(&self, channel: u32) -> Vec<u8> {
         let cache = self.cache();
         if cache.error_flag {
             cache.error.strings[(channel - 1) as usize].clone()
         } else {
-            String::new()
+            Vec::new()
         }
     }
 
@@ -395,29 +405,29 @@ impl Instrument {
     pub fn module_presence(&self, module: usize) -> bool {
         self.cache().modules[module].use_flag
     }
-    pub fn module_string(&self, module: usize) -> String {
+    pub fn module_string(&self, module: usize) -> Vec<u8> {
         let cache = self.cache();
         let m = &cache.modules[module];
         if m.use_flag {
             m.module_string.clone()
         } else if !m.module_string.is_empty() {
-            format!("(unused) {}", m.module_string)
+            [b"(unused) ", &m.module_string[..]].concat()
         } else {
-            "(empty)".to_string()
+            b"(empty)".to_vec()
         }
     }
 
     /// `gm10_channel_start` (`drvGM10.c:1725-1760`): the first-scan async
     /// read-refresh for a single channel, collapsed to a blocking round
     /// trip. Signal channels with no recognized type are a silent no-op.
-    pub fn channel_start(&self, family: ChannelFamily, channel: u32) -> io::Result<()> {
+    pub fn channel_start(&self, family: ChannelFamily, channel: u32) {
         if family == ChannelFamily::Signal
             && matches!(
                 self.channel_type(channel),
                 ChannelType::None | ChannelType::Unknown
             )
         {
-            return Ok(());
+            return;
         }
         let command = match family {
             ChannelFamily::Signal => Command::ReadSignal(channel),
@@ -434,13 +444,15 @@ pub struct Actor {
     stream: TcpStream,
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
+    /// Its own queue, for the record-less `qmesg` of `load_status`.
+    requeue: mpsc::Sender<Job>,
 }
 
 impl Actor {
     fn run(mut self, rx: mpsc::Receiver<Job>) {
         while let Ok(job) = rx.recv() {
-            let result = self.process(job.command);
-            let _ = job.done.send(result);
+            let _ = self.process(job.command);
+            (job.done)();
         }
     }
 
@@ -460,8 +472,10 @@ impl Actor {
             Command::SetConst(ch, value) => self.set_output_value(&cmd_skconst_set(ch, value)),
             Command::SetVarConst(ch, value) => self.set_output_value(&cmd_swconst_set(ch, value)),
             Command::SetBinaryOutput(ch, on) => self.set_binary_value(ch, on),
-            Command::SetOpMode(on) => self.set_output_value(&cmd_orec_set(on)),
-            Command::SetCompute(mode) => self.set_output_value(&cmd_omath_set(mode)),
+            // `set_mode` sends nothing outside 0..1 / 0..3 (`drvGM10.c:1209-1224`).
+            Command::SetOpMode(v @ 0..=1) => self.set_output_value(&cmd_orec_set(v == 1)),
+            Command::SetCompute(v @ 0..=3) => self.set_output_value(&cmd_omath_set(v as u8)),
+            Command::SetOpMode(_) | Command::SetCompute(_) => Ok(()),
             Command::ClearError => self.clear_error(),
             Command::AcknowledgeAlarms => self.acknowledge_alarms(),
         }
@@ -480,6 +494,7 @@ impl Actor {
             self.cache.lock().error_flag = false;
         }
         if let RawResponse::Error(bytes) = &raw {
+            self.cache.lock().error_flag = true;
             let text = String::from_utf8_lossy(bytes);
             let Some((code, parameter)) = parse_error_header(&text) else {
                 return Err(io::Error::new(
@@ -489,9 +504,10 @@ impl Actor {
             };
             {
                 let mut cache = self.cache.lock();
-                cache.error_flag = true;
                 cache.error.code = code;
-                cache.error.parameter = parameter;
+                if let Some(parameter) = parameter {
+                    cache.error.parameter = parameter;
+                }
             }
             self.write_command(&cmd_err_query(code))?;
             let follow = wire::read_response(&mut self.stream)?;
@@ -501,8 +517,7 @@ impl Actor {
                     "_ERR query did not return ASCII",
                 ));
             };
-            let payload = String::from_utf8_lossy(wire::ascii_payload(&ascii_raw)).into_owned();
-            if let Some(msg) = extract_quoted_message(&payload) {
+            if let Some(msg) = extract_quoted_message(wire::ascii_payload(&ascii_raw)) {
                 self.cache.lock().error.strings = split_error_message(msg);
             }
             self.interrupts.fire(InterruptCategory::Error);
@@ -551,7 +566,8 @@ impl Actor {
         let lines = parse_fsysconf(&payload)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed FSysConf body"))?;
 
-        let mut cache = self.cache.lock();
+        let mut guard = self.cache.lock();
+        let cache = &mut *guard;
         for t in cache.meas_type.iter_mut() {
             *t = ChannelType::None;
         }
@@ -560,55 +576,41 @@ impl Actor {
             m.module_string.clear();
         }
         for line in &lines {
+            // C indexes every wire-supplied slot unchecked (UB out of
+            // range); out-of-range slots are skipped here.
+            let Some(module) = cache.modules.get_mut(line.index) else {
+                continue;
+            };
             if !module_line_ok(line) {
                 continue;
             }
-            cache.modules[line.index].module_string = line.set_message.clone();
+            module.module_string = line.set_message.clone();
             let Some((mod_type, channel_number)) = classify_module(&line.set_message) else {
                 continue;
             };
             if mod_type == ModuleType::Pid {
                 continue;
             }
-            cache.modules[line.index].mod_type = mod_type;
-            cache.modules[line.index].channel_number = channel_number;
-            cache.modules[line.index].use_flag = true;
+            module.mod_type = mod_type;
+            module.channel_number = channel_number;
+            module.use_flag = true;
 
             let base = line.index * 100;
-            let [inputs, outputs] = channel_number;
+            let [inputs, outputs] = channel_number.map(|n| n.max(0) as usize);
+            let mut set = |start: usize, count: usize, t: ChannelType| {
+                for slot in cache.meas_type.iter_mut().skip(start).take(count) {
+                    *slot = t;
+                }
+            };
             match mod_type {
-                ModuleType::InputAnalog => {
-                    for j in 0..inputs as usize {
-                        cache.meas_type[base + j] = ChannelType::InputAnalog;
-                    }
-                }
-                ModuleType::InputDigital => {
-                    for j in 0..inputs as usize {
-                        cache.meas_type[base + j] = ChannelType::InputBinary;
-                    }
-                }
-                ModuleType::InputPulse => {
-                    for j in 0..inputs as usize {
-                        cache.meas_type[base + j] = ChannelType::InputInteger;
-                    }
-                }
-                ModuleType::OutputAnalog => {
-                    for j in 0..outputs as usize {
-                        cache.meas_type[base + j] = ChannelType::OutputAnalog;
-                    }
-                }
-                ModuleType::OutputDigital => {
-                    for j in 0..outputs as usize {
-                        cache.meas_type[base + j] = ChannelType::OutputBinary;
-                    }
-                }
+                ModuleType::InputAnalog => set(base, inputs, ChannelType::InputAnalog),
+                ModuleType::InputDigital => set(base, inputs, ChannelType::InputBinary),
+                ModuleType::InputPulse => set(base, inputs, ChannelType::InputInteger),
+                ModuleType::OutputAnalog => set(base, outputs, ChannelType::OutputAnalog),
+                ModuleType::OutputDigital => set(base, outputs, ChannelType::OutputBinary),
                 ModuleType::InputOutputDigital => {
-                    for j in 0..inputs as usize {
-                        cache.meas_type[base + j] = ChannelType::InputBinary;
-                    }
-                    for j in 0..outputs as usize {
-                        cache.meas_type[base + inputs as usize + j] = ChannelType::OutputBinary;
-                    }
+                    set(base, inputs, ChannelType::InputBinary);
+                    set(base + inputs, outputs, ChannelType::OutputBinary);
                 }
                 ModuleType::Pid | ModuleType::Unknown => {}
             }
@@ -618,26 +620,30 @@ impl Actor {
 
     /// `load_status` (`drvGM10.c:625-656`).
     fn load_status(&mut self) -> io::Result<()> {
+        // A failed sscanf leaves the previous value (`drvGM10.c:632,638`).
         let orec_payload = self.expect_ascii(&cmd_orec_query())?;
-        let recording_mode = parse_orec(&String::from_utf8_lossy(&orec_payload)).unwrap_or(0) != 0;
+        if let Some(v) = parse_orec(&String::from_utf8_lossy(&orec_payload)) {
+            self.cache.lock().recording_mode = v != 0;
+        }
         let omath_payload = self.expect_ascii(&cmd_omath_query())?;
-        let compute_mode = parse_omath(&String::from_utf8_lossy(&omath_payload)).unwrap_or(0);
+        if let Some(v) = parse_omath(&String::from_utf8_lossy(&omath_payload)) {
+            self.cache.lock().compute_mode = v;
+        }
 
         let was_settings_mode;
         {
             let mut cache = self.cache.lock();
-            cache.recording_mode = recording_mode;
-            cache.compute_mode = compute_mode;
             was_settings_mode = cache.settings_mode;
-            cache.settings_mode = recording_mode && (compute_mode != 0);
+            cache.settings_mode = cache.recording_mode && (cache.compute_mode != 0);
         }
         self.interrupts.fire(InterruptCategory::Status);
 
         if was_settings_mode && !self.cache.lock().settings_mode {
-            // C enqueues this fire-and-forget (`qmesg(..., NULL, ...)`,
-            // `drvGM10.c:646`); running it inline keeps this single
-            // worker thread the only actor either way.
-            self.load_infos()?;
+            // `qmesg(dq, NULL, CMD_READ_ALL_INFOS, ..)` (`drvGM10.c:646`).
+            let _ = self.requeue.send(Job {
+                command: Command::ReadAllInfos,
+                done: Box::new(|| {}),
+            });
         }
         Ok(())
     }
@@ -649,9 +655,15 @@ impl Actor {
         let fchinfo_payload = self.expect_ascii(&cmd_fchinfo())?;
         let info_lines = parse_fchinfo(&fchinfo_payload);
         {
-            let mut cache = self.cache.lock();
+            let mut guard = self.cache.lock();
+            let cache = &mut *guard;
             for line in &info_lines {
-                if line.family == InfoFamily::Signal && !cache.modules[line.index / 100].use_flag {
+                if line.family == InfoFamily::Signal
+                    && !cache
+                        .modules
+                        .get(line.index / 100)
+                        .is_some_and(|m| m.use_flag)
+                {
                     continue;
                 }
                 let ch_status = match line.status {
@@ -663,46 +675,48 @@ impl Actor {
                 // `drvGM10.c:733-742`: on SKIP, `cd->data_status = VL_SKIP`
                 // is set for whichever family `ci`/`cd` point at — not
                 // Signal-only ("since the input won't do this").
-                match line.family {
-                    InfoFamily::Signal => {
-                        cache.meas_info[line.index].ch_status = ch_status;
-                        cache.meas_info[line.index].unit = line.unit.clone();
-                        cache.meas_info[line.index].scale = line.scale;
-                        if line.status == CH_STATUS_SKIP {
-                            cache.meas_data[line.index].data_status = DataStatus::Skip;
-                        }
-                    }
-                    InfoFamily::Math => {
-                        cache.calc_info[line.index].ch_status = ch_status;
-                        cache.calc_info[line.index].unit = line.unit.clone();
-                        cache.calc_info[line.index].scale = line.scale;
-                        if line.status == CH_STATUS_SKIP {
-                            cache.calc_data[line.index].data_status = DataStatus::Skip;
-                        }
-                    }
-                    InfoFamily::Comm => {
-                        cache.comm_info[line.index].ch_status = ch_status;
-                        cache.comm_info[line.index].unit = line.unit.clone();
-                        cache.comm_info[line.index].scale = line.scale;
-                        if line.status == CH_STATUS_SKIP {
-                            cache.comm_data[line.index].data_status = DataStatus::Skip;
-                        }
-                    }
+                let (infos, datas) = match line.family {
+                    InfoFamily::Signal => (&mut cache.meas_info, &mut cache.meas_data),
+                    InfoFamily::Math => (&mut cache.calc_info, &mut cache.calc_data),
+                    InfoFamily::Comm => (&mut cache.comm_info, &mut cache.comm_data),
+                };
+                let (Some(ci), Some(cd)) = (infos.get_mut(line.index), datas.get_mut(line.index))
+                else {
+                    continue;
+                };
+                ci.ch_status = ch_status;
+                ci.unit = line.unit.clone();
+                ci.scale = line.scale;
+                if line.status == CH_STATUS_SKIP {
+                    cd.data_status = DataStatus::Skip;
                 }
             }
         }
 
-        let srangeao_payload = self.expect_ascii(&cmd_srangeao_query())?;
-        let ao_lines = parse_srangeao(&srangeao_payload);
-        let srangedo_payload = self.expect_ascii(&cmd_srangedo_query())?;
-        let do_lines = parse_srangedo(&srangedo_payload);
-        {
+        for (query, parse) in [
+            (cmd_srangeao_query(), parse_srangeao as fn(&[u8]) -> _),
+            (cmd_srangedo_query(), parse_srangedo),
+        ] {
+            let payload = self.expect_ascii(&query)?;
+            let parsed = parse(&payload);
             let mut cache = self.cache.lock();
-            for line in ao_lines.iter().chain(do_lines.iter()) {
-                if !cache.modules[line.index / 100].use_flag {
+            for line in parsed.as_ref().unwrap_or_else(|lines| lines) {
+                if !cache
+                    .modules
+                    .get(line.index / 100)
+                    .is_some_and(|m| m.use_flag)
+                {
                     continue;
                 }
-                cache.meas_info[line.index].ch_mode = line.mode;
+                if let Some(ci) = cache.meas_info.get_mut(line.index) {
+                    ci.ch_mode = line.mode;
+                }
+            }
+            if parsed.is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SRange line is not a signal channel",
+                ));
             }
         }
 
@@ -711,10 +725,12 @@ impl Actor {
         {
             let mut cache = self.cache.lock();
             for line in &math_lines {
-                cache.calc_expr[line.index] = ExprInfo {
-                    on_flag: line.on_flag,
-                    expr: line.expr.clone(),
-                };
+                if let Some(slot) = cache.calc_expr.get_mut(line.index) {
+                    *slot = ExprInfo {
+                        on_flag: line.on_flag,
+                        expr: line.expr.clone(),
+                    };
+                }
             }
         }
 
@@ -741,6 +757,7 @@ impl Actor {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed FData frame"))?;
 
         let mut alarm_flag = false;
+        let alarm_flag_changed;
         {
             let mut cache = self.cache.lock();
             for record in &records {
@@ -749,16 +766,22 @@ impl Actor {
                 if record.data_type != 1 {
                     continue;
                 }
-                let module_idx = (record.address as usize).saturating_sub(1) / 100;
-                if !cache.modules[module_idx].use_flag {
+                let address = record.address as usize;
+                if !cache.modules.get(address / 100).is_some_and(|m| m.use_flag) {
                     continue;
                 }
-                let idx = (record.address - 1) as usize;
+                // C indexes `[address - 1]` unchecked; out of range is UB there.
+                let Some(idx) = address.checked_sub(1) else {
+                    continue;
+                };
                 let cd = match record.channel_type {
-                    1 => &mut cache.meas_data[idx],
-                    2 => &mut cache.calc_data[idx],
-                    3 => &mut cache.comm_data[idx],
-                    _ => continue,
+                    1 => cache.meas_data.get_mut(idx),
+                    2 => cache.calc_data.get_mut(idx),
+                    3 => cache.comm_data.get_mut(idx),
+                    _ => None,
+                };
+                let Some(cd) = cd else {
+                    continue;
                 };
                 cd.data_status = DataStatus::from_wire(record.status);
                 cd.value = if cd.data_status == DataStatus::Normal {
@@ -780,9 +803,14 @@ impl Actor {
                     alarm_flag = true;
                 }
             }
+            alarm_flag_changed = cache.alarm_flag != alarm_flag;
             cache.alarm_flag = alarm_flag;
         }
-        self.interrupts.fire(InterruptCategory::Channel);
+        // `drvGM10.c:1071-1075`: a single-channel read wakes I/O Intr only
+        // when the alarm summary flips.
+        if scope.is_none() || alarm_flag_changed {
+            self.interrupts.fire(InterruptCategory::Channel);
+        }
         Ok(())
     }
 
@@ -802,7 +830,9 @@ impl Actor {
             let lines = parse_const_lines(&payload);
             let mut cache = self.cache.lock();
             for line in &lines {
-                cache.constant[line.index] = line.value;
+                if let Some(slot) = cache.constant.get_mut(line.index) {
+                    *slot = line.value as f32;
+                }
             }
         }
         if want_varconst {
@@ -814,10 +844,15 @@ impl Actor {
             let lines = parse_const_lines(&payload);
             let mut cache = self.cache.lock();
             for line in &lines {
-                cache.varconstant[line.index] = line.value;
+                if let Some(slot) = cache.varconstant.get_mut(line.index) {
+                    *slot = line.value as f32;
+                }
             }
         }
-        self.interrupts.fire(InterruptCategory::Misc);
+        // `drvGM10.c:1147-1148`: only the all-channel read wakes I/O Intr.
+        if single_channel.is_none() {
+            self.interrupts.fire(InterruptCategory::Misc);
+        }
         Ok(())
     }
 
@@ -870,42 +905,206 @@ impl Actor {
     }
 }
 
-/// `gm10_connect` (`drvGM10.c:1539-1552`): a name-keyed registry populated
-/// by the `gm10Init` iocsh command.
+/// `init_gm10` (`drvGM10.c:1376-1465`), the `gm10Init` command. Every
+/// failure is silent, as in C. The handle is registered before the connect,
+/// so a unit that fails to connect or load still resolves for records.
+pub fn gm10_init(registry: &Registry, device: Option<&[u8]>, address: Option<&[u8]>) {
+    init_on_port(registry, device, address, PORT);
+}
+
+fn init_on_port(registry: &Registry, device: Option<&[u8]>, address: Option<&[u8]>, port: u16) {
+    let Some(device) = device.filter(|d| valid_device_name(d)) else {
+        return;
+    };
+    // Validated ASCII.
+    let name = String::from_utf8_lossy(device).into_owned();
+    if registry.get(&name).is_some() {
+        return;
+    }
+    // C frees `dq` here but leaves it listed (a use-after-free); not
+    // registering is the safe reading.
+    let Some(ip) = address.and_then(inet_aton) else {
+        return;
+    };
+    let instrument = Instrument::new(ip.to_string());
+    let _ = registry.insert(name, instrument.clone());
+    if let Ok(stream) = TcpStream::connect(SocketAddrV4::new(ip, port)) {
+        let _ = instrument.start(stream);
+    }
+}
+
+/// A letter, then letters, digits or underscores (`drvGM10.c:1389-1400`).
+fn valid_device_name(name: &[u8]) -> bool {
+    match name.split_first() {
+        Some((first, rest)) => {
+            first.is_ascii_alphabetic()
+                && rest.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        }
+        None => false,
+    }
+}
+
+/// glibc `inet_aton`: one to four `strtoul(.., 0)` parts, the last filling
+/// the remaining bytes, optionally followed by whitespace and anything.
+fn inet_aton(cp: &[u8]) -> Option<Ipv4Addr> {
+    const MAX: [u32; 4] = [0xffff_ffff, 0xff_ffff, 0xffff, 0xff];
+    let mut parts: Vec<u32> = Vec::with_capacity(3);
+    let mut i = 0;
+    loop {
+        if !cp.get(i).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        // glibc's own strtoul predates C23's `0b`: it stops at the `b`,
+        // which no part may be followed by.
+        if cp[i] == b'0' && matches!(cp.get(i + 1), Some(b'b' | b'B')) {
+            return None;
+        }
+        let (val, len) = strtoul_errno(&cp[i..], 0)?;
+        // glibc's `ul > 0xfffffffful`, through u128 as `unsigned long` may be u32.
+        let val = u32::try_from(u128::from(val)).ok()?;
+        i += len;
+        if cp.get(i) == Some(&b'.') {
+            if parts.len() > 2 || val > 0xff {
+                return None;
+            }
+            parts.push(val);
+            i += 1;
+        } else {
+            if let Some(&c) = cp.get(i)
+                && !matches!(c, 0 | b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+            {
+                return None;
+            }
+            if val > MAX[parts.len()] {
+                return None;
+            }
+            let mut word = val;
+            for (k, p) in parts.iter().enumerate() {
+                word |= p << (24 - 8 * k);
+            }
+            return Some(Ipv4Addr::from(word));
+        }
+    }
+}
+
+/// `gm10_connect` (`drvGM10.c:1539-1552`): `gm10_queue_list`, the handles
+/// `gm10Init` registered, newest first as C prepends them.
 #[derive(Default)]
 pub struct Registry {
-    instruments: Mutex<HashMap<String, Arc<Instrument>>>,
+    instruments: Mutex<Vec<(String, Arc<Instrument>)>>,
 }
 
 impl Registry {
     pub fn new() -> Self {
-        Self {
-            instruments: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     pub fn insert(&self, name: String, instrument: Arc<Instrument>) -> Result<(), &'static str> {
         let mut instruments = self.instruments.lock();
-        if instruments.contains_key(&name) {
+        if instruments.iter().any(|(n, _)| *n == name) {
             return Err("device already exists");
         }
-        instruments.insert(name, instrument);
+        instruments.insert(0, (name, instrument));
         Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Instrument>> {
-        self.instruments.lock().get(name).cloned()
+        self.instruments
+            .lock()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, i)| i.clone())
+    }
+}
+
+/// `drvGM10.report`, `gm10_report` (`drvGM10.c:265-311`).
+impl DriverSupport for Registry {
+    fn report(&self, level: i32) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        for (cnt, (name, instrument)) in self.instruments.lock().iter().enumerate() {
+            out.extend_from_slice(
+                format!(
+                    "    Yokogawa GM10 #{}: {name} @ {}\n",
+                    cnt + 1,
+                    instrument.peer_address
+                )
+                .as_bytes(),
+            );
+            if level != 0 {
+                out.extend_from_slice(b"        Modules:\n");
+                let cache = instrument.cache();
+                for (i, m) in cache.modules.iter().take(6).enumerate() {
+                    out.extend_from_slice(format!("        #{}: ", i + 1).as_bytes());
+                    if m.use_flag {
+                        out.extend_from_slice(&m.module_string);
+                    } else {
+                        out.extend_from_slice(b"empty");
+                    }
+                    out.push(b'\n');
+                }
+            }
+        }
+        Some(out)
     }
 }
 
 /// Fake-device fixtures shared with `device_support`'s tests: building a
 /// `GmDevice` for tests requires a live `Arc<Instrument>`, which requires
-/// running the full `connect_stream` init sequence against a fake device.
+/// running the full `Instrument::start` init sequence against a fake device.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
+
+    #[test]
+    fn out_of_range_wire_indexes_are_skipped() {
+        let mut fsysconf = b"Unit:00  ".to_vec();
+        for (slot, module) in [("12", "GX90XA-06"), ("09", "GX90XA-100")] {
+            fsysconf.extend_from_slice(format!("{slot}:{module:<17}{module:<17}").as_bytes());
+            fsysconf.extend_from_slice(b"----------------\r\n");
+        }
+        fsysconf.push(b'E');
+        let mut responses = default_init_responses();
+        responses[0] = ascii_frame(&fsysconf);
+        responses[3] = ascii_frame(b"N 01000 X ,1\nN 09999 X ,1\nN A9999 X ,1\nE");
+        responses[4] = ascii_frame(b"SRangeAO,09999,X\nE");
+        responses[6] = ascii_frame(b"SRangeMath,9999,f\nE");
+        responses[8] = ascii_frame(b"aaaaaaaa999,1.5\nE");
+        responses[9] = ascii_frame(b"aaaaaaaa999,1.5\nE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        device.join().unwrap();
+        let cache = instrument.cache();
+        // C sizes meas_* at MAX_MEAS_CHAN = 1000, so address 1000 is stored.
+        assert_eq!(cache.meas_type[999], ChannelType::InputAnalog);
+        assert_eq!(cache.meas_info[999].scale, 1);
+    }
+
+    #[test]
+    fn constants_are_stored_as_c_float() {
+        let mut responses = default_init_responses();
+        responses[8] = ascii_frame(b"aaaaaaaa001,0.1\nE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        device.join().unwrap();
+        assert_eq!(
+            instrument.analog_get(ChannelFamily::Const, 1),
+            f64::from(0.1f32)
+        );
+    }
+
+    #[test]
+    fn channel_get_expr_cuts_at_byte_39() {
+        let instrument = Instrument::new("127.0.0.1".into());
+        let expr = format!("{}\u{b0}C", "x".repeat(38)).into_bytes();
+        instrument.cache().calc_expr[0].expr = expr.clone();
+        assert_eq!(instrument.channel_get_expr(1), &expr[..39]);
+    }
 
     pub(crate) fn ascii_frame(body: &[u8]) -> Vec<u8> {
         let mut out = b"EAxx".to_vec();
@@ -914,23 +1113,31 @@ pub(crate) mod test_support {
         out
     }
 
+    /// An `FData` frame of `(channel_type, address, status, alarms, value)`
+    /// records, all `data_type` 1.
+    pub(crate) fn fdata_binary(records: &[(u8, u16, u8, [u8; 4], i32)]) -> Vec<u8> {
+        let mut raw = vec![b'E', b'B', 0, 0];
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        raw.extend_from_slice(&[0u8; 10]);
+        raw.extend_from_slice(&(16 + 12 * records.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&[0u8; 16]);
+        for &(channel_type, address, status, alarms, value) in records {
+            raw.push((1 << 4) | channel_type);
+            raw.push(status);
+            raw.extend_from_slice(&address.to_be_bytes());
+            raw.extend_from_slice(&alarms);
+            raw.extend_from_slice(&value.to_be_bytes());
+        }
+        let total = (raw.len() - 8) as u32;
+        raw[4..8].copy_from_slice(&total.to_be_bytes());
+        raw
+    }
+
     /// One `FData` record: meas channel 1 (address=1), normal status,
     /// value 1234, no alarms (byte layout matches
     /// `codec::tests::fdata_binary_decodes_one_record`).
     pub(crate) fn one_record_fdata_binary() -> Vec<u8> {
-        let mut raw = vec![b'E', b'B', 0, 0];
-        raw.extend_from_slice(&0u32.to_be_bytes());
-        raw.extend_from_slice(&[0u8; 10]);
-        raw.extend_from_slice(&28u16.to_be_bytes());
-        raw.extend_from_slice(&[0u8; 16]);
-        raw.push((1 << 4) | 1);
-        raw.push(0);
-        raw.extend_from_slice(&1u16.to_be_bytes());
-        raw.extend_from_slice(&[0, 0, 0, 0]);
-        raw.extend_from_slice(&1234i32.to_be_bytes());
-        let total = (raw.len() - 8) as u32;
-        raw[4..8].copy_from_slice(&total.to_be_bytes());
-        raw
+        fdata_binary(&[(1, 1, 0, [0; 4], 1234)])
     }
 
     /// One present module (index 0), `GX90XA-06` = `InputAnalog`, 6
@@ -944,6 +1151,14 @@ pub(crate) mod test_support {
         body.extend_from_slice(b"----------------\r\n");
         body.push(b'E');
         ascii_frame(&body)
+    }
+
+    /// Overwrites signal channel `channel`'s cached type and value.
+    pub(crate) fn set_signal(instrument: &Instrument, channel: u32, ty: ChannelType, value: i32) {
+        let mut cache = instrument.cache();
+        let idx = (channel - 1) as usize;
+        cache.meas_type[idx] = ty;
+        cache.meas_data[idx].value = value;
     }
 
     /// Plays the device side of one connection: an unsolicited `E0`
@@ -978,15 +1193,9 @@ pub(crate) mod test_support {
         })
     }
 
-    /// One connected instrument: module 0 is a present `InputAnalog`
-    /// module, channel 1 is `InputAnalog` (unit "DEGC", value 1.234),
-    /// `K1`/`W1` (Const/VarConst) are set to 12.5/-7.5. Every other
-    /// Signal channel (e.g. 2) is `ChannelType::None` — "channel does not
-    /// exist" gate tests use it directly.
-    pub(crate) fn connect_default_fixture() -> Arc<Instrument> {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let responses = vec![
+    /// The replies `connect_default_fixture`'s init sequence consumes.
+    pub(crate) fn default_init_responses() -> Vec<Vec<u8>> {
+        vec![
             fsysconf_one_input_analog_module(),  // FSysConf
             ascii_frame(b"ORec,0\r\n"),          // ORec?
             ascii_frame(b"OMath,0\r\n"),         // OMath?
@@ -997,8 +1206,18 @@ pub(crate) mod test_support {
             one_record_fdata_binary(),           // FData,1
             ascii_frame(b"aaaaaaaa001,12.5\nE"), // SKConst?
             ascii_frame(b"aaaaaaaa001,-7.5\nE"), // SWConst?
-        ];
-        let device = spawn_fake_device(listener, responses);
+        ]
+    }
+
+    /// One connected instrument: module 0 is a present `InputAnalog`
+    /// module, channel 1 is `InputAnalog` (unit "DEGC", value 1.234),
+    /// `K1`/`W1` (Const/VarConst) are set to 12.5/-7.5. Every other
+    /// Signal channel (e.g. 2) is `ChannelType::None` — "channel does not
+    /// exist" gate tests use it directly.
+    pub(crate) fn connect_default_fixture() -> Arc<Instrument> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(listener, default_init_responses());
         let instrument = Instrument::connect_to(addr).unwrap();
         device.join().unwrap();
         instrument
@@ -1010,6 +1229,10 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::net::TcpListener;
+
+    /// Privileged port 1: no test can bind it, so a connect is always refused.
+    /// A freed ephemeral port can be taken by a concurrent test's listener.
+    const DEAD_PORT: u16 = 1;
 
     #[test]
     fn connect_runs_full_init_sequence_then_error_round_trip() {
@@ -1034,16 +1257,19 @@ mod tests {
         let instrument = Instrument::connect_to(addr).unwrap();
 
         assert!(instrument.module_presence(0));
-        assert_eq!(instrument.channel_get_egu(ChannelFamily::Signal, 1), "DEGC");
+        assert_eq!(
+            instrument.channel_get_egu(ChannelFamily::Signal, 1),
+            b"DEGC"
+        );
         assert_eq!(instrument.analog_get(ChannelFamily::Signal, 1), 1.234);
         assert_eq!(instrument.analog_get(ChannelFamily::Const, 1), 12.5);
         assert_eq!(instrument.analog_get(ChannelFamily::VarConst, 1), -7.5);
         assert!(!instrument.get_error_flag());
 
         let mut error_rx = instrument.register_interrupt(InterruptCategory::Error);
-        assert!(instrument.submit(Command::ClearError).is_err());
+        instrument.submit(Command::ClearError);
         assert!(instrument.get_error_flag());
-        assert_eq!(instrument.get_error(1), "Something broke");
+        assert_eq!(instrument.get_error(1), b"Something broke");
         assert!(error_rx.try_recv().is_ok());
 
         let received = device.join().unwrap();
@@ -1062,6 +1288,294 @@ mod tests {
                 "SWConst?\r\n",
                 "OErrorClear,0\r\n",
                 "_ERR,205\r\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn device_text_reaches_records_and_the_report_byte_for_byte() {
+        fn bytes(v: impl AsRef<[u8]>) -> Vec<u8> {
+            v.as_ref().to_vec()
+        }
+        let module = b"GX90XA-06\xff";
+        let mut fsysconf = b"Unit:00  00:".to_vec();
+        for _ in 0..2 {
+            fsysconf.extend_from_slice(module);
+            fsysconf.extend_from_slice(&[b' '; 7]);
+        }
+        fsysconf.extend_from_slice(b"----------------\r\nE");
+        let mut responses = default_init_responses();
+        responses[0] = ascii_frame(&fsysconf);
+        responses[3] = ascii_frame(b"N 0001 DEG\xff ,3\nE");
+        responses[6] = ascii_frame(b"xxxxxxxxxxx0001,'A\xff1'\nE");
+        responses.push(b"E1,205:1:12\r\n".to_vec());
+        responses.push(ascii_frame(b"junk 'bad \xff text' junk"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ClearError);
+        device.join().unwrap();
+
+        assert_eq!(bytes(instrument.module_string(0)), module);
+        assert_eq!(
+            bytes(instrument.channel_get_egu(ChannelFamily::Signal, 1)),
+            b"DEG\xff"
+        );
+        assert_eq!(bytes(instrument.channel_get_expr(1)), b"A\xff1");
+        assert_eq!(bytes(instrument.get_error(1)), b"bad \xff text");
+
+        let registry = Registry::new();
+        registry.insert("gm".into(), instrument).unwrap();
+        let report = registry.report(1).unwrap();
+        let line = b"        #1: GX90XA-06\xff\n";
+        assert!(
+            report.windows(line.len()).any(|w| w == line),
+            "{}",
+            String::from_utf8_lossy(&report)
+        );
+    }
+
+    #[test]
+    fn enqueue_runs_completion_after_the_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(b"E0\r\n".to_vec());
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let cache = instrument.cache.clone();
+        instrument.enqueue(
+            Command::ClearError,
+            Box::new(move || {
+                let _ = tx.send(cache.lock().error.code);
+            }),
+        );
+        assert_eq!(rx.recv().unwrap(), -1);
+        let received = device.join().unwrap();
+        assert_eq!(received.last().unwrap(), "OErrorClear,0\r\n");
+    }
+
+    #[test]
+    fn set_mode_out_of_range_sends_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(b"E0\r\n".to_vec());
+        responses.push(b"E0\r\n".to_vec());
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::SetOpMode(2));
+        instrument.submit(Command::SetCompute(4));
+        instrument.submit(Command::SetCompute(3));
+        instrument.submit(Command::SetOpMode(1));
+        let received = device.join().unwrap();
+        assert_eq!(
+            received[received.len() - 2..],
+            ["OMath,3\r\n", "ORec,1\r\n"]
+        );
+    }
+
+    #[test]
+    fn fdata_module_gate_is_address_over_100() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(fdata_binary(&[
+            (1, 99, 0, [0; 4], 77),
+            (1, 100, 0, [0; 4], 55),
+            (1, 0, 0, [0; 4], 33),
+        ]));
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ReadAllData);
+        device.join().unwrap();
+        let cache = instrument.cache();
+        assert_eq!(cache.meas_data[98].value, 77);
+        assert_eq!(cache.meas_data[99].value, 0);
+    }
+
+    #[test]
+    fn inet_aton_matches_glibc() {
+        let ok = |s: &str| inet_aton(s.as_bytes()).map(|a| a.to_string());
+        assert_eq!(ok("192.168.2.10").as_deref(), Some("192.168.2.10"));
+        assert_eq!(ok("127.1").as_deref(), Some("127.0.0.1"));
+        assert_eq!(ok("10.1.258").as_deref(), Some("10.1.1.2"));
+        assert_eq!(ok("0x7f.0.0.01").as_deref(), Some("127.0.0.1"));
+        assert_eq!(ok("3232236042").as_deref(), Some("192.168.2.10"));
+        assert_eq!(ok("1.2.3.4 trailing").as_deref(), Some("1.2.3.4"));
+        for bad in [
+            "",
+            " 1.2.3.4",
+            "1.2.3.256",
+            "1.2.3.4.5",
+            "08.1.1.1",
+            "1.2.3.4x",
+            "localhost",
+            "4294967296",
+            "1..2",
+            "1.2.3.",
+            "0b1",
+            "1.0B1",
+        ] {
+            assert_eq!(ok(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn gm10_init_rejects_bad_names_duplicates_and_addresses_silently() {
+        let registry = Registry::new();
+        for name in ["", "1dev", "dev-1", "dev 1"] {
+            init_on_port(&registry, Some(name.as_bytes()), Some(b"127.0.0.1"), 1);
+            assert!(registry.get(name).is_none(), "{name:?}");
+        }
+        init_on_port(&registry, Some(b"dev"), Some(b"localhost"), 1);
+        assert!(registry.get("dev").is_none());
+        init_on_port(&registry, Some(b"dev"), None, 1);
+        assert!(registry.get("dev").is_none());
+    }
+
+    #[test]
+    fn gm10_init_registers_before_a_failed_connect() {
+        let registry = Registry::new();
+        init_on_port(&registry, Some(b"gm_1"), Some(b"127.1"), DEAD_PORT);
+        let instrument = registry
+            .get("gm_1")
+            .expect("registered despite the refused connect");
+        assert_eq!(instrument.peer_address, "127.0.0.1");
+        assert!(instrument.tx.get().is_none());
+        init_on_port(&registry, Some(b"gm_1"), Some(b"10.0.0.1"), DEAD_PORT);
+        assert_eq!(registry.get("gm_1").unwrap().peer_address, "127.0.0.1");
+        // No queue thread: the command is dropped and submit returns.
+        instrument.submit(Command::ReadAllData);
+    }
+
+    #[test]
+    fn driver_report_lists_newest_first_with_modules_at_level_1() {
+        let registry = Registry::new();
+        registry
+            .insert("first".into(), Instrument::new("10.0.0.1".into()))
+            .unwrap();
+        registry
+            .insert("second".into(), connect_default_fixture())
+            .unwrap();
+        assert_eq!(
+            registry.report(0).unwrap(),
+            b"    Yokogawa GM10 #1: second @ 127.0.0.1\n    Yokogawa GM10 #2: first @ 10.0.0.1\n"
+        );
+        let level1 = String::from_utf8(registry.report(1).unwrap()).unwrap();
+        assert!(level1.starts_with(
+            "    Yokogawa GM10 #1: second @ 127.0.0.1\n        Modules:\n        #1: GX90XA-06\n        #2: empty\n"
+        ));
+        assert_eq!(level1.matches("        #6: empty\n").count(), 2);
+        assert!(!level1.contains("#7:"));
+    }
+
+    #[test]
+    fn single_channel_reads_fire_io_intr_only_on_alarm_flag_change() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(one_record_fdata_binary());
+        responses.push(fdata_binary(&[(1, 1, 0, [1, 0, 0, 0], 5)]));
+        responses.push(ascii_frame(b"aaaaaaaa001,1.5\nE"));
+        responses.push(ascii_frame(b"aaaaaaaa001,1.5\nE"));
+        responses.push(ascii_frame(b"aaaaaaaa001,1.5\nE"));
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        let mut channel = instrument.register_interrupt(InterruptCategory::Channel);
+        let mut misc = instrument.register_interrupt(InterruptCategory::Misc);
+        instrument.submit(Command::ReadSignal(1));
+        assert!(channel.try_recv().is_err());
+        instrument.submit(Command::ReadSignal(1));
+        assert!(channel.try_recv().is_ok());
+        instrument.submit(Command::ReadConst(1));
+        assert!(misc.try_recv().is_err());
+        instrument.submit(Command::ReadAllMisc);
+        assert!(misc.try_recv().is_ok());
+        device.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_error_header_still_sets_error_flag() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(b"E1,junk\r\n".to_vec());
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ClearError);
+        assert!(instrument.get_error_flag());
+        device.join().unwrap();
+    }
+
+    #[test]
+    fn srange_abort_keeps_earlier_lines_and_skips_the_info_scan() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(ascii_frame(b"E"));
+        responses.push(ascii_frame(b"xxxxxxxxx00001T\nxxxxxxxxxA0002M\nE"));
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        let mut info = instrument.register_interrupt(InterruptCategory::Info);
+        instrument.submit(Command::ReadAllInfos);
+        assert_eq!(instrument.cache().meas_info[0].ch_mode, CH_MODE_DAC_RETRANS);
+        assert!(info.try_recv().is_err());
+        let received = device.join().unwrap();
+        assert_eq!(received.last().unwrap(), "SRangeAO?\r\n");
+    }
+
+    #[test]
+    fn load_status_keeps_the_previous_mode_on_a_malformed_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(ascii_frame(b"ORec,1\r\n"));
+        responses.push(ascii_frame(b"OMath,2\r\n"));
+        responses.push(ascii_frame(b"junk\r\n"));
+        responses.push(ascii_frame(b"OMath,x\r\n"));
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ReadStatus);
+        instrument.submit(Command::ReadStatus);
+        assert!(instrument.get_recording_mode());
+        assert_eq!(instrument.get_compute_mode(), 2);
+        assert!(instrument.get_settings_mode());
+        device.join().unwrap();
+    }
+
+    #[test]
+    fn leaving_settings_mode_queues_the_info_reload_behind_pending_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(ascii_frame(b"ORec,1\r\n"));
+        responses.push(ascii_frame(b"OMath,1\r\n"));
+        responses.push(ascii_frame(b"ORec,0\r\n"));
+        responses.push(ascii_frame(b"OMath,0\r\n"));
+        responses.push(b"E0\r\n".to_vec());
+        for _ in 0..4 {
+            responses.push(ascii_frame(b"E"));
+        }
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ReadStatus);
+        // Both queued before the actor can finish the ReadStatus round trips.
+        instrument.enqueue(Command::ReadStatus, Box::new(|| {}));
+        instrument.enqueue(Command::ClearError, Box::new(|| {}));
+        let received = device.join().unwrap();
+        assert_eq!(
+            received[received.len() - 7..],
+            [
+                "ORec?\r\n",
+                "OMath?\r\n",
+                "OErrorClear,0\r\n",
+                "FChInfo\r\n",
+                "SRangeAO?\r\n",
+                "SRangeDO?\r\n",
+                "SRangeMath?\r\n",
             ]
         );
     }

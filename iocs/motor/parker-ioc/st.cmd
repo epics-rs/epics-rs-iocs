@@ -8,26 +8,24 @@
 #============================================================
 
 epicsEnvSet("P",      "OEM:")
-epicsEnvSet("CARD",   "0")
-epicsEnvSet("IPPORT", "OEM")
+epicsEnvSet("CTRL",   "OEM")
+epicsEnvSet("IPPORT", "PORT")
 epicsEnvSet("HOST",   "192.168.1.220:5000")
-epicsEnvSet("NAXES",  "1")
+epicsEnvSet("NAXES",  "3")
 
 # ---- asyn IP octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
-# OEM framing: the driver appends the CR command terminator, so only the input
-# EOS is configured here. Do not set an output EOS — the port would append it a
-# second time.
-asynOctetSetInputEos("$(IPPORT)", 0, "\r")
-
 # ---- OEM750 controller ----
-# OEMCreateController(card, oemPort, numAxes, [movingPollMs], [idlePollMs]).
-OEMCreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)
+# OEMCreateController(portName, OEMPortName, numAxes, movingPollPeriod, idlePollPeriod).
+OEMCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 20, 1000)
 
-# One motor record per axis (DTYP OEM_$(CARD)_0, _1, ...). The driver reports
-# positions in controller counts, so MRES = 1.
-dbLoadRecords("$(PARKER_IOC)/db/oem.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+# Each axis's basic_asyn_motor.db and OEMSupport.template, as C's
+# st.cmd.oem loads them.
+dbLoadTemplate("$(PARKER_IOC)/db/motor.substitutions.oem", "P=$(P),PORT=$(CTRL)")
+
+# The octet port's asyn record, as C's st.cmd.oem loads it.
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(P),R=asyn1,PORT=$(IPPORT),ADDR=0,OMAX=256,IMAX=256")
 
 iocInit()
 

@@ -1,87 +1,150 @@
 //! `SmartMotorSetup` / `SmartMotorConfig` iocsh commands for the Animatics
-//! SmartMotor.
-//!
-//! Mirrors C `SmartMotorConfig(card, port)`: connect the serial octet port,
-//! probe the single SmartMotor ([`SmartMotorController::new`]), and register its
-//! axis behind a `DTYP`-keyed motor device support (`SMARTMOTOR_{card}_0`).
-//! `SmartMotorSetup` (which only sized a controller array in C) is accepted as a
-//! no-op for startup-script parity.
-//!
-//! Only single-motor (non-daisy-chain) controllers are supported; see the
-//! [`crate::smartmotor`] module docs.
+//! SmartMotor, C's model-1 interface: records reach axis `signal` of `card`
+//! through `DTYP "SmartMotor"` and `OUT "#C card S signal"`. Config keeps
+//! the port; `motor_init` at iocInit connects and identifies the controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
-use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
-};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, Model1Cards, SCAN_RATE, c_int};
+use motor_common::model1_device;
 
 use crate::smartmotor::{SmartMotorAxis, SmartMotorController};
 
 /// Serial command timeout (C `COMM_TIMEOUT` 2 s).
 const SMARTMOTOR_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the `SmartMotorSetup(maxControllers, [scanRate])` no-op command
-/// (startup-script parity; the asyn-rs port allocates per `SmartMotorConfig`).
+/// `device(motor,VME_IO,devSmartMotor,"SmartMotor")` (devSmartMotorMotor.dbd:3).
+static DEV_SMART_MOTOR: DevSup = model1_device("devSmartMotor", "SmartMotor");
+
+/// `SmartMotor_NUM_CARDS` (drvSmartMotor.cc:57).
+static SMART_MOTOR: Model1 = Model1::new(&DEV_SMART_MOTOR, 7, SCAN_RATE);
+
+/// `SmartMotorSetup(num_cards, scan_rate)`, with the `drvSmartMotor` drvet
+/// report its dbd line registers.
 pub fn smartmotor_setup_command() -> CommandDef {
+    SMART_MOTOR.register_report("drvSmartMotor", report);
+    SMART_MOTOR.setup_command("SmartMotorSetup")
+}
+
+/// C `report` (drvSmartMotor.cc:143-166). C's `ident` is never filled, so
+/// the id is always empty.
+fn report(cards: &Model1Cards<'_>) -> String {
+    cards.report("SmartMotor", |card, port| {
+        format!("    SmartMotorSM controller #{card}, port={port}, id:  \n")
+    })
+}
+
+/// `SmartMotorConfig(card, name)`.
+pub fn smartmotor_config_command() -> CommandDef {
     CommandDef::new(
-        "SmartMotorSetup",
-        vec![arg_int_req("maxControllers"), arg_int_opt("scanRate")],
-        "SmartMotorSetup(maxControllers, [scanRate]) - Accepted for parity; SmartMotorConfig allocates per call",
+        "SmartMotorConfig",
+        vec![
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+        ],
+        "SmartMotorConfig(card, name)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxControllers")?;
-            if max < 1 {
-                return Err("SmartMotorSetup: maxControllers must be > 0".into());
+            let card = c_int(args, 0);
+            if !SMART_MOTOR.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+
+            SMART_MOTOR.config(card, move |init| {
+                let Some(port) = get_port(&asyn_port) else {
+                    return;
+                };
+                let Ok(controller) =
+                    SmartMotorController::new(port.handle.clone(), SMARTMOTOR_TIMEOUT)
+                else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                let controller = Arc::new(Mutex::new(controller));
+                for axis in 0..num_axes {
+                    let ax = SmartMotorAxis::new(controller.clone(), axis);
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
+                    init.axis(axis as i32, motor);
+                }
+                init.describe(asyn_port);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `SmartMotorConfig(card, asynPort, [movingPollMs], [idlePollMs])`
-/// command bound to `holder`.
-pub fn smartmotor_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
-    CommandDef::new(
-        "SmartMotorConfig",
-        vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-        ],
-        "SmartMotorConfig(card, asynPort, [movingPollMs], [idlePollMs]) - \
-         Create a single Animatics SmartMotor (DTYP SMARTMOTOR_{card}_0); \
-         daisy-chain controllers are not supported",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("SmartMotorConfig: card must be >= 0".into());
+#[cfg(all(test, target_os = "linux"))]
+mod report {
+    use epics_rs::base::server::driver_support::find_driver_support;
+    use motor_common::testing::{LineRig, drvsup_init, run_command};
+
+    use super::*;
+
+    /// C drvSmartMotor.cc:143-166, the drvet report `dbior` runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_smartmotor_card() {
+        let setup = smartmotor_setup_command();
+        let drvet = find_driver_support("drvSmartMotor").unwrap();
+        assert_eq!(
+            drvet.report(0).unwrap(),
+            b"    No SmartMotor controllers configured.\n"
+        );
+        run_command(setup, vec![ArgValue::Int(2), ArgValue::Int(10)]).await;
+        let (_line, _io) = LineRig::new("smReportLine", |_| "0".into());
+        let config = smartmotor_config_command();
+        let args = vec![ArgValue::Int(1), ArgValue::String("smReportLine".into())];
+        run_command(config, args).await;
+        drvsup_init().await;
+        assert_eq!(
+            drvet.report(0).unwrap(),
+            b"    SmartMotor controller 0 connection failed.\n    \
+             SmartMotorSM controller #1, port=smReportLine, id:  \n"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvSmartMotor.cc:606-660: `motor_init` counts the motors, then reads
+    /// the status once, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn smartmotor_motor_init_reads_the_status_once() {
+        run_command(
+            smartmotor_setup_command(),
+            vec![ArgValue::Int(1), ArgValue::Int(10)],
+        )
+        .await;
+        let (line, _io) = LineRig::new("smInitLine", |cmd| {
+            match cmd {
+                "RP" => "14",
+                _ => "0",
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
-
-            let handle = connect_serial(&asyn_port, SMARTMOTOR_TIMEOUT)?;
-            let controller =
-                SmartMotorController::new(handle).map_err(|e| format!("SmartMotorConfig: {e}"))?;
-            let controller = Arc::new(Mutex::new(controller));
-
-            let ax = SmartMotorAxis::new(controller);
-            let dtyp_key = format!("SMARTMOTOR_{card}_0");
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
-
-            println!(
-                "SmartMotorConfig: card={card} asynPort={asyn_port} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=SMARTMOTOR_{card}_0)"
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
+            .into()
+        });
+        let args = vec![ArgValue::Int(0), ArgValue::String("smInitLine".into())];
+        run_command(smartmotor_config_command(), args).await;
+        drvsup_init().await;
+        assert_eq!(
+            line.sent(),
+            [
+                "RBe", "RBt", "RP", "RBp", "RBm", "RBr", "RBl", "RBo", "RP", "RV"
+            ]
+        );
+        let db = record_init(
+            "record(motor, \"m1\") { field(DTYP, \"SmartMotor\") field(OUT, \"#C0 S0 @\") }\n",
+        )
+        .await;
+        assert_eq!(db.get_pv("m1.RMP").unwrap(), EpicsValue::Long(14));
+    }
 }

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use epics_rs::base::server::db_loader::{DbLoadConfig, DbRecordDef, parse_db_file};
+use epics_rs::base::types::RecordName;
 
 /// The templates st.cmd loads, with the macros it loads them under.
 const TEMPLATES: &[(&str, &[(&str, &str)])] = &[
@@ -63,13 +64,15 @@ fn load_all() -> Vec<DbRecordDef> {
 #[test]
 fn every_template_loads() {
     let defs = load_all();
-    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     // One record from each of the four shapes: the base class the driver's own
     // template pulls in, a Serval scalar, a per-chip DAC, and a rail.
-    assert!(names.contains(&"TPX3-TEST:cam1:Acquire"));
-    assert!(names.contains(&"TPX3-TEST:cam1:WriteData"));
-    assert!(names.contains(&"TPX3-TEST:cam1:CHIP0_Ikrum_RBV"));
-    assert!(names.contains(&"TPX3-TEST:cam1:Pwr0_VDD_RBV"));
+    assert!(defs.iter().any(|d| d.name == "TPX3-TEST:cam1:Acquire"));
+    assert!(defs.iter().any(|d| d.name == "TPX3-TEST:cam1:WriteData"));
+    assert!(
+        defs.iter()
+            .any(|d| d.name == "TPX3-TEST:cam1:CHIP0_Ikrum_RBV")
+    );
+    assert!(defs.iter().any(|d| d.name == "TPX3-TEST:cam1:Pwr0_VDD_RBV"));
 }
 
 /// `dbLoadRecords` merges a re-declared record into the existing instance only
@@ -77,7 +80,7 @@ fn every_template_loads() {
 /// (TimePix3Base.template re-declares ADBase records) must keep its type.
 #[test]
 fn redeclared_records_keep_their_type() {
-    let mut types: HashMap<String, String> = HashMap::new();
+    let mut types: HashMap<RecordName, String> = HashMap::new();
     for def in load_all() {
         match types.get(&def.name) {
             Some(first) => assert_eq!(
@@ -90,7 +93,7 @@ fn redeclared_records_keep_their_type() {
             }
         }
     }
-    assert!(types.contains_key("TPX3-TEST:cam1:TriggerMode"));
+    assert!(types.contains_key(&RecordName::from("TPX3-TEST:cam1:TriggerMode")));
 }
 
 #[test]
@@ -120,4 +123,15 @@ fn every_tpx3_drv_info_is_one_the_driver_creates() {
         }
     }
     assert!(unserved.is_empty(), "unserved drvInfo: {unserved:#?}");
+}
+
+/// Record init refuses a record whose DTYP interface the port does not
+/// register, and an I/O Intr one whose interface cannot post interrupts.
+#[test]
+fn every_record_binds_an_interface_the_port_registers() {
+    ioc_conventions::wiring::assert_wired(
+        &load_all(),
+        timepix3::driver::INTERFACES,
+        timepix3::driver::INTERRUPTS,
+    );
 }

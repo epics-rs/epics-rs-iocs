@@ -1,5 +1,5 @@
 # MW100 Const (constant) channel.
-# Macros: P, DAU, HANDLE, ADDRESS (Const address, e.g. K1).
+# Macros: P, DAU, HANDLE, ADDRESS (Const address, e.g. K01).
 # Port of yokogawaDasApp/Db/MW100_constant_channel.db.
 
 record(ai,"$(P)$(DAU):$(ADDRESS)")

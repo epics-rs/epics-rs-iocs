@@ -76,6 +76,36 @@ fn tag_path_two_indexed_levels() {
     assert_eq!(path_of("arr[2].sub[3]"), "91036172720028029103737562002803");
 }
 
+/// `EIP_parse_tag` reads the element with `atol` into a `size_t`: leading
+/// space and sign are taken, an overflow saturates at `LONG_MAX`, and a
+/// value past 32 bits, which only a 64-bit `long` holds, still picks the
+/// 32-bit form, whose bytes and `[%u]` keep the low half.
+#[test]
+fn tag_path_element_is_atol_into_size_t() {
+    use std::ffi::c_long;
+    let [past_u32, past_long] = if c_long::BITS == 64 {
+        [
+            ("910178002A0000000000", "x[0]"),
+            ("910178002A00FFFFFFFF", "x[4294967295]"),
+        ]
+    } else {
+        [("910178002A00FFFFFF7F", "x[2147483647]"); 2]
+    };
+    let cases = [
+        ("x[ 3]", 3, "910178002803", "x[3]"),
+        ("x[+7]", 3, "910178002807", "x[7]"),
+        ("x[0x10]", 3, "910178002800", "x[0]"),
+        ("x[-1]", 5, "910178002A00FFFFFFFF", "x[4294967295]"),
+        ("x[4294967296]", 5, past_u32.0, past_u32.1),
+        ("x[99999999999999999999]", 5, past_long.0, past_long.1),
+    ];
+    for (s, words, path, shown) in cases {
+        assert_eq!(tag(s).path_words(), words, "{s}");
+        assert_eq!(path_of(s), path, "{s}");
+        assert_eq!(tag(s).to_string(), shown, "{s}");
+    }
+}
+
 #[test]
 fn tag_path_round_trips_through_display() {
     for t in ["FRED", "REALS[3]", "Struct.Member", "arr[2].sub[3]"] {
@@ -243,6 +273,18 @@ fn mr_response_data_skips_extended_status() {
 fn transaction_id_is_eight_ascii_digits() {
     assert_eq!(TransactionId::from_counter(1).to_string(), "00000001");
     assert_eq!(TransactionId::from_counter(1).0, *b"00000001");
+}
+
+#[test]
+fn transaction_id_is_uppercase_hex() {
+    // generateTransactionId writes the counter in hex, most significant
+    // digit first; the fixtures above all sit below 10.
+    assert_eq!(TransactionId::from_counter(10).to_string(), "0000000A");
+    assert_eq!(TransactionId::from_counter(0x432).to_string(), "00000432");
+    assert_eq!(
+        TransactionId::from_counter(0x7FFF_FFFE).to_string(),
+        "7FFFFFFE"
+    );
 }
 
 #[test]
@@ -424,16 +466,44 @@ fn decode_negative_int() {
     assert_eq!(get_double(&i, 0), Some(-3.0)); // C: 65533
 }
 
-/// UPSTREAM FIX (`ether_ip.c:1277-1281` and `:1361-1365`): SINT is read through
-/// an unsigned `CN_USINT` in BOTH `get_CIP_double` and `get_CIP_DINT`, even
-/// though `ether_ip.h:197` declares `typedef signed char CN_SINT`. A SINT of -2
-/// reaches an `ai` record as 254 in the C.
+/// `get_CIP_DINT` reads SINT through an unsigned `CN_USINT`
+/// (ether_ip.c:1361-1365), so a SINT of -2 reaches an `ai` record as 254.
 #[test]
 fn decode_negative_sint() {
     let s = raw(CipType::Sint, &[0xFE]);
-    assert_eq!(get_dint(&s, 0), Some(-2)); // C: 254
+    assert_eq!(get_dint(&s, 0), Some(254));
     assert_eq!(get_double(&s, 0), Some(-2.0)); // C: 254
     assert_eq!(get_usint(&s, 0), Some(0xFE)); // the raw byte, for waveforms
+}
+
+/// `get_CIP_DINT` (ether_ip.c:1366-1384): UINT through a signed `CN_INT`,
+/// floats by x86 C cast, no LINT.
+#[test]
+fn get_dint_converts_as_get_cip_dint() {
+    assert_eq!(get_dint(&raw(CipType::Uint, &[0xFF, 0xFF]), 0), Some(-1));
+    assert_eq!(
+        get_dint(&raw(CipType::Real, &3e9f32.to_le_bytes()), 0),
+        Some(i32::MIN)
+    );
+    assert_eq!(
+        get_dint(&raw(CipType::Lreal, &(-7.9f64).to_le_bytes()), 0),
+        Some(-7)
+    );
+    assert_eq!(get_dint(&raw(CipType::Lint, &5i64.to_le_bytes()), 0), None);
+}
+
+/// `get_CIP_UDINT` (ether_ip.c:1331-1338) casts floats as x86 C does: the
+/// 64-bit convert, low 32 bits.
+#[test]
+fn get_udint_casts_floats_as_get_cip_udint() {
+    assert_eq!(
+        get_udint(&raw(CipType::Real, &(-1.0f32).to_le_bytes()), 0),
+        Some(u32::MAX)
+    );
+    assert_eq!(
+        get_udint(&raw(CipType::Lreal, &5e9f64.to_le_bytes()), 0),
+        Some(705_032_704)
+    );
 }
 
 #[test]

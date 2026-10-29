@@ -20,22 +20,30 @@ use async_opcua::types::{
     DataValue, DateTime, ExpandedMessageInfo, ExtensionObject, NodeId, StatusCode, StructureType,
     Variant,
 };
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::link::{Bini, LinkInfo, TimestampSource};
+use crate::link::{Bini, LinkInfo, NodeIdentifier, TimestampSource};
 use crate::queue::{ConnectionStatus, ProcessReason, Update, UpdateQueue};
-use crate::session::{Priority, Request, SessionHandle};
-use crate::value::EnumChoices;
+use crate::session::{Priority, Request, SessionHandle, status_name};
+use crate::value::{EnumChoices, type_name};
 
 /// One record's binding to an item (`DataElementOpen62541Leaf` +
 /// `RecordConnector`).
 #[derive(Debug)]
 pub struct Leaf {
     pub record: String,
+    /// `RecordConnector::getRecordType`.
+    pub record_type: String,
     pub link: LinkInfo,
-    /// Incoming updates, one popped per record process cycle.
-    pub queue: UpdateQueue,
+    /// Incoming updates, one popped per record process cycle. Only
+    /// [`Self::push`] and [`Self::pop`] touch it, so a non-empty queue always
+    /// has a wake-up pending or `owed` one.
+    queue: UpdateQueue,
+    /// A pass a wake brought took nothing ([`Self::owe_wake`]).
+    owed: bool,
     /// The value the record last wrote, waiting to go out.
     pub outgoing: Option<Variant>,
     /// Set when `outgoing` has not reached the server yet (`markAsDirty`).
@@ -52,12 +60,19 @@ pub struct Leaf {
 }
 
 impl Leaf {
-    pub fn new(record: String, link: LinkInfo, notify: mpsc::Sender<()>) -> Self {
+    pub fn new(
+        record: String,
+        record_type: &str,
+        link: LinkInfo,
+        notify: mpsc::Sender<()>,
+    ) -> Self {
         let queue = UpdateQueue::new(link.client_queue_size as usize, link.discard_oldest);
         Self {
             record,
+            record_type: record_type.to_string(),
             link,
             queue,
+            owed: false,
             outgoing: None,
             dirty: false,
             incoming: None,
@@ -80,13 +95,45 @@ impl Leaf {
         ));
     }
 
-    /// Queue an update and wake the record if this is the one it will see first.
-    fn push(&mut self, update: Update) {
-        if self.queue.push(update) {
-            // A full channel already holds a pulse the record has not consumed,
-            // and one pulse drains the whole queue, so dropping it is correct.
-            let _ = self.notify.try_send(());
+    /// Queue an update and wake the record if this is the one it will see first
+    /// (`pushUpdate`'s `wasFirst`, `DataElementOpen62541Leaf.cpp:134`) or a
+    /// wake is owed.
+    pub fn push(&mut self, update: Update) {
+        let first = self.queue.push(update);
+        if std::mem::take(&mut self.owed) || first {
+            self.wake();
         }
+    }
+
+    /// The pass a wake brought never reached the device (DISA, a breakpoint),
+    /// so the update it was for is queued with no wake left. The C leaves it
+    /// there, waking only on the first push (`DataElementOpen62541Leaf.cpp:
+    /// 129-134`), a defect not copied. Waking now would spin on a record that
+    /// stays disabled, so the next push wakes.
+    pub fn owe_wake(&mut self) {
+        self.owed = true;
+    }
+
+    /// Take the update this pass processes for, and wake the record again if
+    /// another is queued behind it (`if (nextReason)
+    /// pcon->requestRecordProcessing(nextReason)` after every pop,
+    /// `devOpcua.cpp:408` and its 17 twins).
+    pub fn pop(&mut self) -> Option<Update> {
+        let (update, next) = self.queue.pop()?;
+        if next != ProcessReason::None {
+            self.wake();
+        }
+        Some(update)
+    }
+
+    pub fn queue(&self) -> &UpdateQueue {
+        &self.queue
+    }
+
+    fn wake(&self) {
+        // A full channel holds a wake-up the record has not taken yet; the pass
+        // it brings pops, and wakes the record again if more is queued.
+        let _ = self.notify.try_send(());
     }
 }
 
@@ -107,8 +154,13 @@ pub struct Item {
     /// VALUE as a pair, `no_of_properties_read = 2`).
     pub data_type: Option<NodeId>,
     pub state: ConnectionStatus,
-    /// The client handle its monitored item was created with.
-    pub client_handle: u32,
+    /// Its place in `SessionHandle::items`, which is what the worker's requests
+    /// name it by. Not the monitored item's client handle.
+    pub index: u32,
+    /// What the server granted when the monitored item was last created; 0
+    /// until then (`ItemOpen62541::revisedSamplingInterval`/`revisedQueueSize`).
+    pub revised_sampling_interval: f64,
+    pub revised_queue_size: u32,
     /// Every record bound to this node.
     pub leaves: Vec<Arc<Mutex<Leaf>>>,
     /// The item's own last value, from which every leaf's element is taken.
@@ -121,13 +173,16 @@ pub struct Item {
     /// The server's data type dictionary, needed to rebuild a structure around a
     /// changed element.
     pub type_tree: Option<Arc<DataTypeTree>>,
+    /// The element tree was checked against a structure value and what it
+    /// cannot supply was reported (`DataElementOpen62541Node::mapped`); a
+    /// connection loss drops the mapping.
+    mapped: bool,
     /// The session the item's node lives on — `None` until
     /// [`Item::adopt`] puts it there.
     ///
     /// A record only ever reaches its session *through* its item, so this is the
     /// one place the two are tied together, and it is set exactly when the item
-    /// enters `SessionHandle::items` (which is what [`Self::client_handle`]
-    /// indexes).
+    /// enters `SessionHandle::items` (at [`Self::index`]).
     session: Option<Arc<SessionHandle>>,
 }
 
@@ -156,29 +211,34 @@ impl Item {
             registered_node_id: None,
             data_type: None,
             state: ConnectionStatus::Down,
-            client_handle: 0,
+            index: 0,
+            revised_sampling_interval: 0.0,
+            revised_queue_size: 0,
             leaves: Vec::new(),
             last_value: None,
-            last_status: StatusCode::Good,
+            last_status: StatusCode::BadServerNotConnected,
             last_timestamp: None,
             type_tree: None,
+            mapped: false,
             session: None,
         }
     }
 
     /// The record that *addresses the node* has bound: the item is on this
-    /// session, at this node, under this client handle.
+    /// session, at this node, at this index of its items.
     pub fn adopt(
         &mut self,
         link: LinkInfo,
         node_id: NodeId,
-        client_handle: u32,
+        index: u32,
         session: Arc<SessionHandle>,
     ) {
         self.link = link;
-        self.configured_node_id = node_id.clone();
-        self.node_id = node_id;
-        self.client_handle = client_handle;
+        self.configured_node_id = node_id;
+        // Built at each connect (`ItemOpen62541::rebuildNodeId`); null until
+        // then, as `opcuaShow` prints it.
+        self.node_id = NodeId::null();
+        self.index = index;
         self.session = Some(session);
     }
 
@@ -201,7 +261,7 @@ impl Item {
             // to is not in the database. `Registry::start` reports that.
             return;
         };
-        let handle = self.client_handle;
+        let handle = self.index;
         session.request(
             priority,
             match action {
@@ -218,7 +278,13 @@ impl Item {
     }
 
     pub fn is_monitored(&self) -> bool {
-        self.link.monitor && self.link.subscription().is_some()
+        self.subscription().is_some()
+    }
+
+    /// The subscription the item is on: only a monitored item joins its link's
+    /// subscription (`ItemOpen62541.cpp:52-55`).
+    pub fn subscription(&self) -> Option<&str> {
+        self.link.subscription().filter(|_| self.link.monitor)
     }
 
     /// A value arrived from the server (`ItemOpen62541::setIncomingData`).
@@ -229,8 +295,10 @@ impl Item {
         let status = value.status.unwrap_or(StatusCode::Good);
         let data = value.value.clone().unwrap_or(Variant::Empty);
         self.last_value = Some(data.clone());
-        self.last_status = status;
-        self.last_timestamp = Some(self.timestamp_for(&self.link, &value, &data));
+        self.take_value_status(status);
+        self.map_elements(&data);
+        let data_time = self.data_timestamp(&data);
+        self.last_timestamp = Some(timestamp_for(&self.link, &value, data_time));
 
         for leaf in &self.leaves {
             let mut leaf = leaf.lock();
@@ -242,7 +310,7 @@ impl Item {
                 leaf.incoming = Some(element.clone());
             }
 
-            let timestamp = self.timestamp_for(&leaf.link, &value, &data);
+            let timestamp = timestamp_for(&leaf.link, &value, data_time);
             if leaf.state == ConnectionStatus::InitialRead {
                 match leaf.link.bini {
                     // The initial value is thrown away; the item still needed it
@@ -283,14 +351,44 @@ impl Item {
         }
     }
 
-    /// An event with no value — a read failure, a write result, a connection
-    /// loss (`ItemOpen62541::setIncomingEvent`).
-    pub fn set_incoming_event(&mut self, reason: ProcessReason, status: StatusCode) {
+    /// A read answered with a bad status and no value. C hands it to
+    /// `setIncomingData` like any value, so it is the item's status; the records
+    /// see a read failure.
+    pub fn set_incoming_failure(&mut self, status: StatusCode) {
+        self.take_value_status(status);
+        self.set_incoming_event(ProcessReason::ReadFailure);
+    }
+
+    /// The head of `ItemOpen62541::setIncomingData` (`ItemOpen62541.cpp:175-184`).
+    fn take_value_status(&mut self, status: StatusCode) {
+        if self.last_status == StatusCode::BadServerNotConnected
+            && status == StatusCode::BadNodeIdUnknown
+        {
+            // C prints the epicsUInt32 identifier with %d, negative from 2^31.
+            let identifier = match &self.link.identifier {
+                Some(NodeIdentifier::Numeric(n)) => format!("i={n}"),
+                Some(NodeIdentifier::String(s)) => format!("s={s}"),
+                None => "s=".to_string(),
+            };
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: item ns={};{identifier} : BadNodeIdUnknown\n",
+                self.link.session().unwrap_or_default(),
+                self.link.namespace_index,
+            ));
+        }
         self.last_status = status;
+    }
+
+    /// An event with no value — a read failure, a write result, a connection
+    /// loss (`ItemOpen62541::setIncomingEvent`). Only a connection loss
+    /// changes the item's status (`ItemOpen62541.cpp:215-216`).
+    pub fn set_incoming_event(&mut self, reason: ProcessReason) {
         self.last_timestamp = Some(SystemTime::now());
         if reason == ProcessReason::ConnectionLoss {
+            self.last_status = StatusCode::BadServerNotConnected;
             self.state = ConnectionStatus::Down;
             self.last_value = None;
+            self.mapped = false;
         }
         for leaf in &self.leaves {
             let mut leaf = leaf.lock();
@@ -299,7 +397,12 @@ impl Item {
                 leaf.choices = None;
                 leaf.incoming = None;
             }
-            leaf.push(Update::new(reason, None, status, SystemTime::now()));
+            leaf.push(Update::new(
+                reason,
+                None,
+                StatusCode::Good,
+                SystemTime::now(),
+            ));
         }
     }
 
@@ -317,6 +420,9 @@ impl Item {
     /// structure it is a read-modify-write of the last value received, which is
     /// what the C's node elements assemble from their dirty children.
     pub fn take_outgoing(&mut self) -> Option<Variant> {
+        if let Some(base) = self.last_value.clone() {
+            self.map_elements(&base);
+        }
         let mut result: Option<Variant> = None;
         for leaf in &self.leaves {
             let mut leaf = leaf.lock();
@@ -337,18 +443,18 @@ impl Item {
                 .take()
                 .or_else(|| self.last_value.clone())
                 .unwrap_or(Variant::Empty);
+            // Without a dictionary the value stays encoded, which the mapping
+            // reported; C then writes the structure back unchanged.
             let Some(tree) = &self.type_tree else {
-                log::error!(
-                    "{}: cannot write element: the server's type tree is not loaded",
-                    leaf.record
-                );
                 result = Some(base);
                 continue;
             };
             match with_element(&base, &leaf.link.element_path, value, tree) {
                 Ok(updated) => result = Some(updated),
                 Err(e) => {
-                    log::error!("{}: cannot write element: {e}", leaf.record);
+                    if let ElementError::Encode(e) = e {
+                        epics_rs::base::stderr_println!("Item {}: {e}", self.node_id);
+                    }
                     result = Some(base);
                 }
             }
@@ -385,28 +491,264 @@ impl Item {
         }
     }
 
-    /// `ItemOpen62541::getStatus` / `uaToEpicsTime` — which of the value's
-    /// timestamps the record takes.
-    fn timestamp_for(&self, link: &LinkInfo, value: &DataValue, data: &Variant) -> SystemTime {
-        let pick = |dt: Option<DateTime>| dt.map(system_time_of);
-        match link.timestamp {
-            TimestampSource::Server => pick(value.server_timestamp),
-            TimestampSource::Source => pick(value.source_timestamp),
-            TimestampSource::Data => {
-                let element = &self.link.timestamp_element;
-                match element_of(data, std::slice::from_ref(element)) {
-                    Some(Variant::DateTime(dt)) => Some(system_time_of(*dt)),
-                    _ => {
-                        log::warn!(
-                            "item {}: element '{element}' is not a DateTime; using the server time",
-                            self.node_id
-                        );
-                        pick(value.server_timestamp)
-                    }
+    /// The time in the item's `@element`, if it names a DateTime element.
+    fn data_timestamp(&self, data: &Variant) -> Option<SystemTime> {
+        let element = &self.link.timestamp_element;
+        if element.is_empty() {
+            return None;
+        }
+        match element_of(data, std::slice::from_ref(element)) {
+            Some(Variant::DateTime(dt)) => Some(system_time_of(*dt)),
+            _ => None,
+        }
+    }
+
+    /// `DataElementOpen62541Node::createMap` over the whole element tree, on
+    /// the first value after a connect: report the `@element` timestamp source
+    /// and every element the structure cannot supply.
+    ///
+    /// C's encoded-extension-object line has no counterpart: `async-opcua`
+    /// fails the whole decode of a structure its dictionary lacks.
+    fn map_elements(&mut self, data: &Variant) {
+        if self.mapped {
+            return;
+        }
+        self.mapped = true;
+        self.report_timestamp_element(data);
+        for line in self.element_report(data) {
+            epics_rs::base::stderr_println!("{line}");
+        }
+    }
+
+    /// What `createMap` prints, node by node, for the elements `data` cannot
+    /// supply.
+    pub fn element_report(&self, data: &Variant) -> Vec<String> {
+        let paths = self.element_paths();
+        let mut report = Vec::new();
+        for node in element_nodes(&paths) {
+            // A node under one already reported has no value to check.
+            let Some(value) = element_of(data, node) else {
+                continue;
+            };
+            let mut children: Vec<&str> = Vec::new();
+            for path in paths
+                .iter()
+                .filter(|p| p.len() > node.len() && p.starts_with(node))
+            {
+                if !children.contains(&path[node.len()].as_str()) {
+                    children.push(&path[node.len()]);
+                }
+            }
+            let Some(structure) = as_structure(&value) else {
+                // A built-in structure type, whose elements this port cannot
+                // address; reading one is a read failure.
+                if matches!(value, Variant::ExtensionObject(_)) {
+                    continue;
+                }
+                let kind = match &value {
+                    Variant::Array(a) => format!("{:?}", a.value_type),
+                    other => type_name(other),
+                };
+                report.push(format!(
+                    "Error: {} is no structured data but a {kind}",
+                    self.element_name(node)
+                ));
+                continue;
+            };
+            let type_id = structure.full_data_type_id().node_id;
+            let type_name = self
+                .type_tree
+                .as_ref()
+                .and_then(|tree| tree.get_struct_type(&type_id))
+                .map_or_else(|| type_id.to_string(), |info| info.name.clone());
+            for child in children {
+                if structure.get_field_by_name(child).is_none() {
+                    report.push(format!(
+                        "Item {}: element {child} not found in {type_name}",
+                        self.node_id
+                    ));
                 }
             }
         }
-        .unwrap_or_else(SystemTime::now)
+        report
+    }
+
+    /// The `@element` half of `createMap` (`DataElementOpen62541Node.cpp:146-169`).
+    fn report_timestamp_element(&self, data: &Variant) {
+        let element = &self.link.timestamp_element;
+        if element.is_empty() {
+            return;
+        }
+        let record = self.addressing_record();
+        match element_of(data, std::slice::from_ref(element)) {
+            Some(Variant::DateTime(_)) => {}
+            Some(other) => {
+                let kind = match &other {
+                    Variant::Array(a) => format!("{:?}[]", a.value_type),
+                    other => type_name(other),
+                };
+                errlog_vprintf(format_args!(
+                    "{record}: timestamp element {element} has invalid type {kind} - using source timestamp\n"
+                ));
+            }
+            None => errlog_vprintf(format_args!(
+                "{record}: timestamp element {element} not found - using source timestamp\n"
+            )),
+        }
+    }
+
+    /// The element paths of the records bound to the node; an `opcuaItem`
+    /// record is no element of its own tree.
+    fn element_paths(&self) -> Vec<Vec<String>> {
+        self.leaves
+            .iter()
+            .filter_map(|leaf| {
+                let leaf = leaf.lock();
+                (!leaf.link.is_item_record).then(|| leaf.link.element_path.clone())
+            })
+            .collect()
+    }
+
+    /// A node's full name as C's `DataElementOpen62541` prints it:
+    /// `<node id>`, then ` element a.b[0]`.
+    fn element_name(&self, path: &[String]) -> String {
+        let mut name = self.node_id.to_string();
+        for (i, step) in path.iter().enumerate() {
+            if i == 0 {
+                name += " element ";
+            } else if !step.starts_with('[') {
+                name.push('.');
+            }
+            name += step;
+        }
+        name
+    }
+
+    /// `ItemOpen62541::show`: the item's line, then from level 1 its data tree.
+    pub fn show(&self, level: i32) -> String {
+        let mut out = self.show_line() + "\n";
+        if level >= 1
+            && let Some(root) = self.data_tree()
+        {
+            root.show(self.mapped, 1, &mut out);
+        }
+        out
+    }
+
+    /// `ElementTree::addLeaf` over the element records, in the order they
+    /// bound: a record bound to the whole node is the root leaf, otherwise a
+    /// `[ROOT]` node holds a node per path step and the record's leaf last.
+    fn data_tree(&self) -> Option<Element> {
+        let mut root = None;
+        for leaf in &self.leaves {
+            let path = {
+                let locked = leaf.lock();
+                if locked.link.is_item_record {
+                    continue;
+                }
+                locked.link.element_path.clone()
+            };
+            let Some((name, nodes)) = path.split_last() else {
+                root.get_or_insert_with(|| Element::Leaf {
+                    name: "[ROOT]".to_string(),
+                    leaf: leaf.clone(),
+                });
+                continue;
+            };
+            let mut children = match root.get_or_insert_with(|| Element::node("[ROOT]")) {
+                Element::Node { children, .. } => children,
+                Element::Leaf { .. } => continue,
+            };
+            for step in nodes {
+                let at = match children
+                    .iter()
+                    .position(|c| matches!(c, Element::Node { name, .. } if name == step))
+                {
+                    Some(at) => at,
+                    None => {
+                        children.push(Element::node(step));
+                        children.len() - 1
+                    }
+                };
+                let Element::Node { children: next, .. } = &mut children[at] else {
+                    unreachable!("the position matched a node");
+                };
+                children = next;
+            }
+            children.push(Element::Leaf {
+                name: name.clone(),
+                leaf: leaf.clone(),
+            });
+        }
+        root
+    }
+
+    /// `ItemOpen62541::show(0)`'s line.
+    pub fn show_line(&self) -> String {
+        let link = &self.link;
+        let mut out = String::from("item ns=");
+        if self.node_id.namespace != link.namespace_index {
+            out += &format!("{}({})", self.node_id.namespace, link.namespace_index);
+        } else {
+            out += &link.namespace_index.to_string();
+        }
+        match &link.identifier {
+            Some(NodeIdentifier::Numeric(n)) => out += &format!(";i={n}"),
+            Some(NodeIdentifier::String(s)) => out += &format!(";s={s}"),
+            None => out += ";s=",
+        }
+        out += &format!(
+            " record={} state={} status={} dataDirty={} context={}@{} sampling={}({}) \
+             deadband={} qsize={}({}) cqsize={} discard={} timestamp={}",
+            self.addressing_record(),
+            self.state.as_str(),
+            status_name(self.last_status),
+            yn(self.has_dirty_leaf()),
+            link.subscription().unwrap_or(""),
+            self.session.as_ref().map_or("", |s| s.name.as_str()),
+            stream_double(self.revised_sampling_interval),
+            stream_double(link.sampling_interval),
+            stream_double(link.deadband),
+            self.revised_queue_size,
+            link.queue_size,
+            link.client_queue_size,
+            if link.discard_oldest { "old" } else { "new" },
+            link.timestamp.as_str(),
+        );
+        if link.timestamp == TimestampSource::Data {
+            out += &format!("@{}", link.timestamp_element);
+        }
+        out += &format!(
+            " bini={} output={} monitor={} registered=",
+            link.bini.as_str(),
+            yn(link.is_output),
+            yn(link.monitor),
+        );
+        match &self.registered_node_id {
+            Some(id) => out += &id.to_string(),
+            None => out += "-",
+        }
+        out += &format!("({})", yn(link.register_node));
+        let data_leaves = self.element_paths();
+        let nodes = element_nodes(&data_leaves);
+        if !(nodes.is_empty() && data_leaves.len() == 1) {
+            out += &format!(" dataNodes={} dataLeafs={}", nodes.len(), data_leaves.len());
+        }
+        out
+    }
+
+    /// The record whose link addresses the item's node (C `recConnector`).
+    pub fn addressing_record(&self) -> String {
+        self.leaves
+            .iter()
+            .find_map(|leaf| {
+                let leaf = leaf.lock();
+                leaf.link
+                    .item_record()
+                    .is_none()
+                    .then(|| leaf.record.clone())
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -446,6 +788,19 @@ fn system_time_of(dt: DateTime) -> SystemTime {
     }
 }
 
+/// `ItemOpen62541::getStatus` / `uaToEpicsTime` — which of the value's
+/// timestamps the record takes. An unusable `@element` falls back to the
+/// source timestamp, as C's `tsData = tsSource` does.
+fn timestamp_for(link: &LinkInfo, value: &DataValue, data_time: Option<SystemTime>) -> SystemTime {
+    let pick = |dt: Option<DateTime>| dt.map(system_time_of);
+    match link.timestamp {
+        TimestampSource::Server => pick(value.server_timestamp),
+        TimestampSource::Source => pick(value.source_timestamp),
+        TimestampSource::Data => data_time.or_else(|| pick(value.source_timestamp)),
+    }
+    .unwrap_or_else(SystemTime::now)
+}
+
 /// Walk an element path into a structured value.
 ///
 /// An empty path is the value itself. Each further name selects a field of a
@@ -469,6 +824,15 @@ fn as_structure(value: &Variant) -> Option<&DynamicStructure> {
     }
 }
 
+/// Why [`with_element`] left a structure unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElementError {
+    /// The structure has no such element; the mapping reported it.
+    Unmapped,
+    /// The rebuilt structure did not encode.
+    Encode(String),
+}
+
 /// Replace what an element path addresses, leaving the rest of the structure as
 /// the server last sent it — the read-modify-write the C's node elements do when
 /// they assemble outgoing data from their dirty children.
@@ -481,20 +845,19 @@ pub fn with_element(
     path: &[String],
     value: Variant,
     tree: &Arc<DataTypeTree>,
-) -> Result<Variant, String> {
+) -> Result<Variant, ElementError> {
     let Some((name, rest)) = path.split_first() else {
         return Ok(value);
     };
-    let structure =
-        as_structure(base).ok_or_else(|| format!("'{name}' is not inside a structure"))?;
+    let structure = as_structure(base).ok_or(ElementError::Unmapped)?;
     let type_id = structure.full_data_type_id().node_id;
     let type_def = tree
         .get_struct_type(&type_id)
-        .ok_or_else(|| format!("the type of element '{name}' is not in the server's type tree"))?;
+        .ok_or(ElementError::Unmapped)?;
     let index = *type_def
         .index_by_name
         .get(name)
-        .ok_or_else(|| format!("the structure has no element '{name}'"))?;
+        .ok_or(ElementError::Unmapped)?;
 
     let updated = if matches!(type_def.structure_type, StructureType::Union) {
         // A union holds one field at a time; writing a member selects it.
@@ -510,16 +873,89 @@ pub fn with_element(
         )
     } else {
         let mut fields: Vec<Variant> = structure.values().to_vec();
-        let field = fields
-            .get(index)
-            .cloned()
-            .ok_or_else(|| format!("the structure has no element '{name}'"))?;
+        let field = fields.get(index).cloned().ok_or(ElementError::Unmapped)?;
         fields[index] = with_element(&field, rest, value, tree)?;
         DynamicStructure::new_struct(type_def.clone(), tree.clone(), fields)
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| ElementError::Encode(e.to_string()))?;
 
     Ok(Variant::ExtensionObject(ExtensionObject::from_message(
         updated,
     )))
+}
+
+/// The structure nodes of C's element tree for these leaf paths: `[ROOT]` and
+/// one node per further step, in tree order.
+/// One element of an item's data tree, as `opcuaShow` walks it.
+enum Element {
+    Node {
+        name: String,
+        children: Vec<Element>,
+    },
+    Leaf {
+        name: String,
+        leaf: Arc<Mutex<Leaf>>,
+    },
+}
+
+impl Element {
+    fn node(name: &str) -> Self {
+        Element::Node {
+            name: name.to_string(),
+            children: Vec::new(),
+        }
+    }
+
+    /// `DataElementOpen62541Node::show` / `DataElementOpen62541Leaf::show`.
+    /// The port keeps one `mapped` flag per item, where the C keeps one per
+    /// node; every node of a tree maps on the same update.
+    fn show(&self, mapped: bool, indent: usize, out: &mut String) {
+        let ind = " ".repeat(indent * 2);
+        match self {
+            Element::Node { name, children } => {
+                *out += &format!(
+                    "{ind}node={name} children={} mapped={}\n",
+                    children.len(),
+                    yn(mapped)
+                );
+                for child in children {
+                    child.show(mapped, indent + 1, out);
+                }
+            }
+            Element::Leaf { name, leaf } => {
+                let leaf = leaf.lock();
+                *out += &format!(
+                    "{ind}leaf={name} record({})={} type={} timestamp={} bini={} monitor={}\n",
+                    leaf.record_type,
+                    leaf.record,
+                    leaf.incoming
+                        .as_ref()
+                        .map_or_else(|| "Null".to_string(), type_name),
+                    leaf.link.timestamp.as_str(),
+                    leaf.link.bini.as_str(),
+                    yn(leaf.link.monitor),
+                );
+            }
+        }
+    }
+}
+
+fn element_nodes(paths: &[Vec<String>]) -> Vec<&[String]> {
+    let mut nodes: Vec<&[String]> = paths
+        .iter()
+        .filter(|path| !path.is_empty())
+        .flat_map(|path| (0..path.len()).map(move |n| &path[..n]))
+        .collect();
+    nodes.sort();
+    nodes.dedup();
+    nodes
+}
+
+fn yn(flag: bool) -> &'static str {
+    if flag { "y" } else { "n" }
+}
+
+/// A double as `std::cout << v` prints it: `%g` at the default precision 6.
+pub(crate) fn stream_double(v: f64) -> String {
+    CFloat(v).g().to_string()
 }

@@ -1,0 +1,1618 @@
+# c-expansion of st.cmd.acr over the C sources, the records of st.cmd.acr.dbl:
+# dbl of motor R7-4-5 motorParker iocBoot/iocParker st.cmd.acr
+record(bo, "IOC:ACR1:Read") {
+    field(DTYP, "asynInt32")
+    field(ONAM, "Read")
+    field(OUT, "@asyn(ACR1 0)ACR_READ_BINARY_IO")
+    field(SCAN, "1 second")
+    field(ZNAM, "Done")
+}
+record(bi, "IOC:ACR1:bi0") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000001)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi1") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000002)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi10") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000400)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi11") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000800)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi12") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00001000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi13") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00002000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi14") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00004000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi15") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00008000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi16") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00010000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi17") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00020000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi18") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00040000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi19") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00080000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi2") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000004)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi20") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00100000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi21") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00200000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi22") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00400000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi23") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00800000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi24") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x01000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi25") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x02000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi26") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x04000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi27") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x08000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi28") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x10000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi29") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x20000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi3") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000008)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi30") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x40000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi31") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x80000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi4") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000010)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi5") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000020)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi6") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000040)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi7") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000080)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi8") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000100)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:bi9") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000200)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo0") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000001)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo1") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000002)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo10") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000400)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo11") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000800)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo12") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00001000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo13") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00002000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo14") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00004000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo15") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00008000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo16") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00010000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo17") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00020000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo18") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00040000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo19") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00080000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo2") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000004)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo20") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00100000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo21") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00200000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo22") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00400000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo23") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00800000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo24") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x01000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo25") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x02000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo26") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x04000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo27") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x08000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo28") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x10000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo29") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x20000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo3") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000008)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo30") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x40000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo31") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x80000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo4") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000010)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo5") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000020)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo6") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000040)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo7") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000080)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo8") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000100)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR1:bo9") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR1 0 0x00000200)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV0") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000001)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV1") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000002)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV10") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000400)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV11") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000800)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV12") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00001000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV13") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00002000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV14") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00004000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV15") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00008000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV16") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00010000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV17") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00020000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV18") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00040000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV19") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00080000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV2") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000004)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV20") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00100000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV21") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00200000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV22") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00400000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV23") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00800000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV24") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x01000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV25") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x02000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV26") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x04000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV27") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x08000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV28") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x10000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV29") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x20000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV3") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000008)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV30") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x40000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV31") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x80000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV4") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000010)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV5") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000020)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV6") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000040)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV7") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000080)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV8") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000100)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR1:boRBV9") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0x00000200)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(longin, "IOC:ACR1:li") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR1 0 0xffffffff)ACR_BINARY_IN")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+}
+record(bo, "IOC:ACR2:Read") {
+    field(DTYP, "asynInt32")
+    field(ONAM, "Read")
+    field(OUT, "@asyn(ACR2 0)ACR_READ_BINARY_IO")
+    field(SCAN, "1 second")
+    field(ZNAM, "Done")
+}
+record(bi, "IOC:ACR2:bi0") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000001)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi1") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000002)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi10") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000400)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi11") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000800)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi12") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00001000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi13") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00002000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi14") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00004000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi15") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00008000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi16") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00010000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi17") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00020000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi18") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00040000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi19") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00080000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi2") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000004)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi20") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00100000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi21") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00200000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi22") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00400000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi23") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00800000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi24") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x01000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi25") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x02000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi26") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x04000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi27") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x08000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi28") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x10000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi29") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x20000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi3") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000008)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi30") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x40000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi31") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x80000000)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi4") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000010)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi5") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000020)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi6") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000040)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi7") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000080)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi8") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000100)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:bi9") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000200)ACR_BINARY_IN")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo0") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000001)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo1") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000002)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo10") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000400)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo11") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000800)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo12") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00001000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo13") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00002000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo14") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00004000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo15") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00008000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo16") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00010000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo17") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00020000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo18") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00040000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo19") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00080000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo2") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000004)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo20") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00100000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo21") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00200000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo22") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00400000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo23") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00800000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo24") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x01000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo25") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x02000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo26") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x04000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo27") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x08000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo28") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x10000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo29") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x20000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo3") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000008)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo30") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x40000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo31") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x80000000)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo4") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000010)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo5") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000020)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo6") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000040)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo7") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000080)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo8") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000100)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bo, "IOC:ACR2:bo9") {
+    field(DTYP, "asynUInt32Digital")
+    field(ONAM, "High")
+    field(OUT, "@asynMask(ACR2 0 0x00000200)ACR_BINARY_OUT")
+    field(VAL, "1")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV0") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000001)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV1") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000002)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV10") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000400)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV11") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000800)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV12") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00001000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV13") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00002000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV14") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00004000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV15") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00008000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV16") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00010000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV17") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00020000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV18") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00040000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV19") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00080000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV2") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000004)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV20") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00100000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV21") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00200000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV22") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00400000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV23") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00800000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV24") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x01000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV25") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x02000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV26") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x04000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV27") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x08000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV28") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x10000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV29") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x20000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV3") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000008)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV30") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x40000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV31") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x80000000)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV4") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000010)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV5") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000020)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV6") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000040)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV7") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000080)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV8") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000100)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(bi, "IOC:ACR2:boRBV9") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0x00000200)ACR_BINARY_OUT_RBV")
+    field(ONAM, "High")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Low")
+}
+record(longin, "IOC:ACR2:li") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP, "@asynMask(ACR2 0 0xffffffff)ACR_BINARY_IN")
+    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
+}
+record(asyn, "IOC:asyn1") {
+    field(ADDR, "0")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "256")
+    field(OMAX, "256")
+    field(PORT, "ARIES1")
+}
+record(asyn, "IOC:asyn2") {
+    field(ADDR, "0")
+    field(DTYP, "asynRecordDevice")
+    field(IMAX, "256")
+    field(OMAX, "256")
+    field(PORT, "ARIES1")
+}
+record(motor, "IOC:m1") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 1")
+    field(DHLM, "200")
+    field(DIR, "Pos")
+    field(DLLM, "-2")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "1.25e-7")
+    field(OUT, "@asyn(ACR1,0)")
+    field(PREC, "5")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, ".01")
+    field(VELO, ".05")
+}
+record(ao, "IOC:m1:Jerk") {
+    field(DESC, "Jerk parameter")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACR1,0)ACR_JERK")
+    field(PINI, "1")
+    field(PREC, "3")
+    field(VAL, ".01")
+}
+record(longout, "IOC:m1Direction") {
+    field(DESC, "m1 direction")
+    field(DOL, "IOC:m1.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACR1,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m1Offset") {
+    field(DESC, "m1 offset")
+    field(DOL, "IOC:m1.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACR1,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "IOC:m1Resolution") {
+    field(DESC, "m1 resolution")
+    field(DOL, "IOC:m1.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACR1,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}
+record(motor, "IOC:m2") {
+    field(ACCL, ".5")
+    field(ACCU, "0")
+    field(BACC, ".2")
+    field(BDST, "0")
+    field(BVEL, "1")
+    field(DESC, "motor 2")
+    field(DHLM, "200")
+    field(DIR, "Pos")
+    field(DLLM, "-2")
+    field(DTYP, "asynMotor")
+    field(EGU, "mm")
+    field(INIT, "")
+    field(MRES, "1.25e-7")
+    field(OUT, "@asyn(ACR2,0)")
+    field(PREC, "5")
+    field(RTRY, "0")
+    field(TWV, "0.1")
+    field(VBAS, ".01")
+    field(VELO, ".05")
+}
+record(ao, "IOC:m2:Jerk") {
+    field(DESC, "Jerk parameter")
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn(ACR2,0)ACR_JERK")
+    field(PINI, "1")
+    field(PREC, "3")
+    field(VAL, ".01")
+}
+record(longout, "IOC:m2Direction") {
+    field(DESC, "m2 direction")
+    field(DOL, "IOC:m2.DIR CP MS")
+    field(DTYP, "asynInt32")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACR2,0)MOTOR_REC_DIRECTION")
+}
+record(ao, "IOC:m2Offset") {
+    field(DESC, "m2 offset")
+    field(DOL, "IOC:m2.OFF CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACR2,0)MOTOR_REC_OFFSET")
+    field(PREC, "5")
+}
+record(ao, "IOC:m2Resolution") {
+    field(DESC, "m2 resolution")
+    field(DOL, "IOC:m2.MRES CP MS")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "closed_loop")
+    field(OUT, "@asyn(ACR2,0)MOTOR_REC_RESOLUTION")
+    field(PREC, "5")
+}

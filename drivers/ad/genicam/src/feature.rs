@@ -7,6 +7,7 @@ use std::sync::Arc;
 use asyn_rs::param::{EnumEntry, ParamType};
 use asyn_rs::port::PortDriverBase;
 use asyn_rs::trace::TraceMask;
+use epics_libcom_rs::cfmt::CFloat;
 use parking_lot::RwLock;
 
 use ad_core_rs::driver::ImageMode;
@@ -95,7 +96,9 @@ impl FeatureValue {
             (Self::Double(v), ParamType::Int32) => Some(ParamValue::Int32(*v as i32)),
             (Self::Double(v), ParamType::Int64) => Some(ParamValue::Int64(*v as i64)),
             (Self::Double(v), ParamType::Float64) => Some(ParamValue::Float64(*v)),
-            (Self::String(v), ParamType::Octet) => Some(ParamValue::Octet(v.clone().into_bytes())),
+            (Self::String(v), ParamType::Octet) => {
+                Some(ParamValue::Octet(v.clone().into_bytes().into()))
+            }
             _ => None,
         }
     }
@@ -182,14 +185,14 @@ impl GenICamFeature {
     fn warn(&self, base: &PortDriverBase, function: &str, msg: &str) {
         base.trace_print(
             TraceMask::WARNING,
-            &format!("Param[{}] {function}: {msg}\n", self.asyn_name),
+            format_args!("Param[{}] {function}: {msg}\n", self.asyn_name),
         );
     }
 
     fn err(&self, base: &PortDriverBase, function: &str, msg: &str) {
         base.trace_print(
             TraceMask::ERROR,
-            &format!("Param[{}] {function}: {msg}\n", self.asyn_name),
+            format_args!("Param[{}] {function}: {msg}\n", self.asyn_name),
         );
     }
 
@@ -294,7 +297,9 @@ impl GenICamFeature {
                         base,
                         F,
                         &format!(
-                            "node {name} value {v} is less than minimum {min}, setting to minimum"
+                            "node {name} value {} is less than minimum {}, setting to minimum",
+                            CFloat(v),
+                            CFloat(min)
                         ),
                     );
                     v = min;
@@ -304,7 +309,9 @@ impl GenICamFeature {
                         base,
                         F,
                         &format!(
-                            "node {name} value {v} is greater than maximum {max}, setting to maximum"
+                            "node {name} value {} is greater than maximum {}, setting to maximum",
+                            CFloat(v),
+                            CFloat(max)
                         ),
                     );
                     v = max;
@@ -469,7 +476,7 @@ impl GenICamFeature {
         let v = match self.node.feature_type() {
             GCFeatureType::String => self.node.read_string(),
             GCFeatureType::Integer => self.node.read_integer().map(|v| v.to_string()),
-            GCFeatureType::Double => self.node.read_double().map(|v| format!("{v:.6}")),
+            GCFeatureType::Double => self.node.read_double().map(|v| CFloat(v).to_string()),
             GCFeatureType::Boolean => self.node.read_boolean().map(|v| v.to_string()),
             GCFeatureType::Cmd => Ok(String::new()),
             GCFeatureType::Enum => self.node.read_enum_string(),
@@ -582,12 +589,12 @@ impl GenICamFeature {
             let _ = writeln!(
                 out,
                 "        minimum: {}",
-                n.read_double_min().unwrap_or(0.0)
+                CFloat(n.read_double_min().unwrap_or(0.0))
             );
             let _ = writeln!(
                 out,
                 "        maximum: {}",
-                n.read_double_max().unwrap_or(0.0)
+                CFloat(n.read_double_max().unwrap_or(0.0))
             );
         }
         if n.feature_type() == GCFeatureType::Enum {
@@ -685,8 +692,12 @@ impl GenICamFeatureSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ad_core_rs::driver::ad_driver::{AD_DRIVER_INTERFACES, AD_DRIVER_INTERRUPTS};
+    use ad_core_rs::driver::ndarray_driver::{
+        ND_ARRAY_DRIVER_INTERFACES, ND_ARRAY_DRIVER_INTERRUPTS,
+    };
     use asyn_rs::param::ParamValue;
-    use asyn_rs::port::PortFlags;
+    use asyn_rs::port::{InterfaceMask, PortFlags};
     use parking_lot::Mutex;
 
     /// An enum node whose table and availability the test moves.
@@ -775,9 +786,21 @@ mod tests {
     /// differs from the last one it published.
     #[test]
     fn a_read_publishes_the_enum_table_only_when_it_changed() {
-        let mut base = PortDriverBase::new("gc_enum_table", 1, PortFlags::default());
+        let mut base = PortDriverBase::new(
+            "gc_enum_table",
+            1,
+            PortFlags::default(),
+            InterfaceMask::INT64
+                | InterfaceMask::ENUM
+                | AD_DRIVER_INTERFACES
+                | ND_ARRAY_DRIVER_INTERFACES,
+            InterfaceMask::INT64
+                | InterfaceMask::ENUM
+                | AD_DRIVER_INTERRUPTS
+                | ND_ARRAY_DRIVER_INTERRUPTS,
+        );
         let index = base.create_param("GC_Mode", ParamType::Int32).unwrap();
-        let mut tables = base.interrupts.subscribe_async();
+        let mut tables = base.interrupts.subscribe_async(64, 1 << 16);
         let mut published = move || {
             let mut out = Vec::new();
             while let Ok(iv) = tables.try_recv() {

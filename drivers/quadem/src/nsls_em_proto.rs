@@ -227,15 +227,64 @@ fn labelled_number<T: std::str::FromStr>(reply: &str, label: &str) -> Option<T> 
 /// C++ requires all seven items; a short reply is an error and nothing is
 /// written back to the parameter library.
 pub fn parse_status(reply: &str) -> Option<Status> {
-    Some(Status {
-        ip: labelled(reply, "ip: ")?.to_string(),
-        module_id: labelled_number(reply, "id: ")?,
-        firmware: labelled(reply, "ver: ")?.to_string(),
-        mode: labelled_number(reply, "m = ")?,
-        values_per_read: labelled_number(reply, "n = ")?,
-        range: labelled_number(reply, "r = ")?,
-        period_us: labelled_number(reply, "p = ")?,
-    })
+    match scan_status(reply) {
+        (7, status) => Some(status),
+        _ => None,
+    }
+}
+
+/// C++'s `sscanf` of the `s` reply: how many items it assigned before the
+/// first miss, and the values, the unassigned ones zero — the `numItems` and
+/// fields of `getStatus`'s error line.
+pub fn scan_status(reply: &str) -> (usize, Status) {
+    let mut s = Status {
+        ip: String::new(),
+        module_id: 0,
+        firmware: String::new(),
+        mode: 0,
+        values_per_read: 0,
+        range: 0,
+        period_us: 0.0,
+    };
+    let mut items = 0;
+    'scan: {
+        let Some(v) = labelled(reply, "ip: ") else {
+            break 'scan;
+        };
+        s.ip = v.to_string();
+        items += 1;
+        let Some(v) = labelled_number(reply, "id: ") else {
+            break 'scan;
+        };
+        s.module_id = v;
+        items += 1;
+        let Some(v) = labelled(reply, "ver: ") else {
+            break 'scan;
+        };
+        s.firmware = v.to_string();
+        items += 1;
+        let Some(v) = labelled_number(reply, "m = ") else {
+            break 'scan;
+        };
+        s.mode = v;
+        items += 1;
+        let Some(v) = labelled_number(reply, "n = ") else {
+            break 'scan;
+        };
+        s.values_per_read = v;
+        items += 1;
+        let Some(v) = labelled_number(reply, "r = ") else {
+            break 'scan;
+        };
+        s.range = v;
+        items += 1;
+        let Some(v) = labelled_number(reply, "p = ") else {
+            break 'scan;
+        };
+        s.period_us = v;
+        items += 1;
+    }
+    (items, s)
 }
 
 /// `readStatus` (`:539-543`): the sample time doubles when only one phase of

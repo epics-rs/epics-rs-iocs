@@ -1,111 +1,110 @@
-//! Televac vacuum-gauge-controller protocol (`devTelevac.c`).
+//! What `devTelevac.c` puts on the wire and takes off it.
 //!
-//! Commands are bare ASCII, framed by the octet port's EOS:
+//! Commands are bare ASCII; the octet port's EOS frames both directions:
 //!
 //! ```text
-//! R<station>    read the pressure of a station (1..9)
-//! SP<relay>N    read a relay's ON pressure
-//! SP<relay>F    read a relay's OFF pressure
-//! RY            read the relay states as a hex bitmask
+//! R<n>     a station's pressure
+//! SP<n>N   a relay's ON pressure
+//! SP<n>F   a relay's OFF pressure
+//! RY       the relay states, as hex
 //! ```
-//!
-//! A pressure reply is either `n=n.nn-e` (station echoed) or `n.nn-e`; the
-//! exponent digit is hexadecimal, and the over-range marker is `B` = 11
-//! (`devTelevac.c:246-261`).
 
-/// Stations a controller can carry (`parameter` 1..9 in the C link).
-pub const MAX_STATIONS: usize = 9;
+use crate::scan::Scan;
+use crate::user_param::c_str;
 
-/// Relays a controller can carry (`parameter` 1..8 in the C link).
-pub const MAX_RELAYS: usize = 8;
-
-/// The value the C substitutes when a reply is unparseable or over-range:
-/// 9.9e+9 (`devTelevac.c:252-261`).
-pub const OVER_RANGE: f64 = 9.9e9;
-
-/// The exponent digit that means over-range (`B` read as hex = 11).
-const OVER_RANGE_EXPONENT: u32 = 11;
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum TelevacError {
-    #[error("cannot parse {field} from {raw:?}")]
-    Parse { field: &'static str, raw: String },
+/// `devTelevac.h`'s command numbers, by `televacCommands[]`'s names
+/// (`devTelevac.c:47-52`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    GetPressure = 0,
+    GetRelayOn = 1,
+    GetRelayOff = 2,
+    GetRelayStatus = 3,
 }
 
-pub fn read_pressure(station: u8) -> String {
-    format!("R{station}")
-}
+impl Command {
+    const NAMES: [(Self, &'static str); 4] = [
+        (Self::GetPressure, "GET_PRESSURE"),
+        (Self::GetRelayOn, "GET_RELAYON"),
+        (Self::GetRelayOff, "GET_RELAYOFF"),
+        (Self::GetRelayStatus, "GET_RELAYSTATUS"),
+    ];
 
-pub fn read_relay_on(relay: u8) -> String {
-    format!("SP{relay}N")
-}
-
-pub fn read_relay_off(relay: u8) -> String {
-    format!("SP{relay}F")
-}
-
-pub fn read_relay_states() -> String {
-    "RY".to_string()
-}
-
-/// Decode a pressure reply.
-///
-/// `n=n.nn-e` (9 bytes) or `n.nn-e` / `n.n-e` (6 or 5 bytes); anything else is
-/// the over-range value, as in the C. The mantissa is decimal, the exponent one
-/// hex digit, and `-` before it negates the exponent.
-pub fn parse_pressure(raw: &str) -> f64 {
-    let body = raw.trim();
-    let body = match body.split_once('=') {
-        Some((_station, rest)) => rest,
-        None => body,
-    };
-    let bytes = body.as_bytes();
-    // The mantissa runs up to the sign character that introduces the exponent.
-    let Some(sign_at) = bytes.iter().position(|&b| b == b'-' || b == b'+') else {
-        return OVER_RANGE;
-    };
-    let (Ok(mantissa), Some(exponent)) = (
-        body[..sign_at].parse::<f64>(),
-        body[sign_at + 1..]
-            .chars()
-            .next()
-            .and_then(|c| c.to_digit(16)),
-    ) else {
-        return OVER_RANGE;
-    };
-    if exponent == OVER_RANGE_EXPONENT {
-        return OVER_RANGE;
+    /// `epicsStrCaseCmp` against each name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::NAMES
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name))
+            .map(|(c, _)| *c)
     }
-    let exponent = if bytes[sign_at] == b'-' {
-        -(exponent as i32)
-    } else {
-        exponent as i32
-    };
-    mantissa * 10f64.powi(exponent)
+
+    pub fn number(self) -> i32 {
+        self as i32
+    }
+
+    /// The `pact == 0` `sendBuf` of `readAi` (`ai`) or `readBi`; `None` is
+    /// their "Wrong record type" arm.
+    pub fn request(self, ai: bool, parameter: i32) -> Option<String> {
+        match (ai, self) {
+            (true, Self::GetPressure) => Some(format!("R{parameter}")),
+            (true, Self::GetRelayOn) => Some(format!("SP{parameter}N")),
+            (true, Self::GetRelayOff) => Some(format!("SP{parameter}F")),
+            (false, Self::GetRelayStatus) => Some("RY".to_owned()),
+            _ => None,
+        }
+    }
 }
 
-/// Decode the `RY` relay bitmask.
+/// `readAi`'s decode of a pressure reply (`devTelevac.c:244-265`): `n=n.nn-eT`
+/// when it is 9 characters, `n.nn-e` / `n.n-e` when 6 or 5, anything else
+/// 9.9e+9, as is the over-range exponent `B`. The mantissa is a C `float`.
 ///
-/// The reply is two hex digits; the C rewrote an `n` digit to `0` before the
-/// hex conversion, but its second test wrote to `recBuf[0]` again instead of
-/// `recBuf[1]` (`devTelevac.c:312-313`), so an `n` in the low nibble was left
-/// in place and the whole byte failed to convert. Both digits are sanitised
-/// here.
-pub fn parse_relay_states(raw: &str) -> Result<u32, TelevacError> {
-    let sanitised: String = raw
-        .trim()
-        .chars()
-        .map(|c| if c == 'n' { '0' } else { c })
-        .collect();
-    u32::from_str_radix(&sanitised, 16).map_err(|_| TelevacError::Parse {
-        field: "relay states",
-        raw: raw.to_string(),
-    })
+/// C leaves `sign` and `exp` uninitialised when the reply stops short of
+/// them; they read `+` and 0 here.
+pub fn pressure(rec_buf: &[u8]) -> f64 {
+    let buf = c_str(rec_buf);
+    let over_range = (9.9f32, b'+', 9);
+    // `%f%c%x`, each conversion landing until the first that fails.
+    let tail = |scan: &mut Scan| {
+        let value = scan.float().unwrap_or(0.0);
+        (value, scan.char().unwrap_or(b'+'), scan.hex().unwrap_or(0))
+    };
+    let mut scan = Scan::new(buf);
+    let (mut value, mut sign, mut exp) = match buf.len() {
+        9 => {
+            scan.int();
+            tail(scan.literal(b'='))
+        }
+        5 | 6 => tail(&mut scan),
+        _ => over_range,
+    };
+    if exp == 11 {
+        (value, sign, exp) = over_range;
+    }
+    if sign == b'-' {
+        exp = -exp;
+    }
+    f64::from(value) * 10f64.powf(f64::from(exp))
 }
 
-/// Is `relay` (1-based) closed in the `RY` bitmask (`devTelevac.c:316`)?
-pub fn relay_is_set(states: u32, relay: u8) -> bool {
-    states & (1 << (relay - 1)) != 0
+/// `readBi`'s RVAL for `relay` (1-based) from the `RY` reply
+/// (`devTelevac.c:310-317`). C's second `'n'` test rewrites `recBuf[0]`, not
+/// `recBuf[1]`, so a low digit `n` clobbered the high one; both digits are
+/// rewritten in place here. A relay outside 1..32 is an undefined C shift and
+/// selects no bit.
+pub fn relay_rval(rec_buf: &[u8], relay: i32) -> u32 {
+    let mut buf = c_str(rec_buf).to_vec();
+    for digit in buf.iter_mut().take(2) {
+        if *digit == b'n' {
+            *digit = b'0';
+        }
+    }
+    let value = Scan::new(&buf).hex().unwrap_or(0) as u32;
+    let mask = u32::try_from(relay - 1)
+        .ok()
+        .and_then(|shift| 1u32.checked_shl(shift))
+        .unwrap_or(0);
+    value & mask
 }
 
 #[cfg(test)]
@@ -113,49 +112,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn commands_match_the_c_strings() {
-        assert_eq!(read_pressure(3), "R3");
-        assert_eq!(read_relay_on(2), "SP2N");
-        assert_eq!(read_relay_off(2), "SP2F");
-        assert_eq!(read_relay_states(), "RY");
+    fn requests_are_the_c_send_buffers() {
+        use Command::*;
+        assert_eq!(GetPressure.request(true, 3).as_deref(), Some("R3"));
+        assert_eq!(GetRelayOn.request(true, 2).as_deref(), Some("SP2N"));
+        assert_eq!(GetRelayOff.request(true, 2).as_deref(), Some("SP2F"));
+        assert_eq!(GetRelayStatus.request(false, 2).as_deref(), Some("RY"));
+        assert_eq!(GetRelayStatus.request(true, 2), None);
+        assert_eq!(GetPressure.request(false, 1), None);
+        assert_eq!(Command::from_name("get_relayon"), Some(GetRelayOn));
+        assert_eq!(Command::from_name("GET_FOO"), None);
     }
 
     #[test]
-    fn pressure_with_the_station_echoed() {
-        // "1=7.60-2T" -> 7.60e-2
-        assert!((parse_pressure("1=7.60-2T") - 7.6e-2).abs() < 1e-12);
+    fn pressure_replies_decode_as_read_ai_does() {
+        let near = |raw: &[u8], want: f64| {
+            let got = pressure(raw);
+            assert!((got - want).abs() <= want.abs() * 1e-12, "{raw:?}: {got}");
+        };
+        near(b"1=7.60-2T", f64::from(7.6f32) * 1e-2);
+        near(b"7.60-2", f64::from(7.6f32) * 1e-2);
+        near(b"7.6-2", f64::from(7.6f32) * 1e-2);
+        near(b"1.00+3", 1e3);
+        let over = f64::from(9.9f32) * 1e9;
+        near(b"9.90-B", over);
+        near(b"7.600-2", over);
+        near(b"", over);
+        assert_eq!(pressure(b"abcdef"), 0.0);
     }
 
     #[test]
-    fn pressure_without_the_station() {
-        assert!((parse_pressure("7.60-2") - 7.6e-2).abs() < 1e-12);
-        assert!((parse_pressure("7.6-2") - 7.6e-2).abs() < 1e-12);
-        assert!((parse_pressure("1.00+3") - 1.0e3).abs() < 1e-9);
-    }
-
-    #[test]
-    fn over_range_and_garbage_give_the_c_sentinel() {
-        // Exponent 'B' = 11 is the over-range marker.
-        assert_eq!(parse_pressure("9.90-B"), OVER_RANGE);
-        assert_eq!(parse_pressure("junk"), OVER_RANGE);
-        assert_eq!(parse_pressure(""), OVER_RANGE);
-    }
-
-    #[test]
-    fn relay_states_sanitise_both_nibbles() {
-        assert_eq!(parse_relay_states("0F").unwrap(), 0x0f);
-        // The C only fixed the high nibble, so "1n" never converted.
-        assert_eq!(parse_relay_states("1n").unwrap(), 0x10);
-        assert_eq!(parse_relay_states("nn").unwrap(), 0);
-        assert!(parse_relay_states("zz").is_err());
-    }
-
-    #[test]
-    fn relay_bits_are_one_based() {
-        let states = 0b0000_0101;
-        assert!(relay_is_set(states, 1));
-        assert!(!relay_is_set(states, 2));
-        assert!(relay_is_set(states, 3));
-        assert!(!relay_is_set(states, 8));
+    fn relay_rval_is_the_relay_s_bit() {
+        assert_eq!(relay_rval(b"0F", 1), 1);
+        assert_eq!(relay_rval(b"0F", 4), 8);
+        assert_eq!(relay_rval(b"0F", 5), 0);
+        // C rewrote the high digit for a low `n`, and read 0.
+        assert_eq!(relay_rval(b"1n", 5), 0x10);
+        assert_eq!(relay_rval(b"nn", 1), 0);
+        assert_eq!(relay_rval(b"0F", 0), 0);
     }
 }

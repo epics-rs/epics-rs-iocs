@@ -1,191 +1,657 @@
-//! iocsh command for the Aerotech Ensemble driver.
-//!
-//! Mirrors the C `EnsembleAsynSetup` + `EnsembleAsynConfig` pair collapsed into
-//! one command: `EnsembleAsynConfig` connects the asyn octet port, pings the
-//! controller, then probes axes `0..ENSEMBLE_MAX_AXES` and attaches the first
-//! `numAxes` that exist (their `AxisName` parameter ACKs) to `DTYP`-keyed motor
-//! device supports (`ENSEMBLE_{card}_{axis}`, using the controller axis number).
-//! Both port kinds (`drvAsynIPPort` / `drvAsynSerialPort`) work, so `connect_ip`
-//! is used (the lookup is transport-agnostic).
+//! iocsh commands for the Aerotech Ensemble and A3200 drivers, C model-2
+//! drivers: `EnsembleAsynConfig` / `A3200AsynConfig` build card `card` of
+//! [`MOTOR_ENSEMBLE`] / [`MOTOR_A3200`], and `drvAsynMotorConfigure(port,
+//! "motorEnsemble" | "motorA3200", card, numAxes)` opens its axes as
+//! `@asyn(port,0..)`. An Ensemble's addresses count the axes found, not the
+//! controller axis numbers (drvEnsembleAsyn.cc:965).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_ip;
-use motor_common::iocsh::{
-    arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
-    req_int, req_string,
-};
+use epics_libcom_rs::cfmt::CFloat;
+use motor_common::AxisReport;
+use motor_common::connect::{EosRefusal, connect_with_eos};
+use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1_device;
+use motor_common::model2::{Model2, Model2Axis};
 
-use crate::a3200::{A3200_MAX_AXES, A3200Axis, A3200Controller};
-use crate::ensemble::{ENSEMBLE_MAX_AXES, EnsembleAxis, EnsembleController};
+use crate::a3200::{self, A3200_MAX_AXES, A3200Axis, A3200Controller};
+use crate::drv_soloist::{self, DrvSoloistAxis, SOLOIST_NUM_CARDS, SoloistCard};
+use crate::ensemble::{self, ENSEMBLE_MAX_AXES, EnsembleAxis, EnsembleController};
 
-/// Default communication timeout when the `timeoutMs` arg is omitted.
-const DEFAULT_TIMEOUT_MS: f64 = 2000.0;
+/// `TIMEOUT` of both drivers (drvEnsembleAsyn.cc:187, drvA3200Asyn.cc:86).
+const TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the `EnsembleAsynConfig(card, asynPort, numAxes, [movingPollMs],
-/// [idlePollMs], [timeoutMs])` command bound to `holder`.
-pub fn ensemble_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
-    CommandDef::new(
-        "EnsembleAsynConfig",
-        vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_req("numAxes"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-            arg_double_opt("timeoutMs"),
-        ],
-        "EnsembleAsynConfig(card, asynPort, numAxes, [movingPollMs], [idlePollMs], \
-         [timeoutMs]) - Create an Aerotech Ensemble controller (DTYP ENSEMBLE_{card}_{axis}) \
-         with numAxes axes",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let num_axes = req_int(args, 2, "numAxes")?;
-            if !(1..=ENSEMBLE_MAX_AXES as i64).contains(&num_axes) {
-                return Err(format!(
-                    "EnsembleAsynConfig: numAxes must be 1..={ENSEMBLE_MAX_AXES}"
-                ));
-            }
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-            let timeout_ms = opt_double(args, 5, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
+/// drvEnsembleAsyn.cc's `motorAxisDrvSET_t`.
+/// drvEnsembleAsyn.cc:703's poller forces no fast polls.
+pub static MOTOR_ENSEMBLE: Model2 = Model2::new("motorEnsemble", 0);
 
-            let handle = connect_ip(
-                &asyn_port,
-                Duration::from_millis(timeout_ms.max(0.0) as u64),
-            )?;
-            let controller = Arc::new(Mutex::new(EnsembleController::new(handle)));
-            {
-                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                ctrl.ping()
-                    .map_err(|e| format!("EnsembleAsynConfig: no response from controller: {e}"))?;
-                ctrl.wait_mode_nowait()
-                    .map_err(|e| format!("EnsembleAsynConfig: WAIT MODE NOWAIT failed: {e}"))?;
-            }
+/// drvA3200Asyn.cc's `motorAxisDrvSET_t`.
+/// drvA3200Asyn.cc:723's poller forces no fast polls.
+pub static MOTOR_A3200: Model2 = Model2::new("motorA3200", 0);
 
-            let mut found = 0i64;
-            let mut axis = 0i32;
-            while axis < ENSEMBLE_MAX_AXES && found < num_axes {
-                let exists = controller
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .axis_exists(axis);
-                if exists {
-                    let ax = EnsembleAxis::new(controller.clone(), axis)
-                        .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
-                    let dtyp_key = format!("ENSEMBLE_{card}_{axis}");
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
-                    println!("EnsembleAsynConfig: {dtyp_key} (axis={axis})");
-                    found += 1;
-                }
-                axis += 1;
-            }
+/// What C's `motorAxisReport` prints of one controller: the `Setup`'s
+/// calloc'd entry, whose periods `Config` sets before it connects.
+#[derive(Default)]
+struct CardReport {
+    moving_poll_s: f64,
+    idle_poll_s: f64,
+    /// The axes `Config` found. C prints `numAxes` entries, the zeroed ones
+    /// of axes it never found (or of a card that never answered) as
+    /// `Axis 0`; those are not copied.
+    axes: Vec<Arc<dyn AxisReport>>,
+}
 
-            if found < num_axes {
-                return Err(format!(
-                    "EnsembleAsynConfig: found only {found} of {num_axes} requested axes"
-                ));
-            }
-            println!(
-                "EnsembleAsynConfig: card={card} asynPort={asyn_port} axes={found} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms"
+/// `pEnsembleController` / `pA3200Controller`, one entry per controller the
+/// `Setup` allocated.
+static ENSEMBLE_CARDS: Mutex<Vec<CardReport>> = Mutex::new(Vec::new());
+static A3200_CARDS: Mutex<Vec<CardReport>> = Mutex::new(Vec::new());
+
+fn lock_cards(cards: &Mutex<Vec<CardReport>>) -> std::sync::MutexGuard<'_, Vec<CardReport>> {
+    cards.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// C `motorAxisReport` (drvEnsembleAsyn.cc:230-244, drvA3200Asyn.cc:211-228).
+fn motor_axis_report(cards: &Mutex<Vec<CardReport>>, level: i32) -> String {
+    let mut out = String::new();
+    for card in lock_cards(cards).iter() {
+        if level != 0 {
+            out += &format!(
+                "    moving poll period: {:.6}\n    idle poll period: {:.6}\n",
+                CFloat(card.moving_poll_s),
+                CFloat(card.idle_poll_s)
             );
+        }
+        for axis in &card.axes {
+            axis.report(&mut out, level);
+        }
+    }
+    out
+}
+
+/// `card`'s entry as `Config` sets it before connecting.
+fn begin_card(cards: &Mutex<Vec<CardReport>>, card: i32, moving_poll_ms: u64, idle_poll_ms: u64) {
+    lock_cards(cards)[card as usize] = CardReport {
+        moving_poll_s: moving_poll_ms as f64 / 1000.0,
+        idle_poll_s: idle_poll_ms as f64 / 1000.0,
+        axes: Vec::new(),
+    };
+}
+
+/// A `<Drv>AsynSetup(num_controllers)` allocating `cards`, printing
+/// `refusal` as C's does for a count below 1.
+fn setup_command(
+    name: &'static str,
+    cards: &'static Mutex<Vec<CardReport>>,
+    refusal: &'static str,
+) -> CommandDef {
+    CommandDef::new(
+        name,
+        vec![arg_int_req("Max. controller count")],
+        format!("{name}(num_controllers)"),
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let num_controllers = c_int(args, 0);
+            if num_controllers < 1 {
+                println!("{refusal}");
+                return Ok(CommandOutcome::Continue);
+            }
+            *lock_cards(cards) = (0..num_controllers)
+                .map(|_| CardReport::default())
+                .collect();
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `A3200AsynConfig(card, asynPort, numAxes, [taskNumber], [linear],
-/// [movingPollMs], [idlePollMs], [timeoutMs])` command bound to `holder`.
-///
-/// Unlike the Ensemble (which probes for existing axes by index), the A3200
-/// discovers each axis `0..numAxes` by its name string (`GETPARMSTRING`) and
-/// installs it at `DTYP A3200_{card}_{axisName}`. `taskNumber` defaults to 1 and
-/// `linear` (linear vs single-axis move commands) defaults to 1.
-pub fn a3200_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `EnsembleAsynSetup(num_controllers)`.
+pub fn ensemble_setup_command() -> CommandDef {
+    MOTOR_ENSEMBLE.register_report(|level| motor_axis_report(&ENSEMBLE_CARDS, level));
+    setup_command(
+        "EnsembleAsynSetup",
+        &ENSEMBLE_CARDS,
+        "EnsembleSetup, num_controllers must be > 0",
+    )
+}
+
+/// `A3200AsynSetup(num_controllers)`.
+pub fn a3200_setup_command() -> CommandDef {
+    MOTOR_A3200.register_report(|level| motor_axis_report(&A3200_CARDS, level));
+    setup_command(
+        "A3200AsynSetup",
+        &A3200_CARDS,
+        "A3200AsynSetup, num_controllers must be > 0",
+    )
+}
+
+/// The `Config` arguments both drivers share (AerotechRegister.cc).
+fn config_args() -> Vec<ArgDesc> {
+    vec![
+        arg_int_req("Card being configured"),
+        arg_str_req("asyn port name"),
+        arg_int_req("asyn address (GPIB)"),
+        arg_int_req("Number of Axes"),
+        arg_int_req("Moving poll rate"),
+        arg_int_req("Idle poll rate"),
+    ]
+}
+
+/// `EnsembleAsynConfig(card, portName, asynAddress, numAxes,
+/// movingPollPeriod, idlePollPeriod)`, printing what C's does; a controller
+/// that never answers fails silently, as in C.
+pub fn ensemble_config_command() -> CommandDef {
     CommandDef::new(
-        "A3200AsynConfig",
-        vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_req("numAxes"),
-            arg_int_opt("taskNumber"),
-            arg_int_opt("linear"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-            arg_double_opt("timeoutMs"),
-        ],
-        "A3200AsynConfig(card, asynPort, numAxes, [taskNumber], [linear], [movingPollMs], \
-         [idlePollMs], [timeoutMs]) - Create an Aerotech A3200 controller (DTYP \
-         A3200_{card}_{axisName}) with numAxes axes",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let num_axes = req_int(args, 2, "numAxes")?;
-            if !(1..=A3200_MAX_AXES as i64).contains(&num_axes) {
-                return Err(format!(
-                    "A3200AsynConfig: numAxes must be 1..={A3200_MAX_AXES}"
-                ));
-            }
-            let task_number = opt_int(args, 3, 1, "taskNumber")?;
-            if task_number < 0 {
-                return Err("A3200AsynConfig: taskNumber must be >= 0".to_string());
-            }
-            let linear = opt_int(args, 4, 1, "linear")? != 0;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 5, 6)?;
-            let timeout_ms = opt_double(args, 7, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
+        "EnsembleAsynConfig",
+        config_args(),
+        "EnsembleAsynConfig(card, portName, asynAddress, numAxes, movingPollPeriod, \
+         idlePollPeriod)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            let port_name = req_string(args, 1, "asyn port name")?;
+            let num_axes = c_int(args, 3);
+            let moving_poll_ms = c_int(args, 4).max(0) as u64;
+            let idle_poll_ms = c_int(args, 5).max(0) as u64;
 
-            let handle = connect_ip(
-                &asyn_port,
-                Duration::from_millis(timeout_ms.max(0.0) as u64),
-            )?;
-            let controller = Arc::new(Mutex::new(A3200Controller::new(
+            let num_controllers = lock_cards(&ENSEMBLE_CARDS).len() as i32;
+            if num_controllers < 1 {
+                println!(
+                    "EnsembleConfig: no Ensemble controllers allocated, call EnsembleSetup first"
+                );
+                return Ok(CommandOutcome::Continue);
+            }
+            if !(0..num_controllers).contains(&card) {
+                println!(
+                    "EnsembleConfig: card must in range 0 to {}",
+                    num_controllers - 1
+                );
+                return Ok(CommandOutcome::Continue);
+            }
+            if !(1..=ENSEMBLE_MAX_AXES).contains(&num_axes) {
+                println!("EnsembleConfig: numAxes must in range 1 to {ENSEMBLE_MAX_AXES}");
+                return Ok(CommandOutcome::Continue);
+            }
+            begin_card(&ENSEMBLE_CARDS, card, moving_poll_ms, idle_poll_ms);
+
+            let Ok(handle) = connect_with_eos(
+                &port_name,
+                c_int(args, 2),
+                TIMEOUT,
+                ensemble::INPUT_EOS,
+                ensemble::OUTPUT_EOS,
+                EosRefusal::Ignored,
+            ) else {
+                println!("EnsembleAsynConfig: cannot connect to asyn port {port_name}");
+                return Ok(CommandOutcome::Continue);
+            };
+            let controller = Arc::new(Mutex::new(EnsembleController::new(
                 handle,
-                task_number as u32,
-                linear,
+                &port_name,
+                &card.to_string(),
             )));
-            controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .init_task()
-                .map_err(|e| format!("A3200AsynConfig: task init failed: {e}"))?;
+            let answered = {
+                let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                (0..3).any(|_| ctrl.ping().is_ok())
+            };
+            if !answered {
+                return Ok(CommandOutcome::Continue);
+            }
 
-            for axis in 0..num_axes as i32 {
-                let axis_name = controller
+            let mut axes = Vec::new();
+            let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
+            for axis in 0..ENSEMBLE_MAX_AXES {
+                if axes.len() as i32 == num_axes {
+                    break;
+                }
+                let exists = controller
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .discover_axis_name(axis)
-                    .map_err(|e| format!("A3200AsynConfig: axis {axis}: name discovery: {e}"))?;
-                if axis_name.is_empty() {
-                    return Err(format!("A3200AsynConfig: axis {axis}: empty axis name"));
+                    .axis_exists(axis);
+                if exists {
+                    let ax = EnsembleAxis::new(controller.clone(), card, axis, axes.len() as i32)
+                        .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
+                    reports.push(ax.report());
+                    let (getter, log) = (ax.params(), ax.log());
+                    axes.push(Model2Axis::new(Arc::new(Mutex::new(ax)), getter, log));
                 }
-                let ax = A3200Axis::new(controller.clone(), axis_name.clone())
-                    .map_err(|e| format!("A3200AsynConfig: axis {axis} ({axis_name}): {e}"))?;
-                let dtyp_key = format!("A3200_{card}_{axis_name}");
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
-                println!("A3200AsynConfig: {dtyp_key} (axis={axis} name={axis_name})");
             }
-
-            controller
+            // C ignores the reply.
+            let _ = controller
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .finalize()
-                .map_err(|e| format!("A3200AsynConfig: finalize failed: {e}"))?;
-
-            println!(
-                "A3200AsynConfig: card={card} asynPort={asyn_port} axes={num_axes} \
-                 task={task_number} linear={linear} poll=[{moving_poll_ms}/{idle_poll_ms}]ms"
-            );
+                .wait_mode_nowait();
+            lock_cards(&ENSEMBLE_CARDS)[card as usize].axes = reports;
+            MOTOR_ENSEMBLE.start_card(card, axes, moving_poll_ms, idle_poll_ms)?;
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// `A3200AsynConfig(card, portName, asynAddress, numAxes, movingPollPeriod,
+/// idlePollPeriod, taskNumber, linear)`, printing what C's does; a controller
+/// that never answers `~TASK` fails silently, as in C.
+pub fn a3200_config_command() -> CommandDef {
+    let mut args = config_args();
+    args.push(arg_int_req("Task number"));
+    args.push(arg_int_req("Linear move commands"));
+    CommandDef::new(
+        "A3200AsynConfig",
+        args,
+        "A3200AsynConfig(card, portName, asynAddress, numAxes, movingPollPeriod, \
+         idlePollPeriod, taskNumber, linear)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            let port_name = req_string(args, 1, "asyn port name")?;
+            let num_axes = c_int(args, 3);
+            let moving_poll_ms = c_int(args, 4).max(0) as u64;
+            let idle_poll_ms = c_int(args, 5).max(0) as u64;
+            let task_number = c_int(args, 6) as u32;
+            let linear = c_int(args, 7) != 0;
+
+            let num_controllers = lock_cards(&A3200_CARDS).len() as i32;
+            if num_controllers < 1 {
+                println!("A3200AsynConfig: no A3200 controllers allocated, call A3200 first");
+                return Ok(CommandOutcome::Continue);
+            }
+            if !(0..num_controllers).contains(&card) {
+                println!(
+                    "A3200AsynConfig: card must in range 0 to {}",
+                    num_controllers - 1
+                );
+                return Ok(CommandOutcome::Continue);
+            }
+            if !(1..=A3200_MAX_AXES).contains(&num_axes) {
+                println!("A3200AsynConfig: numAxes must be in the range of 1 to {A3200_MAX_AXES}");
+                return Ok(CommandOutcome::Continue);
+            }
+            begin_card(&A3200_CARDS, card, moving_poll_ms, idle_poll_ms);
+
+            let Ok(handle) = connect_with_eos(
+                &port_name,
+                c_int(args, 2),
+                TIMEOUT,
+                a3200::INPUT_EOS,
+                a3200::OUTPUT_EOS,
+                EosRefusal::Ignored,
+            ) else {
+                println!("A3200AsynConfig: cannot connect to asyn port {port_name}");
+                return Ok(CommandOutcome::Continue);
+            };
+            let controller = Arc::new(Mutex::new(A3200Controller::new(
+                handle,
+                &port_name,
+                &card.to_string(),
+                task_number,
+                linear,
+            )));
+            if controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .init_task()
+                .is_err()
+            {
+                return Ok(CommandOutcome::Continue);
+            }
+
+            let mut axes = Vec::new();
+            let mut reports: Vec<Arc<dyn AxisReport>> = Vec::new();
+            // C probes an axis only while the last reply is an ACK, and fails
+            // the config after the loop if it is not (drvA3200Asyn.cc:916-979).
+            let acked = || controller.lock().unwrap_or_else(|e| e.into_inner()).ack();
+            for axis in 0..num_axes {
+                if !acked() {
+                    break;
+                }
+                let axis_name = controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .discover_axis_name(axis);
+                let ax = A3200Axis::new(controller.clone(), card, axis, axis_name);
+                reports.push(ax.report());
+                let (getter, log) = (ax.params(), ax.log());
+                axes.push(Model2Axis::new(Arc::new(Mutex::new(ax)), getter, log));
+            }
+            if !acked() {
+                return Ok(CommandOutcome::Continue);
+            }
+            controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finalize();
+            lock_cards(&A3200_CARDS)[card as usize].axes = reports;
+            MOTOR_A3200.start_card(card, axes, moving_poll_ms, idle_poll_ms)?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `device(motor,VME_IO,devSoloist,"Soloist")` (devSoloist.dbd).
+static DEV_SOLOIST: DevSup = model1_device("devSoloist", "Soloist");
+
+static SOLOIST: Model1 = Model1::new(&DEV_SOLOIST, SOLOIST_NUM_CARDS, SCAN_RATE);
+
+/// `SoloistSetup(num_cards, scan_rate)`.
+pub fn soloist_setup_command() -> CommandDef {
+    SOLOIST.register_report("drvSoloist", |cards| {
+        cards.report("Soloist", |card, line| {
+            format!("    Soloist controller {card}, {line} \n")
+        })
+    });
+    SOLOIST.setup_command("SoloistSetup")
+}
+
+/// `SoloistConfig(card, name, addr)`. C registers the command with two
+/// arguments and reads the address past them; it is taken here, 0 when
+/// absent. `motor_init` at iocInit connects and probes the card; a card
+/// that does not answer is left without its axis.
+pub fn soloist_config_command() -> CommandDef {
+    CommandDef::new(
+        "SoloistConfig",
+        vec![
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_opt("asyn address (GPIB)"),
+        ],
+        "SoloistConfig(card, name, addr)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !SOLOIST.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let addr = c_int(args, 2);
+            SOLOIST.config(card, move |init| {
+                let (handle, connected) = SyncIOHandle::connect_port(
+                    &asyn_port,
+                    addr,
+                    drv_soloist::TIMEOUT,
+                    InterfaceType::Octet,
+                );
+                if connected.is_err() {
+                    return;
+                }
+                let controller = SoloistCard::new(handle);
+                let Some(found) = drv_soloist::motor_init(&controller) else {
+                    return;
+                };
+                let ident = found
+                    .user_string
+                    .unwrap_or_else(|| format!("Soloist{card}"));
+                init.describe(format!("port={asyn_port}, address={addr}, id: {ident}"));
+                let Some(setup) = found.axis else {
+                    return;
+                };
+                let controller = Arc::new(Mutex::new(controller));
+                let motor: Arc<Mutex<dyn Model1Motor>> =
+                    Arc::new(Mutex::new(DrvSoloistAxis::new(controller, setup)));
+                init.axis(0, motor);
+            })?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+#[cfg(test)]
+mod report {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
+
+    fn config(card: i64, line: &str, num_axes: i64) -> Vec<ArgValue> {
+        vec![
+            ArgValue::Int(card),
+            ArgValue::String(line.into()),
+            ArgValue::Int(0),
+            ArgValue::Int(num_axes),
+            ArgValue::Int(100),
+            ArgValue::Int(1000),
+        ]
+    }
+
+    /// `driver`'s report at `level` once it contains `want`.
+    async fn reported(driver: &str, level: i32, want: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = driver_report(driver, level);
+            if text.contains(want) || Instant::now() > deadline {
+                return text;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// drvEnsembleAsyn.cc's motorAxisReport (:218-244), which `dbior` runs
+    /// over every controller `EnsembleAsynSetup` allocated.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_ensemble_controller_and_axis() {
+        let setup = ensemble_setup_command();
+        assert_eq!(driver_report("motorEnsemble", 1), "");
+        run_command(setup, vec![ArgValue::Int(2)]).await;
+        let (_line, _io) = LineRig::new("ensRepLine", |cmd| {
+            match cmd.trim_end() {
+                "GETPARM(@0, 140)" => "%X",
+                c if c.starts_with("GETPARM(@") && c.ends_with(", 140)") => "!",
+                "GETPARM(@0, 2)" => "%1000",
+                "GETPARM(@0, 77)" => "%2.5",
+                "AXISSTATUS(@0)" => "%5",
+                _ => "%0",
+            }
+            .into()
+        });
+        run_command(ensemble_config_command(), config(1, "ensRepLine", 1)).await;
+        // axisStatus is the poller's AXISSTATUS.
+        let axis = "Axis 0\n   axisStatus:  0x5\n   home preset: 2.500000\n   \
+                    step size:   0.001000\n   max digits:  5\n";
+        assert_eq!(
+            reported("motorEnsemble", 1, "axisStatus:  0x5\n").await,
+            format!(
+                "    moving poll period: 0.000000\n    idle poll period: 0.000000\n    \
+                 moving poll period: 0.100000\n    idle poll period: 1.000000\n{axis}"
+            )
+        );
+        assert_eq!(driver_report("motorEnsemble", 0), "");
+    }
+
+    /// drvEnsembleAsyn.cc:1022-1027: EnsembleAsynConfig starts
+    /// EnsemblePoller, whose first pass (:698) polls the axes before any
+    /// drvAsynMotorConfigure.
+    #[epics_rs::base::epics_test]
+    async fn ensemble_config_starts_its_poller() {
+        run_command(ensemble_setup_command(), vec![ArgValue::Int(1)]).await;
+        let (_line, _io) = LineRig::new("ensPollLine", |cmd| {
+            match cmd.trim_end() {
+                "GETPARM(@0, 140)" => "%X",
+                c if c.starts_with("GETPARM(@") && c.ends_with(", 140)") => "!",
+                "AXISSTATUS(@0)" => "%5",
+                _ => "%0",
+            }
+            .into()
+        });
+        run_command(ensemble_config_command(), config(0, "ensPollLine", 1)).await;
+        let text = reported("motorEnsemble", 1, "axisStatus:  0x5\n").await;
+        assert!(text.contains("Axis 0\n   axisStatus:  0x5\n"), "{text}");
+    }
+
+    /// drvA3200Asyn.cc's motorAxisReport (:199-228).
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_a3200_controller_and_axis() {
+        let setup = a3200_setup_command();
+        assert_eq!(driver_report("motorA3200", 1), "");
+        run_command(setup, vec![ArgValue::Int(2)]).await;
+        let (_line, _io) = LineRig::new("a32RepLine", |cmd| {
+            match cmd.trim_end() {
+                "~GETVARIABLE $strtask0" => "%X",
+                "CountsPerUnit.X" => "%1000",
+                "HomeOffset.X" => "%2.5",
+                c if c.starts_with("~STATUS") => "%5 0 0 0 0 0",
+                _ => "%0",
+            }
+            .into()
+        });
+        let mut args = config(1, "a32RepLine", 1);
+        args.extend([ArgValue::Int(1), ArgValue::Int(0)]);
+        run_command(a3200_config_command(), args).await;
+        // axisStatus is the poller's ~STATUS AxisStatus.
+        let axis = "Axis X\n   axisStatus:  0x5\n   home preset: 2.500000\n   \
+                    step size:   0.001000\n   max digits:  5\n";
+        assert_eq!(
+            reported("motorA3200", 1, "axisStatus:  0x5\n").await,
+            format!(
+                "    moving poll period: 0.000000\n    idle poll period: 0.000000\n    \
+                 moving poll period: 0.100000\n    idle poll period: 1.000000\n{axis}"
+            )
+        );
+        assert_eq!(driver_report("motorA3200", 0), "");
+    }
+
+    /// drvA3200Asyn.cc:991-995: A3200AsynConfig starts A3200Poller, which
+    /// polls the axes before any drvAsynMotorConfigure.
+    #[epics_rs::base::epics_test]
+    async fn a3200_config_starts_its_poller() {
+        run_command(a3200_setup_command(), vec![ArgValue::Int(1)]).await;
+        let (_line, _io) = LineRig::new("a32PollLine", |cmd| {
+            match cmd.trim_end() {
+                "~GETVARIABLE $strtask0" => "%X",
+                c if c.starts_with("~STATUS") => "%5 0 0 0 0 0",
+                _ => "%0",
+            }
+            .into()
+        });
+        let mut args = config(0, "a32PollLine", 1);
+        args.extend([ArgValue::Int(1), ArgValue::Int(0)]);
+        run_command(a3200_config_command(), args).await;
+        let text = reported("motorA3200", 1, "axisStatus:  0x5\n").await;
+        assert!(text.contains("Axis X\n   axisStatus:  0x5\n"), "{text}");
+    }
+
+    /// drvA3200Asyn.cc:912-979: a NAK'd `~STOPTASK` leaves no ACK in
+    /// `inputBuff`, so no axis is probed and the config fails.
+    #[epics_rs::base::epics_test]
+    async fn a_refused_stoptask_fails_the_a3200_config() {
+        run_command(a3200_setup_command(), vec![ArgValue::Int(1)]).await;
+        let (line, _io) = LineRig::new("a32StopLine", |cmd| {
+            if cmd.trim_end() == "~STOPTASK" {
+                "!"
+            } else {
+                "%X"
+            }
+            .into()
+        });
+        let mut args = config(0, "a32StopLine", 1);
+        args.extend([ArgValue::Int(1), ArgValue::Int(0)]);
+        run_command(a3200_config_command(), args).await;
+        assert_eq!(line.sent(), ["~TASK 1", "~STOPTASK"]);
+        assert!(!driver_report("motorA3200", 1).contains("Axis"));
+    }
+
+    /// drvSoloist.cc's drvet `report` (:148-172). A card that answered
+    /// `NONE` is reported though it has no axis, as C's `motor_state` keeps
+    /// it; its ident is UserString1, else `Soloist<card>` (:606-615).
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_soloist_card() {
+        let setup = soloist_setup_command();
+        assert_eq!(
+            driver_report("drvSoloist", 0),
+            "    No Soloist controllers configured.\n"
+        );
+        run_command(setup, vec![ArgValue::Int(3), ArgValue::Int(10)]).await;
+        let (_a, _io_a) = LineRig::new("solRepA", |cmd| {
+            if cmd.trim_end() == "GETPARM(265)" {
+                "!"
+            } else {
+                "%0"
+            }
+            .into()
+        });
+        let (_b, _io_b) = LineRig::new("solRepB", |cmd| {
+            match cmd.trim_end() {
+                "GETPARM(265)" => "%MySoloist",
+                "GETPARM(257)" => "!",
+                _ => "%0",
+            }
+            .into()
+        });
+        for (card, line) in [(0, "solRepA"), (1, "solRepB")] {
+            let args = vec![
+                ArgValue::Int(card),
+                ArgValue::String(line.into()),
+                ArgValue::Int(0),
+            ];
+            run_command(soloist_config_command(), args).await;
+        }
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvSoloist", 0),
+            "    Soloist controller 0, port=solRepA, address=0, id: Soloist0 \n    \
+             Soloist controller 1, port=solRepB, address=0, id: MySoloist \n    \
+             Soloist controller 2 connection failed.\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvSoloist.cc:734: `motor_init` reads the axis's status once, after
+    /// its last init query, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn motor_init_reads_the_status_once_and_the_record_starts_from_it() {
+        let setup = vec![ArgValue::Int(1), ArgValue::Int(10)];
+        run_command(soloist_setup_command(), setup).await;
+        let (line, _io) = LineRig::new("solInitLine", |cmd| {
+            match cmd.trim_end() {
+                "GETPARM(3)" => "%2",
+                "AXISSTATUS()" => "%4",
+                "PFBKPROG()" => "%7",
+                _ => "%0",
+            }
+            .into()
+        });
+        let config = vec![
+            ArgValue::Int(0),
+            ArgValue::String("solInitLine".into()),
+            ArgValue::Int(0),
+        ];
+        run_command(soloist_config_command(), config).await;
+        drvsup_init().await;
+        let sent: Vec<String> = line
+            .sent()
+            .iter()
+            .map(|m| m.trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "NONE",
+                "GETPARM(265)",
+                "GETPARM(257)",
+                "GETPARM(58)",
+                "GETPARM(33)",
+                "ABORT",
+                "GETPARM(3)",
+                "GETPARM(108)",
+                "GETPARM(47)",
+                "GETPARM(48)",
+                "GETPARM(106)",
+                "AXISSTATUS()",
+                "AXISFAULT()",
+                "PFBKPROG()",
+            ]
+        );
+        let db = record_init(
+            r##"record(motor, "sol:m0") { field(DTYP, "Soloist") field(OUT, "#C0 S0 @") field(MRES, "0.5") }"##,
+        )
+        .await;
+        assert_eq!(db.get_pv("sol:m0.RMP").unwrap(), EpicsValue::Long(14));
+        assert_eq!(db.get_pv("sol:m0.DRBV").unwrap(), EpicsValue::Double(7.0));
+    }
 }

@@ -1,90 +1,35 @@
-# Ported from upstream `SPApp/Db/teledynePumpH.template` (StreamDevice
-# `field(DTYP,"stream")` + `@teled_h.proto <command>(...)` links) to asyn
-# Int32/Float64/Octet device support against `syringepump`'s
-# `TeledyneDriver` (`Family::H`, see `syringepump::driver`). PV names and
-# instantiation macros are unchanged from upstream -- only DTYP/INP/OUT
-# wiring changed. Upstream unit ($(u=6)) is fixed once per driver
-# instance by `TeledyneHInit`, not a per-link macro.
-#
-# Unlike teledynePumpD.template, this file's own PressSeq/MaxFlowSeq
-# already consistently use the $(s):$(ta):$(ss) naming scheme upstream
-# for Run/PressSet -- no naming-mismatch defect found here; ported
-# verbatim (including PressSeq's own upstream-commented-out LNK1/LNK2
-# steps, preserved as comments below).
-#
-# Removed upstream defect (doc/upstream-c-defects.md #37): upstream's
-# PistonUp OUT referenced "setPistonUp($(u=6),$(p=A))", a command that
-# does not exist anywhere in teled_h.proto's command table (confirmed by
-# search, same absence as BDetStatus/shiftleftpressSet below). Unlike
-# Colby's #35 (an unambiguous alternate address existed to wire to), no
-# derivable wire command exists here, so the dead
-# "$(s):$(ta):$(ss):PistonUp" bo record is removed rather than
-# fabricating a Teledyne command. PV-surface change: that PV no longer
-# exists; it never functioned (OUT was left unwired) so no working
-# behavior is lost.
-#
-# Removed upstream defect (doc/upstream-c-defects.md #38, both D and H):
-# AlarmI.INPA referenced "$(s):$(ta):$(ss):BDetStatus", never defined
-# anywhere in the module -- no in-file target exists to repoint to, so
-# the dangling INPA link is removed. AlarmI itself stays: INPB/INPC/INPD
-# (Vol/Pressure/Flow .SEVR, all real links) keep it functional, so the
-# record is not removed, only the dead term. PV-surface change: CALC's
-# "(A==3)||" leading disjunct is dropped (A defaulted to 0 with INPA
-# unlinked, so this term was already always-false; behavior is
-# unchanged, only the dead input link and its no-op CALC term are gone).
-#
-# UNFIXED (upstream defects preserved as-is -- no fix target exists, or
-# preservation was explicitly directed):
-#   - The five "*PARSE" aSub records (Vol/Pressure/PressSet_RBV/Flow/
-#     MaxFlow_RBV) all name a subroutine, "shiftleftpressSet", that does
-#     not exist anywhere in the shipped module source (confirmed by
-#     search, same as BDetStatus -- no reference implementation
-#     to port, so none is fabricated). Ported as-is: the SNAM reference
-#     is preserved unresolved: the raw stringin readback above each PARSE
-#     record (already wired to `GetVol`/`GetPress`/etc via asynOctet) is
-#     this port's functional readback path; the derived *Format ai
-#     records below each PARSE step stay permanently unpopulated,
-#     matching upstream's own non-functional behavior.
-#   - Run hardcodes addr 0 (pump "A"), matching upstream's own
-#     `$(p=A)` (H's setRun is not pump-parameterized upstream either --
-#     see `syringepump::driver` module doc). Every other OUT/INP link
-#     below also hardcodes addr 0, matching upstream's `$(p=A)`.
-#
-# Deviation (not a defect-fix; substitutes a wire-protocol-derivable
-# implementation for a symbol that does not exist anywhere in the shipped
-# module source): upstream's Command/CmdProc pairing used an `aSub`
-# subroutine named "formatCmd" (SNAM), which -- like "shiftleftpressSet"
-# above -- is not registered or defined anywhere in SyringePump's own
-# source tree. Unlike "shiftleftpressSet", formatCmd's role is fully
-# specified by teled_h.proto's sendCmd command envelope (a 2-hex-digit
-# length prefix ahead of the raw text), so `TeledyneDriver::write_octet`
-# computes it directly and CmdProc is dropped -- the same bytes reach the
-# wire either way. See `syringepump::driver` module doc's "SendCmd"
-# section.
-
 record(bo, "$(s):$(ta):$(ss):Run") {
-    field(DTYP, "asynInt32")
-    field(OUT, "@asyn($(PORT),0) SetRun")
+    field(DTYP, "stream")
+    field(OUT, "@teled_h.proto setRun($(u=6),$(p=A)) $(PORT)")
     info(autosaveFields, "VAL")
     info(archive, "Monitor, 00:00:01, VAL")
 }
 
+record(bo, "$(s):$(ta):$(ss):PistonUp") {
+    field(DTYP, "stream")
+    field(OUT, "@teled_h.proto setPistonUp($(u=6),$(p=A)) $(PORT)")
+    info(autosaveFields, "VAL")
+    info(archive, "Monitor, 00:00:01, VAL")
+}
+
+
+
 record(bo, "$(s):$(ta):$(ss):Stop") {
-    field(DTYP, "asynInt32")
-    field(OUT, "@asyn($(PORT),0) SetStop")
+    field(DTYP, "stream")
+    field(OUT, "@teled_h.proto setStop($(u=6),$(p=A)) $(PORT)")
     info(autosaveFields, "VAL")
     info(archive, "Monitor, 00:00:01, VAL")
 }
 
 record(bo, "$(s):$(ta):$(ss):Remote") {
-    field(DTYP, "asynInt32")
-    field(OUT, "@asyn($(PORT),0) SetRem")
+    field(DTYP, "stream")
+    field(OUT, "@teled_h.proto setRem($(u=6)) $(PORT)")
     info(autosaveFields, "VAL")
     info(archive, "Monitor, 00:00:01, VAL")
 }
 record(bo, "$(s):$(ta):$(ss):Local") {
-    field(DTYP, "asynInt32")
-    field(OUT, "@asyn($(PORT),0) SetLoc")
+    field(DTYP, "stream")
+    field(OUT, "@teled_h.proto setLoc($(u=6)) $(PORT)")
     info(autosaveFields, "VAL")
     info(archive, "Monitor, 00:00:01, VAL")
 }
@@ -107,9 +52,9 @@ record(sseq, "$(s):$(ta):$(ss):PressSeq") {
 }
 
 record(ao, "$(s):$(ta):$(ss):PressSend") {
-    field(DTYP, "asynFloat64")
+    field(DTYP, "stream")
     field(EGU, "")
-    field(OUT, "@asyn($(PORT),0) SetPress")
+    field(OUT, "@teled_h.proto setPress($(u=6),$(p=A)) $(PORT)")
     field(PREC, "3")
     info(archive, "Monitor, 00:00:01, VAL")
 
@@ -131,9 +76,9 @@ record(sseq, "$(s):$(ta):$(ss):MaxFlowSeq") {
     field(LNK3, "$(s):$(ta):$(ss):MaxFlowSend PP")
 }
 record(ao,"$(s):$(ta):$(ss):MaxFlowSend") {
-    field(DTYP, "asynFloat64")
+    field(DTYP, "stream")
     field(EGU, "ml/min")
-    field(OUT, "@asyn($(PORT),0) SetMFlow")
+    field(OUT, "@teled_h.proto setMFlow($(u=6),$(p=A)) $(PORT)")
     field(PREC, "3")
     info(archive, "Monitor, 00:00:01, VAL")
 
@@ -160,13 +105,11 @@ record(seq, "$(s):$(ta):$(ss):Scanner") {
 ######################################################################
 
 record(stringin, "$(s):$(ta):$(ss):Vol") {
-   field(DTYP, "asynOctetRead")
-   field(INP, "@asyn($(PORT),0) GetVol")
+   field(DTYP, "stream")
+   field(INP, "@teled_h.proto getVol($(u=6),$(p=A)) $(PORT)")
    field(FLNK, "$(s):$(ta):$(ss):VolPARSE")
 
 }
-# UNFIXED (see this file's header comment): SNAM names a subroutine that
-# does not exist anywhere in the shipped module source.
 record(aSub, "$(s):$(ta):$(ss):VolPARSE")
 {
     field(SNAM, "shiftleftpressSet")
@@ -174,15 +117,15 @@ record(aSub, "$(s):$(ta):$(ss):VolPARSE")
     field(FTA, "STRING")
     field(OUTA, "$(s):$(ta):$(ss):VolFormat PP")
     field(FTVA, "DOUBLE")
-    field(PREC, "3")
-}
+    field(PREC, "3")	    
+}   
 
 record(ai, "$(s):$(ta):$(ss):VolFormat")
 {
     field(EGU, "")
     field(PREC, "3")
     info(archive, "Monitor, 00:00:01, VAL")
-
+    
 }
 
 
@@ -191,13 +134,11 @@ record(ai, "$(s):$(ta):$(ss):VolFormat")
 ######################################################################
 
 record(stringin, "$(s):$(ta):$(ss):Pressure") {
-   field(DTYP, "asynOctetRead")
-   field(INP,  "@asyn($(PORT),0) GetPress")
+   field(DTYP, "stream")
+   field(INP,  "@teled_h.proto getPress($(u=6),$(p=A)) $(PORT)")
    field(FLNK, "$(s):$(ta):$(ss):PressurePARSE")
 }
 
-# UNFIXED (see this file's header comment): SNAM names a subroutine that
-# does not exist anywhere in the shipped module source.
 record(aSub, "$(s):$(ta):$(ss):PressurePARSE")
 {
     field(SNAM, "shiftleftpressSet")
@@ -219,14 +160,12 @@ record(ai, "$(s):$(ta):$(ss):PressureFormat")
 #Subroutine call to format Pressure SP readback
 ######################################################################
 record(stringin,"$(s):$(ta):$(ss):PressSet_RBV") {
-    field(DTYP, "asynOctetRead")
-    field(INP,  "@asyn($(PORT),0) GetSetPress")
+    field(DTYP, "stream")
+    field(INP,  "@teled_h.proto getSetPress($(u=6),$(p=A)) $(PORT)")
     info(archive, "Monitor, 00:00:01, VAL")
     field(FLNK, "$(s):$(ta):$(ss):PressSetPARSE")
 }
 
-# UNFIXED (see this file's header comment): SNAM names a subroutine that
-# does not exist anywhere in the shipped module source.
 record(aSub, "$(s):$(ta):$(ss):PressSetPARSE")
 {
     field(SNAM, "shiftleftpressSet")
@@ -247,14 +186,12 @@ record(ai, "$(s):$(ta):$(ss):PressSetFormat")
 #Subroutine call to format Flow SP readback
 ####################################################################
 record(stringin,"$(s):$(ta):$(ss):Flow") {
-    field(DTYP, "asynOctetRead")
-    field(INP,  "@asyn($(PORT),0) GetFlow")
+    field(DTYP, "stream")
+    field(INP,  "@teled_h.proto getFlow($(u=6),$(p=A)) $(PORT)")
     info(archive, "Monitor, 00:00:01, VAL")
     field(FLNK, "$(s):$(ta):$(ss):FlowPARSE")
 }
 
-# UNFIXED (see this file's header comment): SNAM names a subroutine that
-# does not exist anywhere in the shipped module source.
 record(aSub, "$(s):$(ta):$(ss):FlowPARSE")
 {
     field(SNAM, "shiftleftpressSet")
@@ -275,14 +212,12 @@ record(ai, "$(s):$(ta):$(ss):FlowFormat")
 #Subroutine call to format MaxFlow_RBV readback
 ####################################################################
 record(stringin,"$(s):$(ta):$(ss):MaxFlow_RBV") {
-    field(DTYP, "asynOctetRead")
-    field(INP,  "@asyn($(PORT),0) GetMFlow")
+    field(DTYP, "stream")
+    field(INP,  "@teled_h.proto getMFlow($(u=6),$(p=A)) $(PORT)")
     info(archive, "Monitor, 00:00:01, VAL")
     field(FLNK, "$(s):$(ta):$(ss):MaxFlow_RBVPARSE")
 }
 
-# UNFIXED (see this file's header comment): SNAM names a subroutine that
-# does not exist anywhere in the shipped module source.
 record(aSub, "$(s):$(ta):$(ss):MaxFlow_RBVPARSE")
 {
     field(SNAM, "shiftleftpressSet")
@@ -304,49 +239,54 @@ record(ai, "$(s):$(ta):$(ss):MaxFlow_RBVFormat")
 
 ####################################################################
 record(stringin, "$(s):$(ta):$(ss):Status") {
-    field(DTYP, "asynOctetRead")
-    field(INP,  "@asyn($(PORT),0) GetStatus")
+    field(DTYP, "stream")
+    field(INP,  "@teled_h.proto getStatus($(u=6),$(p=A)) $(PORT)")
 }
 
 
 
 record(stringin, "$(s):$(ta):$(ss):Units") {
-    field(DTYP, "asynOctetRead")
-    field(INP,  "@asyn($(PORT),0) GetUnit")
+    field(DTYP, "stream")
+    field(INP,  "@teled_h.proto getUnit($(u=6),$(p=A)) $(PORT)")
     field(SCAN, "1 second")
 }
 
 record(stringin, "$(s):$(ta):$(ss):Mode") {
-    field(DTYP, "asynOctetRead")
-    field(INP,  "@asyn($(PORT),0) GetMode")
+    field(DTYP, "stream")
+    field(INP,  "@teled_h.proto getMode($(u=6),$(p=A)) $(PORT)")
     field(SCAN, "1 second")
 }
 
 
 
 record(stringin, "$(s):$(ta):$(ss):ID") {
-    field(DTYP, "asynOctetRead")
-    field(INP,  "@asyn($(PORT),0) GetID")
+    field(DTYP, "stream")
+    field(INP,  "@teled_h.proto getID($(u=6),$(p=A)) $(PORT)")
     field(SCAN, "1 second")
 }
 
 
 
-# Deviation: upstream's "formatCmd" aSub subroutine does not exist
-# anywhere in the shipped module source -- see this file's header
-# comment. `TeledyneDriver::write_octet` computes the length prefix
-# directly; writing this record processes CmdReply via FLNK, which
-# re-reads the cached reply.
 record(stringout, "$(s):$(ta):$(ss):Command") {
-   field(DTYP, "asynOctetWrite")
-   field(OUT, "@asyn($(PORT),0) SendCmd")
-   field(FLNK, "$(s):$(ta):$(ss):CmdReply")
+   field(FLNK, "$(s):$(ta):$(ss):CmdProc")
 
 }
 
+record(aSub, "$(s):$(ta):$(ss):CmdProc") {
+   field(INPA, "$(s):$(ta):$(ss):Command")
+   field(FTA, "STRING")
+   field(SNAM, "formatCmd")
+   field(FTVA, "CHAR")
+   field(NOVA, "80")
+   field(OUTA, "$(s):$(ta):$(ss):CmdReply PP")
+   info(archive, "Monitor, 00:00:01, VAL")
+
+}
+
+# Written to, sends the string. The reply replaces the string written to it. 
 record(waveform, "$(s):$(ta):$(ss):CmdReply") {
-   field(DTYP, "asynOctetRead")
-   field(INP,  "@asyn($(PORT),0) SendCmd")
+   field(DTYP, "stream")
+   field(INP,  "@teled_h.proto sendCmd($(u=6)) $(PORT)")
    field(FTVL, "CHAR")
    field(NELM, "80")
    info(archive, "Monitor, 00:00:01, VAL")
@@ -355,14 +295,11 @@ record(waveform, "$(s):$(ta):$(ss):CmdReply") {
 
 record(calc, "$(s):$(ta):$(ss):AlarmI") {
    field(DESC, "Immediate Alarm")
-   # Removed upstream defect (doc/upstream-c-defects.md #38): INPA
-   # referenced "$(s):$(ta):$(ss):BDetStatus", never defined anywhere in
-   # the module -- dangling link removed, CALC's "(A==3)||" term dropped
-   # with it (see this file's header comment).
+   field(INPA, "$(s):$(ta):$(ss):BDetStatus")
    field(INPB, "$(s):$(ta):$(ss):Vol.SEVR")
    field(INPC, "$(s):$(ta):$(ss):Pressure.SEVR")
    field(INPD, "$(s):$(ta):$(ss):Flow.SEVR")
-   field(CALC, "B||C||D")
+   field(CALC, "(A==3)||B||C||D")
    field(HIHI, "0.5")
    field(HHSV, "MAJOR")
    info(archive, "Monitor, 00:00:01, VAL")
@@ -378,17 +315,17 @@ record(calc, "$(s):$(ta):$(ss):AlarmI") {
 
 record(bo, "$(s):$(ta):$(ss):Refill") {
     field(DESC, "Refill Pump")
-    field(DTYP, "asynInt32")
-    field(OUT, "@asyn($(PORT),0) SetRefill")
+    field(DTYP, "stream")
+    field(OUT, "@teled_h.proto setRefill($(u=6),$(p=A)) $(PORT)")
     info(autosaveFields, "VAL")
     info(archive, "Monitor, 00:00:01, VAL")
     field(HIGH, "1")
 }
 
 record(ai,"$(s):$(ta):$(ss):GetRefillLimit") {
-    field(DTYP, "asynFloat64")
+    field(DTYP, "stream")
     field(EGU, "ml/min")
-    field(INP, "@asyn($(PORT),0) GetRefillLimit")
+    field(INP, "@teled_h.proto getRefillLimit($(u=6),$(p=A)) $(PORT)")
     field(PREC, "3")
     field(SCAN, "1 second")
     info(archive, "Monitor, 00:00:01, VAL")
@@ -404,26 +341,17 @@ record(ao,"$(s):$(ta):$(ss):SetRefillRate") {
     field(PREC, "0")
     info(archive, "Monitor, 00:00:01, VAL")
 
-}
+}  
 
 
-# The scaling stays in the calc; the device write lives on the ao below.
-# EPICS asyn declares no device support for calcout, so an @asyn link here
-# binds nothing and the rate never reached the pump.
 record(calcout, "$(s):$(ta):$(ss):SetRefillRateCalc") {
   field(INPA, "$(s):$(ta):$(ss):SetRefillRate CP")
   field(CALC, "A*10")
   field(DOPT, "Use CALC")
-  field(OUT, "$(s):$(ta):$(ss):SetRefillRateSend.VAL PP")
+  field(OUT, "@teled_h.proto setRefillRate($(u=6),$(p=A)) $(PORT)")
+  field(DTYP, "stream")
   info(archive, "Monitor, 00:00:01, VAL")
 
-}
-
-
-record(ao,"$(s):$(ta):$(ss):SetRefillRateSend") {
-    field(DTYP, "asynFloat64")
-    field(OUT, "@asyn($(PORT),0) SetRefillRate")
-    field(PREC, "4")
 }
 
 
@@ -440,24 +368,17 @@ record(mbbo, "$(s):$(ta):$(ss):SetDigitalOut") {
     field(ONST, "A")
     field(TWST, "B")
 
-}
+}   
 
 record(calcout, "$(s):$(ta):$(ss):SetDigitalCalc1") {
    field(DESC, "Digital Calc 1")
    field(INPA, "$(s):$(ta):$(ss):SetDigitalOut CP")
    field(CALC, "A")
-   field(OUT, "$(s):$(ta):$(ss):SetDigitalSend.VAL PP")
+   field(DTYP, "stream")
+   field(OUT, "@teled_h.proto setDigital($(u=6),$(p=A)) $(PORT)")
    field(PINI, "NO")
    info(archive, "Monitor, 00:00:01, VAL")
 
-}
-
-
-# The selector the driver maps to one of the four DIGITAL= choices is the
-# mbbo's state index, which the calc above passes through.
-record(longout, "$(s):$(ta):$(ss):SetDigitalSend") {
-   field(DTYP, "asynInt32")
-   field(OUT, "@asyn($(PORT),0) SetDigital")
 }
 
 
@@ -528,7 +449,7 @@ record(sseq, "$(s):$(ta):$(ss):AutoFillSeq1") {
    field(DOL2, "2")
    field(DLY2, "1")
    field(LNK2, "$(s):$(ta):$(ss):SetDigitalOut.VAL")
-
+  
    field(DOL3, "1")
    field(DLY3, "10")
    field(LNK3, "$(s):$(ta):$(ss):SetDigitalOut.PROC")
@@ -611,10 +532,10 @@ record(sseq, "$(s):$(ta):$(ss):ControlVentSeq2") {
    field(LNK3, "$(s):$(ta):$(ss):SetDigitalOut.VAL")
    field(DOL4, "1")
    field(DLY4, "1")
-   field(LNK4, "$(s):$(ta):$(ss):SetDigitalOut.PROC")
+   field(LNK4, "$(s):$(ta):$(ss):SetDigitalOut.PROC") 
    field(DOL5, "2")
    field(DLY5, "1")
-   field(LNK5, "$(s):$(ta):$(ss):Run.PROC")
+   field(LNK5, "$(s):$(ta):$(ss):Run.PROC") 
    field(DOL6, "2")
    field(DLY6, "1")
    field(LNK6, "$(s):$(ta):$(ss):SetDigitalOut.VAL")
@@ -623,3 +544,5 @@ record(sseq, "$(s):$(ta):$(ss):ControlVentSeq2") {
    field(LNK7, "$(s):$(ta):$(ss):SetDigitalOut.PROC")
 
 }
+
+

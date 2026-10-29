@@ -15,6 +15,10 @@ pub const MAX_FILENAME_LEN: usize = 256;
 /// socket that may never be connected.
 pub const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long statusTask keeps the driver after a post (C's
+/// `epicsThreadSleep(0.01)`, BISDetector.cpp:436-438).
+pub const STATUS_POST_DELAY: Duration = Duration::from_millis(10);
+
 /// The timeout of an ordinary command (C `BIS_DEFAULT_TIMEOUT`).
 pub const BIS_DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 

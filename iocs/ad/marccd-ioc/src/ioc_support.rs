@@ -15,7 +15,7 @@ use ad_marccd::{MarccdRuntime, create_marccd_detector};
 /// `st.cmd` line works unchanged. The sensor size is not a config argument —
 /// the driver learns it from the server via `getConfig`.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADMARCCD", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADMARCCD", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<MarccdRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -53,13 +53,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             ],
             "marCCDConfig portName serverPort [maxBuffers] [maxMemory] \
              [priority] [stackSize]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let server_port = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("serverPort required".into()),
                 };
                 // C: maxMemory == 0 means unlimited. The Rust pool needs a
@@ -69,14 +69,18 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 100_000_000,
                 };
 
-                println!(
-                    "marCCDConfig: port={port_name}, server={server_port}, \
-                     maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let det = create_marccd_detector(&port_name, &server_port, max_memory)?;
+                let det = create_marccd_detector(&claim, &server_port, max_memory)?;
 
-                epics_rs::asyn::asyn_record::register_port(&port_name, det.port_handle().clone())
+                claim
+                    .publish(
+                        det.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
                     .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

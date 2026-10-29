@@ -90,7 +90,6 @@ impl IoInterface {
             .position(|&r| r == input_id)
             .map(|i| i as u8)
             .ok_or_else(|| UrError::OutOfRange {
-                value: f64::from(input_id),
                 min: f64::from(ids[0]),
                 max: f64::from(ids[4]),
             })
@@ -136,15 +135,8 @@ impl IoInterface {
             recipes.push(vec![cmd.clone(), self.in_double_reg(reg)]);
         }
 
-        for (i, names) in recipes.iter().enumerate() {
-            let assigned = self.session.send_input_setup(names)?;
-            let expected = (i + 1) as u8;
-            if assigned != expected {
-                return Err(UrError::Protocol(format!(
-                    "controller assigned recipe id {assigned} to input recipe {expected} \
-                     ({names:?}); the interface addresses recipes positionally"
-                )));
-            }
+        for names in &recipes {
+            self.session.send_input_setup(names)?;
         }
         Ok(())
     }
@@ -157,8 +149,10 @@ impl IoInterface {
         match self.session.send_command(&cmd) {
             Ok(()) => Ok(()),
             Err(first) => {
-                log::warn!("ur-robot: RTDE I/O lost the connection ({first}); reconnecting");
+                println!("RTDEIOInterface: Lost connection to robot...");
+                epics_rs::base::stderr_println!("{first}");
                 self.session.disconnect(false);
+                println!("RTDEIOInterface: Robot is disconnected, reconnecting...");
                 self.reconnect()?;
                 self.session.send_command(&cmd)
             }
@@ -258,11 +252,7 @@ enum AnalogKind {
 /// output at all (rtde_io_interface.cpp:186).
 fn digital_mask(output_id: u8) -> UrResult<u8> {
     if output_id > 7 {
-        return Err(UrError::OutOfRange {
-            value: f64::from(output_id),
-            min: 0.0,
-            max: 7.0,
-        });
+        return Err(UrError::OutOfRange { min: 0.0, max: 7.0 });
     }
     Ok(1u8 << output_id)
 }
@@ -285,11 +275,7 @@ fn analog_out(output_id: u8, ratio: f64, kind: AnalogKind) -> UrResult<RobotComm
         0 => (ratio, 0.0),
         1 => (0.0, ratio),
         _ => {
-            return Err(UrError::OutOfRange {
-                value: f64::from(output_id),
-                min: 0.0,
-                max: 1.0,
-            });
+            return Err(UrError::OutOfRange { min: 0.0, max: 1.0 });
         }
     };
     Ok(RobotCommand::new(

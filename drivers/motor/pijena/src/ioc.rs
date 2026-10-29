@@ -1,96 +1,213 @@
 //! `PIJEDSSetup` / `PIJEDSConfig` iocsh commands for the piezosystem jena
-//! E-516 controller.
-//!
-//! Mirrors C `PIJEDSConfig(card, name, addr)`: connect the serial octet port,
-//! bring the controller online, detect its axes ([`PiJedsController::new`]), and
-//! register each behind a `DTYP`-keyed motor device support
-//! (`PIJEDS_{card}_{axis}`, 0-based). `PIJEDSSetup` (which only sized a
-//! controller array in C) is accepted as a no-op for startup-script parity.
-//!
-//! C's GPIB `addr` argument is dropped: this is a serial octet port (asyn
-//! address 0).
+//! E-516 controller, C's model-1 interface: records reach axis `signal` of
+//! `card` through `DTYP "PIJEDS"` and `OUT "#C card S signal"`. Config
+//! keeps the port; `motor_init` at iocInit connects and identifies the
+//! controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
-use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
-};
+use motor_common::connect::{EosRefusal, connect_with_eos};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1_device;
 
 use crate::pijeds::{PiJedsAxis, PiJedsController};
 
 /// Serial command timeout (C `COMM_TIMEOUT` 2 s).
 const PIJEDS_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the `PIJEDSSetup(maxControllers, scanRate)` no-op command
-/// (startup-script parity; the asyn-rs port allocates per `PIJEDSConfig`).
+/// `device(motor,VME_IO,devPIJEDS,"PIJEDS")` (devPIJena.dbd:2).
+static DEV_PIJEDS: DevSup = model1_device("devPIJEDS", "PIJEDS");
+
+/// `PIJEDS_NUM_CARDS` (drvPIJEDS.h:32).
+static PIJEDS: Model1 = Model1::new_disabling_ntm(&DEV_PIJEDS, 10, SCAN_RATE);
+
+/// `PIJEDSSetup(num_cards, scan_rate)`.
 pub fn pijeds_setup_command() -> CommandDef {
+    PIJEDS.register_report("drvPIJEDS", |cards| {
+        cards.report("PIJEDS", |card, line| {
+            format!("    PIJEDS controller #{card}, {line} \n")
+        })
+    });
+    PIJEDS.setup_command("PIJEDSSetup")
+}
+
+/// `PIJEDSConfig(card, name, address)`.
+pub fn pijeds_config_command() -> CommandDef {
     CommandDef::new(
-        "PIJEDSSetup",
-        vec![arg_int_req("maxControllers"), arg_int_opt("scanRate")],
-        "PIJEDSSetup(maxControllers, [scanRate]) - Accepted for parity; PIJEDSConfig allocates per call",
+        "PIJEDSConfig",
+        vec![
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
+        ],
+        "PIJEDSConfig(card, name, address)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxControllers")?;
-            if max < 1 {
-                return Err("PIJEDSSetup: maxControllers must be > 0".into());
+            let card = c_int(args, 0);
+            if !PIJEDS.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+
+            PIJEDS.config(card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    0,
+                    PIJEDS_TIMEOUT,
+                    b"\x11",
+                    b"\r",
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = PiJedsController::new(handle) else {
+                    return;
+                };
+                // A card with no stage stays (drvPIJEDS.cc:650-675).
+                let num_axes = controller.num_axes();
+                let line = format!("port={asyn_port}, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
+                for axis in 0..num_axes {
+                    let ax = PiJedsAxis::new(controller.clone(), axis);
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
+                    init.axis(axis as i32, motor);
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIJEDSConfig(card, asynPort, [movingPollMs], [idlePollMs])`
-/// command bound to `holder`.
-pub fn pijeds_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
-    CommandDef::new(
-        "PIJEDSConfig",
-        vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-        ],
-        "PIJEDSConfig(card, asynPort, [movingPollMs], [idlePollMs]) - \
-         Create a piezosystem jena E-516 controller (DTYP PIJEDS_{card}_{0..N-1}); \
-         axis count is auto-detected",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIJEDSConfig: card must be >= 0".into());
-            }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
-            let handle = connect_serial(&asyn_port, PIJEDS_TIMEOUT)?;
-            let controller =
-                PiJedsController::new(handle).map_err(|e| format!("PIJEDSConfig: {e}"))?;
-            let ident = controller.ident().to_string();
-            let version = controller.version();
-            let num_axes = controller.num_axes();
-            if num_axes == 0 {
-                return Err("PIJEDSConfig: no axes detected".into());
+    /// drvPIJEDS.cc's drvet `report` (drvPIJEDS.cc:151-176), which `dbior`
+    /// runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_pijeds_controller() {
+        let setup = pijeds_setup_command();
+        assert_eq!(
+            driver_report("drvPIJEDS", 0),
+            "    No PIJEDS controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::new("jedsRepLine", |cmd| {
+            match cmd.trim() {
+                "" => "DSM V1.959",
+                "mess,0" => "mess,0,1.000",
+                _ => "not present",
             }
-            let controller = Arc::new(Mutex::new(controller));
+            .into()
+        });
+        let config = vec![int(1), ArgValue::String("jedsRepLine".into()), int(0)];
+        run_command(pijeds_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvPIJEDS", 0),
+            "    PIJEDS controller 0 connection failed.\n    PIJEDS controller #1, \
+             port=jedsRepLine, id: DSM V1.959 \n"
+        );
+    }
+}
 
-            for axis in 0..num_axes {
-                let ax = PiJedsAxis::new(controller.clone(), axis);
-                let dtyp_key = format!("PIJEDS_{card}_{axis}");
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
+
+    /// drvPIJEDS.cc:643-678: once `DSM` answered, only a `not present`
+    /// reply ends the axis count, and a card with no axes stays.
+    #[epics_rs::base::epics_test]
+    async fn a_card_answering_dsm_survives_its_axis_count() {
+        let int = ArgValue::Int;
+        run_command(pijeds_setup_command(), vec![int(2), int(10)]).await;
+        let rig = |name: &str, axis0: &'static str| {
+            LineRig::new(name, move |cmd| match cmd.trim_end() {
+                "" => "DSM V1.959".into(),
+                "mess,0" => axis0.into(),
+                _ => String::new(),
+            })
+        };
+        let (_a, _) = rig("edsSilentMess", "");
+        let (_b, _) = rig("edsNoStage", "mess,0,not present");
+        for (card, port) in [(0, "edsSilentMess"), (1, "edsNoStage")] {
+            let config = vec![int(card), ArgValue::String(port.into()), int(0)];
+            run_command(pijeds_config_command(), config).await;
+        }
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvPIJEDS", 0),
+            "    PIJEDS controller #0, port=edsSilentMess, id: DSM V1.959 \n    \
+             PIJEDS controller #1, port=edsNoStage, id: DSM V1.959 \n"
+        );
+    }
+
+    /// drvPIJEDS.cc:461-487: a failed `mess,n` reads as an empty reply,
+    /// which is no `not present`, so the axis counts.
+    #[epics_rs::base::epics_test]
+    async fn a_refused_axis_query_still_counts_the_axis() {
+        let (_line, io) = LineRig::failing(
+            "edsRefusedMess",
+            |cmd| match cmd.trim_end() {
+                "" => "DSM V1.959".into(),
+                _ => "mess,0,not present".into(),
+            },
+            |cmd| cmd.starts_with("mess,0"),
+        );
+        let controller = PiJedsController::new(io).unwrap();
+        assert_eq!(controller.num_axes(), 1);
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvPIJEDS.cc:643-673: `motor_init` counts the axes, then reads each
+    /// axis's status once, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn pijeds_motor_init_reads_each_status_once() {
+        let int = ArgValue::Int;
+        run_command(pijeds_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::new("jedsInitLine", |cmd| {
+            match cmd.trim_end() {
+                "" => "DSM V1.959",
+                "mess,0" => "mess,0,0.014",
+                "mess,1" => "mess,1,0.003",
+                "stat,0" => "stat,0,133",
+                "stat,1" => "stat,1,133",
+                _ => "mess,2,not present",
             }
-            println!(
-                "PIJEDSConfig: card={card} asynPort={asyn_port} axes={num_axes} \
-                 ident=\"{ident}\" version={version} poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=PIJEDS_{card}_{{0..{}}})",
-                num_axes - 1
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
+            .into()
+        });
+        let config = vec![int(0), ArgValue::String("jedsInitLine".into()), int(0)];
+        run_command(pijeds_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            line.sent(),
+            [
+                "", "mess,0", "mess,1", "mess,2", "stat,0", "mess,0", "stat,1", "mess,1"
+            ]
+        );
+        let db = record_init(
+            "record(motor, \"m1\") { field(DTYP, \"PIJEDS\") field(OUT, \"#C0 S0 @\") }\n\
+             record(motor, \"m2\") { field(DTYP, \"PIJEDS\") field(OUT, \"#C0 S1 @\") }\n",
+        )
+        .await;
+        assert_eq!(
+            [db.get_pv("m1.RMP").unwrap(), db.get_pv("m2.RMP").unwrap()],
+            [EpicsValue::Long(14), EpicsValue::Long(3)]
+        );
+    }
 }

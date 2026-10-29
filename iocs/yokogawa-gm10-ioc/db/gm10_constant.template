@@ -1,5 +1,5 @@
 # GM10 Const channel — address family "K" (K1-K100).
-# Macros: P, DAU, HANDLE, ADDRESS (bare "K"-prefixed address, e.g. K1).
+# Macros: P, DAU, HANDLE, ADDRESS (bare "K"-prefixed address, e.g. K001).
 # Port of yokogawaDasApp/Db/GM10_constant_channel.db.
 
 record(ai,"$(P)$(DAU):$(ADDRESS)")

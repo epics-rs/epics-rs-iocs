@@ -9,8 +9,8 @@
 #============================================================
 
 epicsEnvSet("P",      "oms:")
-epicsEnvSet("CTRL",   "omsPort")
-epicsEnvSet("IPPORT", "omsAsyn")
+epicsEnvSet("PORT",   "MAXnet1")
+epicsEnvSet("IPPORT", "MAXNET")
 epicsEnvSet("HOST",   "192.168.1.30:5001")
 
 # ---- asyn octet port ----
@@ -18,24 +18,27 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "38400")
 
-# OMS framing: the controller terminates replies with "\n\r"; the driver owns
-# the "\n" output terminator, so only the input EOS is set here. Do NOT set an
-# output EOS.
-asynOctetSetInputEos("$(IPPORT)", 0, "\n\r")
+# omsMAXnetConfig defaults the EOS to "\n\r" in, "\n" out where it is unset;
+# set either here to override it.
 
 # ---- MAXnet controller ----
-# omsMAXnetConfig(controllerName, asynPort, [initString], [movingPollMs],
-#                 [idlePollMs], [timeoutMs]). initString is sent verbatim at
-# boot (empty here); poll periods default to 100/1000 ms.
-omsMAXnetConfig("$(CTRL)", "$(IPPORT)", "", 100, 1000, 2000)
+# omsMAXnetConfig(portName, numAxes, serialPortName, movingPollPeriod,
+#                 idlePollPeriod, initString). The axes are those the
+# controller reports, up to numAxes; initString is sent verbatim at boot.
+omsMAXnetConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "AX LH PSO;")
 
-# One motor record per axis: omsCreateAxis(controllerName, axis), axis 0-based.
-omsCreateAxis("$(CTRL)", 0)
-dbLoadRecords("$(OMS_ASYN_IOC)/db/oms.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
+# The axis's asyn_motor.db, as C's MAXnet.cmd loads it.
+dbLoadTemplate("$(OMS_ASYN_IOC)/db/MAXnet.substitutions", "P=$(P),PORT=$(PORT)")
+
+# motorUtil's records, as C's st.cmd loads them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
 
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
+
 # Example:
 #   dbl
-#   camonitor oms:m1 oms:m1.RBV
-#   caput oms:m1 1000
+#   camonitor oms:m2 oms:m2.RBV
+#   caput oms:m2 1

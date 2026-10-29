@@ -1,0 +1,13 @@
+# C's iocNewport PM500.substitutions, P from st.cmd.
+# Signal 0,1,2,... is controller channel X,Y,Z,A,... C's MRES 5e-5 is the
+# 50 nm stage's step, but drvPM500.cc sets every axis's drive_resolution to
+# 0.01 controller units (microns), so C reads every position back at five
+# times the stage's; MRES here is that 0.01 um.
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{N,   M,       DTYP,     C,  S,  DESC,          EGU,  DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{31,  "m$(N)", "PM500",  0,  0,  "motor $(N)",  mm,   Pos,  1,     .1,    .2,    0,     1,     .2,    1e-5,  5,     100,   -100,  ""}
+{32,  "m$(N)", "PM500",  0,  1,  "motor $(N)",  mm,   Pos,  1,     .1,    .2,    0,     1,     .2,    1e-5,  5,     100,   -100,  ""}
+{33,  "m$(N)", "PM500",  0,  2,  "motor $(N)",  mm,   Pos,  1,     .1,    .2,    0,     1,     .2,    1e-5,  5,     100,   -100,  ""}
+}

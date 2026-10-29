@@ -100,8 +100,10 @@ mod tests {
         fn arm(&mut self, _start: bool) -> epics_rs::base::error::CaResult<()> {
             Ok(())
         }
-        fn done(&mut self) -> bool {
-            true
+        fn register_done_interrupt(
+            &mut self,
+            _user: epics_rs::scaler::device_support::scaler_asyn::DoneInterrupt,
+        ) {
         }
         fn num_channels(&self) -> usize {
             4

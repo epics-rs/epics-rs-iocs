@@ -1,8 +1,8 @@
-//! Merlin-specific asyn parameters (C `merlinDetector.h` `*String` names).
-//!
-//! C also declared DELAY_TIME, ARMED, THRESHOLD_AUTO_APPLY and
-//! STARTTHRESHOLDSCANNING; none is read or written by the driver or bound by
-//! any record in `merlin.template`, so they are not created here.
+//! Merlin-specific asyn parameters (C `merlinDetector.h` `*String` names),
+//! created in C's order (merlinDetector.cpp:1409-1463) so every reason, and
+//! every `function=` the driver prints, is C's. DELAY_TIME, THRESHOLD_AUTO_APPLY
+//! and ARMED are created and never used, as in C; STARTTHRESHOLDSCANNING is
+//! only defined there, never created.
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
@@ -10,9 +10,12 @@ use epics_rs::asyn::port::PortDriverBase;
 
 #[derive(Clone, Copy)]
 pub struct MerlinParams {
+    pub delay_time: usize,
     pub thresholds: [usize; 8],
     pub operating_energy: usize,
     pub threshold_apply: usize,
+    pub threshold_auto_apply: usize,
+    pub armed: usize,
     pub threshold_scan: usize,
     pub start_threshold_scan: usize,
     pub stop_threshold_scan: usize,
@@ -36,14 +39,18 @@ pub struct MerlinParams {
 
 impl MerlinParams {
     pub fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+        let delay_time = base.create_param("DELAY_TIME", ParamType::Float64)?;
         let mut thresholds = [0usize; 8];
         for (i, slot) in thresholds.iter_mut().enumerate() {
             *slot = base.create_param(&format!("THRESHOLD{i}"), ParamType::Float64)?;
         }
         Ok(Self {
+            delay_time,
             thresholds,
             operating_energy: base.create_param("OPERATINGENERGY", ParamType::Float64)?,
             threshold_apply: base.create_param("THRESHOLD_APPLY", ParamType::Int32)?,
+            threshold_auto_apply: base.create_param("THRESHOLD_AUTO_APPLY", ParamType::Int32)?,
+            armed: base.create_param("ARMED", ParamType::Int32)?,
             threshold_scan: base.create_param("THRESHOLDSCAN", ParamType::Int32)?,
             start_threshold_scan: base.create_param("THRESHOLDSTART", ParamType::Float64)?,
             stop_threshold_scan: base.create_param("THRESHOLDSTOP", ParamType::Float64)?,
@@ -61,5 +68,10 @@ impl MerlinParams {
             quad_merlin_mode: base.create_param("QUADMERLINMODE", ParamType::Int32)?,
             select_gui: base.create_param("SELECTGUI", ParamType::Octet)?,
         })
+    }
+
+    /// C `FIRST_merlin_PARAM` — a reason below this belongs to the base class.
+    pub fn first(&self) -> usize {
+        self.delay_time
     }
 }

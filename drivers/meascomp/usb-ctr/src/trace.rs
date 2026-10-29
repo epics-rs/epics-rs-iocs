@@ -1,47 +1,40 @@
-//! C drvUSBCTR's `asynPrint` lines, printed through the port's asyn trace so
-//! `asynSetTraceMask` shows them as it does for the C driver.
+//! C `asynPrint(pasynUserSelf, ...)` for the code that runs outside
+//! [`PortDriver`](epics_rs::asyn::port::PortDriver): the poller, the scaler
+//! record's driver and the scan helpers they share.
 
-use std::fmt;
+use std::sync::{Arc, OnceLock};
 
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::trace::TraceMask;
-use meascomp::error::ScanPosition;
 
-/// C `driverName` (drvUSBCTR.cpp:42).
-pub(crate) const DRIVER: &str = "USBCTR";
-
-/// C `asynPrint(pasynUserSelf, mask, ...)` from outside the port's actor --
-/// the poller and the scaler device support. Formatted only when `mask` is
-/// on at `addr` (`None` for the port), since the poller runs it every cycle.
-pub(crate) fn print(
-    handle: &PortHandle,
-    addr: Option<i32>,
-    mask: TraceMask,
-    args: fmt::Arguments<'_>,
-) {
-    let trace = handle.trace();
-    let port = handle.port_name();
-    let enabled = match addr {
-        Some(addr) => trace.is_enabled_device(port, addr, mask),
-        None => trace.is_enabled(port, mask),
-    };
-    if enabled {
-        trace.output_device(port, addr, 0, mask, &args.to_string());
+/// C's `return (status==0) ? asynSuccess : asynError;`, which leaves the
+/// user's error message unset.
+pub fn asyn_status(status: i32) -> AsynResult<()> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        })
     }
 }
 
-/// C `readMCS`'s and `readScaler`'s trace of the scan-status call
-/// (drvUSBCTR.cpp:748-750, :968-970), for the named function.
-pub(crate) struct GetStatus<'a>(pub &'a str, pub ScanPosition);
+/// The port's own trace, bound once its runtime exists. Silent before that,
+/// as `PortDriverBase::trace_print` is for a port not yet bound.
+#[derive(Clone, Default)]
+pub struct SelfTrace(Arc<OnceLock<PortHandle>>);
 
-impl fmt::Display for GetStatus<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let GetStatus(function, p) = self;
-        write!(
-            f,
-            "{DRIVER}::{function} getStatus returned status={}, ctrStatus={}, ctrCount={}, \
-             ctrIndex={}",
-            p.code, p.status, p.total_count, p.index
-        )
+impl SelfTrace {
+    pub fn bind(&self, port: PortHandle) {
+        let _ = self.0.set(port);
+    }
+
+    pub fn print(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
+        if let Some(port) = self.0.get() {
+            port.trace()
+                .output_device(port.port_name(), Some(0), 0, mask, &args.to_string());
+        }
     }
 }

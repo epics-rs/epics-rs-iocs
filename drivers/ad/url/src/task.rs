@@ -1,20 +1,20 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
-use epics_rs::ad_core::ndarray::NDArray;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::decode::decode_image;
-use crate::fetch::fetch_bytes;
+use crate::decode::{DecodeError, decode_image};
+use crate::fetch::{FetchError, fetch_bytes};
 use crate::params::URLParams;
 use crate::types::AcqCommand;
 
@@ -26,22 +26,20 @@ pub(crate) struct AcquisitionContext {
     pub acq_rx: rt::CommandReceiver<AcqCommand>,
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
     pub ad: ADBaseParams,
     pub url: URLParams,
 }
 
 impl AcquisitionContext {
-    async fn end_acquisition(&self, wait_for_plugins: bool) {
-        if wait_for_plugins {
-            self.queued.wait_until_zero(Duration::from_secs(5));
-        }
+    /// ADAcquireBusy follows the ADAcquire store (asynNDArrayDriver.cpp:636-663),
+    /// WaitForPlugins included.
+    async fn end_acquisition(&self) {
         let _ = self
             .handle
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::new(self.ad.acquire_busy, 0, ParamValue::Int32(0)),
                     ParamSetValue::new(self.ad.status, 0, ParamValue::Int32(ADStatus::Idle as i32)),
                     ParamSetValue::new(self.ad.acquire, 0, ParamValue::Int32(0)),
                 ],
@@ -108,22 +106,41 @@ async fn acquire_one_image(
 ) -> Result<(), ()> {
     let url_bytes = ctx
         .handle
-        .read_octet(ctx.url.url_name, 0, MAX_FILENAME_LEN)
+        .get_string_param(ctx.url.url_name, 0, MAX_FILENAME_LEN)
         .await
         .unwrap_or_default();
     let url_string = String::from_utf8_lossy(&url_bytes).into_owned();
 
+    // readImage's own lines (URLDriver.cpp:105,126,152); an empty URL returns
+    // asynError without one.
     let decoded = fetch_bytes(&url_string)
-        .map_err(|e| log::error!("ad-url: fetch {url_string}: {e}"))
-        .ok()
+        .map_err(|e| match e {
+            FetchError::EmptyUrl => None,
+            e => Some(format!("error reading URL={e}")),
+        })
         .and_then(|bytes| {
-            decode_image(&bytes)
-                .map_err(|e| log::error!("ad-url: decode {url_string}: {e}"))
-                .ok()
+            decode_image(&bytes).map_err(|e| {
+                Some(match e {
+                    DecodeError::Unsupported(t) => format!("unknown ImageType={t}"),
+                    e => format!("error reading URL={e}"),
+                })
+            })
         });
 
-    let Some(decoded) = decoded else {
-        return Err(());
+    let mut decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(message) => {
+            if let Some(message) = message {
+                ctx.handle.trace().output_device(
+                    ctx.handle.port_name(),
+                    Some(0),
+                    0,
+                    TraceMask::ERROR,
+                    &format!("URLDriver:readImage: {message}\n"),
+                );
+            }
+            return Err(());
+        }
     };
 
     // C++ readImage(): ADSizeX/NDArraySizeX use dims[ndims-2] (X), ADSizeY/
@@ -132,9 +149,9 @@ async fn acquire_one_image(
     let ndims = decoded.dims.len();
     let ncols = decoded.dims[ndims - 2].size as i32;
     let nrows = decoded.dims[ndims - 1].size as i32;
-    let total_bytes: i64 = decoded.data.total_bytes() as i64;
+    let total_bytes: i64 = decoded.total_bytes() as i64;
     let array_size = total_bytes.min(i32::MAX as i64) as i32;
-    let data_type = decoded.data.data_type();
+    let data_type = decoded.data_type;
 
     let array_callbacks = ctx
         .handle
@@ -152,14 +169,32 @@ async fn acquire_one_image(
         NDAttrValue::Int32(color_mode as i32),
     ));
 
-    let end_ts = EpicsTimestamp::now();
-    let mut array = NDArray::with_data(decoded.dims, decoded.data);
-    array.unique_id = image_counter;
-    // Field by field, not `update_time_stamps`: the epicsTS is the read's end
-    // and `time_stamp` the read's start, as C left them.
-    array.timestamp = end_ts;
-    array.time_stamp = start_time.as_f64();
-    array.attributes = attributes;
+    // C updateTimeStamp (URLDriver.cpp:244): the port's stamp, moved now.
+    let end_ts: EpicsTimestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| std::time::SystemTime::now())
+        .into();
+    // C releases pArrays[0] and allocates into it under the driver lock
+    // (URLDriver.cpp:132-133), where it stays through the callbacks. C
+    // dereferences a refused alloc unchecked; here the frame is dropped after
+    // the pool's limit line.
+    let Some(array) = ctx.pool.owner().replace_array(0, || {
+        let mut array = ctx
+            .pool
+            .alloc(std::mem::take(&mut decoded.dims), decoded.data_type)
+            .ok()?;
+        let mut frame = array.fill();
+        decoded.write_into(frame.data_mut().view_mut());
+        frame.set_unique_id(image_counter);
+        frame.set_timestamp(end_ts);
+        frame.set_time_stamp(start_time.as_f64());
+        *frame.attributes_mut() = attributes;
+        Some(array)
+    }) else {
+        return Ok(());
+    };
 
     let _ = ctx
         .handle
@@ -196,7 +231,7 @@ async fn acquire_one_image(
         .await;
 
     if array_callbacks {
-        ctx.publisher.publish(Arc::new(array)).await;
+        ctx.publisher.publish(array).await;
     }
 
     Ok(())
@@ -227,19 +262,13 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .handle
             .set_params_and_notify(
                 0,
-                vec![
-                    ParamSetValue::new(ctx.ad.num_images_counter, 0, ParamValue::Int32(0)),
-                    ParamSetValue::new(ctx.ad.acquire_busy, 0, ParamValue::Int32(1)),
-                ],
+                vec![ParamSetValue::new(
+                    ctx.ad.num_images_counter,
+                    0,
+                    ParamValue::Int32(0),
+                )],
             )
             .await;
-
-        let mut image_counter = ctx
-            .handle
-            .read_int32(ctx.ad.base.array_counter, 0)
-            .await
-            .unwrap_or(0);
-        let mut num_images_counter = 0i32;
 
         loop {
             let start_time = EpicsTimestamp::now();
@@ -264,18 +293,23 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             set_shutter_via_handle(&ctx.handle, &ctx.ad, true).await;
             let _ = ctx.handle.call_param_callbacks(0).await;
 
-            image_counter += 1;
-            num_images_counter += 1;
+            // C re-reads both counters every frame (URLDriver.cpp:231-233), so a
+            // write to either during acquisition is where the next frame counts
+            // from. acquire_one_image stores them only on success, as C does.
+            let image_counter = ctx
+                .handle
+                .read_int32(ctx.ad.base.array_counter, 0)
+                .await
+                .unwrap_or(0)
+                + 1;
+            let num_images_counter = ctx
+                .handle
+                .read_int32(ctx.ad.num_images_counter, 0)
+                .await
+                .unwrap_or(0)
+                + 1;
             let image_result =
                 acquire_one_image(&ctx, start_time, image_counter, num_images_counter).await;
-
-            if image_result.is_err() {
-                // Failed fetch/decode: this iteration's counters didn't advance
-                // (matches C++, which only increments NDArrayCounter/
-                // ADNumImagesCounter inside the `imageStatus == asynSuccess` branch).
-                image_counter -= 1;
-                num_images_counter -= 1;
-            }
 
             set_shutter_via_handle(&ctx.handle, &ctx.ad, false).await;
             let _ = ctx.handle.call_param_callbacks(0).await;
@@ -343,12 +377,6 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             }
         }
 
-        let wait_for_plugins = ctx
-            .handle
-            .read_int32(ctx.ad.base.wait_for_plugins, 0)
-            .await
-            .unwrap_or(0)
-            != 0;
-        ctx.end_acquisition(wait_for_plugins).await;
+        ctx.end_acquisition().await;
     }
 }

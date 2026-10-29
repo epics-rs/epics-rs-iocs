@@ -73,6 +73,18 @@ pub enum ConnectionStatus {
     Up,
 }
 
+impl ConnectionStatus {
+    /// `connectionStatusString` (`devOpcua.h:147`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnectionStatus::Down => "down",
+            ConnectionStatus::InitialRead => "initialRead",
+            ConnectionStatus::InitialWrite => "initialWrite",
+            ConnectionStatus::Up => "up",
+        }
+    }
+}
+
 /// One queued update (`Update<UA_Variant, UA_StatusCode>`, `Update.h:45`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Update {

@@ -1,11 +1,40 @@
 use std::ffi::{CStr, c_char};
+use std::fmt;
 
 use uldaq_sys::*;
 
-use crate::error::{self, Result};
+use crate::error::{self, MeasCompError, Result};
 
 /// Maximum number of devices returned by discovery.
 const MAX_DEVICES: usize = 64;
+
+/// Why [`DaqDevice::connect`] failed: a uldaq call, or no device to open.
+#[derive(Debug)]
+pub enum ConnectError {
+    Ul(MeasCompError),
+    NoDevices,
+    NotFound(String),
+    NullHandle,
+}
+
+impl From<MeasCompError> for ConnectError {
+    fn from(e: MeasCompError) -> Self {
+        Self::Ul(e)
+    }
+}
+
+impl fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ul(e) => e.fmt(f),
+            Self::NoDevices => f.write_str("no MCC DAQ devices found"),
+            Self::NotFound(id) => write!(f, "device with uniqueID '{id}' not found"),
+            Self::NullHandle => f.write_str("ulCreateDaqDevice returned null handle"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {}
 
 /// RAII wrapper around a connected MCC DAQ device.
 ///
@@ -17,7 +46,7 @@ pub struct DaqDevice {
 
 impl DaqDevice {
     /// Discover all MCC DAQ devices and connect to the one matching `unique_id`.
-    pub fn connect(unique_id: &str) -> Result<Self> {
+    pub fn connect(unique_id: &str) -> std::result::Result<Self, ConnectError> {
         let mut descriptors = vec![DaqDeviceDescriptor::default(); MAX_DEVICES];
         let mut num_devs = MAX_DEVICES as u32;
 
@@ -26,30 +55,31 @@ impl DaqDevice {
         })?;
 
         if num_devs == 0 {
-            return Err(error::MeasCompError {
-                code: ERR_DEV_NOT_FOUND,
-                message: "no MCC DAQ devices found".into(),
-            });
+            return Err(ConnectError::NoDevices);
         }
 
         let descriptor = find_descriptor(&descriptors[..num_devs as usize], unique_id)
             .cloned()
-            .ok_or_else(|| error::MeasCompError {
-                code: ERR_DEV_NOT_FOUND,
-                message: format!("device with uniqueID '{unique_id}' not found"),
-            })?;
+            .ok_or_else(|| ConnectError::NotFound(unique_id.to_owned()))?;
 
         let handle = unsafe { ulCreateDaqDevice(descriptor.clone()) };
         if handle == 0 {
-            return Err(error::MeasCompError {
-                code: ERR_DEV_NOT_FOUND,
-                message: "ulCreateDaqDevice returned null handle".into(),
-            });
+            return Err(ConnectError::NullHandle);
         }
 
         error::check(unsafe { ulConnectDaqDevice(handle) })?;
 
         Ok(Self { handle, descriptor })
+    }
+
+    /// A device on uldaq's null handle, for tests that build a driver with
+    /// no hardware: every call on it fails with ERR_BAD_DEV_HANDLE.
+    #[doc(hidden)]
+    pub fn unconnected() -> Self {
+        Self {
+            handle: 0,
+            descriptor: DaqDeviceDescriptor::default(),
+        }
     }
 
     /// Raw device handle for direct FFI calls.
@@ -110,11 +140,9 @@ impl Drop for DaqDevice {
     }
 }
 
-/// The inventory entry whose uniqueID is exactly `unique_id`.
-///
-/// C `measCompDiscover.cpp:169-182` accepts only an exact match, so an empty
-/// ID matches no board: with a USB-CTR08 and a USB-2408 on the same bus, an
-/// IOC must never bind to whichever one enumerates first.
+/// The inventory entry whose uniqueID is exactly `unique_id`. C
+/// `measCompCreateDevice` (measCompDiscover.cpp:171-181) accepts only an
+/// exact match, so an empty ID matches no board.
 fn find_descriptor<'a>(
     descriptors: &'a [DaqDeviceDescriptor],
     unique_id: &str,

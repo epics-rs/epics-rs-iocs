@@ -7,9 +7,11 @@ publish = false
 [dependencies]
 uldaq-sys = { path = "../uldaq-sys" }
 meascomp = { path = "../meascomp" }
-mca = { path = "../../mca" }
 epics-rs = { workspace = true, features = ["asyn", "scaler"] }
+epics-libcom-rs = { workspace = true }
+epics-seq-rs = { workspace = true, features = ["runtime"] }
 parking_lot = "0.12"
-log = "0.4"
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 anyhow = "1.0"
+
+[build-dependencies]
+epics-seq-rs = { workspace = true, features = ["snc"] }

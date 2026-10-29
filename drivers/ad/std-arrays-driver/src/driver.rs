@@ -9,20 +9,22 @@
 use std::sync::Arc;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
-use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -40,8 +42,6 @@ pub const DRIVER_VERSION: &str = "1.3.0";
 /// the deviation note in the crate docs.
 const PUBLISH_QUEUE: usize = 1024;
 
-const MEGABYTE: f64 = 1_048_576.0;
-
 fn pool_err(e: impl std::fmt::Display) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -50,14 +50,9 @@ fn pool_err(e: impl std::fmt::Display) -> AsynError {
 }
 
 pub struct NdStdArraysDriver {
-    pub port_base: PortDriverBase,
-    pub params: ADDriverParams,
+    pub ad: ADDriverBase,
     pub ndsa: NdsaParams,
-    pool: Arc<NDArrayPool>,
-    queued_counter: Arc<QueuedArrayCounter>,
-    publish_tx: rt::CommandSender<Arc<NDArray>>,
-    /// C `pArrays[0]` — the working buffer that waveform writes append into.
-    current: Option<NDArray>,
+    publish_tx: rt::CommandSender<PublishedArray>,
     /// C `arrayDimensions_` — the requested dimensions, written via the
     /// `NDDimensions` (`ARRAY_DIMENSIONS`) waveform.
     array_dimensions: [usize; ND_ARRAY_MAX_DIMS],
@@ -69,40 +64,29 @@ impl NdStdArraysDriver {
     fn new(
         port_name: &str,
         max_memory: usize,
-        pool: Arc<NDArrayPool>,
-        queued_counter: Arc<QueuedArrayCounter>,
-        publish_tx: rt::CommandSender<Arc<NDArray>>,
+        publish_tx: rt::CommandSender<PublishedArray>,
     ) -> AsynResult<Self> {
         // ASYN_CANBLOCK = 0, ASYN_MULTIDEVICE = 0, maxAddr = 1
         // (NDDriverStdArrays.cpp:47-52).
-        let mut port_base = PortDriverBase::new(
+        let mut ad = ADDriverBase::new(
             port_name,
             1,
+            max_memory,
             PortFlags {
                 can_block: false,
                 multi_device: false,
                 ..Default::default()
             },
-        );
-
-        let params = ADDriverParams::create(&mut port_base)?;
-        let ndsa = NdsaParams::create(&mut port_base)?;
-
-        // asynNDArrayDriver constructor defaults.
-        port_base.set_int32_param(params.base.array_callbacks, 0, 1)?;
-        port_base.set_int32_param(params.base.data_type, 0, NDDataType::UInt8 as u8 as i32)?;
-        port_base.set_int32_param(params.base.color_mode, 0, 0)?; // NDColorMode::Mono
-        port_base.set_int32_param(params.base.array_size_x, 0, 0)?;
-        port_base.set_int32_param(params.base.array_size_y, 0, 0)?;
-        port_base.set_int32_param(params.base.array_size_z, 0, 0)?;
-        port_base.set_int32_param(params.base.array_size, 0, 0)?;
-        port_base.set_int32_param(params.base.array_counter, 0, 0)?;
-        port_base.set_float64_param(
-            params.base.pool_max_memory,
-            0,
-            max_memory as f64 / MEGABYTE,
+            InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::INT16_ARRAY
+                | InterfaceMask::INT8_ARRAY,
+            InterfaceMask::NONE,
         )?;
-        port_base.set_int32_param(params.status, 0, ADStatus::Idle as i32)?;
+        let port_base = &mut ad.port_base;
+        let params = ad.params;
+        let ndsa = NdsaParams::create(port_base)?;
 
         // NDDriverStdArrays constructor (NDDriverStdArrays.cpp:70-86).
         port_base.set_string_param(params.base.manufacturer, 0, "NDDriverStdArrays")?;
@@ -122,57 +106,21 @@ impl NdStdArraysDriver {
         port_base.set_int32_param(ndsa.array_complete, 0, 0)?;
 
         Ok(Self {
-            port_base,
-            params,
+            ad,
             ndsa,
-            pool,
-            queued_counter,
             publish_tx,
-            current: None,
             array_dimensions: [0; ND_ARRAY_MAX_DIMS],
             dim_prod: [0; ND_ARRAY_MAX_DIMS],
         })
     }
 
-    fn get_i32(&self, reason: usize, default: i32) -> i32 {
-        self.port_base.get_int32_param(reason, 0).unwrap_or(default)
-    }
-
-    /// `asynNDArrayDriver::setIntegerParam` (asynNDArrayDriver.cpp:636-663):
-    /// writes to `ADAcquire`/`NDNumQueuedArrays` are intercepted to drive
-    /// `ADAcquireBusy`.
-    fn set_integer_param(&mut self, addr: i32, reason: usize, value: i32) -> AsynResult<()> {
-        if reason == self.params.acquire {
-            if value == 0 {
-                let wait_for_plugins = self
-                    .port_base
-                    .get_int32_param(self.params.wait_for_plugins, addr)
-                    .unwrap_or(0)
-                    != 0;
-                if !wait_for_plugins || self.queued_counter.get() == 0 {
-                    self.port_base
-                        .set_int32_param(self.params.acquire_busy, addr, 0)?;
-                }
-            } else {
-                self.port_base
-                    .set_int32_param(self.params.acquire_busy, addr, 1)?;
-            }
-        } else if reason == self.params.base.num_queued_arrays
-            && value == 0
-            && self
-                .port_base
-                .get_int32_param(self.params.acquire, addr)
-                .unwrap_or(0)
-                == 0
-        {
-            self.port_base
-                .set_int32_param(self.params.acquire_busy, addr, 0)?;
-        }
-        self.port_base.params.set_int32(reason, addr, value)
+    /// C reads these ignoring the status, so an unset param is 0.
+    fn get_i32(&self, reason: usize) -> i32 {
+        self.ad.port_base.get_int32_param(reason, 0).unwrap_or(0)
     }
 
     /// The allocation half of `writeXXXArray` (NDDriverStdArrays.cpp:153-218):
-    /// release the previous array, allocate a fresh one sized by
+    /// release `pArrays[0]`, allocate its successor there sized by
     /// `arrayDimensions_`, publish its size parameters, recompute `dimProd_`,
     /// and fill it when required.
     fn allocate_array(
@@ -183,58 +131,89 @@ impl NdStdArraysDriver {
         append_mode: i32,
         n_elements: usize,
     ) -> AsynResult<()> {
-        self.port_base.set_int32_param(self.ndsa.new_array, 0, 0)?;
+        self.ad
+            .port_base
+            .set_int32_param(self.ndsa.new_array, 0, 0)?;
 
         let ndims = num_dimensions.min(ND_ARRAY_MAX_DIMS);
         let dims: Vec<NDDimension> = (0..ndims)
             .map(|i| NDDimension::new(self.array_dimensions[i]))
             .collect();
-        let mut array = self.pool.alloc(dims, data_type).map_err(pool_err)?;
-        // pArray->pAttributeList->add("ColorMode", ...) (NDDriverStdArrays.cpp:167).
-        array.attributes.add(NDAttribute::new_static(
-            "ColorMode",
-            "Color Mode",
-            NDAttrSource::Driver,
-            NDAttrValue::Int32(color_mode),
-        ));
-        let info = array.info();
-        self.port_base
-            .set_int32_param(self.params.base.array_size, 0, info.total_bytes as i32)?;
-        self.port_base
+        let fill = self
+            .ad
+            .port_base
+            .get_float64_param(self.ndsa.fill_value, 0)
+            .unwrap_or(0.0);
+        let pool = &self.ad.pool;
+        let mut made = None;
+        pool.owner().replace_persistent(0, || {
+            let mut array = match pool.alloc(dims, data_type) {
+                Ok(array) => array,
+                Err(e) => {
+                    made = Some(Err(e));
+                    return None;
+                }
+            };
+            // pArray->pAttributeList->add("ColorMode", ...) (NDDriverStdArrays.cpp:167).
+            array.fill().attributes_mut().add(NDAttribute::new_static(
+                "ColorMode",
+                "Color Mode",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(color_mode),
+            ));
+            let info = array.info();
+            // NDDriverStdArrays.cpp:184-214.
+            if append_mode == 1 || (append_mode == 0 && info.num_elements < n_elements) {
+                convert::fill_buffer(array.fill().data_mut().view_mut(), fill);
+            }
+            made = Some(Ok(info));
+            Some(array)
+        });
+        let info = match made.expect("replace_persistent runs make") {
+            Ok(info) => info,
+            Err(e) => {
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!("NDDriverStdArrays:writeXXXArray: error allocating raw buffer\n"),
+                );
+                return Err(pool_err(e));
+            }
+        };
+        self.ad.port_base.set_int32_param(
+            self.ad.params.base.array_size,
+            0,
+            info.total_bytes as i32,
+        )?;
+        self.ad
+            .port_base
             .set_int32_param(self.ndsa.num_elements, 0, info.num_elements as i32)?;
-        self.port_base.set_int32_param(
-            self.params.max_size_x,
+        self.ad.port_base.set_int32_param(
+            self.ad.params.max_size_x,
             0,
             self.array_dimensions[0] as i32,
         )?;
-        self.port_base.set_int32_param(
-            self.params.max_size_y,
+        self.ad.port_base.set_int32_param(
+            self.ad.params.max_size_y,
             0,
             self.array_dimensions[1] as i32,
         )?;
-        self.port_base
-            .set_int32_param(self.params.base.array_size_x, 0, 0)?;
-        self.port_base
-            .set_int32_param(self.params.base.array_size_y, 0, 0)?;
-        self.port_base
-            .set_int32_param(self.params.base.array_size_z, 0, 0)?;
+        self.ad
+            .port_base
+            .set_int32_param(self.ad.params.base.array_size_x, 0, 0)?;
+        self.ad
+            .port_base
+            .set_int32_param(self.ad.params.base.array_size_y, 0, 0)?;
+        self.ad
+            .port_base
+            .set_int32_param(self.ad.params.base.array_size_z, 0, 0)?;
 
         self.dim_prod = convert::dim_prod(&self.array_dimensions, num_dimensions);
 
-        // NDDriverStdArrays.cpp:184-214.
-        if append_mode == 1 || (append_mode == 0 && info.num_elements < n_elements) {
-            let fill = self
-                .port_base
-                .get_float64_param(self.ndsa.fill_value, 0)
-                .unwrap_or(0.0);
-            convert::fill_buffer(&mut array.data, fill);
-        }
         if append_mode == 0 {
-            self.port_base
+            self.ad
+                .port_base
                 .set_int32_param(self.ndsa.next_element, 0, 0)?;
         }
-
-        self.current = Some(array);
         Ok(())
     }
 
@@ -245,12 +224,11 @@ impl NdStdArraysDriver {
 
         // NDDriverStdArrays.cpp:141-142: silently ignore writes when not
         // acquiring.
-        if self.get_i32(self.params.acquire, 0) == 0 {
+        if self.get_i32(self.ad.params.acquire) == 0 {
             return Ok(());
         }
 
-        let data_type_code =
-            self.get_i32(self.params.base.data_type, NDDataType::UInt8 as u8 as i32);
+        let data_type_code = self.get_i32(self.ad.params.base.data_type);
         let data_type = match u8::try_from(data_type_code)
             .ok()
             .and_then(NDDataType::from_ordinal)
@@ -260,16 +238,15 @@ impl NdStdArraysDriver {
                 // C's `switch (dataType)` has no default; there is no Rust
                 // equivalent of allocating an array of an unknown type, so the
                 // write is dropped.
-                log::error!("NDDriverStdArrays: invalid NDDataType {data_type_code}");
                 return Ok(());
             }
         };
-        let color_mode = self.get_i32(self.params.base.color_mode, 0);
-        let callback_mode = self.get_i32(self.ndsa.callback_mode, 0);
-        let append_mode = self.get_i32(self.ndsa.append_mode, 0);
-        let num_dimensions = self.get_i32(self.params.base.n_dimensions, 0).max(0) as usize;
-        let new_array = self.get_i32(self.ndsa.new_array, 0);
-        let array_callbacks = self.get_i32(self.params.base.array_callbacks, 0);
+        let color_mode = self.get_i32(self.ad.params.base.color_mode);
+        let callback_mode = self.get_i32(self.ndsa.callback_mode);
+        let append_mode = self.get_i32(self.ndsa.append_mode);
+        let num_dimensions = self.get_i32(self.ad.params.base.n_dimensions).max(0) as usize;
+        let new_array = self.get_i32(self.ndsa.new_array);
+        let array_callbacks = self.get_i32(self.ad.params.base.array_callbacks);
 
         if append_mode == 0 || (append_mode == 1 && new_array != 0) {
             self.allocate_array(
@@ -281,37 +258,48 @@ impl NdStdArraysDriver {
             )?;
         }
 
-        // arrayInfo_.nElements is the current buffer's element count.
-        let total = self.current.as_ref().map(|a| a.data.len()).unwrap_or(0);
-        let next_element = self.get_i32(self.ndsa.next_element, 0).max(0) as usize;
-
-        // NDDriverStdArrays.cpp:221-223: clamp the write to the buffer tail.
-        let mut n = n_elements;
-        if next_element + n >= total {
-            n = total.saturating_sub(next_element);
-        }
-        let stride = self.get_i32(self.ndsa.stride, 1).max(0) as usize;
-
-        if let Some(array) = self.current.as_mut() {
-            convert::copy_buffer(&mut array.data, next_element, stride, &input[..n]);
-        }
+        let next_element = self.get_i32(self.ndsa.next_element).max(0) as usize;
+        let stride = self.get_i32(self.ndsa.stride).max(0) as usize;
+        // C writes into pArrays[0] in place (NDDriverStdArrays.cpp:220-250).
+        let n = self
+            .ad
+            .pool
+            .owner()
+            .persistent(0, |array| {
+                // arrayInfo_.nElements is the buffer's element count;
+                // NDDriverStdArrays.cpp:221-223 clamp the write to its tail.
+                let total = array.data().len();
+                let mut n = n_elements;
+                if next_element + n >= total {
+                    n = total.saturating_sub(next_element);
+                }
+                convert::copy_buffer(
+                    array.refill().data_mut().view_mut(),
+                    next_element,
+                    stride,
+                    &input[..n],
+                );
+                n
+            })
+            .unwrap_or(0);
 
         let new_next = next_element + n;
-        self.port_base
+        self.ad
+            .port_base
             .set_int32_param(self.ndsa.next_element, 0, new_next as i32)?;
 
-        // NDDriverStdArrays.cpp:256-266: post the current write index back onto
-        // the NDDimensions (ARRAY_DIMENSIONS) parameter.
+        // NDDriverStdArrays.cpp:256-266: post the current write index on
+        // NDDimensions (ARRAY_DIMENSIONS), storing nothing.
         let current_index = convert::current_index(
             new_next as i32,
             num_dimensions,
             &self.dim_prod,
             &self.array_dimensions,
         );
-        self.port_base.params.set_int32_array(
-            self.params.base.array_dimensions,
+        self.ad.port_base.do_callbacks_array(
+            self.ad.params.base.array_dimensions,
             0,
-            current_index.to_vec(),
+            ParamValue::Int32Array(current_index.into()),
         )?;
 
         if append_mode == 0 {
@@ -324,20 +312,23 @@ impl NdStdArraysDriver {
             self.do_callbacks()?;
         }
 
-        self.port_base.call_param_callbacks(0)?;
+        self.ad.port_base.call_param_callbacks(0)?;
         Ok(())
     }
 
     /// `setArrayComplete` (NDDriverStdArrays.cpp:281-308).
     fn set_array_complete(&mut self) -> AsynResult<()> {
-        let num_images = self.get_i32(self.params.num_images, 0);
-        let num_images_counter = self.get_i32(self.params.num_images_counter, 0) + 1;
-        let callback_mode = self.get_i32(self.ndsa.callback_mode, 0);
-        let image_mode = self.get_i32(self.params.image_mode, 0);
-        let array_callbacks = self.get_i32(self.params.base.array_callbacks, 0);
+        let num_images = self.get_i32(self.ad.params.num_images);
+        let num_images_counter = self.get_i32(self.ad.params.num_images_counter) + 1;
+        let callback_mode = self.get_i32(self.ndsa.callback_mode);
+        let image_mode = self.get_i32(self.ad.params.image_mode);
+        let array_callbacks = self.get_i32(self.ad.params.base.array_callbacks);
 
-        self.port_base
-            .set_int32_param(self.params.num_images_counter, 0, num_images_counter)?;
+        self.ad.port_base.set_int32_param(
+            self.ad.params.num_images_counter,
+            0,
+            num_images_counter,
+        )?;
 
         if array_callbacks != 0 && callback_mode != CallbackMode::OnCommand as i32 {
             self.do_callbacks()?;
@@ -346,11 +337,12 @@ impl NdStdArraysDriver {
         if image_mode == ImageMode::Single as i32
             || (image_mode == ImageMode::Multiple as i32 && num_images_counter >= num_images)
         {
-            // setIntegerParam(ADAcquire, 0) routes through the intercept so
-            // ADAcquireBusy is cleared.
-            self.set_integer_param(0, self.params.acquire, 0)?;
-            self.port_base
-                .set_int32_param(self.params.status, 0, ADStatus::Idle as i32)?;
+            self.ad
+                .port_base
+                .set_int32_param(self.ad.params.acquire, 0, 0)?;
+            self.ad
+                .port_base
+                .set_int32_param(self.ad.params.status, 0, ADStatus::Idle as i32)?;
         }
         Ok(())
     }
@@ -358,74 +350,32 @@ impl NdStdArraysDriver {
     /// `doCallbacks` (NDDriverStdArrays.cpp:310-329): bump `NDArrayCounter`,
     /// stamp identity and timestamps, and hand the array to the publisher task.
     fn do_callbacks(&mut self) -> AsynResult<()> {
-        if self.current.is_none() {
+        let owner = self.ad.pool.owner().clone();
+        if owner.persistent(0, |_| ()).is_none() {
             return Ok(());
         }
-        let counter = self.get_i32(self.params.base.array_counter, 0) + 1;
-        self.port_base
-            .set_int32_param(self.params.base.array_counter, 0, counter)?;
+        let counter = self.get_i32(self.ad.params.base.array_counter) + 1;
+        self.ad
+            .port_base
+            .set_int32_param(self.ad.params.base.array_counter, 0, counter)?;
+        let timestamp = self.ad.port_base.update_time_stamp().into();
+        let published = owner.persistent(0, |current| {
+            let mut array = current.refill();
+            array.set_unique_id(counter);
+            array.set_time_stamp(EpicsTimestamp::now().as_f64());
+            array.set_timestamp(timestamp);
+            // DEVIATION: C calls getAttributes(pArray->pAttributeList) here;
+            // the NDAttributesFile machinery is not wired for this driver, so
+            // only the ColorMode attribute added at allocation is attached.
 
-        // DEVIATION: C stamps `pArrays[0]` itself and hands the live pointer to
-        // the plugin, so append-mode re-publishes share one growing buffer.
-        // This port snapshots the buffer per publish, giving each queued frame
-        // an independent copy (identical observable data, no shared-buffer race).
-        let mut snapshot = self.current.as_ref().unwrap().clone();
-        snapshot.unique_id = counter;
-        let now = EpicsTimestamp::now();
-        snapshot.time_stamp = now.sec as f64 + now.nsec as f64 / 1.0e9;
-        snapshot.timestamp = now;
-        // DEVIATION: C calls getAttributes(pArray->pAttributeList) here; the
-        // NDAttributesFile machinery is not wired for this driver, so only the
-        // ColorMode attribute added at allocation is attached.
-
-        if self.publish_tx.try_send(Arc::new(snapshot)).is_err() {
-            log::warn!("NDDriverStdArrays: publish queue full or closed; frame dropped");
+            // C hands `pArrays[0]` itself to the plugins; the publish is a
+            // copy that shares its one pool charge, so later writes never
+            // reach a queued frame.
+            current.published()
+        });
+        if let Some(published) = published {
+            let _ = self.publish_tx.try_send(published);
         }
-        Ok(())
-    }
-
-    /// The pool branch of `asynNDArrayDriver::writeInt32`
-    /// (asynNDArrayDriver.cpp:684-694), reproduced over the public
-    /// `NDArrayPool` API. `pArrays[0]` is the pre-allocation template.
-    fn write_int32_pool(&mut self, reason: usize) -> AsynResult<bool> {
-        if reason == self.params.base.pool_empty_free_list {
-            self.pool.empty_free_list();
-            self.refresh_pool_stats()?;
-            Ok(true)
-        } else if reason == self.params.base.pool_poll_stats {
-            self.refresh_pool_stats()?;
-            Ok(true)
-        } else if reason == self.params.base.pool_pre_alloc {
-            if let Some(template) = self.current.clone() {
-                let count = self
-                    .get_i32(self.params.base.pool_num_pre_alloc_buffers, 0)
-                    .max(0) as usize;
-                self.pool
-                    .pre_allocate_buffers(&template, count)
-                    .map_err(pool_err)?;
-                self.refresh_pool_stats()?;
-            }
-            self.port_base
-                .set_int32_param(self.params.base.pool_pre_alloc, 0, 0)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn refresh_pool_stats(&mut self) -> AsynResult<()> {
-        let max_memory = self.pool.max_memory() as f64 / MEGABYTE;
-        let used = self.pool.allocated_bytes() as f64 / MEGABYTE;
-        let alloc = self.pool.num_alloc_buffers() as i32;
-        let free = self.pool.num_free_buffers() as i32;
-        self.port_base
-            .set_float64_param(self.params.base.pool_max_memory, 0, max_memory)?;
-        self.port_base
-            .set_float64_param(self.params.base.pool_used_memory, 0, used)?;
-        self.port_base
-            .set_int32_param(self.params.base.pool_alloc_buffers, 0, alloc)?;
-        self.port_base
-            .set_int32_param(self.params.base.pool_free_buffers, 0, free)?;
         Ok(())
     }
 
@@ -434,51 +384,73 @@ impl NdStdArraysDriver {
     }
 }
 
+impl ADDriver for NdStdArraysDriver {
+    fn ad_base(&self) -> &ADDriverBase {
+        &self.ad
+    }
+
+    fn ad_base_mut(&mut self) -> &mut ADDriverBase {
+        &mut self.ad
+    }
+}
+
 impl PortDriver for NdStdArraysDriver {
     fn base(&self) -> &PortDriverBase {
-        &self.port_base
+        &self.ad.port_base
     }
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
-        &mut self.port_base
+        &mut self.ad.port_base
     }
 
     /// `NDDriverStdArrays::writeInt32` (NDDriverStdArrays.cpp:336-384).
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
 
-        // setIntegerParam(function, value) (NDDriverStdArrays.cpp:346) — the
-        // ADAcquire/NDNumQueuedArrays intercept lives here.
-        self.set_integer_param(addr, reason, value)?;
+        // setIntegerParam(function, value) (NDDriverStdArrays.cpp:346): list
+        // 0 whatever the address; the ADAcquire/NDNumQueuedArrays intercept
+        // lives here.
+        let _ = self.ad.port_base.set_int32_param(reason, 0, value);
 
-        if reason == self.params.acquire {
+        // C overwrites every status here with callParamCallbacks'
+        // (NDDriverStdArrays.cpp:373), so none of these fail the write.
+        if reason == self.ad.params.acquire {
             if value == 1 {
-                self.port_base
-                    .set_int32_param(self.params.num_images_counter, 0, 0)?;
+                let _ = self
+                    .ad
+                    .port_base
+                    .set_int32_param(self.ad.params.num_images_counter, 0, 0);
             }
         } else if reason == self.ndsa.do_callbacks {
-            self.do_callbacks()?;
+            let _ = self.do_callbacks();
         } else if reason == self.ndsa.new_array {
-            self.port_base
-                .set_int32_param(self.ndsa.next_element, 0, 0)?;
+            let _ = self
+                .ad
+                .port_base
+                .set_int32_param(self.ndsa.next_element, 0, 0);
         } else if reason == self.ndsa.array_complete {
-            if self.get_i32(self.ndsa.append_mode, 0) != 0 {
-                self.set_array_complete()?;
+            if self.get_i32(self.ndsa.append_mode) != 0 {
+                let _ = self.set_array_complete();
             }
         } else if self.ndsa.belongs_to_base(reason) {
-            // ADDriver::writeInt32 — only the pool operations act.
-            self.write_int32_pool(reason)?;
+            let _ = ADDriver::ad_write_int32(self, user, value);
         }
 
-        self.port_base.call_param_callbacks(addr)?;
+        // A failure here reaches C's errorMessage only, never the console.
+        self.ad.port_base.call_param_callbacks(0)?;
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("NDDriverStdArrays:writeInt32: function={reason}, value={value}\n"),
+        );
         Ok(())
     }
 
     /// `writeInt32Array` (NDDriverStdArrays.cpp:396-411): dispatches between the
     /// `NDDimensions` dimension write and `NDSA_ArrayData_` array data.
     fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
-        if user.reason == self.params.base.array_dimensions {
+        if user.reason == self.ad.params.base.array_dimensions {
             for (slot, &v) in self
                 .array_dimensions
                 .iter_mut()
@@ -517,9 +489,8 @@ pub struct NdStdArraysRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub params: ADDriverParams,
     pub ndsa: NdsaParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     /// Owns the publisher thread for the lifetime of the IOC.
     pub task_handle: std::thread::JoinHandle<()>,
 }
@@ -529,7 +500,7 @@ impl NdStdArraysRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -538,8 +509,7 @@ impl NdStdArraysRuntime {
         &self.output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.output.lock().add(sender);
     }
 }
@@ -550,25 +520,19 @@ impl NdStdArraysRuntime {
 /// allocate. `ad-core-rs` 0.22.1's `NDArrayPool` is bounded by `maxMemory`
 /// only, so `max_buffers` is accepted for iocsh signature parity and ignored.
 pub fn create_nd_std_arrays(
-    port_name: &str,
+    claim: &PortClaim,
     _max_buffers: i32,
     max_memory: usize,
 ) -> AsynResult<NdStdArraysRuntime> {
-    let pool = NDArrayPool::new(max_memory);
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
-    let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
+    let port_name = claim.name();
+    let (publish_tx, publish_rx) = rt::command_channel::<PublishedArray>(PUBLISH_QUEUE);
 
-    let driver = NdStdArraysDriver::new(
-        port_name,
-        max_memory,
-        pool.clone(),
-        queued_counter.clone(),
-        publish_tx,
-    )?;
-    let params = driver.params;
+    let driver = NdStdArraysDriver::new(port_name, max_memory, publish_tx)?;
+    let pool = driver.ad.pool.clone();
+    let params = driver.ad.params;
     let ndsa = driver.ndsa;
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
 
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let publisher = ArrayPublisher::new(output.clone());
@@ -583,7 +547,6 @@ pub fn create_nd_std_arrays(
         ndsa,
         pool,
         output,
-        queued_counter,
         task_handle,
     })
 }
@@ -591,32 +554,54 @@ pub fn create_nd_std_arrays(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::NDDataBuffer;
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataView};
+
+    /// NDDriverStdArrays.cpp:49: the five array interfaces ride on top of
+    /// ADDriver's, with no callbacks of their own.
+    #[test]
+    fn the_port_has_the_c_array_interfaces() {
+        let f = Fixture::new();
+        let port = &f.det.ad.port_base;
+        assert!(port.interface_mask().contains(
+            InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::INT16_ARRAY
+                | InterfaceMask::INT8_ARRAY
+        ));
+    }
 
     struct Fixture {
         det: NdStdArraysDriver,
-        publish_rx: rt::CommandReceiver<Arc<NDArray>>,
+        publish_rx: rt::CommandReceiver<PublishedArray>,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let pool = NDArrayPool::new(0);
-            let queued_counter = Arc::new(QueuedArrayCounter::new());
-            let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
-            let det =
-                NdStdArraysDriver::new("NDSATEST", 0, pool, queued_counter, publish_tx).unwrap();
+            Self::with_max_memory(0)
+        }
+
+        fn with_max_memory(max_memory: usize) -> Self {
+            let (publish_tx, publish_rx) = rt::command_channel::<PublishedArray>(PUBLISH_QUEUE);
+            let mut det = NdStdArraysDriver::new("NDSATEST", max_memory, publish_tx).unwrap();
+            // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+            det.ad
+                .port_base
+                .set_int32_param(det.ad.params.base.array_callbacks, 0, 1)
+                .unwrap();
             Self { det, publish_rx }
         }
 
         fn set_i32(&mut self, reason: usize, value: i32) {
             self.det
+                .ad
                 .port_base
                 .set_int32_param(reason, 0, value)
                 .unwrap();
         }
 
         fn get_i32(&self, reason: usize) -> i32 {
-            self.det.port_base.get_int32_param(reason, 0).unwrap()
+            self.det.ad.port_base.get_int32_param(reason, 0).unwrap()
         }
 
         fn write_i32(&mut self, reason: usize, value: i32) {
@@ -625,7 +610,7 @@ mod tests {
         }
 
         fn write_dims(&mut self, dims: &[i32]) {
-            let user = AsynUser::new(self.det.params.base.array_dimensions);
+            let user = AsynUser::new(self.det.ad.params.base.array_dimensions);
             self.det.write_int32_array(&user, dims).unwrap();
         }
 
@@ -634,7 +619,7 @@ mod tests {
             self.det.write_float64_array(&user, data).unwrap();
         }
 
-        fn drain_publish(&mut self) -> Vec<Arc<NDArray>> {
+        fn drain_publish(&mut self) -> Vec<PublishedArray> {
             let mut out = Vec::new();
             while let Ok(a) = self.publish_rx.try_recv() {
                 out.push(a);
@@ -643,18 +628,135 @@ mod tests {
         }
     }
 
+    /// NDDriverStdArrays.cpp:369 hands ShutterControl to ADDriver::writeInt32,
+    /// which calls setShutter (ADDriver.cpp:97-98).
+    /// NDDriverStdArrays.cpp:346, :373: the set and the callbacks are list 0
+    /// whatever the address, and the set's status is overwritten.
+    #[test]
+    fn a_write_at_another_address_sets_list_zero() {
+        let mut f = Fixture::new();
+        let reason = f.det.ndsa.append_mode;
+        let mut user = AsynUser::new(reason).with_addr(1);
+        f.det.write_int32(&mut user, 1).unwrap();
+        assert_eq!(f.get_i32(reason), 1);
+    }
+
+    #[test]
+    fn shutter_control_reaches_addriver_set_shutter() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        let mut f = Fixture::new();
+        let p = f.det.ad.params;
+        f.set_i32(p.shutter_mode, ShutterMode::EpicsOnly as i32);
+        f.write_i32(p.shutter_control, 1);
+        assert_eq!(f.get_i32(p.shutter_control_epics), 1);
+    }
+
     fn f64s(a: &NDArray) -> Vec<f64> {
-        match &a.data {
-            NDDataBuffer::F64(v) => v.clone(),
+        match a.data().view() {
+            NDDataView::F64(v) => v.to_vec(),
             other => panic!("expected F64, got {:?}", other.data_type()),
         }
     }
 
     #[test]
+    fn a_failed_pool_pre_alloc_does_not_fail_the_write() {
+        let (publish_tx, _publish_rx) = rt::command_channel::<PublishedArray>(PUBLISH_QUEUE);
+        // Room for one 6-element Float64 array and no more.
+        let mut det = NdStdArraysDriver::new("NDSAPREALLOC", 64, publish_tx).unwrap();
+        let p = det.ad.params;
+        let base = &mut det.ad.port_base;
+        base.set_int32_param(p.base.data_type, 0, NDDataType::Float64 as u8 as i32)
+            .unwrap();
+        base.set_int32_param(p.base.n_dimensions, 0, 1).unwrap();
+        base.set_int32_param(det.ndsa.append_mode, 0, 1).unwrap();
+        base.set_int32_param(p.image_mode, 0, ImageMode::Continuous as i32)
+            .unwrap();
+        base.set_int32_param(p.base.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        det.write_int32_array(&AsynUser::new(p.base.array_dimensions), &[6])
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(p.acquire), 1).unwrap();
+        det.write_float64_array(&AsynUser::new(det.ndsa.array_data), &[1.0])
+            .unwrap();
+        assert!(det.ad.pool.owner().array(0).is_some());
+
+        let trace = trace_to_file("NDSAPREALLOC");
+        det.write_int32(&mut AsynUser::new(p.base.pool_pre_alloc), 1)
+            .expect("C returns callParamCallbacks' status");
+        let text = read_trace(&trace);
+        assert!(
+            text.contains("asynNDArrayDriver::preAllocateBuffers: ERROR, "),
+            "{text:?}"
+        );
+    }
+
+    /// C allocates pArrays[0] and writes into it there (NDDriverStdArrays.cpp:
+    /// 153-158, :220-250), so from the first NewArray the port's slot 0 holds
+    /// the written array, and PreAllocBuffers copies it
+    /// (asynNDArrayDriver.cpp:717-726).
+    #[test]
+    fn the_written_array_is_parrays0_and_the_pre_alloc_template() {
+        let mut f = Fixture::new();
+        let p = f.det.ad.params;
+        f.set_i32(p.base.data_type, NDDataType::Float64 as u8 as i32);
+        f.set_i32(p.base.n_dimensions, 1);
+        f.set_i32(f.det.ndsa.append_mode, 1);
+        f.set_i32(p.image_mode, ImageMode::Continuous as i32);
+        f.write_dims(&[4]);
+        f.write_i32(p.acquire, 1);
+        f.write_f64_array(&[1.0, 2.0]);
+        let slot = f.det.ad.pool.owner().array(0).expect("pArrays[0]");
+        assert_eq!(f64s(&slot), [1.0, 2.0, 0.0, 0.0]);
+        drop(slot);
+
+        f.set_i32(p.base.pool_num_pre_alloc_buffers, 2);
+        f.write_i32(p.base.pool_pre_alloc, 1);
+        assert_eq!(f.det.ad.pool.num_free_buffers(), 2);
+    }
+
+    #[test]
+    fn a_pre_alloc_before_any_array_prints_cs_error_line() {
+        let (publish_tx, _publish_rx) = rt::command_channel::<PublishedArray>(PUBLISH_QUEUE);
+        let mut det = NdStdArraysDriver::new("NDSANOTEMPLATE", 0, publish_tx).unwrap();
+        let trace = trace_to_file("NDSANOTEMPLATE");
+        det.write_int32(&mut AsynUser::new(det.ad.params.base.pool_pre_alloc), 1)
+            .unwrap();
+        let text = read_trace(&trace);
+        assert!(
+            text.contains(
+                "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first"
+            ),
+            "{text:?}"
+        );
+    }
+
+    fn trace_to_file(port: &str) -> std::path::PathBuf {
+        use epics_rs::asyn::trace::TraceFile;
+        let path = std::env::temp_dir().join(format!("{port}-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .set_trace_file(
+                Some(port),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+        path
+    }
+
+    fn read_trace(path: &std::path::Path) -> String {
+        let text = std::fs::read_to_string(path).unwrap();
+        let _ = std::fs::remove_file(path);
+        text
+    }
+
+    #[test]
     fn constructor_defaults_match_the_c_constructor() {
         let f = Fixture::new();
-        assert_eq!(f.get_i32(f.det.params.image_mode), ImageMode::Single as i32);
-        assert_eq!(f.get_i32(f.det.params.num_images), 100);
+        assert_eq!(
+            f.get_i32(f.det.ad.params.image_mode),
+            ImageMode::Single as i32
+        );
+        assert_eq!(f.get_i32(f.det.ad.params.num_images), 100);
         assert_eq!(
             f.get_i32(f.det.ndsa.callback_mode),
             CallbackMode::OnUpdate as i32
@@ -665,6 +767,7 @@ mod tests {
         assert_eq!(f.get_i32(f.det.ndsa.array_complete), 0);
         assert_eq!(
             f.det
+                .ad
                 .port_base
                 .get_float64_param(f.det.ndsa.fill_value, 0)
                 .unwrap(),
@@ -672,15 +775,17 @@ mod tests {
         );
         assert_eq!(
             f.det
+                .ad
                 .port_base
-                .get_string_param(f.det.params.base.driver_version, 0)
+                .get_string_param(f.det.ad.params.base.driver_version, 0)
                 .unwrap(),
             b"1.3.0"
         );
         assert_eq!(
             f.det
+                .ad
                 .port_base
-                .get_string_param(f.det.params.base.manufacturer, 0)
+                .get_string_param(f.det.ad.params.base.manufacturer, 0)
                 .unwrap(),
             b"NDDriverStdArrays"
         );
@@ -690,14 +795,14 @@ mod tests {
     fn array_writes_are_ignored_until_acquire_is_set() {
         let mut f = Fixture::new();
         f.set_i32(
-            f.det.params.base.data_type,
+            f.det.ad.params.base.data_type,
             NDDataType::Float64 as u8 as i32,
         );
-        f.set_i32(f.det.params.base.n_dimensions, 1);
+        f.set_i32(f.det.ad.params.base.n_dimensions, 1);
         f.write_dims(&[4]);
         // Not acquiring: the write is a no-op and nothing is published.
         f.write_f64_array(&[1.0, 2.0, 3.0, 4.0]);
-        assert!(f.det.current.is_none());
+        assert!(f.det.ad.pool.owner().array(0).is_none());
         assert!(f.drain_publish().is_empty());
     }
 
@@ -705,20 +810,21 @@ mod tests {
     fn a_non_append_write_allocates_and_publishes_one_array() {
         let mut f = Fixture::new();
         f.set_i32(
-            f.det.params.base.data_type,
+            f.det.ad.params.base.data_type,
             NDDataType::Float64 as u8 as i32,
         );
-        f.set_i32(f.det.params.base.n_dimensions, 1);
+        f.set_i32(f.det.ad.params.base.n_dimensions, 1);
         f.set_i32(f.det.ndsa.append_mode, 0);
         // A non-zero fill value that must NOT appear: in non-append mode C only
         // fills when the array is smaller than the incoming data
         // (arrayInfo_.nElements < nElements), which is not the case here.
         f.det
+            .ad
             .port_base
             .set_float64_param(f.det.ndsa.fill_value, 0, -1.0)
             .unwrap();
         f.write_dims(&[6]);
-        f.write_i32(f.det.params.acquire, 1);
+        f.write_i32(f.det.ad.params.acquire, 1);
 
         // Only four samples for a six-element array: the array (6) is larger
         // than the data (4), so no fill runs and the tail keeps the pool zero.
@@ -731,30 +837,70 @@ mod tests {
         assert_eq!(arr.dims[0].size, 6);
         assert_eq!(f64s(arr), vec![10.0, 11.0, 12.0, 13.0, 0.0, 0.0]);
         assert_eq!(arr.unique_id, 1, "NDArrayCounter starts at 1");
+        assert!(
+            arr.owner()
+                .is_some_and(|o| Arc::ptr_eq(&o, &f.det.ad.owner)),
+            "the published array is counted on this driver"
+        );
 
         // Single image mode: acquisition self-clears after one complete array.
-        assert_eq!(f.get_i32(f.det.params.acquire), 0);
-        assert_eq!(f.get_i32(f.det.params.status), ADStatus::Idle as i32);
+        assert_eq!(f.get_i32(f.det.ad.params.acquire), 0);
+        assert_eq!(f.get_i32(f.det.ad.params.status), ADStatus::Idle as i32);
+    }
+
+    /// C publishes `pArrays[0]` itself (NDDriverStdArrays.cpp:310-329), so a
+    /// pool holding exactly that one array still delivers every update, and
+    /// a new array reuses its buffer once the driver and plugins let go.
+    #[test]
+    fn a_pool_holding_exactly_the_array_still_publishes() {
+        let mut f = Fixture::with_max_memory(6 * 8);
+        f.set_i32(
+            f.det.ad.params.base.data_type,
+            NDDataType::Float64 as u8 as i32,
+        );
+        f.set_i32(f.det.ad.params.base.n_dimensions, 1);
+        f.set_i32(f.det.ndsa.append_mode, 1);
+        f.set_i32(f.det.ad.params.image_mode, ImageMode::Continuous as i32);
+        f.write_dims(&[6]);
+        f.write_i32(f.det.ad.params.acquire, 1);
+
+        f.write_f64_array(&[1.0, 2.0, 3.0]);
+        f.write_f64_array(&[4.0, 5.0, 6.0]);
+        let published = f.drain_publish();
+        assert_eq!(published.len(), 2, "every update goes out");
+        assert_eq!(f64s(&published[0]), vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0]);
+        assert_eq!(f64s(&published[1]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let pool = f.det.ad.pool.clone();
+        assert_eq!((pool.num_alloc_buffers(), pool.allocated_bytes()), (1, 48));
+
+        drop(published);
+        f.write_i32(f.det.ndsa.new_array, 1);
+        f.write_f64_array(&[7.0]);
+        let published = f.drain_publish();
+        assert_eq!(published.len(), 1, "the new array reuses the one buffer");
+        assert_eq!(f64s(&published[0])[0], 7.0);
+        assert_eq!(pool.num_alloc_buffers(), 1);
     }
 
     #[test]
     fn append_mode_fills_the_buffer_before_the_first_write() {
         let mut f = Fixture::new();
         f.set_i32(
-            f.det.params.base.data_type,
+            f.det.ad.params.base.data_type,
             NDDataType::Float64 as u8 as i32,
         );
-        f.set_i32(f.det.params.base.n_dimensions, 1);
+        f.set_i32(f.det.ad.params.base.n_dimensions, 1);
         f.set_i32(f.det.ndsa.append_mode, 1);
-        f.set_i32(f.det.params.image_mode, ImageMode::Continuous as i32);
+        f.set_i32(f.det.ad.params.image_mode, ImageMode::Continuous as i32);
         // Append mode always fills the freshly allocated buffer, so the tail
         // not yet written carries the fill value.
         f.det
+            .ad
             .port_base
             .set_float64_param(f.det.ndsa.fill_value, 0, -7.0)
             .unwrap();
         f.write_dims(&[6]);
-        f.write_i32(f.det.params.acquire, 1);
+        f.write_i32(f.det.ad.params.acquire, 1);
 
         f.write_f64_array(&[1.0, 2.0, 3.0]);
         let published = f.drain_publish();
@@ -766,14 +912,14 @@ mod tests {
     fn append_mode_accumulates_across_writes_into_one_array() {
         let mut f = Fixture::new();
         f.set_i32(
-            f.det.params.base.data_type,
+            f.det.ad.params.base.data_type,
             NDDataType::Float64 as u8 as i32,
         );
-        f.set_i32(f.det.params.base.n_dimensions, 1);
+        f.set_i32(f.det.ad.params.base.n_dimensions, 1);
         f.set_i32(f.det.ndsa.append_mode, 1);
-        f.set_i32(f.det.params.image_mode, ImageMode::Continuous as i32);
+        f.set_i32(f.det.ad.params.image_mode, ImageMode::Continuous as i32);
         f.write_dims(&[6]);
-        f.write_i32(f.det.params.acquire, 1);
+        f.write_i32(f.det.ad.params.acquire, 1);
 
         // First append allocates (NewArray defaults to 1) and writes 0..3.
         f.write_f64_array(&[1.0, 2.0, 3.0]);
@@ -787,22 +933,22 @@ mod tests {
         assert_eq!(published.len(), 2);
         assert_eq!(f64s(&published[1]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         // Continuous mode never self-clears acquire.
-        assert_eq!(f.get_i32(f.det.params.acquire), 1);
+        assert_eq!(f.get_i32(f.det.ad.params.acquire), 1);
     }
 
     #[test]
     fn on_command_append_publishes_only_on_the_do_callbacks_command() {
         let mut f = Fixture::new();
         f.set_i32(
-            f.det.params.base.data_type,
+            f.det.ad.params.base.data_type,
             NDDataType::Float64 as u8 as i32,
         );
-        f.set_i32(f.det.params.base.n_dimensions, 1);
+        f.set_i32(f.det.ad.params.base.n_dimensions, 1);
         f.set_i32(f.det.ndsa.append_mode, 1);
         f.set_i32(f.det.ndsa.callback_mode, CallbackMode::OnCommand as i32);
-        f.set_i32(f.det.params.image_mode, ImageMode::Continuous as i32);
+        f.set_i32(f.det.ad.params.image_mode, ImageMode::Continuous as i32);
         f.write_dims(&[4]);
-        f.write_i32(f.det.params.acquire, 1);
+        f.write_i32(f.det.ad.params.acquire, 1);
 
         f.write_f64_array(&[1.0, 2.0]);
         f.write_f64_array(&[3.0, 4.0]);
@@ -826,6 +972,50 @@ mod tests {
         assert_eq!(f.get_i32(f.det.ndsa.next_element), 0);
     }
 
+    /// C posts the write index with `doCallbacksInt32Array`
+    /// (NDDriverStdArrays.cpp:264): typed, ahead of the write's
+    /// `callParamCallbacks`, and stored nowhere.
+    #[test]
+    fn the_write_index_posts_typed_ahead_of_the_params_and_is_not_stored() {
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        let mut f = Fixture::new();
+        f.set_i32(
+            f.det.ad.params.base.data_type,
+            NDDataType::Float64 as u8 as i32,
+        );
+        f.set_i32(f.det.ad.params.base.n_dimensions, 1);
+        f.write_dims(&[4]);
+        f.write_i32(f.det.ad.params.acquire, 1);
+        let dims = f.det.ad.params.base.array_dimensions;
+        let next = f.det.ndsa.next_element;
+        let stored = f.det.ad.port_base.params.get_int32_array(dims, 0).ok();
+        f.det.ad.port_base.own_interrupts(InterruptGate::opened());
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let _sub = f
+            .det
+            .ad
+            .port_base
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                if [dims, next].contains(&iv.reason) {
+                    log.lock().push((iv.reason, iv.iface))
+                }
+            })
+            .unwrap();
+        f.write_f64_array(&[1.0, 2.0]);
+        assert_eq!(
+            *seen.lock(),
+            [(dims, Some(InterfaceType::Int32Array)), (next, None)]
+        );
+        assert_eq!(
+            f.det.ad.port_base.params.get_int32_array(dims, 0).ok(),
+            stored
+        );
+    }
+
     #[test]
     fn dimension_writes_are_stored_but_do_not_touch_the_param_cache() {
         let mut f = Fixture::new();
@@ -837,9 +1027,9 @@ mod tests {
     #[test]
     fn starting_acquisition_raises_busy_and_resets_the_image_counter() {
         let mut f = Fixture::new();
-        f.set_i32(f.det.params.num_images_counter, 9);
-        f.write_i32(f.det.params.acquire, 1);
-        assert_eq!(f.get_i32(f.det.params.acquire_busy), 1);
-        assert_eq!(f.get_i32(f.det.params.num_images_counter), 0);
+        f.set_i32(f.det.ad.params.num_images_counter, 9);
+        f.write_i32(f.det.ad.params.acquire, 1);
+        assert_eq!(f.get_i32(f.det.ad.params.acquire_busy), 1);
+        assert_eq!(f.get_i32(f.det.ad.params.num_images_counter), 0);
     }
 }

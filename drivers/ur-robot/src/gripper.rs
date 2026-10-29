@@ -24,7 +24,7 @@
 //!   [`GripperConfig::MIN_POSITION_STOP_ADJUST`].
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use crate::error::{UrError, UrResult};
@@ -270,13 +270,9 @@ impl RobotiqGripper {
     }
 
     pub fn connect(&mut self) -> UrResult<()> {
-        let addr = (self.hostname.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(|e| UrError::Connect(format!("resolve {}: {e}", self.hostname)))?
-            .next()
-            .ok_or_else(|| UrError::Connect(format!("no address for {}", self.hostname)))?;
-        let sock = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|e| UrError::Connect(format!("gripper {addr}: {e}")))?;
+        let sock =
+            crate::net::connect_tcp(&self.hostname, self.port, Some(crate::net::CONNECT_TIMEOUT))
+                .map_err(|_| UrError::Connect("Timeout connecting to gripper device.".into()))?;
         sock.set_nodelay(true).ok();
         sock.set_read_timeout(Some(self.timeout)).ok();
         sock.set_write_timeout(Some(self.timeout)).ok();

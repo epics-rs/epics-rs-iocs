@@ -69,17 +69,16 @@ dbLoadRecords("$(ADD435I)/db/d435i_depth.template", "P=$(PREFIX),R=depth1:,PORT=
 < $(ADD435I)/d435iPCPlugins.cmd
 
 # Autosave: request file lives next to this script, saved state under
-# ./autosave/<prefix>. set_pass1_restoreFile is a no-op until the first save
-# has run, so a fresh checkout starts on the driver defaults.
+# ./autosave/<prefix>. The auto_settings.sav restore commonPlugins.cmd sets
+# up finds nothing until the first save, so a fresh checkout starts on the
+# driver defaults.
 # The save file is per-prefix because the D405 instance shares this request
 # file -- one shared .sav would have the two cameras overwrite each other.
 set_requestfile_path("$(ADD435I)")
+set_requestfile_path("$(ADD435I)/db")
 set_savefile_path("$(ADD435I)/autosave/RS435")
-set_pass1_restoreFile("auto_settings.sav", "P=$(PREFIX)")
 
-# Spelled out so create_monitor_set below runs after record init. epics-rs
-# calls iocInit itself once the script finishes and the command is idempotent,
-# so this is not a second initialisation.
+# Spelled out so create_monitor_set below runs after record init.
 iocInit()
 
 create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
@@ -97,8 +96,6 @@ create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
 # script finishes, so any dbpf written here executes before the restore and
 # processes the default. run-d435i-ioc.sh forces the process once the IOC is up.
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
 # Example interactive commands:
 #   dbl                                  # List all PVs
 #   dbpf RS435:cam1:Acquire 1            # Start acquisition

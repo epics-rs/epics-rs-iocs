@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use asyn_rs::error::{AsynError, AsynResult};
 use asyn_rs::param::{EnumEntry, ParamType};
-use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase};
+use asyn_rs::port::{DrvUserInfo, DrvUserRequest, InterfaceMask, PortDriver, PortDriverBase};
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 
 use ad_core_rs::driver::{ADDriver, ADDriverBase};
+use ad_core_rs::plugin::runtime::ASYN_CANBLOCK;
 
 use crate::feature::{FeatureIndex, GCFeatureType, GenICamFeature, GenICamFeatureSet, GenICamNode};
 
@@ -114,7 +115,15 @@ impl<B: GenICamBackend> ADGenICam<B> {
         max_memory: usize,
         make_backend: impl FnOnce(&mut ADDriverBase, FeatureIndex) -> AsynResult<B>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory)?;
+        // ADGenICam.cpp:43-46.
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_memory,
+            ASYN_CANBLOCK,
+            InterfaceMask::INT64 | InterfaceMask::ENUM,
+            InterfaceMask::INT64 | InterfaceMask::ENUM,
+        )?;
         let gc = GCParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
@@ -478,7 +487,7 @@ impl<B: GenICamBackend> ADGenICam<B> {
             Some(f) => f.report(&mut out, 2),
             None => self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                &format!("{DRIVER_NAME}::showFeature cannot find feature {feature_name}\n"),
+                format_args!("{DRIVER_NAME}::showFeature cannot find feature {feature_name}\n"),
             ),
         }
         out
@@ -528,7 +537,7 @@ impl<B: GenICamBackend> PortDriver for ADGenICam<B> {
 
         if reason < self.gc.frame_rate {
             if reason == p.shutter_control {
-                self.ad.set_shutter(value != 0)?;
+                self.ad.set_shutter(value != 0);
             } else {
                 self.ad.write_int32_pool(reason, value)?;
             }
@@ -586,12 +595,8 @@ impl<B: GenICamBackend> PortDriver for ADGenICam<B> {
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
-        self.ad
-            .port_base
-            .set_string_param(reason, user.addr, data.to_vec())?;
         // C++ `asynNDArrayDriver::writeOctet`, which ADGenICam inherits.
-        self.ad
-            .write_octet(reason, &String::from_utf8_lossy(data))?;
+        self.ad.write_octet(user, data)?;
         // C ADGenICam has no writeOctet, so a string feature never reaches its
         // camera; here it is written like a feature of any other type.
         let modes = self.features.modes;
@@ -689,7 +694,7 @@ impl<B: GenICamBackend> PortDriver for ADGenICam<B> {
         Ok(())
     }
 
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         self.backend.report(out, level);
         if level > 0 {
             self.features.report(out, level);

@@ -17,7 +17,6 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 anyhow = "1.0"
-log = "0.4"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "tiff", "hdr"] }

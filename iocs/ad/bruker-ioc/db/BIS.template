@@ -1,10 +1,10 @@
-# Records specific to the Bruker BIS driver.
-# Port of areaDetector ADBruker's BIS.template.
+# Database for the records specific to the BIS driver
+# Jeff Gebhardt and Mark Rivers
 
 include "ADBase.template"
 include "NDFile.template"
 
-# Timeout waiting for the SFRM file, on top of the exposure time.
+# Timeout waiting for SFRM file.
 record(ao, "$(P)$(R)ReadSFRMTimeout")
 {
     field(PINI, "YES")
@@ -16,7 +16,7 @@ record(ao, "$(P)$(R)ReadSFRMTimeout")
     field(PREC, "3")
 }
 
-# The last status message BIS broadcast.
+# Status string from BIS
 record(waveform, "$(P)$(R)BISStatus")
 {
     field(DTYP, "asynOctetRead")
@@ -26,7 +26,7 @@ record(waveform, "$(P)$(R)BISStatus")
     field(SCAN, "I/O Intr")
 }
 
-# Number of dark frames.
+# Number of dark fields
 record(longout, "$(P)$(R)NumDarks")
 {
    field(PINI, "YES")
@@ -42,12 +42,11 @@ record(longin, "$(P)$(R)NumDarks_RBV")
    field(SCAN, "I/O Intr")
 }
 
-# We replace the file format choices from ADBase.template.
-# ADBruker's BIS.template spelled the one format BIS writes "SRFM"; the file,
-# the driver's reader and the file name extension all say SFRM.
+
+# We replace the file format choices from ADBase.template
 record(mbbo, "$(P)$(R)FileFormat")
 {
-    field(ZRST, "SFRM")
+    field(ZRST, "SRFM")
     field(ZRVL, "0")
     field(ONST, "Invalid")
     field(ONVL, "1")
@@ -55,14 +54,14 @@ record(mbbo, "$(P)$(R)FileFormat")
 
 record(mbbi, "$(P)$(R)FileFormat_RBV")
 {
-    field(ZRST, "SFRM")
+    field(ZRST, "SRFM")
     field(ZRVL, "0")
     field(ONST, "Invalid")
     field(ONVL, "1")
     field(SCAN, "I/O Intr")
 }
 
-# We replace the choice fields for FrameType from ADBase.template.
+# We replace the choice fields for FrameType from ADBase.template
 record(mbbo, "$(P)$(R)FrameType")
 {
    field(ZRST, "Normal")
@@ -88,7 +87,7 @@ record(mbbi, "$(P)$(R)FrameType_RBV")
    field(SCAN, "I/O Intr")
 }
 
-# Change the PREC of the temperature and time remaining records to 2.
+# Change the PREC of the temperature and time remaining records to 2
 record(ai, "$(P)$(R)Temperature_RBV")
 {
    field(PREC, "2")
@@ -99,10 +98,10 @@ record(ai, "$(P)$(R)TimeRemaining_RBV")
    field(PREC, "2")
 }
 
-# asyn record for interactive communication with BIS.
+# asyn record for interactive communication with BIS
 record(asyn, "$(P)$(R)BISAsyn")
 {
-    field(PORT, "$(BIS_PORT)")
+    field(PORT,  "$(BIS_PORT)")
     field(IMAX, "256")
     field(OMAX, "256")
 }

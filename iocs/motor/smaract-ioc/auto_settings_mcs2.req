@@ -1,0 +1,6 @@
+# C's iocSmarAct auto_settings.req names asyn_motor_settings.req for every
+# controller, but motor.substitutions.smaractmcs2 loads basic_asyn_motor.db,
+# which has no _able record, so each MCS2 save searched for one in vain.
+file "basic_asyn_motor_settings.req",  P=$(P), M=m1
+file "basic_asyn_motor_settings.req",  P=$(P), M=m2
+file "basic_asyn_motor_settings.req",  P=$(P), M=m3

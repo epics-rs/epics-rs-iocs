@@ -191,3 +191,45 @@ fn every_target_and_actual_waveform_names_its_own_parameter() {
          record was added or removed and this test should see it"
     );
 }
+
+/// Record init refuses a record whose DTYP interface its port does not
+/// register, and an I/O Intr one whose interface cannot post interrupts, so
+/// each shipped db is checked against the masks its driver builds its port
+/// with.
+#[test]
+fn every_record_binds_an_interface_its_port_registers() {
+    use ur_robot::drivers::{control, dashboard, gripper, io, receive};
+    let db = |file: &str| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("db")
+            .join(file)
+    };
+    let ports = [
+        ("dashboard.db", dashboard::INTERFACES, dashboard::INTERRUPTS),
+        (
+            "dashboard_ctrl.db",
+            dashboard::INTERFACES,
+            dashboard::INTERRUPTS,
+        ),
+        ("rtde_receive.db", receive::INTERFACES, receive::INTERRUPTS),
+        ("rtde_io.db", io::INTERFACES, io::INTERRUPTS),
+        ("rtde_control.db", control::INTERFACES, control::INTERRUPTS),
+        (
+            "rtde_control_jog.db",
+            control::INTERFACES,
+            control::INTERRUPTS,
+        ),
+        (
+            "robotiq_gripper.db",
+            gripper::INTERFACES,
+            gripper::INTERRUPTS,
+        ),
+    ];
+    for (file, interfaces, interrupts) in ports {
+        ioc_conventions::wiring::assert_wired(
+            &ioc_conventions::wiring::parse(&db(file)),
+            interfaces,
+            interrupts,
+        );
+    }
+}

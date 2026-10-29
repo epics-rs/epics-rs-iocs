@@ -2,7 +2,7 @@
 //!
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` or
 //! `drvAsynSerialPortConfigure`), the OMS iocsh commands (`omsMAXnetConfig`,
-//! `omsMXAConfig`, `omsCreateAxis`), the motor record type, and the CA + PVA
+//! `omsMXAConfig`), the motor record type, and the CA + PVA
 //! (QSRV) server.
 //!
 //! Usage:
@@ -12,7 +12,6 @@
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_common::MotorHolder;
 use motor_oms_asyn::ioc::oms_commands;
 
 #[epics_rs::base::epics_main]
@@ -21,33 +20,41 @@ async fn main() -> CaResult<()> {
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
     } else {
-        eprintln!("Usage: oms-asyn-ioc <st.cmd>");
+        epics_rs::base::stderr_println!("Usage: oms-asyn-ioc <st.cmd>");
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("OMS_ASYN_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("OMS_ASYN_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let mut app = IocApplication::new();
 
     // Motor record type.
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
-
-    // Standard asyn iocsh commands — provides the drvAsyn*PortConfigure family.
-    let port_manager = epics_rs::asyn::manager::PortManager::global();
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
-
-    // OMS config / create-axis commands share one motor device support and a
-    // controller-name registry.
-    let holder = MotorHolder::new();
-    for cmd in oms_commands(&holder) {
+    // motorSupport.dbd's asynMotorControllerRegister.
+    for cmd in epics_rs::motor::ioc::asyn_motor_controller_commands() {
         app = app.register_startup_command(cmd);
     }
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    // motorUtilRegister: motorUtilInit, printChIDlist, listMovingMotors.
+    for cmd in epics_rs::motor::motor_util::motor_util_commands() {
+        app = app.register_startup_command(cmd);
+    }
 
-    app.startup_script(&script)
-        .register_link_set_installer(epics_rs::ca::calink::calink_link_set_install)
-        .register_link_set_installer(epics_rs::bridge::qsrv::pvalink_link_set_install)
-        .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)
-        .await
+    // asyn.dbd, which every C motor IOC links: the asyn record, the devEpics
+    // asyn_motor.db and asyn_motor_model2.db use, and the iocsh commands (the
+    // drvAsyn*PortConfigure family).
+    let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
+    app = app.register_record_type(asyn_name, move || asyn_factory());
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+
+    // OMS config commands + motor device support.
+    for cmd in oms_commands() {
+        app = app.register_startup_command(cmd);
+    }
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
+
+    epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

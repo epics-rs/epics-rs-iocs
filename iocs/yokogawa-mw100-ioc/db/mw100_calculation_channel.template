@@ -1,5 +1,5 @@
 # MW100 Math (calculation) channel.
-# Macros: P, DAU, HANDLE, ADDRESS (Math address, e.g. A1).
+# Macros: P, DAU, HANDLE, ADDRESS (Math address, e.g. A001).
 # Port of yokogawaDasApp/Db/MW100_calculation_channel.db.
 
 record(ai, "$(P)$(DAU):$(ADDRESS)")

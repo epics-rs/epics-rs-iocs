@@ -1,0 +1,50 @@
+# C's iocAMCI motor.substitutions.ANF2, P and the PORT1, PORT2 controllers
+# from st.cmd. C's file loads $(MOTOR)/motorApp/Db/asyn_motor.db, a
+# source-tree path no installed MOTOR has.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{M,   DTYP,        PORT,       ADDR, DESC,          EGU,   DIR, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES, PREC, DHLM, DLLM, INIT}
+{m1,  "asynMotor", "$(PORT1)", 0,    "ANF2 C1 M1",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m2,  "asynMotor", "$(PORT1)", 1,    "ANF2 C1 M2",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m3,  "asynMotor", "$(PORT1)", 2,    "ANF2 C1 M3",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m4,  "asynMotor", "$(PORT1)", 3,    "ANF2 C1 M4",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m5,  "asynMotor", "$(PORT1)", 4,    "ANF2 C1 M5",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m6,  "asynMotor", "$(PORT1)", 5,    "ANF2 C1 M6",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m7,  "asynMotor", "$(PORT1)", 6,    "ANF2 C1 M7",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m8,  "asynMotor", "$(PORT1)", 7,    "ANF2 C1 M8",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m9,  "asynMotor", "$(PORT1)", 8,    "ANF2 C1 M9",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m10, "asynMotor", "$(PORT1)", 9,    "ANF2 C1 M10", steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m11, "asynMotor", "$(PORT1)", 10,   "ANF2 C1 M11", steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m12, "asynMotor", "$(PORT1)", 11,   "ANF2 C1 M12", steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m13, "asynMotor", "$(PORT2)", 0,    "ANF2 C2 M1",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m14, "asynMotor", "$(PORT2)", 1,    "ANF2 C2 M2",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m15, "asynMotor", "$(PORT2)", 2,    "ANF2 C2 M3",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m16, "asynMotor", "$(PORT2)", 3,    "ANF2 C2 M4",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m17, "asynMotor", "$(PORT2)", 4,    "ANF2 C2 M5",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+{m18, "asynMotor", "$(PORT2)", 5,    "ANF2 C2 M6",  steps, Pos, 100,  0,    .2,   0,    50,   .2,   1,    5,    1e9,  -1e9, ""}
+}
+
+file "$(AMCI_IOC)/db/ANF2Aux.template"
+{
+pattern
+{R,    PORT,       ADDR}
+{m1:,  "$(PORT1)",  0}
+{m2:,  "$(PORT1)",  1}
+{m3:,  "$(PORT1)",  2}
+{m4:,  "$(PORT1)",  3}
+{m5:,  "$(PORT1)",  4}
+{m6:,  "$(PORT1)",  5}
+{m7:,  "$(PORT1)",  6}
+{m8:,  "$(PORT1)",  7}
+{m9:,  "$(PORT1)",  8}
+{m10:, "$(PORT1)",  9}
+{m11:, "$(PORT1)", 10}
+{m12:, "$(PORT1)", 11}
+{m13:, "$(PORT2)",  0}
+{m14:, "$(PORT2)",  1}
+{m15:, "$(PORT2)",  2}
+{m16:, "$(PORT2)",  3}
+{m17:, "$(PORT2)",  4}
+{m18:, "$(PORT2)",  5}
+}

@@ -10,6 +10,8 @@
 //! `constant[60]`), and via every `devMW100_*.c::init_record`'s own
 //! `switch(arg[0])` never having a `'W'` (VarConst) arm.
 
+use epics_rs::base::types::c_parse;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelFamily {
     Signal,
@@ -33,18 +35,24 @@ pub struct ParsedLink<'a> {
     pub arg: Option<&'a str>,
 }
 
+/// C `isblank`, the only separator `mw100_parse_link` splits on.
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
 pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
-    let text = text.trim_start();
-    let sep = text.find(char::is_whitespace)?;
-    let device = &text[..sep];
-    if device.is_empty() {
+    // C returns 1 on a leading blank, and reads past the NUL when there is
+    // no blank at all.
+    if text.starts_with(is_blank) {
         return None;
     }
-    let rest = text[sep..].trim_start();
+    let sep = text.find(is_blank)?;
+    let device = &text[..sep];
+    let rest = text[sep..].trim_start_matches(is_blank);
     if rest.is_empty() {
         return None;
     }
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let end = rest.find(is_blank).unwrap_or(rest.len());
     let cmd_and_arg = &rest[..end];
     let (command, arg) = match cmd_and_arg.split_once(':') {
         Some((c, a)) => (c, Some(a)),
@@ -62,37 +70,45 @@ pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
 
 /// Parse a family-prefixed channel address: bare digits (`Signal`, 1-60),
 /// `A<n>` (`Math`, 1-300), `C<n>` (`Comm`, 1-300), `K<n>` (`Const`, 1-60).
-/// Returns `None` on a malformed or out-of-range address.
+/// The number is read with C `atoi`/`strtol` (`devMW100_ai.c:105-145`), so
+/// trailing text after the digits is ignored. Returns `None` on an
+/// out-of-range address.
 pub fn parse_channel_address(arg: &str) -> Option<ChannelAddress> {
-    let mut chars = arg.chars();
-    let first = chars.next()?;
-    let (family, digits, max): (_, &str, u32) = match first {
-        '0'..='9' => (ChannelFamily::Signal, arg, 60),
-        'A' => (ChannelFamily::Math, arg.get(1..)?, 300),
-        'C' => (ChannelFamily::Comm, arg.get(1..)?, 300),
-        'K' => (ChannelFamily::Const, arg.get(1..)?, 60),
-        _ => return None,
-    };
-    let index: u32 = digits.parse().ok()?;
-    if index == 0 || index > max {
-        return None;
-    }
-    Some(ChannelAddress { family, index })
+    parse_channel_address_end(arg).map(|(addr, _)| addr)
 }
 
-/// `ALARM:<addr>.<1-4>` — a channel address plus a mandatory `.N` sub-index
-/// (`devMW100_mbbi.c:1123-1133`).
+/// [`parse_channel_address`] plus the byte offset `strtol` leaves its end
+/// pointer at.
+fn parse_channel_address_end(arg: &str) -> Option<(ChannelAddress, usize)> {
+    let (family, start, max) = match *arg.as_bytes().first()? {
+        b'0'..=b'9' => (ChannelFamily::Signal, 0, 60),
+        b'A' => (ChannelFamily::Math, 1, 300),
+        b'C' => (ChannelFamily::Comm, 1, 300),
+        b'K' => (ChannelFamily::Const, 1, 60),
+        _ => return None,
+    };
+    let (value, len) = c_parse::strtol(&arg.as_bytes()[start..], 10);
+    let index = c_parse::long_to_int(value);
+    if index <= 0 || index > max {
+        return None;
+    }
+    Some((
+        ChannelAddress {
+            family,
+            index: index as u32,
+        },
+        start + len,
+    ))
+}
+
+/// `ALARM:<addr>.<1-4>`: the `strtol` end pointer must be followed by `.`,
+/// one digit 1-4 and the end of the argument (`devMW100_mbbi.c:163-205`).
 pub fn parse_alarm_address(arg: &str) -> Option<(ChannelAddress, u8)> {
-    let (addr_part, sub_part) = arg.split_once('.')?;
-    let addr = parse_channel_address(addr_part)?;
-    if sub_part.len() != 1 {
-        return None;
+    let (addr, end) = parse_channel_address_end(arg)?;
+    match arg.as_bytes()[end..] {
+        [b'.', sub @ b'1'..=b'4'] => Some((addr, sub - b'0')),
+        _ => None,
     }
-    let sub = sub_part.as_bytes()[0];
-    if !(b'1'..=b'4').contains(&sub) {
-        return None;
-    }
-    Some((addr, sub - b'0'))
 }
 
 #[cfg(test)]
@@ -119,6 +135,17 @@ mod tests {
         assert!(parse_link("hdl").is_none());
         assert!(parse_link("").is_none());
         assert!(parse_link("   ").is_none());
+    }
+
+    #[test]
+    fn splits_on_c_isblank_only_and_refuses_a_leading_blank() {
+        assert!(parse_link(" hdl VAL:1").is_none());
+        assert!(parse_link("\thdl VAL:1").is_none());
+        assert!(parse_link("hdl\u{a0}VAL:1").is_none());
+        let l = parse_link("h\x0cdl\tVAL:1\x0bx").unwrap();
+        assert_eq!(l.device, "h\x0cdl");
+        assert_eq!(l.command, "VAL");
+        assert_eq!(l.arg, Some("1\x0bx"));
     }
 
     #[test]
@@ -173,6 +200,28 @@ mod tests {
     }
 
     #[test]
+    fn address_number_uses_c_atoi() {
+        let signal = |index| ChannelAddress {
+            family: ChannelFamily::Signal,
+            index,
+        };
+        assert_eq!(parse_channel_address("1.5"), Some(signal(1)));
+        assert_eq!(parse_channel_address("07abc"), Some(signal(7)));
+        assert_eq!(
+            parse_channel_address("C+3"),
+            Some(ChannelAddress {
+                family: ChannelFamily::Comm,
+                index: 3
+            })
+        );
+        assert_eq!(parse_channel_address("A-3"), None);
+        // int truncation of the long: 2^32 + 5 reads back as 5 where it
+        // fits a long, and saturates past the range where it does not.
+        let wide = std::ffi::c_long::BITS == 64;
+        assert_eq!(parse_channel_address("4294967301"), wide.then(|| signal(5)));
+    }
+
+    #[test]
     fn alarm_sub_address() {
         assert_eq!(
             parse_alarm_address("27.2"),
@@ -188,5 +237,17 @@ mod tests {
         assert_eq!(parse_alarm_address("27.5"), None);
         assert_eq!(parse_alarm_address("27"), None);
         assert_eq!(parse_alarm_address("27.12"), None);
+        // The strtol end pointer, not the first '.', anchors the sub-index.
+        assert_eq!(parse_alarm_address("27x.2"), None);
+        assert_eq!(
+            parse_alarm_address("A+12.4"),
+            Some((
+                ChannelAddress {
+                    family: ChannelFamily::Math,
+                    index: 12
+                },
+                4
+            ))
+        );
     }
 }

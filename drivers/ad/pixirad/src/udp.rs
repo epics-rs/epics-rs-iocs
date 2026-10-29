@@ -110,10 +110,6 @@ impl FrameAssembler {
         if slot >= self.expected_packets {
             // More packets than the frame can hold: the detector is sending a
             // frame we cannot describe, so start over on the next one.
-            log::error!(
-                "pixirad: packet {slot} does not fit a frame of {} packets",
-                self.expected_packets
-            );
             self.reset();
             return None;
         }
@@ -143,30 +139,61 @@ impl FrameAssembler {
 }
 
 /// Bind a UDP socket that listens on every interface, with the receive buffer
-/// the detector's data rate needs (C's `SO_RCVBUF` call).
-pub fn bind_data_socket(port: u16) -> io::Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_recv_buffer_size(MAX_UDP_DATA_BUFFER)?;
-    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
-    let actual = socket.recv_buffer_size()?;
-    if actual < MAX_UDP_DATA_BUFFER {
-        log::warn!(
-            "pixirad: the kernel gave the data socket a {actual}-byte receive buffer, \
-             {MAX_UDP_DATA_BUFFER} were asked for"
-        );
-    }
+/// the detector's data rate needs, and return the buffer size the kernel
+/// reports back. The error is C `udpDataListenerTask`'s text for the step
+/// that failed.
+pub fn bind_data_socket(port: u16) -> Result<(UdpSocket, usize), String> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| format!("Error creating socket error = {}", strerror(&e)))?;
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())
+        .map_err(|e| format!("Error binding socket error = {}", strerror(&e)))?;
+    socket
+        .set_recv_buffer_size(MAX_UDP_DATA_BUFFER)
+        .map_err(|e| format!("Error calling setsockopt for SO_RCVBUF = {}", strerror(&e)))?;
+    let actual = socket
+        .recv_buffer_size()
+        .map_err(|e| format!("Error calling getsockopt for SO_RCVBUF = {}", strerror(&e)))?;
+    Ok((socket.into(), actual))
+}
+
+/// Bind the status broadcast socket. The error is C `statusTask`'s text for
+/// the step that failed.
+pub fn bind_status_socket(port: u16) -> Result<UdpSocket, String> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| format!("Can't create socket: {}", strerror(&e)))?;
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())
+        .map_err(|e| format!("Error in binding port {port}: {}", strerror(&e)))?;
     Ok(socket.into())
 }
 
-/// Bind the status broadcast socket.
-pub fn bind_status_socket(port: u16) -> io::Result<UdpSocket> {
-    UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+/// C `strerror(errno)`: the OS text without Rust's " (os error N)" suffix.
+pub(crate) fn strerror(e: &io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(end) => text[..end].to_string(),
+        None => text,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Asic, Build};
+
+    /// pixirad.cpp:1295-1302: statusTask's bind line names the port.
+    #[test]
+    fn a_status_port_in_use_is_c_s_bind_line() {
+        let busy = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let e = bind_status_socket(port).unwrap_err().to_string();
+        // The strerror text is the OS's own; Windows words it differently.
+        let text = e
+            .strip_prefix(&format!("Error in binding port {port}: "))
+            .unwrap_or_else(|| panic!("{e}"));
+        assert!(!text.is_empty() && !text.contains("(os error"), "{e}");
+    }
 
     fn sensor(packets: usize) -> Sensor {
         Sensor {

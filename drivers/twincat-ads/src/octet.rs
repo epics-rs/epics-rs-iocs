@@ -37,6 +37,8 @@
 
 use std::fmt;
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use crate::ads::defs::AdsType;
 
 /// C `ADS_COM_ERROR_*` (adsAsynPortDriverUtils.h:37-40).
@@ -95,7 +97,7 @@ pub enum OctetError {
 }
 
 impl OctetError {
-    /// The numeric code the C parser puts in its "Error: <n>" reply.
+    /// The numeric code the C parser puts in its `"Error: <n>"` reply.
     pub fn code(&self) -> i32 {
         match self {
             Self::BadAdsPort(_) => ERROR_OCTET_ADSPORT_OPTION_FAIL,
@@ -305,8 +307,11 @@ fn format_element(plc: AdsType, c: &[u8]) -> String {
         AdsType::Int64 => i64::from_le_bytes(c.try_into().unwrap()).to_string(),
         AdsType::UInt64 => u64::from_le_bytes(c.try_into().unwrap()).to_string(),
         // C's "%f" / "%lf": six digits after the point.
-        AdsType::Real32 => format!("{:.6}", f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-        AdsType::Real64 => format!("{:.6}", f64::from_le_bytes(c.try_into().unwrap())),
+        AdsType::Real32 => format!(
+            "{:.6}",
+            CFloat(f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        ),
+        AdsType::Real64 => format!("{:.6}", CFloat(f64::from_le_bytes(c.try_into().unwrap()))),
         _ => unreachable!("text_width admitted only the types handled above"),
     }
 }
@@ -393,22 +398,22 @@ fn axis_status_to_ascii(data: &[u8], name: &str) -> Result<String, OctetError> {
     s.push_str(&format!("{},", b(2))); // bExecute
     s.push_str(&format!("{},", u16_at(4))); // nCommand   (1 pad byte at 3)
     s.push_str(&format!("{},", u16_at(6))); // nCmdData
-    s.push_str(&format!("{:.6},", f64_at(8))); // fVelocity
-    s.push_str(&format!("{:.6},", f64_at(16))); // fPosition
-    s.push_str(&format!("{:.6},", f64_at(24))); // fAcceleration
-    s.push_str(&format!("{:.6},", f64_at(32))); // fDeceleration
+    s.push_str(&format!("{:.6},", CFloat(f64_at(8)))); // fVelocity
+    s.push_str(&format!("{:.6},", CFloat(f64_at(16)))); // fPosition
+    s.push_str(&format!("{:.6},", CFloat(f64_at(24)))); // fAcceleration
+    s.push_str(&format!("{:.6},", CFloat(f64_at(32)))); // fDeceleration
     s.push_str(&format!("{},", b(40))); // bJogFwd
     s.push_str(&format!("{},", b(41))); // bJogBwd
     s.push_str(&format!("{},", b(42))); // bLimitFwd
     s.push_str(&format!("{},", b(43))); // bLimitBwd
-    s.push_str(&format!("{:.6},", f64_at(48))); // fOverride  (4 pad bytes at 44)
+    s.push_str(&format!("{:.6},", CFloat(f64_at(48)))); // fOverride  (4 pad bytes at 44)
     s.push_str(&format!("{},", b(56))); // bHomeSensor
     s.push_str(&format!("{},", b(57))); // bEnabled
     s.push_str(&format!("{},", b(58))); // bError
     s.push_str(&format!("{},", u32_at(60))); // nErrorId   (1 pad byte at 59)
-    s.push_str(&format!("{:.6},", f64_at(64))); // fActVelocity
-    s.push_str(&format!("{:.6},", f64_at(72))); // fActPosition
-    s.push_str(&format!("{:.6},", f64_at(80))); // fActDiff
+    s.push_str(&format!("{:.6},", CFloat(f64_at(64)))); // fActVelocity
+    s.push_str(&format!("{:.6},", CFloat(f64_at(72)))); // fActPosition
+    s.push_str(&format!("{:.6},", CFloat(f64_at(80)))); // fActDiff
     s.push_str(&format!("{},", b(88))); // bHomed
     s.push_str(&format!("{};", b(89))); // bBusy — C ends this one with ';'
     Ok(s)
@@ -592,6 +597,11 @@ mod tests {
         let s =
             binary_to_ascii(&(-0.25f32).to_le_bytes(), AdsType::Real32, 4, "x", "REAL").unwrap();
         assert_eq!(s, "-0.250000");
+        let s = binary_to_ascii(&f64::NAN.to_le_bytes(), AdsType::Real64, 8, "x", "LREAL").unwrap();
+        assert_eq!(s, "nan");
+        let s =
+            binary_to_ascii(&(-f32::NAN).to_le_bytes(), AdsType::Real32, 4, "x", "REAL").unwrap();
+        assert_eq!(s, "-nan");
     }
 
     #[test]
@@ -718,6 +728,15 @@ mod tests {
             s,
             "ax1=1,0,1,3,4,10.500000,0.000000,0.000000,0.000000,0,0,0,0,\
              100.000000,0,0,0,42,0.000000,-1.500000,0.000000,0,1;"
+        );
+
+        d[8..16].copy_from_slice(&(-f64::NAN).to_le_bytes());
+        d[80..88].copy_from_slice(&f64::NAN.to_le_bytes()); // fActDiff
+        let s = axis_status_to_ascii(&d, "ax1").unwrap();
+        assert_eq!(
+            s,
+            "ax1=1,0,1,3,4,-nan,0.000000,0.000000,0.000000,0,0,0,0,\
+             100.000000,0,0,0,42,0.000000,-1.500000,nan,0,1;"
         );
     }
 

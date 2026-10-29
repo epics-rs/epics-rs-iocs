@@ -11,4 +11,5 @@ epics-rs = { workspace = true, features = ["asyn", "ad"] }
 # sources spell as the crate, as `eiger` does with `ad_plugins_rs`.
 asyn-rs = { workspace = true }
 ad-core-rs = { workspace = true }
+epics-libcom-rs = { workspace = true }
 parking_lot = "0.12"

@@ -1,0 +1,14 @@
+# C's iocMotorSim motorSim.substitutions, P and PORT from st.cmd.
+file "$(MOTOR)/db/basic_asyn_motor.db"
+{
+pattern
+{N,  M,       DTYP,         ADDR,  DESC,          EGU,      DIR,  VELO,  VBAS,  ACCL,  BDST,  BVEL,  BACC,  MRES,  PREC,  DHLM,  DLLM,  INIT}
+{1,  "m$(N)", "asynMotor",  0,     "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
+{2,  "m$(N)", "asynMotor",  1,     "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
+{3,  "m$(N)", "asynMotor",  2,     "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
+{4,  "m$(N)", "asynMotor",  3,     "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
+{5,  "m$(N)", "asynMotor",  4,     "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
+{6,  "m$(N)", "asynMotor",  5,     "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
+{7,  "m$(N)", "asynMotor",  6,     "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
+{8,  "m$(N)", "asynMotor",  7,     "motor $(N)",  degrees,  Pos,  1,     .1,    .2,    0,     1,     .2,    0.01,  5,     100,   -100,  ""}
+}

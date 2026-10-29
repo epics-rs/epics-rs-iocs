@@ -17,11 +17,14 @@ pub enum DppType {
     Mca8000D,
     Tb5,
     Dp5X,
+    /// A `DEVICE_ID` outside the enum. C compares the raw id, so such a
+    /// device matches none of the per-type gates; only its name falls back
+    /// to `"DP5"`.
+    Unknown(u8),
 }
 
 impl DppType {
-    /// `CDP5Status::GetDeviceNameFromVal` (`DP5Status.cpp:653-682`): any
-    /// value not in `0..=5` names as `"DP5"`, matching C's `default` arm.
+    /// `RAW[39]` as `Process_Status` stores it in `DEVICE_ID`.
     pub fn from_device_id(device_id: u8) -> Self {
         match device_id {
             0 => DppType::Dp5,
@@ -30,14 +33,15 @@ impl DppType {
             3 => DppType::Mca8000D,
             4 => DppType::Tb5,
             5 => DppType::Dp5X,
-            _ => DppType::Dp5,
+            other => DppType::Unknown(other),
         }
     }
 
-    /// `CDP5Status::GetDeviceNameFromVal` (`DP5Status.cpp:653-682`).
+    /// `CDP5Status::GetDeviceNameFromVal` (`DP5Status.cpp:653-682`): the
+    /// `default` arm names an unknown id `"DP5"`.
     pub fn name(self) -> &'static str {
         match self {
-            DppType::Dp5 => "DP5",
+            DppType::Dp5 | DppType::Unknown(_) => "DP5",
             DppType::Px5 => "PX5",
             DppType::Dp5G => "DP5G",
             DppType::Mca8000D => "MCA8000D",
@@ -74,7 +78,7 @@ pub fn byte_version_to_string(v: u8) -> String {
 /// (`DP5Status.h`) / `drvAmptek.cpp`'s param names.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Dp5Status {
-    pub device_id: u8,
+    /// `DEVICE_ID`.
     pub dpp_type: DppType,
     pub fast_count: f64,
     pub slow_count: f64,
@@ -105,21 +109,16 @@ pub struct Dp5Status {
 /// DP4-format status block extracted as
 /// [`crate::protocol::ReceivedPacket::Status`]'s `data`.
 ///
-/// Panics if `raw.len() < 64` -- C indexes the fixed-size buffer directly
-/// without a length check (`DP5Status.cpp`'s `Process_Status`); a status
-/// packet is only ever produced by [`crate::protocol::parse_packet`] from
-/// wire bytes whose `LEN` field the sender fixes at 64, so a short buffer
-/// here means the transport handed over a malformed/truncated packet, not
-/// legitimate device data.
+/// C reads the fields out of the fixed `Packet_In.DATA` array whatever the
+/// packet's `LEN` (`DP5Status.cpp`'s `Process_Status`); a short block reads
+/// zeros past its end here.
 pub fn process_status(raw: &[u8]) -> Dp5Status {
-    assert!(
-        raw.len() >= 64,
-        "DP5 status block must be 64 bytes, got {}",
-        raw.len()
-    );
+    let mut block = [0u8; 64];
+    let n = raw.len().min(64);
+    block[..n].copy_from_slice(&raw[..n]);
+    let raw = &block;
 
-    let device_id = raw[39];
-    let dpp_type = DppType::from_device_id(device_id);
+    let dpp_type = DppType::from_device_id(raw[39]);
     let fast_count = long_word_to_double(0, raw);
     let slow_count = long_word_to_double(4, raw);
     let accumulation_time = f64::from(raw[12]) * 0.001
@@ -146,7 +145,10 @@ pub fn process_status(raw: &[u8]) -> Dp5Status {
     // sign-extend an 8-bit value: DP5_TEMP = RAW[34] - (RAW[34]&128)*2
     let dp5_temp = f64::from(raw[34]) - f64::from(raw[34] & 128) * 2.0;
     let preset_rt_done = raw[35] & 128 != 0;
-    let preset_lt_done = raw[35] & 64 != 0;
+    // MCA8000D fw >= 6.07 only; on every other device RAW[35] bit 6 is
+    // AFAST_LOCKED, not a preset (`DP5Status.cpp:41-45,69-78`).
+    let dmca_live_time = dpp_type == DppType::Mca8000D && firmware >= 0x67;
+    let preset_lt_done = dmca_live_time && raw[35] & 64 != 0;
     let mca_enabled = raw[35] & 32 != 0;
     let precnt_reached = raw[35] & 16 != 0;
     let mcs_done = raw[36] & 64 != 0;
@@ -157,7 +159,6 @@ pub fn process_status(raw: &[u8]) -> Dp5Status {
         && dpp_eco < 0xFF;
 
     Dp5Status {
-        device_id,
         dpp_type,
         fast_count,
         slow_count,
@@ -190,9 +191,16 @@ mod tests {
     }
 
     #[test]
+    fn short_block_reads_zeros_past_its_end() {
+        let s = process_status(&[255, 0, 0, 0, 7]);
+        assert_eq!(s.fast_count, 255.0);
+        assert_eq!(s.slow_count, 7.0);
+        assert_eq!(s.dpp_type, process_status(&raw_fixture()).dpp_type);
+    }
+
+    #[test]
     fn zeroed_block_decodes_to_zeroed_status() {
         let s = process_status(&raw_fixture());
-        assert_eq!(s.device_id, 0);
         assert_eq!(s.dpp_type, DppType::Dp5);
         assert_eq!(s.fast_count, 0.0);
         assert_eq!(s.slow_count, 0.0);
@@ -275,11 +283,25 @@ mod tests {
         raw[38] = 128;
         let s = process_status(&raw);
         assert!(s.preset_rt_done);
-        assert!(s.preset_lt_done);
+        assert!(!s.preset_lt_done); // a DP5: bit 6 is AFAST_LOCKED
         assert!(s.mca_enabled);
         assert!(s.precnt_reached);
         assert!(s.mcs_done);
         assert!(s.pc5_present);
+    }
+
+    /// `bDMCA_LiveTime`: MCA8000D with firmware >= 0x67.
+    #[test]
+    fn preset_lt_done_needs_mca8000d_firmware_0x67() {
+        let mut raw = raw_fixture();
+        raw[35] = 64;
+        raw[39] = 3;
+        raw[24] = 0x66;
+        assert!(!process_status(&raw).preset_lt_done);
+        raw[24] = 0x67;
+        assert!(process_status(&raw).preset_lt_done);
+        raw[39] = 1; // PX5, same firmware
+        assert!(!process_status(&raw).preset_lt_done);
     }
 
     #[test]
@@ -293,15 +315,23 @@ mod tests {
         assert_eq!(DppType::from_device_id(200).name(), "DP5");
     }
 
+    /// An unknown id is not `dppDP5` for the gates (`DP5Status.cpp:132`).
+    #[test]
+    fn unknown_device_id_is_not_dp5() {
+        let mut raw = raw_fixture();
+        raw[39] = 200;
+        raw[24] = 0x70; // firmware/build >= 0x686
+        raw[49] = 0x01; // DPP_ECO < 0xFF
+        let s = process_status(&raw);
+        assert_eq!(s.dpp_type, DppType::Unknown(200));
+        assert!(!s.is_dp5_rev_dx_gains);
+        raw[39] = 0;
+        assert!(process_status(&raw).is_dp5_rev_dx_gains);
+    }
+
     #[test]
     fn byte_version_formats_as_major_dot_minor() {
         assert_eq!(byte_version_to_string(0x67), "6.07");
         assert_eq!(byte_version_to_string(0x00), "0.00");
-    }
-
-    #[test]
-    #[should_panic(expected = "DP5 status block must be 64 bytes")]
-    fn process_status_rejects_short_buffer() {
-        process_status(&[0u8; 10]);
     }
 }

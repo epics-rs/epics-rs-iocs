@@ -13,32 +13,34 @@
 #============================================================
 
 epicsEnvSet("P",      "NPOINT:")
-epicsEnvSet("CARD",   "0")
-epicsEnvSet("IPPORT", "C300")
+epicsEnvSet("CTRL",   "C300")
+epicsEnvSet("IPPORT", "serial1")
 epicsEnvSet("HOST",   "192.168.0.100:23")
 epicsEnvSet("NAXES",  "3")
 
 # ---- asyn IP octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
-# C300 framing: the driver appends the LF command terminator, so only the input
-# EOS is configured here. Do not set an output EOS — the port would append it a
-# second time.
+# Port EOS as C needs it: C300MotorDriver sets no EOS and sends bare commands.
 asynOctetSetInputEos("$(IPPORT)", 0, "\n")
+asynOctetSetOutputEos("$(IPPORT)", 0, "\n")
 
 # ---- C300 controller ----
-# C300CreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
-C300CreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)
+# C300CreateController(portName, C300PortName, numAxes, movingPollPeriod, idlePollPeriod).
+C300CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 250, 2000)
 
-# One motor record per axis (DTYP C300_$(CARD)_0, _1, _2). Positions cross the
-# driver boundary in the controller's native units, so MRES = 1.
-dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+# Each axis's asyn_motor.db, as C's C300.cmd loads them.
+dbLoadTemplate("$(NPOINT_IOC)/db/C300.substitutions", "P=$(P),PORT=$(CTRL)")
+
+# motorUtil's records, as C's st.cmd loads them.
+dbLoadRecords("$(MOTOR)/db/motorUtil.db", "P=$(P)")
 
 iocInit()
+
+# motorUtil (allstop & alldone)
+motorUtilInit("$(P)")
 
 # Example:
 #   dbl
 #   camonitor NPOINT:m1 NPOINT:m1.RBV
-#   caput NPOINT:m1 100000
+#   caput NPOINT:m1 10

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 
@@ -24,7 +24,7 @@ fn int_arg(args: &[ArgValue], index: usize, default: i32) -> i32 {
 /// are accepted for startup-script compatibility and ignored: the Rust pool is
 /// bounded by memory alone and the runtime schedules the port actors itself.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADPIXIRAD", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADPIXIRAD", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<PixiradRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -81,13 +81,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
         ],
         "pixiradConfig portName commandPort dataPortNumber statusPortNumber \
          maxDataPortBuffers maxSizeX maxSizeY [maxBuffers] [maxMemory] [priority] [stackSize]",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = match &args[0] {
-                ArgValue::String(s) if !s.is_empty() => s.clone(),
+                ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let command_port = match &args[1] {
-                ArgValue::String(s) if !s.is_empty() => s.clone(),
+                ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                 _ => return Err("commandPort required".into()),
             };
             let data_port = int_arg(args, 2, 0);
@@ -111,22 +111,19 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 return Err("maxDataPortBuffers must be at least 1".into());
             }
 
-            let command = get_port(&command_port).ok_or_else(|| {
-                format!(
-                    "command port '{command_port}' not found \
-                     (call drvAsynIPPortConfigure first)"
-                )
-            })?;
+            let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
 
-            println!(
-                "pixiradConfig: port={port_name}, command={command_port}, \
-                 data=UDP {data_port}, status=UDP {status_port}, \
-                 size={max_size_x}x{max_size_y}"
-            );
+            // C ignores the connect status (pixirad.cpp:471-472): a missing
+            // command port leaves a user whose every command fails.
+            let (command, _) =
+                SyncIOHandle::connect_port(&command_port, 0, Duration::ZERO, InterfaceType::Octet);
 
             let rt = create_pixirad_detector(
-                &port_name,
-                command.handle.clone(),
+                &claim,
+                command,
                 data_port,
                 status_port,
                 max_data_port_buffers as usize,
@@ -136,7 +133,11 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             )
             .map_err(|e| format!("failed to create the Pixirad detector: {e}"))?;
 
-            epics_rs::asyn::asyn_record::register_port(&port_name, rt.port_handle().clone())
+            claim
+                .publish(
+                    rt.port_handle().clone(),
+                    ctx.db().scan_control().interrupt_gate(),
+                )
                 .map_err(|e| e.to_string())?;
 
             mgr.set_driver(Arc::new(GenericDriverContext::new(
@@ -151,11 +152,16 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
         },
     ));
 
-    // C's `pixiradAutoCal` looked the driver up by port name and called into it
-    // directly. Here the settings are written to an internal parameter, so the
-    // port actor stays the only thing that talks to the box.
-    let rt_slot = runtime.clone();
-    ioc.register_startup_command(CommandDef::new(
+    ioc.register_startup_command(autocal_command(runtime.clone()));
+
+    ioc.keep_alive(runtime);
+}
+
+// C's `pixiradAutoCal` looked the driver up by port name and called into it
+// directly. Here the settings are written to an internal parameter, so the
+// port actor stays the only thing that talks to the box.
+fn autocal_command(rt_slot: Arc<std::sync::Mutex<Option<PixiradRuntime>>>) -> CommandDef {
+    CommandDef::new(
         "pixiradAutoCal",
         vec![
             ArgDesc {
@@ -193,28 +199,78 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
         ],
         "pixiradAutoCal portName ofs0 fs0 ofs2 fs1 fs2 Ibias vbgMcalDAC",
         move |args: &[ArgValue], _ctx: &CommandContext| {
+            // C returns 0 whatever happens: a port findAsynPortDriver does not
+            // find is skipped, and a refusal is only writeReadServer's trace.
             let port_name = match &args[0] {
-                ArgValue::String(s) if !s.is_empty() => s.clone(),
-                _ => return Err("portName required".into()),
+                ArgValue::String(s) => s.to_str().unwrap_or_default(),
+                _ => "",
             };
-
             let guard = rt_slot.lock().unwrap();
-            let rt = guard
+            let Some(rt) = guard
                 .as_ref()
-                .ok_or_else(|| format!("port '{port_name}' has no Pixirad detector"))?;
+                .filter(|rt| rt.port_handle().port_name() == port_name)
+            else {
+                return Ok(CommandOutcome::Continue);
+            };
 
             let settings = (1..=7)
                 .map(|i| int_arg(args, i, 0).to_string())
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            let sync =
-                SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(10));
-            sync.write_octet(rt.params.autocal_conf, settings.as_bytes())
-                .map_err(|e| format!("pixiradAutoCal failed: {e}"))?;
+            // The connect status is dropped, as C's (pixirad.cpp:472).
+            let (sync, _) = SyncIOHandle::connect_port(
+                rt.port_handle().port_name(),
+                0,
+                Duration::from_secs(10),
+                InterfaceType::Octet,
+            );
+            let _ = sync.write_octet(rt.params.autocal_conf, settings.as_bytes());
             Ok(CommandOutcome::Continue)
         },
-    ));
+    )
+}
 
-    ioc.keep_alive(runtime);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// pixirad.cpp:1522-1529: `pixiradAutoCal` returns 0 for a port it does
+    /// not find and for a box that refuses; only writeReadServer's trace
+    /// reports the refusal.
+    #[epics_rs::base::epics_test]
+    async fn auto_cal_never_fails_the_line() {
+        use epics_rs::base::runtime::task::BlockingBridge;
+        use epics_rs::base::server::database::PvDatabase;
+
+        let (command, _) =
+            SyncIOHandle::connect_port("PIXCAL_IP", 0, Duration::ZERO, InterfaceType::Octet);
+        let rt = create_pixirad_detector(
+            &epics_rs::asyn::registry::claim_port("PIXCAL").unwrap(),
+            command,
+            0,
+            0,
+            1,
+            402,
+            512,
+            1 << 20,
+        )
+        .unwrap();
+        let cmd = autocal_command(Arc::new(std::sync::Mutex::new(Some(rt))));
+        let bridge = BlockingBridge::capture();
+        std::thread::spawn(move || {
+            let ctx = CommandContext::new(Arc::new(PvDatabase::new()), bridge);
+            for port in ["PIXCAL", "NOPIXCAL", ""] {
+                let mut args = vec![ArgValue::String(port.into())];
+                args.extend((1..=7).map(ArgValue::Int));
+                match cmd.handler.call(&args, &ctx) {
+                    Ok(CommandOutcome::Continue) => {}
+                    Err(e) => panic!("{port:?}: the command refused: {e}"),
+                    Ok(_) => panic!("{port:?}: the command failed the line"),
+                }
+            }
+        })
+        .join()
+        .unwrap();
+    }
 }

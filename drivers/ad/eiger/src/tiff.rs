@@ -5,7 +5,7 @@
 //! greyscale TIFF. The C driver hand-parses the five tags it needs rather than
 //! linking libtiff; this port does the same, but bounds-checks every read.
 
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType};
+use epics_rs::ad_core::ndarray::NDDataType;
 
 /// `II` + 42, little-endian — the classic TIFF magic (C compares the first
 /// `uint32` against `0x002A4949`).
@@ -42,11 +42,14 @@ fn u32_at(buf: &[u8], at: usize) -> Result<u32, TiffError> {
         .ok_or_else(|| TiffError(format!("truncated at byte {at}")))
 }
 
-/// A decoded monitor image: `[width, height]` and its pixels.
+/// A checked monitor image: `[width, height]`, its type, and its
+/// little-endian pixel strip for the caller to copy into its NDArray
+/// (C's `memcpy` into `pData`, eigerDetector.cpp:1996).
 #[derive(Debug)]
-pub struct TiffImage {
+pub struct TiffImage<'a> {
     pub dims: [usize; 2],
-    pub data: NDDataBuffer,
+    pub data_type: NDDataType,
+    pub strip: &'a [u8],
 }
 
 /// Decode a monitor TIFF blob.
@@ -63,7 +66,7 @@ pub struct TiffImage {
 /// check that the two agree. A detector (or a man-in-the-middle) reporting a
 /// StripByteCounts larger than the image dimensions overflows the NDArray. Here
 /// the strip must be exactly the size the dimensions imply.
-pub fn decode(buf: &[u8]) -> Result<TiffImage, TiffError> {
+pub fn decode(buf: &[u8]) -> Result<TiffImage<'_>, TiffError> {
     if u32_at(buf, 0)? != TIFF_MAGIC_LE {
         return err("wrong tiff header");
     }
@@ -119,35 +122,25 @@ pub fn decode(buf: &[u8]) -> Result<TiffImage, TiffError> {
         .get(strip_offset..strip_offset + data_len)
         .ok_or_else(|| TiffError("pixel data out of range".into()))?;
 
-    let data = match data_type {
-        NDDataType::UInt8 => NDDataBuffer::U8(strip.to_vec()),
-        NDDataType::UInt16 => NDDataBuffer::U16(
-            strip
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect(),
-        ),
-        _ => NDDataBuffer::U32(
-            strip
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-        ),
-    };
-
     Ok(TiffImage {
         dims: [width, height],
-        data,
+        data_type,
+        strip,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataView};
+
+    /// The image's pixels as the monitor task copies them into its array.
+    fn read_pixels(img: &TiffImage<'_>) -> NDDataBuffer {
+        let mut buf = NDDataBuffer::zeros(img.data_type, img.dims[0] * img.dims[1]);
+        buf.as_u8_slice_mut().copy_from_slice(img.strip);
+        crate::pixels::le_to_host(buf.view_mut());
+        buf
+    }
 
     /// Build the same single-strip TIFF the monitor interface serves.
     fn build(width: u32, height: u32, depth: u32, pixels: &[u8]) -> Vec<u8> {
@@ -186,9 +179,11 @@ mod tests {
     fn decodes_a_16_bit_monitor_image() {
         let pixels: Vec<u16> = (0..12u16).map(|i| i * 100).collect();
         let raw: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
-        let img = decode(&build(4, 3, 16, &raw)).unwrap();
+        let file = build(4, 3, 16, &raw);
+        let img = decode(&file).unwrap();
         assert_eq!(img.dims, [4, 3]);
-        let NDDataBuffer::U16(got) = img.data else {
+        let buf = read_pixels(&img);
+        let NDDataView::U16(got) = buf.view() else {
             panic!("expected U16 pixels");
         };
         assert_eq!(got, pixels);
@@ -198,9 +193,11 @@ mod tests {
     fn decodes_a_32_bit_monitor_image() {
         let pixels: Vec<u32> = (0..6u32).map(|i| i * 70_000).collect();
         let raw: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
-        let img = decode(&build(3, 2, 32, &raw)).unwrap();
+        let file = build(3, 2, 32, &raw);
+        let img = decode(&file).unwrap();
         assert_eq!(img.dims, [3, 2]);
-        let NDDataBuffer::U32(got) = img.data else {
+        let buf = read_pixels(&img);
+        let NDDataView::U32(got) = buf.view() else {
             panic!("expected U32 pixels");
         };
         assert_eq!(got, pixels);
@@ -209,8 +206,10 @@ mod tests {
     #[test]
     fn decodes_an_8_bit_monitor_image() {
         let pixels: Vec<u8> = (0..9u8).collect();
-        let img = decode(&build(3, 3, 8, &pixels)).unwrap();
-        let NDDataBuffer::U8(got) = img.data else {
+        let file = build(3, 3, 8, &pixels);
+        let img = decode(&file).unwrap();
+        let buf = read_pixels(&img);
+        let NDDataView::U8(got) = buf.view() else {
             panic!("expected U8 pixels");
         };
         assert_eq!(got, pixels);

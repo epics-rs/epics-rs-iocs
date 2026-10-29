@@ -1,0 +1,122 @@
+# C's iocAcsMotion AcsMotion.substitutions, P and PORT from st.cmd. C
+# loads every file from $(TOP)/db, where its Makefile installs MOTOR's and
+# MOTOR_ACSMOTION's; MOTOR's come from $(MOTOR)/db here.
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{N, M,       DTYP,        ADDR, DESC,         EGU, DIR, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES,            PREC, DHLM, DLLM, INIT}
+# 2.54 mm/rev, 200 steps/rev, 1024 microsteps/step
+{1, "m$(N)", "asynMotor", 0,    "motor $(N)", mm,  Pos, 1,    .1,   .2,   0,    1,    .2,   1.240234375e-05, 6,    10,   -10,  ""}
+{2, "m$(N)", "asynMotor", 1,    "motor $(N)", mm,  Pos, 1,    .1,   .2,   0,    1,    .2,   0.0001,          4,    100,  -100, ""}
+{3, "m$(N)", "asynMotor", 2,    "motor $(N)", mm,  Pos, 1,    .1,   .2,   0,    1,    .2,   0.0001,          4,    100,  -100, ""}
+{4, "m$(N)", "asynMotor", 3,    "motor $(N)", mm,  Pos, 1,    .1,   .2,   0,    1,    .2,   0.0001,          4,    100,  -100, ""}
+{5, "m$(N)", "asynMotor", 4,    "motor $(N)", mm,  Pos, 1,    .1,   .2,   0,    1,    .2,   0.0001,          4,    100,  -100, ""}
+{6, "m$(N)", "asynMotor", 5,    "motor $(N)", mm,  Pos, 1,    .1,   .2,   0,    1,    .2,   0.0001,          4,    100,  -100, ""}
+{7, "m$(N)", "asynMotor", 6,    "motor $(N)", mm,  Pos, 1,    .1,   .2,   0,    1,    .2,   0.0001,          4,    100,  -100, ""}
+{8, "m$(N)", "asynMotor", 7,    "motor $(N)", mm,  Pos, 1,    .1,   .2,   0,    1,    .2,   0.0001,          4,    100,  -100, ""}
+}
+
+file "$(MOTOR)/db/profileMoveController.template"
+{
+pattern
+{R,    NAXES, NPOINTS, NPULSES, TIMEOUT}
+{pm1:, 8,     2000,    2000,    2.0}
+}
+
+file "$(MOTOR)/db/profileMoveAxis.template"
+{
+pattern
+{R,    M, NPOINTS, NREADBACK, ADDR, TIMEOUT, PREC}
+{pm1:, 1, 2000,    2000,      0,    2.0,     4}
+{pm1:, 2, 2000,    2000,      1,    2.0,     4}
+{pm1:, 3, 2000,    2000,      2,    2.0,     4}
+{pm1:, 4, 2000,    2000,      3,    2.0,     4}
+{pm1:, 5, 2000,    2000,      4,    2.0,     4}
+{pm1:, 6, 2000,    2000,      5,    2.0,     4}
+{pm1:, 7, 2000,    2000,      6,    2.0,     4}
+{pm1:, 8, 2000,    2000,      7,    2.0,     4}
+}
+
+file "$(ACSMOTION_IOC)/db/SPiiPlusProfileMoveController.db"
+{
+pattern
+{R,    NPULSES, TIMEOUT, PREC}
+{pm1:, 2000,    2.0,     4}
+}
+
+file "$(ACSMOTION_IOC)/db/SPiiPlusPEG.db"
+{
+pattern
+{R,    NAXES, NPOINTS, NPULSES, TIMEOUT}
+{pm1:, 8,     2000,    2000,    2.0}
+}
+
+file "$(ACSMOTION_IOC)/db/SPiiPlusAxisExtra.db"
+{
+pattern
+{M,  ADDR}
+{m1, 0}
+{m2, 1}
+{m3, 2}
+{m4, 3}
+{m5, 4}
+{m6, 5}
+{m7, 6}
+{m8, 7}
+}
+
+file "$(ACSMOTION_IOC)/db/SPiiPlusHoming.db"
+{
+pattern
+{M,  ADDR, TIMEOUT, VAL, MAX_DIST, OFFSET_POS, OFFSET_NEG, CURR_LIMIT}
+{m1, 0,    2.0,     0,   0.0,      0.0,        0.0,        0.0}
+{m2, 1,    2.0,     0,   0.0,      0.0,        0.0,        0.0}
+{m3, 2,    2.0,     0,   0.0,      0.0,        0.0,        0.0}
+{m4, 3,    2.0,     0,   0.0,      0.0,        0.0,        0.0}
+{m5, 4,    2.0,     0,   0.0,      0.0,        0.0,        0.0}
+{m6, 5,    2.0,     0,   0.0,      0.0,        0.0,        0.0}
+{m7, 6,    2.0,     0,   0.0,      0.0,        0.0,        0.0}
+{m8, 7,    2.0,     0,   0.0,      0.0,        0.0,        0.0}
+}
+
+file "$(ACSMOTION_IOC)/db/SPiiPlusJogging.db"
+{
+pattern
+{M}
+{m1}
+{m2}
+{m3}
+{m4}
+{m5}
+{m6}
+{m7}
+{m8}
+}
+
+file "$(ACSMOTION_IOC)/db/SPiiPlusMaxParams.db"
+{
+pattern
+{M,  ADDR, MAX_VELO, MAX_ACCL, PREC}
+{m1, 0,    5.0,      20.0,     4}
+{m2, 1,    200.0,    1000.0,   4}
+{m3, 2,    200.0,    1000.0,   4}
+{m4, 3,    200.0,    1000.0,   4}
+{m5, 4,    200.0,    1000.0,   4}
+{m6, 5,    200.0,    1000.0,   4}
+{m7, 6,    200.0,    1000.0,   4}
+{m8, 7,    200.0,    1000.0,   4}
+}
+
+file "$(ACSMOTION_IOC)/db/SPiiPlusMaxParamsRbv.db"
+{
+pattern
+{M,  ADDR, PREC}
+{m1, 0,    4}
+{m2, 1,    4}
+{m3, 2,    4}
+{m4, 3,    4}
+{m5, 4,    4}
+{m6, 5,    4}
+{m7, 6,    4}
+{m8, 7,    4}
+}

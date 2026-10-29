@@ -177,7 +177,9 @@ fn handle_request(buf: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
         (pid::REQ_CONFIG, pid::REQ_CONFIG_SET_PID2) => Some(ack_ok()),
         (pid::REQ_CONFIG, pid::REQ_CONFIG_READ_PID2) => Some(config_readback_response()),
         _ => {
-            eprintln!("stub_dp5: unhandled request pid1={pid1:#04x} pid2={pid2:#04x}");
+            epics_rs::base::stderr_println!(
+                "stub_dp5: unhandled request pid1={pid1:#04x} pid2={pid2:#04x}"
+            );
             None
         }
     }
@@ -185,7 +187,7 @@ fn handle_request(buf: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
 
 fn main() -> std::io::Result<()> {
     let socket = UdpSocket::bind(("127.0.0.1", DP5_COMMAND_PORT))?;
-    eprintln!("stub_dp5: listening on 127.0.0.1:{DP5_COMMAND_PORT}");
+    epics_rs::base::stderr_println!("stub_dp5: listening on 127.0.0.1:{DP5_COMMAND_PORT}");
     let mut buf = [0u8; 2048];
     loop {
         let (n, from) = socket.recv_from(&mut buf)?;

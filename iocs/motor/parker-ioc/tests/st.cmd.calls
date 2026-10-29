@@ -1,0 +1,4 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+PC6KSetup(2, 60)
+PC6KConfig(0, "serial1")
+PC6KConfig(1, "serial3")

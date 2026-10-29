@@ -12,14 +12,14 @@
 //! platform's `double -> integer` conversion, which truncates toward zero and
 //! then wraps modulo 2^N. Rust's `as` saturates instead, so a `gain * j` ramp
 //! that overruns `u8` would clamp at 255 rather than wrap — visibly a different
-//! image. [`SimPixel::from_f64_c`] restores the C behaviour by going through
+//! image. `SimPixel::from_f64_c` restores the C behaviour by going through
 //! `i128` (truncate) before the narrowing bit-truncation.
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::error::ADResult;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray::{NDDataType, NDDataViewMut, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 
 use crate::rng::Rng;
 use crate::types::{SimMode, SineOperation};
@@ -309,48 +309,61 @@ impl Layout {
 // Typed working buffers (C `pRaw_`, `pBackground_`, `pRamp_`, `pPeak_`)
 // ============================================================================
 
-struct Bufs<T> {
-    raw: Vec<T>,
-    background: Vec<T>,
-    ramp: Vec<T>,
-    peak: Vec<T>,
+/// One frame's view of the four buffers, typed.
+struct Bufs<'a, T> {
+    raw: &'a mut [T],
+    background: &'a mut [T],
+    ramp: &'a mut [T],
+    peak: &'a mut [T],
 }
 
-impl<T: SimPixel> Bufs<T> {
-    fn new(n: usize) -> Self {
-        Self {
-            raw: vec![T::ZERO; n],
-            background: vec![T::ZERO; n],
-            ramp: vec![T::ZERO; n],
-            peak: vec![T::ZERO; n],
-        }
-    }
+/// Pool arrays, charged from the reset that allocates them to the next, as
+/// C's are (simDetector.cpp:625-638). All four share one data type.
+struct SimBuffers {
+    raw: DriverArray,
+    background: DriverArray,
+    ramp: DriverArray,
+    peak: DriverArray,
 }
 
 macro_rules! sim_buffers {
     ($($dt:ident / $buf:ident => $t:ty),* $(,)?) => {
-        enum SimBuffers { $($dt(Bufs<$t>)),* }
-
         impl SimBuffers {
-            fn new(data_type: NDDataType, n: usize) -> Self {
-                match data_type { $(NDDataType::$dt => Self::$dt(Bufs::new(n))),* }
-            }
-
-            fn data_type(&self) -> NDDataType {
-                match self { $(Self::$dt(_) => NDDataType::$dt),* }
-            }
-
-            fn len(&self) -> usize {
-                match self { $(Self::$dt(b) => b.raw.len()),* }
+            fn alloc(
+                pool: &DriverPool,
+                dims: &[NDDimension],
+                data_type: NDDataType,
+            ) -> ADResult<Self> {
+                // C allocates each with a NULL pData (simDetector.cpp:631-638),
+                // so each is held to the pool's limit; `wrap` is not.
+                let alloc = || -> ADResult<DriverArray> {
+                    let mut a = pool.alloc(dims.to_vec(), data_type)?;
+                    a.fill().data_mut().as_u8_slice_mut().fill(0);
+                    Ok(a)
+                };
+                Ok(Self {
+                    raw: alloc()?,
+                    background: alloc()?,
+                    ramp: alloc()?,
+                    peak: alloc()?,
+                })
             }
 
             fn compute(&mut self, cfg: &SimConfig, st: &mut DynState, reset: bool, rng: &mut Rng) {
-                match self { $(Self::$dt(b) => compute_array(b, cfg, st, reset, rng)),* }
-            }
-
-            /// Copy of the accumulating raw buffer, as an `NDDataBuffer`.
-            fn raw_buffer(&self) -> NDDataBuffer {
-                match self { $(Self::$dt(b) => NDDataBuffer::$buf(b.raw.clone())),* }
+                match (
+                    self.raw.fill().data_mut().view_mut(),
+                    self.background.fill().data_mut().view_mut(),
+                    self.ramp.fill().data_mut().view_mut(),
+                    self.peak.fill().data_mut().view_mut(),
+                ) {
+                    $((
+                        NDDataViewMut::$buf(raw),
+                        NDDataViewMut::$buf(background),
+                        NDDataViewMut::$buf(ramp),
+                        NDDataViewMut::$buf(peak),
+                    ) => compute_array(&mut Bufs { raw, background, ramp, peak }, cfg, st, reset, rng),)*
+                    _ => unreachable!("allocated with one data type"),
+                }
             }
         }
     };
@@ -467,12 +480,12 @@ fn rgb_row_bases(layout: &Layout, row: usize, size_x: usize, size_y: usize) -> (
 /// `simDetector::computeLinearRampArray` (simDetector.cpp:110-230).
 fn compute_linear_ramp<T: SimPixel>(b: &mut Bufs<T>, cfg: &SimConfig, st: &DynState, reset: bool) {
     if st.use_background {
-        fill_linear_ramp(&mut b.ramp, cfg, reset);
+        fill_linear_ramp(b.ramp, cfg, reset);
         for (r, m) in b.raw.iter_mut().zip(b.ramp.iter()) {
             *r = r.add_c(*m);
         }
     } else {
-        fill_linear_ramp(&mut b.raw, cfg, reset);
+        fill_linear_ramp(b.raw, cfg, reset);
     }
 }
 
@@ -536,9 +549,9 @@ fn compute_peaks<T: SimPixel>(b: &mut Bufs<T>, cfg: &SimConfig, reset: bool, rng
     let pfw_y = peak_full_width(cfg.peak_width_y, sy);
 
     if reset {
-        fill_peak_gaussian(&mut b.peak, cfg, pfw_x, pfw_y);
+        fill_peak_gaussian(b.peak, cfg, pfw_x, pfw_y);
     }
-    add_peaks(&b.peak, &mut b.raw, cfg, pfw_x, pfw_y, rng);
+    add_peaks(b.peak, b.raw, cfg, pfw_x, pfw_y, rng);
 }
 
 /// The 2-D Gaussian kernel, laid out with row stride `maxSizeX`.
@@ -669,11 +682,11 @@ fn compute_sine<T: SimPixel>(b: &mut Bufs<T>, cfg: &SimConfig, st: &mut DynState
                     cfg.gain * cfg.gain_blue * (st.x_sine2[j] + st.y_sine2[i]) / 2.0,
                 ];
                 for (base, value) in bases.iter().zip(values.iter()) {
-                    raw_add(&mut b.raw, base + j * column_step, *value);
+                    raw_add(b.raw, base + j * column_step, *value);
                 }
             } else {
                 let idx = bases[0] + j;
-                raw_add(&mut b.raw, idx, cfg.gain * (st.y_sine1[i] + st.x_sine1[j]));
+                raw_add(b.raw, idx, cfg.gain * (st.y_sine1[i] + st.x_sine1[j]));
             }
         }
     }
@@ -739,24 +752,41 @@ impl SimEngine {
     /// reallocated (and therefore reset) whenever the element count or data type
     /// changes, so `reset` is exactly "the working buffers are fresh" — the
     /// invariant the absolute-vs-incremental branches in the generators depend on.
+    /// The error is the text of C's asynPrint for the refused allocation.
     pub fn compute_image(
         &mut self,
         cfg: &SimConfig,
-        pool: &NDArrayPool,
+        pool: &DriverPool,
         reset_requested: bool,
-    ) -> ADResult<NDArray> {
+    ) -> Result<PublishedArray, &'static str> {
         let layout = Layout::for_color_mode(cfg.color_mode);
         let sx = cfg.geometry.max_size_x as usize;
         let sy = cfg.geometry.max_size_y as usize;
-        let n_elements = sx * sy * if layout.is_color() { 3 } else { 1 };
+        // The raw array is always the full detector: maxSizeX x maxSizeY.
+        let mut dims = vec![NDDimension::new(0); layout.ndims];
+        dims[layout.x_dim] = NDDimension::new(sx);
+        dims[layout.y_dim] = NDDimension::new(sy);
+        if let Some(c) = layout.color_dim {
+            dims[c] = NDDimension::new(3);
+        }
 
-        let stale = self
-            .buffers
-            .as_ref()
-            .is_none_or(|b| b.len() != n_elements || b.data_type() != cfg.data_type);
+        let stale = self.buffers.as_ref().is_none_or(|b| {
+            b.raw.data().data_type() != cfg.data_type
+                || !b
+                    .raw
+                    .dims
+                    .iter()
+                    .map(|d| d.size)
+                    .eq(dims.iter().map(|d| d.size))
+        });
         let reset = reset_requested || stale;
         if reset {
-            self.buffers = Some(SimBuffers::new(cfg.data_type, n_elements));
+            // C releases the previous buffers before allocating the new ones.
+            self.buffers = None;
+            self.buffers = Some(
+                SimBuffers::alloc(pool, &dims, cfg.data_type)
+                    .map_err(|_| "error allocating raw buffer")?,
+            );
             self.state.x_sine1 = Vec::new();
             self.state.x_sine2 = Vec::new();
             self.state.y_sine1 = Vec::new();
@@ -769,19 +799,12 @@ impl SimEngine {
             .expect("buffers allocated on the reset path above");
         bufs.compute(cfg, &mut self.state, reset, &mut self.rng);
 
-        // The raw array is always the full detector: maxSizeX x maxSizeY.
-        let mut dims = vec![NDDimension::new(0); layout.ndims];
-        dims[layout.x_dim] = NDDimension::new(sx);
-        dims[layout.y_dim] = NDDimension::new(sy);
-        if let Some(c) = layout.color_dim {
-            dims[c] = NDDimension::new(3);
-        }
-        let mut raw = NDArray::with_data(dims, bufs.raw_buffer());
+        let raw = &mut bufs.raw;
         if cfg.sim_mode != SimMode::OffsetNoise {
             // C adds the ColorMode attribute inside the three pattern
             // generators; SimModeOffsetNoise is an empty case, so its arrays
             // carry no ColorMode attribute.
-            raw.attributes.add(NDAttribute {
+            raw.fill().attributes_mut().add(NDAttribute {
                 name: "ColorMode".into(),
                 description: "Color mode".into(),
                 source: NDAttrSource::Driver,
@@ -809,32 +832,37 @@ impl SimEngine {
             dims_out[c] = NDDimension::new(3);
         }
 
-        pool.convert(&raw, &dims_out, cfg.data_type)
+        // C releases pArrays[0] after the reset and converts into it under
+        // the driver lock (simDetector.cpp:694-699).
+        pool.owner()
+            .replace_array(0, || pool.convert(raw, &dims_out, cfg.data_type).ok())
+            .ok_or("error allocating buffer in convert()")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataView};
 
-    fn pool() -> std::sync::Arc<NDArrayPool> {
-        NDArrayPool::new(0)
+    fn pool() -> DriverPool {
+        DriverPool::standalone(0)
     }
 
     fn engine() -> SimEngine {
         SimEngine::new(Rng::new(0xC0FFEE))
     }
 
-    fn pixels_u8(a: &NDArray) -> &Vec<u8> {
-        match &a.data {
-            NDDataBuffer::U8(v) => v,
+    fn pixels_u8(a: &NDArray) -> &[u8] {
+        match a.data().view() {
+            NDDataView::U8(v) => v,
             other => panic!("expected U8 buffer, got {:?}", other.data_type()),
         }
     }
 
-    fn pixels_f64(a: &NDArray) -> &Vec<f64> {
-        match &a.data {
-            NDDataBuffer::F64(v) => v,
+    fn pixels_f64(a: &NDArray) -> &[f64] {
+        match a.data().view() {
+            NDDataView::F64(v) => v,
             other => panic!("expected F64 buffer, got {:?}", other.data_type()),
         }
     }
@@ -981,6 +1009,36 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------- the pool
+
+    /// C allocates pRaw_, pBackground_, pRamp_ and pPeak_ from the pool on a
+    /// reset and holds them (simDetector.cpp:625-638); a frame only converts.
+    #[test]
+    fn the_working_buffers_are_charged_once_at_reset() {
+        let cfg = SimConfig::defaults(4, 3);
+        let pool = pool();
+        let mut eng = engine();
+        drop(eng.compute_image(&cfg, &pool, true).unwrap());
+        assert_eq!(pool.num_alloc_buffers(), 5);
+        let charged = pool.allocated_bytes();
+        assert_eq!(charged, 5 * 12);
+        for _ in 0..3 {
+            drop(eng.compute_image(&cfg, &pool, false).unwrap());
+        }
+        assert_eq!(pool.num_alloc_buffers(), 5);
+        assert_eq!(pool.allocated_bytes(), charged);
+    }
+
+    #[test]
+    fn a_pool_without_room_for_the_working_buffers_refuses_the_reset() {
+        let cfg = SimConfig::defaults(4, 3);
+        let pool = DriverPool::standalone(3 * 12);
+        assert_eq!(
+            engine().compute_image(&cfg, &pool, true).err(),
+            Some("error allocating raw buffer")
+        );
+    }
+
     // ----------------------------------------------------------- linear ramp
 
     #[test]
@@ -1004,7 +1062,7 @@ mod tests {
         cfg.gain = 3.0;
         let mut eng = engine();
         let first = eng.compute_image(&cfg, &pool(), true).unwrap();
-        let first: Vec<u8> = pixels_u8(&first).clone();
+        let first: Vec<u8> = pixels_u8(&first).to_vec();
         let second = eng.compute_image(&cfg, &pool(), false).unwrap();
         let second = pixels_u8(&second);
         for (a, b) in first.iter().zip(second.iter()) {
@@ -1121,7 +1179,7 @@ mod tests {
         cfg.noise = 100.0;
         let mut eng = engine();
         let a = eng.compute_image(&cfg, &pool(), true).unwrap();
-        let a: Vec<f64> = pixels_f64(&a).clone();
+        let a: Vec<f64> = pixels_f64(&a).to_vec();
         let b = eng.compute_image(&cfg, &pool(), false).unwrap();
         let b = pixels_f64(&b);
         let is_rotation = (0..8).any(|k| (0..8).all(|i| b[i] == a[(i + k) % 8]));
@@ -1346,7 +1404,7 @@ mod tests {
         cfg.sim_mode = SimMode::Sine;
         cfg.gain = 100.0;
         let add = engine().compute_image(&cfg, &pool(), true).unwrap();
-        let add: Vec<f64> = pixels_f64(&add).clone();
+        let add: Vec<f64> = pixels_f64(&add).to_vec();
 
         cfg.x_sine.operation = SineOperation::Multiply;
         cfg.y_sine.operation = SineOperation::Multiply;
@@ -1365,7 +1423,7 @@ mod tests {
         cfg.y_sine.amplitude2 = 0.0;
         let mut eng = engine();
         let f1 = eng.compute_image(&cfg, &pool(), true).unwrap();
-        let f1: Vec<f64> = pixels_f64(&f1).clone();
+        let f1: Vec<f64> = pixels_f64(&f1).to_vec();
         let f2 = eng.compute_image(&cfg, &pool(), false).unwrap();
         let f2 = pixels_f64(&f2);
         // Sine period in x is exactly one frame width, so frame 2's samples repeat
@@ -1379,7 +1437,7 @@ mod tests {
         cfg.gain_x = 0.25;
         let mut eng = engine();
         let g1 = eng.compute_image(&cfg, &pool(), true).unwrap();
-        let g1: Vec<f64> = pixels_f64(&g1).clone();
+        let g1: Vec<f64> = pixels_f64(&g1).to_vec();
         let g2 = eng.compute_image(&cfg, &pool(), false).unwrap();
         assert_ne!(g1, *pixels_f64(&g2));
     }
@@ -1504,8 +1562,8 @@ mod tests {
             ] {
                 cfg.sim_mode = mode;
                 let img = engine().compute_image(&cfg, &pool(), true).unwrap();
-                assert_eq!(img.data.data_type(), dt, "{dt:?} / {mode:?}");
-                assert_eq!(img.data.len(), 16);
+                assert_eq!(img.data().data_type(), dt, "{dt:?} / {mode:?}");
+                assert_eq!(img.data().len(), 16);
             }
         }
     }

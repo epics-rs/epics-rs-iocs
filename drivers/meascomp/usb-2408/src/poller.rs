@@ -2,34 +2,43 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
-use meascomp::error::MeasCompError;
 
+use crate::board_enums::{AI_CHAN_TYPE_TC, AI_CHAN_TYPE_VOLTAGE, map_range, temp_scale};
+use crate::driver::MultiFunctionDriver;
 use crate::params::*;
-use crate::trace::{self, DRIVER};
-use crate::wave_dig::{self, WaveDigState};
+use crate::trace::{SelfTrace, status_of};
+use crate::wave_dig::{self, WaveDigScan, WaveDigState};
 use crate::wave_gen::{self, WaveGenState};
 
 /// Shared state between driver and poller.
 pub struct PollerState {
     pub wave_dig: WaveDigState,
     pub wave_gen: WaveGenState,
+    pub trace: SelfTrace,
+    /// C `aiInputMode_`: the uldaq mode ANALOG_IN_MODE writes map to
+    /// (drvMultiFunction.cpp:1279, 1989), not the record's menu value.
+    pub ai_input_mode: i32,
 }
 
-/// Start the polling thread for USB-2408-2AO.
+/// Start the polling thread for USB-2408-2AO, reading the first `ai_chans`
+/// voltage and `tc_chans` thermocouple inputs.
 pub fn start_poller(
     handle: PortHandle,
     params: MultiFunctionParams,
     device: Arc<Mutex<DaqDevice>>,
     state: Arc<Mutex<PollerState>>,
+    ai_chans: usize,
+    tc_chans: usize,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("usb-2408-poller".into())
-        .spawn(move || poller_loop(handle, params, device, state))
+        .spawn(move || poller_loop(handle, params, device, state, ai_chans, tc_chans))
         .expect("failed to spawn USB-2408 poller thread")
 }
 
@@ -44,41 +53,16 @@ struct PollSnapshot {
     // wave_gen / wave_dig status
     wave_gen_running: bool,
     wave_gen_current_point: usize,
-    /// The generation of a generator scan that went idle this cycle.
-    wave_gen_ended: Option<u64>,
+    wave_gen_just_stopped: bool,
+    /// Running at the start of the cycle.
     wave_dig_running: bool,
     wave_dig_current_point: usize,
-    /// The generation of a digitizer scan that went idle this cycle.
-    wave_dig_ended: Option<u64>,
+    /// Array callbacks of a digitizer scan that ended this cycle, built
+    /// while the state lock is held and pushed after it is released.
+    wave_dig_arrays: Option<Vec<ParamSetValue>>,
     // Analog inputs (only populated when wave_dig is not running)
     ai_raw: [Option<i32>; MAX_ANALOG_IN],
     ai_temp: [Option<f64>; MAX_ANALOG_IN],
-    /// The C lines of the first call that failed this cycle. C prints them
-    /// only when the previous cycle did not fail, and only that call's,
-    /// since it abandons the cycle there (`goto error`).
-    failure: Vec<String>,
-    /// The first ulTIn failure's line. C prints every one as it happens,
-    /// every cycle, so it is printed on the spot; it fails the cycle all
-    /// the same.
-    tin_failure: Option<String>,
-}
-
-impl PollSnapshot {
-    /// Keep a failed call's C lines, if it is the cycle's first failure.
-    fn failed(&mut self, lines: Vec<String>) {
-        if self.failure.is_empty() {
-            self.failure = lines;
-        }
-    }
-}
-
-/// C `reportError(err, "pollerThread", message)` for a failed call
-/// (drvMultiFunction.cpp:1315-1318).
-fn error_line(message: &str, e: &MeasCompError) -> String {
-    format!(
-        "{DRIVER}::pollerThread Error: {message}, err={} {}",
-        e.code, e.message
-    )
 }
 
 fn poller_loop(
@@ -86,179 +70,182 @@ fn poller_loop(
     params: MultiFunctionParams,
     device: Arc<Mutex<DaqDevice>>,
     state: Arc<Mutex<PollerState>>,
+    ai_chans: usize,
+    tc_chans: usize,
 ) {
+    const FUNCTION: &str = "pollerThread";
     let mut prev_digital_input: u64 = 0;
     let mut force_callback = true;
-    let mut cycle_start = Instant::now();
-    // C prevStatus: whether the previous cycle failed. A failure is
-    // reported once when it starts and once when it clears, not every poll.
-    let mut prev_failed = false;
+    let trace = state.lock().unwrap().trace.clone();
+    // C `prevStatus`: a failing call is reported on the first cycle of an
+    // outage only, and its end once.
+    let mut prev_status = 0;
+    let mut start = Instant::now();
 
     loop {
-        // C publishes the time from the previous loop top to this one, so
-        // POLL_TIME_MS is the real cycle time, sleep included.
-        let now = Instant::now();
-        publish(
-            &handle,
-            0,
-            vec![ParamSetValue::new(
-                params.poll_time_ms,
-                0,
-                ParamValue::Float64(now.duration_since(cycle_start).as_secs_f64() * 1000.0),
-            )],
-        );
-        cycle_start = now;
+        // C's POLL_TIME_MS is the period from one pass's start to the next.
+        let poll_time = start.elapsed();
+        start = Instant::now();
 
         // ---- Phase 1: read config params (no device lock) ----
-        let input_mode = handle
-            .read_int32_blocking(params.analog_in_mode, 0)
-            .unwrap_or(uldaq_sys::AI_DIFFERENTIAL);
+        // C pollerThread's getIntegerParam reads (drvMultiFunction.cpp:
+        // 2762-2763, 2790-2793) into uninitialised locals, status ignored.
+        let input_mode = state
+            .lock()
+            .map_or(uldaq_sys::AI_SINGLE_ENDED, |st| st.ai_input_mode);
         let mut in_types = [0i32; MAX_ANALOG_IN];
-        let mut in_ranges = [uldaq_sys::BIP10VOLTS; MAX_ANALOG_IN];
-        let mut tc_scales = [uldaq_sys::TS_CELSIUS; MAX_ANALOG_IN];
+        let mut in_ranges = [0i32; MAX_ANALOG_IN];
+        let mut tc_scales = [0i32; MAX_ANALOG_IN];
         for ch in 0..MAX_ANALOG_IN {
-            in_types[ch] = handle
-                .read_int32_blocking(params.analog_in_type, ch as i32)
-                .unwrap_or(0);
-            in_ranges[ch] = handle
-                .read_int32_blocking(params.analog_in_range, ch as i32)
-                .unwrap_or(uldaq_sys::BIP10VOLTS);
-            tc_scales[ch] = handle
-                .read_int32_blocking(params.temperature_scale, ch as i32)
-                .unwrap_or(uldaq_sys::TS_CELSIUS);
+            in_types[ch] = get_int(&handle, params.analog_in_type, ch as i32);
+            in_ranges[ch] = get_int(&handle, params.analog_in_range, ch as i32);
+            tc_scales[ch] = get_int(&handle, params.temperature_scale, ch as i32);
         }
 
+        // What a digitizer scan that ends this cycle restarts with.
+        let restart = if state.lock().is_ok_and(|st| st.wave_dig.running) {
+            WaveDigScan::read_restart(
+                &params,
+                input_mode,
+                |r, a| get_int(&handle, r, a),
+                |r, a| get_float(&handle, r, a),
+            )
+        } else {
+            None
+        };
+
+        // What a generator that ends this cycle puts back.
+        let wave_gen_restore = if state.lock().is_ok_and(|st| st.wave_gen.running) {
+            wave_gen::restore_outputs(&params, |r, a| get_int(&handle, r, a))
+        } else {
+            Vec::new()
+        };
+
         // ---- Phase 2: uldaq reads (device lock held) ----
+        // C `status`: the last uldaq call's result. A failed DIn, CIn or
+        // AOutScanStatus ends the cycle's reads (C `goto error`).
+        let mut status = 0;
+        let mut goto_error = false;
         let snapshot = {
             let mut snap = PollSnapshot::default();
             if let Ok(dev) = device.lock() {
-                match dev.digital_in(uldaq_sys::AUXPORT) {
-                    Ok(data) => snap.digital_input = Some(data),
-                    // C adds the index of the port that failed
-                    // (drvMultiFunction.cpp:2620-2623).
-                    Err(e) => snap.failed(vec![
-                        error_line("Calling DIn", &e),
-                        "portNumber=0".to_string(),
-                    ]),
-                }
-
-                for counter in 0..MAX_COUNTERS {
-                    match dev.counter_in(counter as i32) {
-                        Ok(value) => snap.counters[counter] = Some(value as i64),
-                        Err(e) => snap.failed(vec![error_line("Calling CIn", &e)]),
-                    }
-                }
-
-                if let Ok(mut st) = state.lock() {
-                    if st.wave_gen.running {
-                        let (p, ended) = wave_gen::read_wave_gen(&dev, &mut st.wave_gen);
-                        if p.code == uldaq_sys::ERR_NO_ERROR {
-                            trace::print(
-                                &handle,
-                                TraceMask::IO_DRIVER,
-                                format_args!(
-                                    "{DRIVER}::pollerThread waveform generator status, \
-                                     aoStatus={}, aoCount={}, aoIndex={}",
-                                    p.status, p.total_count, p.index
-                                ),
-                            );
-                        } else {
-                            snap.failed(vec![error_line(
-                                "Calling AOutScanStatus",
-                                &MeasCompError::from_code(p.code),
-                            )]);
+                'error: {
+                    // C reads every DIO_INFO_NUM_PORTS port (drvMultiFunction.cpp:
+                    // 2604-2631), but uldaq refuses the 2408's AUXPORT1/2 without
+                    // an expansion board (DioUsb24xx.cpp:41), so every C poll ends
+                    // there before any input is read. That C defect is not copied.
+                    match dev.digital_in(uldaq_sys::AUXPORT) {
+                        Ok(data) => snap.digital_input = Some(data),
+                        Err(e) => {
+                            status = e.code;
+                            if prev_status == 0 {
+                                trace.report_error(status, FUNCTION, "Calling DIn");
+                                trace.print(TraceMask::ERROR, format_args!("portNumber=0\n"));
+                            }
+                            goto_error = true;
+                            break 'error;
                         }
-                        if ended {
-                            snap.wave_gen_ended = Some(st.wave_gen.generation);
+                    }
+
+                    for counter in 0..MAX_COUNTERS {
+                        match dev.counter_in(counter as i32) {
+                            Ok(value) => snap.counters[counter] = Some(value as i64),
+                            Err(e) => {
+                                status = e.code;
+                                if prev_status == 0 {
+                                    trace.report_error(status, FUNCTION, "Calling CIn");
+                                }
+                                goto_error = true;
+                                break 'error;
+                            }
+                        }
+                    }
+
+                    let Ok(mut st) = state.lock() else {
+                        break 'error;
+                    };
+                    let wg_was_running = st.wave_gen.running;
+                    if st.wave_gen.running {
+                        if let Err(code) = wave_gen::read_wave_gen(
+                            &dev,
+                            &mut st.wave_gen,
+                            &wave_gen_restore,
+                            &trace,
+                        ) {
+                            status = code;
+                            if prev_status == 0 {
+                                trace.report_error(status, FUNCTION, "Calling AOutScanStatus");
+                            }
+                            goto_error = true;
+                            break 'error;
                         }
                         snap.wave_gen_current_point = st.wave_gen.current_point;
                     }
                     snap.wave_gen_running = st.wave_gen.running;
+                    snap.wave_gen_just_stopped = wg_was_running && !st.wave_gen.running;
 
                     if st.wave_dig.running {
-                        let (p, ended) = wave_dig::read_wave_dig(&dev, &mut st.wave_dig);
-                        if p.code == uldaq_sys::ERR_NO_ERROR {
-                            trace::print(
-                                &handle,
-                                TraceMask::IO_DRIVER,
-                                format_args!(
-                                    "{DRIVER}::pollerThread waveform digitizer status, \
-                                     aiStatus={}, aiCount={}, aiIndex={}",
-                                    p.status, p.total_count, p.index
-                                ),
-                            );
-                        } else {
-                            snap.failed(vec![error_line(
-                                "Calling AInScanStatus",
-                                &MeasCompError::from_code(p.code),
-                            )]);
+                        let (code, arrays) = wave_dig::read_wave_dig(
+                            &dev,
+                            &mut st.wave_dig,
+                            &params,
+                            restart.as_ref(),
+                            prev_status,
+                            &trace,
+                        );
+                        if code != 0 {
+                            status = code;
                         }
-                        if ended {
-                            snap.wave_dig_ended = Some(st.wave_dig.generation);
-                        }
+                        snap.wave_dig_arrays = arrays;
                         snap.wave_dig_current_point = st.wave_dig.current_point;
-                    }
-                    snap.wave_dig_running = st.wave_dig.running;
-
-                    if !st.wave_dig.running {
-                        for ch in 0..MAX_ANALOG_IN {
+                        snap.wave_dig_running = true;
+                    } else {
+                        // C reads an unset channel's type and range into
+                        // the previous channel's locals; here it is 0, so
+                        // neither loop reads it.
+                        for ch in 0..ai_chans {
                             let ch_i = ch as i32;
                             // One call per channel, chosen by its configured
                             // type: ulAIn rejects a thermocouple channel with
                             // ERR_BAD_RANGE and ulTIn rejects a voltage one.
                             // C drvMultiFunction skips each the same way.
-                            if in_types[ch] == 0 {
-                                // C reads raw counts once; the record's LINR
-                                // conversion over the driver's ADC bounds
-                                // turns them into volts.
-                                match dev.analog_in(
-                                    ch_i,
-                                    input_mode,
-                                    in_ranges[ch],
-                                    uldaq_sys::AIN_FF_NOSCALEDATA,
-                                ) {
-                                    Ok(raw) => snap.ai_raw[ch] = Some(raw as i32),
-                                    // C's USB-2408 branch fails the cycle on
-                                    // it without a line of its own; the one C
-                                    // prints for the USB-TEMP-AI's ulAIn
-                                    // (drvMultiFunction.cpp:2754) says which.
-                                    Err(e) => snap.failed(vec![error_line("Calling AIn", &e)]),
-                                }
-                            } else {
-                                // An open or broken thermocouple is expected,
-                                // not an error: ulTIn reports it as -9999.
-                                let temp = match dev.temperature_in(
-                                    ch_i,
-                                    tc_scales[ch],
-                                    uldaq_sys::TIN_FF_DEFAULT,
-                                ) {
-                                    Ok(temp) => Some(temp),
-                                    Err(e) if e.code == uldaq_sys::ERR_OPEN_CONNECTION => {
-                                        Some(-9999.0)
-                                    }
-                                    Err(e) => {
-                                        let line = error_line("Calling TIn", &e);
-                                        trace::print(
-                                            &handle,
-                                            TraceMask::ERROR,
-                                            format_args!("{line}"),
-                                        );
-                                        snap.tin_failure.get_or_insert(line);
-                                        None
-                                    }
-                                };
-                                // C reports every TIn it counts as a success,
-                                // an open thermocouple included
-                                // (drvMultiFunction.cpp:2822-2834).
-                                if temp.is_some() {
-                                    trace::print(
-                                        &handle,
-                                        TraceMask::IO_DRIVER,
-                                        format_args!("{DRIVER}::pollerThread Info: Calling TIn"),
-                                    );
-                                }
-                                snap.ai_temp[ch] = temp;
+                            if in_types[ch] != AI_CHAN_TYPE_VOLTAGE {
+                                continue;
                             }
+                            let range = map_range(&trace, in_ranges[ch]);
+                            // C does not report a failed ulAIn. It reads raw
+                            // counts only; VOLTAGE_IN_VALUE is USB-TEMP-AI's.
+                            let raw = dev.analog_in(
+                                ch_i,
+                                input_mode,
+                                range,
+                                uldaq_sys::AIN_FF_NOSCALEDATA,
+                            );
+                            status = status_of(&raw);
+                            snap.ai_raw[ch] = raw.ok().map(|v| v as i32);
+                        }
+                        for ch in 0..tc_chans {
+                            if in_types[ch] != AI_CHAN_TYPE_TC {
+                                continue;
+                            }
+                            // An open or broken thermocouple is expected,
+                            // not an error: ulTIn reports it as -9999.
+                            status = match dev.temperature_in(
+                                ch as i32,
+                                temp_scale(&trace, tc_scales[ch]),
+                                uldaq_sys::TIN_FF_DEFAULT,
+                            ) {
+                                Ok(temp) => {
+                                    snap.ai_temp[ch] = Some(temp);
+                                    0
+                                }
+                                Err(e) if e.code == uldaq_sys::ERR_OPEN_CONNECTION => {
+                                    snap.ai_temp[ch] = Some(-9999.0);
+                                    0
+                                }
+                                Err(e) => e.code,
+                            };
+                            trace.report_error(status, FUNCTION, "Calling TIn");
                         }
                     }
                 }
@@ -266,183 +253,260 @@ fn poller_loop(
             snap
         }; // device lock released here
 
-        // ---- Phase 3: report + write results (no device lock) ----
-        let failed = !snapshot.failure.is_empty() || snapshot.tin_failure.is_some();
-        if failed && !prev_failed {
-            for line in &snapshot.failure {
-                trace::print(&handle, TraceMask::ERROR, format_args!("{line}"));
-            }
-            if let Some(line) = snapshot.failure.first().or(snapshot.tin_failure.as_ref()) {
-                let _ = handle.set_params_and_notify_blocking(
-                    0,
-                    vec![ParamSetValue::new(
-                        params.last_error_message,
-                        0,
-                        ParamValue::Octet(line.clone().into_bytes()),
-                    )],
-                );
-            }
-        } else if !failed && prev_failed {
-            trace::print(
-                &handle,
-                TraceMask::ERROR,
-                format_args!("{DRIVER}::pollerThread Error: Device returned to normal status"),
-            );
+        if prev_status != 0 && status == 0 {
+            trace.report_error(-1, FUNCTION, "Device returned to normal status");
         }
-        prev_failed = failed;
+        prev_status = status;
 
+        // ---- Phase 3: set the results under the port, as C's setXxxParam
+        // calls do; a `goto error` cycle skips the callbacks.
+        let int = |reason, addr: usize, v: i32| {
+            ParamSetValue::new(reason, addr as i32, ParamValue::Int32(v))
+        };
+        let float = |reason, addr: usize, v: f64| {
+            ParamSetValue::new(reason, addr as i32, ParamValue::Float64(v))
+        };
+        let mut updates = vec![float(
+            params.poll_time_ms,
+            0,
+            poll_time.as_secs_f64() * 1000.0,
+        )];
         if let Some(data) = snapshot.digital_input {
-            let changed = data ^ prev_digital_input;
-            if force_callback || changed != 0 {
-                prev_digital_input = data;
-                force_callback = false;
-                let _ = handle.set_params_and_notify_blocking(
-                    0,
-                    vec![ParamSetValue::uint32_digital(
-                        params.digital_input,
-                        0,
-                        data as u32,
-                        0xFFFF_FFFF,
-                        0,
-                    )],
-                );
-            }
+            push_digital_in(
+                &mut updates,
+                &params,
+                data,
+                &mut prev_digital_input,
+                &mut force_callback,
+            );
         }
         for (counter, value) in snapshot.counters.iter().enumerate() {
             if let Some(v) = value {
-                let addr = counter as i32;
-                publish(
-                    &handle,
-                    addr,
-                    vec![ParamSetValue::new(
-                        params.counter_value,
-                        addr,
-                        ParamValue::Int32(*v as i32),
-                    )],
-                );
+                updates.push(int(params.counter_value, counter, *v as i32));
             }
         }
-        if snapshot.wave_gen_running {
-            publish(
-                &handle,
+        if snapshot.wave_gen_running || snapshot.wave_gen_just_stopped {
+            updates.push(int(
+                params.wave_gen_current_point,
                 0,
-                vec![ParamSetValue::new(
-                    params.wave_gen_current_point,
-                    0,
-                    ParamValue::Int32(snapshot.wave_gen_current_point as i32),
-                )],
-            );
-            // C stopWaveGen from the poll: the driver ends the scan -- Run,
-            // the outputs put back -- if it is still the one that went idle.
-            if let Some(generation) = snapshot.wave_gen_ended {
-                let _ = handle.write_int32_blocking(params.wave_gen_scan_end, 0, generation as i32);
+                snapshot.wave_gen_current_point as i32,
+            ));
+            if snapshot.wave_gen_just_stopped {
+                updates.push(int(params.wave_gen_run, 0, 0));
             }
         }
         if snapshot.wave_dig_running {
-            publish(
-                &handle,
+            updates.push(int(
+                params.wave_dig_current_point,
                 0,
-                vec![ParamSetValue::new(
-                    params.wave_dig_current_point,
-                    0,
-                    ParamValue::Int32(snapshot.wave_dig_current_point as i32),
-                )],
-            );
-            // C stopWaveDig from the poll: the driver ends the scan -- data,
-            // Run, auto-restart -- if it is still the one that went idle.
-            if let Some(generation) = snapshot.wave_dig_ended {
-                let _ = handle.write_int32_blocking(params.wave_dig_scan_end, 0, generation as i32);
-            }
+                snapshot.wave_dig_current_point as i32,
+            ));
+            // The scan ended: C stopWaveDig's RUN, readWaveDig callbacks
+            // and, under AUTO_RESTART, startWaveDig's parameters.
+            updates.extend(snapshot.wave_dig_arrays.into_iter().flatten());
         } else {
-            // Every sample is a callback, changed or not, as C forces with
-            // its set(v+1)/set(v) pair: the averaging records must count each
-            // poll, and an unchanging reading must keep its timestamp moving.
-            for ch in 0..MAX_ANALOG_IN {
-                let addr = ch as i32;
-                let mut updates = Vec::new();
-                if let Some(raw) = snapshot.ai_raw[ch] {
-                    let reason = params.analog_in_value;
-                    updates.push(ParamSetValue::new(
-                        reason,
-                        addr,
-                        ParamValue::Int32(raw.wrapping_add(1)),
-                    ));
-                    updates.push(ParamSetValue::new(reason, addr, ParamValue::Int32(raw)));
-                }
-                if let Some(t) = snapshot.ai_temp[ch] {
-                    let reason = params.temperature_in_value;
-                    updates.push(ParamSetValue::new(
-                        reason,
-                        addr,
-                        ParamValue::Float64(t + 1.0),
-                    ));
-                    updates.push(ParamSetValue::new(reason, addr, ParamValue::Float64(t)));
-                }
-                if !updates.is_empty() {
-                    let _ = handle.set_params_and_notify_blocking(addr, updates);
+            push_analog_in(&mut updates, &params, &snapshot);
+        }
+        let _ = handle.with_driver_blocking::<MultiFunctionDriver, _>(move |driver| {
+            let base = driver.base_mut();
+            for update in updates {
+                let _ = base.set_param(&update);
+            }
+            if !goto_error {
+                for addr in 0..MAX_SIGNALS as i32 {
+                    let _ = base.call_param_callbacks(addr);
                 }
             }
-        }
+        });
 
-        for addr in 0..MAX_SIGNALS as i32 {
-            let _ = handle.call_param_callbacks_blocking(addr);
-        }
-
-        let poll_ms = handle
-            .read_float64_blocking(params.poll_sleep_ms, 0)
-            .unwrap_or(50.0);
-        std::thread::sleep(poll_sleep(poll_ms));
+        // C :2847-2848; the ctor sets POLL_SLEEP_MS.
+        let poll_ms = get_float(&handle, params.poll_sleep_ms, 0);
+        std::thread::sleep(Duration::from_secs_f64(poll_ms.max(0.0) / 1000.0));
     }
 }
 
-/// Store readbacks and run their callbacks, without going through the
-/// driver's write handlers: a readback is not a command.
-fn publish(handle: &PortHandle, addr: i32, updates: Vec<ParamSetValue>) {
-    let _ = handle.set_params_and_notify_blocking(addr, updates);
+/// C's digital-input set of one poll: on the first poll or a changed bit
+/// (drvMultiFunction.cpp:2626-2631).
+fn push_digital_in(
+    updates: &mut Vec<ParamSetValue>,
+    params: &MultiFunctionParams,
+    data: u64,
+    prev: &mut u64,
+    force: &mut bool,
+) {
+    if !*force && data == *prev {
+        return;
+    }
+    // C's set carries no interrupt mask, so its first poll fires whatever
+    // paramVal left in the never-initialised uInt32CallbackMask
+    // (paramVal.cpp:34-46). The first poll forces every bit instead, so each
+    // bit record processes once at boot even when its bit reads 0.
+    let interrupt_mask = if *force { 0xFFFF_FFFF } else { 0 };
+    *prev = data;
+    *force = false;
+    updates.push(ParamSetValue::uint32_digital(
+        params.digital_input,
+        0,
+        data as u32,
+        0xFFFF_FFFF,
+        interrupt_mask,
+    ));
 }
 
-/// C `epicsThreadSleep(pollTime/1000.)`: the fraction of a millisecond is
-/// kept, and a negative or non-finite POLL_SLEEP_MS sleeps not at all.
-fn poll_sleep(poll_ms: f64) -> Duration {
-    Duration::try_from_secs_f64(poll_ms / 1000.0).unwrap_or(Duration::ZERO)
+/// C's analog-input sets of one poll (drvMultiFunction.cpp:2783-2785,
+/// 2830-2832). C sets each value off by one first to force a callback even
+/// when the value has not changed.
+fn push_analog_in(
+    updates: &mut Vec<ParamSetValue>,
+    params: &MultiFunctionParams,
+    snap: &PollSnapshot,
+) {
+    for ch in 0..MAX_ANALOG_IN {
+        if let Some(raw) = snap.ai_raw[ch] {
+            for v in [raw.wrapping_add(1), raw] {
+                updates.push(ParamSetValue::new(
+                    params.analog_in_value,
+                    ch as i32,
+                    ParamValue::Int32(v),
+                ));
+            }
+        }
+    }
+    for ch in 0..MAX_ANALOG_IN {
+        if let Some(t) = snap.ai_temp[ch] {
+            for v in [t + 1.0, t] {
+                updates.push(ParamSetValue::new(
+                    params.temperature_in_value,
+                    ch as i32,
+                    ParamValue::Float64(v),
+                ));
+            }
+        }
+    }
+}
+
+/// The driver's `int` rule over the port handle: C's getIntegerParam with
+/// its status ignored, an unset value read as 0.
+fn get_int(handle: &PortHandle, reason: usize, addr: i32) -> i32 {
+    handle.read_int32_blocking(reason, addr).unwrap_or(0)
+}
+
+/// C `getDoubleParam`; see [`get_int`].
+fn get_float(handle: &PortHandle, reason: usize, addr: i32) -> f64 {
+    handle.read_float64_blocking(reason, addr).unwrap_or(0.0)
 }
 
 #[cfg(test)]
 mod tests {
+    use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+
     use super::*;
 
     #[test]
-    fn a_fractional_poll_sleep_is_kept() {
-        assert_eq!(poll_sleep(0.5), Duration::from_micros(500));
-        assert_eq!(poll_sleep(50.0), Duration::from_millis(50));
-    }
-
-    #[test]
-    fn a_cycle_keeps_only_its_first_failure() {
-        let mut snap = PollSnapshot::default();
-        snap.failed(vec!["DIn".to_string(), "portNumber=0".to_string()]);
-        snap.failed(vec!["CIn".to_string()]);
-        assert_eq!(snap.failure, ["DIn", "portNumber=0"]);
-    }
-
-    #[test]
-    fn a_failed_call_is_reported_in_c_words() {
-        let e = MeasCompError {
-            code: uldaq_sys::ERR_DEV_NOT_CONNECTED,
-            message: "Device not connected".to_string(),
-        };
+    fn the_first_digital_poll_calls_back_every_bit() {
+        let mut base = PortDriverBase::new(
+            "MFPOLLDI",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let (mut prev, mut force) = (0, true);
+        // Every input low: no bit changed, yet each bit record must process.
+        for (poll, want) in [(0, Some(0xFFFF_FFFF)), (1, None)] {
+            let mut updates = Vec::new();
+            push_digital_in(&mut updates, &params, 0, &mut prev, &mut force);
+            assert_eq!(updates.len(), usize::from(want.is_some()), "poll {poll}");
+            for update in &updates {
+                base.set_param(update).unwrap();
+            }
+            if let Some(mask) = want {
+                assert_eq!(
+                    base.params
+                        .take_uint32_interrupt_mask(params.digital_input, 0)
+                        .unwrap(),
+                    mask
+                );
+            }
+        }
+        // A later change calls back the changed bits only.
+        let mut updates = Vec::new();
+        push_digital_in(&mut updates, &params, 0x5, &mut prev, &mut force);
+        for update in &updates {
+            base.set_param(update).unwrap();
+        }
         assert_eq!(
-            error_line("Calling CIn", &e),
-            format!(
-                "MultiFunction::pollerThread Error: Calling CIn, err={} Device not connected",
-                uldaq_sys::ERR_DEV_NOT_CONNECTED
-            )
+            base.params
+                .take_uint32_interrupt_mask(params.digital_input, 0)
+                .unwrap(),
+            0x5
         );
     }
 
     #[test]
-    fn an_unusable_poll_sleep_does_not_sleep() {
-        assert_eq!(poll_sleep(-1.0), Duration::ZERO);
-        assert_eq!(poll_sleep(f64::NAN), Duration::ZERO);
+    fn an_unchanged_analog_input_calls_back_every_poll() {
+        let mut base = PortDriverBase::new(
+            "MFPOLL",
+            MAX_SIGNALS,
+            PortFlags::default(),
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM
+                | InterfaceMask::DRV_USER,
+            InterfaceMask::UINT32_DIGITAL
+                | InterfaceMask::INT32
+                | InterfaceMask::INT32_ARRAY
+                | InterfaceMask::FLOAT32_ARRAY
+                | InterfaceMask::FLOAT64
+                | InterfaceMask::FLOAT64_ARRAY
+                | InterfaceMask::OCTET
+                | InterfaceMask::ENUM,
+        );
+        let params = MultiFunctionParams::create(&mut base).unwrap();
+        let mut snap = PollSnapshot::default();
+        snap.ai_raw[3] = Some(1234);
+        snap.ai_temp[3] = Some(21.5);
+        for poll in 0..2 {
+            let mut updates = Vec::new();
+            push_analog_in(&mut updates, &params, &snap);
+            for update in &updates {
+                base.set_param(update).unwrap();
+            }
+            assert_eq!(
+                base.params.take_changed(3).unwrap(),
+                [params.analog_in_value, params.temperature_in_value],
+                "poll {poll}"
+            );
+            assert_eq!(
+                base.get_int32_param(params.analog_in_value, 3).unwrap(),
+                1234
+            );
+            assert_eq!(
+                base.get_float64_param(params.temperature_in_value, 3)
+                    .unwrap(),
+                21.5
+            );
+        }
     }
 }

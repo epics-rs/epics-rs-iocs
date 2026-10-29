@@ -15,6 +15,8 @@
 //! that buffer by absolute offset. [`ResponseBuf`] is the buffer, [`decode`] the
 //! decoder.
 
+use epics_libcom_rs::cfmt::CFloat;
+
 use super::scan::{scan_char, scan_float, scan_int};
 use super::{CBuf, cstr};
 
@@ -130,7 +132,8 @@ pub fn configure(dev: DevType, address: i32, user_param: &str) -> Result<Config,
             }
             let limit = if dev == DevType::Mpc { 2 } else { 4 };
             if !(1..=limit).contains(&station) {
-                return Err(format!("{dev:?} station out of range {station}"));
+                let model = if dev == DevType::Mpc { "MPC" } else { "QPC" };
+                return Err(format!("{model} station out of range {station}"));
             }
             cfg.prefix = format!("~ {address:02X}").into_bytes();
             cfg.pump_no = station;
@@ -159,26 +162,6 @@ pub fn build_command(cfg: &Config, pvalue: &[u8]) -> Vec<u8> {
     // truncated there, so the same bound holds here.
     buf.truncate(READ_SIZE - 1);
     buf
-}
-
-/// C `printf("%.0e", v)`: one mantissa digit, `e`, sign, at least two exponent
-/// digits. Rust's `{:.0e}` rounds the same way but writes a bare exponent.
-fn fmt_e0(v: f64) -> String {
-    reformat_exponent(&format!("{v:.0e}"), 'e')
-}
-
-/// C `printf("%.1E", v)`.
-fn fmt_e1_upper(v: f64) -> String {
-    reformat_exponent(&format!("{v:.1E}"), 'E')
-}
-
-fn reformat_exponent(s: &str, marker: char) -> String {
-    let (mantissa, exp) = s.split_once(marker).expect("float always has an exponent");
-    let (sign, digits) = match exp.strip_prefix('-') {
-        Some(d) => ('-', d),
-        None => ('+', exp.strip_prefix('+').unwrap_or(exp)),
-    };
-    format!("{mantissa}{marker}{sign}{digits:0>2}")
 }
 
 /// The record fields the control-command builder reads. Arrays are indexed
@@ -310,10 +293,16 @@ fn digitel_setpoint_command(cfg: &Config, f: &ControlFields) -> Vec<u8> {
 
 /// C: `sprintf(pvalue, "S%d%d%.0e", ...); pvalue[4] = pvalue[7]; pvalue[5] = 0;`
 /// — "Snmxe-0y" collapsed to "Snmxy", keeping only the last exponent digit.
+/// `pvalue` is zeroed first, so a NaN or inf ("Snmnan") gets the NUL past
+/// its end and the string stops at four bytes.
 fn snm_pressure(n: usize, m: usize, value: f64) -> Vec<u8> {
-    let mut p = format!("S{n}{m}{}", fmt_e0(value)).into_bytes();
+    let mut p = format!("S{n}{m}{:.0e}", CFloat(value)).into_bytes();
+    p.resize(p.len().max(8), 0);
     p[4] = p[7];
     p.truncate(5);
+    if let Some(nul) = p.iter().position(|&b| b == 0) {
+        p.truncate(nul);
+    }
     p
 }
 
@@ -388,12 +377,12 @@ fn mpc_setpoint_command(cfg: &Config, f: &ControlFields) -> Vec<u8> {
         return Vec::new();
     }
     format!(
-        " {} {},{},{:>7},{:>7}",
+        " {} {},{},{:7.1E},{:7.1E}",
         CTL_CMD[5],
         t1,
         cfg.pump_no,
-        fmt_e1_upper(val1 as f64),
-        fmt_e1_upper(val2 as f64)
+        CFloat(f64::from(val1)),
+        CFloat(f64::from(val2))
     )
     .into_bytes()
 }
@@ -1057,19 +1046,6 @@ mod tests {
         );
     }
 
-    // ---- %.0e / %.1E ------------------------------------------------------
-
-    #[test]
-    fn exponent_formats_match_c_printf() {
-        assert_eq!(fmt_e0(1e-6), "1e-06");
-        assert_eq!(fmt_e0(1e-11), "1e-11");
-        assert_eq!(fmt_e0(0.0), "0e+00");
-        assert_eq!(fmt_e0(1e5), "1e+05");
-        assert_eq!(fmt_e1_upper(1e-6), "1.0E-06");
-        assert_eq!(fmt_e1_upper(0.0), "0.0E+00");
-        assert_eq!(fmt_e1_upper(1.25e-5), "1.3E-05");
-    }
-
     // ---- control commands: Digitel ----------------------------------------
 
     #[test]
@@ -1123,6 +1099,12 @@ mod tests {
         f.spfg = MOD_SNHS[1];
         f.shs[1] = 1e-11;
         assert_eq!(control_command(&c, MOD_SETP, &f).payload, b"S2211");
+        // C's zeroed `pvalue` puts a NUL at [7] past "S22nan", ending the
+        // command at four bytes.
+        f.shs[1] = f64::NAN;
+        assert_eq!(control_command(&c, MOD_SETP, &f).payload, b"S22n");
+        f.shs[1] = -f64::NAN;
+        assert_eq!(control_command(&c, MOD_SETP, &f).payload, b"S22-");
     }
 
     #[test]
@@ -1270,6 +1252,12 @@ mod tests {
         let cmd = control_command(&mpc(1), MOD_SETP, &f);
         assert_eq!(cmd.payload, b" 3D 1,1,1.0E-06,1.2E-06");
         assert!(cmd.clear_spfg);
+        f.shr[0] = -f64::NAN;
+        let cmd = control_command(&mpc(1), MOD_SETP, &f);
+        assert_eq!(cmd.payload, b" 3D 1,1,1.0E-06,   -NAN");
+        f.shr[0] = f64::NAN;
+        let cmd = control_command(&mpc(1), MOD_SETP, &f);
+        assert_eq!(cmd.payload, b" 3D 1,1,1.0E-06,    NAN");
     }
 
     #[test]

@@ -3,12 +3,16 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase};
+use epics_rs::asyn::port::InterfaceMask;
+use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::detector::{Detector, Settings};
@@ -16,8 +20,8 @@ use crate::protocol::CHANNELS_PER_MODULE;
 
 /// The detector is one row of channels, however many modules it has
 /// (C `MAX_DIMS` / `dims[1]`, mythen.cpp:1345).
-const SENSOR_SIZE_X: i32 = CHANNELS_PER_MODULE as i32;
-const SENSOR_SIZE_Y: i32 = 1;
+pub(crate) const SENSOR_SIZE_X: i32 = CHANNELS_PER_MODULE as i32;
+pub(crate) const SENSOR_SIZE_Y: i32 = 1;
 
 /// The parameters this driver adds to `ADDriver` (C `SD*String`).
 #[derive(Debug, Clone, Copy)]
@@ -66,42 +70,6 @@ impl MythenParams {
     }
 }
 
-/// The outcome of the constructor's detector queries.
-///
-/// The single gate that keeps a constructor-time detector query from failing
-/// port creation: it logs the failure, records which query it was, and hands
-/// the caller a `None` to fall back from. C gets the same property from
-/// `status |= ...` over a C++ constructor, which cannot fail — an unreachable
-/// detector must never stop the IOC from reaching `iocInit`.
-#[derive(Default)]
-struct BootQueries {
-    failed: Vec<String>,
-}
-
-impl BootQueries {
-    /// Run one constructor-time query, logging and recording a failure.
-    fn run<T>(&mut self, what: &str, result: AsynResult<T>) -> Option<T> {
-        match result {
-            Ok(value) => Some(value),
-            Err(e) => {
-                self.fail(what, &e.to_string());
-                None
-            }
-        }
-    }
-
-    /// Record a query that answered, but answered something unusable.
-    fn fail(&mut self, what: &str, why: &str) {
-        log::error!("mythen: cannot read {what} at startup: {why}");
-        self.failed.push(what.to_string());
-    }
-
-    /// The queries that failed, or `None` when every one of them worked.
-    fn failure_summary(&self) -> Option<String> {
-        (!self.failed.is_empty()).then(|| self.failed.join(", "))
-    }
-}
-
 pub struct MythenDriver {
     pub ad: ADDriverBase,
     pub p: MythenParams,
@@ -118,7 +86,17 @@ impl MythenDriver {
         max_memory: usize,
         start_tx: rt::CommandSender<()>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, SENSOR_SIZE_X, SENSOR_SIZE_Y, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_memory,
+            PortFlags {
+                multi_device: true,
+                ..ASYN_CANBLOCK
+            },
+            InterfaceMask::NONE,
+            InterfaceMask::NONE,
+        )?;
         let p = MythenParams::create(&mut ad.port_base)?;
 
         let mut driver = Self {
@@ -140,25 +118,21 @@ impl MythenDriver {
     /// every readout after that would be sized from a count that was never
     /// read. Re-running the constructor's queries here is what closes that.
     pub fn reconnect(&mut self) -> AsynResult<()> {
-        let version = self.det.probe()?;
-        log::warn!("mythen: the detector answered again (firmware {version}); re-reading it");
+        self.det.probe()?;
         self.init_params()
     }
 
     /// C's constructor body, mythen.cpp:1326-1377.
     ///
-    /// Every detector query on this path goes through [`BootQueries`]. C runs
-    /// the same queries with `status |= ...` and carries on when one fails, so
-    /// a detector that is powered off when the IOC boots leaves the parameters
-    /// at their defaults but still gets a port — and the IOC still reaches
-    /// `iocInit`. Nothing here may use `?` on the detector directly.
+    /// C runs every detector query here with `status |= ...` and carries on
+    /// when one fails, so a detector that is powered off when the IOC boots
+    /// leaves the parameters at their defaults but still gets a port — and the
+    /// IOC still reaches `iocInit`. Nothing here may use `?` on the detector directly.
     fn init_params(&mut self) -> AsynResult<()> {
-        let mut q = BootQueries::default();
-
-        let firmware = q.run("the firmware version", self.det.get_firmware());
-        if let Some(firmware) = &firmware {
-            log::info!("mythen: firmware {firmware}");
-        }
+        let firmware = self.det.get_firmware().ok();
+        // C ORs only these two into the constructor's `status`
+        // (mythen.cpp:1329, :1364).
+        let mut camera_params_failed = firmware.is_none();
 
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.base.manufacturer, 0, "Dectris")?;
@@ -172,64 +146,46 @@ impl MythenDriver {
         base.set_int32_param(self.ad.params.size_x, 0, SENSOR_SIZE_X)?;
         base.set_int32_param(self.ad.params.size_y, 0, SENSOR_SIZE_Y)?;
         base.set_int32_param(self.ad.params.base.array_size, 0, 0)?;
-        base.set_int32_param(self.ad.params.base.data_type, 0, NDDataType::UInt32 as i32)?;
+        // NDInt32 although dataCallback publishes NDUInt32 frames, as C does
+        // (mythen.cpp:1345, :979).
+        base.set_int32_param(self.ad.params.base.data_type, 0, NDDataType::Int32 as i32)?;
         base.set_int32_param(self.ad.params.image_mode, 0, ImageMode::Single as i32)?;
 
-        let status = q.run("the detector status", self.det.get_status());
+        let status = self.det.get_status().ok();
         self.ad.port_base.set_int32_param(
             self.ad.params.status,
             0,
             status.unwrap_or(ADStatus::Disconnected) as i32,
         )?;
 
-        if let Some(settings) = q.run("the detector settings", self.det.get_settings()) {
+        if let Ok(settings) = self.det.get_settings() {
             self.apply_settings(&settings)?;
         }
 
-        let nmodules = match q.run("the module count", self.det.read_nmodules()) {
+        let nmodules = match self.det.read_nmodules().ok() {
             Some(n) if n >= 0 => Some(n),
             // C prints the same message and abandons the rest of the
             // constructor (mythen.cpp:1367-1372); the port survives either way.
             Some(n) => {
-                q.fail("the module count", &format!("unexpected reply: {n}"));
+                self.det.trace_error(&format!(
+                    "mythen:mythen: error, outString=-get nmodules, inString={n}\n"
+                ));
+                camera_params_failed = false;
                 None
             }
-            None => None,
+            None => {
+                camera_params_failed = true;
+                None
+            }
         };
+        if camera_params_failed {
+            println!("mythen: unable to read camera parameters");
+        }
         if let Some(nmodules) = nmodules {
             self.ad
                 .port_base
                 .set_int32_param(self.p.nmodules, 0, nmodules)?;
-            // One module is 1280 channels; the array the driver publishes is as
-            // wide as all the modules together.
-            self.ad.port_base.set_int32_param(
-                self.ad.params.base.array_size_x,
-                0,
-                nmodules * CHANNELS_PER_MODULE as i32,
-            )?;
         }
-
-        // The message is set and cleared here because this runs again on every
-        // reconnect: a detector that came back must not leave the operator
-        // reading "FAILED TO CONNECT" off a working port.
-        let message = match q.failure_summary() {
-            Some(failed) => {
-                log::error!(
-                    "mythen: the detector did not answer ({failed}); the port keeps its default \
-                     parameters and reports ADStatus=Disconnected"
-                );
-                self.ad.port_base.set_int32_param(
-                    self.ad.params.status,
-                    0,
-                    ADStatus::Disconnected as i32,
-                )?;
-                "Mythen FAILED TO CONNECT"
-            }
-            None => "",
-        };
-        self.ad
-            .port_base
-            .set_string_param(self.ad.params.status_message, 0, message)?;
 
         self.ad.port_base.call_param_callbacks(0)
     }
@@ -269,7 +225,11 @@ impl MythenDriver {
             // C refuses to talk to a running detector (mythen.cpp:689).
             return Ok(());
         }
-        let settings = self.det.get_settings()?;
+        // C's getSettings returns asynError whatever failed (mythen.cpp:795).
+        let settings = self.det.get_settings().map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: e.to_string(),
+        })?;
         self.apply_settings(&settings)
     }
 
@@ -294,10 +254,62 @@ impl MythenDriver {
         if !self.det.is_connected() {
             self.reconnect()?;
         }
-        if self.det.start()? && self.start_tx.try_send(()).is_err() {
-            log::error!("mythen: the acquisition task is not running");
+        if self.det.start()? {
+            let _ = self.start_tx.try_send(());
         }
         Ok(())
+    }
+}
+
+/// C's `int status` in `writeInt32` / `writeFloat64`: `status |= step()` keeps
+/// going after a failed step, and the write returns the OR of every status.
+/// mythen never writes the record's `pasynUser->errorMessage`; only the
+/// base-class write it calls does.
+#[derive(Default)]
+struct StatusOr {
+    bits: i32,
+    message: String,
+}
+
+impl StatusOr {
+    /// `status |= step`.
+    fn or(&mut self, step: AsynResult<()>) {
+        if let Err(e) = step {
+            self.bits |= e.c_status_code();
+        }
+    }
+
+    /// `status = step`.
+    fn set(&mut self, step: AsynResult<()>) {
+        let message = std::mem::take(&mut self.message);
+        *self = Self {
+            message,
+            ..Self::default()
+        };
+        self.or(step);
+    }
+
+    /// `status = ADDriver::writeXxx(pasynUser, value)`, whose errorMessage
+    /// the record keeps.
+    fn set_base(&mut self, step: AsynResult<()>) {
+        if let Err(e) = &step {
+            self.message = e.message();
+        }
+        self.set(step);
+    }
+
+    /// `return (asynStatus)status`: the OR, not the last failing step.
+    fn into_result(self) -> AsynResult<()> {
+        AsynError::from_c_status_code(self.bits, self.message).map_or(Ok(()), Err)
+    }
+}
+
+impl ADDriver for MythenDriver {
+    fn ad_base(&self) -> &ADDriverBase {
+        &self.ad
+    }
+    fn ad_base_mut(&mut self) -> &mut ADDriverBase {
+        &mut self.ad
     }
 }
 
@@ -312,106 +324,203 @@ impl PortDriver for MythenDriver {
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
         let acquire = self.ad.params.acquire;
 
         // C refuses every write except ADAcquire while an acquisition runs
         // (mythen.cpp:1111).
         if reason != acquire && self.det.state.acquiring.load(Ordering::Acquire) {
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!("mythen:writeInt32: detector is busy\n"),
+            );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: "mythen: detector is busy".into(),
+                message: String::new(),
             });
         }
 
-        self.ad.port_base.params.set_int32(reason, addr, value)?;
+        let mut status = StatusOr::default();
+        // C's setIntegerParam(function, value) and callParamCallbacks() are
+        // list 0 whatever the address.
+        status.or(self.ad.port_base.set_int32_param(reason, 0, value));
 
         if reason == acquire {
             let read_mode = self.int_param(self.p.read_mode);
             self.det.state.read_mode.store(read_mode, Ordering::Release);
-            self.set_acquire(value)?;
+            status.or(self.set_acquire(value));
         } else {
-            let image_mode = self.int_param(self.ad.params.image_mode);
             if reason == self.p.setting {
-                self.det.load_settings(value)?;
+                status.or(self.det.load_settings(value));
             } else if reason == self.p.use_flat_field {
-                self.det.set_flat_field_correction(value)?;
+                status.or(self.det.set_flat_field_correction(value));
             } else if reason == self.p.use_count_rate {
-                self.det.set_rate_correction(value)?;
+                status.or(self.det.set_rate_correction(value));
             } else if reason == self.p.use_bad_chan_intrpl {
-                self.det.set_bad_chan_intrpl(value)?;
+                status.or(self.det.set_bad_chan_intrpl(value));
             } else if reason == self.p.bit_depth {
-                self.det.set_bit_depth(value)?;
+                status.or(self.det.set_bit_depth(value));
             } else if reason == self.p.num_gates {
-                self.det.set_num_gates(value)?;
+                status.set(self.det.set_num_gates(value));
             } else if reason == self.p.use_gates {
-                self.det.set_use_gates(value)?;
+                status.set(self.det.set_use_gates(value));
             } else if reason == self.p.num_frames {
-                self.det.set_frames(value, image_mode)?;
+                // C `setFrames` reads ADImageMode itself (mythen.cpp:312).
+                let image_mode = self.int_param(self.ad.params.image_mode);
+                status.or(self.det.set_frames(value, image_mode));
             } else if reason == self.p.trigger {
-                self.det.set_trigger(value)?;
+                status.or(self.det.set_trigger(value));
             } else if reason == self.p.reset {
                 // C flips SD_RESET on for the duration of the reset
                 // (mythen.cpp:665-673).
-                self.ad.port_base.set_int32_param(self.p.reset, 0, 1)?;
-                self.ad.port_base.call_param_callbacks(0)?;
-                self.det.reset()?;
-                self.ad.port_base.set_int32_param(self.p.reset, 0, 0)?;
+                let _ = self.ad.port_base.set_int32_param(self.p.reset, 0, 1);
+                let _ = self.ad.port_base.call_param_callbacks(0);
+                status.or(self.det.reset());
+                let _ = self.ad.port_base.set_int32_param(self.p.reset, 0, 0);
             } else if reason == self.ad.params.image_mode {
                 // The frame count the detector needs depends on the image mode.
                 let frames = self.det.state.frames.load(Ordering::Acquire);
-                self.det.set_frames(frames, value)?;
+                status.or(self.det.set_frames(frames, value));
+            } else if reason < self.p.setting {
+                // `FIRST_SD_PARAM` is SDSetting (mythen.cpp:100, :1153).
+                status.set_base(ADDriver::ad_write_int32(self, user, value));
             }
-            self.refresh_settings()?;
+            status.or(self.refresh_settings());
         }
 
-        self.ad.port_base.call_param_callbacks(addr)
+        status.or(self.ad.port_base.call_param_callbacks(0));
+        if status.bits != 0 {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "mythen:writeInt32: error, status={} function={reason}, value={value}\n",
+                    status.bits
+                ),
+            );
+        } else {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("mythen:writeInt32: function={reason}, value={value}\n"),
+            );
+        }
+        status.into_result()
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
+        // C refuses an address outside the port before anything else
+        // (mythen.cpp:1182-1183); callParamCallbacks() stays list 0.
+        let addr = self.ad.port_base.get_address(user.addr, reason)?;
 
         if self.det.state.acquiring.load(Ordering::Acquire) {
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!("mythen:writeFloat64: detector is busy\n"),
+            );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: "mythen: detector is busy".into(),
+                message: String::new(),
             });
         }
 
-        self.ad.port_base.params.set_float64(reason, addr, value)?;
+        let mut status = StatusOr::default();
+        status.set(self.ad.port_base.set_float64_param(reason, addr, value));
 
         if reason == self.ad.params.acquire_time {
-            self.det.set_exposure_time(value)?;
+            status.or(self.det.set_exposure_time(value));
         } else if reason == self.p.delay_time {
-            self.det.set_delay_after_trigger(value)?;
+            status.or(self.det.set_delay_after_trigger(value));
         } else if reason == self.p.threshold {
-            self.det.set_kthresh(value)?;
+            // C zeroes SDThreshold on a failed setKthresh (mythen.cpp:387-394).
+            if self.det.set_kthresh(value).is_err() {
+                let _ = self
+                    .ad
+                    .port_base
+                    .set_float64_param(self.p.threshold, 0, 0.0);
+                let _ = self.ad.port_base.call_param_callbacks(0);
+                status.or(Err(self.det.refused("error check if value > 0")));
+            }
         } else if reason == self.p.energy {
-            self.det.set_energy(value)?;
+            // mythen.cpp:413-416.
+            if self.det.set_energy(value).is_err() {
+                status.or(Err(self.det.refused("error check if value > 0")));
+            }
         } else if reason == self.p.tau {
             // C zeroes the parameter and errors out on a value that is neither
             // -1 nor positive (mythen.cpp:361-368).
-            if !self.det.set_tau(value)? {
-                self.ad.port_base.set_float64_param(self.p.tau, 0, 0.0)?;
-                self.ad.port_base.call_param_callbacks(addr)?;
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("mythen: tau must be -1 or > 0, got {value}"),
-                });
-            }
+            status.or(match self.det.set_tau(value) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    let _ = self.ad.port_base.set_float64_param(self.p.tau, 0, 0.0);
+                    let _ = self.ad.port_base.call_param_callbacks(0);
+                    Err(self.det.refused("error check if tau -1 or >0"))
+                }
+                Err(e) => Err(e),
+            });
+        } else if reason < self.p.setting {
+            // ADDriver::writeFloat64 is asynPortDriver's (mythen.cpp:1210).
+            status.set_base(self.ad.port_base.write_float64_param(user, value));
         }
 
-        self.refresh_settings()?;
-        self.ad.port_base.call_param_callbacks(addr)
+        status.or(self.refresh_settings());
+        status.or(self.ad.port_base.call_param_callbacks(0));
+        // C prints `value=%g` (mythen.cpp:1221,1225).
+        let g = CFloat(value).g();
+        if status.bits != 0 {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "mythen:writeFloat64: error, status={} function={reason}, value={g}\n",
+                    status.bits
+                ),
+            );
+        } else {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("mythen:writeFloat64: function={reason}, value={g}\n"),
+            );
+        }
+        status.into_result()
     }
 
+    /// `mythen::writeOctet` (mythen.cpp:1062-1097): the list-0 set's status
+    /// stands unless a base-class param replaces it with ADDriver::writeOctet's.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
-        let addr = user.addr;
-        let value = String::from_utf8_lossy(data).into_owned();
-        self.ad.port_base.params.set_string(reason, addr, value)?;
-        self.ad.port_base.call_param_callbacks(addr)?;
-        Ok(data.len())
+        // C prints the value as the `char *` it was handed: up to the NUL.
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let value = String::from_utf8_lossy(&data[..end]).into_owned();
+        let mut status = StatusOr::default();
+        status.or(self.ad.port_base.set_string_param(reason, 0, value.clone()));
+        if reason < self.p.setting {
+            status.set_base(self.ad.write_octet(user, data).map(|_| ()));
+        }
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        if status.bits != 0 {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "mythen:writeOctet: error, status={} function={reason}, value={value}\n",
+                    status.bits
+                ),
+            );
+        } else {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("mythen:writeOctet: function={reason}, value={value}\n"),
+            );
+        }
+        status.into_result().map(|()| data.len())
     }
 }

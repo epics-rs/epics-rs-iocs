@@ -12,3 +12,6 @@ publish = false
 motor-smaract = { path = "../../../drivers/motor/smaract" }
 motor-common = { path = "../../../drivers/motor/common" }
 epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
+
+[dev-dependencies]
+motor-common = { path = "../../../drivers/motor/common", features = ["testing"] }

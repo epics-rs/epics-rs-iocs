@@ -16,12 +16,6 @@
 //!
 //! * **CBF is not supported.** C links CBFlib and calls `readCbf` for `.cbf`
 //!   file names; this port logs an error and fails the read.
-//! * **Camserver I/O runs on worker threads.** A Rust `PortDriver` method
-//!   executes inside its port actor's current-thread runtime and cannot block
-//!   on a second port, so the work C does inline in `writeInt32` /
-//!   `writeFloat64` / `writeOctet` is queued to a `PilatusCmdTask` thread. The
-//!   command order and the camserver byte stream are unchanged; only the moment
-//!   the record's write callback returns differs.
 //! * **`createFileName` / `checkPath` are reimplemented** in [`file_name`],
 //!   because `ad-core-rs` 0.22.1 does not expose them.
 //! * **Multi-strip TIFFs decode correctly.** C's `readTiff` passes strip index
@@ -31,8 +25,6 @@
 //!   unchecked.
 //! * **Float-to-int conversions saturate** (`as i32`) rather than invoking C's
 //!   undefined behaviour on out-of-range values.
-//! * **The flat-field `NDArray` is `NDInt32`.** C allocates it as `NDUInt32`
-//!   but only ever accesses it through an `epicsInt32 *`.
 //! * **Driver attributes (`NDAttributesFile`) are not attached** to published
 //!   arrays; C calls `getAttributes(pImage->pAttributeList)`. The
 //!   `TIFFImageDescription` attribute read from the file *is* attached.
@@ -59,6 +51,7 @@ pub mod driver;
 pub mod file_name;
 pub mod image;
 pub mod params;
+pub mod port_thread;
 pub mod protocol;
 pub mod task;
 pub mod types;

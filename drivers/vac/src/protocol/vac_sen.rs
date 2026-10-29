@@ -96,6 +96,10 @@ pub struct Config {
     pub spt: i32,
 }
 
+/// C prints `pPvt->address` after this, and the address is still the
+/// calloc'd empty string when the range check refuses it.
+const ADDRESS_OUT_OF_RANGE: &str = "address out of range ";
+
 /// Build the `cmdPrefix` and station set from the asyn address and userParam.
 ///
 /// `devVacSen::init` validates the address range per device and formats the
@@ -117,7 +121,7 @@ pub fn configure(dev: DevType, address: i32, user_param: &str) -> Result<Config,
 
         DevType::Gp350 => {
             if !(0..=31).contains(&address) {
-                return Err(format!("GP350 address out of range {address}"));
+                return Err(ADDRESS_OUT_OF_RANGE.into());
             }
             // C: `address` is the calloc'd empty string when address == 0, so
             // the prefix for RS-232 is a bare "#".
@@ -142,7 +146,7 @@ pub fn configure(dev: DevType, address: i32, user_param: &str) -> Result<Config,
 
         DevType::Cc10 => {
             if !(0..=15).contains(&address) {
-                return Err(format!("CC10 address out of range {address}"));
+                return Err(ADDRESS_OUT_OF_RANGE.into());
             }
             cfg.prefix = vec![STX];
             cfg.prefix
@@ -151,7 +155,7 @@ pub fn configure(dev: DevType, address: i32, user_param: &str) -> Result<Config,
 
         DevType::Mx200 => {
             if !(0..=99).contains(&address) {
-                return Err(format!("MX200 address out of range {address}"));
+                return Err(ADDRESS_OUT_OF_RANGE.into());
             }
             let (cc, cv1, cv2, spt) = parse_mx200_stations(user_param)?;
             // C formats the MX200 address with "%02X" (hex) even though the
@@ -193,7 +197,7 @@ fn parse_mm200_stations(user_param: &str) -> Result<(i32, i32, i32, i32), String
         1 => {
             // Backward-compatible CC-only form.
             if !(3..=6).contains(&station) {
-                return Err(format!("MM200 CC out of range: {station}"));
+                return Err(format!("CC out of range: {station}"));
             }
             const CV1: [i32; 4] = [1, 2, 1, 2];
             const CV2: [i32; 4] = [0, 0, 3, 4];
@@ -203,19 +207,19 @@ fn parse_mm200_stations(user_param: &str) -> Result<(i32, i32, i32, i32), String
         }
         4 => {
             if !(3..=9).contains(&station) {
-                return Err(format!("MM200 CC out of range: {station}"));
+                return Err(format!("CC out of range: {station}"));
             }
             if !(1..=2).contains(&spt) {
-                return Err(format!("MM200 spt out of range {spt}"));
+                return Err(format!("spt out of range {spt}"));
             }
             if !(1..=6).contains(&cv1) {
-                return Err(format!("MM200 CV1 out of range: {cv1}"));
+                return Err(format!("CV1 out of range: {cv1}"));
             }
             if !(0..=6).contains(&cv2) {
-                return Err(format!("MM200 CV2 out of range: {cv2}"));
+                return Err(format!("CV2 out of range: {cv2}"));
             }
         }
-        _ => return Err(format!("MM200 too few/many parameters: {user_param}")),
+        _ => return Err(format!("Too few/many parameters: {user_param}")),
     }
     Ok((station, cv1, cv2, spt))
 }
@@ -232,10 +236,10 @@ fn parse_mx200_stations(user_param: &str) -> Result<(i32, i32, i32, i32), String
         ));
     }
     if !(3..=9).contains(&station) {
-        return Err(format!("MX200 station for CC out of range {station}"));
+        return Err(format!("station for CC out of range {station}"));
     }
     if !(1..=2).contains(&spt) {
-        return Err(format!("MX200 setpoint out of range {spt}"));
+        return Err(format!("setpoint out of range {spt}"));
     }
     Ok((station, cv1, cv2, spt))
 }

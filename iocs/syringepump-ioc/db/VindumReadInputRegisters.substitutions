@@ -1,10 +1,9 @@
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumReadInputRegisters.substitutions.
-# Every `file "$(MODBUS)/db/*.template"` below rewritten to a bare filename
-# resolved relative to this file's own directory (db/) -- dbLoadTemplate does
-# not macro-expand `file` paths.
+# `$(MODBUS)/db/` is `$(SYRINGEPUMP)/db/`: the modbus
+# templates are copied into this directory.
 #
 # These are the values for the input registers starting at 0 with function code 4
-file "longinInt32.template" {
+file "$(SYRINGEPUMP)/db/longinInt32.template" {
 pattern
 {     R,                      OFFSET,  DATA_TYPE,        SCAN}
 {ComResponse,                      0,     UINT16,  "I/O Intr"}
@@ -21,14 +20,14 @@ pattern
 
 # Position range is 0 to 640 for VP pumps.  Convert to percent.
 # Say the ADC is unipolar 10 bits, so full scale is 1024, EGUF=1024/640 = 1.60 %
-file "ai.template" {
+file "$(SYRINGEPUMP)/db/ai.template" {
 pattern
 {     R,                      OFFSET,  BITS,   EGUL,   EGUF,   PREC,       SCAN}
 {A:Position,                      20,    10,     0.,   160.,      1,    "I/O Intr"}
 {B:Position,                      21,    10,     0.,   160.,      1,    "I/O Intr"}
 }
 
-file "aiFloat64.template" {
+file "$(SYRINGEPUMP)/db/aiFloat64.template" {
 pattern
 {     R,                      OFFSET,   DATA_TYPE,  PREC,   SCAN}
 {A:Pressure,                       1,  FLOAT32_BE,   2,  "I/O Intr"}

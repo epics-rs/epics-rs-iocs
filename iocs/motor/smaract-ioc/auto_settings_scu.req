@@ -1,0 +1,9 @@
+# C's iocSmarAct auto_settings.req names m1 to m3 for every controller,
+# but motor.substitutions.smaractscu loads m1 to m6, so an SCU IOC never
+# saved m4 to m6.
+file "asyn_motor_settings.req",  P=$(P), M=m1
+file "asyn_motor_settings.req",  P=$(P), M=m2
+file "asyn_motor_settings.req",  P=$(P), M=m3
+file "asyn_motor_settings.req",  P=$(P), M=m4
+file "asyn_motor_settings.req",  P=$(P), M=m5
+file "asyn_motor_settings.req",  P=$(P), M=m6

@@ -41,19 +41,7 @@ pub(crate) fn atof(s: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Mimic C `atoi`: parse the leading integer prefix, `0` on junk.
-pub(crate) fn atoi(s: &str) -> i32 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i32>().ok()).unwrap_or(0)
-}
+pub(crate) use motor_common::util::atoi;
 
 /// Parse leading hex digits as `u32` (C `sscanf` `%x`); `None` if there is no
 /// hex digit (C `sscanf` count `!= 1`).
@@ -83,8 +71,12 @@ pub(crate) fn nint(f: f64) -> i32 {
 /// Shared MM4000/PM500 `maxDigits`/`res_decpts`: command decimal precision
 /// from the drive resolution, `(int)(-log10(stepSize)) + 2`, floored at 1.
 pub(crate) fn max_digits(step_size: f64) -> usize {
-    let digits = (-step_size.log10()) as i32 + 2;
-    digits.max(1) as usize
+    let x = -step_size.log10();
+    // C `(int)` on x86-64 turns NaN/inf (res <= 0) into INT_MIN, hence the floor.
+    if !x.is_finite() {
+        return 1;
+    }
+    (x as i32 + 2).max(1) as usize
 }
 
 /// Shared ESP300/MM3000 `recv_mess` retry predicate: a reply longer than 3
@@ -107,6 +99,8 @@ mod tests {
         assert_eq!(max_digits(0.1), 3);
         assert_eq!(max_digits(1.0), 2);
         assert_eq!(max_digits(100.0), 1); // -2 + 2 = 0 → floored at 1
+        assert_eq!(max_digits(0.0), 1); // C x86: (int)inf = INT_MIN → floored
+        assert_eq!(max_digits(-1.0), 1); // log10 NaN
     }
 
     #[test]
@@ -141,13 +135,6 @@ mod tests {
         // No valid number → 0.0, like C atof.
         assert_eq!(atof("abc"), 0.0);
         assert_eq!(atof("+"), 0.0);
-    }
-
-    #[test]
-    fn atoi_parses_leading_integer_prefix() {
-        assert_eq!(atoi("400rpm"), 400);
-        assert_eq!(atoi("-7"), -7);
-        assert_eq!(atoi("junk"), 0);
     }
 
     #[test]

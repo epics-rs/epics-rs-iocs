@@ -1,0 +1,10 @@
+# motorMicos ships no Taurus example; P and PORT from st.taurus.cmd. The
+# driver scales the record's steps by axisRes = clPeriod into the
+# controller's units, as C. Changing DHLM/DLLM pushes the soft limits to the
+# controller (setnlimit).
+file "$(MOTOR)/db/asyn_motor.db"
+{
+pattern
+{M,  DTYP,        ADDR, DESC, EGU, DIR, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES, PREC, DHLM, DLLM, INIT}
+{m1, "asynMotor", 0,    "",   mm,  Pos, 5.0,  0,    0.2,  0,    0,    .5,   5e-3, 4,    100,  -100, ""}
+}

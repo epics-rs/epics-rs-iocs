@@ -46,8 +46,15 @@ dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image2:,PORT=I
 NDStdArraysConfigure("ImageMon", 5, 0, "$(PORT)_MON", 0, 0)
 dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=monitor1:,PORT=ImageMon,ADDR=0,TIMEOUT=1,TYPE=Int32,FTVL=LONG,NELEMENTS=1096950,NDARRAY_PORT=$(PORT)_MON")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
+# Load all other plugins using commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd
+set_requestfile_path("$(ADEIGER)/db")
+
+iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
+
 # Example interactive commands:
 #   dbl                                 # List all PVs
 #   dbpf 13EIG2:cam1:Acquire 1          # Start acquisition

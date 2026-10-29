@@ -6,9 +6,9 @@
 Cargo workspace of [epics-rs](https://github.com/epics-rs/epics-rs) based
 IOC applications — Rust ports of the EPICS device-driver modules. Each
 device driver is an independent library crate under `drivers/`, and each
-IOC binary lives under `iocs/`. The workspace currently holds **69 driver
+IOC binary lives under `iocs/`. The workspace currently holds **68 driver
 crates** and **83 IOC crates**, all consuming a single pinned epics-rs
-version (**0.31.0**) declared once in the root `Cargo.toml`.
+version (**0.33.0**) declared once in the root `Cargo.toml`.
 
 > **Platform**: Linux is the primary, fully-supported target — every
 > crate builds and is tested there. CI additionally builds and tests the
@@ -44,7 +44,7 @@ same layout under `iocs/`.
 
 ```
 epics-rs-iocs/
-├── Cargo.toml                  # Workspace root — pins epics-rs 0.31.0 for all crates
+├── Cargo.toml                  # Workspace root — pins epics-rs 0.33.0 for all crates
 ├── drivers/
 │   ├── motor/                  # 27 motor-controller drivers + shared `common` crate
 │   │                           #   acs, acsmotion, acstech80, aerotech, amci, attocube,
@@ -77,7 +77,6 @@ epics-rs-iocs/
 │   ├── ur-robot/               # Universal Robots arm (RTDE/script/dashboard/gripper)
 │   ├── love/                   # Love Controls PID controller (RS-485)
 │   ├── delaygen/               # SRS DG645 / Colby PDL-100A / Coherent SDG
-│   ├── syringepump/            # Teledyne ISCO / ISCO Modbus / Vindum pumps
 │   ├── microepsilon/           # capaNCDT6200 displacement sensor
 │   ├── yokogawa-gm10/          # Yokogawa GM10 data acquisition
 │   └── yokogawa-mw100/         # Yokogawa MW100 data acquisition
@@ -147,7 +146,7 @@ at `$(P)$(M)` (or an axis-letter macro variant such as `$(P)$(MX)`, `$(P)$(MU)`,
 multi-axis controllers) — confirmed by grepping `record(` across all 54 `db/*.template` files in
 `iocs/motor/*/db/`: every single one is `record(motor, ...)`, with no other record type anywhere
 in the MOTOR family. Field definitions below are taken directly from the vendored
-`motorRecord.dbd` (`~/.cargo/registry/.../motor-rs-0.31.0/dbd/motorRecord.dbd`, mirrored at
+`motorRecord.dbd` (`~/.cargo/registry/.../motor-rs-0.33.0/dbd/motorRecord.dbd`, mirrored at
 `crates/motor-rs/dbd/motorRecord.dbd` in `epics-rs`):
 
 | Field | Type | Purpose |
@@ -178,7 +177,7 @@ Every row's "extra records" is **"motor record only"** — confirmed by counting
 |---|---|---|---|---|
 | `acsmotion-ioc` | `motor-acsmotion` | ACS SPiiPlus motion controller (serial/TCP ASCII, ACSPL+) | `iocs/motor/acsmotion-ioc/st.cmd` | motor record only |
 | `acstech80-ioc` | `motor-acstech80` | ACS Tech80 SPiiPlus (serial/TCP ASCII, ACSPL+) | `iocs/motor/acstech80-ioc/st.cmd` | motor record only |
-| `aerotech-ioc` | `motor-aerotech` | Aerotech Ensemble (ASCII over asyn octet); A3200 variant via separate startup | `iocs/motor/aerotech-ioc/st.cmd` (+ `st.a3200.cmd` for A3200) | motor record only |
+| `aerotech-ioc` | `motor-aerotech` | Aerotech Ensemble and Soloist (ASCII over asyn octet); A3200 variant via separate startup | `iocs/motor/aerotech-ioc/st.cmd` (+ `st.a3200.cmd` for A3200) | motor record only |
 | `agap-conex-ioc` | `motor-newport` (`agap.rs`, [ports from](https://github.com/epics-modules/motor) `motorNewport/newportApp/src/AGAP_CONEX.cpp`) | Newport CONEX-AGAP two-axis piezo gonio (serial ASCII) | `iocs/motor/agap-conex-ioc/st.cmd` | motor record only |
 | `ag-uc-ioc` | `motor-newport` (`agilis.rs`, ports from `AG_UC.cpp`) | Newport Agilis AG-UC2/AG-UC8/AG-UC8PC piezo stepper (serial ASCII) | `iocs/motor/ag-uc-ioc/st.cmd` | motor record only |
 | `amci-ioc` | `motor-amci` | AMCI ANF2 / ANG1 stepper controllers (Modbus/TCP registers, not serial ASCII) | `iocs/motor/amci-ioc/st.cmd` | motor record only |
@@ -240,7 +239,7 @@ Records (`iocs/ad/bruker-ioc/db/BIS.template`, includes `ADBase.template` + `NDF
 - `ReadSFRMTimeout` (ao) — timeout waiting for the SFRM file beyond the exposure time
 - `BISStatus` (waveform, I/O Intr) — last status line BIS broadcast
 - `NumDarks` / `NumDarks_RBV` — number of dark frames
-- `FileFormat` redefined to just `SFRM`/`Invalid`
+- `FileFormat` redefined to just `SRFM` (upstream's spelling)/`Invalid`
 - `FrameType` redefined: `Normal`/`Dark`/`Raw`/`DblCorrelation`
 - `BISAsyn` (asyn record) — interactive access to the BIS command port
 
@@ -315,7 +314,7 @@ Records (`iocs/ad/mar345-ioc/db/mar345.template`, includes `ADBase.template` + `
 
 Build/run: `cargo run -p mar345-ioc --release -- iocs/ad/mar345-ioc/st.cmd`
 
-Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot: clean on `ad-plugins-rs`/`ad-core-rs` 0.24.3 (the pin when that was verified; not re-verified since the workspace moved to 0.31.0) — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
+Boot: clean on `ad-plugins-rs`/`ad-core-rs` 0.24.3 (the pin when that was verified; not re-verified since the workspace moved to 0.27.0) — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
 
 ---
 
@@ -335,7 +334,7 @@ Records (`iocs/ad/marccd-ioc/db/marCCD.template`, includes `ADBase.template` + `
 
 Build/run: `cargo run -p marccd-ioc --release -- iocs/ad/marccd-ioc/st.cmd`
 
-Deviation: the upstream template's duplicate `MarState_RBV` definition was dropped as a retro-fixed upstream defect (`doc/upstream-c-defects.md` #15). Server I/O runs on three worker threads sharing one `Server` behind a `tokio::sync::Mutex` (the analog of the C driver lock), since a `PortDriver` method can't block on a second port from its own actor; command order and the wire bytes are unchanged, only the moment a record's write callback returns differs.
+Deviation: the upstream template's duplicate `MarState_RBV` definition was dropped as a retro-fixed upstream defect (`doc/upstream-c-defects.md` #15). Server I/O runs on the port actor, C's driver lock: inline in `writeInt32` / `writeFloat64`, and through `PortHandle::with_driver` from the acquisition and image threads.
 
 ---
 
@@ -753,7 +752,7 @@ A companion `quadEM_TimeSeries.template` (`EraseAll`, `StartAll`, `StopAll`, `Pr
 | `ah501-ioc` | Elettra/CaenEls **AH501BE** (AH501 series), TCP (same `drvAHxxxConfigure`) | `iocs/quadem/ah501-ioc/st.cmd` | `AH501.template`: `Range`/`_RBV`, `TriggerMode`/`_RBV` |
 | `nsls-em-ioc` | **NSLS Precision Integrator**, UDP broadcast discovery (port 37747) then driver-opened TCP command (4747)/data (5757) (`drvNSLS_EMConfigure`) | `iocs/quadem/nsls-em-ioc/st.cmd` | `NSLS_EM.template`: `Range`/`_RBV`, `IntegrationTime`/`_RBV`, `PingPong`/`_RBV` |
 | `pcr4-ioc` | SenSiC **PCR4** 4-channel picoammeter, TCP (`drvPCR4Configure`, EOS `\r\n`/`\r`) | `iocs/quadem/pcr4-ioc/st.cmd` | `PCR4.template`: `TriggerMode`/`_RBV`, `TriggerPolarity`/`_RBV`, `ReadFormat` |
-| `t4u-direct-em-ioc` | Sydor **T4U**, direct to meter — telnet command (23) + driver-bound UDP data port, calibration file `DBPM_Settings.ini` (`drvT4UDirect_EMConfigure`) | `iocs/quadem/t4u-direct-em-ioc/st.cmd` | `T4UDirect_EM.template` (`include`s `T4U_EM.template`): `WaitStateMode`/`_RBV`, `ReadsPerPacket`/`_RBV` |
+| `t4u-direct-em-ioc` | Sydor **T4U**, direct to meter — telnet command (23) + driver-bound UDP data port, calibration file `DBPM_Settings.ini` (`drvT4UDirect_EMConfigure`) | `iocs/quadem/t4u-direct-em-ioc/st.cmd` | `T4UDirect_EM.template`: `T4U_EM.template`, as `t4u-em-ioc`, plus `WaitStateMode`/`_RBV` and `ReadsPerPacket`/`_RBV`, which C loads on both drivers |
 | `t4u-em-ioc` | Sydor **T4U**, through the Qt middle layer — driver-opened TCP command/data ports on `QTHOST:QTBASEPORT`/`+1` (`drvT4U_EMConfigure`) | `iocs/quadem/t4u-em-ioc/st.cmd` | `T4U_EM.template` (`include`s `gc_t4u.db`): bias P/N/pulse controls, `DACMode`, `PIDEn`/`PIDCtrlPol`/`PIDCtrlEx`/`PIDCuEn`/`PIDHystEn`, `Updater`, `PosTrackMode`, `SampleFreq`, plus model-local `IntegrationTime`/`_RBV`, `Geometry`, `Resolution`, `Range`/`Range1`-`4` (44 records total) |
 | `tetramm-ioc` | CaenEls **TetrAMM** electrometer, TCP (`drvTetrAMMConfigure`, EOS `\r\n`/`\r`) | `iocs/quadem/tetramm-ioc/st.cmd` | `TetrAMM.template`: `Range`/`Range1`-`4` + `_RBV`, `TriggerMode`/`_RBV`, `InterlockStatus_RBV`, `InterlockCheck` |
 | `fx4-ioc` | Pyramid **FX4** 4-channel picoammeter, JSON over **WebSocket** (`ws://`, `drvFX4Configure` — no asyn IP port; the driver opens the socket itself) | `iocs/quadem/fx4-ioc/st.cmd` | `FX4.template`: `Range`/`_RBV`, `CurrentUnits`/`SetCurrentUnits`/`_RBV`, `SetRange`/`GetRange`, `SetValuesPerRead`/`GetValuesPerRead`, `GetSampleTime`, bias set/get shadow records, `GetFirmware`, `TriggerMode`/`_RBV` (CA links to the FX4's own PV server via `$(FXP)`) |
@@ -772,7 +771,7 @@ Ports from [`epics-modules/mca`](https://github.com/epics-modules/mca):
 - `drivers/mca-rontec` — Rontec detector driver, ported from `mcaApp/RontecSrc/drvMcaRontec.c`.
 - `drivers/mca-amptek` — Amptek DP5/PX5/DP5G/MCA8000D/TB5/DP5-X driver, ported from `mcaApp/AmptekSrc/drvAmptek.cpp`. USB (`DppLibUsb.cpp`) is feasibility-gated out (no USB crate in the workspace); serial is unported because it's an empty no-op in the upstream C driver too.
 
-The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.31.0"` — 0.31.0 does add an `epics-rs` "mca" feature, but it is only `pub use mca_rs as mca` over this same published crate). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
+The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.33.0"` — `epics-rs` has an "mca" feature, but it is only `pub use mca_rs as mca` over this same published crate). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
 
 #### Shared MCA record set
 
@@ -809,7 +808,7 @@ Ports from [`epics-modules/scaler`](https://github.com/epics-modules/scaler) —
 
 #### scaler974 records
 
-Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at the `scaler-rs` crate dir (its bundled `db/` is re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.31.0` per `Cargo.lock`) and loads `$(SCALER)/db/scaler.db`. That file instantiates one real `scalerRecord`:
+Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at the `scaler-rs` crate dir (its bundled `db/` is re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.33.0` per `Cargo.lock`) and loads `$(SCALER)/db/scaler.db`. That file instantiates one real `scalerRecord`:
 
 ```
 grecord(scaler,"$(P)$(S)") {
@@ -940,25 +939,28 @@ bit addressing (`B <bit>`), and I/O-Intr driven records.
 
 **Ports from:** [epics-modules/ip](https://github.com/epics-modules/ip)
 (`ipApp/src`: `devMPC.c`, `devTPG261.c`, `devTelevac.c`, `devAiMKS.c`,
-`devAiHeidND261.c`, `devXxEurotherm.c`)
+`devAiHeidND261.c`, `devXxEurotherm.c`, `devXxStrParm.c`)
 
-`drivers/ip` (crate `ip-devices`) re-implements each C device-support file
-as an asyn **port driver**: the record link binds to a port parameter
-instead of embedding the raw command text, and each port drives its device
-over a pre-configured serial/IP octet port on its own worker thread.
+`drivers/ip` (crate `ip-devices`) keeps each C device-support file as
+per-record device support, bound by its `ipSupport.dbd` DTYP and driving its
+device over a pre-configured serial/IP octet port, as in C: `devAiMKS.c`
+(`HPS SensaVac 937`) on the upstream `MKS.db`, `devMPC.c` (`asyn MPC`) on
+`MPC.db` and `TSP.db`, `devTPG261.c` (`asyn TPG261`) on `TPG261.db`,
+`devXxStrParm.c` (`asyn <xx> stringParm`) and `devXxEurotherm.c`
+(`asyn ao Eurotherm` / `asyn so Eurotherm`) on `Eurotherm.db`,
+`devAiHeidND261.c` (`asyn ai HeidND261`) on `heidND261.db`, and
+`devTelevac.c` (`asyn Televac` ai/bi), for which ipApp ships no database.
 
 **Build/run:** `cargo run -p ip-ioc --release -- iocs/ip/ip-ioc/st.cmd`
 
 | Device | db template | Records |
 |---|---|---|
-| Gamma Vacuum MPC / Digitel ion pump | `mpc.db` | `STAT`, `PRES`, `PRESEGU`, `CUR`, `VOLT`, `SIZE`, `SP1V`-`SP4V`, `SP1S`-`SP4S`, `GAUTOS`, `TSPSTAT`, `DIS`, `UNIT`, `SSIZE`, `SET1`-`SET4`, `STOP`, `ULCK`, `SAUTOS` (26 records) |
-| Titanium sublimation pump (same controller) | `tsp.db` | `TSP_STAT`, `TSP_REMAINING`, `TSP_MIN1`-`MIN4`, `SEND_TIMED`, `TSP_OFF`, `TSP_FIL`, `TSP_CLEAR`, `TSP_AUTO_ADV`, `TSP_CONTINUOUS`, `SEND_SUBLIMATION`, `TSP_DEGAS`, `TSP_MODE`, `TSP_SUBLIMATION`, `TSP_SUB2`, `TSP_SETMODE`, `TSP_TIMED`, `TSP_VALUE`, `TSP_UNITS`, `TSP_SECONDS`, `TSP_MINUTES`, `TSP_NCYCLES`, `TSP_MIN_PRESS` (25 records) |
-| Pfeiffer TPG261/TPG262 gauge controller | `tpg261.db` | `ID`, `UNIT`, `PRES`, `GSTATUS`, `STATUS`, `SP1S`, `SP2S`, `SP1V`, `SP2V`, `START`, `SUNIT`, `SET1`, `SET2` (13 records) |
-| Televac vacuum gauge | `televac.db` | `PRES` (1 record) |
-| Televac relay outputs | `televac_relay.db` | `ON`, `OFF`, `STATE` (3 records) |
-| MKS / HPS SensaVac 937 gauge | `mks.db` | `PRES`, `STATUS`, `UNITS`, `TYPE`, `LOW`, `HIGH` (6 records) |
-| Heidenhain ND261 display unit | `nd261.db` | `POS`, `STATUS` (2 records) |
-| Eurotherm 800/2000 temperature controller | `eurotherm.db` | `Setpoint`, `RampRate`, `ReadRequest` (3 records) |
+| Gamma Vacuum MPC / Digitel ion pump | `MPC.db` (upstream) | `STAT`, `PRES`, `CUR`, `VOLT`, `SIZE`, `SP1V`-`SP4V`, `SP1S`-`SP4S`, `GAUTOS`, `DIS`, `SSIZE`, `SET1`-`SET4`, `STOP`, `ULCK`, `SAUTOS` (23 records) |
+| Titanium sublimation pump (same controller) | `TSP.db` (upstream) | `TSP_STAT`, `TSP_REMAINING`, `TSP_MIN1`-`MIN4`, `SEND_TIMED`, `TSP_OFF`, `TSP_FIL`, `TSP_CLEAR`, `TSP_AUTO_ADV`, `TSP_CONTINUOUS`, `SEND_SUBLIMATION`, `TSP_DEGAS`, `TSP_MODE`, `TSP_SUBLIMATION`, `TSP_SUB2`, `TSP_SETMODE`, `TSP_TIMED`, `TSP_VALUE`, `TSP_UNITS`, `TSP_SECONDS`, `TSP_MINUTES`, `TSP_NCYCLES`, `TSP_MIN_PRESS` (25 records) |
+| Pfeiffer TPG261/TPG262 gauge controller | `TPG261.db` (upstream) | `ID`, `UNIT`, `PRES`, `STATUS`, `SP1S`, `SP2S`, `SP1V`, `SP2V`, `START`, `SUNIT`, `SET1`, `SET2` (12 records) |
+| MKS / HPS SensaVac 937 gauge | `MKS.db` (upstream) | `$(CC1)`, `$(CC2)`, `$(PR1)`, `$(PR2)` and their `_log` calcs (8 records) |
+| Heidenhain ND261 display unit | `heidND261.db` (upstream) | `HeidND261_read`, `HeidND261`, `HeidND261_ave` (3 records) |
+| Eurotherm 800/2000 temperature controller | `Eurotherm.db` (upstream) | `ET:Setpoint`, `ET:RampRate`, `ET:Temperature`, `ET:SetpointReadback`, `ET:RampRateRBV`, `ET:Read*`, `ET:Query*`, `ET:ack*`, `ET:trash*` (18 records) |
 
 ---
 
@@ -1069,7 +1071,7 @@ Records, by db file (all under `$(P)` prefix):
 
 `drivers/love` is an asyn port driver for Love 1600/16A PID controllers on
 a shared RS-485 multi-drop line, using the checksummed ASCII frame format
-and per-address model configuration (`LoveInit` for the port, `LoveConfig`
+and per-address model configuration (`drvLoveInit` for the port, `drvLoveConfig`
 per bus address) that the C driver uses. EOS (ACK `0x06` in / ETX `0x03`
 out) is hardcoded by the driver itself, not the startup script.
 
@@ -1106,30 +1108,27 @@ other two device blocks are commented out.
 ### syringepump — Teledyne ISCO, ISCO (Modbus), Vindum syringe pumps
 
 **Ports from:** [epics-modules/SyringePump](https://github.com/epics-modules/SyringePump)
-(`teled_d.proto`/`teled_h.proto` for the native driver; ISCO/Vindum are
-Modbus-only upstream)
+(ISCO/Vindum are Modbus-only upstream)
 
-`drivers/syringepump` is a native asyn port driver for the Teledyne ISCO
-D/H-series pumps, translating their StreamDevice `.proto` command tables
-(no StreamDevice engine exists in this framework) into a native command
-table, transcribed byte-for-byte including the shared `%0<nsum>` frame
-checksum. The module's other two families, ISCO and Vindum, are
-Modbus-only upstream (`drvModbusAsynConfigure` + generic templates, no
-StreamDevice) and are wired directly in `iocs/syringepump-ioc` against
-`epics-modbus-rs` — no driver code of their own in this crate.
+The Teledyne ISCO D/H-series pumps run on StreamDevice as in C: SPApp/Db's
+`teled_d.proto`/`teled_h.proto` and templates through `epics-stream-rs`, with
+only the approved `PressSeq`/`MaxFlowSeq` link repoint in
+`teledynePumpD.template`. The module's other two families, ISCO and
+Vindum, are Modbus-only upstream (`drvModbusAsynConfigure` + generic
+templates) and are wired directly in `iocs/syringepump-ioc` against
+`epics-modbus-rs`.
 
 **Build/run:** `cargo run -p syringepump-ioc --release -- iocs/syringepump-ioc/st.cmd`
 
-Native-driver templates (`drivers/syringepump`-backed):
+StreamDevice templates:
 
 | db template | Records |
 |---|---|
-| `teledynePumpD.template` | `PressureTweak(+Down/Up)`, `Run`, `Stop`, `Remote`, `Local`, `PressureSP`, `PressSeq`, `PressSend`, `MaxFlow`, `MaxFlowSeq`, `MaxFlowSend`, `Scanner`, `Vol`, `Pressure`, `PressSet_RBV`, `Flow`, `MaxFlow_RBV`, `Status`, `Command`, `CmdReply`, `AlarmI` (22 records) |
-| `teledynePumpH.template` | Same core set as D-series plus `VolPARSE/Format`, `PressurePARSE/Format`, `PressSetPARSE/Format`, `FlowPARSE/Format`, `MaxFlow_RBVPARSE/Format` (`aSub` parsers, since the H-series reply is line text, not binary), `Units`, `Mode`, `ID`, `Refill`, `GetRefillLimit`, `SetRefillRate(+Calc)`, `SetDigitalOut`, `SetDigitalCalc1`, `AutoFillSeq1/2`, `ControlVentSeq/2` (44 records) |
+| `teledynePumpD.template` | `PressureTweak`, `FlowRateTweak`, `RefillRateTweak` (each +Down/Up), `Run`, `Stop`, `Remote`, `Local`, `PressureSP`, `PressSeq`, `PressSend`, `MaxFlow`, `MaxFlowSeq`, `MaxFlowSend`, `Scanner`, `Vol`, `Pressure`, `PressSet_RBV`, `Flow`, `MaxFlow_RBV`, `Status`, `Command`, `CmdProc`, `CmdReply`, `AlarmI` (30 records) |
+| `teledynePumpH.template` | `Run`, `PistonUp`, `Stop`, `Remote`, `Local`, `PressSet`, `PressSeq`, `PressSend`, `MaxFlow`, `MaxFlowSeq`, `MaxFlowSend`, `Scanner`, `Vol`, `Pressure`, `PressSet_RBV`, `Flow`, `MaxFlow_RBV` (the last five each with `PARSE`/`Format` aSubs), `Status`, `Units`, `Mode`, `ID`, `Command`, `CmdProc`, `CmdReply`, `AlarmI`, `Refill`, `GetRefillLimit`, `SetRefillRate(+Calc)`, `SetDigitalOut`, `SetDigitalCalc1`, `AutoFillSeq1/2`, `ControlVentSeq/2` (44 records) |
 
 Modbus-wired templates (loaded directly by `iocs/syringepump-ioc`'s
-st.cmd against `drvModbusAsynConfigure` ports, not the `syringepump`
-driver crate):
+st.cmd against `drvModbusAsynConfigure` ports):
 
 | db template | Records |
 |---|---|
@@ -1150,8 +1149,8 @@ protocol for the config port)
 `drivers/microepsilon` ports two independent asyn ports per physical unit:
 **L0**, a config port whose ~30-command ASCII protocol (sample rate,
 averaging, trigger mode, per-channel status/info/linearization, data-port
-number, analog filter) is translated from StreamDevice `.proto` into a
-native command table; and **L1**, a fully custom native driver with its
+number, analog filter) runs the upstream `capaNCDT6200.proto` on epics-stream-rs;
+and **L1**, a fully custom native driver with its
 own background reader thread ingesting a raw binary TCP measurement
 stream (fixed-format packets, up to 4 channels), ported byte-for-byte
 including duplicate/missed-packet detection and averaging/throttle.
@@ -1336,7 +1335,7 @@ caput USB2408:WaveDigRun 1
 
 # D435i RealSense areaDetector IOC
 
-An epics-rs 0.31.0 based areaDetector IOC for the Intel RealSense D435i
+An epics-rs 0.33.0 based areaDetector IOC for the Intel RealSense D435i
 camera. A single pipeline produces three NDArray outputs simultaneously
 (Color RGB8, Depth Z16, optional XYZ Pointcloud) and publishes IMU data
 as PVs.

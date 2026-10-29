@@ -1,89 +1,183 @@
-//! `MDT695Setup` / `MDT695Config` iocsh commands for the ThorLabs MDT693/694/695
-//! piezo controller.
-//!
-//! Mirrors C `MDT695Config(card, port)`: connect the serial octet port, identify
-//! the controller ([`Mdt695Controller::new`], which also picks the axis count),
-//! and register its axes behind a `DTYP`-keyed motor device support
-//! (`MDT695_{card}_{index}`, 0-based). `MDT695Setup` (which only sized a
-//! controller array in C) is accepted as a no-op for startup-script parity.
+//! `MDT695Setup` / `MDT695Config` iocsh commands for the ThorLabs
+//! MDT693/694/695 piezo controller, C's model-1 interface: records reach axis
+//! `signal` of `card` through `DTYP "MDT695"` and `OUT "#C card S signal"`.
+//! Config keeps the port; `motor_init` at iocInit connects and identifies
+//! the controller.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::interfaces::motor::Model1Motor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
-use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
-};
+use motor_common::connect::{EosRefusal, connect_with_eos};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1_device;
 
-use crate::mdt695::{Mdt695Axis, Mdt695Controller};
+use crate::mdt695::{INPUT_EOS, Mdt695Axis, Mdt695Build, Mdt695Controller, OUTPUT_EOS};
 
 /// Serial command timeout (C `TIMEOUT` 2 s).
 const MDT695_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the `MDT695Setup(maxControllers, [scanRate])` no-op command
-/// (startup-script parity; the asyn-rs port allocates per `MDT695Config`).
+/// `device(motor,VME_IO,devMDT695,"MDT695")` (devThorLabs.dbd:2).
+static DEV_MDT695: DevSup = model1_device("devMDT695", "MDT695");
+
+/// `MDT695_NUM_CARDS` (drvMDT695.cc:61).
+static MDT695: Model1 = Model1::new_disabling_ntm(&DEV_MDT695, 16, SCAN_RATE);
+
+/// `MDT695Setup(num_cards, scan_rate)`.
 pub fn mdt695_setup_command() -> CommandDef {
+    MDT695.register_report("drvMDT695", |cards| {
+        cards.report("MDT695", |card, line| {
+            format!("    MDT695 controller {card}, {line} \n")
+        })
+    });
+    MDT695.setup_command("MDT695Setup")
+}
+
+/// `MDT695Config(card, name)`.
+pub fn mdt695_config_command() -> CommandDef {
     CommandDef::new(
-        "MDT695Setup",
-        vec![arg_int_req("maxControllers"), arg_int_opt("scanRate")],
-        "MDT695Setup(maxControllers, [scanRate]) - Accepted for parity; MDT695Config allocates per call",
+        "MDT695Config",
+        vec![
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+        ],
+        "MDT695Config(card, name)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxControllers")?;
-            if max < 1 {
-                return Err("MDT695Setup: maxControllers must be > 0".into());
+            let card = c_int(args, 0);
+            if !MDT695.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+
+            MDT695.config(card, move |init| {
+                let Ok(handle) = connect_with_eos(
+                    &asyn_port,
+                    // C connects at an asyn_address MDT695Config never sets (drvMDT695.cc:548).
+                    0,
+                    MDT695_TIMEOUT,
+                    INPUT_EOS,
+                    OUTPUT_EOS,
+                    EosRefusal::Ignored,
+                ) else {
+                    return;
+                };
+                let Ok(controller) = Mdt695Controller::new(handle) else {
+                    return;
+                };
+                let num_axes = controller.num_axes();
+                // C prints `cntrl->asyn_address`, which MDT695Config never sets
+                // (drvMDT695.cc:495-509), a read of uninitialized memory not
+                // copied; this is the address the line is opened at.
+                let line = format!("port={asyn_port}, address=0, id: {}", controller.ident());
+                let controller = Arc::new(Mutex::new(controller));
+                for index in 0..num_axes {
+                    let ax = Mdt695Axis::new(controller.clone(), index);
+                    let motor: Arc<Mutex<dyn Model1Motor>> = Arc::new(Mutex::new(ax));
+                    init.axis_with_build_trans(index as i32, motor, Arc::new(Mdt695Build));
+                }
+                init.describe(line);
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `MDT695Config(card, asynPort, [movingPollMs], [idlePollMs])`
-/// command bound to `holder`.
-pub fn mdt695_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
-    CommandDef::new(
-        "MDT695Config",
-        vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-        ],
-        "MDT695Config(card, asynPort, [movingPollMs], [idlePollMs]) - \
-         Create a ThorLabs MDT693/694/695 piezo controller (DTYP MDT695_{card}_{index}); \
-         the axis count (1 for MDT694, else 3) is read from the controller",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("MDT695Config: card must be >= 0".into());
-            }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+#[cfg(test)]
+mod report {
+    use super::*;
+    use motor_common::testing::{LineRig, driver_report, drvsup_init, run_command};
 
-            let handle = connect_serial(&asyn_port, MDT695_TIMEOUT)?;
-            let controller =
-                Mdt695Controller::new(handle).map_err(|e| format!("MDT695Config: {e}"))?;
-            let ident = controller.ident().to_string();
-            let num_axes = controller.num_axes();
-            let controller = Arc::new(Mutex::new(controller));
+    /// drvMDT695.cc's drvet `report` (drvMDT695.cc:145-172), which `dbior`
+    /// runs.
+    #[epics_rs::base::epics_test]
+    async fn dbior_prints_each_mdt695_card() {
+        let setup = mdt695_setup_command();
+        assert_eq!(
+            driver_report("drvMDT695", 0),
+            "    No MDT695 controllers configured.\n"
+        );
+        let int = ArgValue::Int;
+        run_command(setup, vec![int(2), int(10)]).await;
+        let (_line, _io) = LineRig::queued("mdtRepLine", |cmd| match cmd.trim_end() {
+            "D" => vec!["MDT694".into()],
+            _ => Vec::new(),
+        });
+        let config = vec![int(1), ArgValue::String("mdtRepLine".into())];
+        run_command(mdt695_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvMDT695", 0),
+            "    MDT695 controller 0 connection failed.\n    MDT695 controller 1, \
+             port=mdtRepLine, address=0, id:  \n"
+        );
+    }
 
-            for index in 0..num_axes {
-                let ax = Mdt695Axis::new(controller.clone(), index);
-                let dtyp_key = format!("MDT695_{card}_{index}");
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
-            }
-            println!(
-                "MDT695Config: card={card} asynPort={asyn_port} axes={num_axes} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=MDT695_{card}_{{0..{}}})",
-                num_axes.saturating_sub(1)
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    /// drvMDT695.cc:557-570: a `D` that fails is retried with echo toggled,
+    /// up to 3 times, like a reply without `MDT`.
+    #[epics_rs::base::epics_test]
+    async fn a_refused_first_d_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let int = ArgValue::Int;
+        run_command(mdt695_setup_command(), vec![int(1), int(10)]).await;
+        let tries = AtomicUsize::new(0);
+        let (_line, _io) = LineRig::failing(
+            "mdtRefusedD",
+            |cmd| match cmd.trim_end() {
+                "D" => "MDT694".into(),
+                _ => String::new(),
+            },
+            move |cmd| match cmd.trim_end() {
+                "D" => tries.fetch_add(1, Ordering::SeqCst) == 0,
+                // A quiet line: the I read times out and ends the ident.
+                "I" => true,
+                _ => false,
+            },
+        );
+        let config = vec![int(0), ArgValue::String("mdtRefusedD".into())];
+        run_command(mdt695_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(
+            driver_report("drvMDT695", 0),
+            "    MDT695 controller 0, port=mdtRefusedD, address=0, id:  \n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod init_status {
+    use super::*;
+    use epics_rs::base::types::EpicsValue;
+    use motor_common::testing::{LineRig, drvsup_init, record_init, run_command};
+
+    /// drvMDT695.cc:561-631: `motor_init` identifies the controller, then
+    /// reads each axis's status once, and the record starts from that read.
+    #[epics_rs::base::epics_test]
+    async fn mdt695_motor_init_reads_each_status_once() {
+        let int = ArgValue::Int;
+        run_command(mdt695_setup_command(), vec![int(1), int(10)]).await;
+        let (line, _io) = LineRig::queued("mdtInitLine", |cmd| match cmd.trim_end() {
+            "D" => vec!["MDT695".into()],
+            "XR?" => vec!["X 1.4".into()],
+            "YR?" => vec!["Y 0.3".into()],
+            "ZR?" => vec!["Z 0.0".into()],
+            _ => Vec::new(),
+        });
+        let config = vec![int(0), ArgValue::String("mdtInitLine".into())];
+        run_command(mdt695_config_command(), config).await;
+        drvsup_init().await;
+        assert_eq!(line.sent(), ["D", "I", "XR?", "YR?", "ZR?"]);
+        let db = record_init(
+            "record(motor, \"m1\") { field(DTYP, \"MDT695\") field(OUT, \"#C0 S0 @\") }\n\
+             record(motor, \"m2\") { field(DTYP, \"MDT695\") field(OUT, \"#C0 S1 @\") }\n",
+        )
+        .await;
+        assert_eq!(
+            [db.get_pv("m1.RMP").unwrap(), db.get_pv("m2.RMP").unwrap()],
+            [EpicsValue::Long(14), EpicsValue::Long(3)]
+        );
+    }
 }

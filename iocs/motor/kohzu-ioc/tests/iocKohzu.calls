@@ -1,0 +1,3 @@
+# c-expansion of st.cmd over the C sources, its controller calls:
+SC800Setup(1, 5)
+SC800Config(0, "serial1", 0)

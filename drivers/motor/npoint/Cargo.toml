@@ -1,4 +1,4 @@
-# nPoint C300 (and, later, LC400) piezo controller driver, ported from
+# nPoint C300 and LC400 piezo controller drivers, ported from
 # epics-modules/motor motorNPoint. The C300 is a pure ASCII SCPI-style protocol
 # over an asyn octet port — no vendor library, so this crate builds on any host.
 
@@ -10,4 +10,8 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "motor"] }
+epics-libcom-rs = { workspace = true }
 motor-common = { path = "../common" }
+
+[dev-dependencies]
+motor-common = { path = "../common", features = ["testing"] }

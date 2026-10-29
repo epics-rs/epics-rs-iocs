@@ -1,6 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 
 use epics_rs::ad_core::ioc::GenericDriverContext;
@@ -19,7 +21,7 @@ use merlin::{DetectorType, MerlinRuntime, create_merlin_detector};
 /// 10-entry argument array and reading `args[9]`, so `stackSize` was read
 /// past the end of iocsh's parsed argument buffer.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADMERLIN", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADMERLIN", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<MerlinRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -73,17 +75,17 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             ],
             "merlinDetectorConfig portName cmdPort dataPort maxSizeX maxSizeY detectorType \
              [maxBuffers] [maxMemory] [priority] [stackSize]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) if !s.is_empty() => s.clone(),
+                    ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let cmd_port = match &args[1] {
-                    ArgValue::String(s) if !s.is_empty() => s.clone(),
+                    ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("LabviewCmdPort required".into()),
                 };
                 let data_port = match &args[2] {
-                    ArgValue::String(s) if !s.is_empty() => s.clone(),
+                    ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("LabviewDataPort required".into()),
                 };
                 let size_x = match args.get(3) {
@@ -105,32 +107,27 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                let cmd = get_port(&cmd_port).ok_or_else(|| {
-                    format!(
-                        "command port '{cmd_port}' not found (call drvAsynIPPortConfigure first)"
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+
+                // C ignores both connect statuses (merlinDetector.cpp:1398-1401):
+                // a missing socket port leaves a user whose every transfer fails.
+                let (cmd, _) =
+                    SyncIOHandle::connect_port(&cmd_port, 0, Duration::ZERO, InterfaceType::Octet);
+                let (data, _) =
+                    SyncIOHandle::connect_port(&data_port, 0, Duration::ZERO, InterfaceType::Octet);
+
+                let rt =
+                    create_merlin_detector(&claim, cmd, data, size_x, size_y, det_type, max_memory)
+                        .map_err(|e| format!("failed to create the Merlin detector: {e}"))?;
+
+                claim
+                    .publish(
+                        rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
                     )
-                })?;
-                let data = get_port(&data_port).ok_or_else(|| {
-                    format!("data port '{data_port}' not found (call drvAsynIPPortConfigure first)")
-                })?;
-
-                println!(
-                    "merlinDetectorConfig: port={port_name}, cmd={cmd_port}, data={data_port}, \
-                     size={size_x}x{size_y}, type={det_type:?}"
-                );
-
-                let rt = create_merlin_detector(
-                    &port_name,
-                    cmd.handle.clone(),
-                    data.handle.clone(),
-                    size_x,
-                    size_y,
-                    det_type,
-                    max_memory,
-                )
-                .map_err(|e| format!("failed to create the Merlin detector: {e}"))?;
-
-                epics_rs::asyn::asyn_record::register_port(&port_name, rt.port_handle().clone())
                     .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

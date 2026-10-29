@@ -1,0 +1,7 @@
+# c-expansion of st.cmd.mcc over the C sources, its controller calls:
+phytronCreateMCC("phyMotionPort", "testRemote", 0, 1000, 1000, 1000, 1)
+phytronCreateAxis("phyMotionPort", 1, 1)
+phytronCreateAxis("phyMotionPort", 1, 2)
+phytronCreateAnalog("phyA1", "phyMotionPort", 1, 1, "")
+phytronCreateAnalog("phyA2", "phyMotionPort", 1, 2, "")
+phytronCreateDigital("phyD1", "phyMotionPort", 1, 1, "")

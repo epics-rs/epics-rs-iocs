@@ -67,7 +67,6 @@ members = [
     "drivers/delaygen",
     "drivers/love",
     "drivers/scaler974",
-    "drivers/syringepump",
     "drivers/microepsilon",
     "iocs/ad/eiger-ioc",
     "iocs/ad/mythen-ioc",
@@ -154,6 +153,13 @@ members = [
     "iocs/mca-rontec-ioc",
     "iocs/mca-amptek-ioc",
     "tools/ioc-conventions",
+]
+
+# cargo dylint --all: raw_float_format, built on its own pinned nightly from
+# the epics-rs revision that carries it.
+[workspace.metadata.dylint]
+libraries = [
+    { git = "https://github.com/epics-rs/epics-rs", rev = "32cf8af4ac185d3cdeaad6f531b5e8442ed63907", pattern = "lints/raw_float_format" },
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC
@@ -325,14 +331,31 @@ members = [
 # binaries reach no caller here.
 #
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.31.0"
-asyn-rs = "0.31.0"
-ad-core-rs = "0.31.0"
-ad-plugins-rs = "0.31.0"
+epics-rs = "0.33.0"
+asyn-rs = "0.33.0"
+epics-libcom-rs = "0.33.0"
+# The sequencer. Run time is the `runtime` feature; a build.rs compiling its
+# src/snl/*.st takes `default-features = false, features = ["snc"]`.
+epics-seq-rs = { version = "0.33.0", default-features = false }
+ad-core-rs = "0.33.0"
+ad-plugins-rs = "0.33.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.31.0", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.33.0", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c).
-# 0.31.0 does add an epics-rs "mca" feature, but it is `pub use mca_rs as
-# mca` over this same published crate, so drivers/mca keeps the direct
-# dependency and the version keeps being pinned in one place.
-mca-rs = "0.31.0"
+# epics-rs's "mca" feature is `pub use mca_rs as mca` over this same
+# published crate, so drivers/mca keeps the direct dependency and the
+# version keeps being pinned in one place.
+mca-rs = "0.33.0"
+# StreamDevice port (syringepump-ioc's Teledyne D/H).
+stream-rs = { version = "0.33.0", package = "epics-stream-rs" }
+# float_roundtrip makes the parser correctly rounded, as C's strtod is;
+# without it some doubles parse 1 ULP off.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# libssh2, as C's HAVE_LIBSSH2 build links; motor-newport's `sftp` feature.
+ssh2 = { version = "0.9", default-features = false }
+# Dev-only CFloat gate (tools/ioc-conventions/tests/cfloat.rs). Never
+# published; the patch below takes it from epics-rs at the v0.33.0 rev.
+cfloat-gate = "0.0.0"
+
+[patch.crates-io]
+cfloat-gate = { git = "https://github.com/epics-rs/epics-rs", rev = "32cf8af4ac185d3cdeaad6f531b5e8442ed63907" }

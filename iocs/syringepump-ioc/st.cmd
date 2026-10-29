@@ -5,7 +5,7 @@
 #   cargo run -p syringepump-ioc -- st.cmd
 #
 # Wires all three pump families from epics-modules/SyringePump:
-#   - Teledyne ISCO D/H-series (native asyn port driver -- drivers/syringepump)
+#   - Teledyne ISCO D/H-series (StreamDevice, teled_d.proto/teled_h.proto)
 #   - ISCO (Modbus/TCP, drvModbusAsynConfigure)
 #   - Vindum (Modbus RTU-over-TCP, drvModbusAsynConfigure)
 # No upstream st.cmd/iocBoot ships for either Teledyne family (confirmed
@@ -18,16 +18,16 @@
 # ISCO*/Vindum* register maps load via dbLoadTemplate (epics-base-rs 0.24.3,
 # registered as a builtin iocsh command) against db/*.substitutions -- ported
 # byte-for-byte from the real upstream ISCO*/Vindum*.substitutions files,
-# with each `file "$(MODBUS)/db/..."` path rewritten to a bare filename
-# (dbLoadTemplate does not macro-expand `file` paths; resolved relative to
-# the .substitutions file's own directory, i.e. db/). See each
+# with each `file "$(MODBUS)/db/..."` path rewritten to
+# `$(SYRINGEPUMP)/db/...`, where the modbus templates are copied. See each
 # db/*.substitutions file's own header for its exact deviations from
 # upstream.
 #
-# Omitted (matching drivers/love, drivers/scaler974, motor/amci precedent
-# in this workspace): autosave/save_restore machinery
-# (create_monitor_set/auto_settings.req) and the optional debug asynRecord
-# instance upstream's st.cmd loads. Neither is protocol logic.
+# Omitted: the optional debug asynRecord instance upstream's st.cmd loads.
+#
+# Autosave is upstream's save_restore_IOCSH.cmd once, with each family's
+# iocBoot auto_settings.req kept verbatim as auto_settings_ISCO.req and
+# auto_settings_Vindum.req, one monitor set each.
 #============================================================
 
 epicsEnvSet("P", "SP:")
@@ -36,30 +36,22 @@ epicsEnvSet("P", "SP:")
 # Teledyne D-series (demo instance -- no upstream st.cmd/iocBoot exists
 # for either Teledyne family; see header comment).
 # ------------------------------------------------------------------
-# The driver port records bind to ($(TELD_PORT)) must differ from the serial
-# transport it rides on ($(TELD_TTY)): TeledyneDInit registers its own port,
-# so reusing the serial port's name collides ("port already registered").
-epicsEnvSet("TELD_PORT", "TelD1")
+# The records talk StreamDevice (teled_d.proto, $(u=6) unit) on the tty port.
+epicsEnvSet("STREAM_PROTOCOL_PATH", "$(SYRINGEPUMP)/db")
 epicsEnvSet("TELD_TTY", "TelD1_tty")
 drvAsynSerialPortConfigure("$(TELD_TTY)", "/dev/ttyS0", 0, 0, 0)
 asynSetTraceIOMask("$(TELD_TTY)", 0, HEX)
-# TeledyneDInit(port, serPort, serAddr, unit) -- unit 6 matches
-# teled_d.proto/teled_h.proto's shipped default ($(u=6), never overridden
-# anywhere upstream).
-TeledyneDInit("$(TELD_PORT)", "$(TELD_TTY)", 0, 6)
 
-dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpD.template", "P=$(P),PUMP=D1:,s=SP,ta=Teledyne,ss=D1,PORT=$(TELD_PORT),ADDR=0")
+dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpD.template", "P=$(P),PUMP=D1:,s=SP,ta=Teledyne,ss=D1,PORT=$(TELD_TTY),ADDR=0")
 
 # ------------------------------------------------------------------
 # Teledyne H-series (demo instance -- see header comment).
 # ------------------------------------------------------------------
-epicsEnvSet("TELH_PORT", "TelH1")
 epicsEnvSet("TELH_TTY", "TelH1_tty")
 drvAsynSerialPortConfigure("$(TELH_TTY)", "/dev/ttyS1", 0, 0, 0)
 asynSetTraceIOMask("$(TELH_TTY)", 0, HEX)
-TeledyneHInit("$(TELH_PORT)", "$(TELH_TTY)", 0, 6)
 
-dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpH.template", "s=SP,ta=Teledyne,ss=H1,PORT=$(TELH_PORT)")
+dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpH.template", "s=SP,ta=Teledyne,ss=H1,PORT=$(TELH_TTY)")
 
 # ------------------------------------------------------------------
 # ISCO -- wiring and drvModbusAsynConfigure arguments taken verbatim from
@@ -177,6 +169,26 @@ dbLoadRecords("$(SYRINGEPUMP)/db/VindumController.template", "P=$(VPREFIX), PORT
 dbLoadRecords("$(SYRINGEPUMP)/db/VindumPumpN.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT), PUMP=A:")
 dbLoadRecords("$(SYRINGEPUMP)/db/VindumPumpN.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT), PUMP=B:")
 
+# ------------------------------------------------------------------
+# save_restore (upstream iocBoot/save_restore_IOCSH.cmd)
+# ------------------------------------------------------------------
+save_restoreSet_Debug(0)
+save_restoreSet_IncompleteSetsOk(1)
+save_restoreSet_DatedBackupFiles(1)
+save_restoreSet_NumSeqFiles(3)
+save_restoreSet_SeqPeriodInSeconds(300)
+set_savefile_path("$(SYRINGEPUMP)", "autosave")
+set_pass0_restoreFile("auto_settings_ISCO.sav")
+set_pass1_restoreFile("auto_settings_ISCO.sav")
+set_pass0_restoreFile("auto_settings_Vindum.sav")
+set_pass1_restoreFile("auto_settings_Vindum.sav")
+set_requestfile_path("$(SYRINGEPUMP)", "")
+set_requestfile_path("$(SYRINGEPUMP)", "db")
+set_requestfile_path("$(AUTOSAVE)", "db")
+
 ###############################################################################
 iocInit()
 ###############################################################################
+
+create_monitor_set("auto_settings_ISCO.req",30,"P=$(PREFIX)")
+create_monitor_set("auto_settings_Vindum.req",30,"P=$(VPREFIX)")

@@ -1,3 +1,5 @@
+use crate::trace::{self, TraceMask};
+
 /// Commands sent from the driver to the acquisition task.
 pub enum AcqCommand {
     Start,
@@ -128,15 +130,20 @@ pub struct CameraCapabilities {
 impl CameraCapabilities {
     /// Ask the camera at `serial` what it supports; an empty `serial` means
     /// "first device found", matching what the pipeline itself will open.
-    pub fn discover(serial: &str) -> Self {
+    /// `port` is the port the trace lines are printed on.
+    pub fn discover(port: &str, serial: &str) -> Self {
         let (has_imu, has_emitter) = query_sensor_capabilities(serial).unwrap_or_else(|| {
             // Not enumerable: assume the D435i's feature set so nothing is
             // silently dropped, and let the pipeline report the real problem.
-            log::warn!("D435i: camera not enumerable; assuming a D435i feature set");
+            trace::print(
+                port,
+                TraceMask::WARNING,
+                "D435i: camera not enumerable; assuming a D435i feature set\n",
+            );
             (true, true)
         });
         Self {
-            modes: discover_stream_modes(serial),
+            modes: discover_stream_modes(port, serial),
             has_imu,
             has_emitter,
         }
@@ -179,13 +186,21 @@ fn query_sensor_capabilities(serial: &str) -> Option<(bool, bool)> {
 /// Falls back to [`FALLBACK_STREAM_MODES`] when the camera cannot be reached --
 /// the IOC has to come up with a table either way, and the pipeline will report
 /// the real problem when acquisition starts.
-pub fn discover_stream_modes(serial: &str) -> Vec<StreamMode> {
+pub fn discover_stream_modes(port: &str, serial: &str) -> Vec<StreamMode> {
     let Some(modes) = query_stream_modes(serial) else {
-        log::warn!("D435i: camera not enumerable; offering the D435i's stream modes");
+        trace::print(
+            port,
+            TraceMask::WARNING,
+            "D435i: camera not enumerable; offering the D435i's stream modes\n",
+        );
         return FALLBACK_STREAM_MODES.to_vec();
     };
     if modes.is_empty() {
-        log::warn!("D435i: camera reported no colour+depth mode in common");
+        trace::print(
+            port,
+            TraceMask::WARNING,
+            "D435i: camera reported no colour+depth mode in common\n",
+        );
         return FALLBACK_STREAM_MODES.to_vec();
     }
     modes

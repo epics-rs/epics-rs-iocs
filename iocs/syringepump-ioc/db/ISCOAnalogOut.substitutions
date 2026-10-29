@@ -1,8 +1,7 @@
 # Ported from epics-modules/SyringePump/SPApp/Db/ISCOAnalogOut.substitutions.
-# Only change from upstream: `file "$(MODBUS)/db/aoFloat64.template"`
-# rewritten to a bare filename resolved relative to this file's own
-# directory (db/) -- dbLoadTemplate does not macro-expand `file` paths.
-file "aoFloat64.template" {
+# `$(MODBUS)/db/` is `$(SYRINGEPUMP)/db/`: the modbus
+# templates are copied into this directory.
+file "$(SYRINGEPUMP)/db/aoFloat64.template" {
 pattern
 { R,                      PORT,    OFFSET,      DATA_TYPE,  LOPR,  HOPR, PREC, EGU,  SCAN,       DESC}
 {A:PressureSP,        SP1_Reg_Out_1,    0,     FLOAT32_BE,   0,    10,    4,  egu, "I/O Intr", "Register"}

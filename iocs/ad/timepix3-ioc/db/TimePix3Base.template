@@ -11,54 +11,25 @@
 include "ADBase.template"
 
 ###############################################################################
-#  Note: The following are records defined in ADBase.template.                #
-#        We are changing some of the fields here to reflect valid values for  #
-#        TimePix3                                                             #
+#  Note: Records below override ADBase.template. Some set DB enum fields;      #
+#        TriggerMode uses driver readEnum() instead (see ADTimePix.cpp).      #
 ###############################################################################
 
 ###############################################################################
-#  These records control the trigger mode.                                    # 
+#  TriggerMode (mbbo/mbbi from ADBase.template)                               #
+#  Enum menu strings from driver readEnum() — ADTimePix.cpp kTriggerModes[].  #
+#  No ZRST/ONST/... here; asyn devAsynInt32 fills choices at runtime.         #
+#  Index 7: menu SwReSt_SwReSp; Serval SOFTWARESTART_SOFTWARESTOP (26-char).  #
 ###############################################################################
 
 record(mbbo, "$(P)$(R)TriggerMode")
 {
-   field(ZRST, "PexSt_NexSp")     #  PEXSTART_NEXSTOP
-   field(ZRVL, "0")
-   field(ONST, "NexSt_PexSp")     #  NEXSTART_PEXSTOP
-   field(ONVL, "1")
-   field(TWST, "PexSt_TmrSp")     #  PEXSTART_TIMERSTOP
-   field(TWVL, "2")
-   field(THST, "NexSt_TmrSp")    #  NEXSTART_TIMERSTOP
-   field(THVL, "3")
-   field(FRST, "AutoTrgSt_TmrSp") #  AUTOTRIGSTART_TIMERSTOP
-   field(FRVL, "4")
-   field(FVST, "Continuous")      #  CONTINUOUS
-   field(FVVL, "5")
-   field(SXST, "SwReSt_TmrSp")    #  SOFTWARESTART_TIMERSTOP
-   field(SXVL, "6")
-   field(SVST, "SwReSt_SwReSp")   # "SOFTWARESTART_SOFTWARESTOP"
-   field(SVVL, "7")
+   field(DESC, "Serval TriggerMode")
 }
 
 record(mbbi, "$(P)$(R)TriggerMode_RBV")
 {
-   field(ZRST, "PexSt_NexSp")           #  PEXSTART_NEXSTOP
-   field(ZRVL, "0")  
-   field(ONST, "NexSt_PexSp")           #  NEXSTART_PEXSTOP
-   field(ONVL, "1")
-   field(TWST, "PexSt_TmrSp")           #  PEXSTART_TIMERSTOP
-   field(TWVL, "2")
-   field(THST, "NexSt_TmrSp")          #  NEXSTART_TIMERSTOP
-   field(THVL, "3")
-   field(FRST, "AutoTrgSt_TmrSp")       #  AUTOTRIGSTART_TIMERSTOP
-   field(FRVL, "4")
-   field(FVST, "Continuous")            #  CONTINUOUS
-   field(FVVL, "5")
-   field(SXST, "SwReSt_TmrSp")          #  SOFTWARESTART_TIMERSTOP
-   field(SXVL, "6")
-   field(SVST, "SwReSt_SwReSp")         # "SOFTWARESTART_SOFTWARESTOP"
-   field(SVVL, "7")
-   field(SCAN, "I/O Intr")
+   field(DESC, "Serval TriggerMode RBV")
 }
 
 

@@ -14,6 +14,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # No debuginfo: with debug=2 the workspace test build ran the runner out
+  # of disk on PR #20, as epics-rs found for its own build. Panics keep
+  # their file:line; backtrace frames do not.
+  CARGO_PROFILE_DEV_DEBUG: 0
   # Crates that build/link against a vendor C library not present on a
   # stock GitHub runner. They are excluded here — not silenced — and still
   # build/test locally where the library is installed.
@@ -61,3 +65,24 @@ jobs:
       run: cargo nextest run --workspace $LINK_EXCLUDES
     - name: Run doctests
       run: cargo test --doc --workspace $LINK_EXCLUDES
+
+  # raw_float_format (epics-rs lints/raw_float_format) is a rustc_private
+  # lint, so it runs on the nightly the lint's rust-toolchain.toml pins while
+  # the workspace stays on 1.99.0. Move this toolchain with that file.
+  raw-float-format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly-2026-10-01
+        components: llvm-tools-preview, rustc-dev
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: raw-float-format
+    - name: Install dylint
+      run: cargo install --locked cargo-dylint@6.3.0 dylint-link@6.3.0
+    - name: raw_float_format
+      run: cargo dylint --all --workspace -- $CLIPPY_EXCLUDES --all-features --keep-going

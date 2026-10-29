@@ -1,106 +1,40 @@
-# USB-2408-2AO IOC startup script
+# USB-2408-2AO IOC startup script, ported from iocBoot/iocUSB2408/st.cmd
+#
+# MEASCOMP is set by main.rs to iocs/meascomp; its db/ holds measComp's
+# templates, substitutions and _settings.req files verbatim.
 
-epicsEnvSet("PREFIX", "USB2408:")
-epicsEnvSet("PORT",   "USB2408_1")
-epicsEnvSet("UNIQUE_ID", "01DA523D")
-epicsEnvSet("WDIG_POINTS", "2048")
-epicsEnvSet("WGEN_POINTS", "2048")
+epicsEnvSet("PREFIX",        "USB2408:")
+epicsEnvSet("PORT",          "USB2408_1")
+epicsEnvSet("WDIG_POINTS",   "2048")
+epicsEnvSet("WGEN_POINTS",   "2048")
+epicsEnvSet("UNIQUE_ID",     "01DA523D")
 
-# Create the USB-2408-2AO driver
+## Configure port driver
+# MultiFunctionConfig((portName,        # The name to give to this asyn port driver
+#                      uniqueID,        # For USB the serial number.  For Ethernet the MAC address or IP address.
+#                      maxInputPoints,  # Maximum number of input points for waveform digitizer
+#                      maxOutputPoints) # Maximum number of output points for waveform generator
 MultiFunctionConfig("$(PORT)", "$(UNIQUE_ID)", $(WDIG_POINTS), $(WGEN_POINTS))
 
-# Device info
-dbLoadRecords("$(MEASCOMP)/db/meascomp_device.template", "P=$(PREFIX),PORT=$(PORT)")
+dbLoadTemplate("$(MEASCOMP)/db/USB2408.substitutions", "P=$(PREFIX),PORT=$(PORT),WDIG_POINTS=$(WDIG_POINTS),WGEN_POINTS=$(WGEN_POINTS)")
 
-# Counters (2)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter1,PORT=$(PORT),ADDR=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_counter.template", "P=$(PREFIX),R=Counter2,PORT=$(PORT),ADDR=1")
-
-# Analog inputs (8 channels)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_in.template", "P=$(PREFIX),R=Ai1,PORT=$(PORT),ADDR=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_in.template", "P=$(PREFIX),R=Ai2,PORT=$(PORT),ADDR=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_in.template", "P=$(PREFIX),R=Ai3,PORT=$(PORT),ADDR=2")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_in.template", "P=$(PREFIX),R=Ai4,PORT=$(PORT),ADDR=3")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_in.template", "P=$(PREFIX),R=Ai5,PORT=$(PORT),ADDR=4")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_in.template", "P=$(PREFIX),R=Ai6,PORT=$(PORT),ADDR=5")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_in.template", "P=$(PREFIX),R=Ai7,PORT=$(PORT),ADDR=6")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_in.template", "P=$(PREFIX),R=Ai8,PORT=$(PORT),ADDR=7")
-
-# Temperature inputs (8 channels)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_temperature.template", "P=$(PREFIX),R=Ti1,PORT=$(PORT),ADDR=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_temperature.template", "P=$(PREFIX),R=Ti2,PORT=$(PORT),ADDR=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_temperature.template", "P=$(PREFIX),R=Ti3,PORT=$(PORT),ADDR=2")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_temperature.template", "P=$(PREFIX),R=Ti4,PORT=$(PORT),ADDR=3")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_temperature.template", "P=$(PREFIX),R=Ti5,PORT=$(PORT),ADDR=4")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_temperature.template", "P=$(PREFIX),R=Ti6,PORT=$(PORT),ADDR=5")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_temperature.template", "P=$(PREFIX),R=Ti7,PORT=$(PORT),ADDR=6")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_temperature.template", "P=$(PREFIX),R=Ti8,PORT=$(PORT),ADDR=7")
-
-# Analog input mode (shared by all channels)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_in_mode.template", "P=$(PREFIX),R=AiMode,PORT=$(PORT),MODE=0")
-
-# Analog outputs (2 channels)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_out.template", "P=$(PREFIX),R=Ao1,PORT=$(PORT),ADDR=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_analog_out.template", "P=$(PREFIX),R=Ao2,PORT=$(PORT),ADDR=1")
-
-# Digital I/O (8 bits)
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi1,PORT=$(PORT),ADDR=0,MASK=0x01")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi2,PORT=$(PORT),ADDR=0,MASK=0x02")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi3,PORT=$(PORT),ADDR=0,MASK=0x04")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi4,PORT=$(PORT),ADDR=0,MASK=0x08")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi5,PORT=$(PORT),ADDR=0,MASK=0x10")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi6,PORT=$(PORT),ADDR=0,MASK=0x20")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi7,PORT=$(PORT),ADDR=0,MASK=0x40")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi8,PORT=$(PORT),ADDR=0,MASK=0x80")
-
-# Whole-port digital I/O
-dbLoadRecords("$(MEASCOMP)/db/meascomp_long_in.template",  "P=$(PREFIX),R=Li,PORT=$(PORT),ADDR=0,MASK=0xFF")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_long_out.template", "P=$(PREFIX),R=Lo,PORT=$(PORT),ADDR=0,MASK=0xFF")
-
-# Digital I/O bit directions (0=input, 1=output). The AUXPORT is
-# open-collector with no direction control: "In" releases the bit and the
-# driver then never drives it, "Out" makes Bo/Lo able to pull it low.
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd1,PORT=$(PORT),ADDR=0,MASK=0x01,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd2,PORT=$(PORT),ADDR=0,MASK=0x02,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd3,PORT=$(PORT),ADDR=0,MASK=0x04,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd4,PORT=$(PORT),ADDR=0,MASK=0x08,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd5,PORT=$(PORT),ADDR=0,MASK=0x10,VAL=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd6,PORT=$(PORT),ADDR=0,MASK=0x20,VAL=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd7,PORT=$(PORT),ADDR=0,MASK=0x40,VAL=1")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd8,PORT=$(PORT),ADDR=0,MASK=0x80,VAL=1")
-
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo1,PORT=$(PORT),ADDR=0,MASK=0x01")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo2,PORT=$(PORT),ADDR=0,MASK=0x02")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo3,PORT=$(PORT),ADDR=0,MASK=0x04")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo4,PORT=$(PORT),ADDR=0,MASK=0x08")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo5,PORT=$(PORT),ADDR=0,MASK=0x10")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo6,PORT=$(PORT),ADDR=0,MASK=0x20")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo7,PORT=$(PORT),ADDR=0,MASK=0x40")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo8,PORT=$(PORT),ADDR=0,MASK=0x80")
-
-# Waveform digitizer
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_dig.template", "P=$(PREFIX),PORT=$(PORT),WDIG_POINTS=$(WDIG_POINTS)")
-
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig1,PORT=$(PORT),ADDR=0,WDIG_POINTS=$(WDIG_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig2,PORT=$(PORT),ADDR=1,WDIG_POINTS=$(WDIG_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig3,PORT=$(PORT),ADDR=2,WDIG_POINTS=$(WDIG_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig4,PORT=$(PORT),ADDR=3,WDIG_POINTS=$(WDIG_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig5,PORT=$(PORT),ADDR=4,WDIG_POINTS=$(WDIG_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig6,PORT=$(PORT),ADDR=5,WDIG_POINTS=$(WDIG_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig7,PORT=$(PORT),ADDR=6,WDIG_POINTS=$(WDIG_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig8,PORT=$(PORT),ADDR=7,WDIG_POINTS=$(WDIG_POINTS)")
-
-# Waveform generator
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_gen.template", "P=$(PREFIX),PORT=$(PORT),WGEN_POINTS=$(WGEN_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen1,PORT=$(PORT),ADDR=0,WGEN_POINTS=$(WGEN_POINTS)")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen2,PORT=$(PORT),ADDR=1,WGEN_POINTS=$(WGEN_POINTS)")
-
-# Autosave: request files live next to this script, saved state under
-# ./autosave. set_pass1_restoreFile is a no-op until the first save has run.
-set_requestfile_path("$(USB_2408_IOC)")
-set_savefile_path("$(USB_2408_IOC)/autosave")
-set_pass1_restoreFile("auto_settings.sav", "P=$(PREFIX)")
+save_restoreSet_Debug(0)
+save_restoreSet_IncompleteSetsOk(1)
+save_restoreSet_DatedBackupFiles(1)
+save_restoreSet_NumSeqFiles(3)
+save_restoreSet_SeqPeriodInSeconds(300)
+set_savefile_path("$(MEASCOMP)/usb-2408-ioc", "autosave")
+set_pass0_restoreFile("auto_settings.sav")
+set_pass1_restoreFile("auto_settings.sav")
+set_requestfile_path("$(MEASCOMP)/usb-2408-ioc", "")
+set_requestfile_path("$(MEASCOMP)", "db")
 
 iocInit()
 
-create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
+# save settings every thirty seconds
+create_monitor_set("auto_settings.req",30,"P=$(PREFIX)")
+
+# Need to force the time arrays to process because the records are scan=I/O Intr
+# but asynPortDriver does not do array callbacks before iocInit.
+dbpf $(PREFIX)WaveDigDwell.PROC 1
+dbpf $(PREFIX)WaveGenUserDwell.PROC 1

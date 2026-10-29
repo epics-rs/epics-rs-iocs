@@ -5,7 +5,7 @@
 #   cargo run -p mca-amptek-ioc -- st.cmd
 #
 # Boots one Amptek DP5 asyn port over the Ethernet/UDP transport
-# (drvAmptekConfigure) and loads one mca record (devMcaAsyn) plus the full
+# (drvAmptekConfigure) and loads mca.db (an mca record on devMcaAsyn) plus the full
 # Amptek.db/Amptek_SCAn.db control record set, ported from upstream
 # iocBoot/iocAmptek/st_base.cmd.
 #
@@ -15,10 +15,7 @@
 # dbLoadRecords calls -- textually equivalent to what dbLoadTemplate would
 # have produced.
 #
-# Omitted (matching every other IOC in this workspace): autosave/
-# save_restore machinery (create_monitor_set/auto_settings.req) and the
-# optional debug asynRecord instance upstream's st.cmd loads. Neither is
-# protocol logic.
+# Omitted: the optional debug asynRecord instance upstream's st.cmd loads.
 #
 # Live boot test: point ADDRESS at 127.0.0.1 and run
 # `cargo run -p mca-amptek --example stub_dp5` in another terminal first --
@@ -31,23 +28,40 @@
 # to this IOC crate's CARGO_MANIFEST_DIR.
 
 # drvAmptekConfigure(portName, interface, addressInfo, directMode)
-# interface: 0 = Ethernet (only supported interface -- USB is
-# feasibility-gated, see the mca-amptek crate doc).
+# interface: 0 = Ethernet, 1 = USB (addressInfo "" or the serial number),
+# 2 = Serial (never connects, as in C).
 drvAmptekConfigure("Amptek1", 0, "127.0.0.1", 1)
 
 # ---- records ----
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/mca.db", "P=mcaTest:,R=spectrum1,PORT=Amptek1,ADDR=0,NCHAN=8192")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/mca.db", "P=mcaTest:,M=mca1,NCHAN=8192,DTYP=asynMCA,INP=@asyn(Amptek1)")
 dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek.db", "P=mcaTest:,R=Amptek1:,PORT=Amptek1")
 
 # Amptek_SCAs.substitutions, expanded (see header comment).
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=0")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=1")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=2")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=3")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=4")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=5")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=6")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=7")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=0")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=1")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=2")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=3")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=4")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=5")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=6")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=7")
+
+# ---- save_restore (upstream ../save_restore.cmd) ----
+save_restoreSet_status_prefix("mcaTest:")
+save_restoreSet_Debug(0)
+save_restoreSet_IncompleteSetsOk(1)
+save_restoreSet_DatedBackupFiles(1)
+save_restoreSet_NumSeqFiles(3)
+save_restoreSet_SeqPeriodInSeconds(300)
+set_savefile_path("$(MCA_AMPTEK_IOC)", "autosave")
+set_pass0_restoreFile("auto_settings.sav")
+set_pass1_restoreFile("auto_settings.sav")
+set_requestfile_path("$(MCA_AMPTEK_IOC)", "")
+set_requestfile_path("$(MCA_AMPTEK_IOC)", "db")
+dbLoadRecords("$(AUTOSAVE)/db/save_restoreStatus.db", "P=mcaTest:")
 
 #------------------------------------------------------------------------------
 iocInit()
+
+# save settings every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=mcaTest:,M=mca1,R=Amptek1:")

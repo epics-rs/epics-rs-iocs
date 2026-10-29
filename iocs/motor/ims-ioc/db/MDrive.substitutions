@@ -1,0 +1,7 @@
+# C's iocIms MDrive.substitutions, P and C from st-mdrive.cmd.
+file "$(MOTOR)/db/motor.db"
+{
+pattern
+{N, M,       DTYP,     S, DESC,         EGU,     DIR, VELO, VBAS, ACCL, BDST, BVEL, BACC, MRES, PREC, DHLM, DLLM, INIT}
+{3, "m$(N)", "MDrive", 0, "motor $(N)", degrees, Pos, 1,    .1,   .2,   0,    1,    .2,   0.01, 5,    100,  -100, ""}
+}

@@ -5,6 +5,10 @@
 //! consumer's own `ptr += 4`), or on a full raw binary frame (`FD1`/`FO1`,
 //! which indexes from the frame start).
 
+use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::runtime::stdlib::strtod;
+use epics_rs::base::types::c_parse;
+
 // ---------------------------------------------------------------------
 // Command builders
 // ---------------------------------------------------------------------
@@ -74,13 +78,15 @@ pub fn cmd_skk_set(channel: u32, value: f64) -> String {
 pub fn cmd_vd_set(channel: u32, on: bool) -> String {
     format!("VD{channel:03},{}\r\n", if on { "ON" } else { "OFF" })
 }
-/// `set_mode(CMD_SET_OPMODE, ...)` (`drvMW100.c:1303`).
-pub fn cmd_ds_set(on: bool) -> String {
-    format!("DS{}\r\n", if on { '1' } else { '0' })
+/// `set_mode(CMD_SET_OPMODE, ...)` (`drvMW100.c:1298-1307`): `None`, and
+/// nothing sent, unless `value` is 0 or 1.
+pub fn cmd_ds_set(value: i32) -> Option<String> {
+    matches!(value, 0 | 1).then(|| format!("DS{value}\r\n"))
 }
-/// `set_mode(CMD_SET_COMPUTE, ...)` (`drvMW100.c:1312`): `mode` is 0-3.
-pub fn cmd_ex_set(mode: u8) -> String {
-    format!("EX{}\r\n", (b'0' + (mode & 0x3)) as char)
+/// `set_mode(CMD_SET_COMPUTE, ...)` (`drvMW100.c:1308-1316`): `None`, and
+/// nothing sent, outside 0-3.
+pub fn cmd_ex_set(value: i32) -> Option<String> {
+    (0..=3).contains(&value).then(|| format!("EX{value}\r\n"))
 }
 pub fn cmd_ce0() -> String {
     "CE0\r\n".to_string()
@@ -97,34 +103,9 @@ pub fn cmd_bo1() -> String {
     "BO1\r\n".to_string()
 }
 
-/// C `sprintf("%G", value)` — default precision (6 significant digits),
-/// trailing zeros stripped (`drvMW100.c:1265,1268`).
+/// C `sprintf("%G", value)` (`drvMW100.c:1265,1268`).
 pub fn format_g(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    const PRECISION: i32 = 6;
-    let exponent = value.abs().log10().floor() as i32;
-    if !(-4..PRECISION).contains(&exponent) {
-        let digits = (PRECISION - 1).max(0) as usize;
-        let s = format!("{value:.digits$e}");
-        let (mantissa, exp) = s.split_once('e').expect("Rust {:e} always emits 'e'");
-        let mantissa = strip_trailing_zeros(mantissa);
-        let exp: i32 = exp
-            .parse()
-            .expect("Rust {:e} exponent is always an integer");
-        format!("{mantissa}E{exp:+03}")
-    } else {
-        let decimals = (PRECISION - 1 - exponent).max(0) as usize;
-        strip_trailing_zeros(&format!("{value:.decimals$}"))
-    }
-}
-
-fn strip_trailing_zeros(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_string();
-    }
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    CFloat(value).g().to_string().to_ascii_uppercase()
 }
 
 // ---------------------------------------------------------------------
@@ -132,19 +113,15 @@ fn strip_trailing_zeros(s: &str) -> String {
 // static error-message table (`drvMW100.c:194-394`).
 // ---------------------------------------------------------------------
 
-/// `sscanf(inbuffer, "E1 %d %*s\r\n", &error_code) == 1` — space-separated
-/// (not GM10's comma/`:1:`-suffixed format); the trailing token is
-/// discarded, and `sscanf`'s return count is already satisfied once the
-/// leading `%d` assigns, regardless of what (if anything) follows.
-pub fn parse_error_code(payload: &str) -> Option<i32> {
-    let rest = payload.strip_prefix("E1 ")?;
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    if end == 0 {
-        return None;
+/// `sscanf(inbuffer, "E1 %d %*s\r\n", &error_code) == 1`: the format's
+/// space and `%d` both skip any whitespace (including none) and `%d`
+/// takes a sign, so only the literal `E1` and one digit are required.
+pub fn parse_error_code(payload: &[u8]) -> Option<i32> {
+    let rest = payload.strip_prefix(b"E1")?;
+    match c_parse::strtol(rest, 10) {
+        (_, 0) => None,
+        (code, _) => Some(c_parse::long_to_int(code)),
     }
-    rest[..end].parse().ok()
 }
 
 #[derive(Debug)]
@@ -966,14 +943,15 @@ pub static ERRORS: &[ErrorEntry] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleLine {
     pub index: usize,
-    pub set_message: String,
-    pub status_message: String,
-    pub error_message: String,
+    /// The fixed 13 wire bytes C copies (`drvMW100.c:587-601`).
+    pub set_message: [u8; 13],
+    pub status_message: [u8; 13],
+    pub error_message: Vec<u8>,
 }
 
 /// The all-dashes sentinel for "no module configured" (`drvMW100.c:616`) —
 /// 13 dashes, unlike GM10's 16-dash sentinel.
-pub const NO_MODULE: &str = "-------------";
+pub const NO_MODULE: &[u8; 13] = b"-------------";
 
 /// Parses the `CF0` ASCII body. Each line: 1-digit module index (0-5), 3
 /// unexamined bytes, a fixed 13-byte `set_message` (no space-trimming), 3
@@ -992,13 +970,13 @@ pub fn parse_cf0(payload: &[u8]) -> Option<Vec<ModuleLine>> {
         if p + 13 > payload.len() {
             return None;
         }
-        let set_message = String::from_utf8_lossy(&payload[p..p + 13]).into_owned();
+        let set_message: [u8; 13] = payload[p..p + 13].try_into().expect("13-byte slice");
         p += 13 + 3;
 
         if p + 13 > payload.len() {
             return None;
         }
-        let status_message = String::from_utf8_lossy(&payload[p..p + 13]).into_owned();
+        let status_message: [u8; 13] = payload[p..p + 13].try_into().expect("13-byte slice");
         p += 13 + 1;
 
         let start = p;
@@ -1008,7 +986,7 @@ pub fn parse_cf0(payload: &[u8]) -> Option<Vec<ModuleLine>> {
         if p >= payload.len() {
             return None;
         }
-        let error_message = String::from_utf8_lossy(&payload[start..p]).into_owned();
+        let error_message = payload[start..p].to_vec();
         p += 2;
 
         modules.push(ModuleLine {
@@ -1027,7 +1005,7 @@ pub fn parse_cf0(payload: &[u8]) -> Option<Vec<ModuleLine>> {
 pub fn module_line_ok(line: &ModuleLine) -> bool {
     line.set_message == line.status_message
         && line.error_message.is_empty()
-        && line.set_message != NO_MODULE
+        && line.set_message != *NO_MODULE
 }
 
 /// Decode a module type string (e.g. `"MX110-UNV-M10"`) into
@@ -1036,42 +1014,20 @@ pub fn module_line_ok(line: &ModuleLine) -> bool {
 /// sub-field falls back to a default (`atoi` on garbage returns 0, an
 /// unrecognized speed char yields -1), matching the C source's own
 /// tolerant parse.
-pub fn classify_module_string(module_string: &str) -> (i32, String, i32, i32) {
-    let bytes = module_string.as_bytes();
-    // `ptr = module_string + 2` then `atoi(ptr)` (`drvMW100.c:623-624`):
-    // the model number starts at byte offset 2 (e.g. "MX110..." -> "110...").
-    let model_start = 2.min(bytes.len());
-    let model_str = &module_string[model_start..];
-    let digits_end = model_str
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(model_str.len());
-    let model: i32 = model_str[..digits_end].parse().unwrap_or(0);
-
-    // `ptr += 4` from the model start (`drvMW100.c:625`), then a 3-byte
-    // code field (`drvMW100.c:627-630`).
-    let code_start = (model_start + 4).min(bytes.len());
-    let code_end = (code_start + 3).min(bytes.len());
-    let code = module_string[code_start..code_end].to_string();
-
-    // `ptr++` past the code (`drvMW100.c:631`, the extra increment after the
-    // copy loop skips the `-` separator), then the speed char
-    // (`drvMW100.c:633-646`).
-    let speed_pos = code_start + 3 + 1;
-    let speed = match bytes.get(speed_pos) {
+pub fn classify_module_string(module_string: &[u8]) -> (i32, Vec<u8>, i32, i32) {
+    // Byte offsets, as C walks `ptr` (`drvMW100.c:623-649`); the dash after
+    // the model number halts `atoi`.
+    let tail = |at: usize| module_string.get(at..).unwrap_or(&[]);
+    let model = c_atoi(tail(2));
+    let code_bytes = tail(6);
+    let code = code_bytes[..code_bytes.len().min(3)].to_vec();
+    let speed = match module_string.get(10) {
         Some(b'L') => 0,
         Some(b'M') => 1,
         Some(b'H') => 2,
         _ => -1,
     };
-
-    // `ptr++` past the speed char, then `atoi(ptr)` (`drvMW100.c:647-649`).
-    let number_start = (speed_pos + 1).min(bytes.len());
-    let number_str = &module_string[number_start.min(module_string.len())..];
-    let digits_end = number_str
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(number_str.len());
-    let number: i32 = number_str[..digits_end].parse().unwrap_or(0);
-
+    let number = c_atoi(tail(11));
     (model, code, speed, number)
 }
 
@@ -1104,7 +1060,7 @@ pub struct ChannelInfoLine {
     /// 0-based array index (`address = atoi(channel) - 1`).
     pub index: usize,
     pub status: u8, // CH_STATUS_{SKIP=0,NORMAL=1,DIFF=2,UNKNOWN=3}
-    pub unit: String,
+    pub unit: Vec<u8>,
     pub scale: u8,
 }
 
@@ -1112,6 +1068,72 @@ pub const CH_STATUS_SKIP: u8 = 0;
 pub const CH_STATUS_NORMAL: u8 = 1;
 pub const CH_STATUS_DIFF: u8 = 2;
 pub const CH_STATUS_UNKNOWN: u8 = 3;
+
+/// glibc `inet_aton`: one to four `.`-separated `strtoul(.., 0)` numbers
+/// (decimal, `0` octal, `0x` hex), the last filling the remaining bytes;
+/// the address may end at a whitespace byte.
+pub fn inet_aton(s: &[u8]) -> Option<std::net::Ipv4Addr> {
+    let mut parts = [0u32; 3];
+    let mut n = 0;
+    let mut i = 0;
+    let last = loop {
+        if !s.get(i).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        let (value, len) = strtoul_base0(&s[i..])?;
+        i += len;
+        if s.get(i) != Some(&b'.') {
+            break value;
+        }
+        if n > 2 || value > 0xff {
+            return None;
+        }
+        parts[n] = value as u32;
+        n += 1;
+        i += 1;
+    };
+    if s.get(i)
+        .is_some_and(|&c| !epics_rs::base::runtime::stdlib::c_isspace(c as char))
+    {
+        return None;
+    }
+    if last > [0xffff_ffff, 0xff_ffff, 0xffff, 0xff][n] {
+        return None;
+    }
+    let mut address = last as u32;
+    for (k, part) in parts[..n].iter().enumerate() {
+        address |= part << (24 - 8 * k);
+    }
+    Some(address.into())
+}
+
+/// `strtoul(s, &end, 0)` on a string that starts with a digit: the value
+/// and the digits consumed, `None` on `ERANGE`. Not [`c_parse::strtoul`]:
+/// glibc's own `inet_aton` reads without C23's `0b` prefix.
+fn strtoul_base0(s: &[u8]) -> Option<(u64, usize)> {
+    let (radix, start) = match s {
+        [b'0', b'x' | b'X', c, ..] if c.is_ascii_hexdigit() => (16, 2),
+        [b'0', ..] => (8, 0),
+        _ => (10, 0),
+    };
+    let mut value: u64 = 0;
+    let mut i = start;
+    while let Some(d) = s.get(i).and_then(|&c| (c as char).to_digit(radix)) {
+        value = value
+            .checked_mul(u64::from(radix))?
+            .checked_add(u64::from(d))?;
+        i += 1;
+    }
+    Some((value, i))
+}
+
+pub use c_parse::atoi as c_atoi;
+
+/// C `address = atoi(...) - 1` as an array index. `None` where C indexes
+/// out of bounds (undefined behaviour), so that line is dropped.
+fn zero_based(n: i32) -> Option<usize> {
+    usize::try_from(i64::from(n) - 1).ok()
+}
 
 fn find_byte(payload: &[u8], from: usize, target: u8) -> Option<usize> {
     payload
@@ -1138,29 +1160,22 @@ pub fn parse_fe1(payload: &[u8]) -> Option<Vec<ChannelInfoLine>> {
         let channel = &payload[p..p + 4];
         p += 4;
         let (family, index) = if channel[0] == b'A' {
-            let digits = std::str::from_utf8(&channel[1..4]).ok()?;
-            (
-                InfoFamily::Math,
-                digits.trim_start_matches('0').parse::<i64>().unwrap_or(0),
-            )
+            (InfoFamily::Math, zero_based(c_atoi(&channel[1..4])))
         } else {
-            let digits = std::str::from_utf8(channel).ok()?;
-            (
-                InfoFamily::Signal,
-                digits.trim_start_matches('0').parse::<i64>().unwrap_or(0),
-            )
+            (InfoFamily::Signal, zero_based(c_atoi(channel)))
         };
-        let index = (index - 1).max(0) as usize;
 
         if status == CH_STATUS_SKIP {
             let nl = find_byte(payload, p, b'\n')?;
-            out.push(ChannelInfoLine {
-                family,
-                index,
-                status,
-                unit: "----".to_string(),
-                scale: 0,
-            });
+            if let Some(index) = index {
+                out.push(ChannelInfoLine {
+                    family,
+                    index,
+                    status,
+                    unit: b"----".to_vec(),
+                    scale: 0,
+                });
+            }
             p = nl + 1;
             continue;
         }
@@ -1170,25 +1185,24 @@ pub fn parse_fe1(payload: &[u8]) -> Option<Vec<ChannelInfoLine>> {
         while i < 6 && unit_start + i < payload.len() && payload[unit_start + i] != b' ' {
             i += 1;
         }
-        let unit = String::from_utf8_lossy(&payload[unit_start..unit_start + i]).into_owned();
+        let unit = payload[unit_start..unit_start + i].to_vec();
         p = unit_start + i;
         let comma = find_byte(payload, p, b',')?;
         let scale_start = comma + 1;
         if scale_start + 3 > payload.len() {
             return None;
         }
-        let scale: u8 = std::str::from_utf8(&payload[scale_start..scale_start + 3])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let scale = c_atoi(&payload[scale_start..scale_start + 3]) as u8;
 
-        out.push(ChannelInfoLine {
-            family,
-            index,
-            status,
-            unit,
-            scale,
-        });
+        if let Some(index) = index {
+            out.push(ChannelInfoLine {
+                family,
+                index,
+                status,
+                unit,
+                scale,
+            });
+        }
 
         let nl = find_byte(payload, scale_start + 3, b'\n')?;
         p = nl + 1;
@@ -1221,32 +1235,19 @@ pub fn parse_fo0(payload: &[u8]) -> Option<Vec<OutputStatusLine>> {
             _ => {}
         }
         p += 2;
-        let digits_end = scan_digits(payload, p);
-        let index = parse_1based_index(payload, p, digits_end)?;
-        out.push(OutputStatusLine { index, status });
-        let nl = find_byte(payload, digits_end, b'\n')?;
+        if let Some(index) = zero_based(c_atoi(payload.get(p..).unwrap_or_default())) {
+            out.push(OutputStatusLine { index, status });
+        }
+        let nl = find_byte(payload, p, b'\n')?;
         p = nl + 1;
     }
     Some(out)
 }
 
-fn scan_digits(payload: &[u8], from: usize) -> usize {
-    let mut i = from;
-    while i < payload.len() && payload[i].is_ascii_digit() {
-        i += 1;
-    }
-    i
-}
-
-fn parse_1based_index(payload: &[u8], from: usize, to: usize) -> Option<usize> {
-    if to <= from {
-        return None;
-    }
-    let n: i64 = std::str::from_utf8(&payload[from..to]).ok()?.parse().ok()?;
-    if n < 1 {
-        return None;
-    }
-    Some((n - 1) as usize)
+/// C `*(p + width) = '\0'; atoi(p)`: atoi over at most `width` bytes.
+fn atoi_field(payload: &[u8], from: usize, width: usize) -> i32 {
+    let end = (from + width).min(payload.len());
+    c_atoi(payload.get(from..end).unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------
@@ -1280,8 +1281,7 @@ pub fn parse_ao(payload: &[u8]) -> Option<Vec<ChannelModeLine>> {
     let mut p = 4usize;
     while p < payload.len() && payload[p] != b'E' {
         p += 2;
-        let digits_end = scan_digits(payload, p).min(p + 3);
-        let index = parse_1based_index(payload, p, digits_end)?;
+        let index = zero_based(atoi_field(payload, p, 3));
         p += 4;
         let mode = if payload.get(p) != Some(&b'A') {
             CH_MODE_DAC_SKIP
@@ -1293,7 +1293,9 @@ pub fn parse_ao(payload: &[u8]) -> Option<Vec<ChannelModeLine>> {
                 _ => CH_MODE_DAC_UNKNOWN,
             }
         };
-        out.push(ChannelModeLine { index, mode });
+        if let Some(index) = index {
+            out.push(ChannelModeLine { index, mode });
+        }
         let nl = find_byte(payload, p, b'\n')?;
         p = nl + 1;
     }
@@ -1312,9 +1314,12 @@ pub fn parse_xd(
     let mut p = 4usize;
     while p < payload.len() && payload[p] != b'E' {
         p += 2;
-        let digits_end = scan_digits(payload, p).min(p + 3);
-        let index = parse_1based_index(payload, p, digits_end)?;
+        let index = zero_based(atoi_field(payload, p, 3));
         p += 4;
+        let Some(index) = index else {
+            p = find_byte(payload, p, b'\n')? + 1;
+            continue;
+        };
         let mode = if ch_status_of(index) == CH_STATUS_SKIP {
             CH_MODE_RELAY_SKIP
         } else {
@@ -1344,7 +1349,7 @@ pub type ChStatusWire = u8;
 pub struct ExprLine {
     pub index: usize,
     pub on_flag: bool,
-    pub expr: String,
+    pub expr: Vec<u8>,
 }
 
 /// `SO?` calc-expression decode. Unlike GM10's `SRangeMath`, the
@@ -1355,28 +1360,31 @@ pub fn parse_so(payload: &[u8]) -> Option<Vec<ExprLine>> {
     let mut p = 4usize;
     while p < payload.len() && payload[p] != b'E' {
         p += 3;
-        let digits_end = (p + 3).min(payload.len());
-        let index = parse_1based_index(payload, p, digits_end)?;
+        let index = zero_based(atoi_field(payload, p, 3));
         p += 5;
         if payload.get(p) == Some(&b'F') {
-            out.push(ExprLine {
-                index,
-                on_flag: false,
-                expr: String::new(),
-            });
+            if let Some(index) = index {
+                out.push(ExprLine {
+                    index,
+                    on_flag: false,
+                    expr: Vec::new(),
+                });
+            }
             let nl = find_byte(payload, p, b'\n')?;
             p = nl + 1;
             continue;
         }
         p += 2;
         let comma = find_byte(payload, p, b',')?;
-        let expr = String::from_utf8_lossy(&payload[p..comma]).into_owned();
+        let expr = payload[p..comma].to_vec();
         p = comma + 1;
-        out.push(ExprLine {
-            index,
-            on_flag: true,
-            expr,
-        });
+        if let Some(index) = index {
+            out.push(ExprLine {
+                index,
+                on_flag: true,
+                expr,
+            });
+        }
         let nl = find_byte(payload, p, b'\n')?;
         p = nl + 1;
     }
@@ -1483,43 +1491,23 @@ pub fn parse_const_lines(payload: &[u8]) -> Vec<ValueLine> {
     parse_addr_value_lines(payload, 3, 2)
 }
 
+/// C reads each line as `atoi` of the address field, then `atof` of what
+/// follows the delimiter (`drvMW100.c:1202-1210`), so no line ends the scan.
 fn parse_addr_value_lines(payload: &[u8], skip: usize, addr_width: usize) -> Vec<ValueLine> {
     let mut out = Vec::new();
     let mut p = 4usize;
     while p < payload.len() && payload[p] != b'E' {
         p += skip;
-        if p + addr_width > payload.len() {
-            break;
-        }
-        let Ok(addr1) = std::str::from_utf8(&payload[p..p + addr_width])
-            .unwrap_or("")
-            .parse::<i64>()
-        else {
-            break;
-        };
-        if addr1 < 1 {
-            break;
-        }
+        let index = zero_based(atoi_field(payload, p, addr_width));
         p += addr_width + 1;
-        let value_start = p;
-        let mut i = value_start;
-        while i < payload.len() && payload[i] != b'\n' {
-            i += 1;
+        let value = strtod(payload.get(p..).unwrap_or_default()).value;
+        if let Some(index) = index {
+            out.push(ValueLine { index, value });
         }
-        if i >= payload.len() {
-            break;
-        }
-        let value_str = std::str::from_utf8(&payload[value_start..i])
-            .unwrap_or("")
-            .trim_end_matches('\r');
-        let Ok(value) = value_str.parse::<f64>() else {
+        let Some(nl) = find_byte(payload, p, b'\n') else {
             break;
         };
-        out.push(ValueLine {
-            index: (addr1 - 1) as usize,
-            value,
-        });
-        p = i + 1;
+        p = nl + 1;
     }
     out
 }
@@ -1539,10 +1527,9 @@ pub fn parse_is0(payload: &[u8]) -> Option<[u8; 8]> {
         if p + 3 > payload.len() {
             return None;
         }
-        let d0 = payload[p].checked_sub(b'0')?;
-        let d1 = payload[p + 1].checked_sub(b'0')?;
-        let d2 = payload[p + 2].checked_sub(b'0')?;
-        *slot = 100 * d0 + 10 * d1 + d2;
+        // `unsigned char status[8]` takes the int sum mod 256, digits or not.
+        let d = |i: usize| i32::from(payload[p + i]) - i32::from(b'0');
+        *slot = (100 * d(0) + 10 * d(1) + d(2)) as u8;
         p += 4;
     }
     Some(status)
@@ -1565,9 +1552,53 @@ mod tests {
         assert_eq!(cmd_skk_set(1, -7.5), "SKK01,-7.5\r\n");
         assert_eq!(cmd_vd_set(5, true), "VD005,ON\r\n");
         assert_eq!(cmd_vd_set(5, false), "VD005,OFF\r\n");
-        assert_eq!(cmd_ds_set(true), "DS1\r\n");
-        assert_eq!(cmd_ds_set(false), "DS0\r\n");
-        assert_eq!(cmd_ex_set(3), "EX3\r\n");
+        assert_eq!(cmd_ds_set(1).unwrap(), "DS1\r\n");
+        assert_eq!(cmd_ds_set(0).unwrap(), "DS0\r\n");
+        assert_eq!(cmd_ds_set(2), None);
+        assert_eq!(cmd_ex_set(3).unwrap(), "EX3\r\n");
+        assert_eq!(cmd_ex_set(0).unwrap(), "EX0\r\n");
+        assert_eq!(cmd_ex_set(4), None);
+        assert_eq!(cmd_ex_set(-1), None);
+    }
+
+    #[test]
+    fn inet_aton_matches_glibc() {
+        // Expected values recorded from glibc inet_aton.
+        let cases: &[(&str, Option<&str>)] = &[
+            ("192.168.1.10", Some("192.168.1.10")),
+            ("4294967295", Some("255.255.255.255")),
+            ("4294967296", None),
+            ("18446744073709551616", None),
+            ("10.1", Some("10.0.0.1")),
+            ("0x0a.0.0.1", Some("10.0.0.1")),
+            ("012.0.0.1", Some("10.0.0.1")),
+            ("08.0.0.1", None),
+            ("1.2.3.4 junk", Some("1.2.3.4")),
+            ("1.2.3.4\tx", Some("1.2.3.4")),
+            ("1.2.3.4x", None),
+            ("1.2.3.256", None),
+            ("1.2.65535", Some("1.2.255.255")),
+            ("1.2.65536", None),
+            ("1.2.3.4.5", None),
+            ("", None),
+            (" 1.2.3.4", None),
+            ("1..2", None),
+            ("0x", None),
+            ("0x.1", None),
+            ("1.2.3.", None),
+            ("+1.2.3.4", None),
+            ("0xffffffff", Some("255.255.255.255")),
+            ("1.0xffffff", Some("1.255.255.255")),
+            ("localhost", None),
+            ("0b11.1.1.1", None),
+        ];
+        for &(input, want) in cases {
+            assert_eq!(
+                inet_aton(input.as_bytes()).map(|a| a.to_string()),
+                want.map(str::to_string),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
@@ -1576,13 +1607,25 @@ mod tests {
         assert_eq!(format_g(100.0), "100");
         assert_eq!(format_g(0.0), "0");
         assert_eq!(format_g(1234567.0), "1.23457E+06");
+        // The %e/%f choice uses the exponent after rounding to 6 digits.
+        assert_eq!(format_g(999999.5), "1E+06");
+        assert_eq!(format_g(0.00009999995), "0.0001");
+        assert_eq!(format_g(-0.0), "-0");
+        assert_eq!(format_g(f64::INFINITY), "INF");
+        assert_eq!(format_g(f64::NAN), "NAN");
     }
 
     #[test]
     fn error_code_parses_space_separated_format() {
-        assert_eq!(parse_error_code("E1 205 blah\r\n"), Some(205));
-        assert_eq!(parse_error_code("E1 205\r\n"), Some(205));
-        assert_eq!(parse_error_code("E0\r\n"), None);
+        assert_eq!(parse_error_code(b"E1 205 blah\r\n"), Some(205));
+        assert_eq!(parse_error_code(b"E1 205\r\n"), Some(205));
+        assert_eq!(parse_error_code(b"E0\r\n"), None);
+        // sscanf whitespace/sign leniency.
+        assert_eq!(parse_error_code(b"E1205\r\n"), Some(205));
+        assert_eq!(parse_error_code(b"E1   \t42 x\r\n"), Some(42));
+        assert_eq!(parse_error_code(b"E1 -7\r\n"), Some(-7));
+        assert_eq!(parse_error_code(b"E1 +7x\r\n"), Some(7));
+        assert_eq!(parse_error_code(b"E1 x\r\n"), None);
     }
 
     #[test]
@@ -1601,20 +1644,32 @@ mod tests {
     #[test]
     fn classify_module_string_matches_doc_examples() {
         assert_eq!(
-            classify_module_string("MX110-UNV-M10"),
-            (110, "UNV".to_string(), 1, 10)
+            classify_module_string(b"MX110-UNV-M10"),
+            (110, b"UNV".to_vec(), 1, 10)
         );
         assert_eq!(
-            classify_module_string("MX115-D05-H10"),
-            (115, "D05".to_string(), 2, 10)
+            classify_module_string(b"MX115-D05-H10"),
+            (115, b"D05".to_vec(), 2, 10)
         );
         assert_eq!(
-            classify_module_string("MX120-VAO-M08"),
-            (120, "VAO".to_string(), 1, 8)
+            classify_module_string(b"MX120-VAO-M08"),
+            (120, b"VAO".to_vec(), 1, 8)
         );
         assert_eq!(
-            classify_module_string("MX125-MKC-M10"),
-            (125, "MKC".to_string(), 1, 10)
+            classify_module_string(b"MX125-MKC-M10"),
+            (125, b"MKC".to_vec(), 1, 10)
+        );
+    }
+
+    #[test]
+    fn classify_module_string_reads_non_utf8_bytes_at_c_offsets() {
+        assert_eq!(
+            classify_module_string(b"MX110\xff-2-4-M-1"),
+            (110, b"-2-".to_vec(), -1, 0)
+        );
+        assert_eq!(
+            classify_module_string(b"MX110-\xffNV-M10"),
+            (110, b"\xffNV".to_vec(), 1, 10)
         );
     }
 
@@ -1643,7 +1698,7 @@ mod tests {
         let modules = parse_cf0(&payload).unwrap();
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].index, 0);
-        assert_eq!(modules[0].set_message, "MX110-UNV-M10");
+        assert_eq!(&modules[0].set_message, b"MX110-UNV-M10");
         assert!(module_line_ok(&modules[0]));
     }
 
@@ -1655,7 +1710,7 @@ mod tests {
         assert_eq!(lines[0].family, InfoFamily::Signal);
         assert_eq!(lines[0].index, 0);
         assert_eq!(lines[0].status, CH_STATUS_NORMAL);
-        assert_eq!(lines[0].unit, "DEGC");
+        assert_eq!(lines[0].unit, b"DEGC");
         assert_eq!(lines[0].scale, 3);
     }
 
@@ -1672,8 +1727,35 @@ mod tests {
         let payload = b"xxxxS 0001\nE";
         let lines = parse_fe1(payload).unwrap();
         assert_eq!(lines[0].status, CH_STATUS_SKIP);
-        assert_eq!(lines[0].unit, "----");
+        assert_eq!(lines[0].unit, b"----");
         assert_eq!(lines[0].scale, 0);
+    }
+
+    #[test]
+    fn c_atoi_is_strtol_truncated_to_int() {
+        assert_eq!(c_atoi(b" 12 "), 12);
+        assert_eq!(
+            c_atoi(b"-99999999999999999999"),
+            c_parse::long_to_int(std::ffi::c_long::MIN)
+        );
+        assert_eq!(
+            c_atoi(b"99999999999999999999"),
+            c_parse::long_to_int(std::ffi::c_long::MAX)
+        );
+    }
+
+    #[test]
+    fn fe1_channel_index_is_atoi() {
+        // atoi stops at the first non-digit; " 12" and "012x" both read 12.
+        let lines = parse_fe1(b"xxxxN  12DEGC ,003\nN A012DEGC ,0 3\nE").unwrap();
+        assert_eq!(lines[0].index, 11);
+        assert_eq!(lines[1].family, InfoFamily::Math);
+        assert_eq!(lines[1].index, 11);
+        assert_eq!(lines[1].scale, 0);
+        // Index 0 is C's out-of-bounds write; the line is dropped, not
+        // folded onto channel 1.
+        let lines = parse_fe1(b"xxxxN 0000DEGC ,003\nS A000\nE").unwrap();
+        assert!(lines.is_empty());
     }
 
     #[test]
@@ -1726,7 +1808,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].index, 0);
         assert!(!lines[0].on_flag);
-        assert_eq!(lines[0].expr, "");
+        assert!(lines[0].expr.is_empty());
     }
 
     #[test]
@@ -1735,7 +1817,7 @@ mod tests {
         let lines = parse_so(payload).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].on_flag);
-        assert_eq!(lines[0].expr, "A001+A002");
+        assert_eq!(lines[0].expr, b"A001+A002");
     }
 
     #[test]
@@ -1822,5 +1904,57 @@ mod tests {
         let status = parse_is0(&payload).unwrap();
         assert_eq!(status[4], 5);
         assert_eq!(status[0], 0);
+    }
+
+    #[test]
+    fn info_parsers_take_atoi_and_drop_only_out_of_bounds_lines() {
+        let lines = parse_fo0(b"xxxxN 12x\nS 0\nN  3\nE").unwrap();
+        let got: Vec<_> = lines.iter().map(|l| (l.index, l.status)).collect();
+        assert_eq!(got, [(11, CH_STATUS_NORMAL), (2, CH_STATUS_NORMAL)]);
+
+        let lines = parse_ao(b"xxxx00000-XXX\nxx 2 0AXXT\nE").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!((lines[0].index, lines[0].mode), (1, CH_MODE_DAC_TRANS));
+
+        let lines = parse_xd(b"xxxx00000XM\nxx002XA\nE", |_| CH_STATUS_NORMAL).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!((lines[0].index, lines[0].mode), (1, CH_MODE_RELAY_ALARM));
+
+        let lines = parse_so(b"xxxxxxx000xxF\nxxx  5xxF\nE").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].index, 4);
+    }
+
+    #[test]
+    fn value_lines_read_atof_and_never_stop_early() {
+        let lines = parse_comm_lines(b"xxxxxxx001,abc\nxxx  2,1.5e1x\nxxx000,9\nxxx003,-2\nE");
+        assert_eq!(
+            lines,
+            vec![
+                ValueLine {
+                    index: 0,
+                    value: 0.0
+                },
+                ValueLine {
+                    index: 1,
+                    value: 15.0
+                },
+                ValueLine {
+                    index: 2,
+                    value: -2.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn is0_non_digits_wrap_as_unsigned_char() {
+        let mut payload = b"xxxx".to_vec();
+        payload.extend_from_slice(&b"000x".repeat(4));
+        payload.extend_from_slice(b"0 1x");
+        payload.extend_from_slice(&b"000x".repeat(3));
+        let status = parse_is0(&payload).unwrap();
+        // 10 * (' ' - '0') + 1 = -159, stored mod 256.
+        assert_eq!(status[4], (-159i32) as u8);
     }
 }

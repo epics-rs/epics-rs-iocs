@@ -214,8 +214,6 @@ impl OutputRecipe {
             if let Some(t) = var_type(name) {
                 kept.push(name.clone());
                 types.push(t);
-            } else {
-                log::warn!("ur-robot: unknown RTDE output variable '{name}', ignoring");
             }
         }
         Self { names: kept, types }

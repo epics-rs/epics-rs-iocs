@@ -16,39 +16,37 @@
 //! carry `CONFIGURATION`/`BASE_SPEED`/`HOME_TIMEOUT` instead of
 //! `COMMAND`/`POSITION`/`SPEED`.
 //!
-//! ## Not modeled (documented)
+//! ## Custom params
 //!
-//! `ANF2_RESET_ERRORS`/`ANF2_GET_INFO` are C custom asyn `Int32` params meant
-//! for `ao`/`longout` records outside the motor record (a controller
-//! `writeInt32` override) — there is no analogous generic-asyn-param-to-record
-//! binding at this port's [`AsynMotor`] boundary (mirrors the "not modeled"
-//! auxiliary parameters documented in `smaract::mcs2`). `resetErrors` is
-//! still wired internally: `poll` calls it automatically on a command-error
-//! bit, exactly as C does; only the *external*, user-triggered path is
-//! unmodeled. C's per-axis diagnostic decode fields (`CaptInput_`,
-//! `HomeInput_`, ... used only by C's `report()`) are also not modeled —
-//! `has_encoder` is the only bit of `config` with a functional effect on
-//! `AsynMotor`, so it alone is decoded.
+//! `ANF2_RESET_ERRORS` and `ANF2_GET_INFO` are ported in [`Anf2Params`].
+//! `resetErrors` also runs from `poll` on a command-error bit, exactly as C
+//! does. The encoder bits are the only part of `config` with a functional
+//! effect on `AsynMotor`; the rest is decoded for the report alone.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::Duration;
 
+use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
+};
+use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::{InterfaceMask, PortDriverBase};
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::{AxisUser, ParamWrite, has_motor_axis};
 
 use motor_common::util::nint;
+use motor_common::{AxisReport, ControllerParams, ControllerReport, DEFAULT_CONTROLLER_TIMEOUT};
 
-use crate::regs::ModbusRegs;
+use crate::regs::{ForceRead, ModbusRegs};
 
 /// C `AXIS_REG_OFFSET` — asyn-address stride per axis on both ports.
 pub const AXIS_REG_OFFSET: i32 = 10;
 /// C `MAX_AXES`.
 pub const MAX_AXES: i32 = 12;
-
-/// C `DEFAULT_CONTROLLER_TIMEOUT` (`asynMotorController.h`).
-const TIMEOUT: Duration = Duration::from_millis(2000);
 
 // Input registers (16-bit), offset from the axis base.
 const STATUS_1: i32 = 0;
@@ -67,27 +65,58 @@ const HOME_TIMEOUT: usize = 2;
 
 const ZERO5: [i32; 5] = [0; 5];
 
+/// C `MAX_INPUT_REGS`.
+const MAX_INPUT_REGS: usize = 10;
+
+const RULE: &str = "====================================";
+
 /// Shared controller state: the in/out Modbus register handles and the
 /// axis-created gate (C `axesCreated_`, guards `poll` until every axis
 /// configured on the controller has been constructed).
 pub struct Anf2Controller {
+    /// C `inputDriver_`, which each axis connects its force-read user to.
+    in_port: String,
     in_regs: ModbusRegs,
     out_regs: ModbusRegs,
     num_axes: usize,
     axes_created: usize,
+    /// The axes `ANF2CreateAxis` made, by axis number.
+    axes: BTreeMap<i32, AxisSetup>,
+    /// C `movingPollPeriod_` / `idlePollPeriod_`, in seconds, once
+    /// `ANF2StartPoller` ran.
+    poll_periods: (f64, f64),
+}
+
+/// What C's `ANF2Axis` keeps of its creation, and its `inputReg_`.
+struct AxisSetup {
+    /// C `pasynUserForceRead_`.
+    force_read: ForceRead,
+    config: i32,
+    base_speed: i32,
+    homing_timeout: i32,
+    /// C `inputReg_`, as the last `getInfo` read it.
+    input_regs: [i32; MAX_INPUT_REGS],
 }
 
 impl Anf2Controller {
     /// Connect the In/Out Modbus ports previously created by
     /// `drvModbusAsynConfigure` (C constructor's `pasynInt32SyncIO`/
-    /// `pasynInt32ArraySyncIO` connect loop).
-    pub fn new(in_port: &str, out_port: &str, num_axes: usize) -> Result<Self, String> {
-        Ok(Self {
-            in_regs: ModbusRegs::connect(in_port, TIMEOUT)?,
-            out_regs: ModbusRegs::connect(out_port, TIMEOUT)?,
+    /// `pasynInt32ArraySyncIO` connect loop). C keeps the controller either
+    /// way; the status of the last output connect, the only one C checks, is
+    /// returned, and is success when the loop has no axis to run.
+    pub fn new(in_port: &str, out_port: &str, num_axes: usize) -> (Self, AsynResult<()>) {
+        let (in_regs, _) = ModbusRegs::connect(in_port, DEFAULT_CONTROLLER_TIMEOUT);
+        let (out_regs, out_status) = ModbusRegs::connect(out_port, DEFAULT_CONTROLLER_TIMEOUT);
+        let ctrl = Self {
+            in_port: in_port.to_string(),
+            in_regs,
+            out_regs,
             num_axes,
             axes_created: 0,
-        })
+            axes: BTreeMap::new(),
+            poll_periods: (0.0, 0.0),
+        };
+        (ctrl, if num_axes == 0 { Ok(()) } else { out_status })
     }
 
     fn read16(&self, axis_no: i32, reg: i32) -> AsynResult<i32> {
@@ -109,8 +138,194 @@ impl Anf2Controller {
             .write_array(axis_no * AXIS_REG_OFFSET, data.to_vec())
     }
 
-    fn force_read(&self) -> AsynResult<()> {
-        self.in_regs.force_read()
+    /// C `ANF2Axis::resetErrors` (ANF2Driver.cpp:480-496).
+    fn reset_errors(&self, axis_no: i32) -> AsynResult<()> {
+        let mut reg = ZERO5;
+        reg[COMMAND] = 0x800 << 16;
+        self.write_array(axis_no, &reg)
+    }
+
+    /// C `startPoller`'s periods, in seconds.
+    pub fn set_poll_periods(&mut self, moving: f64, idle: f64) {
+        self.poll_periods = (moving, idle);
+    }
+
+    /// C `ANF2Axis::getInfo` (ANF2Driver.cpp:498-513): a register whose
+    /// read fails keeps what it held.
+    fn get_info(&mut self, axis_no: i32) {
+        let Some(axis) = self.axes.get_mut(&axis_no) else {
+            return;
+        };
+        let _ = axis.force_read.write();
+        for (reg, value) in (0..).zip(axis.input_regs.iter_mut()) {
+            if let Ok(v) = self.in_regs.read16(axis_no * AXIS_REG_OFFSET + reg) {
+                *value = v;
+            }
+        }
+    }
+
+    /// C `ANF2Controller::report` ahead of the base's (ANF2Driver.cpp:
+    /// 140-183). C reads `getAxis(j)` of every address and crashes on one
+    /// `ANF2CreateAxis` never made; it has no column here.
+    fn report(&mut self, port: &str, out: &mut dyn std::fmt::Write) {
+        let (moving, idle) = self.poll_periods;
+        let _ = write!(
+            out,
+            "{RULE}\nANF2 motor driver:\n    asyn port: {port}\n    num axes: {}\n    \
+             axes created: {}\n    moving poll period: {moving:.6}\n    \
+             idle poll period: {idle:.6}\n\nInput registers:\n\n",
+            self.num_axes,
+            self.axes_created,
+            moving = CFloat(moving),
+            idle = CFloat(idle),
+        );
+        let created: Vec<i32> = (0..self.num_axes as i32)
+            .filter(|j| self.axes.contains_key(j))
+            .collect();
+        for &j in &created {
+            self.get_info(j);
+        }
+        let _ = write!(out, " Reg\t");
+        for j in &created {
+            let _ = write!(out, "Axis {j}\t");
+        }
+        let _ = writeln!(out);
+        for i in 0..MAX_INPUT_REGS {
+            let _ = write!(out, "  {i}\t");
+            for j in &created {
+                let _ = write!(out, "0x{:04x}\t", self.axes[j].input_regs[i]);
+            }
+            let _ = writeln!(out);
+        }
+        let _ = writeln!(out);
+    }
+
+    /// C `ANF2Axis::report` (ANF2Driver.cpp:558-588), its fields decoded
+    /// from `config` as the constructor does (:363-380).
+    fn axis_report(&self, axis_no: i32, out: &mut dyn std::fmt::Write) {
+        let Some(axis) = self.axes.get(&axis_no) else {
+            return;
+        };
+        let config = axis.config;
+        let field = |mask: i32, shift: u32| ((config as u32 & mask as u32) >> shift) as i32;
+        let _ = write!(
+            out,
+            "Configuration for axis {axis_no} [0x{config:x}]:\n  Base Speed: {}\n  \
+             Homing Timeout: {}\n  Capture Input: {} (Active State: {})\n  \
+             External Input: {} (Active State: {})\n  Home Input: {} (Active State: {})\n  \
+             CW Input: {} (Active State: {})\n  CCW Input: {} (Active State: {})\n  \
+             Backplane Home Proximity Operation: {}\n  Quadrature Encoder: {}\n  \
+             Diagnostic Feedback: {}\n  Output Pulse Type: {}\n  Home Operation: {}\n  \
+             Card Axis: {}\n  Operation Mode for Axis: {}\n\n",
+            axis.base_speed,
+            axis.homing_timeout,
+            field(0x1 << 16, 16),
+            field(0x1, 0),
+            field(0x2 << 16, 17),
+            field(0x2, 1),
+            field(0x4 << 16, 18),
+            field(0x4, 2),
+            field(0x18 << 16, 19),
+            field(0x8, 3),
+            field(0x60 << 16, 21),
+            field(0x10, 4),
+            field(0x80 << 16, 23),
+            field(0x100 << 16, 24),
+            field(0x200 << 16, 25),
+            field(0x400 << 16, 26),
+            field(0x800 << 16, 27),
+            field(0x4000 << 16, 30),
+            field(0x8000 << 16, 31),
+        );
+    }
+}
+
+/// The ANF2 controller's own parameters and report on its asyn port.
+pub struct Anf2Params {
+    controller: Arc<Mutex<Anf2Controller>>,
+    /// C `ANF2ResetErrors_`, once created.
+    reset_errors: Option<usize>,
+    /// C `ANF2GetInfo_`, once created.
+    get_info: Option<usize>,
+}
+
+impl Anf2Params {
+    pub fn new(controller: Arc<Mutex<Anf2Controller>>) -> Self {
+        Self {
+            controller,
+            reset_errors: None,
+            get_info: None,
+        }
+    }
+}
+
+impl ControllerParams for Anf2Params {
+    const INTERFACE_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY;
+    const INTERRUPT_MASK: InterfaceMask = InterfaceMask::INT32_ARRAY;
+
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.reset_errors = Some(base.create_param("ANF2_RESET_ERRORS", ParamType::Int32)?);
+        self.get_info = Some(base.create_param("ANF2_GET_INFO", ParamType::Int32)?);
+        Ok(())
+    }
+
+    /// C `ANF2Controller::writeInt32` (ANF2Driver.cpp:211-246): the value is
+    /// stored, and a 1 runs the axis's command. C dereferences a null axis
+    /// at an address `ANF2CreateAxis` never made; nothing runs there.
+    fn write_int32(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: AxisUser<'_>,
+        value: i32,
+    ) -> ParamWrite {
+        // C dereferences the null axis there (ANF2Driver.cpp:215-219); refused as the base does.
+        if !has_motor_axis(base, user) {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let addr = user.addr;
+        let reset = Some(user.reason) == self.reset_errors;
+        if !reset && Some(user.reason) != self.get_info {
+            return ParamWrite::PassToBase(Ok(()));
+        }
+        let _ = base.set_int32_param(user.reason, addr, value);
+        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        if value == 1 && ctrl.axes.contains_key(&addr) {
+            if reset {
+                println!("ANF2Controller:writeInt32: Resetting errors for axis = {addr}");
+                let _ = ctrl.reset_errors(addr);
+            } else {
+                println!("ANF2Controller:writeInt32: Getting info for axis = {addr}");
+                ctrl.get_info(addr);
+            }
+        }
+        drop(ctrl);
+        let _ = base.call_param_callbacks(addr);
+        ParamWrite::Handled(Ok(()))
+    }
+
+    fn report(&self, ctx: &ControllerReport<'_>, out: &mut dyn std::fmt::Write, level: i32) {
+        // Released before the base's report runs each axis's, which takes it.
+        self.controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .report(ctx.port_name(), out);
+        ctx.report(out, level);
+        let _ = writeln!(out, "{RULE}");
+    }
+}
+
+/// C `ANF2Axis::report` for axis `axis`.
+pub struct Anf2AxisReport {
+    pub controller: Arc<Mutex<Anf2Controller>>,
+    pub axis: i32,
+}
+
+impl AxisReport for Anf2AxisReport {
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        if level > 0 {
+            let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+            ctrl.axis_report(self.axis, out);
+        }
     }
 }
 
@@ -122,40 +337,42 @@ pub struct Anf2Axis {
     base_speed: i32,
     /// C `jogging_` — `stop` skips the hold-move write while a jog is active.
     jogging: bool,
-    /// Decoded once at construction from `config` bits 24/25 (quadrature
-    /// encoder / diagnostic feedback) — the only config bits with a
-    /// functional effect at the `AsynMotor` boundary.
-    has_encoder: bool,
-    /// C `motorStatusDirection_`, persisted across polls (only updated while
-    /// moving) and used to gate the high/low limit bits.
-    direction: bool,
-    /// Last published status. C's poll reuses a single stale `read_val` on a
-    /// failed read and always publishes; this carries forward the last value
-    /// field-by-field for any read that fails in a cycle (see [`Self::poll`]).
-    last: MotorStatus,
+    /// What the constructor set, for the loop to apply.
+    status_writes: Vec<StatusWrite>,
 }
 
 impl Anf2Axis {
     /// C `ANF2Axis::ANF2Axis`: send the configuration array, decode the
-    /// has-encoder bits, and zero the position. Performs blocking I/O.
+    /// has-encoder bits, and zero the position. Performs blocking I/O. C
+    /// ignores every status here, so the axis is always built and counted.
     pub fn new(
         controller: Arc<Mutex<Anf2Controller>>,
         axis_no: i32,
         config: i32,
         base_speed: i32,
         homing_timeout: i32,
-    ) -> AsynResult<Self> {
+    ) -> Self {
+        let in_port = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_port
+            .clone();
+        let force_read = ForceRead::connect(
+            &in_port,
+            axis_no * AXIS_REG_OFFSET,
+            DEFAULT_CONTROLLER_TIMEOUT,
+        );
+        if !force_read.connected() {
+            println!(
+                "{in_port}: Error, unable to connect pasynUserForceRead_ to Modbus input driver"
+            );
+        }
         let mut ax = Self {
             controller,
             axis_no,
             base_speed,
             jogging: false,
-            has_encoder: false,
-            direction: true,
-            last: MotorStatus {
-                gain_support: true,
-                ..MotorStatus::default()
-            },
+            status_writes: Vec::new(),
         };
 
         sleep(Duration::from_millis(100));
@@ -164,19 +381,33 @@ impl Anf2Axis {
         conf_reg[CONFIGURATION] = config;
         conf_reg[BASE_SPEED] = base_speed;
         conf_reg[HOME_TIMEOUT] = homing_timeout << 16;
-        ax.lock().write_array(ax.axis_no, &conf_reg)?;
+        let _ = ax.lock().write_array(ax.axis_no, &conf_reg);
 
         sleep(Duration::from_millis(50));
 
         // Only allow UEIP if the axis has a quadrature encoder or diagnostic
         // feedback configured (config bits 24/25).
-        ax.has_encoder = (config & 0x0100_0000) != 0 || (config & 0x0200_0000) != 0;
+        let has_encoder = (config & 0x0100_0000) != 0 || (config & 0x0200_0000) != 0;
+        ax.status_writes.push(StatusWrite::HasEncoder(has_encoder));
 
-        ax.set_position(&AsynUser::new(0), 0.0)?;
+        let _ = ax.set_position(&AsynUser::new(0), 0.0);
+        ax.status_writes.push(StatusWrite::Direction(true));
 
-        ax.lock().axes_created += 1;
+        let mut ctrl = ax.lock();
+        ctrl.axes.insert(
+            axis_no,
+            AxisSetup {
+                force_read,
+                config,
+                base_speed,
+                homing_timeout,
+                input_regs: [0; MAX_INPUT_REGS],
+            },
+        );
+        ctrl.axes_created += 1;
+        drop(ctrl);
 
-        Ok(ax)
+        ax
     }
 
     fn lock(&self) -> MutexGuard<'_, Anf2Controller> {
@@ -210,11 +441,12 @@ impl Anf2Axis {
     }
 
     /// Shared `move`/`moveVelocity`/`home` prologue: clear the
-    /// command/configuration register and give the controller 50ms.
-    fn clear_command_reg(&self) -> AsynResult<()> {
-        self.lock().write_array(self.axis_no, &ZERO5)?;
+    /// command/configuration register and give the controller 50ms. Each
+    /// caller overwrites its status with the command's
+    /// (ANF2Driver.cpp:650-800).
+    fn clear_command_reg(&self) {
+        let _ = self.lock().write_array(self.axis_no, &ZERO5);
         sleep(Duration::from_millis(50));
-        Ok(())
     }
 
     fn do_move(
@@ -225,7 +457,7 @@ impl Anf2Axis {
         max_velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.clear_command_reg()?;
+        self.clear_command_reg();
 
         let acceleration = Self::correct_accel(
             self.base_speed as f64,
@@ -239,22 +471,25 @@ impl Anf2Axis {
         reg[COMMAND] = if relative { 0x2 << 16 } else { 0x1 << 16 };
         reg[POSITION] = nint(position);
 
-        self.lock().write_array(self.axis_no, &reg)?;
+        let status = self.lock().write_array(self.axis_no, &reg);
         sleep(Duration::from_millis(50));
-        Ok(())
+        status
     }
 
     /// C `resetErrors`, called automatically from `poll` on a command-error
     /// bit. Takes the already-locked controller to avoid re-locking from
     /// within `poll`.
     fn reset_errors(&self, ctrl: &Anf2Controller) -> AsynResult<()> {
-        let mut reg = ZERO5;
-        reg[COMMAND] = 0x800 << 16;
-        ctrl.write_array(self.axis_no, &reg)
+        ctrl.reset_errors(self.axis_no)
     }
 }
 
 impl AsynMotor for Anf2Axis {
+    /// C `ANF2Axis::poll` ignores each read's status and sets no status bit.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -286,7 +521,7 @@ impl AsynMotor for Anf2Axis {
     ) -> AsynResult<()> {
         // The jog command requires a different stop than a move command.
         self.jogging = true;
-        self.clear_command_reg()?;
+        self.clear_command_reg();
 
         let mut reg = ZERO5;
         if velocity > 0.0 {
@@ -297,9 +532,9 @@ impl AsynMotor for Anf2Axis {
         }
         Self::send_accel_and_velocity(&mut reg, acceleration, velocity);
 
-        self.lock().write_array(self.axis_no, &reg)?;
+        let status = self.lock().write_array(self.axis_no, &reg);
         sleep(Duration::from_millis(50));
-        Ok(())
+        status
     }
 
     fn home(
@@ -310,7 +545,7 @@ impl AsynMotor for Anf2Axis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
-        self.clear_command_reg()?;
+        self.clear_command_reg();
 
         let acceleration =
             Self::correct_accel(self.base_speed as f64, min_velocity, velocity, acceleration);
@@ -326,11 +561,11 @@ impl AsynMotor for Anf2Axis {
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let ctrl = self.lock();
         // The stop commands ignore all 32-bit registers beyond the first.
-        ctrl.write_array(self.axis_no, &ZERO5[..1])?;
+        let status = ctrl.write_array(self.axis_no, &ZERO5[..1]);
         if self.jogging {
             drop(ctrl);
             self.jogging = false;
-            Ok(())
+            status
         } else {
             // Hold move: works well with normal moves (an immediate stop cuts
             // the pulses without deceleration and invalidates the position).
@@ -339,16 +574,16 @@ impl AsynMotor for Anf2Axis {
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
-        self.lock().write_array(self.axis_no, &ZERO5)?;
+        let _ = self.lock().write_array(self.axis_no, &ZERO5);
         sleep(Duration::from_millis(100));
 
         let mut reg = ZERO5;
         reg[COMMAND] = 0x200 << 16;
         reg[POSITION] = nint(position);
 
-        self.lock().write_array(self.axis_no, &reg)?;
+        let status = self.lock().write_array(self.axis_no, &reg);
         sleep(Duration::from_millis(200));
-        Ok(())
+        status
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
@@ -363,102 +598,119 @@ impl AsynMotor for Anf2Axis {
         Ok(())
     }
 
-    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.status_writes)
+    }
+
+    fn poll(&mut self, _user: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
 
         // Don't poll until every axis on this controller has been created —
         // avoids interpreting still-being-written config values as command
         // values (C `axesCreated_ != numAxes_`).
         if ctrl.axes_created != ctrl.num_axes {
-            return Ok(MotorStatus {
-                moving: false,
-                ..MotorStatus::default()
-            });
+            status.moving = false;
+            return Ok(());
         }
 
-        // C presses on through every read and always publishes: each read's
-        // status is discarded (the base poller ignores poll()'s return) and
-        // callParamCallbacks fires unconditionally. Mirror that — attempt each
-        // read, carry forward the last published value for any field whose read
-        // fails this cycle (defined, safe equivalent of C reusing a stale
-        // `read_val`), and always return Ok so the framework publishes.
-        let last = self.last.clone();
+        // C presses on through every read and the base poller ignores poll()'s
+        // return. A failed read sets C's params from a stale `read_val` (the
+        // previous register's value); here the field keeps what it holds. C
+        // defect, not copied.
+        if let Some(axis) = ctrl.axes.get(&self.axis_no) {
+            let _ = axis.force_read.write();
+        }
 
-        let _ = ctrl.force_read();
+        if let Ok(v) = ctrl.read32(self.axis_no, POS_RD_UPR) {
+            status.set_position(v as f64);
+        }
+        if let Ok(v) = ctrl.read32(self.axis_no, EN_POS_UPR) {
+            status.set_encoder_position(v as f64);
+        }
 
-        let position = ctrl
-            .read32(self.axis_no, POS_RD_UPR)
-            .map_or(last.position, |v| v as f64);
-        let encoder_position = ctrl
-            .read32(self.axis_no, EN_POS_UPR)
-            .map_or(last.encoder_position, |v| v as f64);
-
-        // Direction is only updated while moving; otherwise keep the last
-        // polled value (it gates the limit bits below either way).
-        let mut direction = self.direction;
-        // STATUS_1: done / direction / command-error / powered. On a read
-        // failure carry forward last-known done/powered and treat command-error
-        // as clear (avoid a spurious reset from a stale read_val).
-        let (done, cmd_error, powered) = match ctrl.read16(self.axis_no, STATUS_1) {
-            Ok(status1) => {
-                // Status word 1 bit 3 set to 1 when the motor is not in motion.
-                let done = (status1 & 0x8) != 0;
-                if !done {
-                    if status1 & 0x1 != 0 {
-                        direction = true;
-                    }
-                    if status1 & 0x2 != 0 {
-                        direction = false;
-                    }
+        // C reads the direction it updates from list 0 (ANF2Driver.cpp:977),
+        // axis 0's for every axis. C defect, not copied: this axis's own.
+        // A failed read leaves the command-error bit clear rather than reset
+        // errors on a stale `read_val`.
+        let mut cmd_error = false;
+        if let Ok(status1) = ctrl.read16(self.axis_no, STATUS_1) {
+            // Status word 1 bit 3 set to 1 when the motor is not in motion.
+            status.done = (status1 & 0x8) != 0;
+            // Direction is only set while moving.
+            if !status.done {
+                if status1 & 0x1 != 0 {
+                    status.direction = true;
                 }
-                // Enable/disable (not actually the torque status) — determined
-                // by the configuration; it isn't obvious why one would disable
-                // an axis.
-                (done, status1 & 0x1000 != 0, status1 & 0x4000 != 0)
+                if status1 & 0x2 != 0 {
+                    status.direction = false;
+                }
             }
-            Err(_) => (last.done, false, last.powered),
-        };
+            cmd_error = status1 & 0x1000 != 0;
+            // Enable/disable (not actually the torque status) — determined
+            // by the configuration; it isn't obvious why one would disable
+            // an axis.
+            status.powered = status1 & 0x4000 != 0;
+        }
+        status.moving = !status.done;
 
         // High limit reported only while moving positively, low limit only
         // while moving negatively.
-        let (high_limit, low_limit) = match ctrl.read16(self.axis_no, STATUS_2) {
-            Ok(status2) => (
-                (status2 & 0x8 != 0) && direction,
-                (status2 & 0x10 != 0) && !direction,
-            ),
-            Err(_) => (last.high_limit, last.low_limit),
-        };
+        if let Ok(status2) = ctrl.read16(self.axis_no, STATUS_2) {
+            status.high_limit = (status2 & 0x8 != 0) && status.direction;
+            status.low_limit = (status2 & 0x10 != 0) && !status.direction;
+        }
 
         // Clear command errors so we can attempt to move again (error
         // discarded, matching C).
         if cmd_error {
             let _ = self.reset_errors(&ctrl);
         }
-
         drop(ctrl);
-        self.direction = direction;
 
-        let status = MotorStatus {
-            position,
-            encoder_position,
-            done,
-            moving: !done,
-            direction,
-            high_limit,
-            low_limit,
-            powered,
-            has_encoder: self.has_encoder,
-            gain_support: true,
-            ..MotorStatus::default()
-        };
-        self.last = status.clone();
-        Ok(status)
+        status.gain_support = true;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::Polled;
+
+    /// ANF2Driver.cpp:40-41: asynInt32Array is added to both the interfaces
+    /// and the callback interfaces of the motor controller base.
+    #[test]
+    fn the_port_adds_int32_array_to_both_masks() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::motor::controller_port::ControllerPort;
+
+        let (ctrl, _) = Anf2Controller::new("anf2MaskIn", "anf2MaskOut", 1);
+        let port = ControllerPort::new("anf2Mask", 1, Anf2Params::new(Arc::new(Mutex::new(ctrl))))
+            .unwrap();
+        assert!(
+            port.base()
+                .interface_mask()
+                .contains(InterfaceMask::INT32_ARRAY)
+        );
+        assert!(
+            port.base()
+                .interrupt_mask()
+                .contains(InterfaceMask::INT32_ARRAY)
+        );
+    }
+
+    #[test]
+    fn axes_of_missing_ports_are_built_and_counted() {
+        let (ctrl, out_status) = Anf2Controller::new("anf2MissingIn", "anf2MissingOut", 1);
+        assert!(out_status.is_err());
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let mut axis = Anf2Axis::new(ctrl.clone(), 0, 0x0100_0000, 1, 0);
+        assert_eq!(
+            axis.take_status_writes(),
+            [StatusWrite::HasEncoder(true), StatusWrite::Direction(true)]
+        );
+        assert_eq!(ctrl.lock().unwrap().axes_created, 1);
+    }
 
     #[test]
     fn send_accel_and_velocity_clamps_and_packs() {
@@ -486,5 +738,78 @@ mod tests {
         let corrected = Anf2Axis::correct_accel(500.0, 0.0, 2500.0, 1000.0);
         // accelTime = 2500 / 1000 = 2.5; corrected = (2500 - 500) / 2.5 = 800.
         assert!((corrected - 800.0).abs() < 1e-9);
+    }
+
+    /// C sets `status =` on each register write and returns the last
+    /// (ANF2Driver.cpp:650-890): a refused clear still sends the command,
+    /// and stop clears `jogging_` whatever the clear returned.
+    #[test]
+    fn a_refused_clear_still_sends_the_command_after_it() {
+        use crate::regs::fake;
+        fake::publish("anf2RefusedIn");
+        fake::publish("anf2RefusedOut");
+        fake::refuse("anf2RefusedOut", &ZERO5);
+        fake::refuse("anf2RefusedOut", &ZERO5[..1]);
+        let ctrl = Anf2Controller::new("anf2RefusedIn", "anf2RefusedOut", 1).0;
+        let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0, 1, 0);
+        fake::written("anf2RefusedOut");
+        let user = AsynUser::new(0);
+        let commands = || -> Vec<i32> {
+            fake::written("anf2RefusedOut")
+                .into_iter()
+                .filter(|(_, data)| data.len() == 5 && *data != ZERO5)
+                .map(|(_, data)| data[COMMAND])
+                .collect()
+        };
+        ax.move_absolute(&user, 10.0, 0.0, 100.0, 1000.0).unwrap();
+        ax.move_relative(&user, 10.0, 0.0, 100.0, 1000.0).unwrap();
+        ax.home(&user, 0.0, 100.0, 1000.0, true).unwrap();
+        ax.set_position(&user, 5.0).unwrap();
+        assert_eq!(commands(), [0x1 << 16, 0x2 << 16, 0x20 << 16, 0x200 << 16]);
+        ax.stop(&user, 0.0).unwrap();
+        assert_eq!(
+            fake::written("anf2RefusedOut"),
+            [(0, vec![0]), (0, vec![0x4 << 16])]
+        );
+        ax.move_velocity(&user, 0.0, 100.0, 1000.0).unwrap();
+        assert_eq!(commands(), [0x80 << 16]);
+        assert!(ax.stop(&user, 0.0).is_err());
+        assert!(!ax.jogging);
+    }
+
+    /// The loop clears DONE when a move starts (asynMotorController.cpp:301);
+    /// a failed STATUS_1 read must not put back the done the last poll read.
+    #[test]
+    fn a_failed_status_1_read_keeps_the_done_a_move_cleared() {
+        use crate::regs::fake;
+        fake::publish("anf2KeepDoneIn");
+        fake::publish("anf2KeepDoneOut");
+        fake::set_read("anf2KeepDoneIn", STATUS_1, Some(0x4008));
+        fake::set_read("anf2KeepDoneIn", STATUS_2, Some(0));
+        let ctrl = Anf2Controller::new("anf2KeepDoneIn", "anf2KeepDoneOut", 1).0;
+        let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0, 1, 0);
+        let user = AsynUser::new(0);
+        let mut status = MotorStatus::default();
+        ax.poll(&user, &mut status).unwrap();
+        assert!(status.done);
+
+        status.done = false;
+        fake::set_read("anf2KeepDoneIn", STATUS_1, None);
+        ax.poll(&user, &mut status).unwrap();
+        assert!(!status.done);
+        assert!(status.moving);
+        assert!(status.powered);
+        assert_eq!(status.position(), f64::from((2 << 16) | 3));
+        assert_eq!(status.encoder_position(), f64::from((4 << 16) | 5));
+    }
+
+    #[test]
+    fn an_axis_forces_its_read_at_its_register_block() {
+        let (reason, taken) = crate::regs::fake::publish("anf2ForceReadIn");
+        crate::regs::fake::publish("anf2ForceReadOut");
+        let ctrl = Anf2Controller::new("anf2ForceReadIn", "anf2ForceReadOut", 1).0;
+        let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 2, 0, 1, 0);
+        ax.polled(&AsynUser::new(0)).unwrap();
+        assert_eq!(*taken.lock().unwrap(), [(reason, 2 * AXIS_REG_OFFSET)]);
     }
 }
