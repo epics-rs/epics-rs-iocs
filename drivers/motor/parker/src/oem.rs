@@ -45,8 +45,8 @@ use epics_rs::motor::controller_port::{
     ControllerParams, FinishedWrite, WriteHook, WriteOutcome, WriteValue,
 };
 
-use motor_common::ControllerReport;
 use motor_common::util::{atof, leading_hex};
+use motor_common::{ControllerReport, controller_status};
 
 /// Response buffer size.
 const READ_BUF: usize = 64;
@@ -97,7 +97,7 @@ impl OemController {
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
-        status?;
+        status.map_err(controller_status)?;
         Ok(())
     }
 
@@ -110,9 +110,9 @@ impl OemController {
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
-        status?;
+        status.map_err(controller_status)?;
         let (raw, status) = self.handle.read_octet(0, READ_BUF).into_parts();
-        Ok((Self::trimmed(&raw), status))
+        Ok((Self::trimmed(&raw), status.map_err(controller_status)))
     }
 }
 
@@ -582,6 +582,21 @@ mod tests {
         assert!(axis.homed);
         assert!(axis.move_absolute(&user, 7.0, 1.0, 3.0, 4.0).is_err());
         assert!(!axis.homed);
+    }
+
+    /// OEMMotorDriver.cpp:349-385: C's controller I/O returns the bare
+    /// status; the SyncIO errorMessage stays on the controller's asynUser.
+    #[test]
+    fn a_refused_controller_exchange_carries_no_message() {
+        use epics_rs::asyn::error::AsynStatus;
+        use motor_common::testing::{LineRig, assert_bare};
+        let (_rig, io) = LineRig::failing("oemRefusedIo", |_| "*".into(), |cmd| cmd == "1R");
+        let ctrl = OemController::new(io, 1);
+        assert_bare(ctrl.command("1R").unwrap_err(), AsynStatus::Error);
+        assert_bare(ctrl.query("1R").unwrap_err(), AsynStatus::Error);
+        let (_rig, io) = LineRig::queued("oemNoDataLine", |_| vec!["*1R".into()]);
+        let (_, data) = OemController::new(io, 1).query("1R").unwrap();
+        assert_bare(data.unwrap_err(), AsynStatus::Timeout);
     }
 
     #[test]

@@ -59,9 +59,9 @@ use epics_rs::motor::controller_port::{
 };
 use epics_rs::motor::trace::MotorTrace;
 
-use motor_common::ControllerParams;
 use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::util::atoi;
+use motor_common::{ControllerParams, controller_status};
 
 /// Response buffer size.
 const READ_BUF: usize = 64;
@@ -261,7 +261,7 @@ impl McsController {
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
-        status?;
+        status.map_err(controller_status)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
@@ -292,15 +292,15 @@ impl McsController {
     }
 
     /// Issue a command whose reply is only an acknowledgement (move/home/stop/
-    /// set-position/set-speed); succeed on a non-error reply or `E…,0`.
+    /// set-position/set-speed); succeed on a non-error reply or `E…,0`. A
+    /// refused reply is C `parseReply`'s bare asynError
+    /// (smarActMCSMotorDriver.cpp:293-310).
     fn command(&self, cmd: &str) -> AsynResult<()> {
         let reply = self.transact(cmd)?;
-        let (is_err, val) =
-            parse_reply(&reply).ok_or_else(|| mcs_err(format!("MCS: bad reply {reply:?}")))?;
-        if is_err && val != 0 {
-            return Err(mcs_err(format!("MCS: controller error {val} ({reply:?})")));
+        match parse_reply(&reply) {
+            Some((is_err, val)) if !is_err || val == 0 => Ok(()),
+            _ => Err(mcs_err("")),
         }
-        Ok(())
     }
 }
 

@@ -51,7 +51,7 @@ use epics_rs::motor::controller_port::{
 };
 
 use motor_common::util::{atof, atoi};
-use motor_common::{AxisReport, ControllerReport};
+use motor_common::{AxisReport, ControllerReport, controller_status};
 
 /// Response buffer size.
 const READ_BUF: usize = 64;
@@ -97,7 +97,9 @@ impl AcrController {
 
     /// Write a command with no reply expected (echo is disabled).
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.handle
+            .write_octet(0, cmd.as_bytes())
+            .map_err(controller_status)?;
         Ok(())
     }
 
@@ -107,7 +109,7 @@ impl AcrController {
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
             .into_parts();
-        status?;
+        status.map_err(controller_status)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
@@ -944,6 +946,45 @@ mod tests {
         // C getAxis resolves address -1 to axis 0.
         port.write_float64_blocking(jerk, -1, 1.0).unwrap();
         assert_eq!(sent(), ["AXIS0 JOG JRK 1.000000"]);
+    }
+
+    /// ACRMotorDriver.cpp:202-205: a refused `JOG JRK` is writeController's
+    /// bare status, so the Jerk record prints no message.
+    #[test]
+    fn a_refused_controller_exchange_carries_no_message() {
+        use epics_rs::asyn::port::DrvUserRequest;
+        use epics_rs::motor::builder::MotorBuilder;
+        use epics_rs::motor::devices::{register_axis, register_controller_port};
+        use epics_rs::motor::trace::TraceUser;
+        use motor_common::testing::{LineRig, assert_bare};
+
+        let (_rig, io) = LineRig::failing(
+            "acrRefusedIo",
+            |_| "1".into(),
+            |cmd| cmd.contains("JOG JRK") || cmd == "?P4096",
+        );
+        let ctrl = Arc::new(Mutex::new(AcrController::new(io)));
+        let port = register_controller_port(
+            &open_owner(),
+            "acrRefused",
+            1,
+            AcrParams::new(ctrl.clone(), 100, 1000),
+        )
+        .unwrap();
+        let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(AcrAxis::new(ctrl.clone(), 0)));
+        let user = TraceUser::Asyn {
+            port: "acrRefused".into(),
+            addr: 0,
+        };
+        register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        let jerk = port
+            .drv_user_create_blocking(&DrvUserRequest::new("ACR_JERK", 0))
+            .unwrap()
+            .reason;
+        let refused = port.write_float64_blocking(jerk, 0, 2.5).unwrap_err();
+        assert_bare(refused, AsynStatus::Error);
+        let refused = ctrl.lock().unwrap().query("?P4096").unwrap_err();
+        assert_bare(refused, AsynStatus::Error);
     }
 
     /// ACRMotorDriver.cpp:168-175, 210-217: every write ends on C's line,

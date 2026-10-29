@@ -394,6 +394,12 @@ impl LineRig {
     }
 }
 
+/// Assert `e` is the bare `status` of [`crate::controller_status`].
+#[track_caller]
+pub fn assert_bare(e: AsynError, status: AsynStatus) {
+    assert_eq!((e.status(), e.message()), (status, String::new()));
+}
+
 /// The `motorPoller` threads of this process; nextest runs each test in its
 /// own.
 #[cfg(target_os = "linux")]

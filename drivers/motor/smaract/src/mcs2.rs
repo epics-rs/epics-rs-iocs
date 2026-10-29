@@ -52,7 +52,7 @@ use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
 use motor_common::util::{atof, atoi};
-use motor_common::{AxisReport, ControllerParams, ControllerReport};
+use motor_common::{AxisReport, ControllerParams, ControllerReport, controller_status};
 
 /// Response buffer size.
 const READ_BUF: usize = 128;
@@ -205,7 +205,9 @@ impl Mcs2Controller {
 
     /// Write a command with no reply expected.
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
+        self.handle
+            .write_octet(0, cmd.as_bytes())
+            .map_err(controller_status)?;
         Ok(())
     }
 
@@ -226,7 +228,7 @@ impl Mcs2Controller {
         let reply = String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string();
-        (reply, status)
+        (reply, status.map_err(controller_status))
     }
 
     /// C `clearErrors` inside an axis call: [`Self::drain_errors`], then

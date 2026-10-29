@@ -27,6 +27,7 @@ use epics_rs::motor::controller_port::{
     AxisUser, ControllerParams, ControllerReport, FinishedWrite, ParamWrite, WriteHook,
     WriteOutcome, WriteValue, has_motor_axis,
 };
+use motor_common::controller_status;
 
 /// `LC400_TIMEOUT`.
 pub const LC400_TIMEOUT: Duration = Duration::from_secs(5);
@@ -175,7 +176,7 @@ impl Lc400Controller {
     fn handle(&self) -> AsynResult<&SyncIOHandle> {
         self.handle
             .as_ref()
-            .ok_or_else(|| lc400_err("not connected to the LC400"))
+            .ok_or_else(|| controller_status(lc400_err("not connected to the LC400")))
     }
 
     /// Read exactly `len` bytes: C issues one read for a whole frame, which
@@ -185,7 +186,7 @@ impl Lc400Controller {
         let mut buf = Vec::with_capacity(len);
         while buf.len() < len {
             let (chunk, status) = handle.read_octet(0, len - buf.len()).into_parts();
-            status?;
+            status.map_err(controller_status)?;
             if chunk.is_empty() {
                 return Err(lc400_err("short LC400 reply"));
             }
@@ -199,7 +200,9 @@ impl Lc400Controller {
         let mut out = vec![0xA0];
         out.extend_from_slice(&addr.to_le_bytes());
         out.push(EOS);
-        self.handle()?.write_octet(0, &out)?;
+        self.handle()?
+            .write_octet(0, &out)
+            .map_err(controller_status)?;
         let reply = self.read_exact(10)?;
         Ok(i32::from_le_bytes([reply[5], reply[6], reply[7], reply[8]]))
     }
@@ -210,7 +213,10 @@ impl Lc400Controller {
         out.extend_from_slice(&addr.to_le_bytes());
         out.extend_from_slice(&value.to_le_bytes());
         out.push(EOS);
-        self.handle()?.write_octet(0, &out).map(drop)
+        self.handle()?
+            .write_octet(0, &out)
+            .map(drop)
+            .map_err(controller_status)
     }
 
     /// `writeArray`: the first word with `A2`, the rest as one `A3` run.
@@ -228,7 +234,10 @@ impl Lc400Controller {
                 frame
             })
             .collect();
-        self.handle()?.write_octet(0, &out).map(drop)
+        self.handle()?
+            .write_octet(0, &out)
+            .map(drop)
+            .map_err(controller_status)
     }
 
     /// `readArray`.
@@ -238,7 +247,7 @@ impl Lc400Controller {
         out.extend_from_slice(&(count as u32).to_le_bytes());
         out.push(EOS);
         let (header, status) = self.handle()?.write_read(0, &out, 5).into_parts();
-        status?;
+        status.map_err(controller_status)?;
         if header.len() < 5 {
             self.read_exact(5 - header.len())?;
         }
@@ -992,6 +1001,23 @@ mod tests {
             })
             .collect();
         assert_eq!(reasons, [p.digital_pos]);
+    }
+
+    /// LC400MotorDriver.cpp's writeSingle and readSingle return the bare
+    /// status; the SyncIO errorMessage stays on the controller's asynUser.
+    #[test]
+    fn a_refused_controller_exchange_carries_no_message() {
+        use motor_common::testing::{LineRig, assert_bare};
+        let (_rig, io) = LineRig::failing("lc400RefusedIo", |_| "AAAAA\0\0\0\0Z".into(), |_| true);
+        let controller = Lc400Controller::new(Some(io), 1);
+        assert_bare(
+            controller.write_single(0, 1).unwrap_err(),
+            AsynStatus::Error,
+        );
+        assert_bare(controller.read_single(0).unwrap_err(), AsynStatus::Error);
+        let (_rig, io) = LineRig::queued("lc400NoReply", |_| Vec::new());
+        let controller = Lc400Controller::new(Some(io), 1);
+        assert_bare(controller.read_single(0).unwrap_err(), AsynStatus::Timeout);
     }
 
     /// LC400MotorDriver.cpp:882, :913, :922-925: a failed position read

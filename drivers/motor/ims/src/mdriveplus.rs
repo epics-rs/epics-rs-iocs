@@ -53,6 +53,7 @@ use epics_rs::motor::flags::MstaFlags;
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
+use motor_common::controller_status;
 use motor_common::util::{atof, atoi, long_to_int, strtol};
 
 /// Reply read buffer size (C `MAX_BUFF_LEN`).
@@ -234,7 +235,7 @@ impl ImsLine {
         if status.is_err() {
             self.comms_failed.store(true, Ordering::Relaxed);
         }
-        status
+        status.map_err(controller_status)
     }
 
     fn framed(&self, cmd: &str) -> Vec<u8> {
@@ -1020,6 +1021,18 @@ mod tests {
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interfaces::motor::PortSet;
     use motor_common::testing::Polled;
+
+    /// ImsMDrivePlusMotorController.cpp's writeController and
+    /// writeReadController return the bare status; the SyncIO errorMessage
+    /// stays on the controller's asynUser.
+    #[test]
+    fn a_refused_controller_exchange_carries_no_message() {
+        use motor_common::testing::{LineRig, assert_bare};
+        let (_rig, io) = LineRig::failing("imsRefusedIo", |_| "1".into(), |_| true);
+        let line = ImsLine::new(io, String::new(), "imsRefusedIo");
+        assert_bare(line.write_only("MR 1").unwrap_err(), AsynStatus::Error);
+        assert_bare(line.write_read("PR P").unwrap_err(), AsynStatus::Error);
+    }
 
     #[test]
     fn the_constructor_calls_back() {

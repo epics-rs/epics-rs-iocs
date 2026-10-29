@@ -23,7 +23,7 @@ use epics_rs::motor::controller_port::{
 };
 
 use motor_common::util::{atof, atoi};
-use motor_common::{AxisReport, ControllerReport};
+use motor_common::{AxisReport, ControllerReport, controller_status};
 
 /// `MAX_CONTROLLER_STRING_SIZE`.
 const MAX_REPLY: usize = 256;
@@ -79,12 +79,15 @@ impl Nf874xController {
     fn handle(&self) -> AsynResult<&SyncIOHandle> {
         self.handle
             .as_ref()
-            .ok_or_else(|| nf_err("not connected to the nf874x controller"))
+            .ok_or_else(|| controller_status(nf_err("not connected to the nf874x controller")))
     }
 
     /// `writeController`.
     fn write(&self, command: &str) -> AsynResult<()> {
-        self.handle()?.write_octet(0, command.as_bytes()).map(drop)
+        self.handle()?
+            .write_octet(0, command.as_bytes())
+            .map(drop)
+            .map_err(controller_status)
     }
 
     /// `writeReadController`.
@@ -104,7 +107,10 @@ impl Nf874xController {
         let (reply, status) = handle
             .write_read(0, command.as_bytes(), MAX_REPLY)
             .into_parts();
-        (String::from_utf8_lossy(&reply).into_owned(), status)
+        (
+            String::from_utf8_lossy(&reply).into_owned(),
+            status.map_err(controller_status),
+        )
     }
 
     /// `PH?` of the controller `axis` is on, and the shift of its three
@@ -651,6 +657,18 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         text.lines().map(str::to_owned).collect()
+    }
+
+    /// 874xMotorDriver.cpp's writeController and writeReadController return
+    /// the bare status; the SyncIO errorMessage stays on the controller's
+    /// asynUser.
+    #[test]
+    fn a_refused_controller_exchange_carries_no_message() {
+        use motor_common::testing::{LineRig, assert_bare};
+        let (_rig, io) = LineRig::failing("nf874xRefusedIo", |_| "0".into(), |_| true);
+        let ctrl = Nf874xController::new(Some(io));
+        assert_bare(ctrl.write("1 PA 0").unwrap_err(), AsynStatus::Error);
+        assert_bare(ctrl.write_read("1 TP?").unwrap_err(), AsynStatus::Error);
     }
 
     /// 874xMotorDriver.cpp:419-427, which only a started moveToHome thread
