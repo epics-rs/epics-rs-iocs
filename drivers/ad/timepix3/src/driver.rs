@@ -6940,11 +6940,12 @@ mod tests {
         .unwrap();
         let base = det.ad.params.base;
         let dir = std::env::temp_dir();
-        let path = dir.to_str().unwrap().trim_end_matches('/').to_string();
+        let sep = std::path::MAIN_SEPARATOR;
+        let path = dir.to_str().unwrap().trim_end_matches(sep).to_string();
         det.write_octet(&mut AsynUser::new(base.file_path), path.as_bytes())
             .unwrap();
         assert_eq!(det.int(base.file_path_exists, 0), 1);
-        assert_eq!(det.text(base.file_path, 0), format!("{path}/"));
+        assert_eq!(det.text(base.file_path, 0), format!("{path}{sep}"));
     }
 
     /// A start sends no configuration; the workers take the enabled

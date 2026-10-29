@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(sent.lock().last(), Some(&format!("imgpath {dir_path}")));
         assert_eq!(
             det.ad.port_base.get_string_param(file_path, 0).unwrap(),
-            format!("{dir_path}/").as_bytes(),
+            format!("{dir_path}{}", std::path::MAIN_SEPARATOR).as_bytes(),
             "checkPath writes the path back with its separator"
         );
         assert_eq!(det.ad.port_base.get_int32_param(exists, 0).unwrap(), 1);

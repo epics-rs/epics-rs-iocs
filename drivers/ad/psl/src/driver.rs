@@ -1063,13 +1063,13 @@ mod tests {
         let mut det = detector("PSL_CHECK_PATH");
         let p = det.ad.params.base;
         let dir = std::env::temp_dir().display().to_string();
-        let dir = dir.trim_end_matches('/').to_string();
+        let dir = dir.trim_end_matches(std::path::MAIN_SEPARATOR).to_string();
         let _ = det.write_octet(&mut AsynUser::new(p.file_path), dir.as_bytes());
         let stored = |det: &PslDetector| {
             String::from_utf8_lossy(det.ad.port_base.get_string_param(p.file_path, 0).unwrap())
                 .into_owned()
         };
-        assert_eq!(stored(&det), format!("{dir}/"));
+        assert_eq!(stored(&det), format!("{dir}{}", std::path::MAIN_SEPARATOR));
         assert_eq!(det.get_i32(p.file_path_exists), 1);
         let _ = det.write_octet(&mut AsynUser::new(p.file_path), b"");
         assert_eq!(det.get_i32(p.file_path_exists), 1);

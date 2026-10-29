@@ -2751,7 +2751,7 @@ mod tests {
         assert!(!acquire(&s, &mut ch).await);
         assert_eq!(
             s.get_str(s.ad.base.file_path).await,
-            format!("{missing}/"),
+            format!("{missing}{}", std::path::MAIN_SEPARATOR),
             "checkPath writes the path back with its separator"
         );
         assert_eq!(handle.read_int32(exists, 0).await.unwrap(), 0);
