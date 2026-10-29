@@ -1781,8 +1781,8 @@ impl PhytronAxis {
                 .unwrap_or(1.0);
             (ratio, ctrl.axis_status)
         };
-        status.position = pos;
-        status.encoder_position = enc * ratio;
+        status.set_position(pos);
+        status.set_encoder_position(enc * ratio);
         // C engages the brake once the axis stops (:2013-2024).
         let old_done = status.done;
         status.done = !moving;
@@ -2419,7 +2419,7 @@ mod tests {
         controller.lock().unwrap().set_axis_status_reason(99);
         let mut axis = PhytronAxis::new(controller.clone(), 0, 1).unwrap();
         let user = AsynUser::new(0);
-        assert_eq!(axis.polled(&user).unwrap().encoder_position, 1000.0);
+        assert_eq!(axis.polled(&user).unwrap().encoder_position(), 1000.0);
         // AXIS_STATUS on the axis's own address, the poll's only step on
         // the port (:2084).
         let sets: Vec<_> = axis
@@ -2435,13 +2435,13 @@ mod tests {
             .collect();
         assert_eq!(sets, [99]);
         axis.set_encoder_ratio(&user, 0.5).unwrap();
-        assert_eq!(axis.polled(&user).unwrap().encoder_position, 500.0);
+        assert_eq!(axis.polled(&user).unwrap().encoder_position(), 500.0);
         controller
             .lock()
             .unwrap()
             .reset("phytronEncoderPoll", 0)
             .unwrap();
-        assert_eq!(axis.polled(&user).unwrap().encoder_position, 1000.0);
+        assert_eq!(axis.polled(&user).unwrap().encoder_position(), 1000.0);
     }
 
     /// phytronAxisMotor.cpp:2083: status bit 0x4000 is motorStatusSlip_,
@@ -2680,7 +2680,10 @@ mod tests {
         let parallel = axis.polled(&user).unwrap();
         assert_eq!(*written.lock().unwrap(), ["SE1.1 M1.1P20R M1.1P22R"]);
         assert!(parallel.moving && parallel.high_limit);
-        assert_eq!((parallel.position, parallel.encoder_position), (7.0, 9.0));
+        assert_eq!(
+            (parallel.position(), parallel.encoder_position()),
+            (7.0, 9.0)
+        );
     }
 
     /// C's controller poll reads every controller-parallel axis on one line
@@ -2694,7 +2697,7 @@ mod tests {
         ctrl.lock().unwrap().poll();
         for axis in &mut axes {
             let status = axis.polled(&user).unwrap();
-            assert_eq!(status.position, 7.0);
+            assert_eq!(status.position(), 7.0);
         }
         assert_eq!(
             *written.lock().unwrap(),

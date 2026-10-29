@@ -255,8 +255,8 @@ impl Nf874xAxis {
         let ask = |q: &str| ctrl.write_read(&format!("{name} {q}"));
 
         self.encoder_position = atof(skip(&ask("TP?")?, &name));
-        status.encoder_position = self.encoder_position;
-        status.position = self.encoder_position;
+        status.set_encoder_position(self.encoder_position);
+        status.set_position(self.encoder_position);
         status.direction = self.last_direction;
 
         status.done = atoi(skip(&ask("MD?")?, &name)) != 0;
@@ -729,6 +729,22 @@ mod tests {
         refuse.store(true, Ordering::Relaxed);
         assert!(axis.poll(&user, &mut status).is_err());
         assert!(!status.done);
+    }
+
+    /// 874xMotorDriver.cpp:476-487: `TP?` sets both positions before a
+    /// failed `MD?` goes to `skip`.
+    #[test]
+    fn a_failed_md_keeps_the_positions_tp_set() {
+        let (_rig, io) = motor_common::testing::LineRig::failing(
+            "nf874xMdSkip",
+            |sent| if sent == "1 TP?" { "12" } else { "0" }.into(),
+            |sent| sent == "1 MD?",
+        );
+        let ctrl = Arc::new(Mutex::new(Nf874xController::new(Some(io))));
+        let mut axis = Nf874xAxis::new(ctrl, 1);
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+        assert_eq!(status.readbacks.take_sets(), [Some(12.0), Some(12.0), None]);
     }
 
     #[test]

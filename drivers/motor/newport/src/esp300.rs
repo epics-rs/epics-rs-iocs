@@ -494,11 +494,14 @@ impl Esp300Axis {
         // TP? reports controller units; C NINTs them to steps.
         let tp = atof(&read(&ctrl, &format!("{a:02}TP?")));
         let steps = self.resolution().map(|res| (tp / res).round());
-        let position = steps.as_ref().copied().unwrap_or(self.last_status.position);
+        let position = steps
+            .as_ref()
+            .copied()
+            .unwrap_or(self.last_status.position());
         // Direction from the position delta; only one position query exists,
         // so the encoder position is the same value (C set_status).
-        if position != self.last_status.position {
-            self.last_status.direction = position >= self.last_status.position;
+        if position != self.last_status.position() {
+            self.last_status.direction = position >= self.last_status.position();
         }
 
         // Hardware limit/home switches: C reads the ZH? configuration and
@@ -523,9 +526,6 @@ impl Esp300Axis {
         drop(ctrl);
 
         self.last_status = MotorStatus {
-            position,
-            encoder_position: position,
-            velocity: 0.0, // C: "Parse motor velocity? NEEDS WORK"
             done,
             moving: !done,
             high_limit: false,
@@ -538,6 +538,10 @@ impl Esp300Axis {
             gain_support: self.encoder_present,
             has_encoder: self.encoder_present,
             ..MotorStatus::default()
+                .with_position(position)
+                .with_encoder_position(position)
+                // C: "Parse motor velocity? NEEDS WORK"
+                .with_velocity(0.0)
         };
         Ok(self.last_status.clone())
     }
@@ -967,7 +971,7 @@ mod tests {
             ]
         );
         let s = &axis.last_status;
-        assert_eq!(s.position, 1500.0);
+        assert_eq!(s.position(), 1500.0);
         assert!(s.done && s.powered && !s.problem && !s.comms_error);
     }
 

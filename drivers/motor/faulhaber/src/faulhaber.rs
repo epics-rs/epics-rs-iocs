@@ -484,10 +484,6 @@ impl Model1Motor for FaulhaberAxis {
         let signed_velocity = if plusdir { velocity } else { -velocity };
 
         self.last_status = MotorStatus {
-            position: f64::from(self.prev_position),
-            // C `(int) motorData`.
-            encoder_position: f64::from(motor_data as i32),
-            velocity: signed_velocity as f64,
             direction,
             done,
             high_limit: plus_ls,
@@ -498,7 +494,11 @@ impl Model1Motor for FaulhaberAxis {
             gain_support: true,
             has_encoder: true,
             ..MotorStatus::default()
-        };
+        }
+        .with_position(f64::from(self.prev_position))
+        // C `(int) motorData`.
+        .with_encoder_position(f64::from(motor_data as i32))
+        .with_velocity(signed_velocity as f64);
         *status = self.last_status.clone();
         Ok(())
     }
@@ -849,12 +849,12 @@ mod tests {
         assert!(!r.axis.polled(&r.user).unwrap().direction);
         *r.pos.lock().unwrap() = "-20.4";
         let s = r.axis.polled(&r.user).unwrap();
-        assert_eq!((s.position, s.encoder_position), (-20.0, -20.0));
+        assert_eq!((s.position(), s.encoder_position()), (-20.0, -20.0));
         assert!(s.direction, "-20 >= -20");
         *r.pos.lock().unwrap() = "-20";
         assert!(r.axis.polled(&r.user).unwrap().direction, "kept");
         *r.pos.lock().unwrap() = "7.6";
         let s = r.axis.polled(&r.user).unwrap();
-        assert_eq!((s.position, s.encoder_position), (8.0, 7.0));
+        assert_eq!((s.position(), s.encoder_position()), (8.0, 7.0));
     }
 }

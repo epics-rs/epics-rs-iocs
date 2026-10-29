@@ -365,13 +365,13 @@ impl AsynMotor for C300Axis {
         let analog_in = parse_at(&data, CORR_OFFSET).unwrap_or(0.0);
         let encoder_position = (pos_mon - analog_in) * self.di_scale_factor_inv;
         ctrl.axis(self.index).encoder_position = encoder_position;
-        status.encoder_position = encoder_position;
+        status.set_encoder_position(encoder_position);
 
         // Theoretical (set-point) position.
         let pos_query = ctrl.query(&format!("{}:POS?", self.chan))?;
         let theory_position = atof(&pos_query);
         ctrl.axis(self.index).theory_position = theory_position;
-        status.position = theory_position;
+        status.set_position(theory_position);
         drop(ctrl);
 
         // Simulated done: within tolerance of the encoder position.
@@ -479,7 +479,7 @@ mod tests {
         let mut axis = C300Axis::new(controller, 0);
         let mut status = MotorStatus::default();
         assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
-        assert_eq!(status.encoder_position, 50.0);
+        assert_eq!(status.encoder_position(), 50.0);
     }
 
     /// C300MotorDriver.cpp:234-236: only the constructor sets GAIN_SUPPORT

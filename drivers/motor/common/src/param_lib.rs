@@ -152,6 +152,7 @@ impl Params {
         let _ = match write {
             StatusWrite::Position(v) => self.set_double(function::POSITION, v),
             StatusWrite::EncoderPosition(v) => self.set_double(function::ENCODER_POSN, v),
+            StatusWrite::Velocity(v) => self.set_double(function::ACTUAL_VEL, v),
             StatusWrite::Done(v) => bit(function::DONE, v),
             StatusWrite::PowerOn(v) => bit(function::POWER_ON, v),
             StatusWrite::Problem(v) => bit(function::PROBLEM, v),
@@ -174,9 +175,6 @@ impl Params {
         let bit = |f| self.get_integer(f).ok().flatten().unwrap_or(0) != 0;
         let double = |f| self.get_double(f).ok().flatten().unwrap_or(0.0);
         MotorStatus {
-            position: double(function::POSITION),
-            encoder_position: double(function::ENCODER_POSN),
-            velocity: double(function::ACTUAL_VEL),
             done: bit(function::DONE),
             moving: !bit(function::DONE),
             msta_moving: bit(function::MOVING),
@@ -195,6 +193,9 @@ impl Params {
             has_encoder: bit(function::HAS_ENCODER),
             ..MotorStatus::default()
         }
+        .with_position(double(function::POSITION))
+        .with_encoder_position(double(function::ENCODER_POSN))
+        .with_velocity(double(function::ACTUAL_VEL))
     }
 
     /// C `paramDump`, which a driver's report prints (paramLib.c:299-319).

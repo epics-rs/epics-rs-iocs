@@ -804,6 +804,10 @@ impl OmsAxis {
             };
             let poll_shared = ctrl.poll_shared().clone();
             poll_shared.add_axis(index, has_encoder, invert_limit);
+            // Init's "reset if not available" (omsBaseController.cpp:537).
+            if ps.as_bytes().get(1) == Some(&b'O') {
+                poll_shared.set_encoder_position(index, 0.0);
+            }
             (has_encoder, poll_shared)
         };
 

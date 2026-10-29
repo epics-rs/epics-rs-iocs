@@ -580,8 +580,8 @@ impl AsynMotor for PmacAxis {
             },
         );
 
-        out.position = position;
-        out.encoder_position = encoder_position;
+        out.set_position(position);
+        out.set_encoder_position(encoder_position);
         out.direction = direction;
         // C paces on `!done` (pmacAxis.cpp:538-542) and sets
         // motorStatusMoving_ from the velocity/amp bits (548).

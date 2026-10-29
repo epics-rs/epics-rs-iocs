@@ -347,7 +347,7 @@ impl EnsembleAxis {
         let posdir = if relative {
             position >= 0.0
         } else {
-            position >= self.params.motor_status().position
+            position >= self.params.motor_status().position()
         };
         let mode = if relative { "INC" } else { "ABS" };
         {
@@ -1248,7 +1248,7 @@ mod tests {
         set_reply(&line, "PCMDPROG(@0)", "%6");
         let good = axis.polled(&user).unwrap();
         assert!(good.powered && !good.comms_error);
-        assert_eq!((good.position, good.encoder_position), (6.0, 5.0));
+        assert_eq!((good.position(), good.encoder_position()), (6.0, 5.0));
 
         // AXISSTATUS fails: only the comm error changes.
         fail_write(&line, Some("AXISSTATUS(@0)"));
@@ -1278,14 +1278,14 @@ mod tests {
         let mut left = MotorStatus::default();
         assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.comms_error && !left.powered);
-        assert_eq!((left.position, left.encoder_position), (6.0, 5.0));
+        assert_eq!((left.position(), left.encoder_position()), (6.0, 5.0));
 
         // VFBK fails: the positions read before it are left.
         fail_write(&line, Some("VFBK(@0)"));
         let mut left = MotorStatus::default();
         assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.comms_error);
-        assert_eq!((left.position, left.encoder_position), (6.0, 7.0));
+        assert_eq!((left.position(), left.encoder_position()), (6.0, 7.0));
 
         // AXISFAULT fails: comm error, problem untouched.
         fail_write(&line, Some("AXISFAULT(@0)"));
@@ -1314,7 +1314,7 @@ mod tests {
 
         set_reply(&line, "AXISSTATUS(@0)", "%0");
         set_reply(&line, "PFBKPROG(@0)", "!5");
-        assert_eq!(axis.polled(&user).unwrap().encoder_position, 0.0);
+        assert_eq!(axis.polled(&user).unwrap().encoder_position(), 0.0);
 
         set_reply(&line, "AXISFAULT(@0)", "!");
         let mut left = MotorStatus::default();
@@ -1331,9 +1331,9 @@ mod tests {
         set_reply(&line, "PFBKPROG(@0)", "%5");
         set_reply(&line, "PCMDPROG(@0)", "!6");
         // A NAK'd PCMDPROG is still read past its status char.
-        assert_eq!(axis.polled(&user).unwrap().position, 6.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 6.0);
         fail_write(&line, Some("PCMDPROG(@0)"));
-        assert_eq!(axis.polled(&user).unwrap().position, 5.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 5.0);
         // AXISSTATUS's reply, odd, stands in for a failed PLANESTATUS.
         set_reply(&line, "AXISSTATUS(@0)", "%1");
         fail_write(&line, Some("PLANESTATUS(0)"));
@@ -1360,7 +1360,7 @@ mod tests {
         let mut axis = EnsembleAxis::new(controller, 0, 0, 0).unwrap();
         line.sent();
         let status = axis.polled(&AsynUser::new(0)).unwrap();
-        assert_eq!(status.position, 6.0);
+        assert_eq!(status.position(), 6.0);
         assert!(!status.done);
     }
 

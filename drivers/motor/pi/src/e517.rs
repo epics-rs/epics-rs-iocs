@@ -154,9 +154,6 @@ fn fold_reading(
     }
     let position = reading.position as f64;
     MotorStatus {
-        position,
-        encoder_position: position,
-        velocity: 0.0,
         done,
         moving: false,
         msta_moving: false,
@@ -174,6 +171,10 @@ fn fold_reading(
         gain_support: true,
         has_encoder: true,
         vbas_supported: false,
+        ..MotorStatus::default()
+            .with_position(position)
+            .with_encoder_position(position)
+            .with_velocity(0.0)
     }
 }
 

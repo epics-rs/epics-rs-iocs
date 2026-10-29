@@ -750,7 +750,7 @@ impl AsynMotor for ConexAxis {
             .current_position
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = position;
-        status.position = position;
+        status.set_position(position);
 
         // Status (TS): done + limits (model-dependent parse). AG_CONEX.cpp:530,534
         // posts PROBLEM 0 on a bad reply, a C defect.
@@ -855,7 +855,7 @@ mod tests {
                 "1PA12.499900"
             ]
         );
-        assert_eq!(axis.polled(&user).unwrap().position, 25000.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 25000.0);
     }
 
     /// AG_CONEX.cpp:516-522: a refused TS skips after TP's position is set,
@@ -881,7 +881,7 @@ mod tests {
             ..Default::default()
         };
         assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
-        assert_eq!(status.position, 25000.0);
+        assert_eq!(status.position(), 25000.0);
         assert!(!status.done);
     }
 
@@ -902,7 +902,10 @@ mod tests {
         });
         let mut axis = ConexAxis::new(io, 1, &MotorTrace::new("conex_no_rep", 0)).unwrap();
         let status = axis.polled(&AsynUser::default()).unwrap();
-        assert_eq!((status.position, status.encoder_position), (25000.0, 0.0));
+        assert_eq!(
+            (status.position(), status.encoder_position()),
+            (25000.0, 0.0)
+        );
     }
 
     /// AG_CONEX.cpp:271-274: gain support is the constructor's, CC and AGP

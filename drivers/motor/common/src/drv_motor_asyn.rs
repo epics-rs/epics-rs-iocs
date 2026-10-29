@@ -264,15 +264,15 @@ fn int_callback(
             if let Some(bit) = status_bit(&mut status, c) {
                 *bit = getter.get_integer(c).unwrap_or(0) != 0;
             }
-            let value = match c {
-                function::POSITION => &mut status.position,
-                function::ENCODER_POSN => &mut status.encoder_position,
-                function::ACTUAL_VEL => &mut status.velocity,
+            let set: fn(&mut MotorStatus, f64) = match c {
+                function::POSITION => MotorStatus::set_position,
+                function::ENCODER_POSN => MotorStatus::set_encoder_position,
+                function::ACTUAL_VEL => MotorStatus::set_velocity,
                 _ => continue,
             };
             // C's getDouble leaves the value of an undefined one.
             if let Some(v) = getter.get_double(c) {
-                *value = v;
+                set(&mut status, v);
             }
         }
         status.moving = !status.done;

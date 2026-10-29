@@ -546,9 +546,9 @@ impl Mm3000Axis {
 
         // C: first space-delimited token, `atof`, `(epicsInt32)` cast.
         let position = atof(tp.split_whitespace().next().unwrap_or("")).trunc();
-        s.position = position;
-        s.encoder_position = if self.encoder_present { position } else { 0.0 };
-        s.velocity = 0.0; // C: "Parse motor velocity? NEEDS WORK"
+        s.set_position(position);
+        s.set_encoder_position(if self.encoder_present { position } else { 0.0 });
+        s.set_velocity(0.0); // C: "Parse motor velocity? NEEDS WORK"
         s.problem = false;
         Ok(s.clone())
     }
@@ -927,7 +927,7 @@ mod tests {
         let axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         assert_eq!(*sent.lock().unwrap(), ["1TPE", "1MS", "1TP"]);
         let s = &axis.last_status;
-        assert_eq!(s.position, 1234.0);
+        assert_eq!(s.position(), 1234.0);
         assert!(s.done && s.direction && s.powered && s.has_encoder);
     }
 
@@ -940,7 +940,7 @@ mod tests {
         assert_eq!(*sent.lock().unwrap(), ["1TPE", "1MS", "1TP"]);
         let s = &axis.last_status;
         assert!(s.moving && s.direction && s.home && !s.comms_error && !s.problem);
-        assert_eq!(s.position, 0.0);
+        assert_eq!(s.position(), 0.0);
     }
 
     /// C stores the TP reading through an `(epicsInt32)` cast, which
@@ -958,8 +958,11 @@ mod tests {
             ],
         );
         let ctrl = Arc::new(Mutex::new(ctrl));
-        assert_eq!(Mm3000Axis::new(ctrl.clone(), 1).last_status.position, 12.0);
-        assert_eq!(Mm3000Axis::new(ctrl, 2).last_status.position, -12.0);
+        assert_eq!(
+            Mm3000Axis::new(ctrl.clone(), 1).last_status.position(),
+            12.0
+        );
+        assert_eq!(Mm3000Axis::new(ctrl, 2).last_status.position(), -12.0);
     }
 
     #[test]
@@ -1140,10 +1143,7 @@ mod tests {
         let mut axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         let user = AsynUser::default();
         // An exit before any reply leaves the axis's status as it was.
-        let before = MotorStatus {
-            position: 99.0,
-            ..MotorStatus::default()
-        };
+        let before = MotorStatus::default().with_position(99.0);
         let mut left = before.clone();
         assert!(axis.poll(&user, &mut left).is_err());
         assert_eq!(left, before);

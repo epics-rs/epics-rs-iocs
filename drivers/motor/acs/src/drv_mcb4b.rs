@@ -222,14 +222,14 @@ impl Model1Motor for DrvMcb4bAxis {
             self.position = data;
         }
         *status = MotorStatus {
-            position: self.position as f64,
-            encoder_position: self.position as f64,
             done,
             moving: !done,
             high_limit,
             low_limit,
             direction: self.direction,
             ..MotorStatus::default()
+                .with_position(self.position as f64)
+                .with_encoder_position(self.position as f64)
         };
         Ok(())
     }

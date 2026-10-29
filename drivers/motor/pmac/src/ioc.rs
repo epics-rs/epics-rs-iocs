@@ -1364,7 +1364,7 @@ mod tests {
         axis.poll(&user, &mut status).unwrap();
         let read = status.clone();
         assert!(read.powered);
-        assert_eq!(read.position, 100.0);
+        assert_eq!(read.position(), 100.0);
 
         rig.silence("#1 ? F P");
         axis.poll(&user, &mut status).unwrap();
@@ -1826,7 +1826,7 @@ mod tests {
         rig.answer("&2??", b"000001\rzz\r");
         let status = axis.polled(&user).unwrap();
         assert!(!status.done && !status.msta_moving);
-        assert_eq!(status.position, 2500.0);
+        assert_eq!(status.position(), 2500.0);
         assert_eq!(rig.written(), ["&2??", q8]);
         assert_eq!(
             own.take(),
@@ -1891,9 +1891,9 @@ mod tests {
         rig.answer("&2??", b"000000\r020000\r000000\r");
         rig.cut(q8, b"0.75\r");
         let status = axis.polled(&user).unwrap();
-        assert_eq!((status.position, status.comms_error), (7500.0, true));
+        assert_eq!((status.position(), status.comms_error), (7500.0, true));
         rig.silence(q8);
-        assert_eq!(axis.polled(&user).unwrap().position, 0.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 0.0);
         rig.refuse(q8);
         assert!(axis.polled(&user).is_err());
     }
@@ -1922,7 +1922,7 @@ mod tests {
         let mut axis = PmacCsAxis::new(system, 3).unwrap();
         rig.answer("&2??", b"000000\r020000\r000000\r");
         rig.answer("&2Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"0.25\r0.5\r");
-        assert_eq!(axis.polled(&AsynUser::new(0)).unwrap().position, 0.0);
+        assert_eq!(axis.polled(&AsynUser::new(0)).unwrap().position(), 0.0);
     }
 
     /// pmacAsynCoord.c:636-643: each position is one strtod from where the
@@ -1953,14 +1953,14 @@ mod tests {
         let user = AsynUser::new(0);
         rig.answer("&2??", b"000000\r020000\r000000\r");
         rig.answer("&2Q81Q82Q83Q84Q85Q86Q87Q88Q89", b"1e-400\r0.5abc 7\r");
-        assert_eq!(a.polled(&user).unwrap().position, 0.0);
+        assert_eq!(a.polled(&user).unwrap().position(), 0.0);
         assert_eq!(
             own.take(),
             "drvPmacAxisGetStatus: not all status values returned. Status: 0\n\
              Command :&2Q81Q82Q83Q84Q85Q86Q87Q88Q89\nResponse1:1e-400\r0.5abc 7\r\n"
         );
-        assert_eq!(b.polled(&user).unwrap().position, 5000.0);
-        assert_eq!(c.polled(&user).unwrap().position, 0.0);
+        assert_eq!(b.polled(&user).unwrap().position(), 5000.0);
+        assert_eq!(c.polled(&user).unwrap().position(), 0.0);
     }
 
     /// pmacAxis.cpp:131-145: the initial status read sets the axis's soft
@@ -2037,7 +2037,10 @@ mod tests {
         axis.set_low_limit(&user, -100.0).unwrap();
         axis.set_position(&user, 10.0).unwrap();
         let status = axis.polled(&user).unwrap();
-        assert_eq!((status.position, status.encoder_position), (1000.0, 1000.0));
+        assert_eq!(
+            (status.position(), status.encoder_position()),
+            (1000.0, 1000.0)
+        );
         assert_eq!(
             rig.written()[1..],
             [

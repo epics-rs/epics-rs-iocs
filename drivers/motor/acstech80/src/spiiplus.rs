@@ -559,10 +559,6 @@ impl Model1Motor for SpiiPlusAxis {
         self.prev_position = position as i32;
 
         let status = MotorStatus {
-            position,
-            encoder_position: fpos.trunc(),
-            // C `(int)vel` (drvSPiiPlus.cc:397), the record's RVEL.
-            velocity: velocity.trunc(),
             done: d.done,
             moving: d.moving,
             msta_moving: d.moving,
@@ -574,7 +570,11 @@ impl Model1Motor for SpiiPlusAxis {
             // C motor_init sets GAIN_SUPPORT, so CNEN drives enable/disable.
             gain_support: true,
             ..MotorStatus::default()
-        };
+        }
+        .with_position(position)
+        .with_encoder_position(fpos.trunc())
+        // C `(int)vel` (drvSPiiPlus.cc:397), the record's RVEL.
+        .with_velocity(velocity.trunc());
         self.last_status = status.clone();
         *out = status;
         Ok(())
@@ -636,10 +636,16 @@ mod tests {
         let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
         let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         let status = axis.polled(&AsynUser::default()).unwrap();
-        assert_eq!((status.position, status.encoder_position), (12.0, -12.0));
+        assert_eq!(
+            (status.position(), status.encoder_position()),
+            (12.0, -12.0)
+        );
         *sign.lock().unwrap() = -1.0;
         let status = axis.polled(&AsynUser::default()).unwrap();
-        assert_eq!((status.position, status.encoder_position), (-12.0, 12.0));
+        assert_eq!(
+            (status.position(), status.encoder_position()),
+            (-12.0, 12.0)
+        );
     }
 
     /// `motor_init` probes `?APOS(n)` until one fails and keeps that many
@@ -693,10 +699,10 @@ mod tests {
         let ctrl = SpiiPlusController::new(io, CommandMode::Direct).unwrap();
         let mut axis = SpiiPlusAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         let user = AsynUser::default();
-        assert_eq!(axis.polled(&user).unwrap().velocity, -10.0);
+        assert_eq!(axis.polled(&user).unwrap().velocity(), -10.0);
         *vel.lock().unwrap() = "-0.5";
         let status = axis.polled(&user).unwrap();
-        assert_eq!((status.velocity, status.direction), (0.0, false));
+        assert_eq!((status.velocity(), status.direction), (0.0, false));
     }
 
     #[test]

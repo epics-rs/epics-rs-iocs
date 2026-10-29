@@ -292,8 +292,8 @@ impl Model1Motor for DrvMicosAxis {
         if data != self.position {
             status.direction = positive;
             self.position = data;
-            status.position = f64::from(data);
-            status.encoder_position = f64::from(data);
+            status.set_position(f64::from(data));
+            status.set_encoder_position(f64::from(data));
         }
         // drvMicos.cc:285-293: POST with no reply, once the move is done or
         // a limit in its direction is hit.

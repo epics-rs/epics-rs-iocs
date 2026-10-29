@@ -510,8 +510,6 @@ impl KohzuAxis {
         drop(ctrl);
 
         self.last_status = MotorStatus {
-            position: position as f64,
-            velocity: 0.0,
             direction,
             done,
             high_limit: plus_ls,
@@ -523,6 +521,8 @@ impl KohzuAxis {
             // C motor_init sets GAIN_SUPPORT, so CNEN drives COF.
             gain_support: true,
             ..MotorStatus::default()
+                .with_position(position as f64)
+                .with_velocity(0.0)
         };
         Ok(self.last_status.clone())
     }
@@ -804,7 +804,7 @@ mod tests {
         let ctrl = KohzuController::new(io).unwrap();
         let mut axis = KohzuAxis::new(Arc::new(Mutex::new(ctrl)), 0);
         let s = axis.polled(&AsynUser::default()).unwrap();
-        assert_eq!((s.position, s.encoder_position), (1234.0, 0.0));
+        assert_eq!((s.position(), s.encoder_position()), (1234.0, 0.0));
     }
 
     #[test]

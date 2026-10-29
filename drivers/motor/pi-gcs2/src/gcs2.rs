@@ -100,7 +100,7 @@
 //!   it, so not ported.
 //! - **Velocity readback**: the init `getAxisVelocity` (`VEL?`) is sent, but
 //!   the `m_velocity` it seeds is never read back (not in `PIasynAxis::poll`),
-//!   so `MotorStatus::velocity` stays `0.0`.
+//!   so no poll sets the velocity readback.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -2713,9 +2713,6 @@ impl AsynMotor for PIGCS2Axis {
         let done = !(raw_moving || homing);
 
         *status = MotorStatus {
-            position,
-            encoder_position: position,
-            velocity: 0.0,
             done,
             moving: !done,
             // PIasynAxis.cpp:197 motorStatusMoving_ = !done.
@@ -2728,6 +2725,8 @@ impl AsynMotor for PIGCS2Axis {
             homed: self.homed,
             gain_support: true,
             ..MotorStatus::default()
+                .with_position(position)
+                .with_encoder_position(position)
         };
         Ok(())
     }
@@ -3082,7 +3081,7 @@ mod tests {
         };
         let status = axis.polled(&AsynUser::new(0)).unwrap();
         // POS? 2.5 in whole counts.
-        assert_eq!(status.position, 3.0);
+        assert_eq!(status.position(), 3.0);
         assert!(status.moving && status.msta_moving && status.high_limit && status.powered);
         assert!(!status.problem);
         assert_eq!((axis.low_limit, axis.high_limit), (-10.0, 10.0));
@@ -4817,6 +4816,24 @@ mod tests {
         assert_eq!(port.read_int32_blocking(p.last_err, 0).unwrap(), 0);
     }
 
+    /// `PIasynAxis::poll` sets `motorPosition_` and `motorEncoderPosition_`
+    /// and never `motorActVelocity_`.
+    #[test]
+    fn a_poll_sets_no_velocity() {
+        let (_line, io) = motor_common::testing::LineRig::new("gcs2PollVel", |last| {
+            match last {
+                "ERR?" => "0",
+                "POS? 1" => "1=2",
+                _ => "1=1",
+            }
+            .into()
+        });
+        let ctrl = Arc::new(Mutex::new(PIGCS2Controller::new(io, "gcs2PollVel")));
+        let mut axis = PIGCS2Axis::new(ctrl, "1".into(), 0, "gcs2PollVel");
+        let mut status = axis.polled(&AsynUser::new(0)).unwrap();
+        assert_eq!(status.readbacks.take_sets(), [Some(2.0), Some(2.0), None]);
+    }
+
     /// `PIGCSController::getAxisPositionCts` (PIGCSController.cpp:485)
     /// keeps a whole count and logs it (:487-491); rs rounds negatives to
     /// the nearest count too, where C's `int(x + 0.5)` rounds toward zero.
@@ -4841,7 +4858,7 @@ mod tests {
         let printed = traced_mask("gcs2PosCts", TraceMask::FLOW, || {
             for reply in ["1=2.4", "1=-2.4", "1=-2.6"] {
                 *pos.lock().unwrap() = reply;
-                polled.push(axis.polled(&user).unwrap().position);
+                polled.push(axis.polled(&user).unwrap().position());
             }
         });
         assert_eq!(polled, [2.0, -2.0, -3.0]);
@@ -5209,13 +5226,13 @@ mod tests {
         // PIasynAxis::poll reads the position twice (PIasynAxis.cpp:162-164).
         assert_eq!(sent_lines(&line), ["\u{3}", "\u{3}", "\u{3}", "\u{3}"]);
         assert!(status.moving && !status.done && status.powered);
-        assert_eq!(status.position, 20000.0);
+        assert_eq!(status.position(), 20000.0);
         moving.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = ctrl.lock().unwrap().poll();
         let status = axis.polled(&AsynUser::new(0)).unwrap();
         assert_eq!(sent_lines(&line), ["\u{5}", "POS? Y", "POS? Y"]);
         assert!(status.done && !status.moving);
-        assert_eq!(status.position, 30000.0);
+        assert_eq!(status.position(), 30000.0);
     }
 
     /// `PIHexapodController::CanCommunicateWhileHoming` is false: a homing
@@ -5647,7 +5664,7 @@ mod tests {
         );
         let status = axis.polled(&user).unwrap();
         assert_eq!(sent_lines(&line), ["POS? Y", "POS? Y"]);
-        assert!(status.moving && status.position == 20000.0);
+        assert!(status.moving && status.position() == 20000.0);
         axis.move_velocity(&user, 0.0, 10000.0, 0.0).unwrap();
         assert_eq!(
             sent_lines(&line),

@@ -457,9 +457,6 @@ impl Model1Motor for PiJedsAxis {
 
         let powered = (status_word & STATUS_CLOSE_LOOP) != 0;
         self.last_status = MotorStatus {
-            position,
-            encoder_position: position,
-            velocity: 0.0,
             direction,
             done,
             // E-516 has no limit or home switches (C set_status).
@@ -472,6 +469,9 @@ impl Model1Motor for PiJedsAxis {
             gain_support: true,
             has_encoder: true,
             ..MotorStatus::default()
+                .with_position(position)
+                .with_encoder_position(position)
+                .with_velocity(0.0)
         };
         *status = self.last_status.clone();
         Ok(())
@@ -776,7 +776,7 @@ mod tests {
         axis.stop(&user).unwrap();
         let done = (0..20).any(|_| axis.polled(&user).unwrap().done);
         assert!(done, "the stage settled at 5 but never reported done");
-        assert_eq!(axis.polled(&user).unwrap().position, 5000.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 5000.0);
     }
 
     /// C motor_init sets EA_PRESENT on every axis (drvPIJEDS.cc:666-667), so

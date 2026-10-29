@@ -487,7 +487,7 @@ impl AsynMotor for AgUcAxis {
             steps.current = position + steps.offset;
             steps.current
         };
-        status.position = current as f64;
+        status.set_position(current as f64);
 
         // Moving status (TS): state char at index 3; '0' means done.
         let ts = ctrl.write_read(&format!("{}TS", self.axis_id))?;
@@ -626,7 +626,7 @@ mod tests {
         axis.move_relative(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
         assert_eq!(line.sent(), ["CC1", "1PR5"]);
         let status = axis.polled(&user).unwrap();
-        assert_eq!(status.position, 7.0);
+        assert_eq!(status.position(), 7.0);
         assert_eq!(line.sent(), ["CC1", "1TP", "1TS", "PH"]);
     }
 
@@ -660,7 +660,7 @@ mod tests {
         assert!(axis.poll(&user, &mut status).is_err());
         assert_eq!(line.sent(), ["CC1", "1TP", "1TS"]);
         assert!(
-            status.position == 7.0 && !status.moving && !status.problem,
+            status.position() == 7.0 && !status.moving && !status.problem,
             "{status:?}"
         );
         *refused.lock().unwrap() = "PH".into();
@@ -677,7 +677,7 @@ mod tests {
         *refused.lock().unwrap() = "1TP".into();
         assert!(axis.poll(&user, &mut status).is_err());
         assert!(
-            status.position == 7.0 && status.moving && status.low_limit,
+            status.position() == 7.0 && status.moving && status.low_limit,
             "{status:?}"
         );
 
@@ -713,7 +713,7 @@ mod tests {
         let mut axis = AgUcAxis::new(Arc::new(Mutex::new(controller)), 0, true, 50, -50);
         let user = AsynUser::new(0);
         let status = axis.polled(&user).unwrap();
-        assert_eq!(status.position, 0.0);
+        assert_eq!(status.position(), 0.0);
         assert!(status.moving && !status.done && !status.low_limit);
         for (cmd, short) in [("1TP", "1T"), ("1TS", "1T"), ("PH", "P")] {
             let full = replies.lock().unwrap().insert(cmd.into(), short.into());

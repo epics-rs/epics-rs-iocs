@@ -385,14 +385,14 @@ impl Emc18011Axis {
 
     fn status(&self, z: &ZStatus) -> MotorStatus {
         MotorStatus {
-            position: self.prev_position,
-            encoder_position: 0.0,
-            velocity: 0.0,
             done: z.done,
             high_limit: z.plus_ls,
             low_limit: z.minus_ls,
             direction: z.direction,
             ..MotorStatus::default()
+                .with_position(self.prev_position)
+                .with_encoder_position(0.0)
+                .with_velocity(0.0)
         }
     }
 
@@ -676,7 +676,7 @@ mod tests {
         let mut axis = Emc18011Axis::new(ctrl.clone(), 1);
         assert_eq!(line.sent(), ["M2", "Z", "A"]);
         assert_eq!(ctrl.lock().unwrap().selection.holder(), None);
-        assert_eq!(axis.polled(&AsynUser::default()).unwrap().position, 123.0);
+        assert_eq!(axis.polled(&AsynUser::default()).unwrap().position(), 123.0);
     }
 
     /// devEMC18011.cc:243-249: INIT as its own message.
@@ -750,7 +750,7 @@ mod tests {
         axis.record_move_absolute(&user, 1234.0, 0.0, 50.0, 0.0)
             .unwrap();
         assert_eq!(line.sent(), ["M1", "V0.50", "G12.3", "A"]);
-        assert_eq!(axis.polled(&user).unwrap().position, 100.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 100.0);
         axis.record_jog(&user, 0.0, -0.3, 0.0).unwrap();
         assert_eq!(line.sent().last().unwrap(), ">");
     }
@@ -878,7 +878,7 @@ mod tests {
         assert_eq!(a.poll_failure(), PollFailure::NONE);
         let s = b.polled(&user).unwrap();
         assert!(s.done && s.direction && !s.high_limit && !s.low_limit);
-        assert_eq!(s.position, 100.0);
+        assert_eq!(s.position(), 100.0);
         assert!(a.polled(&user).is_err());
         assert_eq!(a.poll_failure(), PollFailure::NONE);
     }

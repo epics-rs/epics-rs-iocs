@@ -442,7 +442,7 @@ impl AsynMotor for AgapAxis {
             .current_position
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = position;
-        status.position = position;
+        status.set_position(position);
 
         // Moving status (controller-wide TS) and power-on (controller-wide MM?)
         // are shared by both axes. AGAP_CONEX.cpp:411 posts PROBLEM 0 on a bad
@@ -536,7 +536,7 @@ mod tests {
             ..Default::default()
         };
         assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
-        assert_eq!(status.position, 2500.0);
+        assert_eq!(status.position(), 2500.0);
         assert!(!status.done);
     }
 
@@ -607,7 +607,7 @@ mod tests {
             line.sent(),
             ["1PAV1.500000", "1PRV-0.010000", "1JAV5000.000000"]
         );
-        assert_eq!(axis.polled(&user).unwrap().position, 2500.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 2500.0);
     }
 
     /// AGAP_CONEX.cpp `writeCONEX`: the next command waits out

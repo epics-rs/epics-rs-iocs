@@ -622,10 +622,10 @@ impl AsynMotor for Anf2Axis {
         }
 
         if let Ok(v) = ctrl.read32(self.axis_no, POS_RD_UPR) {
-            status.position = v as f64;
+            status.set_position(v as f64);
         }
         if let Ok(v) = ctrl.read32(self.axis_no, EN_POS_UPR) {
-            status.encoder_position = v as f64;
+            status.set_encoder_position(v as f64);
         }
 
         // C reads the direction it updates from list 0 (ANF2Driver.cpp:977),
@@ -799,8 +799,8 @@ mod tests {
         assert!(!status.done);
         assert!(status.moving);
         assert!(status.powered);
-        assert_eq!(status.position, f64::from((2 << 16) | 3));
-        assert_eq!(status.encoder_position, f64::from((4 << 16) | 5));
+        assert_eq!(status.position(), f64::from((2 << 16) | 3));
+        assert_eq!(status.encoder_position(), f64::from((4 << 16) | 5));
     }
 
     #[test]

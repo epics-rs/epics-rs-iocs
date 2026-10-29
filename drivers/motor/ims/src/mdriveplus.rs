@@ -807,8 +807,8 @@ impl ImsMDrivePlusAxis {
     fn poll_status(&mut self, status: &mut MotorStatus, position: &mut f64) -> AsynResult<()> {
         *position = atof(&self.write_read("PR P")?);
         // C updates the encoder position too, even without an encoder.
-        status.position = *position;
-        status.encoder_position = *position;
+        status.set_position(*position);
+        status.set_encoder_position(*position);
         let moving = atoi(&self.write_read("PR MV")?) != 0;
         status.moving = moving;
         status.done = !moving;
@@ -837,7 +837,7 @@ impl ImsMDrivePlusAxis {
         let stalled = atoi(&self.write_read("PR ST")?) > 0;
         status.slip_stall = stalled;
         status.slip = stalled;
-        status.encoder_position = atof(&self.write_read("PR C2")?);
+        status.set_encoder_position(atof(&self.write_read("PR C2")?));
         let locked_rotor = atoi(&self.write_read("PR LR")?);
         if let Some(reason) = self.locked_rotor {
             self.sets.axis(reason, ParamValue::Int32(locked_rotor));
@@ -1546,6 +1546,52 @@ mod tests {
             "{failed:?}"
         );
         assert!(failed.vbas_supported);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:407-414, 471-477: a poll sets the position
+    /// from `PR P` and the encoder position last from `PR C2`.
+    #[test]
+    fn a_poll_sets_the_position_and_encoder_position() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::new("imsReadbacks", |last| {
+            match last.trim_end() {
+                "PR VR" => "1.000",
+                "PR P" => "3.5",
+                "PR C2" => "7",
+                _ => "0",
+            }
+            .into()
+        });
+        let mut axis = ImsMDrivePlusAxis::new(
+            ImsLine::new(io, String::new(), "imsReadbacks"),
+            "imsReadbacks",
+        );
+        let mut status = axis.polled(&AsynUser::new(0)).unwrap();
+        assert_eq!(status.readbacks.take_sets(), [Some(3.5), Some(7.0), None]);
+    }
+
+    /// ImsMDrivePlusMotorAxis.cpp:407-419: `PR P` sets the encoder position
+    /// too, before a failed `PR MV` goes to `bail`.
+    #[test]
+    fn a_failed_pr_mv_keeps_the_positions_pr_p_set() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing(
+            "imsMvBail",
+            |last| {
+                match last.trim_end() {
+                    "PR VR" => "1.000",
+                    "PR P" => "3.5",
+                    _ => "0",
+                }
+                .into()
+            },
+            |l| l == "PR MV",
+        );
+        let mut axis =
+            ImsMDrivePlusAxis::new(ImsLine::new(io, String::new(), "imsMvBail"), "imsMvBail");
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
+        assert_eq!(status.readbacks.take_sets(), [Some(3.5), Some(3.5), None]);
     }
 
     /// ImsMDrivePlusMotorAxis.cpp:83-88: a version reply shorter than two

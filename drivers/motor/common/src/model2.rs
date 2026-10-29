@@ -987,7 +987,7 @@ mod asyn_reads {
         params.set_integer(function::DONE, 1).unwrap();
         params.call_callback();
         let polled = next().unwrap();
-        assert_eq!((polled.position, polled.done), (2.5, true));
+        assert_eq!((polled.position(), polled.done), (2.5, true));
         let mut gain = AsynUser::new(function::P_GAIN as usize).with_addr(0);
         port.write_float64(&mut gain, 0.75).unwrap();
         assert_eq!(next(), Some(polled), "the gain set posted nothing");

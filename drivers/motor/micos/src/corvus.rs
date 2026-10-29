@@ -387,8 +387,8 @@ impl AsynMotor for CorvusAxis {
             .filter_map(|tok| tok.parse::<f64>().ok())
             .nth(self.axis_no())
         {
-            status.position = position / self.axis_res();
-            status.encoder_position = position / self.axis_res();
+            status.set_position(position / self.axis_res());
+            status.set_encoder_position(position / self.axis_res());
         }
 
         let moving = (atoi(&ctrl.query("st")?) & STATUS_MOVING) != 0;

@@ -521,8 +521,8 @@ impl AsynMotor for ScuAxis {
             ctrl.query_double(io, "GP", ch)?
         };
         let position = (raw + self.position_offset) * STEPS_PER_EGU;
-        out.encoder_position = position;
-        out.position = position;
+        out.set_encoder_position(position);
+        out.set_position(position);
 
         let status = parse_moving_status(ctrl.query_char(io, "M", ch)?);
         let moving = match status {
@@ -625,7 +625,7 @@ mod tests {
         assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
         let position = 12.5 * STEPS_PER_EGU;
         assert_eq!(
-            (status.position, status.encoder_position),
+            (status.position(), status.encoder_position()),
             (position, position)
         );
         assert!(status.done && !status.moving);

@@ -380,14 +380,14 @@ impl Model1Motor for Mdt695Axis {
         let position = self.prev_position;
 
         *status = MotorStatus {
-            position,
-            encoder_position: 0.0,
-            velocity: 0.0,
             // Open-loop: always done, always "positive" direction, no limits.
             done: true,
             moving: false,
             direction: true,
             ..MotorStatus::default()
+                .with_position(position)
+                .with_encoder_position(0.0)
+                .with_velocity(0.0)
         };
         Ok(())
     }
@@ -503,7 +503,7 @@ mod tests {
         assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::PROBLEM_AND_COMMS_ERROR);
         quiet.store(false, Ordering::SeqCst);
-        assert_eq!(axis.polled(&user).unwrap().position, 15.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 15.0);
         quiet.store(true, Ordering::SeqCst);
         assert!(axis.polled(&user).is_err());
         assert_eq!(axis.poll_failure(), PollFailure::NONE);

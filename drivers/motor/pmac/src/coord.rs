@@ -511,7 +511,7 @@ impl AsynMotor for PmacCsAxis {
         self.poll(user, &mut status)?;
         self.move_absolute(
             user,
-            status.position + distance,
+            status.position() + distance,
             min_velocity,
             velocity,
             acceleration,
@@ -686,8 +686,6 @@ impl AsynMotor for PmacCsAxis {
         }
         params.call_callback();
         *status = MotorStatus {
-            position,
-            encoder_position: position,
             done: flags.done,
             // C's poller paces on the motorAxisDone this sets (pmacAsynCoord.c:
             // 719-724); motorAxisMoving is in-position alone (:659).
@@ -700,6 +698,8 @@ impl AsynMotor for PmacCsAxis {
             problem: flags.problem,
             comms_error: system.params(axis).get_integer(function::COMM_ERROR) == Ok(Some(1)),
             ..MotorStatus::default()
+                .with_position(position)
+                .with_encoder_position(position)
         };
         Ok(())
     }
@@ -884,14 +884,14 @@ mod tests {
     fn record_steps_scale_by_step_size() {
         let (mut axis, system, sent, _) = idle_axis("pmac_cs_steps", Duration::ZERO);
         let user = AsynUser::default();
-        assert_eq!(axis.polled(&user).unwrap().position, 15000.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 15000.0);
         sent.lock().unwrap().clear();
         axis.move_absolute(&user, 20000.0, 0.0, 5000.0, 10000.0)
             .unwrap();
         axis.set_position(&user, 1234.6).unwrap();
         lock(&system).set_steps_per_unit(0, 100.0);
         axis.move_absolute(&user, 250.0, 0.0, 0.0, 0.0).unwrap();
-        assert_eq!(axis.polled(&user).unwrap().position, 150.0);
+        assert_eq!(axis.polled(&user).unwrap().position(), 150.0);
         let wire = sent.lock().unwrap().clone();
         assert_eq!(
             wire[..3],

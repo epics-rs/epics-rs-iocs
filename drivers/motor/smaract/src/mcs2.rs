@@ -532,9 +532,9 @@ impl Mcs2Axis {
         status.home = (state & REFERENCE_MARK) != 0;
         if status.has_encoder {
             let pos = ctrl.query(&format!(":CHAN{c}:POS?"))?;
-            status.encoder_position = atof(&pos) / PULSES_PER_STEP;
+            status.set_encoder_position(atof(&pos) / PULSES_PER_STEP);
             let targ = ctrl.query(&format!(":CHAN{c}:POS:TARG?"))?;
-            status.position = atof(&targ) / PULSES_PER_STEP;
+            status.set_position(atof(&targ) / PULSES_PER_STEP);
         }
         // Drive power-on status (amplitude non-zero).
         status.powered = atof(&ctrl.query(&format!(":CHAN{c}:AMPL?"))?) as i64 != 0;
@@ -735,7 +735,7 @@ impl AsynMotor for Mcs2Axis {
             }
         }
         self.has_encoder = status.has_encoder;
-        self.tracked_position = status.encoder_position;
+        self.tracked_position = status.encoder_position();
         polled
     }
 }
@@ -1025,6 +1025,27 @@ mod tests {
         assert!(axis.has_encoder);
     }
 
+    /// smarActMCS2MotorDriver.cpp:515-525: `POS?` sets the encoder position
+    /// before a refused `POS:TARG?` goes to `skip`.
+    #[test]
+    fn a_failed_pos_targ_keeps_the_encoder_position_pos_set() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing(
+            "mcs2FailedTarg",
+            |cmd| match cmd.trim_end() {
+                ":CHAN0:STAT?" => format!("{SENSOR_PRESENT}\r\n"),
+                ":CHAN0:POS?" => "2000\r\n".to_string(),
+                _ => "0\r\n".to_string(),
+            },
+            |cmd| cmd.trim_end() == ":CHAN0:POS:TARG?",
+        );
+        let ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2FailedTarg", 0), no_port());
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
+        assert_eq!(status.readbacks.take_sets(), [None, Some(2.0), None]);
+    }
+
     /// smarActMCS2MotorDriver.cpp:379: the open-loop move steps from
     /// `motorEncoderPosition_`, the last POS?, not the last POS:TARG?.
     #[test]
@@ -1077,7 +1098,7 @@ mod tests {
             write.apply(&mut status);
         }
         assert!(axis.poll(&user, &mut status).is_err());
-        assert_eq!((status.position, status.encoder_position), (2.5, 2.5));
+        assert_eq!((status.position(), status.encoder_position()), (2.5, 2.5));
     }
 
     /// smarActMCS2MotorDriver.cpp:387-388: the open-loop move sets both
@@ -1110,7 +1131,7 @@ mod tests {
         let user = AsynUser::default();
         let mut status = MotorStatus::default();
         axis.set_position(&user, 1.5).unwrap();
-        status.position = 1.5;
+        status.set_position(1.5);
         for write in axis.take_status_writes() {
             write.apply(&mut status);
         }

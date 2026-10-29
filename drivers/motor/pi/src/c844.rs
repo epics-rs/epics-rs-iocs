@@ -299,7 +299,7 @@ impl PIC844Axis {
     }
 
     fn apply(&mut self, polled: PolledStatus) {
-        let prev = self.last_status.position as i32;
+        let prev = self.last_status.position() as i32;
         // C set_status compares the double `motorData` against the integer
         // `position`, so a fractional target whose NINT did not move forces
         // RA_DIRECTION plus and it flickers on every poll of a slow move;
@@ -310,9 +310,6 @@ impl PIC844Axis {
             self.last_status.direction
         };
         self.last_status = MotorStatus {
-            position: polled.position as f64,
-            encoder_position: polled.encoder_position as f64,
-            velocity: 0.0,
             done: polled.done,
             high_limit: polled.high_limit,
             low_limit: polled.low_limit,
@@ -322,6 +319,9 @@ impl PIC844Axis {
             has_encoder: true,
             vbas_supported: false,
             ..MotorStatus::default()
+                .with_position(polled.position as f64)
+                .with_encoder_position(polled.encoder_position as f64)
+                .with_velocity(0.0)
         };
     }
 }

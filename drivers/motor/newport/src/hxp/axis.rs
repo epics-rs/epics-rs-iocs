@@ -246,8 +246,8 @@ impl AsynMotor for HxpAxis {
         status.powered = data.powered;
         status.homed = data.homed;
         status.moving = data.moving;
-        status.encoder_position = data.encoder[self.axis_no] / MRES;
-        status.position = data.setpoint[self.axis_no] / MRES;
+        status.set_encoder_position(data.encoder[self.axis_no] / MRES);
+        status.set_position(data.setpoint[self.axis_no] / MRES);
         // The hexapod plans its own trajectory; base velocity is ignored.
         status.vbas_supported = false;
         Ok(())
@@ -350,7 +350,7 @@ mod tests {
         axis.lock_controller().poll();
         let status = axis.polled(&user).unwrap();
         assert_eq!(
-            (status.position, status.encoder_position),
+            (status.position(), status.encoder_position()),
             (150000.0, 150000.0)
         );
     }

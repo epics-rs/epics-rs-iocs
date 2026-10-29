@@ -1124,7 +1124,7 @@ mod tests {
         set(&format!("%{} 3 0 5 6 0", AXISSTATUS_NOT_VIRTUAL));
         let good = axis.polled(&user).unwrap();
         assert!(good.powered && good.low_limit && !good.comms_error);
-        assert_eq!((good.position, good.encoder_position), (6.0, 5.0));
+        assert_eq!((good.position(), good.encoder_position()), (6.0, 5.0));
 
         *fail.lock().unwrap() = true;
         let mut left = MotorStatus::default();
@@ -1150,7 +1150,7 @@ mod tests {
             (virt.high_limit, virt.low_limit),
             (good.high_limit, good.low_limit)
         );
-        assert_eq!(virt.position, 8.0);
+        assert_eq!(virt.position(), 8.0);
     }
 
     /// drvA3200Asyn.cc:414-466: enable and disable call back whatever

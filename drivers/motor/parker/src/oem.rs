@@ -432,8 +432,8 @@ impl AsynMotor for OemAxis {
             let (pr, read) = ctrl.query(&format!("{addr}PR"))?;
             if read.is_ok() {
                 self.encoder_base = atof(pr.get(1..).unwrap_or(""));
-                status.encoder_position = self.encoder_base;
-                status.position = self.encoder_base;
+                status.set_encoder_position(self.encoder_base);
+                status.set_position(self.encoder_base);
             }
         } else {
             // Live step count in hex (skip the leading char); "*F" flags negative.
@@ -443,10 +443,10 @@ impl AsynMotor for OemAxis {
             if !status.direction {
                 step -= TWO_POW_32;
             }
-            status.encoder_position = self.encoder_base + step;
-            status.position = status.encoder_position;
+            status.set_encoder_position(self.encoder_base + step);
+            status.set_position(status.encoder_position());
         }
-        self.position = status.position;
+        self.position = status.position();
 
         // Switch status (character flags at fixed offsets 6 and 7).
         // C's poll fails on this read's status, or on the PZ's below.
@@ -565,7 +565,7 @@ mod tests {
         let mut status = MotorStatus::default();
         assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
         assert!(status.done);
-        assert_eq!((status.position, status.encoder_position), (40.0, 40.0));
+        assert_eq!((status.position(), status.encoder_position()), (40.0, 40.0));
     }
 
     /// A refused `G` is what the move and the home return, and C sets
@@ -896,12 +896,12 @@ mod tests {
         // The poller's status, which keeps what a poll does not set.
         let mut status = MotorStatus::default();
         axis.poll(&user, &mut status).unwrap();
-        assert_eq!(status.position, 40.0);
+        assert_eq!(status.position(), 40.0);
 
         cut.lock().unwrap().insert("R", "*B");
         axis.poll(&user, &mut status).unwrap();
         assert!(!status.done);
-        assert_eq!(status.position, 56.0);
+        assert_eq!(status.position(), 56.0);
 
         let cut_only = |query, partial| {
             let mut cut = cut.lock().unwrap();
@@ -911,13 +911,13 @@ mod tests {
         cut_only("PR", "*+7");
         axis.poll(&user, &mut status).unwrap();
         assert!(status.done);
-        assert_eq!(status.position, 56.0);
+        assert_eq!(status.position(), 56.0);
 
         cut_only("IS", "*ABCD01");
         let mut left = MotorStatus::default();
         assert!(axis.poll(&user, &mut left).is_err());
         assert!(left.low_limit && left.home && !left.homed);
-        assert_eq!(left.position, 40.0);
+        assert_eq!(left.position(), 40.0);
 
         axis.home(&user, 0.0, 1.0, 1.0, true).unwrap();
         assert!(axis.polled(&user).unwrap().homed);

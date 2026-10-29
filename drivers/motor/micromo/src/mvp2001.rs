@@ -436,11 +436,11 @@ impl AsynMotor for Mvp2001Axis {
         let position = parse_hex_reply(&pos_reply, 8)
             .ok_or_else(|| micromo_err(format!("MVP2001: unparseable POS reply {pos_reply:?}")))?;
 
-        status.position = position as f64;
+        status.set_position(position as f64);
         // C sets no motorEncoderPosition_ though its constructor sets
         // HasEncoder (MVP2001Driver.cpp:206, :453), so UEIP reads 0. C
         // defect, not copied: POS is the encoder count.
-        status.encoder_position = position as f64;
+        status.set_encoder_position(position as f64);
 
         // Status word (4 hex chars).
         let status_reply = ctrl.query(&format!("{n} ST"))?;
@@ -553,7 +553,7 @@ mod tests {
         status.done = false;
         *refused.lock().unwrap() = "1 ST".into();
         assert!(axis.poll(&user, &mut status).is_err());
-        assert!(status.position == 500.0 && !status.done, "{status:?}");
+        assert!(status.position() == 500.0 && !status.done, "{status:?}");
     }
 
     /// C sets `status =` on each write and returns the last
@@ -640,7 +640,7 @@ mod tests {
         let controller = Arc::new(Mutex::new(Mvp2001Controller::new(io, 1)));
         let mut axis = Mvp2001Axis::new(controller, "mvp2001Nul", 0, 512, 500, 1);
         let status = axis.polled(&AsynUser::default()).unwrap();
-        assert_eq!(status.position, 1.0);
+        assert_eq!(status.position(), 1.0);
     }
 
     #[test]

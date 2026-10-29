@@ -456,9 +456,6 @@ impl SmartMotorAxis {
         };
 
         let status = MotorStatus {
-            position: position as f64,
-            encoder_position: f64::from(encoder_position),
-            velocity,
             done,
             high_limit: plus_ls,
             low_limit: minus_ls,
@@ -467,6 +464,9 @@ impl SmartMotorAxis {
             has_encoder: true,
             gain_support: true,
             ..MotorStatus::default()
+                .with_position(position as f64)
+                .with_encoder_position(f64::from(encoder_position))
+                .with_velocity(velocity)
         };
         self.last_status = status.clone();
         Ok(status)
@@ -878,7 +878,7 @@ mod tests {
             .unwrap()
             .extend([("RP", "!"), ("RBp", "!"), ("RBo", "!"), ("RV", "!")]);
         let s = axis.polled(&user).unwrap();
-        assert_eq!(s.position, 0.0);
+        assert_eq!(s.position(), 0.0);
         assert!(!s.high_limit && s.powered && !s.comms_error && !s.problem);
     }
 
@@ -918,6 +918,6 @@ mod tests {
         let (mut axis, replies, _, _rt) = single("smartEnc");
         replies.lock().unwrap().insert("RP", "-7.6");
         let s = axis.polled(&AsynUser::new(0)).unwrap();
-        assert_eq!((s.position, s.encoder_position), (-8.0, -7.0));
+        assert_eq!((s.position(), s.encoder_position()), (-8.0, -7.0));
     }
 }

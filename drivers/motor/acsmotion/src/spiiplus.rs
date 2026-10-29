@@ -912,20 +912,20 @@ impl AsynMotor for SpiiPlusAxis {
         let fvel = at(&polled.feedback_velocity);
         let ast = bits(&polled.axis_status);
 
-        status.position = apos;
+        status.set_position(apos);
         let (moving, powered) = if self.reduced {
             // Dummy/virtual: motion from AST, no faults; the encoder is the
             // commanded position, or VPOS for a virtual axis that has it.
-            status.encoder_position = if !self.dummy && ctrl.vpos_supported {
+            status.set_encoder_position(if !self.dummy && ctrl.vpos_supported {
                 at(&polled.virtual_feedback_position) / ctrl.encoder_factor[a]
             } else {
                 apos
-            };
+            });
             status.low_limit = false;
             status.high_limit = false;
             ((ast & AST_MOTION) != 0, false)
         } else {
-            status.encoder_position = at(&polled.feedback_position) / ctrl.encoder_factor[a];
+            status.set_encoder_position(at(&polled.feedback_position) / ctrl.encoder_factor[a]);
             let fault = bits(&polled.fault_status);
             status.low_limit = (fault & FAULT_HARD_LEFT_LIMIT) != 0;
             status.high_limit = (fault & FAULT_HARD_RIGHT_LIMIT) != 0;
@@ -1680,7 +1680,7 @@ mod tests {
     fn the_poll_reports_no_velocity() {
         let rig = rig("spiiNoVel", 1, &[("EFAC", &[0.5]), ("FVEL", &[10.0])]);
         let mut axis = SpiiPlusAxis::new(rig.ctrl.clone(), 0);
-        assert_eq!(pass(&rig.ctrl, &mut axis).velocity, 0.0);
+        assert_eq!(pass(&rig.ctrl, &mut axis).velocity(), 0.0);
     }
 
     /// The direction bit follows FVEL's own sign, not FVEL over a negative
@@ -1882,7 +1882,7 @@ mod tests {
         line.lock().unwrap().sent.clear();
         let positions = axes
             .each_mut()
-            .map(|axis| axis.polled(&AsynUser::default()).unwrap().position);
+            .map(|axis| axis.polled(&AsynUser::default()).unwrap().position());
         assert_eq!(positions, [3.0, 4.0]);
         assert!(line.lock().unwrap().sent.is_empty());
     }
@@ -1961,7 +1961,7 @@ mod tests {
         );
         let status = pass(&ctrl, &mut axis);
         // APOS / STEPF, and FPOS / EFAC.
-        assert_eq!((status.position, status.encoder_position), (10.0, 3.0));
+        assert_eq!((status.position(), status.encoder_position()), (10.0, 3.0));
     }
 
     #[test]
@@ -2010,7 +2010,7 @@ mod tests {
         // A virtual microstepper still takes the encoder factor.
         let mut axis = SpiiPlusAxis::new(ctrl.clone(), 0);
         let status = pass(&ctrl, &mut axis);
-        assert_eq!((status.position, status.encoder_position), (0.5, 4.0));
+        assert_eq!((status.position(), status.encoder_position()), (0.5, 4.0));
     }
 
     /// SPiiPlusDriver.cpp:746-748.

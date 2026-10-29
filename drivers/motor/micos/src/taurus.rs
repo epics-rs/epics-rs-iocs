@@ -364,8 +364,8 @@ impl AsynMotor for TaurusAxis {
         let addr = self.addr();
 
         let position = atof(&ctrl.query(&format!("{addr} np"))?) / self.axis_res();
-        status.position = position;
-        status.encoder_position = position;
+        status.set_position(position);
+        status.set_encoder_position(position);
 
         let axis_status = atoi(&ctrl.query(&format!("{addr} nst"))?);
         let moving = (axis_status & STATUS_MOVING) != 0;
@@ -494,8 +494,8 @@ mod tests {
         let res = axis.axis_res();
         let mut status = axis.constructed();
         assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
-        assert_eq!(status.position, 2.5 / res);
-        assert_eq!(status.encoder_position, 2.5 / res);
+        assert_eq!(status.position(), 2.5 / res);
+        assert_eq!(status.encoder_position(), 2.5 / res);
         assert!(status.gain_support);
     }
     /// SMCTaurusAxis.cpp:216-343 sets only what it read before a failed

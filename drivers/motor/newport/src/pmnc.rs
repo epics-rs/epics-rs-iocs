@@ -792,9 +792,6 @@ impl Model1Motor for PmncAxis {
 
         let vbas_supported = self.is_8753();
         self.last_status = MotorStatus {
-            position: self.position as f64,
-            encoder_position: self.encoder_position as f64,
-            velocity: 0.0, // C: "Parse motor velocity? NEEDS WORK"
             done,
             moving: !done,
             direction,
@@ -808,6 +805,10 @@ impl Model1Motor for PmncAxis {
             has_encoder: true,  // C EA_PRESENT = 1
             vbas_supported,
             ..MotorStatus::default()
+                .with_position(self.position as f64)
+                .with_encoder_position(self.encoder_position as f64)
+                // C: "Parse motor velocity? NEEDS WORK"
+                .with_velocity(0.0)
         };
         *out = self.last_status.clone();
         Ok(())
@@ -1324,10 +1325,7 @@ mod tests {
         let user = AsynUser::default();
         quiet.store(true, Ordering::SeqCst);
         // An exit before any reply leaves the axis's status as it was.
-        let before = MotorStatus {
-            position: 99.0,
-            ..MotorStatus::default()
-        };
+        let before = MotorStatus::default().with_position(99.0);
         let mut left = before.clone();
         assert!(axis.poll(&user, &mut left).is_err());
         assert_eq!(left, before);

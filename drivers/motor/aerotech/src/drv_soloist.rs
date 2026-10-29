@@ -396,15 +396,15 @@ impl Model1Motor for DrvSoloistAxis {
         let ls_active =
             (status.high_limit && status.direction) || (status.low_limit && !status.direction);
         let data = pfbk / self.setup.resolution;
-        if data != status.position {
-            status.position = f64::from(nint(data));
-            status.encoder_position = if self.setup.encoder {
-                status.position
+        if data != status.position() {
+            status.set_position(f64::from(nint(data)));
+            status.set_encoder_position(if self.setup.encoder {
+                status.position()
             } else {
                 0.0
-            };
+            });
         }
-        status.velocity = 0.0;
+        status.set_velocity(0.0);
         status.problem = false;
         let status = status.clone();
         if (status.done || ls_active)
@@ -658,7 +658,11 @@ mod tests {
         for (m, want) in [(0, 5.0), (1, 0.0), (0, 5.0), (2, 0.0)] {
             mode.store(m, Ordering::SeqCst);
             let s = axis.polled(&user).unwrap();
-            assert_eq!((s.position, s.encoder_position), (want, want), "mode {m}");
+            assert_eq!(
+                (s.position(), s.encoder_position()),
+                (want, want),
+                "mode {m}"
+            );
         }
     }
 }

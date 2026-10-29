@@ -258,7 +258,7 @@ impl AsynMotor for Mcb4bAxis {
 
         // Position — reply "#01P=+1000"; C parses atof(&inString_[5]).
         let reply = ctrl.command(&format!("#{:02}P", self.axis))?;
-        status.position = reply.get(5..).map(atof).unwrap_or(0.0);
+        status.set_position(reply.get(5..).map(atof).unwrap_or(0.0));
 
         // Moving status — reply "#01X=1"; C: done = (inString_[5]=='0').
         let reply = ctrl.command(&format!("#{:02}X", self.axis))?;
@@ -431,7 +431,7 @@ mod tests {
         let user = AsynUser::default();
         let mut status = MotorStatus::default();
         assert!(axis.poll(&user, &mut status).is_err());
-        assert_eq!(status.position, 1000.0);
+        assert_eq!(status.position(), 1000.0);
         assert!(!status.done);
     }
 

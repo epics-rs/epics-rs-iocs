@@ -227,9 +227,6 @@ struct PolledStatus {
 
 fn status_from_polled(polled: &PolledStatus) -> MotorStatus {
     MotorStatus {
-        position: polled.position,
-        encoder_position: polled.position,
-        velocity: 0.0, // C only ever flips the sign of an otherwise-unset 0.
         done: polled.done,
         high_limit: polled.high_limit,
         low_limit: polled.low_limit,
@@ -242,6 +239,10 @@ fn status_from_polled(polled: &PolledStatus) -> MotorStatus {
         has_encoder: true,
         vbas_supported: false,
         ..MotorStatus::default()
+            .with_position(polled.position)
+            .with_encoder_position(polled.position)
+            // C only ever flips the sign of an otherwise-unset 0.
+            .with_velocity(0.0)
     }
 }
 
@@ -797,9 +798,9 @@ mod tests {
             low_limit: false,
         };
         let status = status_from_polled(&polled);
-        assert_eq!(status.position, 42.0);
-        assert_eq!(status.encoder_position, 42.0);
-        assert_eq!(status.velocity, 0.0);
+        assert_eq!(status.position(), 42.0);
+        assert_eq!(status.encoder_position(), 42.0);
+        assert_eq!(status.velocity(), 0.0);
         assert!(status.done);
         assert!(!status.moving);
         assert!(status.has_encoder);

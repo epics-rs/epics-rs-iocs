@@ -579,10 +579,10 @@ impl AsynMotor for AcrAxis {
 
         let encoder_position = atof(&ctrl.read_reg(self.encoder_pos_reg)?);
         self.state().encoder_position = encoder_position;
-        status.encoder_position = encoder_position;
+        status.set_encoder_position(encoder_position);
         let theory_position = atof(&ctrl.read_reg(self.theory_pos_reg)?);
         self.state().theory_position = theory_position;
-        status.position = theory_position;
+        status.set_position(theory_position);
 
         let flags = atoi(&ctrl.read_reg(self.flags_reg)?);
         self.state().flags = flags;
@@ -670,8 +670,32 @@ mod tests {
             ..Default::default()
         };
         assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
-        assert_eq!((status.encoder_position, status.position), (7.5, 7.25));
+        assert_eq!((status.encoder_position(), status.position()), (7.5, 7.25));
         assert!(!status.done);
+    }
+
+    /// ACRMotorDriver.cpp:436-446: the encoder read sets the encoder position
+    /// before a refused theory-position read goes to `skip`.
+    #[test]
+    fn a_failed_theory_read_keeps_the_encoder_position() {
+        use motor_common::testing::LineRig;
+        let (_rig, io) = LineRig::failing(
+            "acrTheorySkip",
+            |cmd| {
+                match cmd {
+                    "AXIS0 PPU" => "1",
+                    "?P12290" => "7.5",
+                    _ => "",
+                }
+                .into()
+            },
+            |cmd| cmd == "?P12294",
+        );
+        let controller = Arc::new(Mutex::new(AcrController::new(io)));
+        let mut axis = AcrAxis::new(controller, 0);
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
+        assert_eq!(status.readbacks.take_sets(), [None, Some(7.5), None]);
     }
 
     /// ACRMotorDriver.cpp:299-306: the constructor raises PROBLEM on a failed

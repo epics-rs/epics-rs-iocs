@@ -460,10 +460,10 @@ impl Model1Motor for DrvPc6kAxis {
         let data = atof(&tpc) as i32;
         if data != self.position {
             self.position = data;
-            status.encoder_position = f64::from(atoi(&tpe));
+            status.set_encoder_position(f64::from(atoi(&tpe)));
         }
-        status.position = f64::from(self.position);
-        status.velocity = f64::from(atof(&tvela) as i32);
+        status.set_position(f64::from(self.position));
+        status.set_velocity(f64::from(atof(&tvela) as i32));
         status.problem = false;
         let status = status.clone();
         if (status.done || ls_active)

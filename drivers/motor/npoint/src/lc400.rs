@@ -661,7 +661,7 @@ impl AsynMotor for Lc400Axis {
             if let Some(reason) = digital_pos {
                 updates.push((reason, ParamValue::Float64(f64::from(current))));
             }
-            out.position = f64::from(current);
+            out.set_position(f64::from(current));
             let busy = ctrl.read_single(address + WAV_ACTIVE)?;
             let done = busy == 0;
             if done {

@@ -447,7 +447,7 @@ impl AsynMotor for Ang1Axis {
         let _ = self.force_read.write();
 
         if let Ok(v) = ctrl.read32(POS_RD_UPR) {
-            status.position = v as f64;
+            status.set_position(v as f64);
         }
 
         // Status word 1 bit 3 set to 1 when the motor is not in motion.
@@ -464,7 +464,7 @@ impl AsynMotor for Ang1Axis {
         // can move off the limit (errors discarded, matching C).
         if status.high_limit {
             let _ = self.do_set_closed_loop(&ctrl, true);
-            let _ = self.do_set_position(&ctrl, status.position);
+            let _ = self.do_set_position(&ctrl, status.position());
         }
 
         if let Ok(v) = status2 {
@@ -473,7 +473,7 @@ impl AsynMotor for Ang1Axis {
         // A CCW limit reached: same reset.
         if status.low_limit {
             let _ = self.do_set_closed_loop(&ctrl, true);
-            let _ = self.do_set_position(&ctrl, status.position);
+            let _ = self.do_set_position(&ctrl, status.position());
         }
         drop(ctrl);
 
@@ -563,7 +563,7 @@ mod tests {
         assert!(status.moving);
         assert!(status.powered);
         assert!(status.gain_support);
-        assert_eq!(status.position, 2003.0);
+        assert_eq!(status.position(), 2003.0);
     }
 
     /// C `setClosedLoop` sets POWER_ON whatever its writes returned

@@ -280,7 +280,7 @@ impl PIC662Axis {
     /// Fold a fresh poll into `last_status`, deriving direction from the
     /// count delta (held across polls when the position is unchanged).
     fn apply(&mut self, polled: PolledStatus, in_motion: bool) {
-        let prev = self.last_status.position as i32;
+        let prev = self.last_status.position() as i32;
         let mut done = polled.done;
         let direction = if polled.position != prev {
             self.no_motion_count = 0;
@@ -295,8 +295,6 @@ impl PIC662Axis {
             self.last_status.direction
         };
         self.last_status = MotorStatus {
-            position: polled.position as f64,
-            velocity: 0.0,
             done,
             // E-662: no limit/home/encoder/gain feedback; piezo servo powers
             // its stage continuously. No base velocity (`SET_VEL_BASE` no-op).
@@ -306,6 +304,8 @@ impl PIC662Axis {
             has_encoder: false,
             vbas_supported: false,
             ..MotorStatus::default()
+                .with_position(polled.position as f64)
+                .with_velocity(0.0)
         };
     }
 }
@@ -501,7 +501,7 @@ mod tests {
         let ctrl = PIC662Controller::new(io).unwrap();
         let mut axis = PIC662Axis::new(Arc::new(Mutex::new(ctrl)));
         let s = axis.polled(&AsynUser::default()).unwrap();
-        assert_eq!((s.position, s.encoder_position), (5012.0, 0.0));
+        assert_eq!((s.position(), s.encoder_position()), (5012.0, 0.0));
     }
 
     fn post(text: &[u8]) -> PostMessage {

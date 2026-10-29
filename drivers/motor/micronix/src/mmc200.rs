@@ -490,8 +490,8 @@ impl AsynMotor for Mmc200Axis {
         // `goto skip`: what was written stays, and `poll_failure` adds PROBLEM.
         let pos_reply = ctrl.query(&format!("{n}POS?"))?;
         let (position, encoder) = parse_position(&pos_reply);
-        status.position = position / self.resolution;
-        status.encoder_position = encoder / self.resolution;
+        status.set_position(position / self.resolution);
+        status.set_encoder_position(encoder / self.resolution);
 
         let sta_reply = ctrl.query(&format!("{n}STA?"))?;
         let sta = atoi(sta_reply.get(1..).unwrap_or(""));

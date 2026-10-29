@@ -437,12 +437,12 @@ impl Model1Motor for DrvMvp2001Axis {
                 self.position = data;
             }
         }
-        status.position = f64::from(self.position);
+        status.set_position(f64::from(self.position));
         status.high_limit = mstat & PLUS_LS != 0;
         status.low_limit = mstat & MINUS_LS != 0;
         status.home = false;
         status.powered = mstat & NOT_POWER == 0;
-        status.encoder_position = 0.0;
+        status.set_encoder_position(0.0);
         status.problem = false;
         let ls_active =
             (status.high_limit && status.direction) || (status.low_limit && !status.direction);

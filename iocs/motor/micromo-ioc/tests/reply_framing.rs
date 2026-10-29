@@ -111,7 +111,7 @@ fn polled_position(name: &str, input_eos: &[u8]) -> f64 {
     let mut axis = Mvp2001Axis::new(controller, name, 0, 512, 1000, 1);
     let mut status = MotorStatus::default();
     axis.poll(&AsynUser::default(), &mut status).unwrap();
-    status.position
+    status.position()
 }
 
 /// MVP2001Driver.cpp:129-137: the first read takes the prepended terminator,

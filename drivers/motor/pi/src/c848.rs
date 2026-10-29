@@ -372,7 +372,7 @@ impl PIC848Axis {
     }
 
     fn apply(&mut self, polled: PolledStatus, in_motion: bool) {
-        let prev = self.last_status.position as i32;
+        let prev = self.last_status.position() as i32;
         let direction = if polled.position != prev {
             self.no_motion_count = 0;
             polled.position >= prev
@@ -383,9 +383,6 @@ impl PIC848Axis {
             self.last_status.direction
         };
         self.last_status = MotorStatus {
-            position: polled.position as f64,
-            encoder_position: polled.position as f64,
-            velocity: 0.0,
             done: polled.done,
             high_limit: polled.high_limit,
             low_limit: polled.low_limit,
@@ -395,6 +392,9 @@ impl PIC848Axis {
             has_encoder: true,
             vbas_supported: false,
             ..MotorStatus::default()
+                .with_position(polled.position as f64)
+                .with_encoder_position(polled.position as f64)
+                .with_velocity(0.0)
         };
     }
 }

@@ -394,13 +394,13 @@ impl Model1Motor for DrvMDriveAxis {
             status.direction = new >= self.position;
             self.position = new;
         }
-        status.position = f64::from(self.position);
+        status.set_position(f64::from(self.position));
         (status.high_limit, status.low_limit) = limits.unwrap_or_default();
         status.home = home;
-        status.encoder_position = encoder.map_or(0.0, |e| atof(&e).trunc());
+        status.set_encoder_position(encoder.map_or(0.0, |e| atof(&e).trunc()));
         status.problem = false;
         let speed = atof(&velocity).trunc();
-        status.velocity = if status.direction { speed } else { -speed };
+        status.set_velocity(if status.direction { speed } else { -speed });
         let status = status.clone();
         let ls_active =
             (status.high_limit && status.direction) || (status.low_limit && !status.direction);

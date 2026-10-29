@@ -289,9 +289,6 @@ impl MotorSimAxis {
     fn snapshot(&self, done: bool) -> MotorStatus {
         let pos = self.nextpoint.p + self.enc_offset;
         MotorStatus {
-            position: pos,
-            encoder_position: pos,
-            velocity: 0.0,
             done,
             moving: !done,
             msta_moving: !done,
@@ -302,6 +299,8 @@ impl MotorSimAxis {
             encoder_home: self.nextpoint.p == self.home,
             homed: self.homed,
             ..MotorStatus::default()
+                .with_position(pos)
+                .with_encoder_position(pos)
         }
     }
 }
@@ -790,8 +789,8 @@ impl AsynMotor for DrvMotorSimAxis {
         self.axis.poll(user, &mut status)?;
         let params = self.params();
         for (f, v) in [
-            (function::POSITION, status.position),
-            (function::ENCODER_POSN, status.encoder_position),
+            (function::POSITION, status.position()),
+            (function::ENCODER_POSN, status.encoder_position()),
         ] {
             let _ = params.set_double(f, v);
         }
@@ -913,7 +912,7 @@ mod tests {
                 break;
             }
         }
-        (axis.last_status.position, done)
+        (axis.last_status.position(), done)
     }
 
     /// motorSimDriver.cpp:122-141 prints these with `%f`.
@@ -967,9 +966,9 @@ mod tests {
             axis.process(0.05);
         }
         assert!(
-            axis.last_status.position <= 5.0 + 1e-6,
+            axis.last_status.position() <= 5.0 + 1e-6,
             "position {} exceeded hard limit",
-            axis.last_status.position
+            axis.last_status.position()
         );
         assert!(axis.last_status.high_limit, "high-limit flag not set");
     }
@@ -983,9 +982,9 @@ mod tests {
         let later = axis.clock + std::time::Duration::from_secs(30);
         axis.advance(later);
         assert!(
-            axis.last_status.position <= 100.0 + 1e-6,
+            axis.last_status.position() <= 100.0 + 1e-6,
             "position {} passed the hard limit",
-            axis.last_status.position
+            axis.last_status.position()
         );
         assert!(axis.last_status.high_limit);
     }
@@ -996,9 +995,9 @@ mod tests {
         axis.set_position(&user(), 100.0).unwrap();
         axis.process(0.05);
         assert!(
-            (axis.last_status.position - 100.0).abs() < 1e-9,
+            (axis.last_status.position() - 100.0).abs() < 1e-9,
             "offset position {}",
-            axis.last_status.position
+            axis.last_status.position()
         );
     }
 
@@ -1097,7 +1096,7 @@ mod tests {
         for _ in 0..20 {
             b.axis.process(0.05);
         }
-        assert!(b.axis.last_status.position.abs() < 1e-6);
+        assert!(b.axis.last_status.position().abs() < 1e-6);
         a.set_double(&user(), function::DEFER_MOVES, 0.0).unwrap();
         b.polled(&user()).unwrap();
         assert_eq!(
@@ -1170,9 +1169,9 @@ mod tests {
             axis.process(0.05);
         }
         assert!(
-            axis.last_status.position.abs() < 1e-6,
+            axis.last_status.position().abs() < 1e-6,
             "moved before release: {}",
-            axis.last_status.position
+            axis.last_status.position()
         );
         axis.set_deferred_moves(&user(), false).unwrap();
         let (pos, done) = run_to_done(&mut axis, 0.05, 1000);

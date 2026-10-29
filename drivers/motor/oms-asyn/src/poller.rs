@@ -103,13 +103,14 @@ impl PollShared {
     /// `writeFloat64`'s `setDoubleParam(motorPosition_, value)` ahead of
     /// `setPosition`.
     pub(crate) fn set_position(&self, axis: usize, position: f64) {
-        self.axes()[axis].status.position = position;
+        self.axes()[axis].status.set_position(position);
     }
 
-    /// `writeFloat64`'s `setDoubleParam(motorEncoderPosition_, value)`,
-    /// ahead of its encoder check (omsBaseController.cpp:329-333).
+    /// `setDoubleParam(motorEncoderPosition_, value)`: `writeFloat64`'s,
+    /// ahead of its encoder check (omsBaseController.cpp:329-333), and
+    /// Init's for an axis without an encoder (:537).
     pub(crate) fn set_encoder_position(&self, axis: usize, position: f64) {
-        self.axes()[axis].status.encoder_position = position;
+        self.axes()[axis].status.set_encoder_position(position);
     }
 
     fn axes(&self) -> MutexGuard<'_, Vec<AxisState>> {
@@ -357,7 +358,7 @@ impl OmsPoller {
                         )),
                     }
                 }
-                st.encoder_position = f64::from(encoders[i]);
+                st.set_encoder_position(f64::from(encoders[i]));
             }
 
             if flag(1) == Some(b'D') {
@@ -407,7 +408,7 @@ impl OmsPoller {
             }
             st.home = flag(3) == Some(b'H');
             st.direction = flag(0) == Some(b'P');
-            st.position = f64::from(positions[i]);
+            st.set_position(f64::from(positions[i]));
             if have_closed_loop {
                 st.gain_support = self.closed_loop[i];
             }
@@ -759,14 +760,14 @@ pub(crate) mod tests {
             (x.done, x.moving, x.msta_moving, x.problem),
             (false, true, true, false)
         );
-        assert_eq!((x.position, x.encoder_position), (100.0, 7.0));
+        assert_eq!((x.position(), x.encoder_position()), (100.0, 7.0));
         assert!(x.slip_stall && x.direction && !x.home);
         assert!(!x.gain_support, "C sets 0 for an `on` field");
         assert!(!x.low_limit && !x.high_limit);
 
         let y = rig.axes[1].polled(&user).unwrap();
         assert_eq!((y.done, y.moving, y.msta_moving), (true, false, false));
-        assert_eq!((y.position, y.encoder_position), (-5.0, 0.0));
+        assert_eq!((y.position(), y.encoder_position()), (-5.0, 0.0));
         assert!(!y.direction && y.home && y.gain_support);
         assert!(y.low_limit && y.high_limit, "LT? =l inverts a clear flag");
 
@@ -882,8 +883,8 @@ pub(crate) mod tests {
         init_positions(&rig.controller);
         assert_eq!(*rig.written.lock().unwrap(), ["AM PP;"]);
         let user = AsynUser::default();
-        assert_eq!(rig.axes[0].polled(&user).unwrap().position, 3000.0);
-        assert_eq!(rig.axes[1].polled(&user).unwrap().position, -5.0);
+        assert_eq!(rig.axes[0].polled(&user).unwrap().position(), 3000.0);
+        assert_eq!(rig.axes[1].polled(&user).unwrap().position(), -5.0);
     }
 
     /// Init's DONE=1 stands through a loop that finds an axis at rest with
@@ -908,12 +909,12 @@ pub(crate) mod tests {
         let user = AsynUser::default();
         for axis in &mut rig.axes {
             axis.set_encoder_position(&user, 42.0).unwrap();
-            assert_eq!(axis.polled(&user).unwrap().encoder_position, 42.0);
+            assert_eq!(axis.polled(&user).unwrap().encoder_position(), 42.0);
         }
         assert_eq!(*rig.written.lock().unwrap(), ["AX LPE42;"]);
         poller(&rig).pass();
-        assert_eq!(rig.axes[0].polled(&user).unwrap().encoder_position, 7.0);
-        assert_eq!(rig.axes[1].polled(&user).unwrap().encoder_position, 42.0);
+        assert_eq!(rig.axes[0].polled(&user).unwrap().encoder_position(), 7.0);
+        assert_eq!(rig.axes[1].polled(&user).unwrap().encoder_position(), 42.0);
     }
 
     /// C `homing`: set by home(), cleared by the loop that finds the axis
@@ -992,7 +993,7 @@ pub(crate) mod tests {
         assert_eq!(poller.pass(), Some(Duration::from_secs(1)));
         assert!(!poller.enabled);
         assert_eq!(
-            rig.axes[0].polled(&AsynUser::default()).unwrap().position,
+            rig.axes[0].polled(&AsynUser::default()).unwrap().position(),
             0.0
         );
         rig.written.lock().unwrap().clear();

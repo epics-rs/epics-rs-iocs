@@ -391,15 +391,15 @@ impl Mm4000Controller {
         if let Some(position) =
             parse_axis_position(&poll.position, idx).and_then(|p| steps(p, step_size))
         {
-            s.position = position.round();
+            s.set_position(position.round());
         }
-        s.encoder_position = match encoder_present {
+        s.set_encoder_position(match encoder_present {
             true => parse_axis_position(&poll.feedback, idx)
                 .and_then(|e| steps(e, step_size))
-                .map_or(s.encoder_position, f64::trunc),
+                .map_or(s.encoder_position(), f64::trunc),
             false => 0.0,
-        };
-        s.velocity = 0.0;
+        });
+        s.set_velocity(0.0);
         s.problem = !te_ok(&self.unchecked_reply("TE;")) || step_size == 0.0;
         s
     }
@@ -1569,9 +1569,9 @@ mod tests {
         let two = Model1Polled::polled(&mut axes[1], &user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TH;", "TE;", "TE;"]);
 
-        assert_eq!((one.position, one.encoder_position), (1500.0, 0.0));
+        assert_eq!((one.position(), one.encoder_position()), (1500.0, 0.0));
         assert!(one.done && one.powered && !one.has_encoder && !one.problem);
-        assert_eq!((two.position, two.encoder_position), (-2250.0, -2249.0));
+        assert_eq!((two.position(), two.encoder_position()), (-2250.0, -2249.0));
         assert!(two.moving && !two.done && two.direction && two.high_limit);
         assert!(two.has_encoder && !two.low_limit && !two.home);
     }
@@ -1761,16 +1761,16 @@ mod tests {
         let mut axes = axes.unwrap();
         let init = axes[0].take_init_status();
         assert!(init.done && init.powered && init.problem && !init.comms_error);
-        assert_eq!(init.position, 0.0);
+        assert_eq!(init.position(), 0.0);
         sent.lock().unwrap().clear();
         let user = AsynUser::default();
         let one = Model1Polled::polled(&mut axes[0], &user).unwrap();
         let two = Model1Polled::polled(&mut axes[1], &user).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["MS;", "TP;", "TH;", "TE;", "TE;"]);
         assert!(one.done && one.powered && one.problem && !one.comms_error);
-        assert_eq!((one.position, one.encoder_position), (0.0, 0.0));
+        assert_eq!((one.position(), one.encoder_position()), (0.0, 0.0));
         assert!(!two.problem && two.high_limit);
-        assert_eq!((two.position, two.encoder_position), (-2250.0, -2249.0));
+        assert_eq!((two.position(), two.encoder_position()), (-2250.0, -2249.0));
     }
 
     /// An unanswered MS; is a RETRY, which asks TH; but no TP; or TE; and
@@ -1879,7 +1879,10 @@ mod tests {
             .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 0, 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
-        assert_eq!(Polled::polled(&mut axis, &user).unwrap().position, 50000.0);
+        assert_eq!(
+            Polled::polled(&mut axis, &user).unwrap().position(),
+            50000.0
+        );
 
         dead.store(true, Ordering::SeqCst);
         sent.lock().unwrap().clear();
@@ -1887,7 +1890,7 @@ mod tests {
         // C sends `TP;` only after `MS;` succeeded.
         assert_eq!(*sent.lock().unwrap(), ["MS;"]);
         assert!(status.comms_error);
-        assert_eq!(status.position, 50000.0, "a dead line reads back as 0");
+        assert_eq!(status.position(), 50000.0, "a dead line reads back as 0");
         assert!(status.done);
     }
 

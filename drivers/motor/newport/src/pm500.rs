@@ -456,13 +456,10 @@ impl Pm500Axis {
         // kept when the steps equal the last position.
         let last = &self.last_status;
         let (position, encoder_position) = match steps {
-            Ok(steps) if steps != last.position => (nint(steps) as f64, steps as i32 as f64),
-            _ => (last.position, last.encoder_position),
+            Ok(steps) if steps != last.position() => (nint(steps) as f64, steps as i32 as f64),
+            _ => (last.position(), last.encoder_position()),
         };
         self.last_status = MotorStatus {
-            position,
-            encoder_position,
-            velocity: 0.0, // C: "Parse motor velocity? NEEDS WORK"
             done: !moving,
             direction,
             // C sets only the switch in the travel direction on an 'L' and
@@ -484,6 +481,10 @@ impl Pm500Axis {
             // C SET_VEL_BASE: "PM500 does not use base velocity".
             vbas_supported: false,
             ..MotorStatus::default()
+                .with_position(position)
+                .with_encoder_position(encoder_position)
+                // C: "Parse motor velocity? NEEDS WORK"
+                .with_velocity(0.0)
         };
         Ok(self.last_status.clone())
     }
@@ -658,7 +659,7 @@ mod tests {
         let user = AsynUser::default();
         *xr.lock().unwrap() = "XB";
         let s = axis.polled(&user).unwrap();
-        assert!(s.position == 0.0 && !s.done && !s.direction, "{s:?}");
+        assert!(s.position() == 0.0 && !s.done && !s.direction, "{s:?}");
         *xr.lock().unwrap() = "X";
         assert!(axis.polled(&user).is_err());
     }
@@ -721,7 +722,7 @@ mod tests {
         );
         let s = &axis.last_status;
         // drvPM500.cc: NINT steps, the encoder truncated.
-        assert_eq!((s.position, s.encoder_position), (502.0, 501.0));
+        assert_eq!((s.position(), s.encoder_position()), (502.0, 501.0));
         // drvPM500 reports a busy axis as RA_DONE 0 and never sets RA_MOVING.
         assert!(!s.done && !s.moving && s.direction && s.powered && s.has_encoder);
     }
@@ -769,7 +770,7 @@ mod tests {
         let mut poll = |reply: &'static str| {
             *xr.lock().unwrap() = reply;
             let s = axis.polled(&user).unwrap();
-            (s.position, s.encoder_position)
+            (s.position(), s.encoder_position())
         };
         assert_eq!(poll("XD+4.997"), (500.0, 499.0));
         assert_eq!(poll("XD+5.000"), (500.0, 499.0));

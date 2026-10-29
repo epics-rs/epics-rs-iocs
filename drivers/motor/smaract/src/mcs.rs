@@ -728,8 +728,8 @@ impl AsynMotor for McsAxis {
         } else {
             ctrl.get_val("GP", ch)? as i64
         };
-        status.encoder_position = pos as f64;
-        status.position = pos as f64;
+        status.set_encoder_position(pos as f64);
+        status.set_position(pos as f64);
 
         let moving = status_is_moving(ctrl.get_val("GS", ch)?);
         status.moving = moving;
@@ -974,7 +974,10 @@ mod tests {
             ..MotorStatus::default()
         };
         assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
-        assert_eq!((status.position, status.encoder_position), (1234.0, 1234.0));
+        assert_eq!(
+            (status.position(), status.encoder_position()),
+            (1234.0, 1234.0)
+        );
         assert!(status.done && !status.moving);
     }
 

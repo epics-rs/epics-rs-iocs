@@ -385,12 +385,12 @@ impl Model1Motor for DrvIm483Axis {
             status.direction = new >= self.position;
             self.position = new;
         }
-        status.position = f64::from(self.position);
+        status.set_position(f64::from(self.position));
         let limits = atoi(from(&limits, 5));
         status.high_limit = limits & 1 != 0;
         status.low_limit = limits & 2 != 0;
         status.home = home.as_bytes().get(5).is_some_and(|b| b & 1 != 0);
-        status.encoder_position = encoder.map_or(0.0, |e| atof(from(&e, 5)).trunc());
+        status.set_encoder_position(encoder.map_or(0.0, |e| atof(from(&e, 5)).trunc()));
         status.problem = false;
         let status = status.clone();
         // The move's POST, as the field holds it now, once the move is done

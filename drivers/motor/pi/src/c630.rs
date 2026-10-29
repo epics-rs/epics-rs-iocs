@@ -305,15 +305,13 @@ impl PIC630Axis {
     /// position delta (held across polls when the position is unchanged, C
     /// `motorData >= motor_info->position` guarded by `motorData != position`).
     fn apply(&mut self, polled: PolledStatus) {
-        let prev = self.last_status.position as i32;
+        let prev = self.last_status.position() as i32;
         let direction = if polled.position != prev {
             polled.position >= prev
         } else {
             self.last_status.direction
         };
         self.last_status = MotorStatus {
-            position: polled.position as f64,
-            velocity: 0.0,
             done: polled.done,
             high_limit: polled.high_limit,
             low_limit: polled.low_limit,
@@ -326,6 +324,8 @@ impl PIC630Axis {
             has_encoder: false,
             vbas_supported: false,
             ..MotorStatus::default()
+                .with_position(polled.position as f64)
+                .with_velocity(0.0)
         };
     }
 
@@ -545,7 +545,7 @@ mod tests {
         let ctrl = PIC630Controller::new(io, 1).unwrap();
         let mut axis = PIC630Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
         let status = axis.polled(&AsynUser::default()).unwrap();
-        assert_eq!((status.position, status.done), (250.0, false));
+        assert_eq!((status.position(), status.done), (250.0, false));
     }
 
     /// drvPIC630.cc set_status sets no encoder_position, so REP keeps
@@ -560,7 +560,7 @@ mod tests {
         let ctrl = PIC630Controller::new(io, 1).unwrap();
         let mut axis = PIC630Axis::new(Arc::new(Mutex::new(ctrl)), 0, 0);
         let s = axis.polled(&AsynUser::default()).unwrap();
-        assert_eq!((s.position, s.encoder_position), (250.0, 0.0));
+        assert_eq!((s.position(), s.encoder_position()), (250.0, 0.0));
     }
 
     /// devPIC630.cc:186-192: INIT as its own message.

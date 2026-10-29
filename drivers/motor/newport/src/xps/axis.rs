@@ -1460,12 +1460,12 @@ impl XpsAxis {
         let encoder = sock
             .group_position_current_get(&self.positioner_name)
             .inspect_err(|e| poll_error("GroupPositionCurrentGet", e))?;
-        status.encoder_position = encoder / self.step_size;
+        status.set_encoder_position(encoder / self.step_size);
         let setpoint = sock
             .group_position_setpoint_get(&self.positioner_name)
             .inspect_err(|e| poll_error("GroupPositionSetpointGet", e))?;
         self.lock_move_state().setpoint = setpoint;
-        status.position = setpoint / self.step_size;
+        status.set_position(setpoint / self.step_size);
         let positioner_error = sock
             .positioner_error_get(&self.positioner_name)
             .inspect_err(|e| poll_error("PositionerErrorGet", e))?;
@@ -1476,7 +1476,7 @@ impl XpsAxis {
             .inspect_err(|e| poll_error("GroupPositionVelocityGet", e))?;
         // C omission: XPSAxis::poll never sets motorActVelocity_, so its RVEL
         // stays 0 (XPSAxis.cpp:742-753). Kept as the velocity read here.
-        status.velocity = velocity / self.step_size;
+        status.set_velocity(velocity / self.step_size);
         status.direction = velocity > XPS_VELOCITY_DEADBAND;
         // MSTA RA_MOVING is velocity-derived, C `motorStatusMoving_`
         // (XPSAxis.cpp:753), apart from the group-state pace above.
@@ -1643,7 +1643,7 @@ mod tests {
             "{log:?}"
         );
         let status = axis.polled(&user).unwrap();
-        assert_eq!((status.position, status.encoder_position), (2.5, 3.0));
+        assert_eq!((status.position(), status.encoder_position()), (2.5, 3.0));
     }
 
     /// A group in state 44 (moving) whose move replies wait until `answer`.
@@ -1815,7 +1815,7 @@ mod tests {
         assert_eq!(axis.poll_failure(), PollFailure::COMMS_ERROR);
         assert!(!s.problem, "status 12 is Ready");
         assert!(s.homed);
-        assert_eq!((s.encoder_position, s.position), (1.5, 1.25));
+        assert_eq!((s.encoder_position(), s.position()), (1.5, 1.25));
 
         *fail.lock().unwrap() = "";
         s.comms_error = true;
@@ -1825,7 +1825,19 @@ mod tests {
         *fail.lock().unwrap() = "GroupStatusGet";
         assert!(axis.poll(&user, &mut s).is_err());
         assert!(s.homed && !s.problem);
-        assert_eq!(s.position, 1.25);
+        assert_eq!(s.position(), 1.25);
+    }
+
+    /// XPSAxis.cpp:706-716: GroupPositionCurrentGet sets the encoder
+    /// position before a failed GroupPositionSetpointGet goes to `done`, so
+    /// XPS_extra.db's READBACK, on MOTOR_POSITION, stays undefined.
+    #[test]
+    fn a_failed_setpoint_get_keeps_the_encoder_position() {
+        let (mut axis, fail, _) = fake_axis("xps_setpoint_fail", "");
+        *fail.lock().unwrap() = "GroupPositionSetpointGet";
+        let mut status = MotorStatus::default();
+        assert!(axis.poll(&AsynUser::new(0), &mut status).is_err());
+        assert_eq!(status.readbacks.take_sets(), [None, Some(1.5), None]);
     }
 
     /// XPSAxis.cpp:556-758 sets only what it read before a failed call's
@@ -2016,7 +2028,7 @@ mod tests {
         *fail.lock().unwrap() = "PositionerUserTravelLimitsGet";
         let s = axis.polled(&user).unwrap();
         assert!(!s.comms_error);
-        assert_eq!(s.position, 1.25);
+        assert_eq!(s.position(), 1.25);
     }
 
     /// A pulse width past the table refuses before the XPS sees a call, and

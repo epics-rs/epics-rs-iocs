@@ -449,9 +449,6 @@ impl Model1Motor for Pm304Axis {
         }
 
         let status = MotorStatus {
-            position: position as f64,
-            encoder_position: position as f64,
-            velocity: 0.0,
             done: bits.done,
             high_limit: bits.plus_ls,
             low_limit: bits.minus_ls,
@@ -461,7 +458,10 @@ impl Model1Motor for Pm304Axis {
             // word zeroed at init, so the record never sends torque (RS/AB)
             // or gain commands and never offers UEIP.
             ..MotorStatus::default()
-        };
+        }
+        .with_position(position as f64)
+        .with_encoder_position(position as f64)
+        .with_velocity(0.0);
         *out = status;
         Ok(())
     }
@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(ctrl.ident, "Mclennan PM304");
         let mut axis = Pm304Axis::new(Arc::new(Mutex::new(ctrl)), 0);
         let status = axis.polled(&AsynUser::default()).unwrap();
-        assert_eq!((status.position, status.done), (123.0, true));
+        assert_eq!((status.position(), status.done), (123.0, true));
     }
 
     /// drvPM304.cc:662-663: the ident is the 1ID reply as it came.
