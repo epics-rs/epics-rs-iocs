@@ -70,21 +70,13 @@ dbpf("$(P)m6.TWV", "0.1")
 # GROUP over its own XPS sockets, the file sent by FTP as USERNAME:
 #   seq &XPS_trajectoryScan, "P=$(P),R=traj1:,M1=m1,IPADDR=$(IP),PORT=5001,GROUP=GROUP,P1=PHI,USERNAME=Administrator,PASSWORD=Administrator"
 
-# Run a TCL script file stored on the XPS (task name + parameters default "0"):
-#   XPSTclScriptExecute("$(PORT)", "MyScript.tcl")
+# Run a TCL script file stored on the XPS on axis 0's move socket: write
+# its name to TCLScript, then TCLScriptExecute:
+#   dbLoadRecords("$(XPS_IOC)/db/XPSTclScript.template", "P=$(P),R=m1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
-# Position-compare output (PCO), driver-private iocsh command (the C
-# base-class PCO API is an open, unmerged motor PR #248, so PCO is not a
-# motor-record feature here):
-#   XPSPositionCompare(motorPort, positionerName, mode, [minPosition],
-#                      [maxPosition], [positionStep], [pulseWidth], [settlingTime])
-# mode: 0=Disable 1=Pulse 2=AquadB-windowed 3=AquadB-always.
-# Positions/step are device units; pulseWidth/settlingTime are microseconds
-# (valid widths {0.2,1,2.5,10}; valid settling {0.075,1,4,12}), defaulting to
-# 0.2/0.075. Example (Pulse mode over 0..10, step 0.5, 1 us pulses):
-#   XPSPositionCompare("$(PORT)", "GROUP.PHI", 1, 0, 10, 0.5, 1.0, 0.075)
-# Disable:
-#   XPSPositionCompare("$(PORT)", "GROUP.PHI", 0)
+# Position compare output of axis 0; writing a PositionCompare* record
+# applies the six settings to the positioner and reads them back:
+#   dbLoadRecords("$(XPS_IOC)/db/XPSPositionCompare.db", "P=$(P),R=m1:,PORT=$(PORT),ADDR=0,PREC=4")
 
 # Example:
 #   dbl

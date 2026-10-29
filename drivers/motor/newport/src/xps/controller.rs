@@ -16,6 +16,7 @@ use std::time::Duration;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::motor::trace::MotorTrace;
 
+use super::pco::PcoParams;
 use super::rpc::{XpsResult, XpsSocket};
 
 /// A registered axis's identity, kept by the controller for group enumeration.
@@ -55,16 +56,20 @@ pub struct DeferredMove {
     pub relative: bool,
 }
 
-/// The `XPSController` parameters an axis sets (XPSController.cpp:173-174,
-/// :188-189).
+/// The `XPSController` parameters its axes and writes use
+/// (XPSController.cpp:159-176).
 #[derive(Clone, Copy, Debug)]
 pub struct XpsParams {
     /// `XPS_MIN_JERK`, `XPS_MAX_JERK`.
     pub min_jerk: usize,
     pub max_jerk: usize,
+    pub pco: PcoParams,
     /// `XPS_STATUS`, `XPS_STATUS_STRING`.
     pub status: usize,
     pub status_string: usize,
+    /// `XPS_TCL_SCRIPT`, `XPS_TCL_SCRIPT_EXECUTE`.
+    pub tcl_script: usize,
+    pub tcl_script_execute: usize,
 }
 
 /// The [`XpsController::set_position`] step that failed, with its XPS code.

@@ -28,6 +28,7 @@ use epics_rs::motor::trace::MotorTrace;
 
 use super::controller::{DeferredMove, MoveState, SetPositionFailure, XpsController, XpsParams};
 use super::corrector::{self, CorrectorType, PidFailure};
+use super::pco::{self, PcoSettings, RecordUnits};
 use super::rpc::{XpsError, XpsResult, XpsSocket};
 
 /// C `driverName` in XPSAxis.cpp.
@@ -253,6 +254,210 @@ impl XpsAxis {
         } else if reason == self.params.max_jerk {
             self.max_jerk = value;
         }
+    }
+
+    /// A port write of an `XPS_POSITION_COMPARE_*` parameter: C
+    /// `setPositionCompare` then `getPositionCompare` (XPSController.cpp:
+    /// 262-266, :316-320). C keeps only the second status, so a refused set
+    /// read as success; both run here and either failure is returned.
+    pub fn write_position_compare(&mut self, settings: &PcoSettings) -> AsynResult<()> {
+        let set = self.set_position_compare(settings);
+        let get = self.get_position_compare(&settings.units);
+        set.and(get)
+    }
+
+    /// C `setPositionCompare` (XPSAxis.cpp:939-1043) on the poll socket.
+    fn set_position_compare(&self, s: &PcoSettings) -> AsynResult<()> {
+        const F: &str = "setPositionCompare";
+        // C indexes its tables with whatever the parameter holds, past their
+        // end after getPositionCompare stored a width they lack.
+        let (Some(pulse_width), Some(settling_time)) = (
+            pco::entry(&pco::PULSE_WIDTHS, s.pulse_width),
+            pco::entry(&pco::SETTLING_TIMES, s.settling_time),
+        ) else {
+            self.error(
+                F,
+                format_args!(
+                    "[{},{}]: pulseWidth={}, settlingTime={} outside the tables\n",
+                    self.port(),
+                    self.axis_no(),
+                    s.pulse_width,
+                    s.settling_time
+                ),
+            );
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            });
+        };
+        let u = &s.units;
+        let mut min = u.position_to_xps(s.min_position, self.step_size);
+        let mut max = u.position_to_xps(s.max_position, self.step_size);
+        let step = u.step_to_xps(s.step_size, self.step_size).abs();
+        if u.direction != 0 {
+            std::mem::swap(&mut min, &mut max);
+        }
+        let ctrl = self.lock_controller();
+        let sock = ctrl.poll_socket();
+        let p = &self.positioner_name;
+        let failed = |call: &str, e: &XpsError, values: fmt::Arguments<'_>| {
+            self.error(
+                F,
+                format_args!(
+                    "[{},{}]: error calling {call} status={}{values}\n",
+                    self.port(),
+                    self.axis_no(),
+                    e.code()
+                ),
+            )
+        };
+        let enable = |sock: &XpsSocket| {
+            sock.positioner_position_compare_enable(p)
+                .inspect_err(|e| failed("PositionerPositionCompareEnable", e, format_args!("")))
+        };
+        sock.positioner_position_compare_disable(p)
+            .inspect_err(|e| failed("PositionerPositionCompareDisable", e, format_args!("")))?;
+        sock.positioner_position_compare_pulse_parameters_set(p, pulse_width, settling_time)
+            .inspect_err(|e| {
+                failed(
+                    "PositionerPositionComparePulseParametersSet",
+                    e,
+                    format_args!(
+                        ", pulseWidth={:.6}, settlingTime={:.6}",
+                        CFloat(pulse_width),
+                        CFloat(settling_time)
+                    ),
+                )
+            })?;
+        match s.mode {
+            pco::MODE_PULSE => {
+                sock.positioner_position_compare_set(p, min, max, step)
+                    .inspect_err(|e| {
+                        failed(
+                            "PositionerPositionCompareSet",
+                            e,
+                            format_args!(
+                                ", minPosition={:.6}, maxPosition={:.6}, stepSize={:.6}",
+                                CFloat(min),
+                                CFloat(max),
+                                CFloat(step)
+                            ),
+                        )
+                    })?;
+                enable(sock)?;
+            }
+            pco::MODE_AQUADB_WINDOWED => {
+                sock.positioner_position_compare_aquadb_windowed_set(p, min, max)
+                    .inspect_err(|e| {
+                        failed(
+                            "PositionerPositionCompareAquadBWindowedSet",
+                            e,
+                            format_args!(
+                                ", minPosition={:.6}, maxPosition={:.6}",
+                                CFloat(min),
+                                CFloat(max)
+                            ),
+                        )
+                    })?;
+                enable(sock)?;
+            }
+            pco::MODE_AQUADB_ALWAYS => {
+                sock.positioner_position_compare_aquadb_always_enable(p)
+                    .inspect_err(|e| {
+                        failed(
+                            "PositionerPositionCompareAquadBAlwaysEnable",
+                            e,
+                            format_args!(""),
+                        )
+                    })?;
+            }
+            _ => {}
+        }
+        self.flow(
+            F,
+            format_args!(
+                "set XPS {}, axis {} positionCompare set and enable\n",
+                self.port(),
+                self.axis_no()
+            ),
+        );
+        Ok(())
+    }
+
+    /// C `getPositionCompare` (XPSAxis.cpp:1045-1101): the step size, pulse
+    /// width and settling time back into the parameters.
+    fn get_position_compare(&mut self, units: &RecordUnits) -> AsynResult<()> {
+        const F: &str = "getPositionCompare";
+        let ((pulse_width, settling_time), compare, windowed) = {
+            let ctrl = self.lock_controller();
+            let sock = ctrl.poll_socket();
+            let p = &self.positioner_name;
+            let pulse = sock
+                .positioner_position_compare_pulse_parameters_get(p)
+                .inspect_err(|e| {
+                    self.error(
+                        F,
+                        format_args!(
+                            "[{},{}]: error calling PositionerPositionComparePulseParametersGet status={}\n",
+                            self.port(),
+                            self.axis_no(),
+                            e.code()
+                        ),
+                    )
+                })?;
+            (
+                pulse,
+                sock.positioner_position_compare_get(p).ok(),
+                sock.positioner_position_compare_aquadb_windowed_get(p).ok(),
+            )
+        };
+        // C prints an uninitialized `enable` when both reads fail.
+        let (mut min, mut max, mut step, mut enable) = (0.0, 0.0, 0.0, false);
+        if let Some((lo, hi, st, en)) = compare {
+            (min, max, step, enable) = (lo, hi, st, en);
+            if units.direction != 0 {
+                std::mem::swap(&mut min, &mut max);
+            }
+            self.sets.axis(
+                self.params.pco.step_size,
+                ParamValue::Float64(units.step_from_xps(step, self.step_size).abs()),
+            );
+        }
+        if let Some((lo, hi, en)) = windowed {
+            (min, max, enable) = (lo, hi, en);
+            if units.direction != 0 {
+                std::mem::swap(&mut min, &mut max);
+            }
+        }
+        self.flow(
+            F,
+            format_args!(
+                "set XPS {}, axis {}  enable={}, minPosition={:.6}, maxPosition={:.6}, stepSize={:.6}, pulseWidth={:.6}, settlingTime={:.6}\n",
+                self.port(),
+                self.axis_no(),
+                enable as i32,
+                CFloat(min),
+                CFloat(max),
+                CFloat(step),
+                CFloat(pulse_width),
+                CFloat(settling_time)
+            ),
+        );
+        self.sets.axis(
+            self.params.pco.pulse_width,
+            ParamValue::Int32(pco::index_of(&pco::PULSE_WIDTHS, pulse_width)),
+        );
+        self.sets.axis(
+            self.params.pco.settling_time,
+            ParamValue::Int32(pco::index_of(&pco::SETTLING_TIMES, settling_time)),
+        );
+        Ok(())
+    }
+
+    /// C `TCLScriptExecute(pAxis->moveSocket_, fileName, "0", "0")`
+    /// (XPSController.cpp:270-271).
+    pub fn tcl_script_execute(&self, file: &str) -> XpsResult<()> {
+        self.move_sock.tcl_script_execute(file, "0", "0")
     }
 
     fn lock_controller(&self) -> MutexGuard<'_, XpsController> {
@@ -1297,6 +1502,7 @@ mod tests {
     use super::*;
 
     use crate::xps::fake::{Fail, FakeLine, Log};
+    use crate::xps::pco::PcoParams;
     use crate::xps::rpc::SocketMode;
     use motor_common::testing::Polled;
 
@@ -1304,8 +1510,18 @@ mod tests {
     const PARAMS: XpsParams = XpsParams {
         min_jerk: 100,
         max_jerk: 101,
-        status: 102,
-        status_string: 103,
+        pco: PcoParams {
+            mode: 104,
+            min_position: 105,
+            max_position: 106,
+            step_size: 107,
+            pulse_width: 108,
+            settling_time: 109,
+        },
+        status: 110,
+        status_string: 111,
+        tcl_script: 112,
+        tcl_script_execute: 113,
     };
 
     fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Fail, Log) {
@@ -1803,6 +2019,34 @@ mod tests {
         assert_eq!(s.position, 1.25);
     }
 
+    /// A pulse width past the table refuses before the XPS sees a call, and
+    /// a refused set is returned though the read back succeeds.
+    #[test]
+    fn a_refused_position_compare_set_is_returned() {
+        let (mut axis, fail, log) = fake_axis("xps_pco_refused", "");
+        log.lock().unwrap().clear();
+        let gets = [
+            "PositionerPositionComparePulseParametersGet (G1.P1,double *,double *)",
+            "PositionerPositionCompareGet (G1.P1,double *,double *,double *,bool *)",
+            "PositionerPositionCompareAquadBWindowedGet (G1.P1,double *,double *,bool *)",
+        ];
+        let past = PcoSettings {
+            pulse_width: 4,
+            ..PcoSettings::default()
+        };
+        assert!(axis.write_position_compare(&past).is_err());
+        assert_eq!(std::mem::take(&mut *log.lock().unwrap()), gets);
+
+        *fail.lock().unwrap() = "PositionerPositionCompareDisable";
+        assert!(
+            axis.write_position_compare(&PcoSettings::default())
+                .is_err()
+        );
+        let mut calls = vec!["PositionerPositionCompareDisable (G1.P1)"];
+        calls.extend(gets);
+        assert_eq!(*log.lock().unwrap(), calls);
+    }
+
     /// XPSAxis.cpp:193-194 sets the jerk times the constructor read;
     /// :581-582 set the group status once both status reads succeed.
     #[test]
@@ -1833,8 +2077,8 @@ mod tests {
         assert_eq!(
             taken(axis),
             [
-                (102, "Int32(12)".into()),
-                (103, "Octet(\"Ready state\")".into())
+                (110, "Int32(12)".into()),
+                (111, "Octet(\"Ready state\")".into())
             ]
         );
 
