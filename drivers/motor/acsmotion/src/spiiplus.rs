@@ -993,16 +993,18 @@ impl SpiiPlusAxis {
         }
         params.push((r.mflags, ParamValue::Int32(bits(&p.motor_flags))));
         params.push((r.mflagsx, ParamValue::Int32(bits(&p.motor_flags_x))));
-        // C reads motorRecResolution_ unchecked; before the record writes
-        // it that is an uninitialised local, so nothing is set here.
-        if let Some(mres) = ctrl.rec_resolution[a] {
-            let max = |values: &[f64]| {
-                let v = values.get(a).copied().unwrap_or_default();
-                ParamValue::Float64(v / self.resolution * mres)
-            };
-            params.push((r.max_velocity, max(&p.max_velocity)));
-            params.push((r.max_acceleration, max(&p.max_acceleration)));
-        }
+        // C reads motorRecResolution_ unchecked and sets both on every poll;
+        // before the record writes MRES that is an uninitialised local. NaN
+        // stands for it, so a connected controller gets no made-up limit;
+        // -NaN pins the sign C's oracle prints (there 0/0, as XVEL and
+        // resolution_ are 0 while the controller never connects).
+        let mres = ctrl.rec_resolution[a].unwrap_or(-f64::NAN);
+        let max = |values: &[f64]| {
+            let v = values.get(a).copied().unwrap_or_default();
+            ParamValue::Float64(v / self.resolution * mres)
+        };
+        params.push((r.max_velocity, max(&p.max_velocity)));
+        params.push((r.max_acceleration, max(&p.max_acceleration)));
         params.extend([
             (r.axis_pos, at(&p.axis_position)),
             (r.ref_pos, at(&p.reference_position)),
@@ -1695,7 +1697,7 @@ mod tests {
     }
 
     /// A dummy axis has no fault or homed bits, and max velocity follows
-    /// the record's MRES only once the record has written it
+    /// the record's MRES, NaN until the record has written it
     /// (SPiiPlusDriver.cpp:761-768, 873-884).
     #[test]
     fn a_dummy_axis_skips_the_fault_bits_and_max_params_follow_mres() {
@@ -1725,15 +1727,21 @@ mod tests {
         assert_eq!(format!("{velocity:?}"), "Float64(100.0)");
         rig.ctrl.lock().unwrap().rec_resolution[1] = None;
         pass(&rig.ctrl, &mut servo);
-        let max = [
-            rig.param("SPIIPLUS_MAX_VELOCITY"),
-            rig.param("SPIIPLUS_MAX_ACCELERATION"),
-        ];
-        assert!(
-            !reasons(axis_params(servo.take_port_sets()))
-                .iter()
-                .any(|r| max.contains(r))
-        );
+        let nan: Vec<_> = axis_params(servo.take_port_sets())
+            .into_iter()
+            .filter(|(r, _)| {
+                [
+                    rig.param("SPIIPLUS_MAX_VELOCITY"),
+                    rig.param("SPIIPLUS_MAX_ACCELERATION"),
+                ]
+                .contains(r)
+            })
+            .map(|(_, v)| match v {
+                ParamValue::Float64(v) => v.is_nan() && v.is_sign_negative(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(nan, [true, true]);
     }
 
     /// The max writes go to the controller in its units through the
