@@ -246,7 +246,8 @@ impl SpiiPlusComm {
         }
         if let Err(e) = status {
             self.print(format_args!(
-                "SPiiPlusComm:writeReadBinary: Binary read failed (asyn): {e}, nread={}\n",
+                "SPiiPlusComm:writeReadBinary: Binary read failed (asyn): status={}, nread={}\n",
+                e.c_status_code(),
                 reply.len()
             ));
             return Err(e);
@@ -271,7 +272,15 @@ impl SpiiPlusComm {
             let _ = io.with_timeout(ARRAY_TIMEOUT).write_octet(0, &frame);
             let io = io.with_timeout(ACK_TIMEOUT);
             let (mut reply, status) = io.read_octet(0, 2).into_parts();
-            if status.is_err() || reply.first() == Some(&ACKNOWLEDGE) {
+            if let Err(e) = &status {
+                self.print(format_args!(
+                    "SPiiPlusComm:writeReadAckBinary: Binary read failed (asyn): status={}, nread={}\n",
+                    e.c_status_code(),
+                    reply.len()
+                ));
+                return (reply, status);
+            }
+            if reply.first() == Some(&ACKNOWLEDGE) {
                 return (reply, status);
             }
             // An error is longer than the two bytes read so far.
@@ -293,13 +302,7 @@ impl SpiiPlusComm {
                 comm_error(format!("write of command id {id} not acknowledged"))
             }));
         }
-        if let Err(e) = status {
-            self.print(format_args!(
-                "SPiiPlusComm:writeReadAckBinary: Binary read failed (asyn): {e}, nread={}\n",
-                reply.len()
-            ));
-            return Err(e);
-        }
+        status?;
         if reply.get(1) != Some(&id) {
             self.print(format_args!(
                 "SPiiPlusComm:writeReadAckBinary: Command ID mismatch: write ID = {id}, read ID = {:?}\n",
@@ -537,6 +540,15 @@ mod tests {
     /// A comm on `io` printing under `port`, and that port's IO_DRIVER and
     /// ERROR lines without the prefix.
     fn traced_comm(port: &str, io: SyncIOHandle) -> (SpiiPlusComm, std::path::PathBuf) {
+        let path = trace_to_file(port);
+        let comm = SpiiPlusComm {
+            io: Mutex::new(io),
+            port: port.into(),
+        };
+        (comm, path)
+    }
+
+    fn trace_to_file(port: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("acs-comm-{port}-{}", std::process::id()));
         let file = Arc::new(Mutex::new(std::fs::File::create(&path).unwrap()));
         let manager = PortManager::global();
@@ -544,11 +556,7 @@ mod tests {
         trace.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
         trace.set_trace_info_mask(Some(port), TraceInfoMask::empty());
         trace.set_trace_file(Some(port), TraceFile::File(file));
-        let comm = SpiiPlusComm {
-            io: Mutex::new(io),
-            port: port.into(),
-        };
-        (comm, path)
+        path
     }
 
     /// `SPiiPlusCommDriver.cpp:25-26`: the port implements asynInt32,
@@ -671,6 +679,7 @@ mod tests {
         let line = crate::fake::line("acsBinDown");
         line.lock().unwrap().set("V", &[1.0]);
         let comm = SpiiPlusComm::connect("acsBinDownComm", "acsBinDown").unwrap();
+        let path = trace_to_file("acsBinDownComm");
         comm.get_double_array("V", Span::one(0, 0)).unwrap();
         line.lock().unwrap().down = true;
         comm.io().port().unwrap().disconnect_blocking().unwrap();
@@ -678,6 +687,11 @@ mod tests {
         assert_eq!(read.c_status_code(), 4, "{read}");
         let write = comm.write_read_ack_binary(vec![0xE3, 1, 0, 0]).unwrap_err();
         assert_eq!(write.c_status_code(), 4, "{write}");
+        assert_eq!(
+            take(&path),
+            "SPiiPlusComm:writeReadBinary: Binary read failed (asyn): status=4, nread=0\n\
+             SPiiPlusComm:writeReadAckBinary: Binary read failed (asyn): status=4, nread=0\n"
+        );
     }
 
     /// SPiiPlusCommDriver.cpp:352, 431: the comm lock is held from the
