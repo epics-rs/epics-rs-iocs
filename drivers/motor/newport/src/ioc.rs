@@ -612,11 +612,21 @@ impl ControllerParams for XpsHead {
     const INTERFACE_MASK: InterfaceMask = InterfaceMask::NONE;
     const INTERRUPT_MASK: InterfaceMask = InterfaceMask::NONE;
 
-    /// XPSController.cpp:173-189 without the position compare and TCL
-    /// script parameters.
+    /// XPSController.cpp:159-176, in C's order, so every parameter sits at
+    /// C's index.
     fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
         let min_jerk = base.create_param("XPS_MIN_JERK", ParamType::Float64)?;
         let max_jerk = base.create_param("XPS_MAX_JERK", ParamType::Float64)?;
+        for (name, kind) in [
+            ("XPS_POSITION_COMPARE_MODE", ParamType::Int32),
+            ("XPS_POSITION_COMPARE_MIN_POSITION", ParamType::Float64),
+            ("XPS_POSITION_COMPARE_MAX_POSITION", ParamType::Float64),
+            ("XPS_POSITION_COMPARE_STEP_SIZE", ParamType::Float64),
+            ("XPS_POSITION_COMPARE_PULSE_WIDTH", ParamType::Int32),
+            ("XPS_POSITION_COMPARE_SETTLING_TIME", ParamType::Int32),
+        ] {
+            base.create_param(name, kind)?;
+        }
         self.profile.create_params(base)?;
         self.params = Some(XpsParams {
             min_jerk,
@@ -624,6 +634,8 @@ impl ControllerParams for XpsHead {
             status: base.create_param("XPS_STATUS", ParamType::Int32)?,
             status_string: base.create_param("XPS_STATUS_STRING", ParamType::Octet)?,
         });
+        base.create_param("XPS_TCL_SCRIPT", ParamType::Octet)?;
+        base.create_param("XPS_TCL_SCRIPT_EXECUTE", ParamType::Int32)?;
         Ok(())
     }
 
@@ -3364,6 +3376,37 @@ mod xps_profile_tests {
         fn count(log: &[String], call: &str) -> usize {
             log.iter().filter(|c| c.starts_with(call)).count()
         }
+    }
+
+    /// XPSController.cpp:159-176 after asynMotorController's parameters:
+    /// C's console names XPS_STATUS function=90.
+    #[test]
+    fn the_params_sit_at_cs_indices() {
+        let rig = rig("XpsParamIdx");
+        let names = [
+            "XPS_MIN_JERK",
+            "XPS_MAX_JERK",
+            "XPS_POSITION_COMPARE_MODE",
+            "XPS_POSITION_COMPARE_MIN_POSITION",
+            "XPS_POSITION_COMPARE_MAX_POSITION",
+            "XPS_POSITION_COMPARE_STEP_SIZE",
+            "XPS_POSITION_COMPARE_PULSE_WIDTH",
+            "XPS_POSITION_COMPARE_SETTLING_TIME",
+            "XPS_PROFILE_MAX_VELOCITY",
+            "XPS_PROFILE_MAX_ACCELERATION",
+            "XPS_PROFILE_MIN_POSITION",
+            "XPS_PROFILE_MAX_POSITION",
+            "XPS_PROFILE_GROUP_NAME",
+            "XPS_TRAJECTORY_FILE",
+            "XPS_STATUS",
+            "XPS_STATUS_STRING",
+            "XPS_TCL_SCRIPT",
+            "XPS_TCL_SCRIPT_EXECUTE",
+        ];
+        let found = rig.with(move |_, ctx| names.map(|name| ctx.base.find_param(name)));
+        let first = index::PROFILE_FOLLOWING_ERRORS + 1;
+        assert_eq!(found, std::array::from_fn(|i| Some(first + i)));
+        assert_eq!(found[14], Some(90));
     }
 
     /// XPSAxis::defineProfile: the base's steps times stepSize.
