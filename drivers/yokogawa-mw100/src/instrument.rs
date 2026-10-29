@@ -1538,7 +1538,7 @@ mod tests {
 
     #[test]
     fn failed_init_stays_listed_and_resolves_with_no_queue_thread() {
-        let listener = TcpListener::bind(("127.0.0.2", 0)).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         // E0 greeting, BO1, CF0, then EOF during the IS0 status load.
         let device = spawn_fake_device(
@@ -1547,7 +1547,7 @@ mod tests {
         );
         let registry = Registry::new();
         registry.insert_connected("first", connect_default_fixture());
-        assert!(!registry.init_on_port(Some(b"dau2"), Some(b"127.0.0.2"), port));
+        assert!(!registry.init_on_port(Some(b"dau2"), Some(b"127.0.0.1"), port));
         device.join().unwrap();
 
         let dau2 = registry.get("dau2").unwrap();
@@ -1556,7 +1556,7 @@ mod tests {
         assert!(!registry.init_mw100(Some(b"dau2"), Some(b"192.0.2.1")));
         assert_eq!(
             registry.report(1).unwrap(),
-            b"    Yokogawa MW100 #1: dau2 @ 127.0.0.2\n\
+            b"    Yokogawa MW100 #1: dau2 @ 127.0.0.1\n\
              \x20       Modules:\n\
              \x20       #1: MX110-UNV-M06\n\
              \x20       #2: empty\n\

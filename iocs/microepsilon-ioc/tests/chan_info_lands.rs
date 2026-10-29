@@ -15,8 +15,12 @@ const RNG: [i32; 4] = [50, 100, 200, 500];
 const DISP: [u32; 4] = [0x40_0000, 0x80_0000, 0xC0_0000, 0x20_0000];
 
 /// One loopback address per test process: capaNCDT6200Configure always
-/// dials port 10001, so the address is what keeps runs apart.
+/// dials port 10001, so the address is what keeps runs apart. Only Linux
+/// answers on all of 127/8; macOS lo0 has 127.0.0.1 alone.
 fn host() -> String {
+    if !cfg!(target_os = "linux") {
+        return "127.0.0.1".to_string();
+    }
     format!(
         "127.0.{}.{}",
         1 + std::process::id() % 200,
