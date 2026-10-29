@@ -618,10 +618,12 @@ mod tests {
         std::mem::forget(runtime);
     }
 
-    /// Replays one read per entry, `(bytes, timed_out)`, repeating the last.
+    /// Replays one read per entry, `(bytes, timed_out)`, repeating the last;
+    /// `served` holds the bytes the latest read delivered.
     struct ScriptedPort {
         base: PortDriverBase,
         reads: std::collections::VecDeque<(&'static [u8], bool)>,
+        served: Arc<parking_lot::Mutex<&'static [u8]>>,
     }
 
     impl PortDriver for ScriptedPort {
@@ -637,6 +639,7 @@ mod tests {
             } else {
                 self.reads[0]
             };
+            *self.served.lock() = data;
             buf[..data.len()].copy_from_slice(data);
             if !timed_out {
                 return OctetReadResult::ok(data.len(), EomReason::EOS);
@@ -653,8 +656,13 @@ mod tests {
     }
 
     /// `cam_read(timeout)` over a camserver port replaying `reads`: the
-    /// status and the `fromCamserver` it ends with.
-    fn cam_read_over(name: &str, reads: &[(&'static [u8], bool)], timeout: f64) -> (i32, String) {
+    /// status, the `fromCamserver` it ends with and what the last read
+    /// delivered.
+    fn cam_read_over(
+        name: &str,
+        reads: &[(&'static [u8], bool)],
+        timeout: f64,
+    ) -> (i32, String, &'static [u8]) {
         let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
         let stop = Arc::new(Event::new());
         let det = PilatusDriver::new(
@@ -687,6 +695,7 @@ mod tests {
         )
         .unwrap();
         let cam_name = format!("{name}_CAM");
+        let served = Arc::new(parking_lot::Mutex::new(&b""[..]));
         let (cam, _) = create_port_runtime(
             &epics_rs::asyn::registry::claim_port(&cam_name).unwrap(),
             ScriptedPort {
@@ -698,6 +707,7 @@ mod tests {
                     InterfaceMask::OCTET,
                 ),
                 reads: reads.iter().copied().collect(),
+                served: served.clone(),
             },
             RuntimeConfig::default(),
         )
@@ -726,7 +736,8 @@ mod tests {
         .unwrap();
         std::mem::forget(cam);
         std::mem::forget(runtime);
-        rx.recv().unwrap()
+        let (status, from) = rx.recv().unwrap();
+        (status, from, *served.lock())
     }
 
     /// C `readCamserver` (pilatusDetector.cpp:953-976) breaks only on a
@@ -734,7 +745,7 @@ mod tests {
     /// polls again and the next read completes it.
     #[test]
     fn a_timeout_after_part_of_a_reply_keeps_polling() {
-        let (status, from) = cam_read_over(
+        let (status, from, _) = cam_read_over(
             "PILATUS_PARTIAL_POLL",
             &[(b"15 OK", true), (b"15 OK exptime 1.0", false)],
             1.0,
@@ -744,16 +755,18 @@ mod tests {
     }
 
     /// When the polling runs out, C's `fromCamserver` holds what the last
-    /// read delivered, terminated at its `nbytesTransfered`.
+    /// read delivered, terminated at its `nbytesTransfered`. How many polls
+    /// fit in the timeout is the host's scheduling, so the expected reply is
+    /// the one the port served last.
     #[test]
     fn a_read_that_ends_on_a_partial_timeout_keeps_the_partial_reply() {
-        let (status, from) = cam_read_over(
+        let (status, from, served) = cam_read_over(
             "PILATUS_PARTIAL_END",
             &[(b"15 OK", true), (b"15 OK exp", true)],
             0.05,
         );
         assert_eq!(status, AsynStatus::Timeout as i32);
-        assert_eq!(from, "15 OK exp");
+        assert_eq!(from.as_bytes(), served);
     }
 
     /// C prints the last read's nread (pilatusDetector.cpp:985-987): the bytes
@@ -770,7 +783,7 @@ mod tests {
             Some(&format!("{name}_CAM")),
             TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
         );
-        let (status, _) = cam_read_over(name, &[(b"15 \xff", true)], 0.05);
+        let (status, _, _) = cam_read_over(name, &[(b"15 \xff", true)], 0.05);
         let text = std::fs::read_to_string(&log).unwrap();
         let _ = std::fs::remove_file(&log);
         assert_eq!(status, AsynStatus::Timeout as i32);
