@@ -14,6 +14,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # No debuginfo: with debug=2 the workspace test build ran the runner out
+  # of disk on PR #20, as epics-rs found for its own build. Panics keep
+  # their file:line; backtrace frames do not.
+  CARGO_PROFILE_DEV_DEBUG: 0
   # Crates that build/link against a vendor C library not present on a
   # stock GitHub runner. They are excluded here — not silenced — and still
   # build/test locally where the library is installed.
