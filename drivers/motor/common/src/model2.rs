@@ -734,6 +734,120 @@ mod asyn_writes {
             assert!(text.contains(line), "{line:?} not in {text}");
         }
     }
+
+    /// A driver whose every call fails with a message of its own.
+    struct Refusing;
+
+    fn refused() -> AsynResult<()> {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: "line refused".into(),
+        })
+    }
+
+    impl AsynMotor for Refusing {
+        fn move_absolute(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            refused()
+        }
+        fn move_relative(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: f64,
+        ) -> AsynResult<()> {
+            refused()
+        }
+        fn home(&mut self, _: &AsynUser, _: f64, _: f64, _: f64, _: bool) -> AsynResult<()> {
+            refused()
+        }
+        fn stop(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            refused()
+        }
+        fn set_position(&mut self, _: &AsynUser, _: f64) -> AsynResult<()> {
+            refused()
+        }
+        fn poll(&mut self, _: &AsynUser, status: &mut MotorStatus) -> AsynResult<()> {
+            *status = MotorStatus::default();
+            Ok(())
+        }
+        fn poll_failure(&self) -> PollFailure {
+            PollFailure::NONE
+        }
+    }
+
+    impl DrvSet for Refusing {
+        fn set_integer(&mut self, _: &AsynUser, _: i32, _: i32) -> AsynResult<()> {
+            refused()
+        }
+        fn set_double(&mut self, _: &AsynUser, _: i32, _: f64) -> AsynResult<()> {
+            refused()
+        }
+    }
+
+    static REFUSED: Model2 = Model2::new("refused", 0);
+
+    /// drvMotorAsyn.c:576-752: a write returns the drvset call's bare
+    /// status, which C passes no asynUser to put a message on.
+    #[epics_rs::base::epics_test]
+    async fn a_refused_drvset_call_carries_no_message() {
+        use crate::testing::assert_bare;
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::sync_io::SyncIOHandle;
+        use std::time::Duration;
+
+        let axis = Model2Axis {
+            motor: Arc::new(Mutex::new(Refusing)),
+            setter: Arc::new(Mutex::new(Refusing)),
+            getter: Arc::new(crate::param_lib::Params::default()),
+            log: Arc::default(),
+        };
+        REFUSED.start_card(0, vec![axis], 100, 1000).unwrap();
+        let args = vec![
+            ArgValue::String("refusedPort".into()),
+            ArgValue::String("refused".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(1),
+        ];
+        run_command(drv_asyn_motor_configure_command(vec![&REFUSED]), args).await;
+        let port = PortManager::global()
+            .find_port_handle("refusedPort")
+            .unwrap();
+        let refusals = std::thread::spawn(move || {
+            let reason = |info: &str| {
+                port.drv_user_create_blocking(&DrvUserRequest::new(info, 0))
+                    .unwrap()
+                    .reason
+            };
+            let digital = SyncIOHandle::from_handle(
+                port.clone(),
+                0,
+                Duration::from_secs(1),
+                InterfaceType::UInt32Digital,
+            )
+            .unwrap();
+            [
+                port.write_int32_blocking(reason("MOTOR_STOP_AXIS"), 0, 1),
+                port.write_int32_blocking(reason("motor_defer_moves"), 0, 1),
+                port.write_float64_blocking(reason("MOTOR_MOVE_ABS"), 0, 7.0),
+                port.write_float64_blocking(reason("MOTOR_MOVE_HOME"), 0, 1.0),
+                digital.write_uint32_digital(reason("motor_defer_moves"), 1, 1),
+            ]
+        })
+        .join()
+        .unwrap();
+        for refusal in refusals {
+            assert_bare(refusal.unwrap_err(), AsynStatus::Error);
+        }
+    }
 }
 
 #[cfg(all(test, feature = "testing", target_os = "linux"))]
