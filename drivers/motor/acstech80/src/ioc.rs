@@ -100,13 +100,12 @@ mod tests {
         let int = ArgValue::Int;
         run_command(spiiplus_setup_command(), vec![int(3), int(10)]).await;
         let out = std::env::temp_dir().join(format!("spiiplus-mode-{}", std::process::id()));
+        // iocsh takes an unquoted `\` as an escape (iocsh.cpp:275).
+        let redirect = out.display().to_string().replace('\\', "/");
         let shell = IocShell::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
         shell.register(spiiplus_config_command());
         for (card, mode) in [(0, "buffer"), (1, "con"), (2, "Dir")] {
-            let line = format!(
-                "SPiiPlusConfig({card}, \"spRig\", \"{mode}\") >> {}",
-                out.display()
-            );
+            let line = format!("SPiiPlusConfig({card}, \"spRig\", \"{mode}\") >> {redirect}");
             shell.execute_line(line).unwrap();
         }
         let printed = std::fs::read_to_string(&out).unwrap();

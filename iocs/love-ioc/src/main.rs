@@ -237,6 +237,8 @@ mod tests {
         love::registry::register("loveCfgL0", models, follow);
 
         let out = std::env::temp_dir().join(format!("love-cfg-model-{}", std::process::id()));
+        // iocsh takes an unquoted `\` as an escape (iocsh.cpp:275).
+        let redirect = out.display().to_string().replace('\\', "/");
         let shell = IocShell::new(Arc::new(PvDatabase::new()), BlockingBridge::capture());
         shell.register(drv_love_config_command());
         for (model, printed) in [
@@ -250,7 +252,7 @@ mod tests {
                 b"drvLoveConfig(\"loveCfgL0\", 1, \"",
                 model,
                 b"\") > ",
-                out.as_os_str().as_encoded_bytes(),
+                redirect.as_bytes(),
             ]
             .concat();
             shell.execute_line(line).unwrap();
