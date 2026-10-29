@@ -24,8 +24,9 @@ dependencies = [
 
 [[package]]
 name = "ad-core-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ff7362024c16cc64bd81abf155c3087e3f168b24b55b1320157435453526bbc"
 dependencies = [
  "asyn-rs",
  "bytemuck",
@@ -104,8 +105,9 @@ dependencies = [
 
 [[package]]
 name = "ad-plugins-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e26fe06a8596a6750c61ba5eb89e0b98629bc2eed7ad451c80ad881a0c13cabc"
 dependencies = [
  "ad-core-rs",
  "asyn-rs",
@@ -452,8 +454,9 @@ dependencies = [
 
 [[package]]
 name = "asyn-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "700b41115d3980bbd68b092bbb866c8f73f525f577e7edd6f95fc5eb18f66056"
 dependencies = [
  "bitflags 2.11.1",
  "chrono",
@@ -813,7 +816,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 [[package]]
 name = "cfloat-gate"
 version = "0.0.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=309d984d0cffc403762560be407a698d8368a7f0#309d984d0cffc403762560be407a698d8368a7f0"
+source = "git+https://github.com/epics-rs/epics-rs?rev=32cf8af4ac185d3cdeaad6f531b5e8442ed63907#32cf8af4ac185d3cdeaad6f531b5e8442ed63907"
 dependencies = [
  "source-guard",
 ]
@@ -1357,8 +1360,9 @@ dependencies = [
 
 [[package]]
 name = "epics-base-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6173afb3032f72626d24c801fd9966e35f12b3a845ba8bbdad775ada53ad7a20"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1383,8 +1387,9 @@ dependencies = [
 
 [[package]]
 name = "epics-bridge-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89bf486dcb7d03e19b2b434df688d4f1035f58c6b231fcec8c97b0454b701efa"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1407,8 +1412,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "304b9dc2ecb05715110e6d9cd53c3f8eb1dc7a157d4d3e2d8d6d5f5ea9bf0687"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1431,8 +1437,9 @@ dependencies = [
 
 [[package]]
 name = "epics-libcom-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c4f520a089eab40e9b1069ea88fdb1b2295d72f324150a7f5b88c36a0e356d2"
 dependencies = [
  "chrono",
  "hostname",
@@ -1447,8 +1454,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "152ef7e79aca6232c856a04606d8edc93560837d5901ae6515bd634c869e1058"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1458,8 +1466,9 @@ dependencies = [
 
 [[package]]
 name = "epics-modbus-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b10597324aa6a8598c9deb28a53ae4a2b2a7dea72913d0e12fcbdc0e405f8f5"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -1470,8 +1479,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32d7399fee9336f3022fed8f472aedba8efc187221453237bbd227b4966393d3"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1509,8 +1519,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ad7708b5d7902fafb397318cfaf62215cccc94a745e39ef560e34e85f4f42a"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -1525,8 +1536,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rtems-boot"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e8b36c0a0e4b8f05859571fc9384b034d2978d3e0f65e0da8141e2f95955c3b"
 dependencies = [
  "cc",
  "libc",
@@ -1534,8 +1546,9 @@ dependencies = [
 
 [[package]]
 name = "epics-seq-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "201a40c9258483488793471e7fc257f97a7b260c7951ca91ccbc378b13ff72ec"
 dependencies = [
  "chrono",
  "epics-base-rs",
@@ -1545,8 +1558,9 @@ dependencies = [
 
 [[package]]
 name = "epics-stream-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a20cfe449bca3d34f130569e3d8ef2679e4e6dec78e1f4b5cbe7d2bbdc3848e2"
 dependencies = [
  "asyn-rs",
  "chrono",
@@ -2586,8 +2600,9 @@ dependencies = [
 
 [[package]]
 name = "mca-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6d847edadb3b72dd7277a97634172c3548f459bb6197cd54eb9b5a1b394d384"
 dependencies = [
  "chrono",
  "epics-base-rs",
@@ -2989,8 +3004,9 @@ dependencies = [
 
 [[package]]
 name = "motor-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce85a5cc817d0e0ea004e5a911472afe36dd2e1d71cdb1a07d717defe1eb6350"
 dependencies = [
  "asyn-rs",
  "bitflags 2.11.1",
@@ -4120,8 +4136,9 @@ dependencies = [
 
 [[package]]
 name = "scaler-rs"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/_tgt/fixiocs/rs-rel033?rev=ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759#ed7b3a4104cae619c4fa61ac0d6fc6bb2496a759"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d97041547e3f1a15c8afdd27a818fc3bb93d42bb0077184f54a551cb23f769c"
 dependencies = [
  "epics-base-rs",
  "tokio",
@@ -4401,8 +4418,8 @@ dependencies = [
 
 [[package]]
 name = "source-guard"
-version = "0.32.0"
-source = "git+file:///home/stevek/work/epics-rs?rev=309d984d0cffc403762560be407a698d8368a7f0#309d984d0cffc403762560be407a698d8368a7f0"
+version = "0.33.0"
+source = "git+https://github.com/epics-rs/epics-rs?rev=32cf8af4ac185d3cdeaad6f531b5e8442ed63907#32cf8af4ac185d3cdeaad6f531b5e8442ed63907"
 
 [[package]]
 name = "specs-analyser-ioc"
