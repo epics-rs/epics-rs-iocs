@@ -384,16 +384,20 @@ impl SpiiPlusComm {
                 data.len()
             )));
         }
-        let (dimensions, missing) = self.global_var_check(var, span).inspect_err(|_| {
+        // C returns asynError, not the exchange's status, when either fails
+        // (SPiiPlusCommDriver.cpp:857-869).
+        let (dimensions, missing) = self.global_var_check(var, span).map_err(|_| {
             self.print(format_args!(
                 "SPiiPlusComm:putDoubleArray: Global variable exists but isn't large enough: {var}\n"
-            ))
+            ));
+            comm_error(format!("{var}: globalVarCheck failed"))
         })?;
         if missing {
-            self.create_global_real_var(var, span).inspect_err(|_| {
+            self.create_global_real_var(var, span).map_err(|_| {
                 self.print(format_args!(
                     "SPiiPlusComm:putDoubleArray: Failed to create gobal variable: {var}\n"
-                ))
+                ));
+                comm_error(format!("{var}: createGlobalRealVar failed"))
             })?;
         }
         let (mut span, mut slice, mut sent, mut offset) = (span, 0, 0, 0);
@@ -744,6 +748,11 @@ mod tests {
             comm.write_read_ack("ENABLE 9").unwrap_err(),
             AsynStatus::Error,
         );
+        assert_bare(
+            comm.write_read_int("ENABLE 9").unwrap_err(),
+            AsynStatus::Error,
+        );
+        assert_bare(comm.write_read_ack("?Z").unwrap_err(), AsynStatus::Error);
         let _ = take(&path);
 
         let line = crate::fake::line("acsBareBin");
@@ -762,7 +771,7 @@ mod tests {
         );
         assert_bare(
             comm.put_double_array(&[1.0], "V", span).unwrap_err(),
-            AsynStatus::Disconnected,
+            AsynStatus::Error,
         );
     }
 
