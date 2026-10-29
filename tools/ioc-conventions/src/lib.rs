@@ -89,8 +89,10 @@ pub fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 /// The directory of every package in the resolved dependency graph.
 pub fn package_dirs(root: &Path) -> HashMap<String, PathBuf> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    // Not --offline: metadata reads the manifest of every platform's
+    // packages, and a build fetches only the host's.
     let out = std::process::Command::new(cargo)
-        .args(["metadata", "--format-version", "1", "--offline"])
+        .args(["metadata", "--format-version", "1"])
         .current_dir(root)
         .output()
         .expect("cargo metadata runs");
