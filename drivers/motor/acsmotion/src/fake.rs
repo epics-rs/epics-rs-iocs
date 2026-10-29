@@ -26,6 +26,8 @@ pub struct Controller {
     /// Every command, a binary one as `BIN ??var(..)(..)` or
     /// `BIN >>var(..)(..)`.
     pub sent: Vec<String>,
+    /// The link is down: the transport refuses a connect and every write.
+    pub down: bool,
 }
 
 impl Controller {
@@ -149,8 +151,29 @@ impl PortDriver for Line {
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
     }
+    fn connect(&mut self, _: &AsynUser) -> AsynResult<()> {
+        if self.controller.lock().unwrap().down {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "link down".into(),
+            });
+        }
+        self.base.set_connected(true);
+        Ok(())
+    }
+    fn disconnect(&mut self, _: &AsynUser) -> AsynResult<()> {
+        self.base.set_connected(false);
+        Ok(())
+    }
     fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let mut ctrl = self.controller.lock().unwrap();
+        if ctrl.down {
+            self.base.set_connected(false);
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "link down".into(),
+            });
+        }
         self.reply = if data.first() == Some(&FRAME_START) {
             ctrl.binary(data)
         } else {
@@ -187,7 +210,10 @@ pub fn line(name: &str) -> Arc<Mutex<Controller>> {
         base: PortDriverBase::new(
             name,
             1,
-            PortFlags::default(),
+            PortFlags {
+                can_block: true,
+                ..PortFlags::default()
+            },
             InterfaceMask::OCTET_TRANSPORT,
             InterfaceMask::OCTET,
         ),

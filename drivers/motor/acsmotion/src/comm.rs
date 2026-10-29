@@ -3,13 +3,14 @@
 //! registers for it.
 //!
 //! An ASCII reply starting with `?` is an error number; the comm asks the
-//! controller for its text (`??<errno>`) and prints it. A binary exchange
-//! holds the octet port for its flush, write and reads, and suppresses the
-//! EOS for those calls only. C instead clears the port's EOS and restores
-//! `\r` under the lock of its own asyn port, which the controller's and the
-//! aux driver's comms do not share, so their exchanges on one octet port
-//! interleave.
+//! controller for its text (`??<errno>`) and prints it. Like C's comm
+//! `lock()`, a mutex around the octet handle serialises the comm's
+//! exchanges: a binary one clears the EOS, flushes, writes, reads and
+//! restores the EOS without another exchange landing between. The
+//! controller's and the aux driver's comms are separate and do not share
+//! it, so their exchanges on one octet port interleave.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
@@ -17,13 +18,10 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::InterfaceMask;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
-use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
-use epics_rs::asyn::request::{OctetReadOp, PortCalls, RequestOp};
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
 use motor_common::DEFAULT_CONTROLLER_TIMEOUT;
@@ -47,7 +45,9 @@ const READ_BUF: usize = 256;
 
 /// One controller's comm: C `SPiiPlusComm`.
 pub struct SpiiPlusComm {
-    io: SyncIOHandle,
+    /// C's comm `lock()`: held across one ASCII exchange or a whole binary
+    /// one, so no other exchange lands between a binary write and its read.
+    io: Mutex<SyncIOHandle>,
     /// The comm's own asyn port, which C's messages are printed under.
     port: String,
 }
@@ -72,9 +72,13 @@ impl SpiiPlusComm {
             format!("SPiiPlusComm::SPiiPlusComm: cannot connect to SPii+ controller: {e}")
         })?;
         Ok(Self {
-            io,
+            io: Mutex::new(io),
             port: comm_port.to_string(),
         })
+    }
+
+    fn io(&self) -> std::sync::MutexGuard<'_, SyncIOHandle> {
+        self.io.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn print(&self, args: std::fmt::Arguments<'_>) {
@@ -95,7 +99,10 @@ impl SpiiPlusComm {
             TraceMask::IO_DRIVER,
             format_args!("SPiiPlusComm:{func}: output = {cmd}\n"),
         );
-        let (raw, status) = self.io.write_read(0, cmd.as_bytes(), READ_BUF).into_parts();
+        let (raw, status) = self
+            .io()
+            .write_read(0, cmd.as_bytes(), READ_BUF)
+            .into_parts();
         let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         let reply = String::from_utf8_lossy(&raw[..end]).into_owned();
         let code = status.as_ref().err().map_or(0, AsynError::c_status_code);
@@ -204,18 +211,31 @@ impl SpiiPlusComm {
         Ok(!reply.starts_with('?'))
     }
 
+    /// The EOS-free exchange of `writeReadBinary` and `writeReadAckBinary`
+    /// under the comm lock: clear both EOS, flush, run `f`, restore them.
+    /// Every step goes through SyncIO as C's does, and the statuses of all
+    /// but `f`'s are ignored, as C ignores them.
+    fn binary_session<R>(&self, f: impl FnOnce(&SyncIOHandle) -> R) -> R {
+        let io = self.io();
+        let _ = io.set_input_eos(0, b"");
+        let _ = io.set_output_eos(0, b"");
+        let _ = io.flush(0);
+        let out = f(&io);
+        let _ = io.set_input_eos(0, INPUT_EOS);
+        let _ = io.set_output_eos(0, OUTPUT_EOS);
+        out
+    }
+
     /// `writeReadBinary`: send a query frame, read its `in_bytes` reply,
     /// and return the data with whether another slice is waiting.
     fn write_read_binary(&self, frame: Vec<u8>, in_bytes: usize) -> AsynResult<(Vec<u8>, bool)> {
-        let port = self.port()?;
-        let (reply, status) = port.lock_port_blocking(user(CMD_TIMEOUT), move |calls| {
-            calls.call(&RequestOp::Flush, user(CMD_TIMEOUT))?;
-            calls.call(
-                &RequestOp::OctetWriteBinary { data: frame },
-                user(CMD_TIMEOUT),
-            )?;
-            Ok::<_, AsynError>(read(calls, in_bytes, ARRAY_TIMEOUT))
-        })??;
+        let (reply, status) = self.binary_session(|io| {
+            // C ignores the write's status; a failed write reads as a timeout.
+            let _ = io.with_timeout(CMD_TIMEOUT).write_octet(0, &frame);
+            io.with_timeout(ARRAY_TIMEOUT)
+                .read_octet(0, in_bytes)
+                .into_parts()
+        });
         let errno = self.binary_error_check(&reply);
         if errno != 0 {
             self.print(format_args!(
@@ -247,22 +267,18 @@ impl SpiiPlusComm {
     /// controller answers [`ACKNOWLEDGE`] and the command id, or an error.
     fn write_read_ack_binary(&self, frame: Vec<u8>) -> AsynResult<()> {
         let id = frame[1];
-        let port = self.port()?;
-        let (reply, status) = port.lock_port_blocking(user(ARRAY_TIMEOUT), move |calls| {
-            calls.call(&RequestOp::Flush, user(ARRAY_TIMEOUT))?;
-            calls.call(
-                &RequestOp::OctetWriteBinary { data: frame },
-                user(ARRAY_TIMEOUT),
-            )?;
-            let (mut reply, status) = read(calls, 2, ACK_TIMEOUT);
+        let (reply, status) = self.binary_session(|io| {
+            let _ = io.with_timeout(ARRAY_TIMEOUT).write_octet(0, &frame);
+            let io = io.with_timeout(ACK_TIMEOUT);
+            let (mut reply, status) = io.read_octet(0, 2).into_parts();
             if status.is_err() || reply.first() == Some(&ACKNOWLEDGE) {
-                return Ok::<_, AsynError>((reply, status));
+                return (reply, status);
             }
             // An error is longer than the two bytes read so far.
-            let (rest, status) = read(calls, MAX_MESSAGE_LEN, ACK_TIMEOUT);
+            let (rest, status) = io.read_octet(0, MAX_MESSAGE_LEN).into_parts();
             reply.extend(rest);
-            Ok((reply, status))
-        })??;
+            (reply, status)
+        });
         if reply.first() != Some(&ACKNOWLEDGE) {
             let errno = self.binary_error_check(&reply);
             if errno != 0 {
@@ -304,10 +320,6 @@ impl SpiiPlusComm {
             ));
         }
         errno.unwrap_or(0)
-    }
-
-    fn port(&self) -> AsynResult<&PortHandle> {
-        self.io.port()
     }
 
     /// `getDoubleArray`: `var` over `span`, slice by slice.
@@ -460,17 +472,6 @@ fn binary_error_number(reply: &[u8]) -> Option<i32> {
     Some(atoi(digits))
 }
 
-fn user(timeout: Duration) -> AsynUser {
-    AsynUser::new(0).with_addr(0).with_timeout(timeout)
-}
-
-/// An EOS-free read of `n` bytes: what arrived, and the read's status.
-fn read(calls: &mut dyn PortCalls, n: usize, timeout: Duration) -> (Vec<u8>, AsynResult<()>) {
-    calls
-        .octet_read(OctetReadOp::ReadBinary { buf_size: n }, user(timeout))
-        .into_parts()
-}
-
 fn comm_error(message: String) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -544,7 +545,7 @@ mod tests {
         trace.set_trace_info_mask(Some(port), TraceInfoMask::empty());
         trace.set_trace_file(Some(port), TraceFile::File(file));
         let comm = SpiiPlusComm {
-            io,
+            io: Mutex::new(io),
             port: port.into(),
         };
         (comm, path)
@@ -660,6 +661,45 @@ mod tests {
              SPiiPlusComm:writeReadErrorMessage: status = 3\n\
              SPiiPlusComm:writeReadErrorMessage: ERROR #1021: \n"
         );
+    }
+
+    /// SPiiPlusCommDriver.cpp:362-371, 391: the binary exchanges go through
+    /// pasynOctetSyncIO, whose queueLockPort refuses a disconnected port
+    /// with asynDisconnected (4), not the transport's own error (3).
+    #[test]
+    fn binary_exchanges_on_a_disconnected_port_answer_status_4() {
+        let line = crate::fake::line("acsBinDown");
+        line.lock().unwrap().set("V", &[1.0]);
+        let comm = SpiiPlusComm::connect("acsBinDownComm", "acsBinDown").unwrap();
+        comm.get_double_array("V", Span::one(0, 0)).unwrap();
+        line.lock().unwrap().down = true;
+        comm.io().port().unwrap().disconnect_blocking().unwrap();
+        let read = comm.get_double_array("V", Span::one(0, 0)).unwrap_err();
+        assert_eq!(read.c_status_code(), 4, "{read}");
+        let write = comm.write_read_ack_binary(vec![0xE3, 1, 0, 0]).unwrap_err();
+        assert_eq!(write.c_status_code(), 4, "{write}");
+    }
+
+    /// SPiiPlusCommDriver.cpp:352, 431: the comm lock is held from the
+    /// binary write to its read, so an ASCII exchange waits for it.
+    #[test]
+    fn an_ascii_exchange_waits_for_a_binary_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let line = crate::fake::line("acsBinLock");
+        line.lock().unwrap().set("V", &[1.0]);
+        let comm = SpiiPlusComm::connect("acsBinLockComm", "acsBinLock").unwrap();
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            comm.binary_session(|_| {
+                scope.spawn(|| {
+                    let _ = comm.write_read_int("?X");
+                    done.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(!done.load(Ordering::SeqCst), "ASCII ran mid-session");
+            });
+        });
+        assert!(done.load(Ordering::SeqCst));
     }
 
     #[test]
