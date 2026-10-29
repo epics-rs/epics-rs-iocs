@@ -40,7 +40,7 @@ use std::process::{Command, Stdio};
 
 use epics_rs::base::runtime::mac_lib::macro_defn_pairs_bytes;
 use epics_rs::base::server::db_loader::{
-    parse_db_file, parse_substitutions, DbLoadConfig, MacroDefs, SubstitutionEvent,
+    db_path, parse_db_file, parse_substitutions, DbLoadConfig, MacroDefs, SubstitutionEvent,
 };
 
 /// envPaths macros the framework sets, and where each points in the crate
@@ -287,13 +287,11 @@ pub fn args(line: &str) -> Vec<String> {
     out
 }
 
-/// `EPICS_DB_INCLUDE_PATH`, or `.`, as directories under `cwd`.
+/// `EPICS_DB_INCLUDE_PATH`, or `.`, as directories under `cwd`, split as
+/// the IOC splits it: on `;` on Windows, where `:` is a drive's.
 fn include_path(cwd: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> {
     let search = env.get("EPICS_DB_INCLUDE_PATH").map_or(".", String::as_str);
-    search
-        .split(':')
-        .map(|d| cwd.join(if d.is_empty() { "." } else { d }))
-        .collect()
+    db_path(search).into_iter().map(|d| cwd.join(d)).collect()
 }
 
 /// `dbOpenFile`: a name with a `/` opens as is, from the IOC's directory;

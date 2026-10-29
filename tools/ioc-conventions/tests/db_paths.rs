@@ -10,6 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use epics_rs::base::server::db_loader::PATH_LIST_SEPARATOR;
+
 use ioc_conventions::{
     check_includes, expand, framework_env, ioc_env, open_db, package_dirs, set_default_calls, walk,
     workspace_root, Run,
@@ -91,7 +93,10 @@ fn a_bare_name_opens_through_the_include_path_only() {
     std::fs::write(dir.join("db/a.template"), "include \"b.template\"\n").unwrap();
     let mut env = HashMap::new();
     assert_eq!(open_db("a.template", &dir, &env), None);
-    env.insert("EPICS_DB_INCLUDE_PATH".to_string(), "x:db".to_string());
+    env.insert(
+        "EPICS_DB_INCLUDE_PATH".to_string(),
+        format!("x{PATH_LIST_SEPARATOR}db"),
+    );
     let found = open_db("a.template", &dir, &env).expect("found along the path");
     let mut missing = Vec::new();
     check_includes(&found, &dir, &env, &mut HashSet::new(), &mut missing);
