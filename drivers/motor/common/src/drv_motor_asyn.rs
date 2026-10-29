@@ -25,6 +25,7 @@ use epics_rs::motor::device_support::StatusPoster;
 use epics_rs::motor::flags::MstaFlags;
 use epics_rs::motor::poll_loop::PollCommand;
 
+use crate::controller_status;
 use crate::param_lib::Params;
 
 /// `motorAxisParam_t` (motor_interface.h:301-333): the functions a driver's
@@ -540,7 +541,9 @@ impl PortDriver for DrvMotorAsyn {
                 temp as i32
             ),
         );
-        status
+        // A drvset call returns a bare status: C passes it no asynUser to
+        // put a message on.
+        status.map_err(controller_status)
     }
 
     /// C `writeInt32` (drvMotorAsyn.c:576-629).
@@ -575,7 +578,7 @@ impl PortDriver for DrvMotorAsyn {
             line!(),
             format_args!("drvMotorAsyn::writeInt32, reason={command}, value={value}\n"),
         );
-        status
+        status.map_err(controller_status)
     }
 
     /// C `writeFloat64` (drvMotorAsyn.c:674-752).
@@ -628,6 +631,6 @@ impl PortDriver for DrvMotorAsyn {
                 CFloat(value)
             ),
         );
-        status
+        status.map_err(controller_status)
     }
 }

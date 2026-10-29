@@ -22,6 +22,7 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use motor_common::controller_status;
 
 /// C `MODBUS_DATA_STRING` — the modbus-rs param every register read/write
 /// resolves through.
@@ -67,19 +68,25 @@ impl ModbusRegs {
 
     /// Read one register (C `readReg16` / `pasynInt32SyncIO->read`).
     pub fn read16(&self, addr: i32) -> AsynResult<i32> {
-        self.reg(addr)?.read_int32(self.data_reason)
+        self.reg(addr)
+            .and_then(|reg| reg.read_int32(self.data_reason))
+            .map_err(controller_status)
     }
 
     /// Write one register (C `writeReg16` / `pasynInt32SyncIO->write`).
     pub fn write16(&self, addr: i32, value: i32) -> AsynResult<()> {
-        self.reg(addr)?.write_int32(self.data_reason, value)
+        self.reg(addr)
+            .and_then(|reg| reg.write_int32(self.data_reason, value))
+            .map_err(controller_status)
     }
 
     /// Write an array of registers atomically (C `writeReg32Array` /
     /// `pasynInt32ArraySyncIO->write`); the port must be configured with a
     /// write-multiple-registers Modbus function.
     pub fn write_array(&self, addr: i32, data: Vec<i32>) -> AsynResult<()> {
-        self.reg(addr)?.write_int32_array(self.data_reason, &data)
+        self.reg(addr)
+            .and_then(|reg| reg.write_int32_array(self.data_reason, &data))
+            .map_err(controller_status)
     }
 }
 
@@ -303,6 +310,7 @@ pub(crate) mod fake {
 mod tests {
     use super::*;
     use epics_rs::asyn::asyn_record::get_port;
+    use epics_rs::asyn::error::AsynStatus;
 
     #[test]
     fn a_force_read_writes_modbus_read_at_its_address() {
@@ -312,6 +320,24 @@ mod tests {
         assert_eq!(fr.reason(), reason);
         fr.write().unwrap();
         assert_eq!(*taken.lock().unwrap(), [(reason, 0)]);
+    }
+
+    /// ANG1Driver.cpp and ANF2Driver.cpp return the register transfer's bare
+    /// status; the SyncIO errorMessage stays on the controller's asynUser.
+    #[test]
+    fn a_refused_register_transfer_carries_no_message() {
+        use motor_common::testing::assert_bare;
+        let name = "amciRefusedRegs";
+        fake::publish(name);
+        fake::set_read(name, 7, None);
+        fake::refuse(name, &[1, 2]);
+        let (regs, status) = ModbusRegs::connect(name, Duration::from_secs(1));
+        status.unwrap();
+        assert_bare(regs.read16(7).unwrap_err(), AsynStatus::Error);
+        assert_bare(
+            regs.write_array(3, vec![1, 2]).unwrap_err(),
+            AsynStatus::Error,
+        );
     }
 
     /// ANF2Driver.cpp:271, :282, ANG1Driver.cpp:204, :547: register reads

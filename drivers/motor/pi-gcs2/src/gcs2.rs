@@ -124,7 +124,7 @@ use epics_rs::motor::controller_port::{
 };
 use epics_rs::motor::flags::{DriverCall, MotorCommand};
 use motor_common::util::{atof, atoi, nint, strtol};
-use motor_common::{ControllerParams, ControllerReport};
+use motor_common::{ControllerParams, ControllerReport, controller_status};
 
 /// Response buffer size for a single reply line.
 const READ_BUF: usize = 256;
@@ -798,7 +798,7 @@ impl PIGCS2Controller {
                 e.status() as i32
             ),
         );
-        Err(e)
+        Err(controller_status(e))
     }
 
     /// Write a command and read one reply line (C `sendAndReceive`),
@@ -833,7 +833,7 @@ impl PIGCS2Controller {
             self.trace(IO_ERROR, format_args!(
                 "PIGCSController:sendAndReceive error calling write, output={cmd} status={status}, error={message}\n"
             ));
-            pigcs2_err(message)
+            controller_status(pigcs2_err(message))
         };
         match self.handle.write_octet(0, cmd.as_bytes()) {
             Ok(n) if n == cmd.len() => {}
@@ -866,7 +866,7 @@ impl PIGCS2Controller {
             status = append_read(&mut reply, self.handle.read_octet(0, READ_BUF).into_parts());
         }
         self.trace_received(&reply);
-        (reply, status)
+        (reply, status.map_err(controller_status))
     }
 
     /// [`Self::send_and_receive_buffer`]'s reply, or its error.
@@ -1155,7 +1155,7 @@ impl PIGCS2Controller {
                 e.status() as i32
             ),
         );
-        Err(e)
+        Err(controller_status(e))
     }
 
     /// `PIHexapodController::haltAxis`: byte 24 + `ERR? == PI_CNTR_STOP`.
@@ -1425,7 +1425,7 @@ impl PIGCS2Controller {
             status = append_read(&mut reply, write_read());
         }
         self.trace_received(&reply);
-        status.map(|()| reply)
+        status.map(|()| reply).map_err(controller_status)
     }
 
     /// [`Self::send_and_receive_char`]'s reply line.
@@ -2756,6 +2756,22 @@ mod tests {
             "gcs2CtorCallback",
         );
         assert!(axis.constructor_calls_param_callbacks());
+    }
+
+    /// PIInterface.cpp's sendOnly and sendAndReceive return the bare status;
+    /// the SyncIO errorMessage stays on the controller's asynUser.
+    #[test]
+    fn a_refused_controller_exchange_carries_no_message() {
+        use motor_common::testing::{LineRig, assert_bare};
+        let (_line, io) = LineRig::failing("gcs2RefusedIo", |_| "0".into(), |_| true);
+        let ctrl = PIGCS2Controller::new(io, "gcs2RefusedIo");
+        assert_bare(ctrl.send_only("MOV 1 0").unwrap_err(), AsynStatus::Error);
+        assert_bare(ctrl.query("POS? 1").unwrap_err(), AsynStatus::Error);
+        assert_bare(ctrl.send_only_char(24).unwrap_err(), AsynStatus::Error);
+        assert_bare(
+            ctrl.send_and_receive_char(5).unwrap_err(),
+            AsynStatus::Error,
+        );
     }
 
     /// The controller poll, its sets applied as the poller does.

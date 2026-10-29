@@ -37,6 +37,7 @@ use epics_rs::motor::controller_port::{
     WriteOutcome, WriteValue, has_motor_axis, index,
 };
 use epics_rs::motor::trace::MotorTrace;
+use motor_common::controller_status;
 
 use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, UNDEFINE_ALL, fast_deferred_command};
 use crate::protocol::{HARDWARE_PROB, InitialStatus, parse_feedrate, parse_global_status};
@@ -265,7 +266,9 @@ impl PmacController {
         let Some(handle) = self.handle.as_ref() else {
             return (
                 Vec::new(),
-                Err(pmac_err("no low level asynOctetSyncIO port")),
+                Err(controller_status(pmac_err(
+                    "no low level asynOctetSyncIO port",
+                ))),
             );
         };
         self.low.print(
@@ -308,7 +311,7 @@ impl PmacController {
             0,
             format_args!("{FUNCTION}: response: {response}\n"),
         );
-        (raw, status)
+        (raw, status.map_err(controller_status))
     }
 
     /// Send a command whose reply carries no value (moves, jogs, set-position).
@@ -1049,6 +1052,19 @@ mod tests {
         port.write_float64_blocking(index::VELOCITY, 0, 2.5)
             .unwrap();
         assert_eq!(comms(), PMAC_OK);
+    }
+
+    /// pmacController.cpp:308-351: lowLevelWriteRead returns the bare
+    /// status; the SyncIO errorMessage stays on lowLevelPortUser_.
+    #[test]
+    fn a_refused_controller_exchange_carries_no_message() {
+        use motor_common::testing::{LineRig, assert_bare};
+        let (_rig, handle) = LineRig::failing("pmacRefusedIo", |_| "\x06".into(), |_| true);
+        let c = PmacController::new("pmacRefusedCtl", "pmacRefusedIo", 0, Some(handle));
+        assert_bare(c.command("#1J/").unwrap_err(), AsynStatus::Error);
+        assert_bare(c.reply("I100").unwrap_err(), AsynStatus::Error);
+        let c = PmacController::new("pmacNoLowLevel", "", 0, None);
+        assert_bare(c.command("#1J/").unwrap_err(), AsynStatus::Error);
     }
 
     /// pmacController.cpp:859-871: releasing a fast deferral with no axis

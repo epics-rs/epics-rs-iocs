@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -15,7 +16,7 @@ use epics_rs::asyn::trace::{TraceFile, TraceMask};
 use epics_rs::base::runtime::task::{BlockingBridge, sleep};
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::iocsh::registry::{ArgValue, CommandContext};
-use motor_common::testing::LineRig;
+use motor_common::testing::{LineRig, assert_bare};
 
 /// An idle channel 0 with a sensor, calibrated (`0x60`), positioner type
 /// 300, MCLF 5000 and hold time 60.
@@ -142,6 +143,19 @@ async fn a_channel_parameter_write_is_sent_and_stored_as_c() {
         assert!(sent.contains(&want), "{want}: {sent:?}");
     }
     assert_eq!(stored, 301);
+}
+
+/// smarActMCS2MotorDriver.cpp:228-231: a refused `MCLF:CURR` is
+/// writeController's bare status, so the record prints no message.
+#[epics_rs::base::epics_test]
+async fn a_refused_channel_parameter_write_carries_no_message() {
+    let refused = |cmd: &str| cmd.trim_end() == ":CHAN0:MCLF:CURR 4000";
+    let (refusal, _) = on_mcs2_with("mcs2RefusedMclf", [1, 100, 100, 0], refused, |port| {
+        port.write_int32_blocking(reason(&port, "MCLF"), 0, 4000)
+            .unwrap_err()
+    })
+    .await;
+    assert_bare(refusal, AsynStatus::Error);
 }
 
 #[epics_rs::base::epics_test]

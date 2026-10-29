@@ -62,7 +62,7 @@ use epics_rs::motor::controller_port::{
 use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::{atoi, atol};
-use motor_common::{ControllerParams, ControllerReport};
+use motor_common::{ControllerParams, ControllerReport, controller_status};
 
 use crate::poller::PollShared;
 
@@ -613,7 +613,7 @@ impl OmsController {
                 e.status() as i32
             ),
         );
-        Err(e)
+        Err(controller_status(e))
     }
 
     /// Send a command and read one reply, skipping any notification lines and
@@ -627,7 +627,7 @@ impl OmsController {
     /// leaves the bytes it got there, and C callers that ignore the status
     /// read them.
     pub fn send_receive_buffer(&self, cmd: &str) -> (String, AsynResult<()>) {
-        let failed = |raw: Vec<u8>, e: AsynError| (trim_reply(&raw), Err(e));
+        let failed = |raw: Vec<u8>, e: AsynError| (trim_reply(&raw), Err(controller_status(e)));
         let mut raw = match self
             .handle
             .write_read(0, cmd.as_bytes(), READ_BUF)
@@ -651,7 +651,9 @@ impl OmsController {
         }
         (
             String::new(),
-            Err(oms_err("oms: only notification lines received")),
+            Err(controller_status(oms_err(
+                "oms: only notification lines received",
+            ))),
         )
     }
 
@@ -1503,6 +1505,23 @@ mod tests {
         .unwrap();
         let controller = OmsController::new(io, "omsAxisCount", "omsAxisCount", "MAXnet");
         assert_eq!(controller.axis_count(), 3);
+    }
+
+    /// omsBaseController.cpp's sendOnly and sendReceive return the bare
+    /// status; the SyncIO errorMessage stays on the controller's asynUser.
+    #[test]
+    fn a_refused_controller_exchange_carries_no_message() {
+        use motor_common::testing::{LineRig, assert_bare};
+        let (_rig, io) = LineRig::failing("omsRefusedIo", |_| "0".into(), |_| true);
+        let controller = OmsController::new(io, "omsRefused", "omsRefusedIo", "MAXnet");
+        assert_bare(
+            controller.send_only("AA ST;").unwrap_err(),
+            AsynStatus::Error,
+        );
+        assert_bare(
+            controller.send_receive("AA RP;").unwrap_err(),
+            AsynStatus::Error,
+        );
     }
 
     /// A line that refuses every write; records what was offered.

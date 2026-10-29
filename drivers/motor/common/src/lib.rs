@@ -38,6 +38,7 @@ pub mod util;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, PortSets};
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::driver_support::{DriverSupport, register_driver_support};
@@ -58,6 +59,14 @@ pub use epics_rs::motor::trace::TraceUser;
 /// asynMotorController's `DEFAULT_CONTROLLER_TIMEOUT` (asynMotorController.h:16):
 /// what `writeController`, `writeReadController` and `readController` pass.
 pub const DEFAULT_CONTROLLER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What C `writeController`, `readController` and `writeReadController`
+/// (asynMotorController.cpp:756-820) and every driver's own controller I/O
+/// return: the bare asynStatus. The SyncIO `errorMessage` stays on the
+/// controller's asynUser, so a record whose write fails on it prints none.
+pub fn controller_status(e: AsynError) -> AsynError {
+    AsynError::from_c_status_code(e.c_status_code(), String::new()).unwrap_or(e)
+}
 
 /// Create C `asynMotorController` port `port` with axes `0..num_axes` for a
 /// driver with no parameters of its own, gated on the IOC's interruptAccept.
@@ -373,7 +382,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
-    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::error::{AsynResult, AsynStatus};
     use epics_rs::asyn::interfaces::motor::{MotorStatus, PollFailure};
     use epics_rs::asyn::user::AsynUser;
     use epics_rs::base::runtime::task::BlockingBridge;
@@ -560,6 +569,22 @@ mod tests {
         let text = port.report_blocking(1).unwrap();
         let want = "driver reportHooks numAxes=2\n  axis 0\n  axis 1\n";
         assert!(text.contains(want), "{text}");
+    }
+
+    /// parker-ioc:acr's refused Jerk write, whose record C prints with no
+    /// message.
+    #[test]
+    fn controller_status_keeps_the_status_alone() {
+        let refused = AsynError::QueueRefused {
+            status: AsynStatus::Disconnected,
+            message: "asynManager::queueLockPort queueRequest failed: port ARIES0 not connected"
+                .into(),
+        };
+        let bare = controller_status(refused);
+        assert_eq!(
+            (bare.status(), bare.message(), bare.never_ran()),
+            (AsynStatus::Disconnected, String::new(), false)
+        );
     }
 }
 

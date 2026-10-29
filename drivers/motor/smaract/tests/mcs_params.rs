@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -16,7 +17,7 @@ use epics_rs::base::runtime::task::{BlockingBridge, sleep};
 use epics_rs::base::server::database::PvDatabase;
 use epics_rs::base::server::iocsh::registry::{ArgValue, CommandContext};
 use epics_rs::motor::controller_port::index;
-use motor_common::testing::LineRig;
+use motor_common::testing::{LineRig, assert_bare};
 
 /// An idle linear channel 0 with sensor type 300; `:SST0,999` is refused.
 fn mcs_reply(cmd: &str) -> String {
@@ -281,4 +282,16 @@ async fn a_refused_move_raises_comms_error() {
     .await;
     assert!(refused.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(raised, Some(1));
+}
+
+/// smarActMCSMotorDriver.cpp:124-130, 293-298: a refused `:SST` is
+/// parseReply's bare asynError, so the record prints no message.
+#[epics_rs::base::epics_test]
+async fn a_refused_channel_parameter_write_carries_no_message() {
+    let refusal = on_mcs("mcsRefusedPtyp", |port, _| {
+        port.write_int32_blocking(reason(&port, "PTYP"), 1, 999)
+            .unwrap_err()
+    })
+    .await;
+    assert_bare(refusal, AsynStatus::Error);
 }
