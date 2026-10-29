@@ -14,7 +14,7 @@ use ad_pilatus::{PilatusRuntime, create_pilatus_detector};
 /// memory-bounded and the worker threads are plain OS threads); they are
 /// accepted and ignored so the C `st.cmd` line works unchanged.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADPILATUS", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADPILATUS", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<PilatusRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

@@ -15,7 +15,7 @@ use ad_marccd::{MarccdRuntime, create_marccd_detector};
 /// `st.cmd` line works unchanged. The sensor size is not a config argument —
 /// the driver learns it from the server via `getConfig`.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADMARCCD", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADMARCCD", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<MarccdRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

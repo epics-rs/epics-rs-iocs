@@ -12,7 +12,7 @@ use d435i::{D435iColorRuntime, D435iDepthRuntime, create_d435i_detector};
 /// a D435i detector. All records use standard asyn DTYPs handled by
 /// the universal asyn device support factory.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADD435I", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADD435I", env!("CARGO_MANIFEST_DIR"));
 
     let color_runtime: Arc<std::sync::Mutex<Option<D435iColorRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

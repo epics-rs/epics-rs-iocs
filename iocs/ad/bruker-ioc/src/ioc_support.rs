@@ -17,7 +17,7 @@ use bruker::{BrukerRuntime, create_bruker_detector};
 /// Rust pool is bounded by memory alone and the runtime schedules the port
 /// actors itself.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADBRUKER", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADBRUKER", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<BrukerRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

@@ -13,7 +13,10 @@ use quadem::iocsh::ahxxx_configure_command;
 
 /// Register the AHxxx configure command.
 pub fn register(ioc: &mut AdIoc) {
-    epics_rs::base::runtime::env::set_default("QUADEM", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    epics_rs::base::runtime::env::set_default_path(
+        "QUADEM",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
+    );
 
     let runtime: Arc<Mutex<Option<AhxxxRuntime>>> = Arc::new(Mutex::new(None));
     let cmd = ahxxx_configure_command(ioc.mgr().clone(), runtime.clone());

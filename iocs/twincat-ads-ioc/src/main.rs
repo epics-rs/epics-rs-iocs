@@ -46,7 +46,7 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("TWINCAT_ADS", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("TWINCAT_ADS", env!("CARGO_MANIFEST_DIR"));
 
     // One IOC can serve several PLCs; each port's runtime is kept alive here.
     let runtimes: Arc<Mutex<Vec<AdsRuntime>>> = Arc::new(Mutex::new(Vec::new()));

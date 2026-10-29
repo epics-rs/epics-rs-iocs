@@ -12,7 +12,7 @@ use ad_simdetector::{SimDetectorRuntime, create_sim_detector};
 /// Signature matches the C iocsh command (simDetector.cpp:1160-1196):
 ///   `simDetectorConfig(portName, maxSizeX, maxSizeY, dataType, maxBuffers, maxMemory)`
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<SimDetectorRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

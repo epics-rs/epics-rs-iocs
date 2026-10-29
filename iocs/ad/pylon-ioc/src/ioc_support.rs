@@ -9,7 +9,7 @@ use ad_pylon::{ADPylon, PylonRuntime, create_pylon};
 
 /// Register `ADPylonConfig` on an `AdIoc`.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADPYLON", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADPYLON", env!("CARGO_MANIFEST_DIR"));
 
     let runtimes: Arc<std::sync::Mutex<Vec<PylonRuntime>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));

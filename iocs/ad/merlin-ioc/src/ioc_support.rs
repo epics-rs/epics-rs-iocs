@@ -21,7 +21,7 @@ use merlin::{DetectorType, MerlinRuntime, create_merlin_detector};
 /// 10-entry argument array and reading `args[9]`, so `stackSize` was read
 /// past the end of iocsh's parsed argument buffer.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADMERLIN", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADMERLIN", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<MerlinRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

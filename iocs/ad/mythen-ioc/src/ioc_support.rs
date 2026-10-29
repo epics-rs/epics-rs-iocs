@@ -10,7 +10,7 @@ use mythen::{MythenRuntime, create_mythen_detector};
 
 /// Register the Mythen configure command on an `AdIoc`.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADMYTHEN", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADMYTHEN", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Vec<MythenRuntime>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));

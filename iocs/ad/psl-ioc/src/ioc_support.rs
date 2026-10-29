@@ -16,7 +16,7 @@ use psl::{PslRuntime, create_psl_detector};
 /// startup-script compatibility and ignored: the Rust pool is bounded by memory
 /// alone and the runtime schedules the port actors itself.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADPSL", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADPSL", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<PslRuntime>>> = Arc::new(std::sync::Mutex::new(None));
 

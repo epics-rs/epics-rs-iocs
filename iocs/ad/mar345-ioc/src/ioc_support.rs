@@ -15,7 +15,7 @@ use ad_mar345::{Mar345Runtime, create_mar345_detector};
 /// works unchanged. The sensor size is not a config argument — mar345 fixes
 /// `ADMaxSizeX`/`ADMaxSizeY` at 3450 and learns the scan size from mode changes.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADMAR345", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADMAR345", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<Mar345Runtime>>> =
         Arc::new(std::sync::Mutex::new(None));

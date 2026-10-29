@@ -14,7 +14,7 @@ use ad_specs_analyser::{SpecsAnalyserRuntime, create_specs_analyser_detector};
 /// plain OS thread with no configurable priority/stack size); they are
 /// accepted and ignored so the C `st.cmd` line works unchanged.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADSPECSANALYSER", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADSPECSANALYSER", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<SpecsAnalyserRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

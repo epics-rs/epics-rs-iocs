@@ -31,7 +31,7 @@ fn monitor_port(port: &str) -> String {
 
 /// Register the Eiger configure command on an `AdIoc`.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADEIGER", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADEIGER", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Vec<EigerRuntime>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));

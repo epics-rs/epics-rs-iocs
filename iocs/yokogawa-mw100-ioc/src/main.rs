@@ -87,7 +87,7 @@ async fn main() -> CaResult<()> {
     register_driver_support("drvMW100", registry.clone());
     let init_registry = registry.clone();
 
-    epics_rs::base::runtime::env::set_default("MW100", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("MW100", env!("CARGO_MANIFEST_DIR"));
 
     let mut app = IocApplication::new();
     app = app.register_dynamic_device_support(DEVICES, device_support::factory(registry.clone()));

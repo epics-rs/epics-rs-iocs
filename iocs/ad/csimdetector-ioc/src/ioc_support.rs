@@ -16,7 +16,7 @@ use ad_csimdetector::{CSimDetectorRuntime, MAX_SIGNALS, create_c_sim_detector};
 /// Rust simulation task runs on a `run_thread_named` worker with no equivalent
 /// knobs, so both are accepted and ignored.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADCSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADCSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<CSimDetectorRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

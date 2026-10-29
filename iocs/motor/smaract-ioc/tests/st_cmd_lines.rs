@@ -81,7 +81,7 @@ fn recorder(name: String) -> CommandDef {
 /// `$(MOTOR)`, `$(ASYN)` and `$(AUTOSAVE)`.
 async fn run(script: &str) -> Vec<Vec<String>> {
     // As main.rs sets them.
-    epics_rs::base::runtime::env::set_default("SMARACT_IOC", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("SMARACT_IOC", env!("CARGO_MANIFEST_DIR"));
     let _ = epics_rs::motor::motor_record_factory();
     let _ = epics_rs::asyn::asyn_record::asyn_record_factory();
     let _ =

@@ -11,7 +11,7 @@ use timepix3::{TimePix3Runtime, create_timepix3_detector};
 
 /// Register the TimePix3 configure command on an `AdIoc`.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADTIMEPIX", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADTIMEPIX", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Vec<TimePix3Runtime>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));

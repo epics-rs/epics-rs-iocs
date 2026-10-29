@@ -19,7 +19,7 @@ use ad_pva_driver::{PvaRuntime, create_pva_detector};
 /// same framework limitation the rest of this workspace's AD ports (e.g.
 /// ad-url) already accept.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("PVADRIVERIOC", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("PVADRIVERIOC", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<PvaRuntime>>> = Arc::new(std::sync::Mutex::new(None));
 

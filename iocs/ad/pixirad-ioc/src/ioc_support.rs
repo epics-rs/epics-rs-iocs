@@ -24,7 +24,7 @@ fn int_arg(args: &[ArgValue], index: usize, default: i32) -> i32 {
 /// are accepted for startup-script compatibility and ignored: the Rust pool is
 /// bounded by memory alone and the runtime schedules the port actors itself.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("ADPIXIRAD", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("ADPIXIRAD", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<PixiradRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

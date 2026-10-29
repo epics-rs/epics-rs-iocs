@@ -15,7 +15,7 @@ use ad_std_arrays_driver::{NdStdArraysRuntime, create_nd_std_arrays};
 /// Rust publisher task runs on a `run_thread_named` worker with no equivalent
 /// knobs, so both are accepted and ignored.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
-    epics_rs::base::runtime::env::set_default("NDDRIVERSTDARRAYS", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("NDDRIVERSTDARRAYS", env!("CARGO_MANIFEST_DIR"));
 
     let runtime: Arc<std::sync::Mutex<Option<NdStdArraysRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

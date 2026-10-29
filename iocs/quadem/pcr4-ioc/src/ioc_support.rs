@@ -11,7 +11,10 @@ use quadem::iocsh::pcr4_configure_command;
 
 /// Register the PCR4 configure command.
 pub fn register(ioc: &mut AdIoc) {
-    epics_rs::base::runtime::env::set_default("QUADEM", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    epics_rs::base::runtime::env::set_default_path(
+        "QUADEM",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
+    );
 
     let runtime: Arc<Mutex<Option<Pcr4Runtime>>> = Arc::new(Mutex::new(None));
     let cmd = pcr4_configure_command(ioc.mgr().clone(), runtime.clone());

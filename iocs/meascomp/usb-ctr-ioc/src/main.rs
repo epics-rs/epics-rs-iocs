@@ -32,7 +32,7 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default(
+    epics_rs::base::runtime::env::set_default_path(
         "MEASCOMP",
         concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
     );
@@ -43,7 +43,7 @@ async fn main() -> CaResult<()> {
     let scaler_dir = std::path::Path::new(epics_rs::scaler::SCALER_DB_DIR)
         .parent()
         .expect("SCALER_DB_DIR is <crate>/db");
-    epics_rs::base::runtime::env::set_default(
+    epics_rs::base::runtime::env::set_default_path(
         "SCALER",
         scaler_dir.to_str().expect("cargo paths are UTF-8"),
     );
@@ -53,7 +53,7 @@ async fn main() -> CaResult<()> {
     let mca_dir = std::path::Path::new(mca::MCA_DB_DIR)
         .parent()
         .expect("MCA_DB_DIR is <crate>/db");
-    epics_rs::base::runtime::env::set_default(
+    epics_rs::base::runtime::env::set_default_path(
         "MCA",
         mca_dir.to_str().expect("cargo paths are UTF-8"),
     );

@@ -73,7 +73,7 @@ async fn main() -> CaResult<()> {
     let registry = Arc::new(Registry::new());
     epics_rs::base::server::driver_support::register_driver_support("drvGM10", registry.clone());
 
-    epics_rs::base::runtime::env::set_default("GM10", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default_path("GM10", env!("CARGO_MANIFEST_DIR"));
 
     let mut app = IocApplication::new();
     app = app.register_dynamic_device_support(DEVICES, device_support::factory(registry.clone()));

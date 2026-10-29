@@ -184,7 +184,7 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("IP", ip_devices::IP_DIR);
+    epics_rs::base::runtime::env::set_default_path("IP", ip_devices::IP_DIR);
 
     let mut app = IocApplication::new();
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
