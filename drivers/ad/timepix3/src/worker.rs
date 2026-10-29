@@ -251,6 +251,12 @@ mod tests {
         let g = w.wait_for_start(None);
         let (mut client, _server) = pair();
         assert!(w.mark_connected(g, &client));
+        // Winsock's shutdown does not wake a recv blocked in another thread;
+        // there the worker's read timeout (C `kReceivePollTimeoutMs`) ends it.
+        #[cfg(windows)]
+        client
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
 
         let stopper = w.clone();
         let t = std::thread::spawn(move || {
