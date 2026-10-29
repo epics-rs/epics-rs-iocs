@@ -7694,6 +7694,9 @@ mod tests {
         bpc[5] = 3;
         bpc[300] = 1;
         bpc[301] = 2;
+        // On a case-insensitive filesystem cal.BPC would be the helper's
+        // cal.bpc, and C's fs::canonical reports the on-disk name.
+        std::fs::remove_file(dir.join("cal.bpc")).unwrap();
         std::fs::write(dir.join("cal.BPC"), &bpc).unwrap();
 
         det.export_masked_pels_json(&bpc).unwrap();
