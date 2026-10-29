@@ -2019,8 +2019,16 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stre
                     return;
                 }
             }
-            // C `isReceiveTimeout` (network_client.cpp:236-238).
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && worker.running(run) => continue,
+            // C `isReceiveTimeout` (network_client.cpp:236-238); Windows
+            // reports an SO_RCVTIMEO expiry as WSAETIMEDOUT, not EWOULDBLOCK.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && worker.running(run) =>
+            {
+                continue;
+            }
             Err(e) => {
                 if worker.running(run) {
                     let msg = format!("{} TCP socket error: {}", kind.name(), strerror(&e));
