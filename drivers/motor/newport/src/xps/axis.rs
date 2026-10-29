@@ -454,6 +454,12 @@ impl XpsAxis {
         Ok(())
     }
 
+    /// C `TCLScriptExecute(pAxis->moveSocket_, fileName, "0", "0")`
+    /// (XPSController.cpp:270-271).
+    pub fn tcl_script_execute(&self, file: &str) -> XpsResult<()> {
+        self.move_sock.tcl_script_execute(file, "0", "0")
+    }
+
     fn lock_controller(&self) -> MutexGuard<'_, XpsController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1514,6 +1520,8 @@ mod tests {
         },
         status: 110,
         status_string: 111,
+        tcl_script: 112,
+        tcl_script_execute: 113,
     };
 
     fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Fail, Log) {

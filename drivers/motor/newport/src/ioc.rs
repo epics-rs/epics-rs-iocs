@@ -66,7 +66,7 @@ use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::pmnc::{PmncAxis, PmncController};
 use crate::report::{AxisLines, ControllerHead, period_s};
 use crate::smc100::Smc100Axis;
-use crate::xps::profile_move::{ProfileHost, XpsProfile};
+use crate::xps::profile_move::{MAX_FILENAME_LEN, ProfileHost, XpsProfile};
 use crate::xps::{
     PcoParams, PcoSettings, RecordUnits, SocketMode, XpsAxis, XpsController, XpsParams, XpsSocket,
     gpio,
@@ -641,6 +641,67 @@ fn write_position_compare(
     ParamWrite::Handled(status)
 }
 
+/// A write of `XPS_TCL_SCRIPT_EXECUTE`: C runs the `XPS_TCL_SCRIPT` file on
+/// the axis's move socket and calls back without the base
+/// (XPSController.cpp:262-283).
+fn write_tcl_script_execute(
+    base: &mut PortDriverBase,
+    user: AxisUser<'_>,
+    value: i32,
+    tcl_script: usize,
+) -> ParamWrite {
+    if !has_motor_axis(base, user) {
+        return ParamWrite::PassToBase(Ok(()));
+    }
+    let _ = base.set_int32_param(user.reason, user.addr, value);
+    let port = base.port_name.to_string();
+    let trace = MotorTrace::new(&port, 0);
+    let refused = || AsynError::Status {
+        status: AsynStatus::Error,
+        message: String::new(),
+    };
+    let file = base.get_string_param(tcl_script, 0).map(|name| {
+        let name = name.split(|&b| b == 0).next().unwrap_or_default();
+        String::from_utf8_lossy(&name[..name.len().min(MAX_FILENAME_LEN - 1)]).into_owned()
+    });
+    // C tests its array for NULL, so its unset branch is dead and an unset
+    // name runs from an uninitialized buffer; rs takes the unset branch.
+    let status = match file {
+        Err(_) => {
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!("TCL script name has not been set on XPS: {port}\n"),
+            );
+            Err(refused())
+        }
+        Ok(file) => {
+            trace.print_self(
+                TraceMask::FLOW,
+                format_args!("Executing TCL script {file} on XPS: {port}\n"),
+            );
+            let call = DriverCall::new(move |motor, _| {
+                let any: &mut dyn std::any::Any = motor;
+                let Some(axis) = any.downcast_mut::<XpsAxis>() else {
+                    return Ok(());
+                };
+                axis.tcl_script_execute(&file).map_err(|e| {
+                    trace.print_self(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "TCLScriptExecute returned error {}, on XPS: {port}\n",
+                            e.code()
+                        ),
+                    );
+                    refused()
+                })
+            });
+            user.run(base, MotorCommand::Driver(call))
+        }
+    };
+    let _ = base.call_param_callbacks(user.addr);
+    ParamWrite::Handled(status)
+}
+
 /// The port's [`XpsParams`], for the controller its axes read them from.
 fn xps_params(port: &PortHandle) -> AsynResult<XpsParams> {
     port.with_driver_blocking::<ControllerPort<XpsHead>, _>(|d| {
@@ -681,9 +742,9 @@ impl ControllerParams for XpsHead {
             pco,
             status: base.create_param("XPS_STATUS", ParamType::Int32)?,
             status_string: base.create_param("XPS_STATUS_STRING", ParamType::Octet)?,
+            tcl_script: base.create_param("XPS_TCL_SCRIPT", ParamType::Octet)?,
+            tcl_script_execute: base.create_param("XPS_TCL_SCRIPT_EXECUTE", ParamType::Int32)?,
         });
-        base.create_param("XPS_TCL_SCRIPT", ParamType::Octet)?;
-        base.create_param("XPS_TCL_SCRIPT_EXECUTE", ParamType::Int32)?;
         Ok(())
     }
 
@@ -697,7 +758,11 @@ impl ControllerParams for XpsHead {
         user: AxisUser<'_>,
         value: i32,
     ) -> ParamWrite {
-        let pco = self.params().pco;
+        let p = self.params();
+        if user.reason == p.tcl_script_execute {
+            return write_tcl_script_execute(base, user, value, p.tcl_script);
+        }
+        let pco = p.pco;
         if [pco.mode, pco.pulse_width, pco.settling_time].contains(&user.reason) {
             return write_position_compare(base, user, ParamValue::Int32(value), pco);
         }
@@ -1050,101 +1115,6 @@ fn xps_controller_flag_command(name: &'static str, set: fn(&mut XpsController)) 
             Ok(CommandOutcome::Continue)
         },
     )
-}
-
-/// The XPS registered as `motor_port`, for the driver-private commands.
-fn xps_controller(motor_port: &str, cmd: &str) -> Result<Arc<Mutex<XpsController>>, String> {
-    let controllers = XPS_CONTROLLERS.lock().unwrap_or_else(|e| e.into_inner());
-    controllers
-        .iter()
-        .find(|r| r.port_name == motor_port)
-        .map(|r| r.controller.clone())
-        .ok_or_else(|| {
-            format!("{cmd}: controller '{motor_port}' not found (call XPSCreateController first)")
-        })
-}
-
-/// Create the `XPSTclScriptExecute` iocsh command.
-///
-/// Usage:
-/// `XPSTclScriptExecute(motorPort, tclFile, [taskName], [parameters])`
-///
-/// Runs a TCL script file on the XPS registered under `motorPort`, over its
-/// shared poll socket. Ports `TCLScriptExecute`; `taskName`/`parameters`
-/// default to `"0"` as the C driver does. DEVIATION from C's record-driven
-/// trigger (`XPSTclScript_`/`XPSTclScriptExecute_` asyn params): this is an
-/// imperative iocsh command, the natural interface for a one-shot script.
-pub fn xps_tcl_script_execute_command() -> CommandDef {
-    CommandDef::new(
-        "XPSTclScriptExecute",
-        vec![
-            arg_str_req("motorPort"),
-            arg_str_req("tclFile"),
-            ArgDesc {
-                name: "taskName",
-                arg_type: ArgType::String,
-            },
-            ArgDesc {
-                name: "parameters",
-                arg_type: ArgType::String,
-            },
-        ],
-        "XPSTclScriptExecute(motorPort, tclFile, [taskName], [parameters]) - Run a TCL script file on a Newport XPS controller",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let motor_port = req_string(args, 0, "motorPort")?;
-            let tcl_file = req_string(args, 1, "tclFile")?;
-            let task_name = opt_string(args, 2)?.unwrap_or_else(|| "0".to_string());
-            let parameters = opt_string(args, 3)?.unwrap_or_else(|| "0".to_string());
-
-            let controller = xps_controller(&motor_port, "XPSTclScriptExecute")?;
-            let ran = xps_tcl_script_execute(
-                &motor_port,
-                controller
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .poll_socket(),
-                &tcl_file,
-                &task_name,
-                &parameters,
-            );
-            if !ran {
-                return Ok(CommandOutcome::Continue);
-            }
-            println!(
-                "XPSTclScriptExecute: motorPort={motor_port} tclFile={tcl_file} task={task_name} params={parameters}"
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// XPSController.cpp:267-277: `TCLScriptExecute` between C's FLOW and
-/// ERROR lines on the controller's own user.
-fn xps_tcl_script_execute(
-    motor_port: &str,
-    sock: &XpsSocket,
-    tcl_file: &str,
-    task_name: &str,
-    parameters: &str,
-) -> bool {
-    let trace = MotorTrace::new(motor_port, 0);
-    trace.print_self(
-        TraceMask::FLOW,
-        format_args!("Executing TCL script {tcl_file} on XPS: {motor_port}\n"),
-    );
-    match sock.tcl_script_execute(tcl_file, task_name, parameters) {
-        Ok(()) => true,
-        Err(e) => {
-            trace.print_self(
-                TraceMask::ERROR,
-                format_args!(
-                    "TCLScriptExecute returned error {}, on XPS: {motor_port}\n",
-                    e.code()
-                ),
-            );
-            false
-        }
-    }
 }
 
 /// C `tclCall.cc` `getsocket`: the XPS `tclcall` runs on, fixed in C's
@@ -1934,20 +1904,6 @@ mod tests {
         let text = std::fs::read_to_string(path).unwrap();
         let _ = std::fs::remove_file(path);
         text
-    }
-
-    /// XPSController.cpp:267: the TCL script's FLOW line, before the call.
-    #[test]
-    fn the_tcl_script_traces_as_c() {
-        let port = "xps_tcl_trace";
-        let line = FakeLine::new(&format!("{port}_ip"), "");
-        let path = trace_flow(port);
-        let sock = line.socket(SocketMode::Query);
-        assert!(xps_tcl_script_execute(port, &sock, "a.tcl", "0", "0"));
-        assert_eq!(
-            read_trace(&path),
-            "Executing TCL script a.tcl on XPS: xps_tcl_trace\n"
-        );
     }
 
     /// C `tclcall`: the controller's code is the status, and a missing
@@ -4157,5 +4113,138 @@ mod xps_profile_tests {
             );
             sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// XPSTclScript.template on the driver: TCLScriptExecute runs the
+    /// TCLScript file on the axis's move socket (XPSController.cpp:262-283).
+    #[epics_rs::base::epics_test]
+    async fn tcl_script_records_run_the_script() {
+        use std::collections::HashMap;
+
+        use epics_rs::asyn::adapter::register_asyn_device_support_for_builder;
+        use epics_rs::asyn::manager::PortManager;
+        use epics_rs::base::runtime::task::sleep;
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::{PiniMode, ProcessCompletion};
+        use epics_rs::base::types::EpicsValue;
+
+        use super::tests::{read_trace, trace_flow};
+
+        let port_name = "XpsTclRecCtrl";
+        let line = FakeLine::new("XpsTclRecLine", "");
+        let fail = line.fail.clone();
+        let owner = Arc::new(PvDatabase::new());
+        let gate = owner.scan_control().interrupt_gate().clone();
+        let shell = std::thread::spawn(move || {
+            let (profile, thread) = XpsProfile::new(port_name);
+            let head = XpsHead {
+                moving_s: 0.1,
+                idle_s: 0.1,
+                enable_set_position: false,
+                settling_s: 0.0,
+                profile,
+                params: None,
+            };
+            let port = register_controller_port(&gate, port_name, 1, head).unwrap();
+            let controller = Arc::new(Mutex::new(
+                XpsController::new(
+                    line.socket(SocketMode::Query),
+                    false,
+                    Duration::ZERO,
+                    xps_params(&port).unwrap(),
+                )
+                .unwrap(),
+            ));
+            let poller = Controller::new().controller_poll(thread.poll(controller.clone()));
+            poller.start(port_name, 100, 100, 10);
+            poller
+                .install_built(asyn_user(port_name, 0), || {
+                    let axis = XpsAxis::new(
+                        controller,
+                        line.socket(SocketMode::Fire),
+                        port_name,
+                        0,
+                        "G1.P1",
+                        0.25,
+                    );
+                    Ok((Arc::new(Mutex::new(axis)), None))
+                })
+                .unwrap();
+            (line, poller)
+        });
+        while !shell.is_finished() {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let (line, _poller) = shell.join().unwrap();
+        let path = trace_flow(port_name);
+        PortManager::global().trace_manager().set_device_trace_mask(
+            port_name,
+            0,
+            TraceMask::FLOW | TraceMask::ERROR,
+        );
+
+        let macros: HashMap<String, String> = [
+            ("P", "xpsTcl:"),
+            ("R", "m1:"),
+            ("PORT", port_name),
+            ("ADDR", "0"),
+            ("TIMEOUT", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        let (db, _) = register_asyn_device_support_for_builder(IocBuilder::new())
+            .with_database(owner)
+            .db_string(
+                include_str!("../../../../iocs/motor/xps-ioc/db/XPSTclScript.template"),
+                &macros,
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db.pini_process(PiniMode::Yes).await;
+        db.scan_control().run();
+        let put = async |name: &str, value: EpicsValue| {
+            let done = db
+                .put_record_field_from_ca(format!("xpsTcl:m1:{name}"), "VAL", value)
+                .await
+                .unwrap();
+            if let ProcessCompletion::Async(done) = done {
+                let _ = done.await;
+            }
+        };
+        let tcl_log = || -> Vec<String> {
+            line.take_log()
+                .into_iter()
+                .filter(|c| c.starts_with("TCLScriptExecute"))
+                .collect()
+        };
+
+        put(
+            "TCLScript",
+            EpicsValue::CharArray(b"MyScript.tcl".to_vec().into()),
+        )
+        .await;
+        assert_eq!(tcl_log(), Vec::<String>::new());
+        put("TCLScriptExecute", EpicsValue::Enum(1)).await;
+        assert_eq!(tcl_log(), ["TCLScriptExecute (MyScript.tcl,0,0)"]);
+        *fail.lock().unwrap() = "TCLScriptExecute";
+        put("TCLScriptExecute", EpicsValue::Enum(1)).await;
+        assert_eq!(tcl_log(), ["TCLScriptExecute (MyScript.tcl,0,0)"]);
+        let trace: Vec<String> = read_trace(&path)
+            .lines()
+            .filter(|l| l.contains("TCL") && !l.starts_with("asynPortDriver:"))
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            trace,
+            [
+                "Executing TCL script MyScript.tcl on XPS: XpsTclRecCtrl",
+                "Executing TCL script MyScript.tcl on XPS: XpsTclRecCtrl",
+                "TCLScriptExecute returned error -3, on XPS: XpsTclRecCtrl",
+                "xpsTcl:m1:TCLScriptExecute devAsynInt32::processCallbackOutput process write error ",
+            ]
+        );
     }
 }

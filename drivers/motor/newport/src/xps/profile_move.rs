@@ -34,7 +34,7 @@ use super::rpc::{XpsError, XpsSocket};
 use super::{ftp, sftp};
 
 /// XPSController.h `MAX_FILENAME_LEN` and `MAX_GROUPNAME_LEN`.
-const MAX_FILENAME_LEN: usize = 256;
+pub(crate) const MAX_FILENAME_LEN: usize = 256;
 const MAX_GROUPNAME_LEN: usize = 64;
 
 /// The trajectory folders by controller (XPSController.h:19-21).
