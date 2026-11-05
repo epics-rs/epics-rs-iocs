@@ -559,25 +559,18 @@ mod tests {
         let mut rec = MotorRecord::new();
         let (port, mut rx) = CommandPort::capture();
         rec.set_command_port(port.with_build_trans(Arc::new(Mdt695Build)));
-        rec.conv.mres = 1.0;
-        rec.stat.msta = MstaFlags::DONE;
-        rec.limits.dhlm = 100.0;
-        rec.limits.hlm = 100.0;
-        rec.limits.dllm = -100.0;
-        rec.limits.llm = -100.0;
-        rec.limits.rhlm = 100.0;
-        rec.limits.rllm = -100.0;
-        rec.internal.init_invariants_synced = true;
+        rec.put_field("MRES", EpicsValue::Double(1.0)).unwrap();
+        rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+            .unwrap();
+        rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+        rec.init_record(1).unwrap();
         rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
         rec.put_field("LLM", EpicsValue::Double(-50.0)).unwrap();
         assert!(rx.try_recv().is_err());
+        let limits = rec.limits();
         assert_eq!(
-            (
-                rec.limits.hlm,
-                rec.limits.dhlm,
-                rec.limits.llm,
-                rec.limits.dllm
-            ),
+            (limits.hlm, limits.dhlm, limits.llm, limits.dllm),
             (100.0, 100.0, -100.0, -100.0)
         );
     }

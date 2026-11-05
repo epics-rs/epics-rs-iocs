@@ -952,15 +952,12 @@ mod tests {
             let mut rec = MotorRecord::new();
             let (port, rx) = CommandPort::capture();
             rec.set_command_port(port.with_build_trans(axis.build_trans()));
-            rec.conv.mres = 1.0;
-            rec.stat.msta = MstaFlags::DONE;
-            rec.limits.dhlm = 100.0;
-            rec.limits.hlm = 100.0;
-            rec.limits.dllm = -100.0;
-            rec.limits.llm = -100.0;
-            rec.limits.rhlm = 100.0;
-            rec.limits.rllm = -100.0;
-            rec.internal.init_invariants_synced = true;
+            rec.put_field("MRES", EpicsValue::Double(1.0)).unwrap();
+            rec.put_field("MSTA", EpicsValue::ULong(MstaFlags::DONE.bits()))
+                .unwrap();
+            rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+            rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+            rec.init_record(1).unwrap();
             (rec, rx)
         };
         macro_rules! sent {
@@ -981,18 +978,19 @@ mod tests {
         ra.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
         ra.put_field("LLM", EpicsValue::Double(-50.0)).unwrap();
         assert_eq!(sent!(rxa), []);
+        let limits = ra.limits();
         assert_eq!(
-            (ra.limits.hlm, ra.limits.dhlm, ra.limits.rhlm),
+            (limits.hlm, limits.dhlm, limits.rhlm),
             (100.0, 100.0, 100.0)
         );
         assert_eq!(
-            (ra.limits.llm, ra.limits.dllm, ra.limits.rllm),
+            (limits.llm, limits.dllm, limits.rllm),
             (-100.0, -100.0, -100.0)
         );
 
         rb.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
         assert_eq!(sent!(rxb), [MotorCommand::Poll]);
-        assert_eq!((rb.limits.hlm, rb.limits.dhlm), (50.0, 50.0));
+        assert_eq!((rb.limits().hlm, rb.limits().dhlm), (50.0, 50.0));
     }
 
     /// A selection released between two of a move's commands, as the
@@ -1045,13 +1043,13 @@ mod tests {
         let state = new_shared_state();
         state.lock().unwrap().latest_status = Some(status(1));
         let mut rec = MotorRecord::new();
-        rec.conv.mres = 1.0;
-        rec.limits.dhlm = 100.0;
-        rec.limits.hlm = 100.0;
-        rec.limits.dllm = -100.0;
-        rec.limits.llm = -100.0;
-        rec.vel.velo = 10.0;
-        rec.vel.accl = 0.5;
+        rec.put_field("MRES", EpicsValue::Double(1.0)).unwrap();
+        rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
+        rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+        rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+        rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
         rec.set_device_state(state.clone());
         let (port, _rx) = CommandPort::capture();
         rec.set_command_port(port.with_build_trans(device.clone()));
