@@ -102,14 +102,52 @@ enum Done {
     /// A write left PACT by `write_begin`.
     Write(DeviceDone),
     NoRecord,
-    /// Test only: the queue thread panics once the command ran.
+    /// Test only: once the command ran, the queue thread waits for this to
+    /// fire and then panics.
     #[cfg(test)]
-    Panic,
+    Panic(mpsc::Receiver<()>),
+}
+
+impl Done {
+    // queue_func's `dbScanLock; process; dbScanUnlock` on the queue thread
+    // (drvMW100.c:1418-1424), not through a callback band that can refuse
+    // it. That thread holds no lock set.
+    fn run(self) {
+        match self {
+            Done::Read(done) => done.reprocess_now(),
+            Done::Write(done) => done.complete_now(),
+            Done::NoRecord => {}
+            #[cfg(test)]
+            Done::Panic(fire) => {
+                let _ = fire.recv();
+                panic!("the queue thread panics, for a test");
+            }
+        }
+    }
+}
+
+/// A queued job's pass, ended once, on the queue thread, by its drop: after
+/// the command ran, or when the [`Link`] holding it drops.
+struct Pass(Option<Done>);
+
+impl Pass {
+    /// The job never queued; its caller ends the pass instead.
+    fn defuse(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Pass {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            done.run();
+        }
+    }
 }
 
 struct Job {
     command: Command,
-    done: Done,
+    pass: Pass,
 }
 
 /// One `mw100Init` handle (C `struct devqueue`), looked up by name from the
@@ -128,13 +166,26 @@ pub struct Instrument {
     pub peer_address: String,
 }
 
-/// The queue thread's hold on [`Instrument::online`], its one writer. Its
-/// drop, when the thread ends or unwinds, marks the unit offline.
-struct Link(Arc<AtomicBool>);
+/// The queue thread's hold on [`Instrument::online`], its one writer, and
+/// on every job it has yet to finish. Its drop, when the thread ends or
+/// unwinds, marks the unit offline before its fields drop, so each pass
+/// they hold ends on an offline unit.
+struct Link {
+    reachable: Arc<AtomicBool>,
+    /// The job whose command is running.
+    running: Option<Pass>,
+    /// Jobs taken off `rx` ahead of one the actor queued itself, in order.
+    backlog: VecDeque<Job>,
+    rx: mpsc::Receiver<Job>,
+}
 
 impl Link {
     fn set(&self, reachable: bool) {
-        self.0.store(reachable, Ordering::Release);
+        self.reachable.store(reachable, Ordering::Release);
+    }
+
+    fn next_job(&mut self) -> Option<Job> {
+        self.backlog.pop_front().or_else(|| self.rx.recv().ok())
     }
 }
 
@@ -168,12 +219,15 @@ impl Instrument {
     fn start(&self, stream: TcpStream) -> io::Result<()> {
         let (tx, rx) = mpsc::channel::<Job>();
         let actor = Actor {
-            link: Link(self.reachable.clone()),
+            link: Link {
+                reachable: self.reachable.clone(),
+                running: None,
+                backlog: VecDeque::new(),
+                rx,
+            },
             stream,
             cache: self.cache.clone(),
             interrupts: self.interrupts.clone(),
-            rx,
-            backlog: VecDeque::new(),
         };
         let (loaded_tx, loaded) = mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -210,21 +264,44 @@ impl Instrument {
         self.reachable.load(Ordering::Acquire)
     }
 
+    /// Test only: queue a job that panics the queue thread once the
+    /// returned sender fires.
+    #[cfg(test)]
+    pub(crate) fn queue_panic(&self) -> mpsc::Sender<()> {
+        let (fire, panic) = mpsc::channel();
+        // `set_mode` takes 0 or 1, so `SetOpMode(2)` sends nothing.
+        assert!(self.send(Command::SetOpMode(2), Done::Panic(panic)));
+        fire
+    }
+
+    /// Test only: the queue thread panics in the next command it runs,
+    /// with that command's job as the running one.
+    #[cfg(test)]
+    pub(crate) fn panic_in_next_command(&self) {
+        self.cache.lock().panic_in_next_command = true;
+    }
+
     /// Test only: panic the queue thread; returns once it is gone.
     #[cfg(test)]
     pub(crate) fn panic_queue_thread(&self) {
-        // `set_mode` takes 0 or 1, so `SetOpMode(2)` sends nothing.
-        let mut done = Done::Panic;
-        while self.send(Command::SetOpMode(2), done) {
-            done = Done::NoRecord;
+        let _ = self.queue_panic().send(());
+        while self.send(Command::SetOpMode(2), Done::NoRecord) {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
     fn send(&self, command: Command, done: Done) -> bool {
-        self.tx
-            .get()
-            .is_some_and(|tx| tx.send(Job { command, done }).is_ok())
+        let Some(tx) = self.tx.get() else {
+            return false;
+        };
+        let pass = Pass(Some(done));
+        match tx.send(Job { command, pass }) {
+            Ok(()) => true,
+            Err(mpsc::SendError(job)) => {
+                job.pass.defuse();
+                false
+            }
+        }
     }
 
     fn cache(&self) -> parking_lot::MutexGuard<'_, Cache> {
@@ -526,14 +603,10 @@ impl Instrument {
 }
 
 pub struct Actor {
-    /// First, so the unit reads offline before `rx` refuses a job.
     link: Link,
     stream: TcpStream,
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
-    rx: mpsc::Receiver<Job>,
-    /// Jobs taken off `rx` ahead of one the actor queued itself, in order.
-    backlog: VecDeque<Job>,
 }
 
 impl Actor {
@@ -546,18 +619,10 @@ impl Actor {
         if failed {
             return;
         }
-        while let Some(job) = self.backlog.pop_front().or_else(|| self.rx.recv().ok()) {
-            let _ = self.process(job.command);
-            // queue_func's `dbScanLock; process; dbScanUnlock` on this thread
-            // (drvMW100.c:1418-1424), not through a callback band that can
-            // refuse it. This thread holds no lock set.
-            match job.done {
-                Done::Read(done) => done.reprocess_now(),
-                Done::Write(done) => done.complete_now(),
-                Done::NoRecord => {}
-                #[cfg(test)]
-                Done::Panic => panic!("the queue thread panics, for a test"),
-            }
+        while let Some(Job { command, pass }) = self.link.next_job() {
+            self.link.running = Some(pass);
+            let _ = self.process(command);
+            drop(self.link.running.take());
         }
     }
 
@@ -590,14 +655,19 @@ impl Actor {
     /// C `qmesg(dq, NULL, ...)` from the queue thread: the job goes behind
     /// everything already queued.
     fn queue_self(&mut self, command: Command) {
-        self.backlog.extend(self.rx.try_iter());
-        self.backlog.push_back(Job {
+        let link = &mut self.link;
+        link.backlog.extend(link.rx.try_iter());
+        link.backlog.push_back(Job {
             command,
-            done: Done::NoRecord,
+            pass: Pass(Some(Done::NoRecord)),
         });
     }
 
     fn process(&mut self, command: Command) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.cache.lock().panic_in_next_command) {
+            panic!("the queue thread panics running a command, for a test");
+        }
         match command {
             Command::ReadAllInputs => self.load_input_values(None),
             Command::ReadSignalInput(ch) => {

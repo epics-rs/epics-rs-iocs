@@ -1985,6 +1985,58 @@ record(ao, "AO") {{
         });
     }
 
+    /// A read and a write queued behind the job that panics the queue
+    /// thread never run, so their passes end with COMM_ALARM as it unwinds.
+    #[test]
+    fn records_queued_when_the_queue_thread_panics_end_their_passes_with_comm_alarm() {
+        test_block_on(async {
+            let (instrument, _device) = connect_fixture_then(Vec::new());
+            let db = ai_and_ao_on("", instrument.clone()).await;
+            let fire = instrument.queue_panic();
+            db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                .await
+                .unwrap();
+            db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                .await
+                .unwrap();
+            fire.send(()).unwrap();
+            pact_after_settling(&db).await;
+            assert_eq!(
+                [pact_and_alarm(&db, "AI"), pact_and_alarm(&db, "AO")],
+                [COMM_INVALID, COMM_INVALID],
+                "PACT, STAT, SEVR of AI and AO"
+            );
+            assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(0.0));
+        });
+    }
+
+    /// A read and a write whose command is running when the queue thread
+    /// panics end their passes with COMM_ALARM as it unwinds.
+    #[test]
+    fn records_running_when_the_queue_thread_panics_end_their_passes_with_comm_alarm() {
+        test_block_on(async {
+            let mut ends = Vec::new();
+            for (record, field, value) in [
+                ("AI", "PROC", EpicsValue::Short(1)),
+                ("AO", "VAL", EpicsValue::Double(2.5)),
+            ] {
+                let (instrument, _device) = connect_fixture_then(Vec::new());
+                let db = ai_and_ao_on("", instrument.clone()).await;
+                instrument.panic_in_next_command();
+                db.put_record_field_from_ca_no_notify(record, field, value)
+                    .await
+                    .unwrap();
+                pact_after_settling(&db).await;
+                ends.push((record, pact_and_alarm(&db, record)));
+            }
+            assert_eq!(
+                ends,
+                [("AI", COMM_INVALID), ("AO", COMM_INVALID)],
+                "each record's PACT, STAT, SEVR"
+            );
+        });
+    }
+
     #[test]
     fn a_read_and_a_write_end_on_the_queue_thread_while_their_band_is_full() {
         with_full_low_band(
