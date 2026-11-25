@@ -16,7 +16,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
-use epics_rs::base::server::database::{AsyncDbHandle, DeviceDoneSource, ProcessCallback};
+use epics_rs::base::server::database::{AsyncDbHandle, DeviceDoneSource};
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, IoIntrAction,
     WriteStart,
@@ -358,8 +358,6 @@ pub struct EtherIpDevice {
     alarm: Option<(u16, u16)>,
     /// The database an output's PLC callback runs in.
     db: Option<AsyncDbHandle>,
-    /// C's `rset->process` from an output's PLC callback that finds no data.
-    process: Option<ProcessCallback>,
 }
 
 impl EtherIpDevice {
@@ -376,7 +374,6 @@ impl EtherIpDevice {
             io_intr_rx: None,
             alarm: None,
             db: None,
-            process: None,
         }
     }
 
@@ -547,7 +544,6 @@ impl DeviceSupport for EtherIpDevice {
     }
 
     fn bind_database(&mut self, db: AsyncDbHandle) {
-        self.process = Some(db.process_callback(&self.name));
         self.db = Some(db);
     }
 
@@ -609,17 +605,11 @@ impl DeviceSupport for EtherIpDevice {
         }
         match self.check_callback(record, common) {
             Callback::ScanOnce => IoIntrAction::ScanOnce,
-            // C calls `rset->process` under the record's lock, past every
-            // dbProcess gate (devEtherIP.c:347-354). This callback holds the
-            // lock, so the record's ProcessCallback runs it on the record's
-            // band as an async completion re-enters: past the PACT and TPRO
-            // gates, not the DISA one.
-            Callback::Process => {
-                if let Some(process) = &self.process {
-                    let _ = process.request(common.callback_priority());
-                }
-                IoIntrAction::Skip
-            }
+            // C calls `rset->process` under the record's lock on the scan
+            // task (devEtherIP.c:347-354), where no full queue can drop the
+            // once-per-outage pass. Unlike C it goes through dbProcess, so a
+            // disabled record stays disabled and TPRO traces the pass.
+            Callback::Process => IoIntrAction::Process,
             Callback::Leave => IoIntrAction::Skip,
         }
     }
@@ -1513,6 +1503,44 @@ mod tests {
             .unwrap()
     }
 
+    /// Holds the low band's one worker until `open`.
+    #[derive(Clone, Default)]
+    struct Hold(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl epics_rs::base::runtime::background::CallbackBody for Hold {
+        fn run(&self) {
+            let (open, wake) = &*self.0;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+        }
+    }
+
+    impl Hold {
+        fn open(&self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    /// Queue `Hold`s on the low band until it refuses one, in a process
+    /// that gave the band one worker and a queue of one.
+    fn fill_low_band() -> Hold {
+        use epics_rs::base::runtime::background::{CallbackCell, CallbackError};
+        use epics_rs::base::runtime::task::{CallbackPriority, request_cell};
+        let hold = Hold::default();
+        let full = (0..64).any(|_| {
+            match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
+                Ok(()) => false,
+                Err(CallbackError::QueueFull) => true,
+                Err(e) => panic!("{e:?}"),
+            }
+        });
+        assert!(full, "the low band never filled");
+        hold
+    }
+
     /// devEtherIP.c:326-437: check_ao_callback copies the PLC's value and
     /// scanOnces the record, whose own process converts it, so OVAL, PVAL,
     /// RVAL and ORAW follow, and ao_write finds nothing to write.
@@ -1928,19 +1956,24 @@ mod tests {
         assert!(device_factory(&ctx("ao", DTYP_RESET)).is_none());
     }
 
-    /// check_ao_callback's no-data branch calls `rset->process` itself
-    /// (devEtherIP.c:347-354): a TPRO record prints no dbProcess line for
-    /// it, and still ends in WRITE_ALARM. Run in a child, whose stdout the
-    /// trace goes to.
+    /// check_ao_callback's no-data branch processes the record on the scan
+    /// task (devEtherIP.c:347-354), and invalidate_PLC_tags runs it once per
+    /// outage (drvEtherIP.c:448-474), so a full callback band must not keep
+    /// a disconnected output out of WRITE_ALARM. In a child process: the
+    /// band's size and threads are set before it arms.
     #[test]
-    fn a_no_data_pulse_processes_past_dbprocess() {
+    fn a_no_data_pulse_raises_write_alarm_while_its_band_is_full() {
+        use epics_rs::base::runtime::background::callback_executor::{
+            set_parallel_threads, set_queue_size,
+        };
+        use epics_rs::base::runtime::task::CallbackPriority;
         use epics_rs::base::server::records::ao::AoRecord;
         use std::time::{Duration, Instant};
-        const CHILD: &str = "EIP_NO_DATA_CHILD";
+        const CHILD: &str = "EIP_NO_DATA_FULL_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "device::tests::a_no_data_pulse_processes_past_dbprocess",
+                    "device::tests::a_no_data_pulse_raises_write_alarm_while_its_band_is_full",
                     "--exact",
                     "--nocapture",
                 ])
@@ -1951,30 +1984,34 @@ mod tests {
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(out.status.success(), "{stdout}{stderr}");
             assert!(stdout.contains("1 passed"), "{stdout}");
-            assert!(!stdout.contains("dbProcess of 'AONODATA'"), "{stdout}");
             return;
         }
+        // The record's PRIO is LOW.
+        set_queue_size(1);
+        set_parallel_threads(1, Some(CallbackPriority::Low));
         epics_rs::base::runtime::task::background_arm();
         let rt = current_thread();
-        let db = eip_db("nodatapulse");
+        let db = eip_db("nodatafull");
         let tag = load_output(
             &rt,
             &db,
             "AONODATA",
             Box::new(AoRecord::default()),
-            "nodatapulse",
+            "nodatafull",
             "R",
         );
-        rt.block_on(db.put_pv_no_process("AONODATA.TPRO", EpicsValue::Char(1)))
-            .unwrap();
         let stat = || db.get_record("AONODATA").unwrap().read().common.stat;
         assert_ne!(stat(), alarm_status::WRITE_ALARM);
-        pulse(&tag);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while stat() != alarm_status::WRITE_ALARM {
-            assert!(Instant::now() < deadline, "no WRITE_ALARM");
+        let hold = fill_low_band();
+        // The tag holds no data, as after invalidate_tags.
+        tag.notify();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while stat() != alarm_status::WRITE_ALARM && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
+        let alarmed = stat() == alarm_status::WRITE_ALARM;
+        hold.open();
+        assert!(alarmed, "no WRITE_ALARM while the band is full");
     }
 
     /// The scan task's callback loop runs a pending write's `process`
@@ -1986,10 +2023,8 @@ mod tests {
         use epics_rs::base::runtime::background::callback_executor::{
             set_parallel_threads, set_queue_size,
         };
-        use epics_rs::base::runtime::background::{CallbackBody, CallbackCell, CallbackError};
-        use epics_rs::base::runtime::task::{CallbackPriority, request_cell};
+        use epics_rs::base::runtime::task::CallbackPriority;
         use epics_rs::base::server::records::ao::AoRecord;
-        use std::sync::Condvar;
         use std::time::{Duration, Instant};
         const CHILD: &str = "EIP_FULL_BAND_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -2009,25 +2044,6 @@ mod tests {
             return;
         }
 
-        /// Holds the low band's one worker until `open`.
-        #[derive(Clone, Default)]
-        struct Hold(Arc<(std::sync::Mutex<bool>, Condvar)>);
-        impl CallbackBody for Hold {
-            fn run(&self) {
-                let (open, wake) = &*self.0;
-                let mut open = open.lock().unwrap();
-                while !*open {
-                    open = wake.wait(open).unwrap();
-                }
-            }
-        }
-        impl Hold {
-            fn open(&self) {
-                *self.0.0.lock().unwrap() = true;
-                self.0.1.notify_all();
-            }
-        }
-
         // The record's PRIO is LOW.
         set_queue_size(1);
         set_parallel_threads(1, Some(CallbackPriority::Low));
@@ -2043,15 +2059,7 @@ mod tests {
             "R",
         );
         set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
-        let hold = Hold::default();
-        let full = (0..64).any(|_| {
-            match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
-                Ok(()) => false,
-                Err(CallbackError::QueueFull) => true,
-                Err(e) => panic!("{e:?}"),
-            }
-        });
-        assert!(full, "the low band never filled");
+        let hold = fill_low_band();
 
         rt.block_on(db.put_record_field_from_ca_no_notify(
             "AOFULL",
