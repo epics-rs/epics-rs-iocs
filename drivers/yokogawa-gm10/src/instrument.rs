@@ -70,6 +70,13 @@ impl Interrupts {
             )
         });
     }
+
+    fn fire_all(&self) {
+        use InterruptCategory::*;
+        for category in [Channel, Misc, Info, Status, Error] {
+            self.fire(category);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,14 +170,20 @@ pub struct Instrument {
 /// they hold ends on an offline unit.
 struct Link {
     reachable: Arc<AtomicBool>,
+    interrupts: Arc<Interrupts>,
     /// The job whose command is running.
     running: Option<Pass>,
     rx: mpsc::Receiver<Job>,
 }
 
 impl Link {
+    /// C posts no scan when the link changes, so its I/O Intr records keep
+    /// their last value unalarmed. Each change posts every one here: the
+    /// passes alarm on a lost unit and clear on its return.
     fn set(&self, reachable: bool) {
-        self.reachable.store(reachable, Ordering::Release);
+        if self.reachable.swap(reachable, Ordering::AcqRel) != reachable {
+            self.interrupts.fire_all();
+        }
     }
 }
 
@@ -206,6 +219,7 @@ impl Instrument {
         let actor = Actor {
             link: Link {
                 reachable: self.reachable.clone(),
+                interrupts: self.interrupts.clone(),
                 running: None,
                 rx,
             },

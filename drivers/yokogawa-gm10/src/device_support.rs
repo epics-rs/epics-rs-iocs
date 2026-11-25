@@ -1568,6 +1568,15 @@ mod tests {
         flnk: &str,
         instrument: Arc<Instrument>,
     ) -> Arc<epics_rs::base::server::database::PvDatabase> {
+        ai_and_ao_with(flnk, "", instrument).await
+    }
+
+    /// [`ai_and_ao_on`] beside the records `more`.
+    async fn ai_and_ao_with(
+        flnk: &str,
+        more: &str,
+        instrument: Arc<Instrument>,
+    ) -> Arc<epics_rs::base::server::database::PvDatabase> {
         use epics_rs::base::server::ioc_builder::IocBuilder;
         use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
         // gm10Support.dbd's ai and ao rows, as yokogawa-gm10-ioc lists them.
@@ -1594,6 +1603,7 @@ record(ao, "AO") {{
     field(OUT, "@gm10dev VAL:K1")
     field(FLNK, "{flnk}")
 }}
+{more}
 "#
         );
         let (db, _) = IocBuilder::new()
@@ -1766,6 +1776,69 @@ record(ao, "AO") {{
                     (NO_ALARM, EpicsValue::Double(5.678))
                 ],
                 "(PACT, STAT, SEVR) and VAL after each read"
+            );
+        });
+    }
+
+    /// An I/O Intr record scans once on each change of the link: losing the
+    /// unit ends its pass with COMM_ALARM, INVALID, and the unit's return
+    /// clears that at once. A further exchange that changes nothing scans
+    /// nothing. `CNT` counts the record's passes; the unit's frames carry
+    /// the cached 1.234, so the value IN reads does not depend on timing.
+    #[test]
+    fn io_intr_records_scan_once_on_each_change_of_the_link() {
+        use epics_rs::base::runtime::task::sleep;
+        use std::time::Duration;
+        epics_rs::base::runtime::task::test_block_on(async {
+            let cached = || fdata_binary(&[(1, 1, 0, [0; 4], 1234)]);
+            let (instrument, _device) = fixture_then(vec![
+                b"XX\r\n".to_vec(),
+                b"XX\r\n".to_vec(),
+                cached(),
+                cached(),
+            ]);
+            let more = format!(
+                r#"
+record(ai, "IN") {{
+    field(DTYP, "{DTYP}")
+    field(INP, "@gm10dev VAL:1")
+    field(SCAN, "I/O Intr")
+    field(FLNK, "CNT")
+}}
+record(calc, "CNT") {{ field(CALC, "A+1") field(INPA, "CNT") }}
+"#
+            );
+            let db = ai_and_ao_with("", &more, instrument).await;
+            // `iocRun`: I/O Intr pulses may now process.
+            db.scan_control().run();
+            let mut trace = Vec::new();
+            for passes in [1.0, 1.0, 2.0, 2.0] {
+                proc_ai(&db).await;
+                for _ in 0..400 {
+                    if db.get_pv("CNT.VAL").unwrap() == EpicsValue::Double(passes) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+                sleep(Duration::from_millis(50)).await;
+                trace.push((
+                    pact_and_alarm(&db, "IN"),
+                    db.get_pv("IN.VAL").unwrap(),
+                    db.get_pv("CNT.VAL").unwrap(),
+                ));
+            }
+            let at =
+                |alarm, val, passes| (alarm, EpicsValue::Double(val), EpicsValue::Double(passes));
+            assert_eq!(
+                trace,
+                [
+                    at(COMM_INVALID, 0.0, 1.0),
+                    at(COMM_INVALID, 0.0, 1.0),
+                    at(NO_ALARM, 1.234, 2.0),
+                    at(NO_ALARM, 1.234, 2.0),
+                ],
+                "IN's (PACT, STAT, SEVR), VAL and passes after the read that loses \
+                 the unit, a second failed read, the read the unit answers, and one more"
             );
         });
     }
