@@ -7,6 +7,8 @@
 //! command's `system()` status. Both upload the file `buildProfile` wrote
 //! under `file_name` in the working directory.
 
+use super::UPLOAD_TIMEOUT;
+
 /// xpsSFTPUpload.cpp:183-192, C's build with neither library.
 #[cfg(not(feature = "sftp"))]
 pub fn xps_sftp_upload(
@@ -33,7 +35,8 @@ pub fn xps_sftp_upload(
 
 /// C's command line, and the same words as arguments. C runs it through
 /// `system()`, so a shell word in the password splits or expands it; here
-/// each word goes to `curl` as it is.
+/// each word goes to `curl` as it is. C leaves curl its 300 s to connect
+/// and no bound on a stalled transfer; here both are [`UPLOAD_TIMEOUT`].
 #[cfg(any(not(feature = "sftp"), test))]
 fn curl_command(
     ip_address: &str,
@@ -46,11 +49,23 @@ fn curl_command(
     let verbose_option = if verbose { "--verbose" } else { "--silent" };
     let auth = format!("{user_name}:{password}");
     let url = format!("scp://{ip_address}{trajectory_directory}/");
-    let command = format!("curl -k -u {auth} -T {file_name} {verbose_option}  {url}");
-    let args = ["-k", "-u", &auth, "-T", file_name, verbose_option, &url]
-        .map(String::from)
-        .to_vec();
-    (command, args)
+    let bound = UPLOAD_TIMEOUT.as_secs().to_string();
+    let bounds = [
+        "--connect-timeout",
+        &bound,
+        "--speed-limit",
+        "1",
+        "--speed-time",
+        &bound,
+    ];
+    let command = format!(
+        "curl -k -u {auth} -T {file_name} {verbose_option} {}  {url}",
+        bounds.join(" ")
+    );
+    let mut args = vec!["-k", "-u", &auth, "-T", file_name, verbose_option];
+    args.extend(bounds);
+    args.push(&url);
+    (command, args.into_iter().map(String::from).collect())
 }
 
 /// `system()`'s answer: the wait status, or the shell's 127 when the
@@ -78,7 +93,7 @@ pub fn xps_sftp_upload(
     _verbose: bool,
 ) -> i32 {
     use std::io::Write;
-    use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
     use std::path::Path;
 
     use ssh2::{ErrorCode, HashType, OpenFlags, OpenType, Session};
@@ -98,16 +113,17 @@ pub fn xps_sftp_upload(
         }
     };
     // C `inet_addr`: a dotted address only, no name lookup.
-    let stream = ip_address
-        .parse::<Ipv4Addr>()
-        .ok()
-        .and_then(|ip| TcpStream::connect(SocketAddrV4::new(ip, 22)).ok());
+    let stream = ip_address.parse::<Ipv4Addr>().ok().and_then(|ip| {
+        TcpStream::connect_timeout(&SocketAddr::from((ip, ssh_port())), UPLOAD_TIMEOUT).ok()
+    });
     let Some(stream) = stream else {
         epics_rs::base::stderr_println!("failed to connect to {ip_address}");
         return -1;
     };
     let _ = stream.set_nodelay(true);
     session.set_blocking(true);
+    // Every blocking libssh2 call below gives up after it.
+    session.set_timeout(UPLOAD_TIMEOUT.as_millis() as u32);
     session.set_tcp_stream(stream);
     if let Err(e) = session.handshake() {
         epics_rs::base::stderr_println!("Failure establishing SSH session: {}", rc(&e));
@@ -152,14 +168,33 @@ pub fn xps_sftp_upload(
     status
 }
 
+/// The XPS's SSH port.
+#[cfg(all(feature = "sftp", not(test)))]
+fn ssh_port() -> u16 {
+    22
+}
+
+/// The port the libssh2 upload calls in a test, whose own server stands
+/// in for the XPS's privileged 22.
+#[cfg(all(feature = "sftp", test))]
+static SSH_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(22);
+
+#[cfg(all(feature = "sftp", test))]
+fn ssh_port() -> u16 {
+    SSH_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "sftp", unix))]
+    use crate::xps::ftp::tests::{silent_server, within};
 
     /// xpsSFTPUpload.cpp:187-188: C's command line, two spaces before the URL
-    /// and the folder joined to the address with no slash.
+    /// and the folder joined to the address with no slash, with curl's bounds
+    /// on a stalled connect and transfer added.
     #[test]
-    fn the_curl_command_is_cs() {
+    fn the_curl_command_is_cs_bounded() {
         let (command, args) = curl_command(
             "10.0.0.5",
             "/Admin/Public/Trajectories",
@@ -170,7 +205,8 @@ mod tests {
         );
         assert_eq!(
             command,
-            "curl -k -u Administrator:pass word -T traj.trj --silent  \
+            "curl -k -u Administrator:pass word -T traj.trj --silent \
+             --connect-timeout 1 --speed-limit 1 --speed-time 1  \
              scp://10.0.0.5/Admin/Public/Trajectories/"
         );
         assert_eq!(
@@ -182,11 +218,43 @@ mod tests {
                 "-T",
                 "traj.trj",
                 "--silent",
+                "--connect-timeout",
+                "1",
+                "--speed-limit",
+                "1",
+                "--speed-time",
+                "1",
                 "scp://10.0.0.5/Admin/Public/Trajectories/"
             ]
         );
         let (_, args) = curl_command("h", "/d", "f", "u", "p", true);
         assert_eq!(args[5], "--verbose");
+    }
+
+    /// A server that takes the connection and never answers ends the curl
+    /// upload in curl's timeout status 28, where C's waits curl's 300 s.
+    #[cfg(all(unix, not(feature = "sftp")))]
+    #[test]
+    fn a_curl_upload_to_a_server_that_never_answers_times_out() {
+        let file = std::env::temp_dir().join(format!("xps-sftp-{}.trj", std::process::id()));
+        std::fs::write(&file, "0.5, 1, 2\n").unwrap();
+        let (addr, _log) = silent_server(false);
+        let name = file.to_str().unwrap().to_string();
+        let status =
+            within(move || xps_sftp_upload(&addr.to_string(), "/d", &name, "u", "p", false));
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(status, Some(28 << 8));
+    }
+
+    /// A server that takes the connection and never answers fails the
+    /// libssh2 upload, where C's waits in its handshake forever.
+    #[cfg(feature = "sftp")]
+    #[test]
+    fn a_libssh2_upload_to_a_server_that_never_answers_fails() {
+        let (addr, _log) = silent_server(false);
+        SSH_PORT.store(addr.port(), std::sync::atomic::Ordering::Relaxed);
+        let status = within(|| xps_sftp_upload("127.0.0.1", "/d", "f", "u", "p", false));
+        assert_eq!(status, Some(-1));
     }
 
     /// `system()`'s status: the wait status, and 127 from the shell for a
