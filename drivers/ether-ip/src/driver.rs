@@ -18,7 +18,6 @@ use crate::encap::{self, ETHERIP_PORT};
 use chrono::TimeZone;
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
 use epics_rs::base::server::database::{AsyncDbHandle, DeviceDone};
 use epics_rs::base::server::ioc_app::InitHookState;
 
@@ -109,7 +108,7 @@ pub struct Listener {
     /// the removal takes.
     fired: AtomicBool,
     /// Set while the record's write is PACT; the next transfer completes it.
-    pub write_done: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+    pub write_done: Mutex<Option<DeviceDone>>,
 }
 
 impl Listener {
@@ -146,13 +145,15 @@ impl TagInfo {
     /// an I/O Intr pulse.
     ///
     /// The list is copied first: a check takes the record's lock, under
-    /// which a device-link put adds and removes listeners.
+    /// which a device-link put adds and removes listeners. Every caller is a
+    /// scan thread or `drvEtherIP_restart`'s, holding no lock set, so a
+    /// pending write ends here, as C's does, and no full band can refuse it.
     pub(crate) fn notify(&self) {
         let listeners = self.listeners.lock().clone();
         for l in &listeners {
             let done = l.write_done.lock().take();
-            if let Some((done, prio)) = done {
-                let _ = done.complete(prio);
+            if let Some(done) = done {
+                done.complete_now();
                 continue;
             }
             match &l.on_transfer {

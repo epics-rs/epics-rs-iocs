@@ -836,7 +836,7 @@ impl EtherIpDevice {
         if changed {
             tag.request_write(&mut data, &self.name);
             if let (Some(done), Some(listener)) = (done, &self.listener) {
-                *listener.write_done.lock() = Some((done.device_done(), done.priority()));
+                *listener.write_done.lock() = Some(done.device_done());
             }
         }
         drop(data);
@@ -1975,6 +1975,101 @@ mod tests {
             assert!(Instant::now() < deadline, "no WRITE_ALARM");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The scan task's callback loop runs a pending write's `process`
+    /// itself (drvEtherIP.c:819-823, devEtherIP.c:336-344), not through
+    /// `callbackRequest`, so a full callback band cannot leave it PACT. In
+    /// a child process: the band's size and threads are set before it arms.
+    #[test]
+    fn a_pending_write_ends_on_its_transfer_while_its_band_is_full() {
+        use epics_rs::base::runtime::background::callback_executor::{
+            set_parallel_threads, set_queue_size,
+        };
+        use epics_rs::base::runtime::background::{CallbackBody, CallbackCell, CallbackError};
+        use epics_rs::base::runtime::task::{CallbackPriority, request_cell};
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::sync::Condvar;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "EIP_FULL_BAND_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "device::tests::a_pending_write_ends_on_its_transfer_while_its_band_is_full",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+
+        /// Holds the low band's one worker until `open`.
+        #[derive(Clone, Default)]
+        struct Hold(Arc<(std::sync::Mutex<bool>, Condvar)>);
+        impl CallbackBody for Hold {
+            fn run(&self) {
+                let (open, wake) = &*self.0;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = wake.wait(open).unwrap();
+                }
+            }
+        }
+        impl Hold {
+            fn open(&self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+
+        // The record's PRIO is LOW.
+        set_queue_size(1);
+        set_parallel_threads(1, Some(CallbackPriority::Low));
+        epics_rs::base::runtime::task::background_arm();
+        let rt = current_thread();
+        let db = eip_db("fullband");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AOFULL",
+            Box::new(AoRecord::default()),
+            "fullband",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        let hold = Hold::default();
+        let full = (0..64).any(|_| {
+            match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
+                Ok(()) => false,
+                Err(CallbackError::QueueFull) => true,
+                Err(e) => panic!("{e:?}"),
+            }
+        });
+        assert!(full, "the low band never filled");
+
+        rt.block_on(db.put_record_field_from_ca_no_notify(
+            "AOFULL",
+            "VAL",
+            EpicsValue::Double(3.0),
+        ))
+        .unwrap();
+        let pact = || db.get_record("AOFULL").unwrap().read().is_processing();
+        assert!(pact(), "the write is pending");
+        // The transfer that sent it, as scan_pass announces it.
+        tag.notify();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pact() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ended = !pact();
+        hold.open();
+        assert!(ended, "PACT after the write's transfer");
     }
 
     /// A disconnected tag leaves an output in WRITE_ALARM, as C's ao_write.
