@@ -98,7 +98,7 @@ pub enum Command {
 /// (drvMW100.c:1418-1424).
 enum Done {
     /// A read left PACT by `read_begin`; its re-entered pass reads the cache.
-    Read(DeviceDone),
+    Read(DeviceDone, Arc<ReadFailure>),
     /// A write left PACT by `write_begin`.
     Write(DeviceDone),
     NoRecord,
@@ -112,9 +112,13 @@ impl Done {
     // queue_func's `dbScanLock; process; dbScanUnlock` on the queue thread
     // (drvMW100.c:1418-1424), not through a callback band that can refuse
     // it. That thread holds no lock set.
-    fn run(self) {
+    /// `answered`: the command got the reply it asked for.
+    fn run(self, answered: bool) {
         match self {
-            Done::Read(done) => done.reprocess_now(),
+            Done::Read(done, failure) => {
+                failure.0.store(!answered, Ordering::Release);
+                done.reprocess_now();
+            }
             Done::Write(done) => done.complete_now(),
             Done::NoRecord => {}
             #[cfg(test)]
@@ -126,11 +130,29 @@ impl Done {
     }
 }
 
-/// A queued job's pass, ended once, on the queue thread, by its drop: after
-/// the command ran, or when the [`Link`] holding it drops.
+/// Whether a record's latest queued read went without the data it asked
+/// for: written before its pass re-enters, taken by that pass.
+#[derive(Default)]
+pub struct ReadFailure(AtomicBool);
+
+impl ReadFailure {
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::Acquire)
+    }
+}
+
+/// A queued job's pass, ended once, on the queue thread: by
+/// [`Pass::end`] after the command ran, or by its drop when the [`Link`]
+/// holding it drops.
 struct Pass(Option<Done>);
 
 impl Pass {
+    fn end(mut self, answered: bool) {
+        if let Some(done) = self.0.take() {
+            done.run(answered);
+        }
+    }
+
     /// The job never queued; its caller ends the pass instead.
     fn defuse(mut self) {
         self.0 = None;
@@ -140,7 +162,7 @@ impl Pass {
 impl Drop for Pass {
     fn drop(&mut self) {
         if let Some(done) = self.0.take() {
-            done.run();
+            done.run(false);
         }
     }
 }
@@ -582,8 +604,15 @@ impl Instrument {
     /// [`Self::submit_write`] does. False when nothing was queued: a Signal
     /// channel with no recognized type, which C leaves PACT with no packet,
     /// or a unit with no queue thread, whose packet C leaves on a list
-    /// nobody drains; this port ends either pass at once.
-    pub fn channel_start(&self, family: ChannelFamily, channel: u32, done: DeviceDone) -> bool {
+    /// nobody drains; this port ends either pass at once. `failure` is
+    /// set when the unit answers with anything but the data.
+    pub fn channel_start(
+        &self,
+        family: ChannelFamily,
+        channel: u32,
+        done: DeviceDone,
+        failure: &Arc<ReadFailure>,
+    ) -> bool {
         let command = match family {
             ChannelFamily::Signal => match self.channel_type(channel) {
                 ChannelType::InputAnalog | ChannelType::InputInteger | ChannelType::InputBinary => {
@@ -598,7 +627,7 @@ impl Instrument {
             ChannelFamily::Comm => Command::ReadComm(channel),
             ChannelFamily::Const => Command::ReadConst(channel),
         };
-        self.send(command, Done::Read(done))
+        self.send(command, Done::Read(done, failure.clone()))
     }
 }
 
@@ -621,8 +650,10 @@ impl Actor {
         }
         while let Some(Job { command, pass }) = self.link.next_job() {
             self.link.running = Some(pass);
-            let _ = self.process(command);
-            drop(self.link.running.take());
+            let answered = self.process(command).is_ok();
+            if let Some(pass) = self.link.running.take() {
+                pass.end(answered);
+            }
         }
     }
 

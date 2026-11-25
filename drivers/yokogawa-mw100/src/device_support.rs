@@ -23,7 +23,7 @@
 //!   one dispatcher, reused everywhere the C source reuses it.
 
 use crate::codec;
-use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
+use crate::instrument::{Command, Instrument, InterruptCategory, ReadFailure, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::sync::mpsc::{self, Receiver, Sender};
@@ -32,7 +32,7 @@ use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
     WriteStart,
 };
-use epics_rs::base::server::recgbl::alarm_status::COMM_ALARM;
+use epics_rs::base::server::recgbl::alarm_status::{COMM_ALARM, READ_ALARM};
 use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 use epics_rs::ca::server::ioc_app::DeviceSupportContext;
@@ -574,9 +574,19 @@ pub struct MwDevice {
     record_type: &'static str,
     /// Senders of the dummy IOSCANPVT an invalid input record scans on.
     dummy_scan: Vec<Sender<()>>,
-    /// The latest pass met an offline unit: its read had only the stale
-    /// cache, or its write never reached the queue.
-    offline: bool,
+    /// Why the latest pass has no current value or its write never landed.
+    fault: Option<Fault>,
+    /// The outcome of this record's queued reads.
+    read_failure: Arc<ReadFailure>,
+}
+
+#[derive(Clone, Copy)]
+enum Fault {
+    /// The unit was unreachable: a read had only the stale cache, or a
+    /// write never reached it.
+    Offline,
+    /// The unit answered the pass's queued read with an error.
+    ReadFailed,
 }
 
 impl MwDevice {
@@ -588,7 +598,8 @@ impl MwDevice {
             resolved: None,
             record_type: "",
             dummy_scan: Vec::new(),
-            offline: false,
+            fault: None,
+            read_failure: Arc::default(),
         }
     }
 }
@@ -659,12 +670,19 @@ impl DeviceSupport for MwDevice {
             return Ok(ReadStart::Synchronous);
         }
         let queued = match *op {
-            Operation::AnalogVal(addr) => {
-                instrument.channel_start(addr.family, addr.index, done.device_done())
-            }
-            Operation::IntegerVal(channel) | Operation::BinaryVal(channel) => {
-                instrument.channel_start(ChannelFamily::Signal, channel, done.device_done())
-            }
+            Operation::AnalogVal(addr) => instrument.channel_start(
+                addr.family,
+                addr.index,
+                done.device_done(),
+                &self.read_failure,
+            ),
+            Operation::IntegerVal(channel) | Operation::BinaryVal(channel) => instrument
+                .channel_start(
+                    ChannelFamily::Signal,
+                    channel,
+                    done.device_done(),
+                    &self.read_failure,
+                ),
             _ => false,
         };
         Ok(if queued {
@@ -674,15 +692,25 @@ impl DeviceSupport for MwDevice {
         })
     }
 
-    // C serves an offline unit's cache as if current; this pass keeps the
+    // C serves the cache as if current on an offline unit, and after the
+    // unit answered the queued read with an error: `load_input_values` and
+    // `load_output_values` return 1 and `command_process` drops it
+    // (drvMW100.c:1074-1075, 1162-1163, 1349-1394). This pass keeps the
     // record's value and alarms instead. The configured address is the one
     // value not read from the unit.
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
             return Ok(DeviceReadOutcome::ok());
         };
-        self.offline = !matches!(op, Operation::IpAddr) && !instrument.online();
-        if self.offline {
+        let read_failed = self.read_failure.take();
+        self.fault = if !matches!(op, Operation::IpAddr) && !instrument.online() {
+            Some(Fault::Offline)
+        } else if read_failed {
+            Some(Fault::ReadFailed)
+        } else {
+            None
+        };
+        if self.fault.is_some() {
             return Ok(DeviceReadOutcome::failed());
         }
         match *op {
@@ -836,8 +864,9 @@ impl DeviceSupport for MwDevice {
             return Ok(WriteStart::Completed);
         };
         let command = output_command(*op, record)?;
-        self.offline = !instrument.submit_write(command, done.device_done());
-        if self.offline {
+        let queued = instrument.submit_write(command, done.device_done());
+        self.fault = (!queued).then_some(Fault::Offline);
+        if !queued {
             return Err(CaError::LinkError(
                 "MW100 device support: unit offline".into(),
             ));
@@ -846,8 +875,12 @@ impl DeviceSupport for MwDevice {
     }
 
     fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
-        self.offline.then_some(DeviceAlarm {
-            stat: COMM_ALARM,
+        let stat = match self.fault? {
+            Fault::Offline => COMM_ALARM,
+            Fault::ReadFailed => READ_ALARM,
+        };
+        Some(DeviceAlarm {
+            stat,
             sevr: AlarmSeverity::Invalid as u16,
             msg: "",
         })
@@ -860,7 +893,7 @@ impl DeviceSupport for MwDevice {
         let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
             return;
         };
-        self.offline = !instrument.online();
+        self.fault = (!instrument.online()).then_some(Fault::Offline);
         if matches!(
             op,
             Operation::InputTrig
@@ -1960,6 +1993,33 @@ record(ao, "AO") {{
                 [after_wire_error, after_good_frame],
                 [
                     (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (NO_ALARM, EpicsValue::Double(5.678))
+                ],
+                "(PACT, STAT, SEVR) and VAL after each read"
+            );
+        });
+    }
+
+    /// A reachable unit that answers the read with a device error has no
+    /// current value for it: the pass keeps VAL and ends with READ_ALARM,
+    /// INVALID. The next read the unit answers with data clears it.
+    #[test]
+    fn a_device_error_reply_to_a_read_ends_its_pass_with_read_alarm() {
+        test_block_on(async {
+            let (db, _device) = ai_and_ao(
+                "",
+                vec![b"E1 205 x\r\n".to_vec(), fd1_binary_channel_1(5678)],
+            )
+            .await;
+            let after_device_error = proc_ai(&db).await;
+            let after_data = proc_ai(&db).await;
+            assert_eq!(
+                [after_device_error, after_data],
+                [
+                    (
+                        (false, EpicsValue::Short(1), EpicsValue::Short(3)),
+                        EpicsValue::Double(0.0)
+                    ),
                     (NO_ALARM, EpicsValue::Double(5.678))
                 ],
                 "(PACT, STAT, SEVR) and VAL after each read"
