@@ -95,14 +95,33 @@ pub enum Command {
 }
 
 /// Run by the actor once its command was processed — C `queue_func`'s
-/// `rset->process` call (`drvGM10.c:1327-1332`).
-type Completion = Box<dyn FnOnce() + Send>;
+/// `rset->process` call (`drvGM10.c:1327-1332`); its argument says whether
+/// the command got the reply it asked for.
+type Completion = Box<dyn FnOnce(bool) + Send>;
 
-/// A queued job's pass, ended once, on the queue thread, by its drop: after
-/// the command ran, or when the [`Link`] holding it drops.
+/// Whether a record's latest queued read went without the data it asked
+/// for: written before its pass re-enters, taken by that pass.
+#[derive(Default)]
+pub struct ReadFailure(AtomicBool);
+
+impl ReadFailure {
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::Acquire)
+    }
+}
+
+/// A queued job's pass, ended once, on the queue thread: by
+/// [`Pass::end`] after the command ran, or by its drop when the [`Link`]
+/// holding it drops.
 struct Pass(Option<Completion>);
 
 impl Pass {
+    fn end(mut self, answered: bool) {
+        if let Some(done) = self.0.take() {
+            done(answered);
+        }
+    }
+
     /// The job never queued; its caller ends the pass instead.
     fn defuse(mut self) {
         self.0 = None;
@@ -112,7 +131,7 @@ impl Pass {
 impl Drop for Pass {
     fn drop(&mut self) {
         if let Some(done) = self.0.take() {
-            done();
+            done(false);
         }
     }
 }
@@ -239,7 +258,7 @@ impl Instrument {
         // queue_func's `dbScanLock; process; dbScanUnlock` on the actor
         // thread (drvGM10.c:1327-1332), which holds no lock set, not through
         // a callback band that can refuse it.
-        self.enqueue(command, Box::new(move || done.complete_now()))
+        self.enqueue(command, Box::new(move |_| done.complete_now()))
     }
 
     /// The unit is reachable now: the queue thread's latest exchange read a
@@ -258,7 +277,7 @@ impl Instrument {
         // `set_mode` takes 0 or 1, so `SetOpMode(2)` sends nothing.
         assert!(self.enqueue(
             Command::SetOpMode(2),
-            Box::new(move || {
+            Box::new(move |_| {
                 let _ = panic.recv();
                 panic!("the queue thread panics, for a test");
             }),
@@ -277,7 +296,7 @@ impl Instrument {
     #[cfg(test)]
     pub(crate) fn panic_queue_thread(&self) {
         let _ = self.queue_panic().send(());
-        while self.enqueue(Command::SetOpMode(2), Box::new(|| {})) {
+        while self.enqueue(Command::SetOpMode(2), Box::new(|_| {})) {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
@@ -288,7 +307,7 @@ impl Instrument {
         let (done_tx, done_rx) = mpsc::channel();
         self.enqueue(
             command,
-            Box::new(move || {
+            Box::new(move |_| {
                 let _ = done_tx.send(());
             }),
         );
@@ -522,8 +541,15 @@ impl Instrument {
     /// [`Self::submit_write`] ends a write's. False when nothing was queued:
     /// a Signal channel with no recognized type, which C leaves PACT with no
     /// packet, or a unit with no queue thread, whose packet C leaves on a
-    /// list nobody drains; this port ends either pass at once.
-    pub fn channel_start(&self, family: ChannelFamily, channel: u32, done: DeviceDone) -> bool {
+    /// list nobody drains; this port ends either pass at once. `failure`
+    /// is set when the unit answers with anything but the data.
+    pub fn channel_start(
+        &self,
+        family: ChannelFamily,
+        channel: u32,
+        done: DeviceDone,
+        failure: &Arc<ReadFailure>,
+    ) -> bool {
         if family == ChannelFamily::Signal
             && matches!(
                 self.channel_type(channel),
@@ -539,7 +565,14 @@ impl Instrument {
             ChannelFamily::Const => Command::ReadConst(channel),
             ChannelFamily::VarConst => Command::ReadVarConst(channel),
         };
-        self.enqueue(command, Box::new(move || done.reprocess_now()))
+        let failure = failure.clone();
+        self.enqueue(
+            command,
+            Box::new(move |answered| {
+                failure.0.store(!answered, Ordering::Release);
+                done.reprocess_now();
+            }),
+        )
     }
 }
 
@@ -564,8 +597,10 @@ impl Actor {
         }
         while let Ok(Job { command, pass }) = self.link.rx.recv() {
             self.link.running = Some(pass);
-            let _ = self.process(command);
-            drop(self.link.running.take());
+            let answered = self.process(command).is_ok();
+            if let Some(pass) = self.link.running.take() {
+                pass.end(answered);
+            }
         }
     }
 
@@ -793,7 +828,7 @@ impl Actor {
             // `qmesg(dq, NULL, CMD_READ_ALL_INFOS, ..)` (`drvGM10.c:646`).
             let _ = self.requeue.send(Job {
                 command: Command::ReadAllInfos,
-                pass: Pass(Some(Box::new(|| {}))),
+                pass: Pass(Some(Box::new(|_| {}))),
             });
         }
         Ok(())
@@ -1507,7 +1542,7 @@ mod tests {
         let cache = instrument.cache.clone();
         instrument.enqueue(
             Command::ClearError,
-            Box::new(move || {
+            Box::new(move |_| {
                 let _ = tx.send(cache.lock().error.code);
             }),
         );
@@ -1722,8 +1757,8 @@ mod tests {
         let instrument = Instrument::connect_to(addr).unwrap();
         instrument.submit(Command::ReadStatus);
         // Both queued before the actor can finish the ReadStatus round trips.
-        instrument.enqueue(Command::ReadStatus, Box::new(|| {}));
-        instrument.enqueue(Command::ClearError, Box::new(|| {}));
+        instrument.enqueue(Command::ReadStatus, Box::new(|_| {}));
+        instrument.enqueue(Command::ClearError, Box::new(|_| {}));
         let received = device.join().unwrap();
         assert_eq!(
             received[received.len() - 7..],

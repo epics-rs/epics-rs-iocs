@@ -12,7 +12,7 @@
 //! the single place that mirrors every `devGM10_*.c::init_record`'s
 //! command/address validation.
 
-use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
+use crate::instrument::{Command, Instrument, InterruptCategory, ReadFailure, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::database::DeviceDoneSource;
@@ -20,7 +20,7 @@ use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
     WriteStart,
 };
-use epics_rs::base::server::recgbl::alarm_status::COMM_ALARM;
+use epics_rs::base::server::recgbl::alarm_status::{COMM_ALARM, READ_ALARM};
 use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 use epics_rs::ca::server::ioc_app::DeviceSupportContext;
@@ -468,9 +468,19 @@ pub struct GmDevice {
     resolved: Option<Resolved>,
     /// Keeps the never-fired `dummy_ioscanpvt` receiver open.
     dummy_ioscan: Option<tokio::sync::mpsc::Sender<()>>,
-    /// The latest pass met an offline unit: its read had only the stale
-    /// cache, or its write never reached the queue.
-    offline: bool,
+    /// Why the latest pass has no current value or its write never landed.
+    fault: Option<Fault>,
+    /// The outcome of this record's queued reads.
+    read_failure: Arc<ReadFailure>,
+}
+
+#[derive(Clone, Copy)]
+enum Fault {
+    /// The unit was unreachable: a read had only the stale cache, or a
+    /// write never reached it.
+    Offline,
+    /// The unit answered the pass's queued read with an error.
+    ReadFailed,
 }
 
 impl GmDevice {
@@ -482,7 +492,8 @@ impl GmDevice {
             is_io_intr: false,
             resolved: None,
             dummy_ioscan: None,
-            offline: false,
+            fault: None,
+            read_failure: Arc::default(),
         }
     }
 
@@ -564,12 +575,19 @@ impl DeviceSupport for GmDevice {
             return Ok(ReadStart::Synchronous);
         }
         let queued = match *op {
-            Operation::AnalogVal(addr) => {
-                instrument.channel_start(addr.family, addr.index, done.device_done())
-            }
-            Operation::IntegerVal(channel) | Operation::BinaryVal(channel) => {
-                instrument.channel_start(ChannelFamily::Signal, channel, done.device_done())
-            }
+            Operation::AnalogVal(addr) => instrument.channel_start(
+                addr.family,
+                addr.index,
+                done.device_done(),
+                &self.read_failure,
+            ),
+            Operation::IntegerVal(channel) | Operation::BinaryVal(channel) => instrument
+                .channel_start(
+                    ChannelFamily::Signal,
+                    channel,
+                    done.device_done(),
+                    &self.read_failure,
+                ),
             _ => false,
         };
         Ok(if queued {
@@ -579,15 +597,25 @@ impl DeviceSupport for GmDevice {
         })
     }
 
-    // C serves an offline unit's cache as if current; this pass keeps the
-    // record's value and alarms instead. The configured address is the one
-    // value not read from the unit.
+    // C serves the cache as if current on an offline unit, and after the
+    // unit answered the queued read with an error: `load_data_values` and
+    // `load_misc_values` return 1 and `command_process` drops it
+    // (drvGM10.c:965-966, 1102-1103, 1130-1131, 1263-1309). This pass keeps
+    // the record's value and alarms instead. The configured address is the
+    // one value not read from the unit.
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let Some(Resolved { instrument, op }) = &self.resolved else {
             return Ok(DeviceReadOutcome::ok());
         };
-        self.offline = !matches!(op, Operation::IpAddr) && !instrument.online();
-        if self.offline {
+        let read_failed = self.read_failure.take();
+        self.fault = if !matches!(op, Operation::IpAddr) && !instrument.online() {
+            Some(Fault::Offline)
+        } else if read_failed {
+            Some(Fault::ReadFailed)
+        } else {
+            None
+        };
+        if self.fault.is_some() {
             return Ok(DeviceReadOutcome::failed());
         }
         match *op {
@@ -723,8 +751,9 @@ impl DeviceSupport for GmDevice {
         else {
             return Ok(WriteStart::Completed);
         };
-        self.offline = !instrument.submit_write(command, done.device_done());
-        if self.offline {
+        let queued = instrument.submit_write(command, done.device_done());
+        self.fault = (!queued).then_some(Fault::Offline);
+        if !queued {
             return Err(CaError::LinkError(
                 "GM10 device support: unit offline".into(),
             ));
@@ -733,8 +762,12 @@ impl DeviceSupport for GmDevice {
     }
 
     fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
-        self.offline.then_some(DeviceAlarm {
-            stat: COMM_ALARM,
+        let stat = match self.fault? {
+            Fault::Offline => COMM_ALARM,
+            Fault::ReadFailed => READ_ALARM,
+        };
+        Some(DeviceAlarm {
+            stat,
             sevr: AlarmSeverity::Invalid as u16,
             msg: "",
         })
@@ -747,7 +780,7 @@ impl DeviceSupport for GmDevice {
         let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
             return;
         };
-        self.offline = !instrument.online();
+        self.fault = (!instrument.online()).then_some(Fault::Offline);
         if matches!(
             op,
             Operation::ChanTrig
@@ -1705,6 +1738,37 @@ record(ao, "AO") {{
         (false, EpicsValue::Short(9), EpicsValue::Short(3));
     const NO_ALARM: (bool, EpicsValue, EpicsValue) =
         (false, EpicsValue::Short(0), EpicsValue::Short(0));
+
+    /// A reachable unit that answers the read with a device error has no
+    /// current value for it: the pass keeps VAL and ends with READ_ALARM,
+    /// INVALID. The next read the unit answers with data clears it.
+    #[test]
+    fn a_device_error_reply_to_a_read_ends_its_pass_with_read_alarm() {
+        epics_rs::base::runtime::task::test_block_on(async {
+            let (db, _device) = ai_and_ao(
+                "",
+                vec![
+                    b"E1,205:1:12\r\n".to_vec(),
+                    ascii_frame(b"junk 'Something broke' junk"),
+                    channel_1_reads_5678(),
+                ],
+            )
+            .await;
+            let after_device_error = proc_ai(&db).await;
+            let after_data = proc_ai(&db).await;
+            assert_eq!(
+                [after_device_error, after_data],
+                [
+                    (
+                        (false, EpicsValue::Short(1), EpicsValue::Short(3)),
+                        EpicsValue::Double(0.0)
+                    ),
+                    (NO_ALARM, EpicsValue::Double(5.678))
+                ],
+                "(PACT, STAT, SEVR) and VAL after each read"
+            );
+        });
+    }
 
     /// The unit hangs up once it loaded: the read finds no reply and keeps
     /// VAL, the write never lands, and both passes end with COMM_ALARM.
