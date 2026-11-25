@@ -186,12 +186,19 @@ impl Instrument {
     /// C `qmesg(dq, precord, ...)`: queue `command` and return at once; the
     /// actor ends `done`'s pass once it has run. C's `command_process`
     /// discards every handler's status (`drvGM10.c:1263-1309`), so a device
-    /// or wire error cannot alarm.
-    pub fn submit_write(&self, command: Command, done: DeviceDone) {
+    /// or wire error cannot alarm. False as [`Instrument::enqueue`].
+    pub fn submit_write(&self, command: Command, done: DeviceDone) -> bool {
         // queue_func's `dbScanLock; process; dbScanUnlock` on the actor
         // thread (drvGM10.c:1327-1332), which holds no lock set, not through
         // a callback band that can refuse it.
-        self.enqueue(command, Box::new(move || done.complete_now()));
+        self.enqueue(command, Box::new(move || done.complete_now()))
+    }
+
+    /// The queue thread started, which it does only when `init_gm10`
+    /// connected and loaded the unit (drvGM10.c:1376-1465); otherwise
+    /// nothing ever refreshes the cache.
+    pub fn online(&self) -> bool {
+        self.tx.get().is_some()
     }
 
     /// Test only: block until the actor has processed `command`.
@@ -434,7 +441,7 @@ impl Instrument {
     /// [`Self::submit_write`] ends a write's. False when nothing was queued:
     /// a Signal channel with no recognized type, which C leaves PACT with no
     /// packet, or a unit with no queue thread, whose packet C leaves on a
-    /// list nobody drains; this port reads either from the cache at once.
+    /// list nobody drains; this port ends either pass at once.
     pub fn channel_start(&self, family: ChannelFamily, channel: u32, done: DeviceDone) -> bool {
         if family == ChannelFamily::Signal
             && matches!(

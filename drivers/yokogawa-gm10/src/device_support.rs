@@ -17,9 +17,11 @@ use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart, WriteStart,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
+    WriteStart,
 };
-use epics_rs::base::server::record::{Record, ScanType};
+use epics_rs::base::server::recgbl::alarm_status::COMM_ALARM;
+use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 use epics_rs::ca::server::ioc_app::DeviceSupportContext;
 use std::sync::Arc;
@@ -466,6 +468,9 @@ pub struct GmDevice {
     resolved: Option<Resolved>,
     /// Keeps the never-fired `dummy_ioscanpvt` receiver open.
     dummy_ioscan: Option<tokio::sync::mpsc::Sender<()>>,
+    /// The latest pass met an offline unit: its read had only the stale
+    /// cache, or its write never reached the queue.
+    offline: bool,
 }
 
 impl GmDevice {
@@ -477,6 +482,7 @@ impl GmDevice {
             is_io_intr: false,
             resolved: None,
             dummy_ioscan: None,
+            offline: false,
         }
     }
 
@@ -573,10 +579,17 @@ impl DeviceSupport for GmDevice {
         })
     }
 
+    // C serves an offline unit's cache as if current; this pass keeps the
+    // record's value and alarms instead. The configured address is the one
+    // value not read from the unit.
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let Some(Resolved { instrument, op }) = &self.resolved else {
             return Ok(DeviceReadOutcome::ok());
         };
+        self.offline = !matches!(op, Operation::IpAddr) && !instrument.online();
+        if self.offline {
+            return Ok(DeviceReadOutcome::failed());
+        }
         match *op {
             Operation::AnalogVal(addr) => {
                 let v = instrument.analog_get(addr.family, addr.index);
@@ -697,7 +710,9 @@ impl DeviceSupport for GmDevice {
     }
 
     /// C `write_*` sets PACT and `qmesg`s the command; `queue_func` ends the
-    /// cycle once it ran (`drvGM10.c:1311-1338`).
+    /// cycle once it ran (`drvGM10.c:1311-1338`). A command nothing queued
+    /// fails the pass now, where C's `qmesg` leaves the record PACT for good
+    /// on a unit `init_gm10` gave up on.
     fn write_begin(
         &mut self,
         record: &mut dyn Record,
@@ -708,8 +723,21 @@ impl DeviceSupport for GmDevice {
         else {
             return Ok(WriteStart::Completed);
         };
-        instrument.submit_write(command, done.device_done());
+        self.offline = !instrument.submit_write(command, done.device_done());
+        if self.offline {
+            return Err(CaError::LinkError(
+                "GM10 device support: unit offline".into(),
+            ));
+        }
         Ok(WriteStart::Pending)
+    }
+
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        self.offline.then_some(DeviceAlarm {
+            stat: COMM_ALARM,
+            sevr: AlarmSeverity::Invalid as u16,
+            msg: "",
+        })
     }
 
     // devGM10_bo.c:192-197: the completing pass drops a REC_TRIG or
@@ -1547,10 +1575,8 @@ record(ao, "AO") {{
         fdata_binary(&[(1, 1, 0, [0; 4], 5678)])
     }
 
-    /// A read on a unit that never connected has no queue thread to end
-    /// it, so the pass that starts it ends it.
-    #[test]
-    fn a_read_on_an_offline_unit_ends_its_pass() {
+    /// `records` over a unit that never connected.
+    async fn offline_db(records: &str) -> Arc<epics_rs::base::server::database::PvDatabase> {
         use epics_rs::base::server::ioc_builder::IocBuilder;
         use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
         static AI: &[DevSup] = &[DevSup {
@@ -1559,24 +1585,78 @@ record(ao, "AO") {{
             link_type: DbLinkType::InstIo,
             dset: Dset::new(6, &[2, 3, 4], false),
         }];
+        static AO: &[DevSup] = &[DevSup {
+            name: "devGM10_ao",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }];
+        let (db, _) = IocBuilder::new()
+            .register_dynamic_device_support(
+                &[("ai", AI), ("ao", AO)],
+                factory(registry_with_offline("gm10dev")),
+            )
+            .db_string(records, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db
+    }
+
+    /// (PACT, STAT, SEVR) of `name`.
+    fn pact_and_alarm(
+        db: &epics_rs::base::server::database::PvDatabase,
+        name: &str,
+    ) -> (bool, EpicsValue, EpicsValue) {
+        (
+            db.get_record(name).unwrap().read().is_processing(),
+            db.get_pv(format!("{name}.STAT")).unwrap(),
+            db.get_pv(format!("{name}.SEVR")).unwrap(),
+        )
+    }
+
+    /// A read on a unit that never connected has no queue thread to end
+    /// it and nothing current to serve: the pass that starts it ends it,
+    /// keeps VAL and fails with COMM_ALARM, INVALID.
+    #[test]
+    fn a_read_on_an_offline_unit_ends_its_pass_with_comm_alarm() {
         let records = format!(
-            r#"record(ai, "AI") {{ field(DTYP, "{DTYP}") field(INP, "@gm10dev VAL:K1") }}"#
+            r#"record(ai, "AI") {{ field(DTYP, "{DTYP}") field(INP, "@gm10dev VAL:K1") field(VAL, "7") }}"#
         );
         epics_rs::base::runtime::task::test_block_on(async {
-            let (db, _) = IocBuilder::new()
-                .register_dynamic_device_support(
-                    &[("ai", AI)],
-                    factory(registry_with_offline("gm10dev")),
-                )
-                .db_string(&records, &HashMap::new())
-                .unwrap()
-                .build()
-                .await
-                .unwrap();
-            db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
-                .await
-                .unwrap();
-            assert!(!db.get_record("AI").unwrap().read().is_processing());
+            let db = offline_db(&records).await;
+            let put = db
+                .put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                .await;
+            assert_eq!(
+                pact_and_alarm(&db, "AI"),
+                (false, EpicsValue::Short(9), EpicsValue::Short(3)),
+                "PACT, STAT, SEVR"
+            );
+            assert!(put.is_err(), "the put fails with the pass");
+            assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(7.0));
+        });
+    }
+
+    /// A write to a unit that never connected never reaches it: the pass
+    /// ends now with COMM_ALARM, INVALID and the put fails.
+    #[test]
+    fn a_write_to_an_offline_unit_ends_its_pass_with_comm_alarm() {
+        let records = format!(
+            r#"record(ao, "AO") {{ field(DTYP, "{DTYP}") field(OUT, "@gm10dev VAL:K1") }}"#
+        );
+        epics_rs::base::runtime::task::test_block_on(async {
+            let db = offline_db(&records).await;
+            let put = db
+                .put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                .await;
+            assert_eq!(
+                pact_and_alarm(&db, "AO"),
+                (false, EpicsValue::Short(9), EpicsValue::Short(3)),
+                "PACT, STAT, SEVR"
+            );
+            assert!(put.is_err(), "the put fails with the pass");
         });
     }
 
