@@ -107,14 +107,53 @@ pub struct Listener {
     /// the device bound since. C walks the list under `plc->lock`, which
     /// the removal takes.
     fired: AtomicBool,
-    /// Set while the record's write is PACT; the next transfer completes it.
-    pub write_done: Mutex<Option<DeviceDone>>,
+    write: Mutex<WriteSlot>,
+}
+
+/// A bound record's write, from its staging to the pass that ends it.
+#[derive(Default)]
+enum WriteSlot {
+    #[default]
+    Idle,
+    /// The record is PACT on it; the tag's next callback ends it.
+    Pending(DeviceDone),
+    /// Ended by [`WriteEnd::Failed`]; its completion pass takes this.
+    Failed,
+}
+
+/// How a tag's callback ends the writes pending on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteEnd {
+    /// As C ends a PACT write: on any callback of its tag.
+    Ended,
+    /// With WRITE_ALARM: `invalidate_tags` dropped it, or the PLC refused it.
+    Failed,
 }
 
 impl Listener {
     /// Whether a transfer is running this listener's check, consumed.
     pub fn take_fired(&self) -> bool {
         self.fired.swap(false, Ordering::AcqRel)
+    }
+
+    /// Hold the record PACT on its staged write until a callback ends it.
+    pub fn stage_write(&self, done: DeviceDone) {
+        *self.write.lock() = WriteSlot::Pending(done);
+    }
+
+    /// Whether the record is PACT on a staged write.
+    pub fn write_pending(&self) -> bool {
+        matches!(*self.write.lock(), WriteSlot::Pending(_))
+    }
+
+    /// Whether the write whose completion pass is running failed, consumed.
+    pub fn take_failed_write(&self) -> bool {
+        let mut write = self.write.lock();
+        let failed = matches!(*write, WriteSlot::Failed);
+        if failed {
+            *write = WriteSlot::Idle;
+        }
+        failed
     }
 }
 
@@ -148,10 +187,24 @@ impl TagInfo {
     /// which a device-link put adds and removes listeners. Every caller is a
     /// scan thread or `drvEtherIP_restart`'s, holding no lock set, so a
     /// pending write ends here, as C's does, and no full band can refuse it.
-    pub(crate) fn notify(&self) {
+    pub(crate) fn notify(&self, end: WriteEnd) {
         let listeners = self.listeners.lock().clone();
         for l in &listeners {
-            let done = l.write_done.lock().take();
+            let done = {
+                let mut write = l.write.lock();
+                match std::mem::take(&mut *write) {
+                    WriteSlot::Pending(done) => {
+                        if end == WriteEnd::Failed {
+                            *write = WriteSlot::Failed;
+                        }
+                        Some(done)
+                    }
+                    other => {
+                        *write = other;
+                        None
+                    }
+                }
+            };
             if let Some(done) = done {
                 done.complete_now();
                 continue;
@@ -177,7 +230,7 @@ impl TagInfo {
             tx,
             on_transfer,
             fired: AtomicBool::new(false),
-            write_done: Mutex::new(None),
+            write: Mutex::default(),
         });
         self.listeners.lock().push(l.clone());
         l
@@ -351,7 +404,7 @@ impl Plc {
                     d.do_write = false;
                     d.valid_data_size = 0;
                 }
-                info.notify();
+                info.notify(WriteEnd::Failed);
             }
         }
     }
@@ -389,6 +442,14 @@ pub fn define_plc(name: &str, ip_addr: &str, slot: u8) -> Arc<Plc> {
     let plc = Arc::new(Plc::new(name, ip_addr, slot));
     reg.push(plc.clone());
     plc
+}
+
+/// [`define_plc`] for a test's fake PLC on 127.0.0.1:`port`.
+#[cfg(test)]
+pub(crate) fn define_plc_on_port(name: &str, port: u16) {
+    REGISTRY
+        .lock()
+        .push(Arc::new(Plc::on_port(name, "127.0.0.1", 0, port)));
 }
 
 /// `drvEtherIP_find_PLC`.
@@ -960,8 +1021,8 @@ fn process_scan_list(c: &mut Connection, list: &Arc<ScanList>) -> bool {
                 release_writes(&items);
                 return false;
             };
-            apply_response(item, sub, transfer_time);
-            item.info.notify();
+            let end = apply_response(item, sub, transfer_time);
+            item.info.notify(end);
         }
 
         start = next;
@@ -992,7 +1053,7 @@ fn print_rejected(tag: &str, size: usize) {
     );
 }
 
-fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
+fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) -> WriteEnd {
     let mut d = item.info.data.lock();
     d.transfer_time = transfer_time;
 
@@ -1001,8 +1062,9 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
         if !cip::check_write_data_response(sub) {
             crate::eip_printf_time!(0, "EIP: CIPWrite failed for '{}'\n", item.info.string_tag);
             d.valid_data_size = 0;
+            return WriteEnd::Failed;
         }
-        return;
+        return WriteEnd::Ended;
     }
 
     match cip::check_read_data_response(sub, sub.len()) {
@@ -1026,6 +1088,7 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
         }
         _ => d.valid_data_size = 0,
     }
+    WriteEnd::Ended
 }
 
 // ---------------------------------------------------------------------------
