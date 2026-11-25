@@ -21,13 +21,13 @@ use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
-use crate::{Reentry, Unconnected};
+use crate::{Reentry, Refused, Unconnected};
 use protocol::{INVALID_VALUE, NCHAR, READ_COMMAND, TERM, parse_position};
 
 /// The `device(ai,INST_IO,devAiHeidND261,…)` line of `ipSupport.dbd`.
@@ -146,6 +146,10 @@ impl DevHeidNd261 {
         }
     }
 
+    fn refused(&self) -> Option<Refused> {
+        self.live.as_ref().and_then(|l| l.job.reentry.refused())
+    }
+
     /// `completeIO`.
     fn complete(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let Some(live) = self.live.as_ref() else {
@@ -232,8 +236,7 @@ impl DeviceSupport for DevHeidNd261 {
         Ok(DeviceInitOutcome::ok())
     }
 
-    /// `io` with `pact == 0`. A refused `queueRequest` returns -1 with PACT
-    /// already set, so the record stays active, as in C.
+    /// `io` with `pact == 0`.
     fn read_begin(
         &mut self,
         _record: &mut dyn Record,
@@ -251,18 +254,25 @@ impl DeviceSupport for DevHeidNd261 {
                 .reentry
                 .queue(&live.job.handle, &live.cell, &user, done, false)
             {
-                Ok(QueueOutcome::Queued) | Err(_) => ReadStart::Pending,
-                Ok(QueueOutcome::Ran) => ReadStart::Synchronous,
+                Ok(QueueOutcome::Queued) => ReadStart::Pending,
+                Ok(QueueOutcome::Ran) | Err(_) => ReadStart::Synchronous,
             },
         )
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        if self.refused().is_some() {
+            return Ok(DeviceReadOutcome::failed());
+        }
         self.complete(record)
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         Ok(())
+    }
+
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        self.refused().map(Refused::alarm)
     }
 }
 

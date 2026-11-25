@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::adapter::parse_asyn_link;
-use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
 use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
@@ -29,9 +29,9 @@ use epics_rs::base::server::recgbl::alarm_status::READ_ALARM;
 use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
-use crate::Reentry;
 use crate::scan::Scan;
 use crate::user_param::c_str;
+use crate::{Reentry, Refused};
 use protocol::Command;
 
 /// `device(ai|bi,INST_IO,dev<Type>Televac,"asyn Televac")` (`ipSupport.dbd`).
@@ -215,9 +215,8 @@ impl DevTelevac {
 
     /// The `pact == 0` half of `readAi` / `readBi`, then `startIOCommon`, or
     /// `None` with no port. The wrong-type arm still queues its empty
-    /// `sendBuf`, as C does; a refused `queueRequest` returns -1 with PACT
-    /// already set, so the record stays active.
-    fn start(&mut self, done: &DeviceDoneSource<'_>) -> Option<AsynResult<QueueOutcome>> {
+    /// `sendBuf`, as C does.
+    fn start(&mut self, done: &DeviceDoneSource<'_>) -> Option<Result<QueueOutcome, Refused>> {
         self.alarm = false;
         let live = self.live.as_ref()?;
         let send = live
@@ -248,6 +247,10 @@ impl DevTelevac {
                 .reentry
                 .queue(&live.job.handle, &live.cell, &user, done, false),
         )
+    }
+
+    fn refused(&self) -> Option<Refused> {
+        self.live.as_ref().and_then(|l| l.job.reentry.refused())
     }
 }
 
@@ -344,8 +347,8 @@ impl DeviceSupport for DevTelevac {
             return Ok(ReadStart::Synchronous);
         }
         Ok(match self.start(done) {
-            Some(Ok(QueueOutcome::Queued) | Err(_)) => ReadStart::Pending,
-            Some(Ok(QueueOutcome::Ran)) | None => ReadStart::Synchronous,
+            Some(Ok(QueueOutcome::Queued)) => ReadStart::Pending,
+            Some(Ok(QueueOutcome::Ran) | Err(_)) | None => ReadStart::Synchronous,
         })
     }
 
@@ -364,6 +367,9 @@ impl DeviceSupport for DevTelevac {
         let Some(live) = self.live.as_ref() else {
             return Ok(DeviceReadOutcome::ok());
         };
+        if live.job.reentry.refused().is_some() {
+            return Ok(DeviceReadOutcome::failed());
+        }
         let rec_buf = {
             let mut ex = live.job.exchange.lock().unwrap();
             self.alarm = std::mem::take(&mut ex.alarm);
@@ -390,6 +396,9 @@ impl DeviceSupport for DevTelevac {
     }
 
     fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        if let Some(refused) = self.refused() {
+            return Some(refused.alarm());
+        }
         self.alarm.then_some(DeviceAlarm {
             stat: READ_ALARM,
             sevr: AlarmSeverity::Invalid as u16,

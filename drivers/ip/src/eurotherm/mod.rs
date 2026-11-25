@@ -22,7 +22,7 @@ use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, WriteStart,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, WriteStart,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::record::{Record, ScanType};
@@ -31,7 +31,7 @@ use epics_rs::base::types::EpicsValue;
 use crate::fmt::{c_literal, format_c_double};
 use crate::mpc::protocol::{c_atoi, c_strtod};
 use crate::user_param::{after, c_str, term, up_to_comma};
-use crate::{Reentry, Unconnected};
+use crate::{Reentry, Refused, Unconnected};
 use protocol::{ENQ, ETX};
 
 /// The `device(ao,…)` and `device(stringout,…)` lines of `ipSupport.dbd`.
@@ -307,8 +307,7 @@ impl DeviceSupport for DevEurotherm {
         Ok(DeviceReadOutcome::ok())
     }
 
-    /// `startIOCommon`. A refused `queueRequest` returns -1 with PACT already
-    /// set, so the record stays active, as in C.
+    /// `startIOCommon`.
     fn write_begin(
         &mut self,
         record: &mut dyn Record,
@@ -325,16 +324,23 @@ impl DeviceSupport for DevEurotherm {
             match live
                 .job
                 .reentry
-                .queue(&live.job.handle, &live.cell, &user, done, true)
+                .queue(&live.job.handle, &live.cell, &user, done, true)?
             {
-                Ok(QueueOutcome::Queued) | Err(_) => WriteStart::Pending,
-                Ok(QueueOutcome::Ran) => WriteStart::Completed,
+                QueueOutcome::Queued => WriteStart::Pending,
+                QueueOutcome::Ran => WriteStart::Completed,
             },
         )
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         Ok(())
+    }
+
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        self.live
+            .as_ref()
+            .and_then(|l| l.job.reentry.refused())
+            .map(Refused::alarm)
     }
 }
 

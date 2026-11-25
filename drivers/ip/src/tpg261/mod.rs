@@ -14,7 +14,7 @@ use std::time::Duration;
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::asyn_record::get_port;
-use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
@@ -33,8 +33,8 @@ use epics_rs::base::server::recgbl::alarm_status::READ_ALARM;
 use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
-use crate::Reentry;
 use crate::scan::Scan;
+use crate::{Reentry, Refused};
 use protocol::{Command, ENQ, NAK};
 
 /// `device(<type>,INST_IO,dev<Type>TPG261,"asyn TPG261")` (`ipSupport.dbd`).
@@ -357,14 +357,12 @@ impl DevTpg261 {
         built + "\r"
     }
 
-    /// `buildCommand` then `startIOCommon`, or `None` with no port. A refused
-    /// `queueRequest` returns -1 with PACT already set, so the record stays
-    /// active, as in C.
+    /// `buildCommand` then `startIOCommon`, or `None` with no port.
     fn start(
         &mut self,
         record: &dyn Record,
         done: &DeviceDoneSource<'_>,
-    ) -> Option<AsynResult<QueueOutcome>> {
+    ) -> Option<Result<QueueOutcome, Refused>> {
         self.alarm = None;
         let live = self.live.as_ref()?;
         let send = self.command(live, record);
@@ -398,6 +396,10 @@ impl DevTpg261 {
         let mut ex = live.job.exchange.lock().unwrap();
         self.alarm = ex.alarm.take();
         ex.rec_buf.clone()
+    }
+
+    fn refused(&self) -> Option<Refused> {
+        self.live.as_ref().and_then(|l| l.job.reentry.refused())
     }
 
     fn command_of(&self) -> Option<Command> {
@@ -571,8 +573,8 @@ impl DeviceSupport for DevTpg261 {
             return Ok(ReadStart::Synchronous);
         }
         Ok(match self.start(record, done) {
-            Some(Ok(QueueOutcome::Queued) | Err(_)) => ReadStart::Pending,
-            Some(Ok(QueueOutcome::Ran)) | None => ReadStart::Synchronous,
+            Some(Ok(QueueOutcome::Queued)) => ReadStart::Pending,
+            Some(Ok(QueueOutcome::Ran) | Err(_)) | None => ReadStart::Synchronous,
         })
     }
 
@@ -592,6 +594,9 @@ impl DeviceSupport for DevTpg261 {
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        if self.refused().is_some() {
+            return Ok(DeviceReadOutcome::failed());
+        }
         match self.kind {
             Kind::Ai => self.read_ai(record),
             Kind::Bi | Kind::Mbbi => self.read_rval(record),
@@ -606,7 +611,8 @@ impl DeviceSupport for DevTpg261 {
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
         Ok(match self.start(record, done) {
-            Some(Ok(QueueOutcome::Queued) | Err(_)) => WriteStart::Pending,
+            Some(Ok(QueueOutcome::Queued)) => WriteStart::Pending,
+            Some(Err(refused)) => return Err(refused.into()),
             Some(Ok(QueueOutcome::Ran)) => {
                 self.async_write_completed(record);
                 WriteStart::Completed
@@ -632,6 +638,9 @@ impl DeviceSupport for DevTpg261 {
     }
 
     fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        if let Some(refused) = self.refused() {
+            return Some(refused.alarm());
+        }
         self.alarm.map(|(stat, sevr)| DeviceAlarm {
             stat,
             sevr: sevr as u16,

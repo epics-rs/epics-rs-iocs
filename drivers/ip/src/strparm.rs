@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
 use asyn_rs::adapter::parse_asyn_link;
-use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
+use asyn_rs::error::{AsynError, AsynStatus};
 use asyn_rs::manager::PortManager;
 use asyn_rs::port::QueuePriority;
 use asyn_rs::port_handle::{PortHandle, QueueOutcome};
@@ -25,7 +25,8 @@ use epics_rs::base::runtime::scanf::{self, ScanTarget};
 use epics_rs::base::runtime::stdlib::strtod;
 use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart, WriteStart,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
+    WriteStart,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
@@ -35,7 +36,7 @@ use epics_rs::base::types::c_parse::atoi as c_atoi;
 
 use crate::fmt::{c_literal, format_c_double, format_c_int};
 use crate::user_param::{after, c_str, term, up_to_comma};
-use crate::{Reentry, Unconnected};
+use crate::{Reentry, Refused, Unconnected};
 
 /// The `device(<type>,INST_IO,dev<Xx>StrParm,"asyn <xx> stringParm")` lines
 /// of `ipSupport.dbd`.
@@ -382,13 +383,12 @@ impl DevStrParm {
         }
     }
 
-    /// `startIOCommon`, or `None` with no port. A refused `queueRequest`
-    /// returns -1 with PACT already set, so the record stays active, as in C.
+    /// `startIOCommon`, or `None` with no port.
     fn start(
         &mut self,
         record: &dyn Record,
         done: &DeviceDoneSource<'_>,
-    ) -> Option<AsynResult<QueueOutcome>> {
+    ) -> Option<Result<QueueOutcome, Refused>> {
         let live = self.live.as_ref()?;
         if self.kind.is_output() {
             let send = self.buffer(&live.parm, record);
@@ -402,6 +402,10 @@ impl DevStrParm {
                 .reentry
                 .queue(&live.job.handle, &live.cell, &user, done, live.job.output),
         )
+    }
+
+    fn refused(&self) -> Option<Refused> {
+        self.live.as_ref().and_then(|l| l.job.reentry.refused())
     }
 
     /// `completeIOCommon` for an input.
@@ -616,8 +620,8 @@ impl DeviceSupport for DevStrParm {
             return Ok(ReadStart::Synchronous);
         }
         Ok(match self.start(record, done) {
-            Some(Ok(QueueOutcome::Queued) | Err(_)) => ReadStart::Pending,
-            Some(Ok(QueueOutcome::Ran)) | None => ReadStart::Synchronous,
+            Some(Ok(QueueOutcome::Queued)) => ReadStart::Pending,
+            Some(Ok(QueueOutcome::Ran) | Err(_)) | None => ReadStart::Synchronous,
         })
     }
 
@@ -637,6 +641,9 @@ impl DeviceSupport for DevStrParm {
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        if self.refused().is_some() {
+            return Ok(DeviceReadOutcome::failed());
+        }
         self.complete_input(record)
     }
 
@@ -646,7 +653,8 @@ impl DeviceSupport for DevStrParm {
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
         Ok(match self.start(record, done) {
-            Some(Ok(QueueOutcome::Queued) | Err(_)) => WriteStart::Pending,
+            Some(Ok(QueueOutcome::Queued)) => WriteStart::Pending,
+            Some(Err(refused)) => return Err(refused.into()),
             Some(Ok(QueueOutcome::Ran)) | None => WriteStart::Completed,
         })
     }
@@ -654,6 +662,10 @@ impl DeviceSupport for DevStrParm {
     /// A failed write is the -1 the output records do not look at.
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         Ok(())
+    }
+
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        self.refused().map(Refused::alarm)
     }
 }
 
