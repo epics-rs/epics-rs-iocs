@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
 use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
 use epics_rs::base::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, ReadStart,
@@ -91,13 +90,12 @@ struct McaPort {
     /// This pass's completion cell, on a port that can block: the read
     /// queued from it re-enters the record through it. Only `&mut self`
     /// touches it (`get_mut`); the `Mutex` makes the dset `Sync`.
-    reentry: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+    reentry: Mutex<Option<DeviceDone>>,
 }
 
 /// What C's `asynCallback` reads into `mcaAsynPvt` and the record copies
 /// out on the pass the callback re-enters.
 struct Reads {
-    name: String,
     addr: i32,
     reasons: [usize; McaReason::COUNT],
     /// C's `acquiring`/`elapsedLive`/`elapsedReal`/`totalCounts`/`dwellTime`:
@@ -122,7 +120,7 @@ struct Trip {
 
 struct Message {
     read: McaRead,
-    reentry: Option<(DeviceDone, CallbackPriority)>,
+    reentry: Option<DeviceDone>,
 }
 
 /// C `asynPrint(pasynUser, ASYN_TRACE_ERROR, ...)` for a user on `port`
@@ -302,9 +300,8 @@ impl McaLink {
 }
 
 impl McaPort {
-    fn new(link: McaLink, name: &str) -> Self {
+    fn new(link: McaLink) -> Self {
         let reads = Arc::new(Reads {
-            name: name.to_owned(),
             addr: link.addr,
             reasons: link.reasons,
             status: Mutex::new(McaStatus::default()),
@@ -348,11 +345,7 @@ impl McaPort {
     /// C `send_msg`'s `duplicateAsynUser` and `queueRequest` of a read
     /// (`devMcaAsyn.c:263-337`), re-entering the record through `reentry`
     /// when it is queued.
-    fn queue(
-        &mut self,
-        read: McaRead,
-        reentry: Option<(DeviceDone, CallbackPriority)>,
-    ) -> Result<QueueOutcome, Nack> {
+    fn queue(&mut self, read: McaRead, reentry: Option<DeviceDone>) -> Result<QueueOutcome, Nack> {
         let free = self.idle.lock().unwrap().pop();
         let index = free.unwrap_or_else(|| self.add_request());
         let (cell, trip) = &self.requests[index];
@@ -439,15 +432,11 @@ impl CellBody for Trip {
             McaRead::Status => self.reads.read_status(port),
             McaRead::Data => self.reads.read_spectrum(port),
         }
-        // C's `dbScanLock; prset->process` (`:358-360`, `:378-380`).
+        // C's `dbScanLock; prset->process; dbScanUnlock` on this thread
+        // (`:359-361`, `:381-383`), which no full callback band can refuse.
         let reentry = self.message.lock().unwrap().reentry.take();
-        if let Some((done, band)) = reentry
-            && done.reprocess(band).is_err()
-        {
-            errlog_vprintf(format_args!(
-                "devMcaAsyn::asynCallback: {} callback queue full\n",
-                self.reads.name
-            ));
+        if let Some(done) = reentry {
+            done.reprocess_now();
         }
     }
 
@@ -573,7 +562,7 @@ impl DeviceSupport for DevMcaAsyn {
         let Connect::Resolved(link) = connect else {
             return Ok(DeviceInitOutcome::dead());
         };
-        self.port = Some(McaPort::new(link, &self.name));
+        self.port = Some(McaPort::new(link));
         Ok(DeviceInitOutcome::ok())
     }
 
@@ -590,11 +579,7 @@ impl DeviceSupport for DevMcaAsyn {
         };
         let mca = Self::mca(record)?;
         port.reads.nuse.store(mca.nuse, Ordering::Relaxed);
-        *port.reentry.get_mut().unwrap() = port
-            .link
-            .handle
-            .can_block()
-            .then(|| (done.device_done(), done.priority()));
+        *port.reentry.get_mut().unwrap() = port.link.handle.can_block().then(|| done.device_done());
         Ok(mca.device_read_begin(port, done))
     }
 
@@ -1301,6 +1286,101 @@ record(mca, "MCAHOLD") {
         drop(runtime);
     }
 
+    /// C's callbacks end a queued read with `dbScanLock; process;
+    /// dbScanUnlock` on the port thread (`devMcaAsyn.c:359-361`, `:381-383`),
+    /// never through `callbackRequest`: a READ on a blocking port ends with
+    /// the spectrum while the record's callback band is full.
+    #[test]
+    fn a_read_on_a_blocking_port_completes_while_its_callback_band_is_full() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use epics_rs::base::runtime::background::callback_executor::{
+            set_parallel_threads, set_queue_size,
+        };
+        use epics_rs::base::runtime::background::{CallbackBody, CallbackCell, CallbackError};
+        use epics_rs::base::runtime::task::{
+            CallbackPriority, background_init, request_cell, sleep, test_block_on,
+        };
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+
+        /// Holds the low band's one worker until dropped.
+        #[derive(Clone, Default)]
+        struct Hold(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl CallbackBody for Hold {
+            fn run(&self) {
+                let (open, wake) = &*self.0;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = wake.wait(open).unwrap();
+                }
+            }
+        }
+        struct FullBand(Hold);
+        impl Drop for FullBand {
+            fn drop(&mut self) {
+                let (open, wake) = &*(self.0).0;
+                *open.lock().unwrap() = true;
+                wake.notify_all();
+            }
+        }
+
+        // `callbackSetQueueSize` and `callbackParallelThreads` before
+        // `callbackInit`; the mca record's PRIO is LOW.
+        set_queue_size(1);
+        set_parallel_threads(1, Some(CallbackPriority::Low));
+        background_init();
+        let (runtime, _, array_reads, _) = driver_port("MCAFULL", true, None, None, None);
+        let db = r#"
+record(mca, "MCAFULL") {
+    field(DTYP, "asynMCA")
+    field(INP, "@asyn(MCAFULL)")
+    field(NMAX, "4")
+    field(NUSE, "4")
+}
+"#;
+        test_block_on(async {
+            let (name, factory) = mca_rs::mca_record_factory();
+            let (db, _) = IocBuilder::new()
+                .register_record_type(name, factory)
+                .register_dynamic_device_support(&[("mca", &MCA_DEVICES)], mca_device_support)
+                .db_string(db, &HashMap::new())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let hold = Hold::default();
+            let _full = (0..64)
+                .find_map(|_| {
+                    match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
+                        Ok(()) => None,
+                        Err(CallbackError::QueueFull) => Some(FullBand(hold.clone())),
+                        Err(e) => panic!("{e:?}"),
+                    }
+                })
+                .expect("the low band never filled");
+            db.put_record_field_from_ca("MCAFULL", "READ", EpicsValue::Enum(1))
+                .await
+                .unwrap();
+            for _ in 0..400 {
+                if !db.get_record("MCAFULL").unwrap().read().is_processing() {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                !db.get_record("MCAFULL").unwrap().read().is_processing(),
+                "the read left the record PACT"
+            );
+            assert_eq!(
+                db.get_pv("MCAFULL.VAL").unwrap(),
+                EpicsValue::LongArray(vec![1, 2, 3, 4].into())
+            );
+        });
+        assert_eq!(array_reads.load(Ordering::SeqCst), 1);
+        drop(runtime);
+    }
+
     /// C duplicates the asynUser for every read it queues
     /// (`devMcaAsyn.c:263-265`) and each callback re-enters the record only
     /// for its own message: a data read queued ahead of the status read does
@@ -1330,7 +1410,7 @@ record(mca, "MCAHOLD") {
                 .await
                 .unwrap();
             let done = DeviceDone::new(&db, &db.get_record("MCAOWNN").unwrap().read());
-            let reentry = || Some((done.clone(), done.priority()));
+            let reentry = || Some(done.clone());
             let reentered = || db.get_pv("MCAOWNN").unwrap().to_f64().unwrap();
             let run = async |n| {
                 gate.open(n);
@@ -1386,8 +1466,7 @@ record(mca, "MCAHOLD") {
                 .unwrap();
             let done = DeviceDone::new(&db, &db.get_record("MCADOWNN").unwrap().read());
             port.queue(McaRead::Data, None).unwrap();
-            port.queue(McaRead::Status, Some((done.clone(), done.priority())))
-                .unwrap();
+            port.queue(McaRead::Status, Some(done.clone())).unwrap();
             sleep(Duration::from_millis(200)).await;
             assert_eq!(array_reads.load(Ordering::SeqCst), 1);
             assert!(
