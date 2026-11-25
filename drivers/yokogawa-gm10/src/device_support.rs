@@ -906,7 +906,8 @@ mod tests {
     use super::*;
     use crate::instrument::test_support::{
         ascii_frame, connect_default_fixture, default_init_responses, fdata_binary,
-        one_record_fdata_binary, registry_with_offline, spawn_fake_device, spawn_gated_fake_device,
+        one_record_fdata_binary, registry_with_offline, spawn_fake_device,
+        spawn_fake_device_sessions, spawn_gated_fake_device,
     };
     use epics_rs::base::server::record::FieldDesc;
     use std::collections::HashMap;
@@ -1907,6 +1908,85 @@ record(calc, "CNT") {{ field(CALC, "A+1") field(INPA, "CNT") }}
                     (COMM_INVALID, EpicsValue::Double(0.0))
                 ],
                 "(PACT, STAT, SEVR) and VAL after the read with no reply and the next"
+            );
+        });
+    }
+
+    /// `AI` over a unit that plays `sessions`, one per connection: (PACT,
+    /// STAT, SEVR) and VAL after the read right after the boot load, and
+    /// after the first later read that does not end with COMM_ALARM, if one
+    /// does within five seconds.
+    async fn reads_across_a_reconnect(
+        sessions: Vec<Vec<Vec<u8>>>,
+    ) -> (
+        [((bool, EpicsValue, EpicsValue), EpicsValue); 2],
+        std::thread::JoinHandle<Vec<Vec<String>>>,
+    ) {
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device_sessions(listener, sessions);
+        let db = ai_and_ao_on("", Instrument::connect_to(addr).unwrap()).await;
+        let read = || async {
+            let _ = db
+                .put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                .await;
+            pact_after_settling(&db).await;
+            (pact_and_alarm(&db, "AI"), db.get_pv("AI.VAL").unwrap())
+        };
+        let first = read().await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut later = read().await;
+        while later.0 == COMM_INVALID && Instant::now() < deadline {
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(50)).await;
+            later = read().await;
+        }
+        ([first, later], device)
+    }
+
+    /// A unit that hangs up after it loaded fails the next read with
+    /// COMM_ALARM; once it accepts a connection again it is loaded as at
+    /// boot and reads are answered again.
+    #[test]
+    fn a_unit_that_hangs_up_is_loaded_again_and_read() {
+        epics_rs::base::runtime::task::test_block_on(async {
+            let mut back = default_init_responses();
+            back.push(channel_1_reads_5678());
+            let (ends, device) =
+                reads_across_a_reconnect(vec![default_init_responses(), back]).await;
+            assert_eq!(
+                ends,
+                [
+                    (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (NO_ALARM, EpicsValue::Double(5.678))
+                ],
+                "(PACT, STAT, SEVR) and VAL after the read the hang-up fails and the next answered"
+            );
+            let received = device.join().unwrap();
+            assert_eq!(
+                received[1][..received[0].len()],
+                received[0],
+                "the commands of the load at boot and of the load on the new connection"
+            );
+        });
+    }
+
+    /// A unit that hangs up again in the middle of the load on a new
+    /// connection is connected to and loaded once more.
+    #[test]
+    fn a_load_the_unit_cuts_short_is_tried_again() {
+        epics_rs::base::runtime::task::test_block_on(async {
+            let mut back = default_init_responses();
+            back.push(channel_1_reads_5678());
+            let (ends, _device) =
+                reads_across_a_reconnect(vec![default_init_responses(), Vec::new(), back]).await;
+            assert_eq!(
+                ends,
+                [
+                    (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (NO_ALARM, EpicsValue::Double(5.678))
+                ],
+                "(PACT, STAT, SEVR) and VAL after the read the hang-up fails and the next answered"
             );
         });
     }
