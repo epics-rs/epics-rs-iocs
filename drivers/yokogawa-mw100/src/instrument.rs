@@ -2,10 +2,9 @@
 //! serializing every wire operation through one OS thread (mirrors C's
 //! single-consumer `queue_func`/`qmesg` pair, `drvMW100.c:1398-1462` —
 //! `qmesg` enqueues from any EPICS scan thread, `queue_func` is the sole
-//! socket owner). `DeviceSupport::read`/`write` collapse C's PACT-then-
-//! completed-by-`queue_func` two-phase dance into one blocking round trip
-//! on [`Instrument::submit`] — legitimate since nothing else here depends
-//! on interleaving with other records' scans mid-flight.
+//! socket owner). A record's read or write queues itself and stays PACT;
+//! the actor ends the pass when its command has run. Nothing waits on the
+//! actor: the passes it ends run on it, and their FLNKs can queue here.
 
 use crate::cache::*;
 use crate::codec::*;
@@ -94,11 +93,13 @@ pub enum Command {
     AcknowledgeAlarms,
 }
 
-/// Who `queue_func` hands the finished command back to: a blocking caller,
-/// or the record whose `process()` it re-runs (drvMW100.c:1418-1424).
+/// The record pass `queue_func` ends once the command has run
+/// (drvMW100.c:1418-1424).
 enum Done {
-    Wait(mpsc::Sender<()>),
-    Process(DeviceDone),
+    /// A read left PACT by `read_begin`; its re-entered pass reads the cache.
+    Read(DeviceDone),
+    /// A write left PACT by `write_begin`.
+    Write(DeviceDone),
     NoRecord,
 }
 
@@ -185,22 +186,14 @@ impl Instrument {
         self.interrupts.register(category)
     }
 
-    /// Block until the actor thread has finished processing `command`.
-    /// Returns nothing: C's queue reports no status to the record
-    /// (`queue_func`, drvMW100.c:1398-1424), so a device or wire error cannot alarm.
-    pub fn submit(&self, command: Command) {
-        let (done_tx, done_rx) = mpsc::channel();
-        if self.send(command, Done::Wait(done_tx)) {
-            let _ = done_rx.recv();
-        }
-    }
-
     /// C `qmesg(dq, precord, ...)`: queue `command` and return at once; the
-    /// actor completes `done` when it has run. On a device with no queue
-    /// thread `done` is dropped un-run and the record stays in PACT, as C's
-    /// packet sits on a list nobody drains.
+    /// actor completes `done` when it has run. C's queue reports no status
+    /// to the record (`queue_func`, drvMW100.c:1398-1424), so a device or
+    /// wire error cannot alarm. On a device with no queue thread `done` is
+    /// dropped un-run and the record stays in PACT, as C's packet sits on a
+    /// list nobody drains.
     pub fn submit_write(&self, command: Command, done: DeviceDone) {
-        self.send(command, Done::Process(done));
+        self.send(command, Done::Write(done));
     }
 
     fn send(&self, command: Command, done: Done) -> bool {
@@ -482,10 +475,13 @@ impl Instrument {
         cache.modules[module].number
     }
 
-    /// `mw100_channel_start` (`drvMW100.c:1832-1866`): the first-scan async
-    /// read-refresh for a single channel, collapsed to a blocking round
-    /// trip. Signal channels with no recognized type are a silent no-op.
-    pub fn channel_start(&self, family: ChannelFamily, channel: u32) {
+    /// `mw100_channel_start` (`drvMW100.c:1832-1866`): queue the refresh
+    /// of one channel; the actor re-runs `done`'s pass once it has run, as
+    /// [`Self::submit_write`] does. False when nothing was queued: a Signal
+    /// channel with no recognized type, which C leaves PACT with no packet,
+    /// or a unit with no queue thread, whose packet C leaves on a list
+    /// nobody drains; this port reads either from the cache at once.
+    pub fn channel_start(&self, family: ChannelFamily, channel: u32, done: DeviceDone) -> bool {
         let command = match family {
             ChannelFamily::Signal => match self.channel_type(channel) {
                 ChannelType::InputAnalog | ChannelType::InputInteger | ChannelType::InputBinary => {
@@ -494,13 +490,13 @@ impl Instrument {
                 ChannelType::OutputBinary | ChannelType::OutputAnalog => {
                     Command::ReadSignalOutput(channel)
                 }
-                ChannelType::None | ChannelType::Unknown => return,
+                ChannelType::None | ChannelType::Unknown => return false,
             },
             ChannelFamily::Math => Command::ReadMath(channel),
             ChannelFamily::Comm => Command::ReadComm(channel),
             ChannelFamily::Const => Command::ReadConst(channel),
         };
-        self.submit(command)
+        self.send(command, Done::Read(done))
     }
 }
 
@@ -517,13 +513,12 @@ impl Actor {
     fn run(mut self) {
         while let Some(job) = self.backlog.pop_front().or_else(|| self.rx.recv().ok()) {
             let _ = self.process(job.command);
+            // queue_func's `dbScanLock; process; dbScanUnlock` on this thread
+            // (drvMW100.c:1418-1424), not through a callback band that can
+            // refuse it. This thread holds no lock set.
             match job.done {
-                Done::Wait(tx) => {
-                    let _ = tx.send(());
-                }
-                Done::Process(done) => {
-                    let _ = done.complete(done.priority());
-                }
+                Done::Read(done) => done.reprocess_now(),
+                Done::Write(done) => done.complete_now(),
                 Done::NoRecord => {}
             }
         }
@@ -1189,13 +1184,18 @@ pub(crate) mod test_support {
     /// consumes) must physically be present, or the reader blocks forever
     /// waiting for bytes the fake device already stopped sending.
     pub(crate) fn one_record_fd1_binary() -> Vec<u8> {
+        fd1_binary_channel_1(1234)
+    }
+
+    /// [`one_record_fd1_binary`] with channel 1 reading `value`.
+    pub(crate) fn fd1_binary_channel_1(value: u32) -> Vec<u8> {
         let mut raw = vec![b'E', b'B', 0, 0];
         raw.extend_from_slice(&30u32.to_le_bytes());
         raw.extend_from_slice(&[0u8; 20]);
         raw.extend_from_slice(&1u16.to_le_bytes());
         raw.push(0);
         raw.push(0);
-        raw.extend_from_slice(&1234u32.to_le_bytes());
+        raw.extend_from_slice(&value.to_le_bytes());
         raw.extend_from_slice(&[0u8; 2]);
         raw
     }
@@ -1255,6 +1255,14 @@ pub(crate) mod test_support {
             }
             received
         })
+    }
+
+    /// A registry listing `name`, a unit whose connect was refused, so it
+    /// has no queue thread. Nothing can listen on privileged port 1.
+    pub(crate) fn registry_with_offline(name: &str) -> Arc<Registry> {
+        let registry = Arc::new(Registry::new());
+        assert!(!registry.init_on_port(Some(name.as_bytes()), Some(b"127.0.0.1"), 1));
+        registry
     }
 
     /// One connected instrument: module 0 is a present `InputAnalog` module
@@ -1423,13 +1431,13 @@ mod tests {
         assert!(!instrument.get_error_flag());
 
         let mut error_rx = instrument.register_interrupt(InterruptCategory::Error);
-        instrument.submit(Command::ClearError);
+        assert!(instrument.send(Command::ClearError, Done::NoRecord));
+        assert!(error_rx.blocking_recv().is_some());
         assert!(instrument.get_error_flag());
         assert_eq!(
             instrument.get_error(1),
             "Cannot execute during MATH operation."
         );
-        assert!(error_rx.try_recv().is_ok());
 
         let received = device.join().unwrap();
         assert_eq!(

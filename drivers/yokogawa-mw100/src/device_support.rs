@@ -29,7 +29,7 @@ use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::sync::mpsc::{self, Receiver, Sender};
 use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart, WriteStart,
 };
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
@@ -637,32 +637,53 @@ impl DeviceSupport for MwDevice {
         Some(resolved.instrument.register_interrupt(category))
     }
 
+    // A VAL read that is not I/O Intr queues the channel's refresh and
+    // stays PACT; its re-entered pass reads the cache (devMW100_ai.c:192-208,
+    // devMW100_bi.c:261-280, devMW100_longin.c:214-233). The scan thread
+    // never waits on the instrument.
+    fn read_begin(
+        &mut self,
+        _record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
+        let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
+            return Ok(ReadStart::Synchronous);
+        };
+        if self.is_io_intr || done.pact() {
+            return Ok(ReadStart::Synchronous);
+        }
+        let queued = match *op {
+            Operation::AnalogVal(addr) => {
+                instrument.channel_start(addr.family, addr.index, done.device_done())
+            }
+            Operation::IntegerVal(channel) | Operation::BinaryVal(channel) => {
+                instrument.channel_start(ChannelFamily::Signal, channel, done.device_done())
+            }
+            _ => false,
+        };
+        Ok(if queued {
+            ReadStart::Pending
+        } else {
+            ReadStart::Synchronous
+        })
+    }
+
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
             return Ok(DeviceReadOutcome::ok());
         };
-        let is_io_intr = self.is_io_intr;
         match *op {
             Operation::AnalogVal(addr) => {
-                if !is_io_intr {
-                    instrument.channel_start(addr.family, addr.index);
-                }
                 let v = instrument.analog_get(addr.family, addr.index);
                 record.put_field("VAL", EpicsValue::Double(v))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::IntegerVal(channel) => {
-                if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel);
-                }
                 let v = instrument.integer_get(channel);
                 record.put_field("VAL", EpicsValue::Long(v))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::BinaryVal(channel) => {
-                if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel);
-                }
                 let v = instrument.binary_get(channel);
                 record.put_field("RVAL", EpicsValue::ULong(v as u32))?;
                 Ok(DeviceReadOutcome::ok())
@@ -930,7 +951,8 @@ mod tests {
     use super::*;
     use crate::instrument::test_support::{
         ascii_frame, connect_default_fixture, connect_fixture_then, empty_fo1_binary,
-        fe1_one_signal_channel, is0_all_zero, one_record_fd1_binary, spawn_fake_device,
+        fd1_binary_channel_1, fe1_one_signal_channel, is0_all_zero, one_record_fd1_binary,
+        registry_with_offline, spawn_fake_device,
     };
     use epics_rs::base::runtime::task::test_block_on;
     use epics_rs::base::server::database::{DeviceDone, PvDatabase};
@@ -1638,5 +1660,213 @@ mod tests {
             DeviceInitOutcome::DoNotConvert(DeviceUdf::Defined)
         );
         assert_eq!(init("bo", "mw100dev INP_TRIG"), DeviceInitOutcome::ok());
+    }
+
+    // -- queue_func ends the passes it ran (drvMW100.c:1418-1424) --
+
+    const FULL_BAND_CHILD: &str = "MW100_FULL_BAND_CHILD";
+
+    /// Holds the low band's one worker until its `FullBand` drops.
+    #[derive(Clone, Default)]
+    struct Hold(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl epics_rs::base::runtime::background::CallbackBody for Hold {
+        fn run(&self) {
+            let (open, wake) = &*self.0;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+        }
+    }
+
+    struct FullBand(Hold);
+
+    impl Drop for FullBand {
+        fn drop(&mut self) {
+            let (open, wake) = &*(self.0).0;
+            *open.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    /// Runs `body` in a child that re-runs `test`, with the low callback
+    /// band refusing work: its size and threads are set once per process,
+    /// before it arms. The records' PRIO is LOW.
+    fn with_full_low_band(test: &str, body: impl FnOnce()) {
+        use epics_rs::base::runtime::background::callback_executor::{
+            set_parallel_threads, set_queue_size,
+        };
+        use epics_rs::base::runtime::background::{CallbackCell, CallbackError};
+        use epics_rs::base::runtime::task::{CallbackPriority, background_arm, request_cell};
+        if std::env::var_os(FULL_BAND_CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture"])
+                .env(FULL_BAND_CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+        set_queue_size(1);
+        set_parallel_threads(1, Some(CallbackPriority::Low));
+        background_arm();
+        let hold = Hold::default();
+        let _full = (0..64)
+            .find_map(|_| {
+                match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
+                    Ok(()) => None,
+                    Err(CallbackError::QueueFull) => Some(FullBand(hold.clone())),
+                    Err(e) => panic!("{e:?}"),
+                }
+            })
+            .expect("the low band never filled");
+        body();
+    }
+
+    /// `AI` reads channel 1 and `AO` writes K1 of one instrument, whose
+    /// fixture then answers `extra`; `AO`'s FLNK is `flnk`.
+    async fn ai_and_ao(
+        flnk: &str,
+        extra: Vec<Vec<u8>>,
+    ) -> (Arc<PvDatabase>, std::thread::JoinHandle<Vec<String>>) {
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
+        // mw100Support.dbd's ai and ao rows, as yokogawa-mw100-ioc lists them.
+        static AI: &[DevSup] = &[DevSup {
+            name: "devMW100_ai",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 3, 4], false),
+        }];
+        static AO: &[DevSup] = &[DevSup {
+            name: "devMW100_ao",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }];
+        let (instrument, device) = connect_fixture_then(extra);
+        let records = format!(
+            r#"
+record(ai, "AI") {{
+    field(DTYP, "{DTYP}")
+    field(INP, "@mw100dev VAL:1")
+}}
+record(ao, "AO") {{
+    field(DTYP, "{DTYP}")
+    field(OUT, "@mw100dev VAL:K1")
+    field(FLNK, "{flnk}")
+}}
+"#
+        );
+        let (db, _) = IocBuilder::new()
+            .register_dynamic_device_support(
+                &[("ai", AI), ("ao", AO)],
+                factory(registry_with("mw100dev", instrument)),
+            )
+            .db_string(&records, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        (db, device)
+    }
+
+    /// Whether `AI` and `AO` are still PACT after up to two seconds.
+    async fn pact_after_settling(db: &PvDatabase) -> [bool; 2] {
+        let pact = |name: &str| db.get_record(name).unwrap().read().is_processing();
+        for _ in 0..400 {
+            if !pact("AI") && !pact("AO") {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+        [pact("AI"), pact("AO")]
+    }
+
+    /// A read on a unit that never connected has no queue thread to end
+    /// it, so the pass that starts it ends it.
+    #[test]
+    fn a_read_on_an_offline_unit_ends_its_pass() {
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
+        static AI: &[DevSup] = &[DevSup {
+            name: "devMW100_ai",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 3, 4], false),
+        }];
+        let records = format!(
+            r#"record(ai, "AI") {{ field(DTYP, "{DTYP}") field(INP, "@mw100dev VAL:K1") }}"#
+        );
+        test_block_on(async {
+            let (db, _) = IocBuilder::new()
+                .register_dynamic_device_support(
+                    &[("ai", AI)],
+                    factory(registry_with_offline("mw100dev")),
+                )
+                .db_string(&records, &HashMap::new())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                .await
+                .unwrap();
+            assert!(!db.get_record("AI").unwrap().read().is_processing());
+        });
+    }
+
+    #[test]
+    fn a_read_and_a_write_end_on_the_queue_thread_while_their_band_is_full() {
+        with_full_low_band(
+            "device_support::tests::a_read_and_a_write_end_on_the_queue_thread_while_their_band_is_full",
+            || {
+                test_block_on(async {
+                    let (db, device) =
+                        ai_and_ao("", vec![fd1_binary_channel_1(5678), b"E0\r\n".to_vec()]).await;
+                    db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                        .await
+                        .unwrap();
+                    db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                        .await
+                        .unwrap();
+                    assert_eq!(pact_after_settling(&db).await, [false, false], "PACT");
+                    assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(5.678));
+                    assert_eq!(
+                        device.join().unwrap()[12..],
+                        ["FD1,001,001\r\n", "SKK01,2.5\r\n"]
+                    );
+                });
+            },
+        );
+    }
+
+    /// The write's completing pass runs on the queue thread, and its FLNK
+    /// reads the same instrument: that read must queue, not wait on the
+    /// thread running it.
+    #[test]
+    fn a_write_whose_flnk_reads_the_same_instrument_ends_both_passes() {
+        with_full_low_band(
+            "device_support::tests::a_write_whose_flnk_reads_the_same_instrument_ends_both_passes",
+            || {
+                test_block_on(async {
+                    let (db, device) =
+                        ai_and_ao("AI", vec![b"E0\r\n".to_vec(), fd1_binary_channel_1(5678)]).await;
+                    db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                        .await
+                        .unwrap();
+                    assert_eq!(pact_after_settling(&db).await, [false, false], "PACT");
+                    assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(5.678));
+                    assert_eq!(
+                        device.join().unwrap()[12..],
+                        ["SKK01,2.5\r\n", "FD1,001,001\r\n"]
+                    );
+                });
+            },
+        );
     }
 }
