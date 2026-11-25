@@ -1037,8 +1037,11 @@ impl Actor {
             for record in &records {
                 let cd = if record.address > 100 {
                     cache.calc_data.get_mut((record.address - 101) as usize)
+                } else if let Some(index) = record.address.checked_sub(1) {
+                    cache.ch_data.get_mut(index as usize)
                 } else {
-                    cache.ch_data.get_mut((record.address - 1) as usize)
+                    // Address 0 names no channel; C writes ch_data[-1].
+                    None
                 };
                 let Some(cd) = cd else { continue };
 
@@ -1089,7 +1092,11 @@ impl Actor {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed FO1 frame"))?;
             let mut cache = self.cache.lock();
             for record in &records {
-                if let Some(cd) = cache.ch_data.get_mut((record.address - 1) as usize) {
+                // Address 0 names no channel; C writes ch_data[-1].
+                let Some(index) = record.address.checked_sub(1) else {
+                    continue;
+                };
+                if let Some(cd) = cache.ch_data.get_mut(index as usize) {
                     cd.data_status = DataStatus::Normal;
                     cd.value = record.value as i32;
                 }
@@ -1579,6 +1586,46 @@ mod tests {
             instrument.get_data_status(ChannelFamily::Math, 2),
             DataStatus::Normal
         );
+    }
+
+    /// FD1 and FO1 entries name a 1-based channel; one at address 0 names
+    /// none and is skipped.
+    #[test]
+    fn reply_entries_at_address_0_are_skipped() {
+        // Header, then per entry the address, two alarm (FD1) or pad (FO1)
+        // bytes and the value, then the 2 bytes the length counts past them.
+        fn binary(entries: &[(u16, u32)]) -> Vec<u8> {
+            let mut raw = vec![b'E', b'B', 0, 0];
+            raw.extend_from_slice(&(22 + 8 * entries.len() as u32).to_le_bytes());
+            raw.extend_from_slice(&[0u8; 20]);
+            for &(address, value) in entries {
+                raw.extend_from_slice(&address.to_le_bytes());
+                raw.extend_from_slice(&[0, 0]);
+                raw.extend_from_slice(&value.to_le_bytes());
+            }
+            raw.extend_from_slice(&[0u8; 2]);
+            raw
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responses = vec![
+            b"E0\r\n".to_vec(),
+            cf0_one_input_analog_module(),
+            is0_all_zero(),
+            fe1_one_signal_channel(),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            binary(&[(1, 1234), (0, 999)]), // FD1
+            binary(&[(0, 7)]),              // FO1
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+        ];
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        device.join().unwrap();
+        assert_eq!(instrument.analog_get(ChannelFamily::Signal, 1), 1.234);
     }
 
     #[test]
