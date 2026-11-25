@@ -19,8 +19,14 @@ use std::net::{SocketAddrV4, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 const PORT: u16 = 34318;
+
+/// How long a reply may take. C reads with no bound (`TODO: add timeout`,
+/// drvMW100_comm.c:31, :57), so a unit that stops answering holds its
+/// queue thread and every record queued on it.
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 5 });
 
 /// `mw100_channel_io_handler`/`mw100_info_io_handler`/`mw100_status_io_handler`/
 /// `mw100_error_io_handler` (`drvMW100.c:1643-1688`).
@@ -252,6 +258,7 @@ impl Instrument {
     /// where C's `init_mw100` loads before it starts the thread, so the
     /// stream and the [`Link`] never leave it; jobs queue once that loaded.
     fn start(&self, stream: TcpStream) -> io::Result<()> {
+        stream.set_read_timeout(Some(READ_TIMEOUT))?;
         let (tx, rx) = mpsc::channel::<Job>();
         let actor = Actor {
             link: Link {
@@ -751,6 +758,16 @@ impl Actor {
     /// offline until the next one.
     fn read_frame(&mut self) -> io::Result<RawResponse> {
         let frame = wire::read_response(&mut self.stream);
+        if let Err(e) = &frame
+            && matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            )
+        {
+            // A reply that comes after the timeout would answer the next
+            // command.
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
         self.link.set(frame.is_ok());
         frame
     }
@@ -1421,7 +1438,8 @@ pub(crate) mod test_support {
         spawn_gated_fake_device(listener, responses, None)
     }
 
-    /// [`spawn_fake_device`], holding reply `n` back until `gate` fires.
+    /// [`spawn_fake_device`], holding reply `n` back until `gate` fires or
+    /// its sender drops. It stops once the driver closes the connection.
     pub(crate) fn spawn_gated_fake_device(
         listener: TcpListener,
         responses: Vec<Vec<u8>>,
@@ -1435,7 +1453,7 @@ pub(crate) mod test_support {
                 let mut line = Vec::new();
                 let mut byte = [0u8; 1];
                 loop {
-                    if stream.read(&mut byte).unwrap() == 0 {
+                    if !matches!(stream.read(&mut byte), Ok(1)) {
                         return received;
                     }
                     line.push(byte[0]);
@@ -1447,9 +1465,11 @@ pub(crate) mod test_support {
                 if let Some((at, gate)) = &gate
                     && *at == n
                 {
-                    gate.recv().unwrap();
+                    let _ = gate.recv();
                 }
-                stream.write_all(&response).unwrap();
+                if stream.write_all(&response).is_err() {
+                    return received;
+                }
             }
             received
         })
@@ -1479,6 +1499,22 @@ pub(crate) mod test_support {
     pub(crate) fn connect_fixture_then(
         extra: Vec<Vec<u8>>,
     ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
+        connect_gated_fixture_then(extra, None)
+    }
+
+    /// [`connect_fixture_then`], the reply to the first command after the
+    /// load held back until `gate` fires.
+    pub(crate) fn connect_fixture_holding_then(
+        extra: Vec<Vec<u8>>,
+        gate: mpsc::Receiver<()>,
+    ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
+        connect_gated_fixture_then(extra, Some(gate))
+    }
+
+    fn connect_gated_fixture_then(
+        extra: Vec<Vec<u8>>,
+        gate: Option<mpsc::Receiver<()>>,
+    ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut responses = vec![
@@ -1495,8 +1531,9 @@ pub(crate) mod test_support {
             ascii_frame(b"xxx001,-7.5\nE"), // CM?
             ascii_frame(b"xxx01,12.5\nE"),  // SK?
         ];
+        let gate = gate.map(|gate| (responses.len(), gate));
         responses.extend(extra);
-        let device = spawn_fake_device(listener, responses);
+        let device = spawn_gated_fake_device(listener, responses, gate);
         let instrument = Instrument::connect_to(addr).unwrap();
         (instrument, device)
     }

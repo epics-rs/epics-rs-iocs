@@ -1013,10 +1013,11 @@ pub fn factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instrument::READ_TIMEOUT;
     use crate::instrument::test_support::{
-        ascii_frame, connect_default_fixture, connect_fixture_then, empty_fo1_binary,
-        fd1_binary_channel_1, fe1_one_signal_channel, is0_all_zero, one_record_fd1_binary,
-        registry_with_offline, spawn_fake_device,
+        ascii_frame, connect_default_fixture, connect_fixture_holding_then, connect_fixture_then,
+        empty_fo1_binary, fd1_binary_channel_1, fe1_one_signal_channel, is0_all_zero,
+        one_record_fd1_binary, registry_with_offline, spawn_fake_device,
     };
     use epics_rs::base::runtime::task::test_block_on;
     use epics_rs::base::server::database::{DeviceDone, PvDatabase};
@@ -2066,6 +2067,41 @@ record(calc, "CNT") {{ field(CALC, "A+1") field(INPA, "CNT") }}
                     (NO_ALARM, EpicsValue::Double(5.678))
                 ],
                 "(PACT, STAT, SEVR) and VAL after each read"
+            );
+        });
+    }
+
+    /// A unit that stops answering ends the read with COMM_ALARM once
+    /// READ_TIMEOUT passes, and the reply it sends after that answers no
+    /// later read.
+    #[test]
+    fn a_read_the_unit_never_answers_ends_with_comm_alarm() {
+        test_block_on(async {
+            let (late, gate) = std::sync::mpsc::channel();
+            let (instrument, _device) = connect_fixture_holding_then(
+                vec![fd1_binary_channel_1(5678), fd1_binary_channel_1(5678)],
+                gate,
+            );
+            let db = ai_and_ao_on("", instrument).await;
+            let mut ends = Vec::new();
+            for _ in 0..2 {
+                let _ = db
+                    .put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                    .await;
+                let deadline = std::time::Instant::now() + READ_TIMEOUT + Duration::from_secs(3);
+                while pact_and_alarm(&db, "AI").0 && std::time::Instant::now() < deadline {
+                    epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+                }
+                ends.push((pact_and_alarm(&db, "AI"), db.get_pv("AI.VAL").unwrap()));
+                let _ = late.send(());
+            }
+            assert_eq!(
+                ends,
+                [
+                    (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (COMM_INVALID, EpicsValue::Double(0.0))
+                ],
+                "(PACT, STAT, SEVR) and VAL after the read with no reply and the next"
             );
         });
     }
