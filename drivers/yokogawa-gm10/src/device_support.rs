@@ -740,19 +740,22 @@ impl DeviceSupport for GmDevice {
         })
     }
 
-    // devGM10_bo.c:192-197: the completing pass drops a REC_TRIG or
-    // REC_ERROR bo's VAL back to 0.
+    // A write whose exchange the link lost ends its pass with the alarm.
+    // devGM10_bo.c:192-197: the completing pass drops a REC_TRIG or REC_ERROR
+    // bo's VAL back to 0.
     fn async_write_completed(&mut self, record: &mut dyn Record) {
-        if let Some(Resolved {
-            op:
-                Operation::ChanTrig
+        let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
+            return;
+        };
+        self.offline = !instrument.online();
+        if matches!(
+            op,
+            Operation::ChanTrig
                 | Operation::MiscTrig
                 | Operation::InfoTrig
                 | Operation::StatTrig
-                | Operation::ErrorClearSet,
-            ..
-        }) = self.resolved
-        {
+                | Operation::ErrorClearSet
+        ) {
             let _ = record.put_field("VAL", EpicsValue::Enum(0));
         }
     }
@@ -1511,6 +1514,27 @@ mod tests {
         Arc<epics_rs::base::server::database::PvDatabase>,
         std::thread::JoinHandle<Vec<String>>,
     ) {
+        let (instrument, device) = fixture_then(extra);
+        (ai_and_ao_on(flnk, instrument).await, device)
+    }
+
+    /// An instrument loaded by the init fixture, which then answers `extra`.
+    fn fixture_then(
+        extra: Vec<Vec<u8>>,
+    ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.extend(extra);
+        let device = spawn_fake_device(listener, responses);
+        (Instrument::connect_to(addr).unwrap(), device)
+    }
+
+    /// [`ai_and_ao`] on `instrument`.
+    async fn ai_and_ao_on(
+        flnk: &str,
+        instrument: Arc<Instrument>,
+    ) -> Arc<epics_rs::base::server::database::PvDatabase> {
         use epics_rs::base::server::ioc_builder::IocBuilder;
         use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
         // gm10Support.dbd's ai and ao rows, as yokogawa-gm10-ioc lists them.
@@ -1526,12 +1550,6 @@ mod tests {
             link_type: DbLinkType::InstIo,
             dset: Dset::new(6, &[2, 4], false),
         }];
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut responses = default_init_responses();
-        responses.extend(extra);
-        let device = spawn_fake_device(listener, responses);
-        let instrument = Instrument::connect_to(addr).unwrap();
         let records = format!(
             r#"
 record(ai, "AI") {{
@@ -1555,7 +1573,7 @@ record(ao, "AO") {{
             .build()
             .await
             .unwrap();
-        (db, device)
+        db
     }
 
     /// Whether `AI` and `AO` are still PACT after up to two seconds.
@@ -1657,6 +1675,88 @@ record(ao, "AO") {{
                 "PACT, STAT, SEVR"
             );
             assert!(put.is_err(), "the put fails with the pass");
+        });
+    }
+
+    /// `AI` read and `AO` written once, then let settle. A put fails when
+    /// its pass ends at once, which is not what these tests look at.
+    async fn read_and_write(db: &epics_rs::base::server::database::PvDatabase) {
+        let _ = db
+            .put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+            .await;
+        let _ = db
+            .put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+            .await;
+        pact_after_settling(db).await;
+    }
+
+    /// (PACT, STAT, SEVR) and VAL of `AI` once a read of it settled.
+    async fn proc_ai(
+        db: &epics_rs::base::server::database::PvDatabase,
+    ) -> ((bool, EpicsValue, EpicsValue), EpicsValue) {
+        db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+            .await
+            .unwrap();
+        pact_after_settling(db).await;
+        (pact_and_alarm(db, "AI"), db.get_pv("AI.VAL").unwrap())
+    }
+
+    const COMM_INVALID: (bool, EpicsValue, EpicsValue) =
+        (false, EpicsValue::Short(9), EpicsValue::Short(3));
+    const NO_ALARM: (bool, EpicsValue, EpicsValue) =
+        (false, EpicsValue::Short(0), EpicsValue::Short(0));
+
+    /// The unit hangs up once it loaded: the read finds no reply and keeps
+    /// VAL, the write never lands, and both passes end with COMM_ALARM.
+    #[test]
+    fn a_link_lost_after_boot_ends_reads_and_writes_with_comm_alarm() {
+        epics_rs::base::runtime::task::test_block_on(async {
+            let (db, _device) = ai_and_ao("", Vec::new()).await;
+            read_and_write(&db).await;
+            assert_eq!(
+                [pact_and_alarm(&db, "AI"), pact_and_alarm(&db, "AO")],
+                [COMM_INVALID, COMM_INVALID],
+                "PACT, STAT, SEVR of AI and AO"
+            );
+            assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(0.0));
+        });
+    }
+
+    /// A reply that is no frame alarms the read; the unit's next whole
+    /// frame clears it and serves the value it carried.
+    #[test]
+    fn a_good_exchange_after_a_wire_error_clears_the_alarm() {
+        epics_rs::base::runtime::task::test_block_on(async {
+            let (db, _device) =
+                ai_and_ao("", vec![b"XX\r\n".to_vec(), channel_1_reads_5678()]).await;
+            let after_wire_error = proc_ai(&db).await;
+            let after_good_frame = proc_ai(&db).await;
+            assert_eq!(
+                [after_wire_error, after_good_frame],
+                [
+                    (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (NO_ALARM, EpicsValue::Double(5.678))
+                ],
+                "(PACT, STAT, SEVR) and VAL after each read"
+            );
+        });
+    }
+
+    /// Nothing serves a unit whose queue thread panicked: its cache is
+    /// never refreshed again, so reads and writes end with COMM_ALARM.
+    #[test]
+    fn a_panicked_queue_thread_ends_reads_and_writes_with_comm_alarm() {
+        epics_rs::base::runtime::task::test_block_on(async {
+            let (instrument, _device) = fixture_then(Vec::new());
+            let db = ai_and_ao_on("", instrument.clone()).await;
+            instrument.panic_queue_thread();
+            read_and_write(&db).await;
+            assert_eq!(
+                [pact_and_alarm(&db, "AI"), pact_and_alarm(&db, "AO")],
+                [COMM_INVALID, COMM_INVALID],
+                "PACT, STAT, SEVR of AI and AO"
+            );
+            assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(0.0));
         });
     }
 
