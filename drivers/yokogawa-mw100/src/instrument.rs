@@ -15,18 +15,23 @@ use epics_rs::base::server::driver_support::DriverSupport;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io::{self, Write as _};
-use std::net::{SocketAddrV4, TcpStream};
+use std::net::{SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PORT: u16 = 34318;
 
-/// How long a reply may take. C reads with no bound (`TODO: add timeout`,
-/// drvMW100_comm.c:31, :57), so a unit that stops answering holds its
-/// queue thread and every record queued on it.
+/// How long a reply, or a connect to the unit again, may take. C reads with
+/// no bound (`TODO: add timeout`, drvMW100_comm.c:31, :57), so a unit that
+/// stops answering holds its queue thread and every record queued on it.
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 5 });
+
+/// How long the queue thread waits, once it lost the connection or failed
+/// to load the unit on a new one, before it connects again. C connects once,
+/// in `init_mw100`, so a unit that restarts stays lost until the IOC does.
+const RECONNECT_HOLDOFF: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 5000 });
 
 /// `mw100_channel_io_handler`/`mw100_info_io_handler`/`mw100_status_io_handler`/
 /// `mw100_error_io_handler` (`drvMW100.c:1643-1688`).
@@ -225,8 +230,56 @@ impl Link {
         }
     }
 
-    fn next_job(&mut self) -> Option<Job> {
-        self.backlog.pop_front().or_else(|| self.rx.recv().ok())
+    /// The next job; with `due`, [`mpsc::RecvTimeoutError::Timeout`] once
+    /// that passes first.
+    fn next_job(&mut self, due: Option<Instant>) -> Result<Job, mpsc::RecvTimeoutError> {
+        if let Some(job) = self.backlog.pop_front() {
+            return Ok(job);
+        }
+        match due {
+            Some(due) => self
+                .rx
+                .recv_timeout(due.saturating_duration_since(Instant::now())),
+            None => self
+                .rx
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        }
+    }
+}
+
+/// The queue thread's connection to the unit.
+enum Conn {
+    /// Connected; `loaded` once the load on it completed. Until then no
+    /// exchange puts the unit online.
+    Open { stream: TcpStream, loaded: bool },
+    /// Lost; the next connect is due at `retry_at`.
+    Down { retry_at: Instant },
+}
+
+impl Conn {
+    /// A new connection, its reads bounded by [`READ_TIMEOUT`].
+    fn open(stream: TcpStream) -> io::Result<Self> {
+        stream.set_read_timeout(Some(READ_TIMEOUT))?;
+        Ok(Conn::Open {
+            stream,
+            loaded: false,
+        })
+    }
+
+    fn stream(&mut self) -> io::Result<&mut TcpStream> {
+        match self {
+            Conn::Open { stream, .. } => Ok(stream),
+            Conn::Down { .. } => Err(io::ErrorKind::NotConnected.into()),
+        }
+    }
+
+    /// When the next connect is due, on a lost connection.
+    fn due(&self) -> Option<Instant> {
+        match self {
+            Conn::Down { retry_at } => Some(*retry_at),
+            Conn::Open { .. } => None,
+        }
     }
 }
 
@@ -257,8 +310,10 @@ impl Instrument {
     /// Start the queue thread on `stream`. It runs [`Actor::load`] first,
     /// where C's `init_mw100` loads before it starts the thread, so the
     /// stream and the [`Link`] never leave it; jobs queue once that loaded.
+    /// The thread connects to the same peer again when it loses the unit.
     fn start(&self, stream: TcpStream) -> io::Result<()> {
-        stream.set_read_timeout(Some(READ_TIMEOUT))?;
+        let peer = stream.peer_addr()?;
+        let conn = Conn::open(stream)?;
         let (tx, rx) = mpsc::channel::<Job>();
         let actor = Actor {
             link: Link {
@@ -268,7 +323,8 @@ impl Instrument {
                 backlog: VecDeque::new(),
                 rx,
             },
-            stream,
+            conn,
+            peer,
             cache: self.cache.clone(),
             interrupts: self.interrupts.clone(),
         };
@@ -300,9 +356,10 @@ impl Instrument {
     }
 
     /// The unit is reachable now: the queue thread's latest exchange read a
-    /// whole frame. False until the thread has one, from a wire error to
-    /// the next whole frame, and once the thread is gone. C has no such
-    /// state and serves an unreachable unit's cache as current.
+    /// whole frame on a connection the unit loaded on. False until the boot
+    /// load completes, from a wire error to the next whole frame or reload,
+    /// and once the thread is gone. C has no such state and serves an
+    /// unreachable unit's cache as current.
     pub fn online(&self) -> bool {
         self.reachable.load(Ordering::Acquire)
     }
@@ -654,28 +711,74 @@ impl Instrument {
 
 pub struct Actor {
     link: Link,
-    stream: TcpStream,
+    conn: Conn,
+    /// Where `conn` connects again.
+    peer: SocketAddr,
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
 }
 
 impl Actor {
     /// [`Actor::load`], whose outcome `loaded` takes back to `start`, then,
-    /// on a unit that loaded, `queue_func`.
+    /// on a unit that loaded, `queue_func`, connecting again whenever the
+    /// connection is lost and its holdoff has passed.
     fn run(mut self, loaded: mpsc::SyncSender<io::Result<()>>) {
-        let load = self.load();
+        let load = self.load_connection();
         let failed = load.is_err();
         let _ = loaded.send(load);
         if failed {
             return;
         }
-        while let Some(Job { command, pass }) = self.link.next_job() {
+        loop {
+            if self.conn.due().is_some_and(|due| due <= Instant::now()) {
+                self.reconnect();
+            }
+            let Job { command, pass } = match self.link.next_job(self.conn.due()) {
+                Ok(job) => job,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             self.link.running = Some(pass);
             let answered = self.process(command).is_ok();
             if let Some(pass) = self.link.running.take() {
                 pass.end(answered);
             }
         }
+    }
+
+    /// `init_mw100`'s connect and load again (`drvMW100.c:1531-1553`), to
+    /// the unit that loaded at boot.
+    fn reconnect(&mut self) {
+        match TcpStream::connect_timeout(&self.peer, READ_TIMEOUT).and_then(Conn::open) {
+            Ok(conn) => {
+                self.conn = conn;
+                let _ = self.load_connection();
+            }
+            Err(_) => self.lose(),
+        }
+    }
+
+    /// [`Actor::load`] on a new connection: the unit is online once it
+    /// loaded, and a connection it failed to load on is dropped.
+    fn load_connection(&mut self) -> io::Result<()> {
+        let load = self.load();
+        match (&load, &mut self.conn) {
+            (Ok(()), Conn::Open { loaded, .. }) => {
+                *loaded = true;
+                self.link.set(true);
+            }
+            _ => self.lose(),
+        }
+        load
+    }
+
+    /// Drop the connection, offline, and connect again after
+    /// [`RECONNECT_HOLDOFF`].
+    fn lose(&mut self) {
+        self.conn = Conn::Down {
+            retry_at: Instant::now() + RECONNECT_HOLDOFF,
+        };
+        self.link.set(false);
     }
 
     /// The tail of `init_mw100` (`drvMW100.c:1531-1556`): read the
@@ -747,28 +850,28 @@ impl Actor {
 
     /// With [`Actor::read_frame`], the only use of the stream.
     fn write_command(&mut self, command: &str) -> io::Result<()> {
-        let sent = wire::write_command(&mut self.stream, command);
+        let sent = wire::write_command(self.conn.stream()?, command);
         if sent.is_err() {
-            self.link.set(false);
+            self.lose();
         }
         sent
     }
 
-    /// A whole frame is a good exchange; a wire error leaves the unit
-    /// offline until the next one.
+    /// A whole frame on a loaded connection is a good exchange. A frame
+    /// that does not parse leaves the unit offline on the same connection
+    /// until the next one. Any other error loses the connection: a reply
+    /// still in flight on it would answer the next command.
     fn read_frame(&mut self) -> io::Result<RawResponse> {
-        let frame = wire::read_response(&mut self.stream);
-        if let Err(e) = &frame
-            && matches!(
-                e.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            )
-        {
-            // A reply that comes after the timeout would answer the next
-            // command.
-            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        let frame = wire::read_response(self.conn.stream()?);
+        match &frame {
+            Ok(_) => {
+                if let Conn::Open { loaded: true, .. } = self.conn {
+                    self.link.set(true);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => self.link.set(false),
+            Err(_) => self.lose(),
         }
-        self.link.set(frame.is_ok());
         frame
     }
 
@@ -1445,34 +1548,55 @@ pub(crate) mod test_support {
         responses: Vec<Vec<u8>>,
         gate: Option<(usize, mpsc::Receiver<()>)>,
     ) -> std::thread::JoinHandle<Vec<String>> {
+        std::thread::spawn(move || play(listener.accept().unwrap().0, responses, gate))
+    }
+
+    /// Plays the device for one connection per entry of `sessions`, each as
+    /// [`spawn_fake_device`] plays its one, and returns what each received.
+    pub(crate) fn spawn_fake_device_sessions(
+        listener: TcpListener,
+        sessions: Vec<Vec<Vec<u8>>>,
+    ) -> std::thread::JoinHandle<Vec<Vec<String>>> {
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.write_all(b"E0\r\n").unwrap();
-            let mut received = Vec::new();
-            for (n, response) in responses.into_iter().enumerate() {
-                let mut line = Vec::new();
-                let mut byte = [0u8; 1];
-                loop {
-                    if !matches!(stream.read(&mut byte), Ok(1)) {
-                        return received;
-                    }
-                    line.push(byte[0]);
-                    if line.ends_with(b"\r\n") {
-                        break;
-                    }
-                }
-                received.push(String::from_utf8(line).unwrap());
-                if let Some((at, gate)) = &gate
-                    && *at == n
-                {
-                    let _ = gate.recv();
-                }
-                if stream.write_all(&response).is_err() {
+            sessions
+                .into_iter()
+                .map(|responses| play(listener.accept().unwrap().0, responses, None))
+                .collect()
+        })
+    }
+
+    fn play(
+        mut stream: TcpStream,
+        responses: Vec<Vec<u8>>,
+        gate: Option<(usize, mpsc::Receiver<()>)>,
+    ) -> Vec<String> {
+        let mut received = Vec::new();
+        if stream.write_all(b"E0\r\n").is_err() {
+            return received;
+        }
+        for (n, response) in responses.into_iter().enumerate() {
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                if !matches!(stream.read(&mut byte), Ok(1)) {
                     return received;
                 }
+                line.push(byte[0]);
+                if line.ends_with(b"\r\n") {
+                    break;
+                }
             }
-            received
-        })
+            received.push(String::from_utf8(line).unwrap());
+            if let Some((at, gate)) = &gate
+                && *at == n
+            {
+                let _ = gate.recv();
+            }
+            if stream.write_all(&response).is_err() {
+                return received;
+            }
+        }
+        received
     }
 
     /// A registry listing `name`, a unit whose connect was refused, so it
@@ -1517,7 +1641,17 @@ pub(crate) mod test_support {
     ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut responses = vec![
+        let mut responses = load_responses();
+        let gate = gate.map(|gate| (responses.len(), gate));
+        responses.extend(extra);
+        let device = spawn_gated_fake_device(listener, responses, gate);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        (instrument, device)
+    }
+
+    /// The replies to the load after the greeting: the default fixture's.
+    pub(crate) fn load_responses() -> Vec<Vec<u8>> {
+        vec![
             b"E0\r\n".to_vec(),             // BO1
             cf0_one_input_analog_module(),  // CF0
             is0_all_zero(),                 // IS0
@@ -1530,12 +1664,7 @@ pub(crate) mod test_support {
             empty_fo1_binary(),             // FO1,001,060
             ascii_frame(b"xxx001,-7.5\nE"), // CM?
             ascii_frame(b"xxx01,12.5\nE"),  // SK?
-        ];
-        let gate = gate.map(|gate| (responses.len(), gate));
-        responses.extend(extra);
-        let device = spawn_gated_fake_device(listener, responses, gate);
-        let instrument = Instrument::connect_to(addr).unwrap();
-        (instrument, device)
+        ]
     }
 }
 
