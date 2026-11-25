@@ -837,9 +837,9 @@ impl EtherIpDevice {
         };
 
         if changed {
-            tag.request_write(&mut data, &self.name);
+            let carrier = tag.request_write(&mut data, &self.name);
             if let (Some(done), Some(listener)) = (done, &self.listener) {
-                listener.stage_write(done.device_done());
+                listener.stage_write(done.device_done(), carrier);
             }
         }
         drop(data);
@@ -1226,6 +1226,7 @@ mod tests {
     use crate::driver::WriteEnd;
     use epics_rs::base::server::database::{ProcStack, PvDatabase, RecordLoad};
     use epics_rs::base::server::records::bo::BoRecord;
+    use std::sync::mpsc;
 
     /// devEtherIP.c mbbo_write / check_mbbo_callback: a staged write leaves
     /// the record PACT, and the next transfer ends it without the check
@@ -1267,9 +1268,9 @@ mod tests {
             WriteStart::Pending
         ));
         assert!(tag.data.lock().do_write);
-        tag.notify(WriteEnd::Ended);
+        tag.transfer();
         assert!(!checked(), "the write's transfer runs no check");
-        tag.notify(WriteEnd::Ended);
+        tag.transfer();
         assert!(checked(), "later transfers check again");
         assert!(rx.try_recv().is_err(), "an output is never pulsed");
 
@@ -1302,8 +1303,8 @@ mod tests {
         assert_eq!(b.string_tag, "DSXT_B");
 
         old.del_record().unwrap();
-        a.notify(WriteEnd::Ended);
-        b.notify(WriteEnd::Ended);
+        a.notify(WriteEnd::Read);
+        b.notify(WriteEnd::Read);
         assert!(old_rx.try_recv().is_err(), "the old tag still calls back");
         assert!(new_rx.try_recv().is_ok());
     }
@@ -1321,7 +1322,7 @@ mod tests {
         dev.set_record_info("AI", ScanType::Passive);
         dev.init(&mut record).unwrap();
         let mut rx = dev.io_intr_receiver().unwrap();
-        dev.tag.clone().unwrap().notify(WriteEnd::Ended);
+        dev.tag.clone().unwrap().notify(WriteEnd::Read);
         assert!(rx.try_recv().is_ok());
     }
 
@@ -1486,7 +1487,7 @@ mod tests {
     /// One transfer's callbacks as the scan thread runs them, then whatever
     /// they queued on scanOnce, whose ring runs in order on one thread.
     fn pulse(tag: &TagInfo) {
-        tag.notify(WriteEnd::Ended);
+        tag.notify(WriteEnd::Read);
         flush_scan_once();
     }
 
@@ -1709,7 +1710,7 @@ mod tests {
         let mut words = [0; 10];
         words[9] = 3 << 12;
         set_words(&tag, &words);
-        tag.notify(WriteEnd::Ended);
+        tag.notify(WriteEnd::Read);
         // The periodic scan, in the gap a follow on another thread left.
         rt.block_on(db.process_record_with_links("STALE", &mut ProcStack::new()))
             .unwrap();
@@ -2014,7 +2015,7 @@ mod tests {
         assert_ne!(stat(), alarm_status::WRITE_ALARM);
         let hold = fill_low_band();
         // The tag holds no data, as after invalidate_tags.
-        tag.notify(WriteEnd::Failed);
+        tag.notify(WriteEnd::Dropped);
         let deadline = Instant::now() + Duration::from_secs(2);
         while stat() != alarm_status::WRITE_ALARM && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -2080,7 +2081,7 @@ mod tests {
         let pact = || db.get_record("AOFULL").unwrap().read().is_processing();
         assert!(pact(), "the write is pending");
         // The transfer that sent it, as scan_pass announces it.
-        tag.notify(WriteEnd::Ended);
+        tag.transfer();
         let deadline = Instant::now() + Duration::from_secs(2);
         while pact() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -2129,11 +2130,17 @@ mod tests {
         driver::stop_scan_tasks();
     }
 
+    /// What a [`fake_plc`] does with a scan request.
+    enum Answer {
+        Reply(Vec<u8>),
+        HangUp,
+        Silent,
+    }
+
     /// A PLC on a free 127.0.0.1 port: it registers a session, refuses the
-    /// identity read and answers the tag's probe with a REAL. It answers
-    /// the first scan with `scan`, or hangs up on it when there is none,
-    /// and answers nothing after that.
-    fn fake_plc(scan: Option<Vec<u8>>) -> u16 {
+    /// identity read and answers the tag's probe with a REAL. It does what
+    /// `answer` says with each scan request, given the request's body.
+    fn fake_plc(mut answer: impl FnMut(&[u8]) -> Answer + Send + 'static) -> u16 {
         use crate::encap;
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2163,13 +2170,15 @@ mod tests {
                     encap::EC_REGISTER_SESSION => (0, vec![1, 0, 0, 0]),
                     encap::EC_SEND_RR_DATA => {
                         rr_data += 1;
-                        let cip = match (rr_data, &scan) {
+                        let cip = match rr_data {
                             // The identity read.
-                            (1, _) => (1, Vec::new()),
-                            (2, _) => (0, probe.clone()),
-                            (3, Some(scan)) => (0, scan.clone()),
-                            (3, None) => return,
-                            _ => continue,
+                            1 => (1, Vec::new()),
+                            2 => (0, probe.clone()),
+                            _ => match answer(&body) {
+                                Answer::Reply(scan) => (0, scan),
+                                Answer::HangUp => return,
+                                Answer::Silent => continue,
+                            },
                         };
                         if cip.0 == 0 {
                             let reply = encap::encode_send_rr_data(1, tid, &cip.1);
@@ -2203,7 +2212,15 @@ mod tests {
         if !driver::initialized() {
             driver::init();
         }
-        driver::define_plc_on_port(plc, fake_plc(scan));
+        let mut first = Some(scan);
+        driver::define_plc_on_port(
+            plc,
+            fake_plc(move |_| match first.take() {
+                Some(Some(scan)) => Answer::Reply(scan),
+                Some(None) => Answer::HangUp,
+                None => Answer::Silent,
+            }),
+        );
         let rt = current_thread();
         let db = eip_db(plc);
         let tag = load_output(&rt, &db, "AO", Box::new(AoRecord::default()), plc, "R");
@@ -2257,6 +2274,203 @@ mod tests {
         assert_eq!(
             write_through_fake_plc("takes", Some(taken)),
             (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm)
+        );
+    }
+
+    /// The REAL a scan request writes to tag `R`, if it writes one.
+    fn written_to_r(body: &[u8]) -> Option<f32> {
+        let write = [0x4D, 2, 0x91, 1, b'R', 0, 0xCA, 0, 1, 0];
+        let at = body.windows(write.len()).position(|w| w == write)? + write.len();
+        Some(f32::from_le_bytes(body.get(at..at + 4)?.try_into().ok()?))
+    }
+
+    /// A MultiRequest reply holding one CIP reply.
+    fn multi_reply(item: &[u8]) -> Vec<u8> {
+        let mut r = vec![0x8A, 0, 0, 0, 1, 0, 4, 0];
+        r.extend_from_slice(item);
+        r
+    }
+
+    /// A [`fake_plc`] for tag `R` that reports what each scan request
+    /// writes, then waits for the test to let it answer: a read with 1.0, a
+    /// write by taking it.
+    fn gated_plc(plc: &str) -> (mpsc::Receiver<Option<f32>>, mpsc::Sender<()>) {
+        let (seen_tx, seen) = mpsc::channel();
+        let (answer, answer_rx) = mpsc::channel::<()>();
+        let port = fake_plc(move |body| {
+            let written = written_to_r(body);
+            let _ = seen_tx.send(written);
+            if answer_rx.recv().is_err() {
+                return Answer::Silent;
+            }
+            Answer::Reply(match written {
+                Some(_) => multi_reply(&[0xCD, 0, 0, 0]),
+                None => {
+                    let mut read = vec![0xCC, 0, 0, 0, 0xCA, 0];
+                    read.extend_from_slice(&1.0f32.to_le_bytes());
+                    multi_reply(&read)
+                }
+            })
+        });
+        if !driver::initialized() {
+            driver::init();
+        }
+        driver::define_plc_on_port(plc, port);
+        (seen, answer)
+    }
+
+    /// C ends a PACT write on any callback of its tag (devEtherIP.c:1937),
+    /// so a read in flight when the write was staged ends it before it is
+    /// sent; here the record stays PACT until the PLC answers its write.
+    #[test]
+    fn a_write_staged_during_a_read_ends_when_the_plc_answers_the_write() {
+        use epics_rs::base::server::ioc_app::InitHookState;
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        let (seen, answer) = gated_plc("midread");
+        let rt = current_thread();
+        let db = eip_db("midread");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AO",
+            Box::new(AoRecord::default()),
+            "midread",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        let record = db.get_record("AO").unwrap();
+        let wait = Duration::from_secs(10);
+
+        driver::init_hook(InitHookState::AfterScanInit);
+        assert_eq!(seen.recv_timeout(wait), Ok(None), "the first scan reads");
+        rt.block_on(db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(3.0)))
+            .unwrap();
+        answer.send(()).unwrap();
+        assert_eq!(
+            seen.recv_timeout(wait),
+            Ok(Some(3.0)),
+            "the next scan writes"
+        );
+        let pact_while_unanswered = record.read().is_processing();
+        answer.send(()).unwrap();
+        let deadline = Instant::now() + wait;
+        while record.read().is_processing() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let r = record.read();
+        let ended = (
+            pact_while_unanswered,
+            r.is_processing(),
+            r.common.stat,
+            r.common.sevr,
+        );
+        drop(r);
+        driver::stop_scan_tasks();
+        assert_eq!(
+            ended,
+            (true, false, alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
+            "PACT until the write is answered, then the write's end"
+        );
+    }
+
+    /// Of two records writing one tag, the one staged while the other's
+    /// write is in flight stays PACT until the PLC answers its own.
+    #[test]
+    fn a_write_staged_during_another_write_ends_when_the_plc_answers_it() {
+        use epics_rs::base::server::ioc_app::InitHookState;
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        let (seen, answer) = gated_plc("midwrite");
+        let rt = current_thread();
+        let db = eip_db("midwrite");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AO1",
+            Box::new(AoRecord::default()),
+            "midwrite",
+            "R",
+        );
+        load_output(
+            &rt,
+            &db,
+            "AO2",
+            Box::new(AoRecord::default()),
+            "midwrite",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        let pact = |name: &str| db.get_record(name).unwrap().read().is_processing();
+        let wait = Duration::from_secs(10);
+
+        rt.block_on(db.put_record_field_from_ca_no_notify("AO1", "VAL", EpicsValue::Double(3.0)))
+            .unwrap();
+        driver::init_hook(InitHookState::AfterScanInit);
+        assert_eq!(
+            seen.recv_timeout(wait),
+            Ok(Some(3.0)),
+            "the first scan writes AO1's"
+        );
+        rt.block_on(db.put_record_field_from_ca_no_notify("AO2", "VAL", EpicsValue::Double(5.0)))
+            .unwrap();
+        answer.send(()).unwrap();
+        assert_eq!(
+            seen.recv_timeout(wait),
+            Ok(Some(5.0)),
+            "the next scan writes AO2's"
+        );
+        let while_unanswered = (pact("AO1"), pact("AO2"));
+        answer.send(()).unwrap();
+        let deadline = Instant::now() + wait;
+        while pact("AO2") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ended = pact("AO2");
+        driver::stop_scan_tasks();
+        assert_eq!(
+            (while_unanswered, ended),
+            ((false, true), false),
+            "(AO1, AO2) PACT while AO2's write is unanswered, then AO2's"
+        );
+    }
+
+    /// A write whose request alone outgrows the buffer limit never reaches
+    /// the PLC, so the pass that cannot send it ends it in WRITE_ALARM.
+    #[test]
+    fn a_write_too_large_to_send_ends_in_write_alarm() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        let rt = current_thread();
+        let db = eip_db("toolarge");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AOBIG",
+            Box::new(AoRecord::default()),
+            "toolarge",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        {
+            let mut d = tag.data.lock();
+            (d.r_request, d.r_response) = (10, 10);
+            (d.w_request, d.w_response) = (10_000, 10);
+        }
+        rt.block_on(db.put_record_field_from_ca_no_notify("AOBIG", "VAL", EpicsValue::Double(3.0)))
+            .unwrap();
+        let record = db.get_record("AOBIG").unwrap();
+        assert!(record.read().is_processing(), "the write is pending");
+
+        let (items, _) = driver::build_multi_request(500, &[tag], 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while record.read().is_processing() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let r = record.read();
+        assert_eq!(
+            (items.len(), r.is_processing(), r.common.stat, r.common.sevr),
+            (0, false, alarm_status::WRITE_ALARM, AlarmSeverity::Invalid)
         );
     }
 
