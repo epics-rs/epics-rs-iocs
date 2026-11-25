@@ -223,10 +223,9 @@ impl PvaRuntime {
 ///
 /// `max_memory` is C++ `pvaDriverConfig`'s `maxMemory` argument. C++'s
 /// `maxBuffers`/`priority`/`stackSize` arguments have no equivalent in this
-/// framework (`ADDriverBase::new` takes only a byte budget, and the monitor
-/// task always runs on its own `rt::run_thread_named` OS thread at default
-/// priority/stack size) — same framework limitation as the rest of this
-/// workspace's AD ports (e.g. ad-url).
+/// framework: `ADDriverBase::new` takes only a byte budget, and C gives
+/// `priority`/`stackSize` to the asyn port thread, which the runtime
+/// schedules itself.
 pub fn create_pva_detector(
     claim: &PortClaim,
     pv_name: &str,

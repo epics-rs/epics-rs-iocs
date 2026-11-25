@@ -379,7 +379,13 @@ impl Worker {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn start_det_task(w: Worker) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("MarccdTask", move || det_loop(w))
+    // As C creates it (marCCD.cpp:1582-1586).
+    rt::run_thread_named(
+        "MarccdTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || det_loop(w),
+    )
 }
 
 /// C `marCCDTask`: it holds the lock except while waiting for a start.
@@ -785,7 +791,13 @@ fn finish_series(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn start_image_task(w: Worker) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("MarccdImageTask", move || image_loop(w))
+    // As C creates it (marCCD.cpp:1593-1597).
+    rt::run_thread_named(
+        "MarccdImageTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || image_loop(w),
+    )
 }
 
 /// C `getImageDataTask`: it releases the lock for the image event and each
@@ -932,17 +944,22 @@ mod tests {
         let xml = r#"<Attributes>
             <Attribute name="Period" type="PARAM" source="ACQ_PERIOD" datatype="DOUBLE"/>
         </Attributes>"#;
-        rt::run_thread(move || async move {
-            let p = &worker.port;
-            p.write_octet(ad.base.attributes_file, 0, xml.as_bytes().to_vec())
-                .await
-                .unwrap();
-            p.write_octet(ad.base.full_file_name, 0, path.into_bytes())
-                .await
-                .unwrap();
-            let mut l = worker.port.hold_driver_blocking().unwrap();
-            assert_eq!(worker.get_image_data(&mut l).await, AsynStatus::Success);
-        })
+        rt::run_thread_named(
+            "MarccdTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                let p = &worker.port;
+                p.write_octet(ad.base.attributes_file, 0, xml.as_bytes().to_vec())
+                    .await
+                    .unwrap();
+                p.write_octet(ad.base.full_file_name, 0, path.into_bytes())
+                    .await
+                    .unwrap();
+                let mut l = worker.port.hold_driver_blocking().unwrap();
+                assert_eq!(worker.get_image_data(&mut l).await, AsynStatus::Success);
+            },
+        )
         .join()
         .unwrap();
         let _ = std::fs::remove_file(&file);

@@ -321,8 +321,11 @@ pub fn start(shared: Arc<Shared>, rx: Receivers) -> Vec<std::thread::JoinHandle<
             stream_start_tx,
             stream_done_rx,
         };
+        // Each task's band and stack as C creates it (eigerDetector.cpp:436-474).
         threads.push(rt::run_thread_named(
             "eigerControlTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
             move || async move {
                 control_task(s, ch).await;
             },
@@ -330,15 +333,22 @@ pub fn start(shared: Arc<Shared>, rx: Receivers) -> Vec<std::thread::JoinHandle<
     }
     {
         let s = shared.clone();
-        threads.push(rt::run_thread_named("eigerPollTask", move || async move {
-            poll_task(s, poll_rx, download_tx, poll_done_tx).await;
-        }));
+        threads.push(rt::run_thread_named(
+            "eigerPollTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                poll_task(s, poll_rx, download_tx, poll_done_tx).await;
+            },
+        ));
     }
     {
         let s = shared.clone();
         let reap = reap_tx.clone();
         threads.push(rt::run_thread_named(
             "eigerDownloadTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
             move || async move {
                 download_task(s, download_rx, parse_tx, save_tx, reap).await;
             },
@@ -347,27 +357,44 @@ pub fn start(shared: Arc<Shared>, rx: Receivers) -> Vec<std::thread::JoinHandle<
     {
         let s = shared.clone();
         let reap = reap_tx.clone();
-        threads.push(rt::run_thread_named("eigerParseTask", move || async move {
-            parse_task(s, parse_rx, reap).await;
-        }));
+        threads.push(rt::run_thread_named(
+            "eigerParseTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                parse_task(s, parse_rx, reap).await;
+            },
+        ));
     }
     {
         let s = shared.clone();
         let reap = reap_tx.clone();
-        threads.push(rt::run_thread_named("eigerSaveTask", move || async move {
-            save_task(s, save_rx, reap).await;
-        }));
+        threads.push(rt::run_thread_named(
+            "eigerSaveTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                save_task(s, save_rx, reap).await;
+            },
+        ));
     }
     {
         let s = shared.clone();
-        threads.push(rt::run_thread_named("eigerReapTask", move || async move {
-            reap_task(s, reap_rx).await;
-        }));
+        threads.push(rt::run_thread_named(
+            "eigerReapTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                reap_task(s, reap_rx).await;
+            },
+        ));
     }
     {
         let s = shared.clone();
         threads.push(rt::run_thread_named(
             "eigerMonitorTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
             move || async move {
                 monitor_task(s).await;
             },
@@ -377,6 +404,8 @@ pub fn start(shared: Arc<Shared>, rx: Receivers) -> Vec<std::thread::JoinHandle<
         let s = shared.clone();
         threads.push(rt::run_thread_named(
             "eigerStreamTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
             move || async move {
                 stream_task(s, stream_start_rx, stream_apis_rx, stream_done_tx).await;
             },
@@ -386,6 +415,8 @@ pub fn start(shared: Arc<Shared>, rx: Receivers) -> Vec<std::thread::JoinHandle<
         let s = shared.clone();
         threads.push(rt::run_thread_named(
             "eigerInitializeTask",
+            rt::ThreadPriority::High,
+            rt::StackSizeClass::Medium,
             move || async move {
                 command_task(s, init_rx, "initialize").await;
             },
@@ -395,6 +426,8 @@ pub fn start(shared: Arc<Shared>, rx: Receivers) -> Vec<std::thread::JoinHandle<
         let s = shared;
         threads.push(rt::run_thread_named(
             "eigerRestartTask",
+            rt::ThreadPriority::High,
+            rt::StackSizeClass::Medium,
             move || async move {
                 command_task(s, restart_rx, "restart").await;
             },

@@ -1426,7 +1426,13 @@ where
             let _ = handle.with_driver_blocking(|driver: &mut D| driver.exit_handler());
         }
     });
-    rt::run_thread_named("drvQuadEMCallbackTask", move || callback_loop(ctx))
+    // As C creates it (drvQuadEM.cpp:132-136).
+    rt::run_thread_named(
+        "drvQuadEMCallbackTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || callback_loop(ctx),
+    )
 }
 
 #[cfg(test)]

@@ -14,10 +14,8 @@ use ad_url::{URLRuntime, create_url_detector};
 ///
 /// `maxBuffers`, `priority` and `stackSize` are accepted (matching the C++
 /// signature) but unused: `ADDriverBase::new` takes only a memory budget (no
-/// buffer-count cap), and the acquisition task always runs on its own
-/// `rt::run_thread_named` OS thread at default priority/stack size — the
-/// same framework limitation the rest of this workspace's AD ports (e.g.
-/// d435i) already accept.
+/// buffer-count cap), and C gives `priority`/`stackSize` to the asyn port
+/// thread (URLDriver.cpp:380-383), which the runtime schedules itself.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
     epics_rs::base::runtime::env::set_default_path("ADURLIOC", env!("CARGO_MANIFEST_DIR"));
 

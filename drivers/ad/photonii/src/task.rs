@@ -44,7 +44,13 @@ pub(crate) struct AcquisitionContext {
 }
 
 pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PhotonIIDetTask", move || task_loop(ctx))
+    // As C creates it (PhotonII.cpp:133-137).
+    rt::run_thread_named(
+        "PhotonIIDetTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || task_loop(ctx),
+    )
 }
 
 /// How the parameters a single acquisition needs looked when it started.
@@ -584,21 +590,26 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = ctx.handle.clone();
         let remaining = ctx.ad_params.time_remaining;
-        rt::run_thread(move || async move {
-            let setup = setup(acquire_time);
-            let start = Instant::now();
-            let timed_out = matches!(
-                wait_for_frame(
-                    &ctx,
-                    &setup,
-                    start,
-                    f64::from(setup.count) * setup.acquire_time
-                )
-                .await,
-                Err(Abort::Timeout(_))
-            );
-            let _ = tx.send((timed_out, start.elapsed()));
-        })
+        rt::run_thread_named(
+            "PhotonIIDetTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                let setup = setup(acquire_time);
+                let start = Instant::now();
+                let timed_out = matches!(
+                    wait_for_frame(
+                        &ctx,
+                        &setup,
+                        start,
+                        f64::from(setup.count) * setup.acquire_time
+                    )
+                    .await,
+                    Err(Abort::Timeout(_))
+                );
+                let _ = tx.send((timed_out, start.elapsed()));
+            },
+        )
         .join()
         .unwrap();
         let (timed_out, took) = rx.recv().unwrap();
@@ -638,12 +649,18 @@ mod tests {
         std::fs::write(&path, vec![0u8; raw::frame_bytes()]).unwrap();
         let file = path.to_string_lossy().into_owned();
         let (tx, rx) = std::sync::mpsc::channel();
-        rt::run_thread(move || async move {
-            let start = SystemTime::now() - Duration::from_secs(5);
-            let outcome =
-                publish_frame(&ctx, &setup(-10.0), &file, start, EpicsTimestamp::now(), 1).await;
-            let _ = tx.send(matches!(outcome, Err(Abort::Timeout(_))));
-        })
+        rt::run_thread_named(
+            "PhotonIIDetTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                let start = SystemTime::now() - Duration::from_secs(5);
+                let outcome =
+                    publish_frame(&ctx, &setup(-10.0), &file, start, EpicsTimestamp::now(), 1)
+                        .await;
+                let _ = tx.send(matches!(outcome, Err(Abort::Timeout(_))));
+            },
+        )
         .join()
         .unwrap();
         let _ = std::fs::remove_file(&path);
@@ -677,12 +694,17 @@ mod tests {
         .unwrap();
         let file = path.to_string_lossy().into_owned();
         let (tx, rx) = std::sync::mpsc::channel();
-        rt::run_thread(move || async move {
-            let start = SystemTime::now() - Duration::from_secs(5);
-            let outcome =
-                publish_frame(&ctx, &setup(0.0), &file, start, EpicsTimestamp::now(), 1).await;
-            let _ = tx.send(outcome.is_ok());
-        })
+        rt::run_thread_named(
+            "PhotonIIDetTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                let start = SystemTime::now() - Duration::from_secs(5);
+                let outcome =
+                    publish_frame(&ctx, &setup(0.0), &file, start, EpicsTimestamp::now(), 1).await;
+                let _ = tx.send(outcome.is_ok());
+            },
+        )
         .join()
         .unwrap();
         let _ = std::fs::remove_file(&path);

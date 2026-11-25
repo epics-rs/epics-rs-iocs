@@ -42,7 +42,13 @@ pub(crate) struct AcquisitionContext {
 }
 
 pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PSLDetTask", move || task_loop(ctx))
+    // As C creates PSLTask (PSL.cpp:199-203).
+    rt::run_thread_named(
+        "PSLDetTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || task_loop(ctx),
+    )
 }
 
 /// Why an acquisition ended before it had taken every frame.
@@ -428,9 +434,14 @@ mod tests {
             data_len: 4,
             header_len: 0,
         };
-        rt::run_thread(move || async move {
-            publish_frame(&ctx, &header, vec![1, 0, 2, 0], 1).await;
-        })
+        rt::run_thread_named(
+            "PSLDetTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                publish_frame(&ctx, &header, vec![1, 0, 2, 0], 1).await;
+            },
+        )
         .join()
         .unwrap();
         let array = arrays.blocking_recv().unwrap();

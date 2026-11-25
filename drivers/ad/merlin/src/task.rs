@@ -53,10 +53,19 @@ pub(crate) fn start_acquisition_task(
     let status_params = ctx.ad_params;
     let init_param = ctx.init_param;
 
-    let data = rt::run_thread_named("MerlinDataTask", move || data_loop(ctx));
-    let status = rt::run_thread_named("MerlinStatusTask", move || {
-        status_loop(status_handle, status_params, init_param)
-    });
+    // As C creates merlinTask and merlinStatus (merlinDetector.cpp:1516-1529).
+    let data = rt::run_thread_named(
+        "MerlinDataTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || data_loop(ctx),
+    );
+    let status = rt::run_thread_named(
+        "MerlinStatusTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || status_loop(status_handle, status_params, init_param),
+    );
     (data, status)
 }
 

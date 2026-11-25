@@ -68,12 +68,19 @@ pub(crate) fn start_flat_field_task(
     output: ArrayPublisher,
     mut rx: rt::CommandReceiver<FlatFieldJob>,
 ) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PilatusFlatField", move || async move {
-        while let Some((array, done)) = rx.recv().await {
-            output.publish(array).await;
-            let _ = done.send(());
-        }
-    })
+    // C publishes on the port thread, which asynManager starts at Medium for
+    // the shipped priority 0 (asynManager.c:2077-2080).
+    rt::run_thread_named(
+        "PilatusFlatField",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || async move {
+            while let Some((array, done)) = rx.recv().await {
+                output.publish(array).await;
+                let _ = done.send(());
+            }
+        },
+    )
 }
 
 /// C reads into `pFlatField` and publishes it (pilatusDetector.cpp:290,
@@ -356,7 +363,13 @@ async fn max_size(ctx: &mut Ctx) -> (usize, usize) {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn start_acq_task(w: Worker, start: Arc<Event>) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PilatusDetTask", move || acq_loop(w, start))
+    // As C creates it (pilatusDetector.cpp:1823-1827).
+    rt::run_thread_named(
+        "PilatusDetTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || acq_loop(w, start),
+    )
 }
 
 /// C `asynNDArrayDriver::createFileName`.

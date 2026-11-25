@@ -527,7 +527,13 @@ impl Worker {
 
 /// Spawn the `mar345Task` worker thread.
 pub(crate) fn start_task(w: Worker) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("mar345Task", move || w.run())
+    // As C creates it (mar345.cpp:773-777).
+    rt::run_thread_named(
+        "mar345Task",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || w.run(),
+    )
 }
 
 #[cfg(test)]
@@ -803,17 +809,22 @@ mod tests {
                 .unwrap(),
         };
         let writer = h.clone();
-        rt::run_thread(move || async move {
-            let (h, mut worker) = (writer, worker);
-            h.write_octet(ad.base.attributes_file, 0, xml.as_bytes().to_vec())
-                .await
-                .unwrap();
-            h.write_octet(ad.base.full_file_name, 0, path.into_bytes())
-                .await
-                .unwrap();
-            let mut l = worker.port.hold_driver_blocking().unwrap();
-            worker.get_image_data(&mut l).await;
-        })
+        rt::run_thread_named(
+            "mar345Task",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                let (h, mut worker) = (writer, worker);
+                h.write_octet(ad.base.attributes_file, 0, xml.as_bytes().to_vec())
+                    .await
+                    .unwrap();
+                h.write_octet(ad.base.full_file_name, 0, path.into_bytes())
+                    .await
+                    .unwrap();
+                let mut l = worker.port.hold_driver_blocking().unwrap();
+                worker.get_image_data(&mut l).await;
+            },
+        )
         .join()
         .unwrap();
         let _ = std::fs::remove_file(&file);

@@ -907,10 +907,15 @@ mod tests {
             // it would post everything the port has set, in the order it was
             // first set.
             let flushed = handle.clone();
-            epics_rs::ad_core::runtime::run_thread(move || async move {
-                gate.jobs_settled().await;
-                flushed.interrupts().edge_sweeps().cleared().await;
-            })
+            epics_rs::ad_core::runtime::run_thread_named(
+                "openFlushWait",
+                epics_rs::ad_core::runtime::ThreadPriority::Medium,
+                epics_rs::ad_core::runtime::StackSizeClass::Medium,
+                move || async move {
+                    gate.jobs_settled().await;
+                    flushed.interrupts().edge_sweeps().cleared().await;
+                },
+            )
             .join()
             .unwrap();
             std::mem::forget(runtime);

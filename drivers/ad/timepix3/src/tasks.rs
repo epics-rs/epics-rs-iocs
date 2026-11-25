@@ -375,14 +375,27 @@ pub fn start(
     // (ADTimePix.cpp:2065-2068).
     let skip_once = !ctx.http.base_url().is_empty();
     let c = ctx.clone();
-    let connection = rt::run_thread_named("tpx3ConnectionPoll", move || async move {
-        connection_poll(c, cmd_rx, acq_tx, connected, skip_once).await;
-    });
+    // As C creates connectionPoll (ADTimePix.cpp:2069-2073).
+    let connection = rt::run_thread_named(
+        "tpx3ConnectionPoll",
+        rt::ThreadPriority::Low,
+        rt::StackSizeClass::Small,
+        move || async move {
+            connection_poll(c, cmd_rx, acq_tx, connected, skip_once).await;
+        },
+    );
 
     let c = ctx.clone();
-    let acquisition = rt::run_thread_named("tpx3Acquisition", move || async move {
-        acquisition_poll(c, acq_rx).await;
-    });
+    // C timePixCallback takes EPICS_THREAD_OPTS_INIT's band
+    // (acquire.cpp:345-346, 519-520; epicsThread.h:173-174).
+    let acquisition = rt::run_thread_named(
+        "tpx3Acquisition",
+        rt::ThreadPriority::Low,
+        rt::StackSizeClass::Medium,
+        move || async move {
+            acquisition_poll(c, acq_rx).await;
+        },
+    );
 
     let mut threads = vec![connection, acquisition];
     for (name, channel) in [
@@ -392,9 +405,14 @@ pub fn start(
         ("tpx3PrvHstWorker", StreamKind::PrvHst),
     ] {
         let c = ctx.clone();
-        threads.push(rt::run_thread_named(name, move || async move {
-            stream_worker(c, channel).await;
-        }));
+        threads.push(rt::run_thread_named(
+            name,
+            channel.priority(),
+            rt::StackSizeClass::Medium,
+            move || async move {
+                stream_worker(c, channel).await;
+            },
+        ));
     }
     threads
 }
@@ -1823,6 +1841,16 @@ impl StreamKind {
         match self {
             Self::PrvHst => Channel::Histogram,
             _ => Channel::Image,
+        }
+    }
+
+    /// The band C starts the worker at: prvHstWorker its own Medium
+    /// (acquire.cpp:505-512), the image workers EPICS_THREAD_OPTS_INIT's
+    /// Low (acquire.cpp:345-346, 440-475; epicsThread.h:173-174).
+    fn priority(self) -> rt::ThreadPriority {
+        match self {
+            Self::PrvHst => rt::ThreadPriority::Medium,
+            _ => rt::ThreadPriority::Low,
         }
     }
 
@@ -4504,9 +4532,14 @@ mod tests {
             assert!(ctx.shared.acquisition.begin_start());
             assert!(kind.worker(&ctx.shared).start());
             let c = ctx.clone();
-            let _worker = rt::run_thread_named(&name, move || async move {
-                stream_worker(c, kind).await;
-            });
+            let _worker = rt::run_thread_named(
+                &name,
+                kind.priority(),
+                rt::StackSizeClass::Medium,
+                move || async move {
+                    stream_worker(c, kind).await;
+                },
+            );
             listener.set_nonblocking(true).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             while listener.accept().is_err() {
@@ -4527,9 +4560,14 @@ mod tests {
         assert!(ctx.shared.acquisition.begin_start());
         assert!(ctx.shared.prv_img_worker.start());
         let c = ctx.clone();
-        let _worker = rt::run_thread_named("TpxOneShot", move || async move {
-            stream_worker(c, StreamKind::PrvImg).await;
-        });
+        let _worker = rt::run_thread_named(
+            "TpxOneShot",
+            StreamKind::PrvImg.priority(),
+            rt::StackSizeClass::Medium,
+            move || async move {
+                stream_worker(c, StreamKind::PrvImg).await;
+            },
+        );
 
         drop(listener.accept().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -4608,9 +4646,14 @@ mod tests {
         assert!(acquisition.commit_start());
         assert!(ctx.shared.prv_img_worker.start());
         let c = ctx.clone();
-        let _worker = rt::run_thread_named("TpxStopDrain", move || async move {
-            stream_worker(c, StreamKind::PrvImg).await;
-        });
+        let _worker = rt::run_thread_named(
+            "TpxStopDrain",
+            StreamKind::PrvImg.priority(),
+            rt::StackSizeClass::Medium,
+            move || async move {
+                stream_worker(c, StreamKind::PrvImg).await;
+            },
+        );
         *peer.lock() = Some(stream.accept().unwrap().0);
         assert!(
             ctx.shared
@@ -5075,9 +5118,14 @@ mod tests {
         let worker = &ctx.shared.prv_img1_worker;
         assert!(worker.start());
         let c = ctx.clone();
-        let _thread = rt::run_thread_named("TpxPrvImg1", move || async move {
-            stream_worker(c, StreamKind::PrvImg1).await;
-        });
+        let _thread = rt::run_thread_named(
+            "TpxPrvImg1",
+            StreamKind::PrvImg1.priority(),
+            rt::StackSizeClass::Medium,
+            move || async move {
+                stream_worker(c, StreamKind::PrvImg1).await;
+            },
+        );
         let mut peer = listener.accept().unwrap().0;
         assert!(worker.wait_for_connected_for(Duration::from_secs(5)));
         let mut bytes =

@@ -1254,10 +1254,15 @@ mod tests {
         // The open's flush runs on its own thread. A frame ahead of it would
         // post everything the port has set, in the order it was first set.
         let flushed = handle.clone();
-        epics_rs::ad_core::runtime::run_thread(move || async move {
-            gate.jobs_settled().await;
-            flushed.interrupts().edge_sweeps().cleared().await;
-        })
+        epics_rs::ad_core::runtime::run_thread_named(
+            "openFlushWait",
+            epics_rs::ad_core::runtime::ThreadPriority::Medium,
+            epics_rs::ad_core::runtime::StackSizeClass::Medium,
+            move || async move {
+                gate.jobs_settled().await;
+                flushed.interrupts().edge_sweeps().cleared().await;
+            },
+        )
         .join()
         .unwrap();
         std::mem::forget(runtime);
@@ -1281,9 +1286,14 @@ mod tests {
     fn run_quad_frame_in(ctx: AcquisitionContext) {
         let mut body = crate::protocol::tests::quad_header(768, 1);
         body.resize(768 + 256 * 256 * 2, 0);
-        epics_rs::ad_core::runtime::run_thread(move || async move {
-            crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
-        })
+        epics_rs::ad_core::runtime::run_thread_named(
+            "MerlinDataTask",
+            epics_rs::ad_core::runtime::ThreadPriority::Medium,
+            epics_rs::ad_core::runtime::StackSizeClass::Medium,
+            move || async move {
+                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+            },
+        )
         .join()
         .unwrap();
     }
@@ -1316,9 +1326,14 @@ mod tests {
         // Big-endian pixels, each the value of its row-major index.
         body.extend((0..w * h).flat_map(|i| (i as u16).to_be_bytes()));
         let counted = crate::alloc_count::count(size);
-        epics_rs::ad_core::runtime::run_thread(move || async move {
-            crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
-        })
+        epics_rs::ad_core::runtime::run_thread_named(
+            "MerlinDataTask",
+            epics_rs::ad_core::runtime::ThreadPriority::Medium,
+            epics_rs::ad_core::runtime::StackSizeClass::Medium,
+            move || async move {
+                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+            },
+        )
         .join()
         .unwrap();
         let allocs = counted.stop();
@@ -1440,9 +1455,14 @@ mod tests {
         let trace_held = file.lock().unwrap();
         let pass = std::thread::spawn(move || {
             let body = b"XXX,000001".to_vec();
-            epics_rs::ad_core::runtime::run_thread(move || async move {
-                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
-            })
+            epics_rs::ad_core::runtime::run_thread_named(
+                "MerlinDataTask",
+                epics_rs::ad_core::runtime::ThreadPriority::Medium,
+                epics_rs::ad_core::runtime::StackSizeClass::Medium,
+                move || async move {
+                    crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+                },
+            )
             .join()
             .unwrap();
         });
@@ -1480,9 +1500,14 @@ mod tests {
         let mut body = crate::protocol::tests::quad_header(768, 1);
         body[..3].copy_from_slice(b"PR1");
         body.resize(768 + (256 + 256) * 8, 0);
-        epics_rs::ad_core::runtime::run_thread(move || async move {
-            crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
-        })
+        epics_rs::ad_core::runtime::run_thread_named(
+            "MerlinDataTask",
+            epics_rs::ad_core::runtime::ThreadPriority::Medium,
+            epics_rs::ad_core::runtime::StackSizeClass::Medium,
+            move || async move {
+                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+            },
+        )
         .join()
         .unwrap();
         handle.read_int32_blocking(counter, 0).unwrap();
@@ -1528,9 +1553,14 @@ mod tests {
         let mut body = crate::protocol::tests::quad_header(768, 1);
         body[..3].copy_from_slice(prefix);
         body.resize(768 + len, 0);
-        epics_rs::ad_core::runtime::run_thread(move || async move {
-            crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
-        })
+        epics_rs::ad_core::runtime::run_thread_named(
+            "MerlinDataTask",
+            epics_rs::ad_core::runtime::ThreadPriority::Medium,
+            epics_rs::ad_core::runtime::StackSizeClass::Medium,
+            move || async move {
+                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+            },
+        )
         .join()
         .unwrap();
         receiver.blocking_recv().expect("the frame's array")

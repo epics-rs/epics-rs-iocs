@@ -129,7 +129,13 @@ pub(crate) struct DataContext {
 }
 
 pub(crate) fn start_data_task(ctx: DataContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PixiradDataTask", move || data_loop(ctx))
+    // As C creates it (pixirad.cpp:671-674).
+    rt::run_thread_named(
+        "PixiradDataTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || data_loop(ctx),
+    )
 }
 
 /// The image being built out of one frame per colour.
@@ -359,14 +365,20 @@ pub(crate) fn start_status_task(
     status_port: u16,
     ctx: StatusContext,
 ) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PixiradStatusTask", move || async move {
-        match udp::bind_status_socket(status_port) {
-            Ok(socket) => status_loop(socket, ctx).await,
-            // C returns here still holding the port lock, which wedges the
-            // port; only the task stops.
-            Err(e) => ctx.trace_error(&format!("pixirad:statusTask: {e}\n")),
-        }
-    })
+    // As C creates it (pixirad.cpp:665-668).
+    rt::run_thread_named(
+        "PixiradStatusTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || async move {
+            match udp::bind_status_socket(status_port) {
+                Ok(socket) => status_loop(socket, ctx).await,
+                // C returns here still holding the port lock, which wedges the
+                // port; only the task stops.
+                Err(e) => ctx.trace_error(&format!("pixirad:statusTask: {e}\n")),
+            }
+        },
+    )
 }
 
 /// The status task on a socket the caller already holds, so no other socket
@@ -376,7 +388,12 @@ pub(crate) fn start_status_task_on(
     socket: std::net::UdpSocket,
     ctx: StatusContext,
 ) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PixiradStatusTask", move || status_loop(socket, ctx))
+    rt::run_thread_named(
+        "PixiradStatusTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || status_loop(socket, ctx),
+    )
 }
 
 /// Read the environmental broadcast, work out the dew point, and switch the

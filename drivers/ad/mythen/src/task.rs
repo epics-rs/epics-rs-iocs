@@ -61,11 +61,17 @@ pub fn start(
     shared: Arc<Shared>,
     mut start_rx: rt::CommandReceiver<()>,
 ) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("mythenAcquisitionTask", move || async move {
-        while start_rx.recv().await.is_some() {
-            acquire(&shared).await;
-        }
-    })
+    // As C creates it (mythen.cpp:1388-1392).
+    rt::run_thread_named(
+        "mythenAcquisitionTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || async move {
+            while start_rx.recv().await.is_some() {
+                acquire(&shared).await;
+            }
+        },
+    )
 }
 
 /// One acquisition, from the start signal to the last frame.

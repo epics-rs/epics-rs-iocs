@@ -108,7 +108,12 @@ impl AcquisitionContext {
 
 /// Start the acquisition task thread via the `rt` facade.
 pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("D435iTask", move || acquisition_loop_async(ctx))
+    rt::run_thread_named(
+        "D435iTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || acquisition_loop_async(ctx),
+    )
 }
 
 /// Open a fresh context and start a pipeline for `config`.

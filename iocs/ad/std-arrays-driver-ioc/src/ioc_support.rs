@@ -11,9 +11,9 @@ use ad_std_arrays_driver::{NdStdArraysRuntime, create_nd_std_arrays};
 /// Signature matches the C iocsh command (NDDriverStdArrays.cpp:424-450):
 ///   `NDDriverStdArraysConfig(portName, maxBuffers, maxMemory, priority, stackSize)`
 ///
-/// DEVIATION: `priority` and `stackSize` configure `epicsThreadCreate`; the
-/// Rust publisher task runs on a `run_thread_named` worker with no equivalent
-/// knobs, so both are accepted and ignored.
+/// `priority` and `stackSize` are accepted and ignored: C gives them to the
+/// asyn port thread, which it never starts for this non-`ASYN_CANBLOCK` port
+/// (NDDriverStdArrays.cpp:44-52).
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
     epics_rs::base::runtime::env::set_default_path("NDDRIVERSTDARRAYS", env!("CARGO_MANIFEST_DIR"));
 
