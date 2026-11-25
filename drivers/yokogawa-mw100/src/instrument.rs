@@ -189,11 +189,17 @@ impl Instrument {
     /// C `qmesg(dq, precord, ...)`: queue `command` and return at once; the
     /// actor completes `done` when it has run. C's queue reports no status
     /// to the record (`queue_func`, drvMW100.c:1398-1424), so a device or
-    /// wire error cannot alarm. On a device with no queue thread `done` is
-    /// dropped un-run and the record stays in PACT, as C's packet sits on a
-    /// list nobody drains.
-    pub fn submit_write(&self, command: Command, done: DeviceDone) {
-        self.send(command, Done::Write(done));
+    /// wire error cannot alarm. `false`: nothing was queued and `done` is
+    /// dropped un-run.
+    pub fn submit_write(&self, command: Command, done: DeviceDone) -> bool {
+        self.send(command, Done::Write(done))
+    }
+
+    /// The queue thread started, which it does only when `init_mw100`
+    /// connected and loaded the unit (drvMW100.c:1531-1556); otherwise
+    /// nothing ever refreshes the cache.
+    pub fn online(&self) -> bool {
+        self.tx.get().is_some()
     }
 
     fn send(&self, command: Command, done: Done) -> bool {
@@ -480,7 +486,7 @@ impl Instrument {
     /// [`Self::submit_write`] does. False when nothing was queued: a Signal
     /// channel with no recognized type, which C leaves PACT with no packet,
     /// or a unit with no queue thread, whose packet C leaves on a list
-    /// nobody drains; this port reads either from the cache at once.
+    /// nobody drains; this port ends either pass at once.
     pub fn channel_start(&self, family: ChannelFamily, channel: u32, done: DeviceDone) -> bool {
         let command = match family {
             ChannelFamily::Signal => match self.channel_type(channel) {
