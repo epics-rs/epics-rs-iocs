@@ -155,6 +155,10 @@ pub struct Cache {
 
     pub error_flag: bool,
     pub error: ErrorState,
+
+    /// Test only: the queue thread panics in the next command it runs.
+    #[cfg(test)]
+    pub panic_in_next_command: bool,
 }
 
 impl Default for Cache {
@@ -177,6 +181,8 @@ impl Default for Cache {
             alarm_flag: false,
             error_flag: false,
             error: ErrorState::default(),
+            #[cfg(test)]
+            panic_in_next_command: false,
         }
     }
 }
