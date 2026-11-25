@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io::{self, Write as _};
 use std::net::{SocketAddrV4, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 
@@ -101,6 +102,9 @@ enum Done {
     /// A write left PACT by `write_begin`.
     Write(DeviceDone),
     NoRecord,
+    /// Test only: the queue thread panics once the command ran.
+    #[cfg(test)]
+    Panic,
 }
 
 struct Job {
@@ -116,9 +120,28 @@ pub struct Instrument {
     /// The `queue_func` thread's queue; unset when the connect or load
     /// failed, which leaves C's `dq` listed with no thread to drain it.
     tx: OnceLock<mpsc::Sender<Job>>,
+    /// [`Instrument::online`], written only through the queue thread's
+    /// [`Link`].
+    reachable: Arc<AtomicBool>,
     /// `mw100_system_info(which=0, ...)` (`drvMW100.c:1731-1742`): the
     /// configured address, as `inet_ntop` prints it.
     pub peer_address: String,
+}
+
+/// The queue thread's hold on [`Instrument::online`], its one writer. Its
+/// drop, when the thread ends or unwinds, marks the unit offline.
+struct Link(Arc<AtomicBool>);
+
+impl Link {
+    fn set(&self, reachable: bool) {
+        self.0.store(reachable, Ordering::Release);
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.set(false);
+    }
 }
 
 impl Instrument {
@@ -127,6 +150,7 @@ impl Instrument {
             cache: Arc::default(),
             interrupts: Arc::default(),
             tx: OnceLock::new(),
+            reachable: Arc::default(),
             peer_address,
         })
     }
@@ -138,43 +162,26 @@ impl Instrument {
         Ok(instrument)
     }
 
-    /// The tail of `init_mw100` (`drvMW100.c:1531-1556`): read the
-    /// unsolicited post-connect `E0` greeting, negotiate binary byte order,
-    /// run the fixed load sequence (the cache keeps whatever loaded if a
-    /// step fails), then start the queue thread.
+    /// Start the queue thread on `stream`. It runs [`Actor::load`] first,
+    /// where C's `init_mw100` loads before it starts the thread, so the
+    /// stream and the [`Link`] never leave it; jobs queue once that loaded.
     fn start(&self, stream: TcpStream) -> io::Result<()> {
         let (tx, rx) = mpsc::channel::<Job>();
-        let mut actor = Actor {
+        let actor = Actor {
+            link: Link(self.reachable.clone()),
             stream,
             cache: self.cache.clone(),
             interrupts: self.interrupts.clone(),
             rx,
             backlog: VecDeque::new(),
         };
-
-        match wire::read_response(&mut actor.stream)? {
-            RawResponse::Ok => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "no initial E0 greeting after connect",
-                ));
-            }
-        }
-
-        // `#if EPICS_BYTE_ORDER == EPICS_ENDIAN_LITTLE` (`drvMW100.c:1538-1543`):
-        // this port always decodes little-endian, so it always negotiates BO1.
-        actor.expect_ok(&cmd_bo1())?;
-
-        actor.load_modules()?;
-        actor.load_status()?;
-        actor.load_infos()?;
-        actor.load_input_values(None)?;
-        actor.load_output_values(None)?;
-
+        let (loaded_tx, loaded) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("mw100-instrument".to_string())
-            .spawn(move || actor.run())?;
+            .spawn(move || actor.run(loaded_tx))?;
+        loaded
+            .recv()
+            .unwrap_or_else(|_| Err(io::Error::other("queue thread died loading the unit")))?;
         let _ = self.tx.set(tx);
         Ok(())
     }
@@ -188,18 +195,30 @@ impl Instrument {
 
     /// C `qmesg(dq, precord, ...)`: queue `command` and return at once; the
     /// actor completes `done` when it has run. C's queue reports no status
-    /// to the record (`queue_func`, drvMW100.c:1398-1424), so a device or
-    /// wire error cannot alarm. `false`: nothing was queued and `done` is
-    /// dropped un-run.
+    /// to the record (`queue_func`, drvMW100.c:1398-1424), so a device
+    /// error cannot alarm; a wire error shows in [`Instrument::online`].
+    /// `false`: nothing was queued and `done` is dropped un-run.
     pub fn submit_write(&self, command: Command, done: DeviceDone) -> bool {
         self.send(command, Done::Write(done))
     }
 
-    /// The queue thread started, which it does only when `init_mw100`
-    /// connected and loaded the unit (drvMW100.c:1531-1556); otherwise
-    /// nothing ever refreshes the cache.
+    /// The unit is reachable now: the queue thread's latest exchange read a
+    /// whole frame. False until the thread has one, from a wire error to
+    /// the next whole frame, and once the thread is gone. C has no such
+    /// state and serves an unreachable unit's cache as current.
     pub fn online(&self) -> bool {
-        self.tx.get().is_some()
+        self.reachable.load(Ordering::Acquire)
+    }
+
+    /// Test only: panic the queue thread; returns once it is gone.
+    #[cfg(test)]
+    pub(crate) fn panic_queue_thread(&self) {
+        // `set_mode` takes 0 or 1, so `SetOpMode(2)` sends nothing.
+        let mut done = Done::Panic;
+        while self.send(Command::SetOpMode(2), done) {
+            done = Done::NoRecord;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn send(&self, command: Command, done: Done) -> bool {
@@ -507,6 +526,8 @@ impl Instrument {
 }
 
 pub struct Actor {
+    /// First, so the unit reads offline before `rx` refuses a job.
+    link: Link,
     stream: TcpStream,
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
@@ -516,7 +537,15 @@ pub struct Actor {
 }
 
 impl Actor {
-    fn run(mut self) {
+    /// [`Actor::load`], whose outcome `loaded` takes back to `start`, then,
+    /// on a unit that loaded, `queue_func`.
+    fn run(mut self, loaded: mpsc::SyncSender<io::Result<()>>) {
+        let load = self.load();
+        let failed = load.is_err();
+        let _ = loaded.send(load);
+        if failed {
+            return;
+        }
         while let Some(job) = self.backlog.pop_front().or_else(|| self.rx.recv().ok()) {
             let _ = self.process(job.command);
             // queue_func's `dbScanLock; process; dbScanUnlock` on this thread
@@ -526,8 +555,36 @@ impl Actor {
                 Done::Read(done) => done.reprocess_now(),
                 Done::Write(done) => done.complete_now(),
                 Done::NoRecord => {}
+                #[cfg(test)]
+                Done::Panic => panic!("the queue thread panics, for a test"),
             }
         }
+    }
+
+    /// The tail of `init_mw100` (`drvMW100.c:1531-1556`): read the
+    /// unsolicited post-connect `E0` greeting, negotiate binary byte order,
+    /// run the fixed load sequence (the cache keeps whatever loaded if a
+    /// step fails).
+    fn load(&mut self) -> io::Result<()> {
+        match self.read_frame()? {
+            RawResponse::Ok => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "no initial E0 greeting after connect",
+                ));
+            }
+        }
+
+        // `#if EPICS_BYTE_ORDER == EPICS_ENDIAN_LITTLE` (`drvMW100.c:1538-1543`):
+        // this port always decodes little-endian, so it always negotiates BO1.
+        self.expect_ok(&cmd_bo1())?;
+
+        self.load_modules()?;
+        self.load_status()?;
+        self.load_infos()?;
+        self.load_input_values(None)?;
+        self.load_output_values(None)
     }
 
     /// C `qmesg(dq, NULL, ...)` from the queue thread: the job goes behind
@@ -566,8 +623,21 @@ impl Actor {
         }
     }
 
+    /// With [`Actor::read_frame`], the only use of the stream.
     fn write_command(&mut self, command: &str) -> io::Result<()> {
-        wire::write_command(&mut self.stream, command)
+        let sent = wire::write_command(&mut self.stream, command);
+        if sent.is_err() {
+            self.link.set(false);
+        }
+        sent
+    }
+
+    /// A whole frame is a good exchange; a wire error leaves the unit
+    /// offline until the next one.
+    fn read_frame(&mut self) -> io::Result<RawResponse> {
+        let frame = wire::read_response(&mut self.stream);
+        self.link.set(frame.is_ok());
+        frame
     }
 
     /// `response_reader` (`drvMW100.c:526-562`): resets BOTH the transient
@@ -579,7 +649,7 @@ impl Actor {
     /// no interrupt (`drvMW100.c:558-559` has no `scanIoRequest` call in
     /// that branch).
     fn read_response(&mut self) -> io::Result<RawResponse> {
-        let raw = wire::read_response(&mut self.stream)?;
+        let raw = self.read_frame()?;
         {
             let mut cache = self.cache.lock();
             cache.error.flag = false;
