@@ -20,8 +20,14 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 const PORT: u16 = 34434;
+
+/// How long a reply may take. C reads with no bound (`TODO: add timeout`,
+/// drvGM10_comm.c:31, :58), so a unit that stops answering holds its
+/// queue thread and every record queued on it.
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 5 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptCategory {
@@ -215,6 +221,7 @@ impl Instrument {
     /// where C's `init_gm10` loads before it starts the thread, so the
     /// stream and the [`Link`] never leave it; jobs queue once that loaded.
     fn start(&self, stream: TcpStream) -> io::Result<()> {
+        stream.set_read_timeout(Some(READ_TIMEOUT))?;
         let (tx, rx) = mpsc::channel::<Job>();
         let actor = Actor {
             link: Link {
@@ -681,6 +688,16 @@ impl Actor {
     /// offline until the next one.
     fn read_frame(&mut self) -> io::Result<RawResponse> {
         let frame = wire::read_response(&mut self.stream);
+        if let Err(e) = &frame
+            && matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            )
+        {
+            // A reply that comes after the timeout would answer the next
+            // command.
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
         self.link.set(frame.is_ok());
         frame
     }
@@ -1370,15 +1387,25 @@ pub(crate) mod test_support {
         listener: TcpListener,
         responses: Vec<Vec<u8>>,
     ) -> std::thread::JoinHandle<Vec<String>> {
+        spawn_gated_fake_device(listener, responses, None)
+    }
+
+    /// [`spawn_fake_device`], holding reply `n` back until `gate` fires or
+    /// its sender drops. It stops once the driver closes the connection.
+    pub(crate) fn spawn_gated_fake_device(
+        listener: TcpListener,
+        responses: Vec<Vec<u8>>,
+        gate: Option<(usize, mpsc::Receiver<()>)>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream.write_all(b"E0\r\n").unwrap();
             let mut received = Vec::new();
-            for response in responses {
+            for (n, response) in responses.into_iter().enumerate() {
                 let mut line = Vec::new();
                 let mut byte = [0u8; 1];
                 loop {
-                    if stream.read(&mut byte).unwrap() == 0 {
+                    if !matches!(stream.read(&mut byte), Ok(1)) {
                         return received;
                     }
                     line.push(byte[0]);
@@ -1387,7 +1414,14 @@ pub(crate) mod test_support {
                     }
                 }
                 received.push(String::from_utf8(line).unwrap());
-                stream.write_all(&response).unwrap();
+                if let Some((at, gate)) = &gate
+                    && *at == n
+                {
+                    let _ = gate.recv();
+                }
+                if stream.write_all(&response).is_err() {
+                    return received;
+                }
             }
             received
         })

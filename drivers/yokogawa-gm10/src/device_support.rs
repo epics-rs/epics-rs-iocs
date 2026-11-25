@@ -906,7 +906,7 @@ mod tests {
     use super::*;
     use crate::instrument::test_support::{
         ascii_frame, connect_default_fixture, default_init_responses, fdata_binary,
-        one_record_fdata_binary, registry_with_offline, spawn_fake_device,
+        one_record_fdata_binary, registry_with_offline, spawn_fake_device, spawn_gated_fake_device,
     };
     use epics_rs::base::server::record::FieldDesc;
     use std::collections::HashMap;
@@ -1555,11 +1555,28 @@ mod tests {
     fn fixture_then(
         extra: Vec<Vec<u8>>,
     ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
+        gated_fixture_then(extra, None)
+    }
+
+    /// [`fixture_then`], the reply to the first command after the load held
+    /// back until `gate` fires.
+    fn fixture_holding_then(
+        extra: Vec<Vec<u8>>,
+        gate: std::sync::mpsc::Receiver<()>,
+    ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
+        gated_fixture_then(extra, Some(gate))
+    }
+
+    fn gated_fixture_then(
+        extra: Vec<Vec<u8>>,
+        gate: Option<std::sync::mpsc::Receiver<()>>,
+    ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut responses = default_init_responses();
+        let gate = gate.map(|gate| (responses.len(), gate));
         responses.extend(extra);
-        let device = spawn_fake_device(listener, responses);
+        let device = spawn_gated_fake_device(listener, responses, gate);
         (Instrument::connect_to(addr).unwrap(), device)
     }
 
@@ -1856,6 +1873,41 @@ record(calc, "CNT") {{ field(CALC, "A+1") field(INPA, "CNT") }}
                 "PACT, STAT, SEVR of AI and AO"
             );
             assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(0.0));
+        });
+    }
+
+    /// A unit that stops answering ends the read with COMM_ALARM once
+    /// READ_TIMEOUT passes, and the reply it sends after that answers no
+    /// later read.
+    #[test]
+    fn a_read_the_unit_never_answers_ends_with_comm_alarm() {
+        use crate::instrument::READ_TIMEOUT;
+        use std::time::{Duration, Instant};
+        epics_rs::base::runtime::task::test_block_on(async {
+            let (late, gate) = std::sync::mpsc::channel();
+            let (instrument, _device) =
+                fixture_holding_then(vec![channel_1_reads_5678(), channel_1_reads_5678()], gate);
+            let db = ai_and_ao_on("", instrument).await;
+            let mut ends = Vec::new();
+            for _ in 0..2 {
+                let _ = db
+                    .put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                    .await;
+                let deadline = Instant::now() + READ_TIMEOUT + Duration::from_secs(3);
+                while pact_and_alarm(&db, "AI").0 && Instant::now() < deadline {
+                    epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+                }
+                ends.push((pact_and_alarm(&db, "AI"), db.get_pv("AI.VAL").unwrap()));
+                let _ = late.send(());
+            }
+            assert_eq!(
+                ends,
+                [
+                    (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (COMM_INVALID, EpicsValue::Double(0.0))
+                ],
+                "(PACT, STAT, SEVR) and VAL after the read with no reply and the next"
+            );
         });
     }
 
