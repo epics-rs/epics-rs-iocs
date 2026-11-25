@@ -248,6 +248,8 @@ pub struct Plc {
     started: AtomicBool,
     /// C's `ETHERIP_PORT`; a test's fake PLC listens on a port of its own.
     port: u16,
+    #[cfg(test)]
+    panic_in_next_pass: AtomicBool,
 }
 
 impl Plc {
@@ -267,7 +269,14 @@ impl Plc {
             stop: AtomicBool::new(false),
             started: AtomicBool::new(false),
             port,
+            #[cfg(test)]
+            panic_in_next_pass: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_in_next_pass(&self) {
+        self.panic_in_next_pass.store(true, Ordering::SeqCst);
     }
 
     /// `drvEtherIP_add_tag`: register a tag for scanning at `period`,
@@ -538,6 +547,7 @@ pub fn stop_scan_tasks() {
 // ---------------------------------------------------------------------------
 
 fn scan_loop(plc: Arc<Plc>) {
+    let _exit = ScanExit(plc.clone());
     while !plc.stop.load(Ordering::Relaxed) {
         // The pass holds the connection the way C's PLC_scan_task holds
         // plc->lock; the sleep comes after it is released.
@@ -546,16 +556,32 @@ fn scan_loop(plc: Arc<Plc>) {
             std::thread::sleep(pause);
         }
     }
+}
 
-    if let Some(c) = plc.conn.lock().take() {
-        c.shutdown();
+/// The scan thread's exit, a panic's included: no write stays pending on
+/// a PLC without a scan thread, and `drvEtherIP_restart` may launch one.
+struct ScanExit(Arc<Plc>);
+
+impl Drop for ScanExit {
+    fn drop(&mut self) {
+        let plc = &self.0;
+        // Held until `started` is cleared: restart reads it under this lock.
+        let mut conn = plc.conn.lock();
+        if let Some(c) = conn.take() {
+            c.shutdown();
+        }
+        plc.connected.store(false, Ordering::Relaxed);
+        plc.invalidate_tags();
+        plc.started.store(false, Ordering::SeqCst);
     }
-    plc.connected.store(false, Ordering::Relaxed);
-    plc.started.store(false, Ordering::SeqCst);
 }
 
 /// One turn of C's `scan_loop:` label. Returns how long to sleep.
 fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> {
+    #[cfg(test)]
+    if plc.panic_in_next_pass.swap(false, Ordering::SeqCst) {
+        panic!("the scan thread panics, for a test");
+    }
     // -- connect ---------------------------------------------------------
     if conn.is_none() {
         let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;

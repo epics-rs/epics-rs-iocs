@@ -2080,6 +2080,45 @@ mod tests {
         assert!(ended, "PACT after the write's transfer");
     }
 
+    /// A scan thread that panics ends the write it left pending, and
+    /// `drvEtherIP_restart`, which launches a scan task only for a PLC
+    /// without one (drvEtherIP.c:1389), launches the PLC a new one.
+    #[test]
+    fn a_scan_thread_that_panics_ends_the_pending_write_and_can_be_relaunched() {
+        use epics_rs::base::server::ioc_app::InitHookState;
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        let rt = current_thread();
+        let db = eip_db("panics");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AOPANIC",
+            Box::new(AoRecord::default()),
+            "panics",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        rt.block_on(db.put_record_field_from_ca_no_notify(
+            "AOPANIC",
+            "VAL",
+            EpicsValue::Double(3.0),
+        ))
+        .unwrap();
+        let pact = || db.get_record("AOPANIC").unwrap().read().is_processing();
+        assert!(pact(), "the write is pending");
+
+        driver::find_plc("panics").unwrap().panic_in_next_pass();
+        driver::init_hook(InitHookState::AfterScanInit);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pact() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pact(), "PACT after the scan thread panicked");
+        assert_eq!(driver::restart(), 1, "scan threads restart launched");
+        driver::stop_scan_tasks();
+    }
+
     /// A disconnected tag leaves an output in WRITE_ALARM, as C's ao_write.
     #[test]
     fn an_output_without_data_raises_write_alarm() {
