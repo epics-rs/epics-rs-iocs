@@ -13,16 +13,15 @@ use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::adapter::parse_asyn_link;
-use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::port::QueuePriority;
-use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
 use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
-use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
     WriteStart,
@@ -32,6 +31,7 @@ use epics_rs::base::server::recgbl::alarm_status::{READ_ALARM, WRITE_ALARM};
 use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
+use crate::Reentry;
 use protocol::{Command, DISPLAY_STRINGS, c_atoi, c_strtod};
 
 /// `device(<type>,INST_IO,dev<Type>MPC,"asyn MPC")` (`ipSupport.dbd`).
@@ -141,19 +141,10 @@ struct Job {
     command: Command,
     handle: PortHandle,
     exchange: Mutex<Exchange>,
-    /// The record's completion and band, and whether it ends a write.
-    reentry: Mutex<Option<(DeviceDone, CallbackPriority, bool)>>,
+    reentry: Reentry,
 }
 
 impl Job {
-    fn arm(&self, done: &DeviceDoneSource<'_>, write: bool) {
-        let mut slot = self.reentry.lock().unwrap();
-        match &mut *slot {
-            Some((_, prio, w)) => (*prio, *w) = (done.priority(), write),
-            None => *slot = Some((done.device_done(), done.priority(), write)),
-        }
-    }
-
     fn trace(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
         print(&self.handle, mask, args);
     }
@@ -280,6 +271,8 @@ impl CellBody for Job {
     fn process(&self, port: &mut dyn PortCalls) {
         let mut ex = self.exchange.lock().unwrap();
         self.exchange(port, &mut ex);
+        drop(ex);
+        self.reentry.end();
     }
 
     /// No `timeoutUser`, so only a port shutting down with the request queued
@@ -288,19 +281,12 @@ impl CellBody for Job {
         let mut ex = self.exchange.lock().unwrap();
         ex.ok = false;
         ex.rec_buf.clear();
+        drop(ex);
+        self.reentry.end();
     }
 
-    /// `dbScanLock(pr); prset->process(pr)` at the end of `devMPCCallback`.
-    fn done(self: Arc<Self>) {
-        let armed = self.reentry.lock().unwrap().clone();
-        if let Some((done, prio, write)) = armed {
-            let _ = if write {
-                done.complete(prio)
-            } else {
-                done.reprocess(prio)
-            };
-        }
-    }
+    /// `process` and `unrun` end the pass.
+    fn done(self: Arc<Self>) {}
 
     /// `createAsynUser(devMPCCallback, 0)` (`devMPC.c:214`).
     fn timeout_user(&self) -> bool {
@@ -433,13 +419,16 @@ impl DevMpc {
         }
     }
 
-    /// `buildCommand` then `startIOCommon`. A refused `queueRequest` returns
-    /// -1 with PACT already set, so the record stays active, as in C.
-    fn start(&mut self, record: &dyn Record, done: &DeviceDoneSource<'_>) {
+    /// `buildCommand` then `startIOCommon`, or `None` with no port. A refused
+    /// `queueRequest` returns -1 with PACT already set, so the record stays
+    /// active, as in C.
+    fn start(
+        &mut self,
+        record: &dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> Option<AsynResult<QueueOutcome>> {
         self.alarm = None;
-        let Some(live) = self.live.as_ref() else {
-            return;
-        };
+        let live = self.live.as_ref()?;
         if let Some((hex, data)) = self.command(live, record) {
             let send = protocol::build_command(&live.address, hex, &data);
             print(
@@ -453,11 +442,16 @@ impl DevMpc {
             );
             live.job.exchange.lock().unwrap().send = send;
         }
-        live.job.arm(done, self.kind.is_output());
         let user = AsynUser::new(0)
             .with_addr(ADDR)
             .with_priority(QueuePriority::Low);
-        let _ = live.job.handle.queue_request(&live.cell, &user);
+        Some(live.job.reentry.queue(
+            &live.job.handle,
+            &live.cell,
+            &user,
+            done,
+            self.kind.is_output(),
+        ))
     }
 
     /// The exchange's outcome and `recBuf`, with its alarm taken.
@@ -672,7 +666,7 @@ impl DeviceSupport for DevMpc {
                 prev_read_status: 0,
                 alarm: None,
             }),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let cell = handle.new_cell(job.clone());
         self.live = Some(Live {
@@ -689,11 +683,13 @@ impl DeviceSupport for DevMpc {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        if done.pact() || self.live.is_none() {
+        if done.pact() {
             return Ok(ReadStart::Synchronous);
         }
-        self.start(record, done);
-        Ok(ReadStart::Pending)
+        Ok(match self.start(record, done) {
+            Some(Ok(QueueOutcome::Queued) | Err(_)) => ReadStart::Pending,
+            Some(Ok(QueueOutcome::Ran)) | None => ReadStart::Synchronous,
+        })
     }
 
     /// C `MPCConvert`, the slot of both devAiMPC and devAoMPC.
@@ -725,11 +721,14 @@ impl DeviceSupport for DevMpc {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
-        if self.live.is_none() {
-            return Ok(WriteStart::Completed);
-        }
-        self.start(record, done);
-        Ok(WriteStart::Pending)
+        Ok(match self.start(record, done) {
+            Some(Ok(QueueOutcome::Queued) | Err(_)) => WriteStart::Pending,
+            Some(Ok(QueueOutcome::Ran)) => {
+                self.async_write_completed(record);
+                WriteStart::Completed
+            }
+            None => WriteStart::Completed,
+        })
     }
 
     /// `writeX` with `pact == 1`: a reply longer than `OK` alarms.
@@ -790,7 +789,7 @@ mod tests {
                 prev_read_status: 0,
                 alarm: None,
             }),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let mut dev = DevMpc::new(kind, "");
         dev.live = Some(Live {

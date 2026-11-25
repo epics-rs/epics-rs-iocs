@@ -14,17 +14,16 @@ use std::time::Duration;
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::asyn_record::get_port;
-use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::QueuePriority;
-use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
 use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
-use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
     WriteStart,
@@ -34,6 +33,7 @@ use epics_rs::base::server::recgbl::alarm_status::READ_ALARM;
 use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
+use crate::Reentry;
 use crate::scan::Scan;
 use protocol::{Command, ENQ, NAK};
 
@@ -137,19 +137,10 @@ struct Job {
     command: Command,
     handle: PortHandle,
     exchange: Mutex<Exchange>,
-    /// The record's completion and band, and whether it ends a write.
-    reentry: Mutex<Option<(DeviceDone, CallbackPriority, bool)>>,
+    reentry: Reentry,
 }
 
 impl Job {
-    fn arm(&self, done: &DeviceDoneSource<'_>, write: bool) {
-        let mut slot = self.reentry.lock().unwrap();
-        match &mut *slot {
-            Some((_, prio, w)) => (*prio, *w) = (done.priority(), write),
-            None => *slot = Some((done.device_done(), done.priority(), write)),
-        }
-    }
-
     fn trace(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
         print(&self.handle, mask, args);
     }
@@ -249,6 +240,8 @@ impl CellBody for Job {
     fn process(&self, port: &mut dyn PortCalls) {
         let mut ex = self.exchange.lock().unwrap();
         self.exchange(port, &mut ex);
+        drop(ex);
+        self.reentry.end();
     }
 
     /// No `timeoutUser`, so only a port shutting down with the request queued
@@ -256,19 +249,12 @@ impl CellBody for Job {
     fn unrun(&self, _why: Unrun) {
         let mut ex = self.exchange.lock().unwrap();
         raise(&mut ex.alarm, READ_ALARM, AlarmSeverity::Invalid);
+        drop(ex);
+        self.reentry.end();
     }
 
-    /// `dbScanLock(pr); prset->process(pr)` at `finish:`.
-    fn done(self: Arc<Self>) {
-        let armed = self.reentry.lock().unwrap().clone();
-        if let Some((done, prio, write)) = armed {
-            let _ = if write {
-                done.complete(prio)
-            } else {
-                done.reprocess(prio)
-            };
-        }
-    }
+    /// `process` and `unrun` end the pass.
+    fn done(self: Arc<Self>) {}
 
     /// `createAsynUser(devTPG261Callback, 0)` (`devTPG261.c:175`).
     fn timeout_user(&self) -> bool {
@@ -371,13 +357,16 @@ impl DevTpg261 {
         built + "\r"
     }
 
-    /// `buildCommand` then `startIOCommon`. A refused `queueRequest` returns
-    /// -1 with PACT already set, so the record stays active, as in C.
-    fn start(&mut self, record: &dyn Record, done: &DeviceDoneSource<'_>) {
+    /// `buildCommand` then `startIOCommon`, or `None` with no port. A refused
+    /// `queueRequest` returns -1 with PACT already set, so the record stays
+    /// active, as in C.
+    fn start(
+        &mut self,
+        record: &dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> Option<AsynResult<QueueOutcome>> {
         self.alarm = None;
-        let Some(live) = self.live.as_ref() else {
-            return;
-        };
+        let live = self.live.as_ref()?;
         let send = self.command(live, record);
         print(
             &live.job.handle,
@@ -389,11 +378,16 @@ impl DevTpg261 {
             ),
         );
         live.job.exchange.lock().unwrap().send = send;
-        live.job.arm(done, self.kind.is_output());
         let user = AsynUser::new(0)
             .with_addr(ADDR)
             .with_priority(QueuePriority::Low);
-        let _ = live.job.handle.queue_request(&live.cell, &user);
+        Some(live.job.reentry.queue(
+            &live.job.handle,
+            &live.cell,
+            &user,
+            done,
+            self.kind.is_output(),
+        ))
     }
 
     /// `recBuf`, with the callback's alarm taken.
@@ -561,7 +555,7 @@ impl DeviceSupport for DevTpg261 {
                 rec_buf: String::new(),
                 alarm: None,
             }),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let cell = handle.new_cell(job.clone());
         self.live = Some(Live { job, cell, address });
@@ -573,11 +567,13 @@ impl DeviceSupport for DevTpg261 {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        if done.pact() || self.live.is_none() {
+        if done.pact() {
             return Ok(ReadStart::Synchronous);
         }
-        self.start(record, done);
-        Ok(ReadStart::Pending)
+        Ok(match self.start(record, done) {
+            Some(Ok(QueueOutcome::Queued) | Err(_)) => ReadStart::Pending,
+            Some(Ok(QueueOutcome::Ran)) | None => ReadStart::Synchronous,
+        })
     }
 
     /// C `TPG261Convert`, the slot of both devAiTPG261 and devAoTPG261.
@@ -609,11 +605,14 @@ impl DeviceSupport for DevTpg261 {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
-        if self.live.is_none() {
-            return Ok(WriteStart::Completed);
-        }
-        self.start(record, done);
-        Ok(WriteStart::Pending)
+        Ok(match self.start(record, done) {
+            Some(Ok(QueueOutcome::Queued) | Err(_)) => WriteStart::Pending,
+            Some(Ok(QueueOutcome::Ran)) => {
+                self.async_write_completed(record);
+                WriteStart::Completed
+            }
+            None => WriteStart::Completed,
+        })
     }
 
     /// `writeX` with `pact == 1`: an empty `recBuf` alarms.
@@ -722,7 +721,7 @@ mod tests {
                 rec_buf: String::new(),
                 alarm: None,
             }),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let mut dev = DevTpg261::new(kind, "");
         dev.live = Some(Live {

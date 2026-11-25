@@ -38,10 +38,16 @@ pub mod televac;
 pub mod tpg261;
 pub mod user_param;
 
+use std::sync::{Arc, Mutex};
+
+use asyn_rs::error::AsynResult;
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::manager::DeviceUser;
-use asyn_rs::port_handle::PortHandle;
+use asyn_rs::port_handle::{PortHandle, QueueOutcome};
+use asyn_rs::request::RequestCell;
+use asyn_rs::user::AsynUser;
 use epics_rs::base::error::CaResult;
+use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
 use epics_rs::base::server::record::Record;
 use epics_rs::base::types::EpicsValue;
 
@@ -92,6 +98,60 @@ pub fn connect_octet(port: &str, addr: i32) -> Result<PortHandle, Unconnected> {
         return Err(Unconnected::NoOctet);
     }
     Ok(entry.handle.clone())
+}
+
+/// The pass each callback here ends with, C's `dbScanLock(pr);
+/// (*prset->process)(pr); dbScanUnlock(pr)`: armed by [`Reentry::queue`] for
+/// a port that can block, ended once by that request's `process` or `unrun`.
+#[derive(Default)]
+pub(crate) struct Reentry(Mutex<Option<Armed>>);
+
+struct Armed {
+    done: DeviceDone,
+    /// The pass completes a write rather than re-entering a read.
+    write: bool,
+}
+
+impl Reentry {
+    /// `queueRequest` of `cell`, whose body ends the pass armed here. A port
+    /// without `ASYN_CANBLOCK` runs the body inside this call, under the
+    /// record's lock set, so nothing is armed and [`QueueOutcome::Ran`] tells
+    /// the caller to finish in this pass; C processes the record a second
+    /// time from inside the first instead.
+    pub(crate) fn queue(
+        &self,
+        handle: &PortHandle,
+        cell: &Arc<RequestCell>,
+        user: &AsynUser,
+        done: &DeviceDoneSource<'_>,
+        write: bool,
+    ) -> AsynResult<QueueOutcome> {
+        if handle.can_block() {
+            *self.0.lock().unwrap() = Some(Armed {
+                done: done.device_done(),
+                write,
+            });
+        }
+        let outcome = handle.queue_request(cell, user);
+        if outcome.is_err() {
+            self.0.lock().unwrap().take();
+        }
+        outcome
+    }
+
+    /// From the request's `process` or `unrun`. On a port that can block
+    /// both run on its thread, which holds no lock set, so the pass runs
+    /// there, as C's does, and no full callback band can refuse it.
+    pub(crate) fn end(&self) {
+        let Some(Armed { done, write }) = self.0.lock().unwrap().take() else {
+            return;
+        };
+        if write {
+            done.complete_now();
+        } else {
+            done.reprocess_now();
+        }
+    }
 }
 
 /// A registered port without `asynOctet`, as `findInterface` sees it.

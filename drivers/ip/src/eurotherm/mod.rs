@@ -14,14 +14,13 @@ use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::QueuePriority;
-use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
 use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::{AsynUser, timeout_from_secs};
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
-use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, WriteStart,
 };
@@ -29,10 +28,10 @@ use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
-use crate::Unconnected;
 use crate::fmt::{c_literal, format_c_double};
 use crate::mpc::protocol::{c_atoi, c_strtod};
 use crate::user_param::{after, c_str, term, up_to_comma};
+use crate::{Reentry, Unconnected};
 use protocol::{ENQ, ETX};
 
 /// The `device(ao,…)` and `device(stringout,…)` lines of `ipSupport.dbd`.
@@ -121,8 +120,7 @@ struct Job {
     handle: PortHandle,
     /// `buffer[0..nchar]`.
     frame: Mutex<Vec<u8>>,
-    /// The record's completion and band.
-    reentry: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+    reentry: Reentry,
 }
 
 impl CellBody for Job {
@@ -134,17 +132,15 @@ impl CellBody for Job {
             .with_addr(ADDR)
             .with_timeout_opt(timeout_from_secs(self.timeout));
         let _ = port.call(&RequestOp::OctetWrite { data }, user);
+        self.reentry.end();
     }
 
-    fn unrun(&self, _why: Unrun) {}
-
-    /// `dbScanLock(pr); prset->process(pr)` at the end of the callback.
-    fn done(self: Arc<Self>) {
-        let armed = self.reentry.lock().unwrap().clone();
-        if let Some((done, prio)) = armed {
-            let _ = done.complete(prio);
-        }
+    fn unrun(&self, _why: Unrun) {
+        self.reentry.end();
     }
+
+    /// `process` and `unrun` end the pass.
+    fn done(self: Arc<Self>) {}
 
     /// `createAsynUser(devEurothermCallback, 0)`.
     fn timeout_user(&self) -> bool {
@@ -300,7 +296,7 @@ impl DeviceSupport for DevEurotherm {
             timeout: parm.timeout,
             handle: handle.clone(),
             frame: Mutex::new(Vec::new()),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let cell = handle.new_cell(job.clone());
         self.live = Some(Live { job, cell, parm });
@@ -322,18 +318,19 @@ impl DeviceSupport for DevEurotherm {
             return Ok(WriteStart::Completed);
         };
         *live.job.frame.lock().unwrap() = self.frame(&live.parm, record);
-        {
-            let mut slot = live.job.reentry.lock().unwrap();
-            match &mut *slot {
-                Some((_, prio)) => *prio = done.priority(),
-                None => *slot = Some((done.device_done(), done.priority())),
-            }
-        }
         let user = AsynUser::new(0)
             .with_addr(ADDR)
             .with_priority(QueuePriority::Low);
-        let _ = live.job.handle.queue_request(&live.cell, &user);
-        Ok(WriteStart::Pending)
+        Ok(
+            match live
+                .job
+                .reentry
+                .queue(&live.job.handle, &live.cell, &user, done, true)
+            {
+                Ok(QueueOutcome::Queued) | Err(_) => WriteStart::Pending,
+                Ok(QueueOutcome::Ran) => WriteStart::Completed,
+            },
+        )
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -369,7 +366,7 @@ mod tests {
             timeout: parm.timeout,
             handle: handle.clone(),
             frame: Mutex::new(Vec::new()),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let mut dev = DevEurotherm::new(kind, "");
         dev.live = Some(Live {

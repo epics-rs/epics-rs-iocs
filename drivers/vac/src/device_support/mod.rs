@@ -18,16 +18,15 @@ pub mod digitel_pump;
 pub mod vac_sen;
 
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::port::QueuePriority;
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{OctetReadOp, PortCalls, RequestOp};
+use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
+use epics_rs::asyn::request::{OctetReadOp, PortCalls, RequestCell, RequestOp};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::base::runtime::task::CallbackPriority;
 use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
 
 /// `asynPrint(pasynUser, mask, ...)` on the record's port, printed as given.
@@ -83,23 +82,41 @@ fn c_str(b: &[u8]) -> std::borrow::Cow<'_, str> {
 }
 
 /// The pass a queued request's callback re-enters — C's `dbScanLock(pr);
-/// prset->process(pr)` at the callback's `finish`.
+/// prset->process(pr)` at the callback's `finish`: armed by
+/// [`Reentry::queue`] for a port that can block, ended once by that request's
+/// `process` or `unrun`.
 #[derive(Default)]
-struct Reentry(Mutex<Option<(DeviceDone, CallbackPriority)>>);
+struct Reentry(Mutex<Option<DeviceDone>>);
 
 impl Reentry {
-    fn arm(&self, done: &DeviceDoneSource<'_>) {
-        let mut slot = self.0.lock().unwrap();
-        match &mut *slot {
-            Some((_, prio)) => *prio = done.priority(),
-            None => *slot = Some((done.device_done(), done.priority())),
+    /// `queueRequest` of `cell`, whose body ends the pass armed here. A port
+    /// without `ASYN_CANBLOCK` runs the body inside this call, under the
+    /// record's lock set, so nothing is armed and [`QueueOutcome::Ran`] tells
+    /// the caller to finish in this pass; C processes the record a second
+    /// time from inside the first instead.
+    fn queue(
+        &self,
+        handle: &PortHandle,
+        cell: &Arc<RequestCell>,
+        user: &AsynUser,
+        done: &DeviceDoneSource<'_>,
+    ) -> AsynResult<QueueOutcome> {
+        if handle.can_block() {
+            *self.0.lock().unwrap() = Some(done.device_done());
         }
+        let outcome = handle.queue_request(cell, user);
+        if outcome.is_err() {
+            self.0.lock().unwrap().take();
+        }
+        outcome
     }
 
-    fn reprocess(&self) {
-        let armed = self.0.lock().unwrap().clone();
-        if let Some((done, prio)) = armed {
-            let _ = done.reprocess(prio);
+    /// From the request's `process` or `unrun`. On a port that can block
+    /// both run on its thread, which holds no lock set, so the pass runs
+    /// there, as C's does, and no full callback band can refuse it.
+    fn end(&self) {
+        if let Some(done) = self.0.lock().unwrap().take() {
+            done.reprocess_now();
         }
     }
 }
