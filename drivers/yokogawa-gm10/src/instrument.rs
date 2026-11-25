@@ -2,14 +2,15 @@
 //! serializing every wire operation through one OS thread (mirrors C's
 //! single-consumer `queue_func`/`qmesg` pair, `drvGM10.c:1311-1375` —
 //! `qmesg` enqueues from any EPICS scan thread, `queue_func` is the sole
-//! socket owner). Writes queue through [`Instrument::enqueue`] and complete
-//! the record from the actor, as C does. Reads block on
-//! [`Instrument::submit`]: the framework has no asynchronous read completion.
+//! socket owner). Writes and non-I/O-Intr reads queue through
+//! [`Instrument::submit_write`] and [`Instrument::channel_start`] and the
+//! actor ends their record's pass, as C does; no scan thread waits on it.
 
 use crate::cache::*;
 use crate::codec::*;
 use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
+use epics_rs::base::server::database::DeviceDone;
 use epics_rs::base::server::driver_support::DriverSupport;
 use epics_rs::base::types::c_parse::strtoul_errno;
 use parking_lot::Mutex;
@@ -94,7 +95,7 @@ pub enum Command {
 
 /// Run by the actor once its command was processed — C `queue_func`'s
 /// `rset->process` call (`drvGM10.c:1327-1332`).
-pub type Completion = Box<dyn FnOnce() + Send>;
+type Completion = Box<dyn FnOnce() + Send>;
 
 struct Job {
     command: Command,
@@ -174,17 +175,28 @@ impl Instrument {
     }
 
     /// C `qmesg` (`drvGM10.c:1342-1373`): queue `command` behind every
-    /// earlier one; `done` runs after it. A gone actor drops `done` un-run.
-    pub fn enqueue(&self, command: Command, done: Completion) {
-        if let Some(tx) = self.tx.get() {
-            let _ = tx.send(Job { command, done });
-        }
+    /// earlier one; `done` runs after it. False when nothing was queued: a
+    /// unit with no queue thread, or a gone actor, drops `done` un-run.
+    fn enqueue(&self, command: Command, done: Completion) -> bool {
+        self.tx
+            .get()
+            .is_some_and(|tx| tx.send(Job { command, done }).is_ok())
     }
 
-    /// Block until the actor thread has finished processing `command`. C's
-    /// `command_process` discards every handler's status (`drvGM10.c:1263-1309`),
-    /// so there is none to return.
-    pub fn submit(&self, command: Command) {
+    /// C `qmesg(dq, precord, ...)`: queue `command` and return at once; the
+    /// actor ends `done`'s pass once it has run. C's `command_process`
+    /// discards every handler's status (`drvGM10.c:1263-1309`), so a device
+    /// or wire error cannot alarm.
+    pub fn submit_write(&self, command: Command, done: DeviceDone) {
+        // queue_func's `dbScanLock; process; dbScanUnlock` on the actor
+        // thread (drvGM10.c:1327-1332), which holds no lock set, not through
+        // a callback band that can refuse it.
+        self.enqueue(command, Box::new(move || done.complete_now()));
+    }
+
+    /// Test only: block until the actor has processed `command`.
+    #[cfg(test)]
+    fn submit(&self, command: Command) {
         let (done_tx, done_rx) = mpsc::channel();
         self.enqueue(
             command,
@@ -417,17 +429,20 @@ impl Instrument {
         }
     }
 
-    /// `gm10_channel_start` (`drvGM10.c:1725-1760`): the first-scan async
-    /// read-refresh for a single channel, collapsed to a blocking round
-    /// trip. Signal channels with no recognized type are a silent no-op.
-    pub fn channel_start(&self, family: ChannelFamily, channel: u32) {
+    /// `gm10_channel_start` (`drvGM10.c:1725-1760`): queue the refresh of
+    /// one channel; the actor re-runs `done`'s pass once it has run, as
+    /// [`Self::submit_write`] ends a write's. False when nothing was queued:
+    /// a Signal channel with no recognized type, which C leaves PACT with no
+    /// packet, or a unit with no queue thread, whose packet C leaves on a
+    /// list nobody drains; this port reads either from the cache at once.
+    pub fn channel_start(&self, family: ChannelFamily, channel: u32, done: DeviceDone) -> bool {
         if family == ChannelFamily::Signal
             && matches!(
                 self.channel_type(channel),
                 ChannelType::None | ChannelType::Unknown
             )
         {
-            return;
+            return false;
         }
         let command = match family {
             ChannelFamily::Signal => Command::ReadSignal(channel),
@@ -436,7 +451,7 @@ impl Instrument {
             ChannelFamily::Const => Command::ReadConst(channel),
             ChannelFamily::VarConst => Command::ReadVarConst(channel),
         };
-        self.submit(command)
+        self.enqueue(command, Box::new(move || done.reprocess_now()))
     }
 }
 
@@ -1207,6 +1222,14 @@ pub(crate) mod test_support {
             ascii_frame(b"aaaaaaaa001,12.5\nE"), // SKConst?
             ascii_frame(b"aaaaaaaa001,-7.5\nE"), // SWConst?
         ]
+    }
+
+    /// A registry listing `name`, a unit whose connect was refused, so it
+    /// has no queue thread. Nothing can listen on privileged port 1.
+    pub(crate) fn registry_with_offline(name: &str) -> Arc<Registry> {
+        let registry = Arc::new(Registry::new());
+        init_on_port(&registry, Some(name.as_bytes()), Some(b"127.0.0.1"), 1);
+        registry
     }
 
     /// One connected instrument: module 0 is a present `InputAnalog`

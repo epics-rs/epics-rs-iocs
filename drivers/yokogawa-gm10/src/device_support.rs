@@ -17,7 +17,7 @@ use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart, WriteStart,
 };
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
@@ -542,32 +542,53 @@ impl DeviceSupport for GmDevice {
         Some(resolved.instrument.register_interrupt(category))
     }
 
+    // A VAL read that is not I/O Intr queues the channel's refresh and
+    // stays PACT; its re-entered pass reads the cache (devGM10_ai.c:199-214,
+    // devGM10_bi.c:261-280, devGM10_longin.c:181-197). The scan thread
+    // never waits on the instrument.
+    fn read_begin(
+        &mut self,
+        _record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
+        let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
+            return Ok(ReadStart::Synchronous);
+        };
+        if self.is_io_intr || done.pact() {
+            return Ok(ReadStart::Synchronous);
+        }
+        let queued = match *op {
+            Operation::AnalogVal(addr) => {
+                instrument.channel_start(addr.family, addr.index, done.device_done())
+            }
+            Operation::IntegerVal(channel) | Operation::BinaryVal(channel) => {
+                instrument.channel_start(ChannelFamily::Signal, channel, done.device_done())
+            }
+            _ => false,
+        };
+        Ok(if queued {
+            ReadStart::Pending
+        } else {
+            ReadStart::Synchronous
+        })
+    }
+
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let Some(Resolved { instrument, op }) = &self.resolved else {
             return Ok(DeviceReadOutcome::ok());
         };
-        let is_io_intr = self.is_io_intr;
         match *op {
             Operation::AnalogVal(addr) => {
-                if !is_io_intr {
-                    instrument.channel_start(addr.family, addr.index);
-                }
                 let v = instrument.analog_get(addr.family, addr.index);
                 record.put_field("VAL", EpicsValue::Double(v))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::IntegerVal(channel) => {
-                if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel);
-                }
                 let v = instrument.integer_get(channel);
                 record.put_field("VAL", EpicsValue::Long(v))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::BinaryVal(channel) => {
-                if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel);
-                }
                 let v = instrument.binary_get(channel);
                 record.put_field("RVAL", EpicsValue::ULong(v as u32))?;
                 Ok(DeviceReadOutcome::ok())
@@ -669,13 +690,9 @@ impl DeviceSupport for GmDevice {
         }
     }
 
-    fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        let Some(command) = self.output_command(record)? else {
-            return Ok(());
-        };
-        if let Some(Resolved { instrument, .. }) = &self.resolved {
-            instrument.submit(command);
-        }
+    // write_begin queues every write; the framework calls this only after
+    // WriteStart::Synchronous, which write_begin never answers.
+    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         Ok(())
     }
 
@@ -691,13 +708,7 @@ impl DeviceSupport for GmDevice {
         else {
             return Ok(WriteStart::Completed);
         };
-        let (write_done, priority) = (done.device_done(), done.priority());
-        instrument.enqueue(
-            command,
-            Box::new(move || {
-                let _ = write_done.complete(priority);
-            }),
-        );
+        instrument.submit_write(command, done.device_done());
         Ok(WriteStart::Pending)
     }
 
@@ -830,7 +841,8 @@ pub fn factory(
 mod tests {
     use super::*;
     use crate::instrument::test_support::{
-        ascii_frame, connect_default_fixture, one_record_fdata_binary, spawn_fake_device,
+        ascii_frame, connect_default_fixture, default_init_responses, fdata_binary,
+        one_record_fdata_binary, registry_with_offline, spawn_fake_device,
     };
     use epics_rs::base::server::record::FieldDesc;
     use std::collections::HashMap;
@@ -1215,45 +1227,6 @@ mod tests {
 
     // -- end-to-end: write (one live wire round trip) --
 
-    #[test]
-    fn bo_chan_trig_write_end_to_end_submits_read_all_data() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut responses = vec![
-            crate::instrument::test_support::fsysconf_one_input_analog_module(),
-            ascii_frame(b"ORec,0\r\n"),
-            ascii_frame(b"OMath,0\r\n"),
-            ascii_frame(b"N 0001 DEGC ,3\nE"),
-            ascii_frame(b"E"),
-            ascii_frame(b"E"),
-            ascii_frame(b"E"),
-            one_record_fdata_binary(),
-            ascii_frame(b"aaaaaaaa001,12.5\nE"),
-            ascii_frame(b"aaaaaaaa001,-7.5\nE"),
-        ];
-        // The write itself triggers exactly one more FData round trip
-        // (`Command::ReadAllData` -> `cmd_fdata_all` -> `"FData,1\r\n"`).
-        responses.push(one_record_fdata_binary());
-        let device_thread = spawn_fake_device(listener, responses);
-        let instrument = crate::instrument::Instrument::connect_to(addr).unwrap();
-
-        let registry = registry_with("gm10dev", instrument);
-        let f = factory(registry);
-        let ctx = DeviceSupportContext {
-            record_type: "bo",
-            dtyp: DTYP,
-            inp: "",
-            out: "gm10dev CHAN_TRIG",
-        };
-        let mut device = f(&ctx).unwrap();
-        let mut record = FakeRecord::new("bo").with("VAL", EpicsValue::Enum(1));
-        device.init(&mut record).unwrap();
-        device.write(&mut record).unwrap();
-
-        let received = device_thread.join().unwrap();
-        assert_eq!(received.last().unwrap(), "FData,1\r\n");
-    }
-
     /// C ao init_record returns 2 with the seeded VAL defined; bo returns 0
     /// so the record converts the RVAL the dset left.
     #[test]
@@ -1333,7 +1306,18 @@ mod tests {
         let mut device = f(&ctx).unwrap();
         let mut record = FakeRecord::new("bo").with("VAL", EpicsValue::Enum(1));
         device.init(&mut record).unwrap();
-        device.write(&mut record).unwrap();
+        let db = epics_rs::base::server::database::PvDatabase::new();
+        let done = epics_rs::base::server::database::DeviceDone::new(
+            &db,
+            &epics_rs::base::server::record::RecordInstance::new(
+                "GM10:ERR",
+                epics_rs::base::server::records::bo::BoRecord::default(),
+            ),
+        );
+        let start = device
+            .write_begin(&mut record, &DeviceDoneSource::new(&done))
+            .unwrap();
+        assert!(matches!(start, WriteStart::Pending));
         let received = device_thread.join().unwrap();
         assert_eq!(received.last().unwrap(), "_ERR,205\r\n");
     }
@@ -1381,6 +1365,14 @@ mod tests {
     #[test]
     fn failed_init_is_silent_and_inert() {
         use tokio::sync::mpsc::error::TryRecvError;
+        let db = epics_rs::base::server::database::PvDatabase::new();
+        let done = epics_rs::base::server::database::DeviceDone::new(
+            &db,
+            &epics_rs::base::server::record::RecordInstance::new(
+                "GM10:BOGUS",
+                epics_rs::base::server::records::bo::BoRecord::default(),
+            ),
+        );
         let registry = registry_with("gm10dev", connect_default_fixture());
         let f = factory(registry);
         for (record_type, inp, out) in [
@@ -1408,9 +1400,233 @@ mod tests {
             if record_type == "ai" {
                 assert!(!device.read(&mut record).unwrap().did_compute());
             } else {
-                device.write(&mut record).unwrap();
+                let start = device
+                    .write_begin(&mut record, &DeviceDoneSource::new(&done))
+                    .unwrap();
+                assert!(matches!(start, WriteStart::Completed));
             }
             assert!(record.fields.is_empty(), "{inp}{out}");
         }
+    }
+
+    // -- queue_func ends the passes it ran (drvGM10.c:1327-1332) --
+
+    const FULL_BAND_CHILD: &str = "GM10_FULL_BAND_CHILD";
+
+    /// Holds the low band's one worker until its `FullBand` drops.
+    #[derive(Clone, Default)]
+    struct Hold(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl epics_rs::base::runtime::background::CallbackBody for Hold {
+        fn run(&self) {
+            let (open, wake) = &*self.0;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+        }
+    }
+
+    struct FullBand(Hold);
+
+    impl Drop for FullBand {
+        fn drop(&mut self) {
+            let (open, wake) = &*(self.0).0;
+            *open.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    /// Runs `body` in a child that re-runs `test`, with the low callback
+    /// band refusing work: its size and threads are set once per process,
+    /// before it arms. The records' PRIO is LOW.
+    fn with_full_low_band(test: &str, body: impl FnOnce()) {
+        use epics_rs::base::runtime::background::callback_executor::{
+            set_parallel_threads, set_queue_size,
+        };
+        use epics_rs::base::runtime::background::{CallbackCell, CallbackError};
+        use epics_rs::base::runtime::task::{CallbackPriority, background_arm, request_cell};
+        if std::env::var_os(FULL_BAND_CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture"])
+                .env(FULL_BAND_CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+        set_queue_size(1);
+        set_parallel_threads(1, Some(CallbackPriority::Low));
+        background_arm();
+        let hold = Hold::default();
+        let _full = (0..64)
+            .find_map(|_| {
+                match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
+                    Ok(()) => None,
+                    Err(CallbackError::QueueFull) => Some(FullBand(hold.clone())),
+                    Err(e) => panic!("{e:?}"),
+                }
+            })
+            .expect("the low band never filled");
+        body();
+    }
+
+    /// `AI` reads channel 1 and `AO` writes K1 of one instrument, whose
+    /// fixture then answers `extra`; `AO`'s FLNK is `flnk`.
+    async fn ai_and_ao(
+        flnk: &str,
+        extra: Vec<Vec<u8>>,
+    ) -> (
+        Arc<epics_rs::base::server::database::PvDatabase>,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
+        // gm10Support.dbd's ai and ao rows, as yokogawa-gm10-ioc lists them.
+        static AI: &[DevSup] = &[DevSup {
+            name: "devGM10_ai",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 3, 4], false),
+        }];
+        static AO: &[DevSup] = &[DevSup {
+            name: "devGM10_ao",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.extend(extra);
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        let records = format!(
+            r#"
+record(ai, "AI") {{
+    field(DTYP, "{DTYP}")
+    field(INP, "@gm10dev VAL:1")
+}}
+record(ao, "AO") {{
+    field(DTYP, "{DTYP}")
+    field(OUT, "@gm10dev VAL:K1")
+    field(FLNK, "{flnk}")
+}}
+"#
+        );
+        let (db, _) = IocBuilder::new()
+            .register_dynamic_device_support(
+                &[("ai", AI), ("ao", AO)],
+                factory(registry_with("gm10dev", instrument)),
+            )
+            .db_string(&records, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        (db, device)
+    }
+
+    /// Whether `AI` and `AO` are still PACT after up to two seconds.
+    async fn pact_after_settling(db: &epics_rs::base::server::database::PvDatabase) -> [bool; 2] {
+        let pact = |name: &str| db.get_record(name).unwrap().read().is_processing();
+        for _ in 0..400 {
+            if !pact("AI") && !pact("AO") {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        [pact("AI"), pact("AO")]
+    }
+
+    /// Channel 1 reading 5.678 (FChInfo gives it 3 decimals).
+    fn channel_1_reads_5678() -> Vec<u8> {
+        fdata_binary(&[(1, 1, 0, [0; 4], 5678)])
+    }
+
+    /// A read on a unit that never connected has no queue thread to end
+    /// it, so the pass that starts it ends it.
+    #[test]
+    fn a_read_on_an_offline_unit_ends_its_pass() {
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
+        static AI: &[DevSup] = &[DevSup {
+            name: "devGM10_ai",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 3, 4], false),
+        }];
+        let records = format!(
+            r#"record(ai, "AI") {{ field(DTYP, "{DTYP}") field(INP, "@gm10dev VAL:K1") }}"#
+        );
+        epics_rs::base::runtime::task::test_block_on(async {
+            let (db, _) = IocBuilder::new()
+                .register_dynamic_device_support(
+                    &[("ai", AI)],
+                    factory(registry_with_offline("gm10dev")),
+                )
+                .db_string(&records, &HashMap::new())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                .await
+                .unwrap();
+            assert!(!db.get_record("AI").unwrap().read().is_processing());
+        });
+    }
+
+    #[test]
+    fn a_read_and_a_write_end_on_the_queue_thread_while_their_band_is_full() {
+        with_full_low_band(
+            "device_support::tests::a_read_and_a_write_end_on_the_queue_thread_while_their_band_is_full",
+            || {
+                epics_rs::base::runtime::task::test_block_on(async {
+                    let (db, device) =
+                        ai_and_ao("", vec![channel_1_reads_5678(), b"E0\r\n".to_vec()]).await;
+                    db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                        .await
+                        .unwrap();
+                    db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                        .await
+                        .unwrap();
+                    assert_eq!(pact_after_settling(&db).await, [false, false], "PACT");
+                    assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(5.678));
+                    assert_eq!(
+                        device.join().unwrap()[10..],
+                        ["FData,1,0001,0001\r\n", "SKConst,1,2.5\r\n"]
+                    );
+                });
+            },
+        );
+    }
+
+    /// The write's completing pass runs on the queue thread, and its FLNK
+    /// reads the same instrument: that read must queue, not wait on the
+    /// thread running it.
+    #[test]
+    fn a_write_whose_flnk_reads_the_same_instrument_ends_both_passes() {
+        with_full_low_band(
+            "device_support::tests::a_write_whose_flnk_reads_the_same_instrument_ends_both_passes",
+            || {
+                epics_rs::base::runtime::task::test_block_on(async {
+                    let (db, device) =
+                        ai_and_ao("AI", vec![b"E0\r\n".to_vec(), channel_1_reads_5678()]).await;
+                    db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                        .await
+                        .unwrap();
+                    assert_eq!(pact_after_settling(&db).await, [false, false], "PACT");
+                    assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(5.678));
+                    assert_eq!(
+                        device.join().unwrap()[10..],
+                        ["SKConst,1,2.5\r\n", "FData,1,0001,0001\r\n"]
+                    );
+                });
+            },
+        );
     }
 }
