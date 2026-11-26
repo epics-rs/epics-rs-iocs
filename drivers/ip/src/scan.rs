@@ -1,7 +1,7 @@
 //! C `sscanf` over a device reply, one conversion at a time, for the formats
 //! `devTPG261.c` and `devTelevac.c` scan.
 
-use epics_rs::base::runtime::stdlib::strtod;
+use crate::fmt::scan_f64_prefix;
 
 /// A failed conversion stops the scan and leaves the rest unassigned.
 pub struct Scan<'a> {
@@ -75,13 +75,12 @@ impl<'a> Scan<'a> {
         if self.failed {
             return None;
         }
-        let parsed = strtod(self.rest);
-        if parsed.len == 0 {
+        let Some((value, len)) = scan_f64_prefix(self.rest) else {
             self.failed = true;
             return None;
-        }
-        self.rest = &self.rest[parsed.len..];
-        Some(parsed.value as f32)
+        };
+        self.rest = &self.rest[len..];
+        Some(value as f32)
     }
 
     /// `%c`: the next byte, whitespace included.
@@ -152,5 +151,23 @@ mod tests {
         assert_eq!(Scan::new(b"0x1f").hex(), Some(31));
         assert_eq!(Scan::new(b"0n").hex(), Some(0));
         assert_eq!(Scan::new(b"n0").hex(), None);
+    }
+
+    /// glibc's `sscanf("%E")` fails a float it read only part of, where
+    /// `strtod` would take its longest prefix; gcc's output on this host.
+    #[test]
+    fn a_float_cut_short_fails_the_scan() {
+        for text in [&b"infi,5"[..], b"0x,5", b"0xg,5"] {
+            let mut s = Scan::new(text);
+            let text = String::from_utf8_lossy(text);
+            assert_eq!(s.float(), None, "{text}");
+            assert_eq!(s.comma().int(), None, "{text}");
+        }
+        let mut s = Scan::new(b"inf,5");
+        assert_eq!(s.float(), Some(f32::INFINITY));
+        assert_eq!(s.comma().int(), Some(5));
+        let mut s = Scan::new(b" 0x1p3,5");
+        assert_eq!(s.float(), Some(8.0));
+        assert_eq!(s.comma().int(), Some(5));
     }
 }
