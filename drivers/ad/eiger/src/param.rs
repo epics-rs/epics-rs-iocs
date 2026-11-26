@@ -849,10 +849,13 @@ impl ParamOps {
             "put<double>",
             format_args!("{value:.6}", value = CFloat(value)),
         );
-        let def = self.ensure_meta(index)?;
+        // The epsilon is local, so a no-op write succeeds before the first
+        // touch's metadata fetch can fail it (eigerParam.cpp:861-871).
+        let def = self.def(index)?;
         if def.epsilon != 0.0 && (current - value).abs() < def.epsilon {
             return Ok(Vec::new());
         }
+        let def = self.ensure_meta(index)?;
 
         let mut value = value;
         let mut updates = Vec::new();
@@ -972,6 +975,33 @@ mod tests {
         assert_eq!(ops.enum_index_of(7, "disabled"), Some(0));
         assert_eq!(ops.enum_index_of(7, "4M"), Some(1));
         assert_eq!(ops.enum_index_of(7, "nonesuch"), None);
+    }
+
+    /// C `put(double)` checks the epsilon before the first touch's fetch
+    /// (eigerParam.cpp:861-871): a write within it succeeds with the detector
+    /// unreachable.
+    #[test]
+    fn a_write_within_epsilon_succeeds_before_any_fetch() {
+        let mut reg = ParamRegistry::new();
+        reg.add(
+            3,
+            "WAVELENGTH",
+            AsynType::Float64,
+            Sys::DetConfig,
+            "wavelength",
+        );
+        reg.set_epsilon(3, 0.0005);
+        let ops = ParamOps::new(
+            RestApi::new("127.0.0.1", DEAD_PORT),
+            reg,
+            Trace::new("EIGTEST"),
+        );
+
+        assert!(ops.put_f64(3, 1.0001, 1.0).unwrap().is_empty());
+        assert!(
+            ops.put_f64(3, 1.1, 1.0).is_err(),
+            "outside it, the fetch fails"
+        );
     }
 
     /// `fetch_all` used to hold the registry lock across the loop body, and
