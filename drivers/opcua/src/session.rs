@@ -1733,7 +1733,10 @@ impl SessionWorker {
                         item.wire_node_id(),
                         status_name(last)
                     );
-                    item.set_incoming_event(ProcessReason::ConnectionLoss);
+                    // The server refused the item, not the session: the item
+                    // stays up and readable. C files a connectionLoss here
+                    // (`SubscriptionOpen62541.cpp:198`).
+                    item.set_incoming_failure(last);
                 }
             }
             if config.debug > 0 && !mine.is_empty() {

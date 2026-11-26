@@ -1740,7 +1740,8 @@ async fn each_monitored_item_is_its_own_call_under_a_session_wide_handle() {
 }
 
 /// C still runs `addMonitoredItems` for a subscription whose create failed, so
-/// each of its items is told the connection is lost.
+/// each of its items fails on the unknown subscription id; the session is up,
+/// and so is the item.
 #[tokio::test]
 async fn a_refused_subscription_still_fails_its_items() {
     let mock = Mock::arc();
@@ -1754,13 +1755,12 @@ async fn a_refused_subscription_still_fails_its_items() {
         .lock()
         .push(SubscriptionConfig::new("subs", "sess"));
     handle.control(Control::Connect);
-    until(|| !mock.calls.lock().subscriptions.is_empty()).await;
-    until(|| item0.lock().state == ConnectionStatus::Down).await;
+    until(|| item0.lock().last_status == StatusCode::BadSubscriptionIdInvalid).await;
 
     assert!(mock.calls.lock().monitored.is_empty());
+    assert_eq!(item0.lock().state, ConnectionStatus::Up);
     let last = drain(&leaf0).pop().expect("the leaf has an update");
-    assert_eq!(last.reason, ProcessReason::ConnectionLoss);
-    assert_eq!(item0.lock().last_status, StatusCode::BadServerNotConnected);
+    assert_eq!(last.reason, ProcessReason::ReadFailure);
 }
 
 /// `SubscriptionOpen62541::show` prints the server's revised interval beside
@@ -1797,10 +1797,11 @@ async fn a_subscription_shows_the_interval_the_server_revised() {
     }
 }
 
-/// `SubscriptionOpen62541::addMonitoredItems` files a connection loss for an
-/// item the server refuses to monitor.
+/// An item the server refuses to monitor takes the refusal as its status and
+/// its records see a read failure; the session is still up, and so is the
+/// item. C files a connectionLoss (`SubscriptionOpen62541.cpp:198`).
 #[tokio::test]
-async fn a_refused_monitored_item_is_told_the_connection_is_lost() {
+async fn a_refused_monitored_item_fails_and_stays_up() {
     let mock = Mock::arc();
     mock.behave(|b| b.monitor_status = Some(StatusCode::BadNodeIdUnknown));
     let (item0, leaf0) = item("subs ns=2;s=Sensor", INPUT);
@@ -1813,12 +1814,11 @@ async fn a_refused_monitored_item_is_told_the_connection_is_lost() {
         .subscriptions
         .lock()
         .push(SubscriptionConfig::new("subs", "sess"));
-    until(|| !mock.calls.lock().monitored.is_empty()).await;
-    until(|| item0.lock().state == ConnectionStatus::Down).await;
+    until(|| item0.lock().last_status == StatusCode::BadNodeIdUnknown).await;
 
+    assert_eq!(item0.lock().state, ConnectionStatus::Up);
     let last = drain(&leaf0).pop().expect("the leaf has an update");
-    assert_eq!(last.reason, ProcessReason::ConnectionLoss);
-    assert_eq!(item0.lock().last_status, StatusCode::BadServerNotConnected);
+    assert_eq!(last.reason, ProcessReason::ReadFailure);
 }
 
 #[tokio::test]
