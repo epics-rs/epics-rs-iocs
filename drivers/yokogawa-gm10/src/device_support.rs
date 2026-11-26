@@ -1002,14 +1002,18 @@ impl DeviceSupport for GmDevice {
         })
     }
 
-    // A write whose exchange the link lost ends its pass with the alarm.
-    // devGM10_bo.c:192-197: the completing pass drops a REC_TRIG or REC_ERROR
-    // bo's VAL back to 0.
-    fn async_write_completed(&mut self, record: &mut dyn Record) {
+    // A write whose exchange the link lost ends its pass with the alarm; one
+    // that landed defines the record, which C does on every completing pass
+    // (devGM10_bo.c:199). devGM10_bo.c:192-197: the completing pass drops a
+    // REC_TRIG or REC_ERROR bo's VAL back to 0.
+    fn async_write_completed_common(&mut self, record: &mut dyn Record, common: &mut CommonFields) {
         let Binding::Bound(Resolved { instrument, op }) = &self.binding else {
             return;
         };
         self.fault = (!instrument.online()).then_some(Fault::Offline);
+        if self.fault.is_none() {
+            common.udf = 0;
+        }
         if matches!(
             op,
             Operation::ChanTrig
@@ -1658,10 +1662,110 @@ mod tests {
         assert!(matches!(start, WriteStart::Pending));
         // VAL drops to 0 on the completing pass, not while PACT holds.
         assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(1)));
-        device.async_write_completed(&mut record);
+        device.async_write_completed_common(&mut record, &mut CommonFields::default());
         assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
         let received = device_thread.join().unwrap();
         assert_eq!(received.last().unwrap(), "FData,1\r\n");
+    }
+
+    /// A bo `BO` writing `CHAN_TRIG` to a unit the init fixture loaded, which
+    /// then answers `extra`.
+    async fn chan_trig_bo(
+        extra: Vec<Vec<u8>>,
+    ) -> (
+        Arc<epics_rs::base::server::database::PvDatabase>,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
+        static BO: &[DevSup] = &[DevSup {
+            name: "devGM10_bo",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }];
+        let (instrument, device) = fixture_then(extra);
+        let records = format!(
+            r#"
+record(bo, "BO") {{
+    field(DTYP, "{DTYP}")
+    field(OUT, "@gm10dev CHAN_TRIG")
+}}
+"#
+        );
+        let (db, _) = IocBuilder::new()
+            .register_dynamic_device_support(
+                &[("bo", BO)],
+                factory(registry_with("gm10dev", instrument)),
+            )
+            .db_string(&records, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        (db, device)
+    }
+
+    /// Put `val` to `BO.field` and let the pass it starts settle.
+    async fn put_bo_and_settle(
+        db: &epics_rs::base::server::database::PvDatabase,
+        field: &str,
+        val: EpicsValue,
+    ) {
+        let _ = db
+            .put_record_field_from_ca_no_notify("BO", field, val)
+            .await;
+        for _ in 0..500 {
+            if !db.get_record("BO").unwrap().read().is_processing() {
+                return;
+            }
+            epics_rs::base::runtime::task::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the queued write never completed");
+    }
+
+    fn bo_udf_and_alarm(db: &epics_rs::base::server::database::PvDatabase) -> [EpicsValue; 3] {
+        ["UDF", "STAT", "SEVR"].map(|f| db.get_pv(format!("BO.{f}")).unwrap())
+    }
+
+    /// devGM10_bo.c:199: a write's completing pass defines the record, so a
+    /// bo a client marked undefined is clean from its next pass.
+    #[test]
+    fn a_landed_write_clears_udf() {
+        epics_rs::base::runtime::task::test_block_on(async {
+            let (db, _device) =
+                chan_trig_bo(vec![one_record_fdata_binary(), one_record_fdata_binary()]).await;
+            put_bo_and_settle(&db, "UDF", EpicsValue::UChar(1)).await;
+            put_bo_and_settle(&db, "PROC", EpicsValue::Short(1)).await;
+            assert_eq!(
+                bo_udf_and_alarm(&db),
+                [
+                    EpicsValue::UChar(0),
+                    EpicsValue::Short(0),
+                    EpicsValue::Short(0)
+                ]
+            );
+        });
+    }
+
+    /// A write queued on a unit that hung up once it loaded never lands, and
+    /// the record stays undefined.
+    #[test]
+    fn a_write_the_unit_never_got_leaves_udf_set() {
+        epics_rs::base::runtime::task::test_block_on(async {
+            let (db, device) = chan_trig_bo(Vec::new()).await;
+            device.join().unwrap();
+            put_bo_and_settle(&db, "UDF", EpicsValue::UChar(1)).await;
+            assert_eq!(
+                bo_udf_and_alarm(&db),
+                [
+                    EpicsValue::UChar(1),
+                    EpicsValue::Short(17),
+                    EpicsValue::Short(3)
+                ],
+                "UDF, then UDF_ALARM, INVALID"
+            );
+        });
     }
 
     #[test]

@@ -724,18 +724,25 @@ impl DeviceSupport for EtherIpDevice {
         }
     }
 
-    fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        self.stage_write(record, None).map(|_| ())
+    // The framework calls write_common and write_begin_common, which see
+    // the record's UDF.
+    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+        Ok(())
+    }
+
+    fn write_common(&mut self, record: &mut dyn Record, common: &mut CommonFields) -> CaResult<()> {
+        self.stage_write(record, common, None).map(|_| ())
     }
 
     /// C's `*_write` first pass: a staged write leaves the record PACT until
     /// the driver's next transfer ends it, without a readback.
-    fn write_begin(
+    fn write_begin_common(
         &mut self,
         record: &mut dyn Record,
+        common: &mut CommonFields,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
-        Ok(if self.stage_write(record, Some(done))? {
+        Ok(if self.stage_write(record, common, Some(done))? {
             WriteStart::Pending
         } else {
             WriteStart::Completed
@@ -759,9 +766,11 @@ impl DeviceSupport for EtherIpDevice {
 impl EtherIpDevice {
     /// Stage the record's value in the tag buffer and flag the write; true
     /// when a write was flagged and `done` now waits on the next transfer.
+    /// A write the tag takes defines the record.
     fn stage_write(
         &mut self,
         record: &mut dyn Record,
+        common: &mut CommonFields,
         done: Option<&DeviceDoneSource<'_>>,
     ) -> CaResult<bool> {
         let Some((tag, link)) = self.bound() else {
@@ -848,6 +857,7 @@ impl EtherIpDevice {
         }
         drop(data);
         self.no_alarm();
+        common.udf = 0;
         Ok(matches!(stage, Stage::Staged) && done.is_some())
     }
 }
@@ -1284,7 +1294,8 @@ mod tests {
 
         record.put_field("RVAL", EpicsValue::Long(3)).unwrap();
         assert!(matches!(
-            dev.write_begin(&mut record, &source).unwrap(),
+            dev.write_begin_common(&mut record, &mut CommonFields::default(), &source)
+                .unwrap(),
             WriteStart::Pending
         ));
         assert!(tag.data.lock().do_write);
@@ -1297,7 +1308,8 @@ mod tests {
         // The 3 just written reads back as 3, so the next pass has nothing
         // to write.
         assert!(matches!(
-            dev.write_begin(&mut record, &source).unwrap(),
+            dev.write_begin_common(&mut record, &mut CommonFields::default(), &source)
+                .unwrap(),
             WriteStart::Completed
         ));
     }
@@ -1572,6 +1584,52 @@ mod tests {
         });
         assert!(full, "the low band never filled");
         hold
+    }
+
+    /// devEtherIP.c:2074-2077: a write the tag takes, staged or already
+    /// current, defines the record; one with no data to stage alarms and
+    /// leaves it undefined.
+    #[test]
+    fn a_write_the_tag_takes_clears_udf() {
+        let rt = current_thread();
+        let db = eip_db("boudf");
+        let tag = load_output(
+            &rt,
+            &db,
+            "BOUDF",
+            Box::new(BoRecord::default()),
+            "boudf",
+            "BOOLs[300]",
+        );
+        set_words(&tag, &[0; 10]);
+        load_output(
+            &rt,
+            &db,
+            "BONODATA",
+            Box::new(BoRecord::default()),
+            "boudf",
+            "EMPTY[300]",
+        );
+        let after_udf_then_proc = |name: &str| {
+            for (f, v) in [
+                ("UDF", EpicsValue::UChar(1)),
+                ("PROC", EpicsValue::Short(1)),
+            ] {
+                rt.block_on(db.put_record_field_from_ca_no_notify(name, f, v))
+                    .unwrap();
+            }
+            ["UDF", "STAT", "SEVR"].map(|f| db.get_pv(format!("{name}.{f}")).unwrap())
+        };
+        assert_eq!(
+            after_udf_then_proc("BOUDF"),
+            [
+                EpicsValue::UChar(0),
+                EpicsValue::Short(0),
+                EpicsValue::Short(0)
+            ]
+        );
+        let [udf, _, sevr] = after_udf_then_proc("BONODATA");
+        assert_eq!([udf, sevr], [EpicsValue::UChar(1), EpicsValue::Short(3)]);
     }
 
     /// devEtherIP.c:326-437: check_ao_callback copies the PLC's value and
@@ -1852,7 +1910,7 @@ mod tests {
             record.get_field("VAL"),
             Some(EpicsValue::String(long[..MAX_STRING_SIZE - 1].into()))
         );
-        dev.write(&mut record).unwrap();
+        dev.write_common(&mut record, &mut common).unwrap();
         assert!(!tag.data.lock().do_write);
         assert_eq!(
             dev.check_callback(&mut record, &mut common),
@@ -1880,7 +1938,7 @@ mod tests {
             Callback::ScanOnce
         );
         assert_eq!(string_val(&record), long);
-        dev.write(&mut record).unwrap();
+        dev.write_common(&mut record, &mut common).unwrap();
         assert!(!tag.data.lock().do_write, "lso wrote back");
         assert_eq!(
             dev.check_callback(&mut record, &mut common),
@@ -1998,7 +2056,7 @@ mod tests {
             );
             assert_eq!(f64_field(&record, "VAL"), want_val, "udf={udf}");
             // ao_write, in the process that follows.
-            dev.write(&mut record).unwrap();
+            dev.write_common(&mut record, &mut common).unwrap();
             assert_eq!(tag.data.lock().do_write, want_write, "udf={udf}");
         }
     }
@@ -2560,7 +2618,8 @@ mod tests {
             dev.check_callback(&mut record, &mut CommonFields::default()),
             Callback::Process
         );
-        dev.write(&mut record).unwrap();
+        dev.write_common(&mut record, &mut CommonFields::default())
+            .unwrap();
         let alarm = dev.last_alarm().unwrap();
         assert_eq!(alarm.stat, alarm_status::WRITE_ALARM);
     }

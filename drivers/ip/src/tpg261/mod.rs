@@ -30,7 +30,7 @@ use epics_rs::base::server::device_support::{
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::alarm_status::READ_ALARM;
-use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
+use epics_rs::base::server::record::{AlarmSeverity, CommonFields, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
 use crate::scan::Scan;
@@ -389,6 +389,21 @@ impl DevTpg261 {
     }
 
     /// `recBuf`, with the callback's alarm taken.
+    /// `writeX` with `pact == 1`: an empty `recBuf` alarms, a reply defines
+    /// the record.
+    fn complete_write(&mut self, common: &mut CommonFields) {
+        if self.rec_buf().is_empty() {
+            raise(&mut self.alarm, READ_ALARM, AlarmSeverity::Invalid);
+            self.error(format_args!(
+                "devTPG261::{} reply message error {}\n",
+                self.kind.routine(),
+                self.name
+            ));
+        } else {
+            common.udf = 0;
+        }
+    }
+
     fn rec_buf(&mut self) -> String {
         let Some(live) = self.live.as_ref() else {
             return String::new();
@@ -605,32 +620,29 @@ impl DeviceSupport for DevTpg261 {
         }
     }
 
-    fn write_begin(
+    fn write_begin_common(
         &mut self,
         record: &mut dyn Record,
+        common: &mut CommonFields,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
         Ok(match self.start(record, done) {
             Some(Ok(QueueOutcome::Queued)) => WriteStart::Pending,
             Some(Err(refused)) => return Err(refused.into()),
             Some(Ok(QueueOutcome::Ran)) => {
-                self.async_write_completed(record);
+                self.complete_write(common);
                 WriteStart::Completed
             }
             None => WriteStart::Completed,
         })
     }
 
-    /// `writeX` with `pact == 1`: an empty `recBuf` alarms.
-    fn async_write_completed(&mut self, _record: &mut dyn Record) {
-        if self.rec_buf().is_empty() {
-            raise(&mut self.alarm, READ_ALARM, AlarmSeverity::Invalid);
-            self.error(format_args!(
-                "devTPG261::{} reply message error {}\n",
-                self.kind.routine(),
-                self.name
-            ));
-        }
+    fn async_write_completed_common(
+        &mut self,
+        _record: &mut dyn Record,
+        common: &mut CommonFields,
+    ) {
+        self.complete_write(common);
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

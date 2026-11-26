@@ -28,7 +28,7 @@ use epics_rs::base::server::device_support::{
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::alarm_status::{READ_ALARM, WRITE_ALARM};
-use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
+use epics_rs::base::server::record::{AlarmSeverity, CommonFields, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
 use crate::{Reentry, Refused};
@@ -466,6 +466,25 @@ impl DevMpc {
         (ex.ok, ex.rec_buf.clone())
     }
 
+    /// `writeX` with `pact == 1`: a reply longer than `OK` alarms, a bare `OK`
+    /// defines the record.
+    fn complete_write(&mut self, common: &mut CommonFields) {
+        let (ok, buf) = self.outcome();
+        if !ok {
+            return;
+        }
+        if buf.len() > 2 {
+            raise(&mut self.alarm, READ_ALARM, AlarmSeverity::Invalid);
+            self.error(format_args!(
+                "devMPC::{} message too big in {}\n",
+                self.kind.routine(),
+                self.name
+            ));
+        } else {
+            common.udf = 0;
+        }
+    }
+
     fn error(&self, args: std::fmt::Arguments<'_>) {
         if let Some(live) = &self.live {
             print(&live.job.handle, TraceMask::ERROR, args);
@@ -721,33 +740,29 @@ impl DeviceSupport for DevMpc {
         }
     }
 
-    fn write_begin(
+    fn write_begin_common(
         &mut self,
         record: &mut dyn Record,
+        common: &mut CommonFields,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
         Ok(match self.start(record, done) {
             Some(Ok(QueueOutcome::Queued)) => WriteStart::Pending,
             Some(Err(refused)) => return Err(refused.into()),
             Some(Ok(QueueOutcome::Ran)) => {
-                self.async_write_completed(record);
+                self.complete_write(common);
                 WriteStart::Completed
             }
             None => WriteStart::Completed,
         })
     }
 
-    /// `writeX` with `pact == 1`: a reply longer than `OK` alarms.
-    fn async_write_completed(&mut self, _record: &mut dyn Record) {
-        let (ok, buf) = self.outcome();
-        if ok && buf.len() > 2 {
-            raise(&mut self.alarm, READ_ALARM, AlarmSeverity::Invalid);
-            self.error(format_args!(
-                "devMPC::{} message too big in {}\n",
-                self.kind.routine(),
-                self.name
-            ));
-        }
+    fn async_write_completed_common(
+        &mut self,
+        _record: &mut dyn Record,
+        common: &mut CommonFields,
+    ) {
+        self.complete_write(common);
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

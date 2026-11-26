@@ -1116,14 +1116,18 @@ impl DeviceSupport for MwDevice {
         })
     }
 
-    // A write whose exchange the link lost ends its pass with the alarm.
-    // devMW100_bo.c:192-197: the completing pass drops a REC_TRIG or REC_ERROR
-    // bo's VAL back to 0.
-    fn async_write_completed(&mut self, record: &mut dyn Record) {
+    // A write whose exchange the link lost ends its pass with the alarm; one
+    // that landed defines the record, which C does on every completing pass
+    // (devMW100_bo.c:199). devMW100_bo.c:192-197: the completing pass drops a
+    // REC_TRIG or REC_ERROR bo's VAL back to 0.
+    fn async_write_completed_common(&mut self, record: &mut dyn Record, common: &mut CommonFields) {
         let Binding::Bound(Resolved { instrument, op }) = &self.binding else {
             return;
         };
         self.fault = (!instrument.online()).then_some(Fault::Offline);
+        if self.fault.is_none() {
+            common.udf = 0;
+        }
         if matches!(
             op,
             Operation::InputTrig
@@ -1825,6 +1829,80 @@ mod tests {
         });
     }
 
+    /// Put `val` to `TEST.field`, and the pass it starts settle; the put's
+    /// own result.
+    async fn put_and_settle(
+        db: &PvDatabase,
+        field: &str,
+        val: EpicsValue,
+    ) -> epics_rs::base::error::CaResult<()> {
+        let put = db
+            .put_record_field_from_ca_no_notify("TEST", field, val)
+            .await;
+        for _ in 0..500 {
+            if !db.get_record("TEST").unwrap().read().is_processing() {
+                return put;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the queued write never completed");
+    }
+
+    fn udf_and_alarm(db: &PvDatabase) -> [EpicsValue; 3] {
+        ["UDF", "STAT", "SEVR"].map(|f| db.get_pv(format!("TEST.{f}")).unwrap())
+    }
+
+    /// devMW100_bo.c:199: a write's completing pass defines the record, so a
+    /// bo a client marked undefined is clean from its next pass.
+    #[test]
+    fn a_landed_write_clears_udf() {
+        test_block_on(async {
+            let (db, _device) = wired_output(
+                Box::new(BoRecord::new(0)),
+                "mw100dev INP_TRIG",
+                vec![one_record_fd1_binary(), one_record_fd1_binary()],
+            )
+            .await;
+            put_and_settle(&db, "UDF", EpicsValue::UChar(1))
+                .await
+                .unwrap();
+            put_and_settle(&db, "PROC", EpicsValue::Short(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                udf_and_alarm(&db),
+                [
+                    EpicsValue::UChar(0),
+                    EpicsValue::Short(0),
+                    EpicsValue::Short(0)
+                ]
+            );
+        });
+    }
+
+    /// A write queued on a unit that hung up once it loaded never lands, and
+    /// the record stays undefined.
+    #[test]
+    fn a_write_the_unit_never_got_leaves_udf_set() {
+        test_block_on(async {
+            let (db, device) =
+                wired_output(Box::new(BoRecord::new(0)), "mw100dev INP_TRIG", Vec::new()).await;
+            device.join().unwrap();
+            put_and_settle(&db, "UDF", EpicsValue::UChar(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                udf_and_alarm(&db),
+                [
+                    EpicsValue::UChar(1),
+                    EpicsValue::Short(17),
+                    EpicsValue::Short(3)
+                ],
+                "UDF, then UDF_ALARM, INVALID"
+            );
+        });
+    }
+
     #[test]
     fn write_begin_queues_the_write() {
         test_block_on(async {
@@ -1856,7 +1934,7 @@ mod tests {
             assert!(matches!(start, WriteStart::Pending));
             // VAL drops to 0 on the completing pass, not while PACT holds.
             assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(1)));
-            device.async_write_completed(&mut record);
+            device.async_write_completed_common(&mut record, &mut CommonFields::default());
             assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
             assert_eq!(
                 device_thread.join().unwrap().last().unwrap(),
