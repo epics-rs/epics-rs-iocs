@@ -581,15 +581,13 @@ impl AmptekDriver {
     /// fixed-shape request packet for `cmd` and wait for a response, with
     /// no bookkeeping and no parsing -- both are the caller's decision (see
     /// [`Self::send_command`] and [`Self::receive_data`]).
-    fn raw_send(&mut self, cmd: TransmitPacketType) -> AsynResult<Vec<u8>> {
+    fn raw_send(&mut self, cmd: TransmitPacketType) -> Vec<u8> {
         let expected_size = if cmd == TransmitPacketType::SendStatus {
             72
         } else {
             24648
         };
-        Ok(self
-            .link
-            .send(&protocol::build_command(cmd), expected_size)?)
+        self.link.send(&protocol::build_command(cmd), expected_size)
     }
 
     /// `drvAmptek::sendCommand` (`drvAmptek.cpp:361-382`): success means
@@ -597,7 +595,7 @@ impl AmptekDriver {
     /// returned for the callers that go on to [`Self::receive_data`].
     fn send_command(&mut self, cmd: TransmitPacketType) -> AsynResult<Vec<u8>> {
         self.require_connected()?;
-        let raw = self.raw_send(cmd)?;
+        let raw = self.raw_send(cmd);
         if raw.is_empty() {
             let msg = format!(
                 "drvAmptek::sendCommand error calling CH_.SendCommand({})",
@@ -654,9 +652,9 @@ impl AmptekDriver {
                     protocol_error(format!("Cannot resolve address: {address_info}"))
                 })?;
                 let (confirmed, num_devices) = if *direct_mode {
-                    udp.connect_direct(ip)?
+                    udp.connect_direct(ip)
                 } else {
-                    udp.connect_default(ip)?
+                    udp.connect_default(ip)
                 };
                 if confirmed {
                     *dpp_addr = Some(ip);
@@ -727,7 +725,7 @@ impl AmptekDriver {
         // status round-trip failure right after a successful discovery
         // cannot leave a stale *previous* connection's status behind.
         self.last_status = status::process_status(&[0u8; 64]);
-        let raw = self.raw_send(TransmitPacketType::SendStatus)?;
+        let raw = self.raw_send(TransmitPacketType::SendStatus);
         if raw.is_empty() {
             return Err(protocol_error(
                 "error calling SendCommand for XMTPT_SEND_STATUS",
@@ -785,43 +783,39 @@ impl AmptekDriver {
             "drvAmptek::sendCommandString sending configuration string:\n{command_string}\n"
         ));
         let packet = protocol::build_config_packet_ex(command_string);
-        let send_status: AsynResult<()> = match self.raw_config_round_trip(packet) {
-            Ok(raw) if raw.is_empty() => {
+        let raw = self.raw_config_round_trip(packet);
+        if raw.is_empty() {
+            let msg = format!(
+                "drvAmptek::sendCommandString error calling \
+                 CH_.SendCommand_Config(XMTPT_SEND_CONFIG_PACKET_EX, {command_string})"
+            );
+            self.trace_error(&msg);
+            self.check_failed_comm("sendCommandString");
+            // C returns before the readback (`drvAmptek.cpp:450-455`).
+            return Err(protocol_error(msg));
+        }
+        self.failed_sends = 0;
+        let send_status: AsynResult<()> = match self.receive_data(&raw) {
+            None => {
                 let msg = format!(
-                    "drvAmptek::sendCommandString error calling \
+                    "drvAmptek::sendCommandString error in response for \
                      CH_.SendCommand_Config(XMTPT_SEND_CONFIG_PACKET_EX, {command_string})"
                 );
                 self.trace_error(&msg);
-                self.check_failed_comm("sendCommandString");
-                // C returns before the readback (`drvAmptek.cpp:450-455`).
-                return Err(protocol_error(msg));
+                Err(protocol_error(msg))
             }
-            Ok(raw) => {
-                self.failed_sends = 0;
-                match self.receive_data(&raw) {
-                    None => {
-                        let msg = format!(
-                            "drvAmptek::sendCommandString error in response for \
-                             CH_.SendCommand_Config(XMTPT_SEND_CONFIG_PACKET_EX, {command_string})"
-                        );
-                        self.trace_error(&msg);
-                        Err(protocol_error(msg))
-                    }
-                    Some(ReceivedPacket::Ack { status, data }) => {
-                        let source = protocol::pid2_text_to_string("Send config", status);
-                        let error = protocol::parse_cmd(&source, status, &data);
-                        if error.is_empty() {
-                            Ok(())
-                        } else {
-                            let msg = format!("drvAmptek::sendCommandString ACK error {error}");
-                            self.trace_error(&msg);
-                            Err(protocol_error(msg))
-                        }
-                    }
-                    Some(_) => Ok(()),
+            Some(ReceivedPacket::Ack { status, data }) => {
+                let source = protocol::pid2_text_to_string("Send config", status);
+                let error = protocol::parse_cmd(&source, status, &data);
+                if error.is_empty() {
+                    Ok(())
+                } else {
+                    let msg = format!("drvAmptek::sendCommandString ACK error {error}");
+                    self.trace_error(&msg);
+                    Err(protocol_error(msg))
                 }
             }
-            Err(e) => Err(e),
+            Some(_) => Ok(()),
         };
 
         // "Some commands could have made it to the hardware, read back
@@ -836,8 +830,8 @@ impl AmptekDriver {
         }
     }
 
-    fn raw_config_round_trip(&mut self, packet: Vec<u8>) -> AsynResult<Vec<u8>> {
-        Ok(self.link.send(&packet, 8)?)
+    fn raw_config_round_trip(&mut self, packet: Vec<u8>) -> Vec<u8> {
+        self.link.send(&packet, 8)
     }
 
     /// `drvAmptek::saveConfigurationFile` (`drvAmptek.cpp:384-398`).
@@ -1093,7 +1087,7 @@ impl AmptekDriver {
         let mut raw = Vec::new();
         let mut sent = false;
         for _ in 0..100 {
-            raw = self.raw_config_round_trip(packet.clone())?;
+            raw = self.raw_config_round_trip(packet.clone());
             if !raw.is_empty() {
                 sent = true;
                 break;
@@ -1740,6 +1734,53 @@ mod tests {
         let before = fake.pids().len();
         assert!(driver.send_command_string("GAIN=1;").is_err());
         assert_eq!(fake.pids()[before..], [(0x20, 0x02)]);
+    }
+
+    /// A config packet the socket refuses fails like an unanswered one,
+    /// without the readback (`drvAmptek.cpp:450-455`).
+    #[test]
+    fn unsendable_config_send_skips_the_readback() {
+        let status = [0u8; 64];
+        let (mut driver, fake) = driver_with_fake(move |req| default_reply(req, &status));
+        connect(&mut driver).unwrap();
+        let before = fake.pids().len();
+        // Past the 65507-byte UDP payload limit, so `sendto` fails.
+        assert!(driver.send_command_string(&"A".repeat(65_510)).is_err());
+        assert_eq!(fake.pids()[before..], Vec::<(u8, u8)>::new());
+    }
+
+    /// A request the socket cannot send is a failed send like an
+    /// unanswered one: the eleventh disconnects device 0 with COMM_ALARM
+    /// (`drvAmptek.cpp:51,250-258`).
+    #[test]
+    fn unsendable_requests_disconnect_on_the_eleventh_failure() {
+        let status = [0u8; 64];
+        let (mut driver, _fake) = driver_with_fake(move |req| default_reply(req, &status));
+        driver.connect_addr(&AsynUser::new(0).with_addr(0)).unwrap();
+        // The connected link's socket now refuses every send: no OS takes
+        // a datagram to port 0.
+        driver.link = DppLink::Ethernet {
+            udp: AmptekUdpTransport::bind_on_command_port(0).unwrap(),
+            direct_mode: true,
+            dpp_addr: Some(Ipv4Addr::LOCALHOST),
+        };
+        let user = AsynUser::new(0);
+        let mut buf = [0i32; 8];
+        for _ in 0..10 {
+            assert!(PortDriver::read_int32_array(&mut driver, &user, &mut buf).is_err());
+        }
+        assert!(driver.base.is_device_connected(0));
+        assert!(PortDriver::read_int32_array(&mut driver, &user, &mut buf).is_err());
+        assert!(!driver.base.is_device_connected(0));
+        let gain = driver.amptek[AmptekReason::Gain as usize];
+        assert_eq!(
+            driver.base.params.get_param_status(gain, 0).unwrap(),
+            (
+                AsynStatus::Success,
+                alarm_status::COMM_ALARM,
+                AlarmSeverity::Invalid as u16
+            )
+        );
     }
 
     #[test]
