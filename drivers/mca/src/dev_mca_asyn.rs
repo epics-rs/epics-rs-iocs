@@ -1379,17 +1379,17 @@ record(mca, "MCAHOLD") {
         use epics_rs::base::runtime::background::callback_executor::{
             set_parallel_threads, set_queue_size,
         };
-        use epics_rs::base::runtime::background::{CallbackBody, CallbackCell, CallbackError};
         use epics_rs::base::runtime::task::{
-            CallbackPriority, background_init, request_cell, sleep, test_block_on,
+            CallbackPriority, background_callback_stats, background_init, sleep,
+            spawn_blocking_background, test_block_on,
         };
         use epics_rs::base::server::ioc_builder::IocBuilder;
 
         /// Holds the low band's one worker until dropped.
         #[derive(Clone, Default)]
         struct Hold(Arc<(Mutex<bool>, std::sync::Condvar)>);
-        impl CallbackBody for Hold {
-            fn run(&self) {
+        impl Hold {
+            fn wait(&self) {
                 let (open, wake) = &*self.0;
                 let mut open = open.lock().unwrap();
                 while !*open {
@@ -1430,14 +1430,32 @@ record(mca, "MCAFULL") {
                 .build()
                 .await
                 .unwrap();
+            // A cell is never refused, so the worker is held and its one
+            // ring slot taken by ad-hoc requests until one is refused.
+            let low_overflows = || {
+                background_callback_stats(false).unwrap()[CallbackPriority::Low.index()]
+                    .num_overflow
+            };
             let hold = Hold::default();
+            let (running_tx, running_rx) = std::sync::mpsc::channel();
+            let holder = hold.clone();
+            drop(spawn_blocking_background(
+                CallbackPriority::Low,
+                move |_| {
+                    running_tx.send(()).unwrap();
+                    holder.wait();
+                },
+            ));
+            running_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let refused = low_overflows() + 1;
             let _full = (0..64)
                 .find_map(|_| {
-                    match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
-                        Ok(()) => None,
-                        Err(CallbackError::QueueFull) => Some(FullBand(hold.clone())),
-                        Err(e) => panic!("{e:?}"),
-                    }
+                    let filler = hold.clone();
+                    drop(spawn_blocking_background(
+                        CallbackPriority::Low,
+                        move |_| filler.wait(),
+                    ));
+                    (low_overflows() >= refused).then(|| FullBand(hold.clone()))
                 })
                 .expect("the low band never filled");
             db.put_record_field_from_ca("MCAFULL", "READ", EpicsValue::Enum(1))

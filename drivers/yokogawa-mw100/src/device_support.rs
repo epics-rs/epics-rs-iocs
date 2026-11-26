@@ -2055,8 +2055,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct Hold(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
 
-    impl epics_rs::base::runtime::background::CallbackBody for Hold {
-        fn run(&self) {
+    impl Hold {
+        fn wait(&self) {
             let (open, wake) = &*self.0;
             let mut open = open.lock().unwrap();
             while !*open {
@@ -2082,8 +2082,9 @@ mod tests {
         use epics_rs::base::runtime::background::callback_executor::{
             set_parallel_threads, set_queue_size,
         };
-        use epics_rs::base::runtime::background::{CallbackCell, CallbackError};
-        use epics_rs::base::runtime::task::{CallbackPriority, background_arm, request_cell};
+        use epics_rs::base::runtime::task::{
+            CallbackPriority, background_arm, background_callback_stats, spawn_blocking_background,
+        };
         if std::env::var_os(FULL_BAND_CHILD).is_none() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([test, "--exact", "--nocapture"])
@@ -2099,14 +2100,33 @@ mod tests {
         set_queue_size(1);
         set_parallel_threads(1, Some(CallbackPriority::Low));
         background_arm();
+        // A cell is never refused, so the worker is held and its one ring
+        // slot taken by ad-hoc requests until one is refused.
+        let low_overflows = || {
+            background_callback_stats(false).unwrap()[CallbackPriority::Low.index()].num_overflow
+        };
         let hold = Hold::default();
+        let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let holder = hold.clone();
+        drop(spawn_blocking_background(
+            CallbackPriority::Low,
+            move |_| {
+                running_tx.send(()).unwrap();
+                holder.wait();
+            },
+        ));
+        running_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let refused = low_overflows() + 1;
         let _full = (0..64)
             .find_map(|_| {
-                match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
-                    Ok(()) => None,
-                    Err(CallbackError::QueueFull) => Some(FullBand(hold.clone())),
-                    Err(e) => panic!("{e:?}"),
-                }
+                let filler = hold.clone();
+                drop(spawn_blocking_background(
+                    CallbackPriority::Low,
+                    move |_| filler.wait(),
+                ));
+                (low_overflows() >= refused).then(|| FullBand(hold.clone()))
             })
             .expect("the low band never filled");
         body();

@@ -18,9 +18,9 @@ use asyn_rs::user::AsynUser;
 use epics_rs::base::runtime::background::callback_executor::{
     set_parallel_threads, set_queue_size,
 };
-use epics_rs::base::runtime::background::{CallbackBody, CallbackCell, CallbackError};
 use epics_rs::base::runtime::task::{
-    CallbackPriority, background_init, request_cell, sleep, test_block_on,
+    CallbackPriority, background_callback_stats, background_init, sleep, spawn_blocking_background,
+    test_block_on,
 };
 use epics_rs::base::server::ioc_builder::IocBuilder;
 use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
@@ -41,8 +41,8 @@ static MPC_AO: [(&str, &[DevSup]); 1] = [(
 #[derive(Clone, Default)]
 struct Hold(Arc<(Mutex<bool>, Condvar)>);
 
-impl CallbackBody for Hold {
-    fn run(&self) {
+impl Hold {
+    fn wait(&self) {
         let (open, wake) = &*self.0;
         let mut open = open.lock().unwrap();
         while !*open {
@@ -59,6 +59,38 @@ impl Drop for FullBand {
         *open.lock().unwrap() = true;
         wake.notify_all();
     }
+}
+
+fn low_overflows() -> u64 {
+    background_callback_stats(false).unwrap()[CallbackPriority::Low.index()].num_overflow
+}
+
+/// Hold the low band's one worker, then take its one ring slot with ad-hoc
+/// requests until one is refused: a `CallbackCell` is never refused.
+fn fill_low_band() -> FullBand {
+    let hold = Hold::default();
+    let (running_tx, running_rx) = std::sync::mpsc::channel();
+    let holder = hold.clone();
+    drop(spawn_blocking_background(
+        CallbackPriority::Low,
+        move |_| {
+            running_tx.send(()).unwrap();
+            holder.wait();
+        },
+    ));
+    running_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let refused = low_overflows() + 1;
+    for _ in 0..64 {
+        let filler = hold.clone();
+        drop(spawn_blocking_background(
+            CallbackPriority::Low,
+            move |_| filler.wait(),
+        ));
+        if low_overflows() >= refused {
+            return FullBand(hold);
+        }
+    }
+    panic!("the low band never filled");
 }
 
 /// An octet port without `ASYN_CANBLOCK` that answers every read with
@@ -160,16 +192,7 @@ record(ao, "SYNCFULL:MPC") {
             .build()
             .await
             .unwrap();
-        let hold = Hold::default();
-        let _full = (0..64)
-            .find_map(|_| {
-                match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
-                    Ok(()) => None,
-                    Err(CallbackError::QueueFull) => Some(FullBand(hold.clone())),
-                    Err(e) => panic!("{e:?}"),
-                }
-            })
-            .expect("the low band never filled");
+        let _full = fill_low_band();
         db.put_record_field_from_ca_no_notify("SYNCFULL:AI", "PROC", EpicsValue::Short(1))
             .await
             .unwrap();

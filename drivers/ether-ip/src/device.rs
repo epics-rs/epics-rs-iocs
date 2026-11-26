@@ -1552,35 +1552,52 @@ mod tests {
     #[derive(Clone, Default)]
     struct Hold(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
 
-    impl epics_rs::base::runtime::background::CallbackBody for Hold {
-        fn run(&self) {
+    impl Hold {
+        fn wait(&self) {
             let (open, wake) = &*self.0;
             let mut open = open.lock().unwrap();
             while !*open {
                 open = wake.wait(open).unwrap();
             }
         }
-    }
 
-    impl Hold {
         fn open(&self) {
             *self.0.0.lock().unwrap() = true;
             self.0.1.notify_all();
         }
     }
 
-    /// Queue `Hold`s on the low band until it refuses one, in a process
-    /// that gave the band one worker and a queue of one.
+    /// Hold the low band's one worker, then take its one ring slot with
+    /// ad-hoc requests until one is refused (a `CallbackCell` never is), in
+    /// a process that gave the band one worker and a queue of one.
     fn fill_low_band() -> Hold {
-        use epics_rs::base::runtime::background::{CallbackCell, CallbackError};
-        use epics_rs::base::runtime::task::{CallbackPriority, request_cell};
+        use epics_rs::base::runtime::task::{
+            CallbackPriority, background_callback_stats, spawn_blocking_background,
+        };
+        let low_overflows = || {
+            background_callback_stats(false).unwrap()[CallbackPriority::Low.index()].num_overflow
+        };
         let hold = Hold::default();
+        let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let holder = hold.clone();
+        drop(spawn_blocking_background(
+            CallbackPriority::Low,
+            move |_| {
+                running_tx.send(()).unwrap();
+                holder.wait();
+            },
+        ));
+        running_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let refused = low_overflows() + 1;
         let full = (0..64).any(|_| {
-            match request_cell(CallbackPriority::Low, &CallbackCell::new(hold.clone())) {
-                Ok(()) => false,
-                Err(CallbackError::QueueFull) => true,
-                Err(e) => panic!("{e:?}"),
-            }
+            let filler = hold.clone();
+            drop(spawn_blocking_background(
+                CallbackPriority::Low,
+                move |_| filler.wait(),
+            ));
+            low_overflows() >= refused
         });
         assert!(full, "the low band never filled");
         hold
