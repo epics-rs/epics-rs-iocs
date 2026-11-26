@@ -431,6 +431,18 @@ impl AdsShared {
         }
     }
 
+    /// C `fireAllCallbacksLock` (adsAsynPortDriver.cpp:4677-4690): fire every
+    /// cached value, for the records that registered after its sample. Under
+    /// the lock, so a racing `publish` cannot be overtaken by its older value.
+    fn fire_all_callbacks(&self) {
+        let params = self.params.lock();
+        for (reason, p) in params.iter().enumerate() {
+            if let Some(iv) = p.as_ref().and_then(|p| interrupt_for(reason, p)) {
+                self.interrupts.notify(iv);
+            }
+        }
+    }
+
     /// Mark every PLC parameter of one AMS port for refresh (C
     /// `invalidateParams`).
     fn invalidate_ams_port(&self, ams_port: u16) -> Vec<usize> {
@@ -1929,7 +1941,7 @@ pub fn create_ads_port(claim: &PortClaim, cfg: AdsConfig) -> AsynResult<AdsRunti
     })
 }
 
-/// C `initHook`'s `getEpicsState` lines; registered once, as C's
+/// C `initHook`'s `getEpicsState`; registered once, as C's
 /// `initHookRegister` drops a repeated function.
 fn register_init_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1946,6 +1958,12 @@ fn register_init_hook() {
                 );
             }
             InitHookState::AfterScanInit => println!("Begin polling PLC!"),
+            // C replays at AfterScanInit, while interruptAccept still drops it.
+            InitHookState::AfterInterruptAccept => {
+                for (_, shared) in PORTS.lock().iter() {
+                    shared.fire_all_callbacks();
+                }
+            }
             _ => {}
         }));
     });
@@ -2241,6 +2259,7 @@ mod tests {
     use std::sync::mpsc;
 
     use asyn_rs::interrupt::InterruptFilter;
+    use epics_rs::base::server::ioc_app::init_hook_announce;
 
     use super::*;
 
@@ -2360,6 +2379,44 @@ mod tests {
         assert_eq!(iface, Some(InterfaceType::Float64));
         assert_eq!(severity, NO_ALARM_SEV);
         assert_eq!(d.read_float64(&user(reason)).unwrap(), 2.5);
+    }
+
+    /// The bind-time first sample fires before any I/O Intr record has
+    /// registered; a PLC variable that never changes again must still reach
+    /// the record once interrupts are accepted. One never sampled stays UDF.
+    #[test]
+    fn interrupt_accept_replays_each_sampled_value_to_a_late_subscriber() {
+        let mut d = driver();
+        let sampled = bind(
+            &mut d,
+            "ADSPORT=851/.ADR.16#4020,16#0,8,5?",
+            InterfaceType::Float64,
+        );
+        let _unsampled = bind(
+            &mut d,
+            "ADSPORT=851/.ADR.16#4020,16#8,8,5?",
+            InterfaceType::Float64,
+        );
+        // What `create_ads_port` wires up for every port.
+        register_port(&d.shared);
+        register_init_hook();
+        d.shared.publish(sampled, &2.5f64.to_le_bytes(), 0);
+
+        let (tx, rx) = mpsc::channel();
+        let _sub = d
+            .shared
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                let _ = tx.send((iv.reason, iv.value.clone()));
+            })
+            .unwrap();
+        init_hook_announce(InitHookState::AfterInterruptAccept);
+
+        let fired: Vec<_> = rx.try_iter().collect();
+        assert!(
+            matches!(fired.as_slice(), [(r, ParamValue::Float64(v))] if *r == sampled && *v == 2.5),
+            "{fired:?}"
+        );
     }
 
     #[test]
