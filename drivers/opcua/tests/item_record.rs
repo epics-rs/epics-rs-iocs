@@ -22,6 +22,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use epics_rs::base::server::device_support::{DeviceAlarm, DeviceSupport};
+use epics_rs::base::server::ioc_builder::IocBuilder;
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::server::records::longout::LongoutRecord;
 use epics_rs::base::types::EpicsValue;
@@ -307,6 +308,24 @@ fn a_string_field_keeps_the_bytes_a_client_put() {
             Some(EpicsValue::String(bytes.clone().into())),
             "{field}"
         );
+    }
+}
+
+/// READ and WRITE are `DBF_UCHAR` (`opcuaItemRecord.dbd:56,62`): a client's
+/// 200 reads back as 200, not as a signed -56.
+#[tokio::test]
+async fn read_and_write_hold_an_unsigned_byte() {
+    let (name, factory) = opcua::ioc::item_record_factory();
+    let (db, _) = IocBuilder::new()
+        .register_record_type(name, factory)
+        .db_string("record(opcuaItem, \"IT\") {}\n", &Default::default())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for field in ["IT.READ", "IT.WRITE"] {
+        db.put_pv(field, EpicsValue::Double(200.0)).await.unwrap();
+        assert_eq!(db.get_pv(field).unwrap().to_f64(), Some(200.0), "{field}");
     }
 }
 

@@ -91,8 +91,8 @@ static FIELDS: &[FieldDesc] = &[
         menu_name: Some("menuBini"),
         ..FieldDesc::new("BINI", DbFieldType::Enum, false)
     },
-    FieldDesc::new("READ", DbFieldType::Char, false),
-    FieldDesc::new("WRITE", DbFieldType::Char, false),
+    FieldDesc::new("READ", DbFieldType::UChar, false),
+    FieldDesc::new("WRITE", DbFieldType::UChar, false),
     FieldDesc::new("STATCODE", DbFieldType::ULong, false),
     FieldDesc::new("OSTATCODE", DbFieldType::ULong, false),
     FieldDesc::new("STATTEXT", DbFieldType::String, false),
@@ -197,8 +197,8 @@ impl Record for OpcuaItemRecord {
             "SUBS" => EpicsValue::String(self.subs.0.clone()),
             "DEFACTN" => EpicsValue::Enum(self.defactn),
             "BINI" => EpicsValue::Enum(self.bini),
-            "READ" => EpicsValue::Char(self.read),
-            "WRITE" => EpicsValue::Char(self.write),
+            "READ" => EpicsValue::UChar(self.read),
+            "WRITE" => EpicsValue::UChar(self.write),
             "STATCODE" => EpicsValue::ULong(self.statcode),
             "OSTATCODE" => EpicsValue::ULong(self.ostatcode),
             "STATTEXT" => EpicsValue::String(self.stattext.0.clone()),
@@ -331,7 +331,7 @@ fn index(value: &EpicsValue) -> Option<u16> {
 
 fn byte(value: &EpicsValue) -> Option<u8> {
     match value {
-        EpicsValue::Char(v) => Some(*v),
+        EpicsValue::Char(v) | EpicsValue::UChar(v) => Some(*v),
         EpicsValue::Short(v) => Some(*v as u8),
         EpicsValue::Long(v) => Some(*v as u8),
         EpicsValue::Enum(v) => Some(*v as u8),
