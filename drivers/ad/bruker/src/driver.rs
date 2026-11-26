@@ -21,6 +21,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::NDDataType;
@@ -155,9 +156,26 @@ impl BrukerDetector {
         self.ad.port_base.get_int32_param(reason, 0).unwrap_or(0)
     }
 
+    /// C `asynNDArrayDriver::checkPath()` (asynNDArrayDriver.cpp:98-109).
+    fn check_path(&mut self) {
+        let p = self.ad.params.base;
+        let base = &mut self.ad.port_base;
+        let Ok(path) = base.get_string_param(p.file_path, 0) else {
+            return;
+        };
+        let mut path = String::from_utf8_lossy(path).into_owned();
+        if path.is_empty() {
+            return;
+        }
+        let exists = check_path_str(&mut path);
+        let _ = base.set_string_param(p.file_path, 0, path);
+        let _ = base.set_int32_param(p.file_path_exists, 0, i32::from(exists));
+    }
+
     /// Build the next frame's file name (C `asynNDArrayDriver::createFileName`,
     /// which refuses when any of its five reads fails, asynNDArrayDriver.cpp:205-210).
     fn create_file_name(&mut self) -> AsynResult<String> {
+        self.check_path();
         let p = self.ad.params.base;
         let base = &mut self.ad.port_base;
         let path = String::from_utf8_lossy(base.get_string_param(p.file_path, 0)?).into_owned();

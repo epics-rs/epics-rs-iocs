@@ -372,8 +372,10 @@ pub(crate) fn start_acq_task(w: Worker, start: Arc<Event>) -> std::thread::JoinH
     )
 }
 
-/// C `asynNDArrayDriver::createFileName`.
+/// C `asynNDArrayDriver::createFileName`: a template that cannot be formatted
+/// names nothing and leaves FileNumber alone (:212-215).
 async fn create_file_name(ctx: &mut Ctx) -> String {
+    ctx.check_path().await;
     let base = ctx.ad.base;
     let file_path = ctx.get_str(base.file_path, MAX_FILENAME_LEN).await;
     let file_name = ctx.get_str(base.file_name, MAX_FILENAME_LEN).await;
@@ -381,8 +383,9 @@ async fn create_file_name(ctx: &mut Ctx) -> String {
     let file_number = ctx.get_i32(base.file_number).await.unwrap_or(0);
     let auto_increment = ctx.get_i32(base.auto_increment).await.unwrap_or(0);
 
-    let full =
-        format_file_template(&template, &file_path, &file_name, file_number).unwrap_or_default();
+    let Some(full) = format_file_template(&template, &file_path, &file_name, file_number) else {
+        return String::new();
+    };
     if auto_increment != 0 {
         ctx.set_i32(base.file_number, file_number + 1);
     }
@@ -859,5 +862,98 @@ mod tests {
                 .map(|x| x.value.as_string()),
             Some("desc".to_string())
         );
+    }
+
+    /// `create_file_name` on the acquisition context of a driver seeded with
+    /// FilePath `path`, FileName `img`, FileTemplate `template`, FileNumber 5
+    /// and AutoIncrement on: the name, then FilePath, FilePathExists and
+    /// FileNumber after it.
+    fn file_name_on(name: &str, path: &str, template: &str) -> (String, String, i32, i32) {
+        use crate::driver::{DriverLinks, PilatusDriver};
+        use epics_rs::asyn::interfaces::InterfaceType;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::sync_io::SyncIOHandle;
+
+        let (flat_field_tx, _flat_field_rx) = rt::command_channel::<FlatFieldJob>(4);
+        let stop = Arc::new(Event::new());
+        let cam = Arc::new(
+            SyncIOHandle::connect_port(
+                "PILATUS_NO_CAM",
+                0,
+                std::time::Duration::ZERO,
+                InterfaceType::Octet,
+            )
+            .0,
+        );
+        let links = DriverLinks {
+            flat_field_tx,
+            start: Arc::new(Event::new()),
+            stop: stop.clone(),
+            shared: Arc::new(Mutex::new(Shared::default())),
+            cam: cam.clone(),
+        };
+        let mut det = PilatusDriver::new(name, 2, 1, 0, links).unwrap();
+        let (ad, p) = (det.ad.params, det.p);
+        let b = &mut det.ad.port_base;
+        b.set_string_param(ad.base.file_path, 0, path).unwrap();
+        b.set_string_param(ad.base.file_name, 0, "img").unwrap();
+        b.set_string_param(ad.base.file_template, 0, template)
+            .unwrap();
+        b.set_int32_param(ad.base.file_number, 0, 5).unwrap();
+        b.set_int32_param(ad.base.auto_increment, 0, 1).unwrap();
+        b.set_int32_param(ad.base.file_path_exists, 0, 0).unwrap();
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
+        let h = runtime.port_handle().clone();
+        let mut ctx = Ctx::new(h.clone(), cam, ad, p, stop);
+        let (tx, rx) = std::sync::mpsc::channel();
+        // C runs createFileName on PilatusDetTask (pilatusDetector.cpp:1104,
+        // :1823-1827).
+        rt::run_thread_named(
+            "PilatusFileNameTest",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                let full = create_file_name(&mut ctx).await;
+                ctx.callbacks().await;
+                tx.send(full).unwrap();
+            },
+        )
+        .join()
+        .unwrap();
+        let full = rx.recv().unwrap();
+        let file_path = h
+            .get_string_param_blocking(ad.base.file_path, 0, 256)
+            .unwrap();
+        let out = (
+            full,
+            String::from_utf8_lossy(&file_path).into_owned(),
+            h.read_int32_blocking(ad.base.file_path_exists, 0).unwrap(),
+            h.read_int32_blocking(ad.base.file_number, 0).unwrap(),
+        );
+        std::mem::forget(runtime);
+        out
+    }
+
+    /// C `createFileName` runs `checkPath` first (asynNDArrayDriver.cpp:203):
+    /// the name carries the separator and FilePathExists is refreshed.
+    #[test]
+    fn a_file_name_checks_the_path_first() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap().trim_end_matches('/');
+        let (full, path, exists, number) = file_name_on("PILATUS_NAME_PATH", dir, "%s%s_%3.3d");
+        assert_eq!(full, format!("{dir}/img_005"));
+        assert_eq!(path, format!("{dir}/"));
+        assert_eq!((exists, number), (1, 6));
+    }
+
+    /// A template C cannot format leaves FileNumber alone
+    /// (asynNDArrayDriver.cpp:212-215).
+    #[test]
+    fn a_failed_template_leaves_the_file_number() {
+        let (full, _, _, number) = file_name_on("PILATUS_NAME_FAIL", "", "%f");
+        assert_eq!((full.as_str(), number), ("", 5));
     }
 }

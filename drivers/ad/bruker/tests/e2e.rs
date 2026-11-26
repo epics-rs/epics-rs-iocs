@@ -367,6 +367,43 @@ fn one_scan_reaches_the_plugins() {
     );
 }
 
+/// C `createFileName` runs `checkPath` (asynNDArrayDriver.cpp:203), so a
+/// directory made after the FilePath write is seen at the next scan.
+#[test]
+fn a_scan_refreshes_file_path_exists() {
+    let fixture = Fixture::new("APX_PATH_LATER");
+    let ad = fixture.detector.ad_params;
+    let later = fixture.dir.join("later");
+    let path = format!("{}/", later.display());
+    // The write fails because the directory is missing; the path is kept.
+    let _ = fixture.sync.write_octet(ad.base.file_path, path.as_bytes());
+    assert_eq!(
+        fixture.sync.read_int32(ad.base.file_path_exists).unwrap(),
+        0
+    );
+    std::fs::create_dir(&later).expect("the directory, made after");
+
+    fixture
+        .sync
+        .write_int32(ad.image_mode, ImageMode::Single as i32)
+        .expect("image mode");
+    fixture
+        .sync
+        .write_float64(ad.acquire_time, 0.05)
+        .expect("acquire time");
+    fixture.sync.write_int32(ad.acquire, 1).expect("acquire");
+    assert!(fixture.next_array(Duration::from_secs(20)).is_some());
+
+    assert_eq!(
+        fixture.sync.read_int32(ad.base.file_path_exists).unwrap(),
+        1
+    );
+    assert_eq!(
+        PathBuf::from(fixture.string(ad.base.full_file_name)),
+        later.join("frame_007.sfrm")
+    );
+}
+
 #[test]
 fn a_stop_during_the_exposure_publishes_no_frame() {
     // C signalled one event both for the exposure timer and for a user Stop, so
