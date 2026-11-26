@@ -42,9 +42,11 @@
 //! - The C300 has no limit switches, home, speed or acceleration; those are
 //!   reported clear / are no-ops, matching C.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::asyn::error::{AsynResult, OctetStep};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
@@ -71,11 +73,12 @@ const CORR_OFFSET: usize = 28;
 /// Done-tolerance in controller units (C global `C300Tolerance`).
 const TOLERANCE: f64 = 256.0;
 
-/// Parse a leading float from a fixed byte offset into an ASCII record, matching
-/// the C `sscanf(&inString[offset], "%lG", ...)`. Returns `None` if the record
-/// is shorter than the offset.
+/// C `sscanf(&inString[offset], "%lG", ...)`: `None` when the field does not
+/// convert or the record is shorter than the offset.
 fn parse_at(record: &str, offset: usize) -> Option<f64> {
-    record.get(offset..).map(|tail| atof(tail.trim_start()))
+    let value = Cell::new(0f64);
+    let tail = record.as_bytes().get(offset..)?;
+    (sscanf(tail, "%lG", &[&value]) == 1).then(|| value.get())
 }
 
 /// Shared controller endpoint owning the asyn octet handle.
@@ -89,11 +92,15 @@ pub struct C300Controller {
     in_string: String,
 }
 
-/// C `C300Axis`'s `bitsPerUnit_`, `encoderPosition_` and `theoryPosition_`.
+/// C `C300Axis`'s `bitsPerUnit_`, `posMonCorrectedVal_`,
+/// `analogInScaledVal_`, `encoderPosition_` and `theoryPosition_`.
 #[derive(Default)]
 struct AxisState {
     /// 2^20 over the stage range, 0 while the range is unread.
     bits_per_unit: f64,
+    /// The `DATA?` fields, each kept when its field does not convert.
+    pos_mon: f64,
+    analog_in: f64,
     encoder_position: f64,
     /// The theoretical (set-point) position, for relative moves and the
     /// simulated done comparison.
@@ -361,10 +368,15 @@ impl AsynMotor for C300Axis {
         let mut ctrl = self.lock();
         let data = ctrl.query(&format!("{}:DATA?", self.chan))?;
         // Encoder position from the monitor record (fixed-offset fields).
-        let pos_mon = parse_at(&data, DATA_OFFSET).unwrap_or(0.0);
-        let analog_in = parse_at(&data, CORR_OFFSET).unwrap_or(0.0);
-        let encoder_position = (pos_mon - analog_in) * self.di_scale_factor_inv;
-        ctrl.axis(self.index).encoder_position = encoder_position;
+        let state = ctrl.axis(self.index);
+        if let Some(value) = parse_at(&data, DATA_OFFSET) {
+            state.pos_mon = value;
+        }
+        if let Some(value) = parse_at(&data, CORR_OFFSET) {
+            state.analog_in = value;
+        }
+        let encoder_position = (state.pos_mon - state.analog_in) * self.di_scale_factor_inv;
+        state.encoder_position = encoder_position;
         status.set_encoder_position(encoder_position);
 
         // Theoretical (set-point) position.
@@ -480,6 +492,32 @@ mod tests {
         let mut status = MotorStatus::default();
         assert!(axis.poll(&AsynUser::default(), &mut status).is_err());
         assert_eq!(status.encoder_position(), 50.0);
+    }
+
+    /// C300MotorDriver.cpp:293-295: a `DATA?` field `%lG` does not convert
+    /// keeps the value the last poll read; the other field still updates.
+    #[test]
+    fn an_unparsable_data_field_keeps_its_last_value() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let junk = Arc::new(AtomicBool::new(false));
+        let replies = {
+            let junk = junk.clone();
+            move |cmd: &str| match cmd.trim_end() {
+                "CHAN1:DATA?" if junk.load(Ordering::SeqCst) => {
+                    format!("{:28}{:<84}xx", "", "1.5")
+                }
+                other => c300_replies(other),
+            }
+        };
+        let (_rig, io) = motor_common::testing::LineRig::new("c300JunkData", replies);
+        let controller = Arc::new(Mutex::new(C300Controller::new(io, 1)));
+        let mut axis = C300Axis::new(controller, 0);
+        let mut status = MotorStatus::default();
+        axis.poll(&AsynUser::default(), &mut status).unwrap();
+        assert_eq!(status.encoder_position(), 50.0);
+        junk.store(true, Ordering::SeqCst);
+        axis.poll(&AsynUser::default(), &mut status).unwrap();
+        assert_eq!(status.encoder_position(), (100.5 - 1.5) * 0.5);
     }
 
     /// C300MotorDriver.cpp:234-236: only the constructor sets GAIN_SUPPORT
