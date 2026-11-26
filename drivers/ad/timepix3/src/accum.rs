@@ -335,20 +335,27 @@ impl Accumulator {
         self.time_axis_len = 0;
     }
 
-    /// `add`, recording the frame's geometry for the arrays built later from
-    /// the accumulation and its storage for the memory estimate.
+    /// Accumulate a frame of geometry `shape`, which the arrays built later
+    /// from the accumulation carry, and record its storage for the memory
+    /// estimate.
     pub fn add_shaped(&mut self, frame: &[u32], shape: &[usize], value_bytes: usize) -> Update {
-        let update = self.add(frame);
-        self.shape = shape.to_vec();
         self.value_bytes = value_bytes;
-        update
+        self.accumulate(frame, shape)
     }
 
+    /// `add_shaped` for a one-dimensional frame (PrvHst's bins).
     pub fn add(&mut self, frame: &[u32]) -> Update {
+        self.accumulate(frame, &[frame.len()])
+    }
+
+    fn accumulate(&mut self, frame: &[u32], shape: &[usize]) -> Update {
         let mut reset = false;
         let mut range = None;
-        if frame.len() != self.len {
+        // C compares width and height, not the pixel count, so a transposed
+        // frame restarts the sums too (serval_stream.cpp:1068-1086).
+        if frame.len() != self.len || shape != self.shape {
             // A geometry change invalidates every accumulated frame.
+            self.shape = shape.to_vec();
             self.running = vec![0; frame.len()];
             self.window.clear();
             self.len = frame.len();
@@ -594,6 +601,18 @@ mod tests {
         assert_eq!(sum_n(&a, &u), Some(vec![5, 5]));
         assert_eq!(a.frame_count(), 1);
         assert_eq!(a.total_counts(), 10);
+    }
+
+    #[test]
+    fn a_transposed_frame_restarts_the_accumulation() {
+        let mut a = Accumulator::new();
+        a.add_shaped(&[1, 2, 3, 4, 5, 6], &[2, 3], 2);
+        let u = a.add_shaped(&[1, 1, 1, 1, 1, 1], &[3, 2], 2);
+        assert!(u.reset);
+        assert_eq!(a.running(), [1; 6]);
+        assert_eq!(sum_n(&a, &u), Some(vec![1; 6]));
+        assert_eq!(a.frame_count(), 1);
+        assert_eq!(a.shape(), [3, 2]);
     }
 
     #[test]

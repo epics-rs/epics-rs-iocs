@@ -4414,7 +4414,13 @@ mod tests {
         );
         assert_eq!(*arrays.lock(), vec![(p.img_image_sum_n_frames, vec![3, 4])]);
         // C sets the update counter due, so the next frame publishes the sum.
-        assert!(shared.img.lock().add(&[5, 6]).sum_updated);
+        assert!(
+            shared
+                .img
+                .lock()
+                .add_shaped(&[5, 6], &[2, 1], 2)
+                .sum_updated
+        );
 
         det.write_int32(&mut AsynUser::new(p.img_retention_limit_mb), 1)
             .unwrap();
