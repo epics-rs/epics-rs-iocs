@@ -818,6 +818,7 @@ pub fn create_merlin_detector(
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+    use epics_rs::ad_core::timestamp::EpicsTimestamp;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::interpose::{EomReason, OctetReadResult};
@@ -1291,7 +1292,8 @@ mod tests {
             epics_rs::ad_core::runtime::ThreadPriority::Medium,
             epics_rs::ad_core::runtime::StackSizeClass::Medium,
             move || async move {
-                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+                crate::task::handle_frame(&ctx, &body, EpicsTimestamp::now(), &mut String::new())
+                    .await;
             },
         )
         .join()
@@ -1331,7 +1333,8 @@ mod tests {
             epics_rs::ad_core::runtime::ThreadPriority::Medium,
             epics_rs::ad_core::runtime::StackSizeClass::Medium,
             move || async move {
-                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+                crate::task::handle_frame(&ctx, &body, EpicsTimestamp::now(), &mut String::new())
+                    .await;
             },
         )
         .join()
@@ -1460,7 +1463,13 @@ mod tests {
                 epics_rs::ad_core::runtime::ThreadPriority::Medium,
                 epics_rs::ad_core::runtime::StackSizeClass::Medium,
                 move || async move {
-                    crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+                    crate::task::handle_frame(
+                        &ctx,
+                        &body,
+                        EpicsTimestamp::now(),
+                        &mut String::new(),
+                    )
+                    .await;
                 },
             )
             .join()
@@ -1505,7 +1514,8 @@ mod tests {
             epics_rs::ad_core::runtime::ThreadPriority::Medium,
             epics_rs::ad_core::runtime::StackSizeClass::Medium,
             move || async move {
-                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+                crate::task::handle_frame(&ctx, &body, EpicsTimestamp::now(), &mut String::new())
+                    .await;
             },
         )
         .join()
@@ -1558,7 +1568,8 @@ mod tests {
             epics_rs::ad_core::runtime::ThreadPriority::Medium,
             epics_rs::ad_core::runtime::StackSizeClass::Medium,
             move || async move {
-                crate::task::handle_frame(&ctx, &body, &mut String::new()).await;
+                crate::task::handle_frame(&ctx, &body, EpicsTimestamp::now(), &mut String::new())
+                    .await;
             },
         )
         .join()
@@ -1588,6 +1599,62 @@ mod tests {
                 array.time_stamp
             );
         }
+    }
+
+    /// C takes timeStamp before it waits for the frame
+    /// (merlinDetector.cpp:101-112): a frame that comes after a wait carries
+    /// the wait's start.
+    #[test]
+    fn a_frame_is_stamped_before_its_read() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use std::io::Write;
+        let name = "MERLIN_READ_TS";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut body = crate::protocol::tests::quad_header(768, 1);
+            body.resize(768 + 256 * 256 * 2, 0);
+            let mut frame = format!("MPX,{:010},", body.len() + 1).into_bytes();
+            frame.extend_from_slice(&body);
+            // The port connects at creation; the wait runs from the read.
+            go_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            sent_tx.send(EpicsTimestamp::now().as_f64()).unwrap();
+            stream.write_all(&frame).unwrap();
+            std::mem::forget(stream);
+        });
+        let ip = format!("{name}_DATA");
+        let driver = DrvAsynIPPort::new(&ip, &addr).unwrap();
+        let (runtime, _) =
+            create_port_runtime(&claim_port(&ip).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let data = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+
+        let (sender, mut receiver) = ndarray_channel(&format!("{name}_SINK"), 4);
+        let mut output = NDArrayOutput::new();
+        output.add(sender);
+        let mut ctx = quad_frame_context(name, detector_sized(name, 2 << 20), output);
+        ctx.data = MpxConnection::new(
+            SyncIOHandle::from_handle(data, 0, Duration::ZERO, InterfaceType::Octet).unwrap(),
+            DetectorType::MerlinQuad.max_frame_bytes(),
+        );
+        ctx.shared.starting_up.store(false, Ordering::Release);
+        // As C creates merlinTask (merlinDetector.cpp:1516-1518).
+        epics_rs::ad_core::runtime::run_thread_named(
+            "MerlinDataTask",
+            epics_rs::ad_core::runtime::ThreadPriority::Medium,
+            epics_rs::ad_core::runtime::StackSizeClass::Medium,
+            move || crate::task::data_loop(ctx),
+        );
+        go_tx.send(()).unwrap();
+
+        let array = receiver.blocking_recv().expect("the frame's array");
+        let sent = sent_rx.recv().unwrap();
+        assert!(array.time_stamp < sent, "{} >= {sent}", array.time_stamp);
     }
 
     /// merlinDetector.cpp sets the array size and type params only in the
