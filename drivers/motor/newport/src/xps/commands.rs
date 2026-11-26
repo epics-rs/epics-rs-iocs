@@ -10,7 +10,9 @@
 //!
 //! [`SocketMode`]: super::rpc::SocketMode
 
-use epics_rs::base::runtime::stdlib::strtod;
+use std::cell::Cell;
+
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use super::rpc::{XpsResult, XpsSocket, g13 as g};
@@ -88,10 +90,8 @@ impl XpsSocket {
         );
         let r = self.exec(&cmd)?.require_ok()?;
         for (i, p) in pos.iter_mut().enumerate() {
-            if let Some(read) = r.field(i + 1).map(|f| strtod(f.as_bytes()))
-                && read.len > 0
-            {
-                *p = read.value;
+            if let Some(field) = r.field(i + 1) {
+                sscanf(field, "%lf", &[Cell::from_mut(p)]);
             }
         }
         Ok(())
@@ -694,10 +694,8 @@ impl XpsSocket {
         if let Some(name) = r.field(1) {
             *master = name.to_string();
         }
-        if let Some(read) = r.field(2).map(|f| strtod(f.as_bytes()))
-            && read.len > 0
-        {
-            *ratio = read.value;
+        if let Some(field) = r.field(2) {
+            sscanf(field, "%lf", &[Cell::from_mut(ratio)]);
         }
         Ok(())
     }
@@ -748,6 +746,22 @@ mod tests {
             .group_positions_current_get("G1", &mut pos)
             .unwrap_err();
         assert_eq!((err.code(), pos), (-3, [9.0; 2]));
+    }
+
+    /// `sscanf(pt, "%lf")` (XPS_C8_drivers.cpp:3595,7704) converts nothing
+    /// from a float glibc reads only part of, so the out-parameter keeps
+    /// its value.
+    #[test]
+    fn a_float_cut_short_keeps_its_out_parameter() {
+        let line = FakeLine::new("xps_cut_floats", "");
+        let sock = line.socket(SocketMode::Query);
+        let mut pos = [9.0; 4];
+        sock.group_positions_current_get("CUT", &mut pos).unwrap();
+        assert_eq!(pos, [9.0, 9.0, 9.0, 16.0]);
+        let (mut master, mut ratio) = (String::new(), 7.0);
+        sock.single_axis_slave_parameters_get("CUT", &mut master, &mut ratio)
+            .unwrap();
+        assert_eq!(ratio, 7.0);
     }
 
     /// XPS_C8_drivers.cpp:7439-7473: the file is reply field 1 and the

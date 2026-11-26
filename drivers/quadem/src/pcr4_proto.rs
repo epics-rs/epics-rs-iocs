@@ -5,9 +5,11 @@
 //! stream is one `\r\n`-terminated line of space-separated floating-point
 //! currents per sample.
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::base::types::c_parse::{atoi, long_to_int, strtol};
 
 use crate::drv_quad_em::{QE_MAX_INPUTS, QeTriggerPolarity};
@@ -174,14 +176,14 @@ fn parse_int_after(resp: &str, prefix: &str) -> Option<i32> {
 }
 
 /// C++ `readStatus`: `"BIASSTATUS:OFF"` means the bias is off, anything else
-/// carries the voltage. `Some(None)` is bias off, `Some(Some(v))` is bias on.
+/// carries the voltage, `sscanf(inString_, "BIASSTATUS:%lf")`. `Some(None)` is
+/// bias off, `Some(Some(v))` is bias on.
 pub fn parse_bias_status(resp: &str) -> Option<Option<f64>> {
     if resp.starts_with("BIASSTATUS:OFF") {
         return Some(None);
     }
-    let rest = resp.strip_prefix("BIASSTATUS:")?;
-    let (value, consumed) = strtod(rest);
-    (consumed > 0).then_some(Some(value))
+    let value = Cell::new(0.0);
+    (sscanf(resp, "BIASSTATUS:%lf", &[&value]) == 1).then(|| Some(value.get()))
 }
 
 /// C++ `setAcquire(0)`'s resynchronisation loop: it re-reads until a line ends
@@ -410,6 +412,20 @@ mod tests {
         assert_eq!(parse_bias_status("BIASSTATUS:OFF"), Some(None));
         assert_eq!(parse_bias_status("BIASSTATUS:24.500000"), Some(Some(24.5)));
         assert_eq!(parse_bias_status("ACK"), None);
+    }
+
+    /// `sscanf(inString_, "BIASSTATUS:%lf")` (drvPCR4.cpp:668): the whole
+    /// `%lf` grammar, and nothing from a float glibc reads only part of.
+    #[test]
+    fn bias_status_scans_as_sscanf_lf() {
+        assert_eq!(
+            parse_bias_status("BIASSTATUS: inf"),
+            Some(Some(f64::INFINITY))
+        );
+        assert_eq!(parse_bias_status("BIASSTATUS:0x1p4"), Some(Some(16.0)));
+        assert_eq!(parse_bias_status("BIASSTATUS:0x"), None);
+        assert_eq!(parse_bias_status("BIASSTATUS:2e"), None);
+        assert_eq!(parse_bias_status("BIASSTATUS:infi"), None);
     }
 
     #[test]
