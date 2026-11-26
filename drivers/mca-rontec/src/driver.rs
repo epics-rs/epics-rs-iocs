@@ -241,7 +241,7 @@ impl RontecDriver {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             RONTEC_INTERFACES,
             InterfaceMask::NONE,
@@ -756,7 +756,7 @@ mod tests {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             RONTEC_INTERFACES,
             InterfaceMask::NONE,
@@ -1098,6 +1098,22 @@ mod tests {
         rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::Sequence)
             .expect("noop");
         assert_eq!(rig.trace().matches("sendMessage").count(), 1);
+    }
+
+    /// C registers the port without `ASYN_DESTRUCTIBLE` (`drvMcaRontec.c:219-220`),
+    /// so `asynShutdownPort` is refused and the port keeps serving.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let rig = Rig::new("shut", rontec_reply);
+        let refused = rig
+            .rontec
+            .port_handle()
+            .submit_blocking(RequestOp::ShutdownPort, AsynUser::default())
+            .unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::Erase)
+            .expect("the port still serves");
+        assert_eq!(rig.writes.lock().unwrap().as_slice(), [b"$CC".to_vec()]);
     }
 
     /// C `sendMessage`'s `ASYN_TRACEIO_DEVICE` line (`drvMcaRontec.c:593-597`)

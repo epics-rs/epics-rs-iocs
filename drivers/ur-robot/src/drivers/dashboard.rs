@@ -160,7 +160,7 @@ impl DashboardDriver {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             INTERFACES,
             INTERRUPTS,
@@ -501,6 +501,23 @@ mod tests {
     use super::*;
     use epics_rs::asyn::error::AsynError;
     use std::io::{BufRead, BufReader as StdBufReader, Write};
+
+    /// C registers the port without `ASYN_DESTRUCTIBLE`
+    /// (`dashboard_driver.cpp:36`), so `asynShutdownPort` is refused and the
+    /// port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        use epics_rs::asyn::error::AsynStatus;
+
+        // Privileged port 1: the connect is refused and the port is built
+        // disconnected.
+        let mut client = DashboardClient::new("127.0.0.1", DEFAULT_TIMEOUT);
+        client.set_port(1);
+        let mut drv = DashboardDriver::with_client("DASH_SHUT", "127.0.0.1", client).unwrap();
+        let refused = drv.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(drv.base.is_enabled());
+    }
 
     /// Below PolyScope 5.6 the C++ constructor's getSerialNumber throws, so
     /// URDashboardConfig reports that text and no dashboard is left behind

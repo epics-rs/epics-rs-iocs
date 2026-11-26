@@ -294,7 +294,7 @@ impl ReceiveDriver {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             INTERFACES,
             INTERRUPTS,
@@ -730,6 +730,17 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Instant;
 
+    /// C registers the port without `ASYN_DESTRUCTIBLE`
+    /// (`rtde_receive_driver.cpp:53`), so `asynShutdownPort` is refused and
+    /// the port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let mut drv = ReceiveDriver::new("RECV_SHUT", "127.0.0.1").expect("driver");
+        let refused = drv.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(drv.base.is_enabled());
+    }
+
     /// The pacing boundaries: an attempt is due immediately on the unhealthy
     /// transition, then 1 s → 2 s → 5 s, capped at 5 s, and reset restores
     /// the immediate first attempt.
@@ -986,7 +997,7 @@ mod tests {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             INTERFACES,
             INTERRUPTS,

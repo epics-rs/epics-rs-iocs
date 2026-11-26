@@ -282,7 +282,7 @@ impl DataDriver {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             InterfaceMask::COMMON | InterfaceMask::FLOAT64 | InterfaceMask::INT32,
             InterfaceMask::FLOAT64,
@@ -856,6 +856,17 @@ mod tests {
         )
         .unwrap();
         (driver, rbk_runtime)
+    }
+
+    /// C registers the port without `ASYN_DESTRUCTIBLE`
+    /// (`capaNCDT6200Sup.c:731-733`), so `asynShutdownPort` is refused and
+    /// the port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let (mut driver, _keep_alive) = make_test_driver();
+        let refused = driver.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(driver.base.is_enabled());
     }
 
     #[test]

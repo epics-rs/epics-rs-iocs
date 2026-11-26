@@ -1136,7 +1136,7 @@ impl AdsPortDriver {
                 multi_device: false,
                 // Every parameter bind and every write goes to the PLC over TCP.
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             INTERFACES,
             INTERRUPTS,
@@ -2247,6 +2247,17 @@ mod tests {
     fn driver() -> AdsPortDriver {
         let cfg = AdsConfig::new("ADS1", "10.0.0.1", AmsNetId([10, 0, 0, 1, 1, 1]), 851);
         AdsPortDriver::new(cfg).unwrap()
+    }
+
+    /// C registers the port with `ASYN_CANBLOCK` alone
+    /// (`adsAsynPortDriver.cpp:293`), so `asynShutdownPort` is refused and the
+    /// port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let mut d = driver();
+        let refused = d.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(d.base.is_enabled());
     }
 
     /// Bind one record. `.ADR.` links carry the PLC type and size in the link

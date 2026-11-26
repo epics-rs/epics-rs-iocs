@@ -471,7 +471,7 @@ impl AmptekDriver {
             PortFlags {
                 multi_device: false,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             AMPTEK_INTERFACES,
             AMPTEK_INTERRUPTS,
@@ -1883,6 +1883,16 @@ mod tests {
             "DPP device /dev/ttyS0 not found, total devices found=0"
         );
         assert!(!driver.link.is_connected());
+    }
+
+    /// C registers the port with `ASYN_CANBLOCK` alone (`drvAmptek.cpp:68`),
+    /// so `asynShutdownPort` is refused and the port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let mut driver = AmptekDriver::new("AMPTEKSHUT", 2, "/dev/ttyS0", true).unwrap();
+        let refused = driver.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(driver.base.is_enabled());
     }
 
     /// C traces an unknown interface type and leaves the port with a NULL

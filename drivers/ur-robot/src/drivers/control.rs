@@ -382,7 +382,7 @@ impl ControlDriver {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             INTERFACES,
             INTERRUPTS,
@@ -1141,6 +1141,35 @@ mod tests {
     /// Privileged port 1: no test can bind it, so a connect is always refused.
     /// A freed ephemeral port can be taken by a concurrent test's listener.
     const DEAD_PORT: u16 = 1;
+
+    /// C registers the port without `ASYN_DESTRUCTIBLE`
+    /// (`rtde_control_driver.cpp:169`), so `asynShutdownPort` is refused and
+    /// the port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        use epics_rs::asyn::error::AsynStatus;
+
+        let dash = DashboardHandle::new("127.0.0.1");
+        dash.set(DashboardState {
+            polyscope: Some(PolyScopeVersion::default()),
+            ..Default::default()
+        });
+        registry::register_dashboard("CTRL_SHUT_DASH", dash).expect("fresh port name");
+        registry::register_receive("CTRL_SHUT_RECV", ReceiveHandle::new())
+            .expect("fresh port name");
+        let script_server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let script_port = script_server.local_addr().expect("addr").port();
+        let mut drv = ControlDriver::with_script_port(
+            "CTRL_SHUT",
+            "CTRL_SHUT_DASH",
+            "CTRL_SHUT_RECV",
+            script_port,
+        )
+        .expect("driver");
+        let refused = drv.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(drv.base.is_enabled());
+    }
 
     fn params() -> ControlParams {
         let mut n = 0usize;

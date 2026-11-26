@@ -476,7 +476,7 @@ impl Dg645Driver {
             PortFlags {
                 multi_device: false,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             InterfaceMask::COMMON
                 | InterfaceMask::DRV_USER
@@ -988,6 +988,16 @@ mod tests {
 mod init_tests {
     use super::*;
     use crate::connect::mute_link;
+
+    /// C registers the port with `ASYN_CANBLOCK` alone (`drvAsynDG645.cpp:525`),
+    /// so `asynShutdownPort` is refused and the port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let mut dg = Dg645Driver::new("DG645_SHUT", mute_link("DG645_SHUT_IO")).unwrap();
+        let refused = dg.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(dg.base.is_enabled());
+    }
 
     /// C leaves `init == 0` when `*IDN?` fails, and every transfer refuses.
     #[test]

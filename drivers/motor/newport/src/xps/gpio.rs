@@ -81,7 +81,7 @@ impl XpsGpio {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             InterfaceMask::COMMON
                 | InterfaceMask::FLOAT64
@@ -383,6 +383,19 @@ mod tests {
     fn uint32(handle: &PortHandle, op: RequestOp, reason: usize, addr: i32) -> AsynResult<u32> {
         let r = handle.submit_blocking(op, AsynUser::new(reason).with_addr(addr))?;
         Ok(r.uint_val.unwrap_or(0))
+    }
+
+    /// C registers the port with `ASYN_MULTIDEVICE` alone
+    /// (`drvXPSAsynAux.c:190-191`), so `asynShutdownPort` is refused and the
+    /// port keeps serving.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let (_line, port) = gpio("xps_gpio_shut");
+        let refused = port
+            .submit_blocking(RequestOp::ShutdownPort, AsynUser::default())
+            .unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert_eq!(port.read_float64_blocking(ANALOG_INPUT, 3).unwrap(), 1.5);
     }
 
     #[test]

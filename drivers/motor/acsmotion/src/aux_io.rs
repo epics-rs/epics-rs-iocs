@@ -271,7 +271,7 @@ pub fn config(
         PortFlags {
             multi_device: true,
             can_block: true,
-            destructible: true,
+            destructible: false,
         },
         InterfaceMask::INT32
             | InterfaceMask::FLOAT64
@@ -344,6 +344,26 @@ mod tests {
     use epics_rs::asyn::trace::TraceFile;
 
     use super::*;
+
+    /// C registers the aux port and its comm port without `ASYN_DESTRUCTIBLE`
+    /// (SPiiPlusAuxDriver.cpp:40, SPiiPlusCommDriver.cpp:27), so
+    /// `asynShutdownPort` is refused on both and they keep serving.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        use epics_rs::asyn::error::AsynStatus;
+
+        let _line = crate::fake::line("spiiAuxShut");
+        config(&open_owner(), "spiiAuxShutIo", "spiiAuxShut", 2, 1000.0).unwrap();
+        for name in ["spiiAuxShutIo", "spiiAuxShutIoComm"] {
+            let port = PortManager::global().find_port_handle(name).unwrap();
+            let refused = port
+                .submit_blocking(RequestOp::ShutdownPort, AsynUser::default())
+                .unwrap_err();
+            assert_eq!(refused.status(), AsynStatus::Error, "{name}");
+            port.submit_blocking(RequestOp::NoIo, AsynUser::default())
+                .unwrap_or_else(|e| panic!("{name} still serves: {e}"));
+        }
+    }
 
     /// A write at address -1 goes to channel 0, getAddress's channel for it
     /// (SPiiPlusAuxDriver.cpp:135, :186).

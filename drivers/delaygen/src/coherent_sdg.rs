@@ -332,7 +332,7 @@ impl CoherentSdgDriver {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             InterfaceMask::COMMON
                 | InterfaceMask::DRV_USER
@@ -593,6 +593,17 @@ mod tests {
 mod init_tests {
     use super::*;
     use crate::connect::mute_link;
+
+    /// C registers the port without `ASYN_DESTRUCTIBLE`
+    /// (`drvAsynCoherentSDG.cpp:304`), so `asynShutdownPort` is refused and
+    /// the port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let mut sdg = CoherentSdgDriver::new("SDG_SHUT", mute_link("SDG_SHUT_IO"));
+        let refused = sdg.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(sdg.base.is_enabled());
+    }
 
     /// C leaves `init == 0` when `status?` fails, and every transfer refuses
     /// without touching the device.

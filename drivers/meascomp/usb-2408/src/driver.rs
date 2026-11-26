@@ -241,7 +241,7 @@ impl MultiFunctionDriver {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             MULTIFUNCTION_INTERFACES,
             MULTIFUNCTION_INTERRUPTS,
@@ -1381,6 +1381,17 @@ pub fn create_usb_2408(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C registers the port without `ASYN_DESTRUCTIBLE`
+    /// (`drvMultiFunction.cpp:821`), so `asynShutdownPort` is refused and the
+    /// port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let mut drv = MultiFunctionDriver::new("MFSHUT", DaqDevice::unconnected(), 16, 16).unwrap();
+        let refused = drv.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(drv.base.is_enabled());
+    }
 
     #[test]
     fn trigger_mode_refuses_the_hysteresis_gates_and_out_of_range() {
