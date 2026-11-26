@@ -782,22 +782,22 @@ impl EtherIpDevice {
         // Stage the record's value in the tag buffer, but only when it differs
         // from what the PLC last reported -- otherwise every process would
         // queue a redundant write (C ao_write/bo_write/... all compare first).
-        let changed = match rtype {
+        let stage = match rtype {
             "ao" => match cip::typecode(&data.buf) {
                 Some(CipType::Real) | Some(CipType::Lreal) => {
                     let val = f64_field(record, "VAL");
                     match cip::get_double(&data.buf, element) {
-                        Some(cur) if cur == val => false,
-                        Some(_) => cip::put_double(&mut data.buf, element, val),
-                        None => false,
+                        Some(cur) if cur == val => Stage::Skipped,
+                        Some(_) => Stage::put(cip::put_double(&mut data.buf, element, val)),
+                        None => Stage::Skipped,
                     }
                 }
                 _ => {
                     let rval = i32_field(record, "RVAL");
                     match cip::get_dint(&data.buf, element) {
-                        Some(cur) if cur == rval => false,
-                        Some(_) => cip::put_dint(&mut data.buf, element, rval),
-                        None => false,
+                        Some(cur) if cur == rval => Stage::Skipped,
+                        Some(_) => Stage::put(cip::put_dint(&mut data.buf, element, rval)),
+                        None => Stage::Skipped,
                     }
                 }
             },
@@ -807,44 +807,64 @@ impl EtherIpDevice {
                     _ => 0,
                 };
                 match cip::get_lint(&data.buf, element) {
-                    Some(cur) if cur == val => false,
-                    Some(_) => cip::put_lint(&mut data.buf, element, val),
-                    None => false,
+                    Some(cur) if cur == val => Stage::Skipped,
+                    Some(_) => Stage::put(cip::put_lint(&mut data.buf, element, val)),
+                    None => Stage::Failed,
                 }
             }
             "bo" | "mbbo" | "mbboDirect" => {
                 let bits = if rtype == "bo" { 1 } else { nobt(record) };
                 let rval = i32_field(record, "RVAL") as u32;
                 match get_bits(&data.buf, element, mask, bits) {
-                    Some(cur) if cur == rval => false,
-                    Some(_) => put_bits(&mut data.buf, element, mask, bits, rval),
-                    None => false,
+                    Some(cur) if cur == rval => Stage::Skipped,
+                    Some(_) => Stage::put(put_bits(&mut data.buf, element, mask, bits, rval)),
+                    None => Stage::Skipped,
                 }
             }
             "stringout" | "lso" => {
                 let val = string_val(record);
                 match cip::get_string(&data.buf, element, string_size(record)) {
-                    Some(cur) if cur == val => false,
-                    Some(_) => cip::put_string(&mut data.buf, &val),
-                    None => false,
+                    Some(cur) if cur == val => Stage::Skipped,
+                    Some(_) => Stage::put(cip::put_string(&mut data.buf, &val)),
+                    None => Stage::Failed,
                 }
             }
-            _ => {
+            _ => Stage::Failed,
+        };
+
+        match stage {
+            Stage::Failed => {
                 drop(data);
                 self.write_alarm();
                 return Ok(false);
             }
-        };
-
-        if changed {
-            let carrier = tag.request_write(&mut data, &self.name);
-            if let (Some(done), Some(listener)) = (done, &self.listener) {
-                listener.stage_write(done.device_done(), carrier);
+            Stage::Staged => {
+                let carrier = tag.request_write(&mut data, &self.name);
+                if let (Some(done), Some(listener)) = (done, &self.listener) {
+                    listener.stage_write(done.device_done(), carrier);
+                }
             }
+            Stage::Skipped => {}
         }
         drop(data);
         self.no_alarm();
-        Ok(changed && done.is_some())
+        Ok(matches!(stage, Stage::Staged) && done.is_some())
+    }
+}
+
+/// What a write pass did with the record's value.
+enum Stage {
+    /// Nothing to write: the tag holds the value already, or the C
+    /// ao/bo/mbbo write skips an element it cannot read.
+    Skipped,
+    Staged,
+    /// C's `ok = false`: WRITE_ALARM.
+    Failed,
+}
+
+impl Stage {
+    fn put(ok: bool) -> Self {
+        if ok { Stage::Staged } else { Stage::Failed }
     }
 }
 
@@ -1448,9 +1468,11 @@ mod tests {
         static AO: [DevSup; 1] = [row("devAoEtherIP", 6)];
         static BO: [DevSup; 1] = [row("devBoEtherIP", 6)];
         static MBBO: [DevSup; 1] = [row("devMbboEtherIP", 5)];
+        static SO: [DevSup; 1] = [row("devSoEtherIP", 5)];
         register_device_menu("ao", &AO);
         register_device_menu("bo", &BO);
         register_device_menu("mbbo", &MBBO);
+        register_device_menu("stringout", &SO);
         define_plc(plc, "127.0.0.1", 0);
         let db = PvDatabase::new();
         db.install_device_support_resolver(Arc::new(device_factory));
@@ -1753,6 +1775,58 @@ mod tests {
         bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&chars);
         set_tag(tag, CipType::Struct, &bytes);
+    }
+
+    /// devEtherIP.c:2238-2257: so_write's `ok = false`, from a tag it cannot
+    /// read a string from or a put it refuses, raises WRITE_ALARM and leaves
+    /// the record undefined; a string already current and bo_write's skip of
+    /// an element it cannot read raise nothing.
+    #[test]
+    fn a_refused_write_raises_write_alarm_and_leaves_udf() {
+        use epics_rs::base::server::records::stringout::StringoutRecord;
+        let rt = current_thread();
+        let db = eip_db("sofail");
+        let load = |name: &str, record: Box<dyn Record>, tag: &str| {
+            load_output(&rt, &db, name, record, "sofail", tag)
+        };
+        let so = Box::<StringoutRecord>::default;
+        // get_CIP_STRING reads a plain CIP STRING; put_CIP_STRING takes only
+        // a Logix one.
+        set_tag(&load("SOPUT", so(), "PLAIN"), CipType::String, b"\0\0PLC");
+        set_words(&load("SOGET", so(), "WORDS"), &[0; 2]);
+        set_string_tag(&load("SOSAME", so(), "LOGIX"), "");
+        set_string_tag(
+            &load("BOSKIP", Box::<BoRecord>::default(), "TEXT[0]"),
+            "PLC",
+        );
+        // UDFS NO_ALARM keeps UDF_ALARM, raised first, from hiding the
+        // write's alarm.
+        let after_proc = |name: &str| {
+            for (f, v) in [
+                ("UDFS", EpicsValue::Short(0)),
+                ("UDF", EpicsValue::UChar(1)),
+                ("PROC", EpicsValue::Short(1)),
+            ] {
+                rt.block_on(db.put_record_field_from_ca_no_notify(name, f, v))
+                    .unwrap();
+            }
+            ["UDF", "STAT", "SEVR"].map(|f| db.get_pv(format!("{name}.{f}")).unwrap())
+        };
+        let refused = [
+            EpicsValue::UChar(1),
+            EpicsValue::Short(alarm_status::WRITE_ALARM as i16),
+            EpicsValue::Short(AlarmSeverity::Invalid as i16),
+        ];
+        assert_eq!(after_proc("SOPUT"), refused, "refused put");
+        assert_eq!(after_proc("SOGET"), refused, "unreadable tag");
+        for name in ["SOSAME", "BOSKIP"] {
+            let [_, stat, sevr] = after_proc(name);
+            assert_eq!(
+                [stat, sevr],
+                [EpicsValue::Short(0), EpicsValue::Short(0)],
+                "{name}"
+            );
+        }
     }
 
     /// check_so_callback and so_write compare the PLC's string cut to
