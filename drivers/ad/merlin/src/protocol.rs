@@ -5,6 +5,7 @@
 //! Ported from `merlinApp/src/mpxConnection.cpp`.
 
 use epics_rs::ad_core::attributes::NDAttrValue;
+use epics_rs::base::runtime::stdlib::strtod;
 use epics_rs::base::types::c_parse::{atoi, strtoul};
 
 use crate::types::*;
@@ -180,8 +181,9 @@ pub struct MqHeader {
     pub attrs: Vec<(String, NDAttrValue)>,
 }
 
-fn parse_f64(tok: &str) -> f64 {
-    tok.trim().parse().unwrap_or(0.0)
+/// C `atof`: the leading number, 0 when there is none.
+pub(crate) fn atof(tok: &str) -> f64 {
+    strtod(tok.as_bytes()).value
 }
 
 /// Parse the comma-delimited header of an `MQ1` (or `PR1`) data frame.
@@ -251,7 +253,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
         attrs.push(("Time stamp".into(), NDAttrValue::String((*t).to_string())));
     }
     if let Some(t) = f.get(10) {
-        attrs.push(("Shutter Time".into(), NDAttrValue::Float64(parse_f64(t))));
+        attrs.push(("Shutter Time".into(), NDAttrValue::Float64(atof(t))));
     }
     if let Some(t) = f.get(11) {
         attrs.push(("Counter".into(), NDAttrValue::Int8(atoi(t) as i8)));
@@ -266,7 +268,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
     let mut idx = 14;
     for i in 0..8 {
         if let Some(t) = f.get(idx) {
-            attrs.push((format!("Threshold {i}"), NDAttrValue::Float64(parse_f64(t))));
+            attrs.push((format!("Threshold {i}"), NDAttrValue::Float64(atof(t))));
             idx += 1;
         }
     }
@@ -617,6 +619,20 @@ pub(crate) mod tests {
         assert_eq!(get("Shutter Time"), Some(NDAttrValue::Float64(0.015)));
         assert_eq!(get("Threshold 0"), Some(NDAttrValue::Float64(1.5)));
         assert_eq!(get("Threshold 7"), Some(NDAttrValue::Float64(8.5)));
+    }
+
+    /// C reads the shutter time and thresholds with `atof`
+    /// (mpxConnection.cpp:141, :168): a unit tail keeps the number.
+    #[test]
+    fn parse_mq_header_reads_floats_with_atof() {
+        let text = String::from_utf8(quad_header(768, 1)).unwrap();
+        let text = text
+            .replacen("1.5E-2,", "1.5E-2s,", 1)
+            .replacen("1.5,", "1.5keV,", 1);
+        let h = parse_mq_header(text.as_bytes()).unwrap();
+        let get = |n: &str| h.attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+        assert_eq!(get("Shutter Time"), Some(NDAttrValue::Float64(0.015)));
+        assert_eq!(get("Threshold 0"), Some(NDAttrValue::Float64(1.5)));
     }
 
     #[test]
