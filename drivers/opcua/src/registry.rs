@@ -185,8 +185,22 @@ impl Registry {
     pub fn start(&self) {
         let mut inner = self.inner.lock();
         for (name, item) in &inner.item_records {
-            let item = item.lock();
+            let mut item = item.lock();
             if item.is_adopted() {
+                // An element that bound first could not be checked then; one
+                // that is refused now is left off the item, never served.
+                let monitored = item.is_monitored();
+                item.leaves.retain(|leaf| {
+                    let leaf = leaf.lock();
+                    let refusal = check_element_monitor(name, monitored, &leaf.link);
+                    if let Err(e) = &refusal {
+                        epics_rs::base::stderr_println!(
+                            "{} Error in add_record : {e}",
+                            leaf.record
+                        );
+                    }
+                    refusal.is_ok()
+                });
                 continue;
             }
             // C's `add_record` refuses each linking record (`devOpcua.cpp:107`).
@@ -325,7 +339,13 @@ impl Registry {
                 }
             }
             let item = self.item_of_record(item_record);
-            item.lock().leaves.push(leaf.clone());
+            {
+                let mut locked = item.lock();
+                if locked.is_adopted() {
+                    check_element_monitor(item_record, locked.is_monitored(), &link)?;
+                }
+                locked.leaves.push(leaf.clone());
+            }
             return Ok(Binding { item, leaf });
         }
 
@@ -364,6 +384,22 @@ impl Registry {
             .or_insert_with(|| Arc::new(Mutex::new(Item::pending())))
             .clone()
     }
+}
+
+/// `linkParser.cpp:378-380`: an element record asking for the monitor
+/// updates of an `opcuaItem` record whose item has none. The item record's
+/// own link addresses the node and is not an element.
+fn check_element_monitor(
+    item_record: &str,
+    item_monitored: bool,
+    link: &LinkInfo,
+) -> Result<(), String> {
+    if link.monitor && !link.linked_to_item && !item_monitored {
+        return Err(format!(
+            "monitor=y requires link to monitored opcuaItemRecord (but {item_record} is not)"
+        ));
+    }
+    Ok(())
 }
 
 fn node_id_of(link: &LinkInfo) -> Result<NodeId, String> {

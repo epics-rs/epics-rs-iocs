@@ -560,7 +560,7 @@ async fn an_element_record_may_bind_before_the_item_record_it_belongs_to() {
     registry.declare_record("ITEM", "opcuaItem");
 
     let mut element = LongoutRecord::new(0);
-    let mut element_device = bind(&registry, "EL", &mut element, "ITEM");
+    let mut element_device = bind(&registry, "EL", &mut element, "ITEM monitor=n");
 
     let mut item = OpcuaItemRecord::default();
     let mut item_device = bind(&registry, "ITEM", &mut item, "S ns=2;s=Struct monitor=n");
@@ -652,6 +652,49 @@ async fn an_element_record_bound_before_its_item_record_failed_is_left_unadopted
     );
 }
 
+#[test]
+fn an_element_record_asking_an_unmonitored_item_for_monitor_updates_is_refused() {
+    let registry = offline();
+    let mut item = OpcuaItemRecord::default();
+    bind(&registry, "ITEM", &mut item, "S ns=2;s=Struct monitor=n");
+
+    let err = refused(&registry, "ITEM monitor=y");
+    assert!(
+        err.contains("monitor=y requires link to monitored opcuaItemRecord (but ITEM is not)"),
+        "{err}"
+    );
+    let mut element = LongoutRecord::new(0);
+    bind(&registry, "EL2", &mut element, "ITEM monitor=n");
+}
+
+#[tokio::test]
+async fn an_element_record_bound_before_its_unmonitored_item_record_is_not_served() {
+    // The element's init ran first, so only `start` can refuse it.
+    let mock = Arc::new(Mock::default());
+    let registry = live(&mock);
+    registry.declare_record("ITEM", "opcuaItem");
+    let mut element = LongoutRecord::new(0);
+    let mut element_device = bind(&registry, "EL", &mut element, "ITEM monitor=y");
+    let mut item = OpcuaItemRecord::default();
+    bind(&registry, "ITEM", &mut item, "S ns=2;s=Struct monitor=n");
+    let leaf = leaf_of(&mut item);
+    registry.start();
+    settled(&mock, &leaf).await;
+
+    // The item is up, but the element is not on it.
+    element.put_field("VAL", EpicsValue::Long(5)).unwrap();
+    element.process().unwrap();
+    element_device.write(&mut element).unwrap();
+    assert_eq!(
+        element_device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 9,
+            sevr: 3,
+            msg: ""
+        })
+    );
+}
+
 // -------------------------------------------------------------------- the actions
 
 #[tokio::test]
@@ -680,7 +723,7 @@ async fn a_put_to_write_sends_what_the_elements_wrote() {
     // An element of the item: its value goes out inside the item's write, and it
     // asks for no write of its own.
     let mut element = LongoutRecord::new(0);
-    let mut element_device = bind(&registry, "EL", &mut element, "ITEM");
+    let mut element_device = bind(&registry, "EL", &mut element, "ITEM monitor=n");
     let leaf = leaf_of(&mut item);
     registry.start();
     settled(&mock, &leaf).await;
@@ -714,7 +757,7 @@ async fn defactn_write_makes_a_bare_process_a_write() {
     item.defactn = 1;
     let mut item_device = bind(&registry, "ITEM", &mut item, "S ns=2;s=Struct monitor=n");
     let mut element = LongoutRecord::new(0);
-    let mut element_device = bind(&registry, "EL", &mut element, "ITEM");
+    let mut element_device = bind(&registry, "EL", &mut element, "ITEM monitor=n");
     let leaf = leaf_of(&mut item);
     registry.start();
     settled(&mock, &leaf).await;
@@ -739,7 +782,7 @@ async fn woc_immediate_sends_what_the_elements_have_already_written() {
     let mut item = OpcuaItemRecord::default();
     let mut item_device = bind(&registry, "ITEM", &mut item, "S ns=2;s=Struct monitor=n");
     let mut element = LongoutRecord::new(0);
-    let mut element_device = bind(&registry, "EL", &mut element, "ITEM");
+    let mut element_device = bind(&registry, "EL", &mut element, "ITEM monitor=n");
     let leaf = leaf_of(&mut item);
     registry.start();
     settled(&mock, &leaf).await;
@@ -767,7 +810,7 @@ async fn woc_immediate_with_nothing_dirty_sends_nothing() {
     let mut item = OpcuaItemRecord::default();
     let mut item_device = bind(&registry, "ITEM", &mut item, "S ns=2;s=Struct monitor=n");
     let mut element = LongoutRecord::new(0);
-    bind(&registry, "EL", &mut element, "ITEM");
+    bind(&registry, "EL", &mut element, "ITEM monitor=n");
     let leaf = leaf_of(&mut item);
     registry.start();
     settled(&mock, &leaf).await;
