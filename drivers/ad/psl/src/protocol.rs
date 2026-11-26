@@ -9,9 +9,11 @@
 //! [`quoted_field`] and [`numeric_field`], but bounded: a reply shorter than
 //! the skip no longer reads past its end.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::ndarray::NDDataType;
 
@@ -73,13 +75,17 @@ pub fn parse_version(reply: &str) -> Result<f64, ProtocolError> {
     let start = reply
         .find(VERSION_PREFIX)
         .ok_or_else(|| ProtocolError::BadVersion(reply.to_string()))?;
-    let tail = &reply[start + VERSION_PREFIX.len()..];
-    let end = tail
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .unwrap_or(tail.len());
-    let version: f64 = tail[..end]
-        .parse()
-        .map_err(|_| ProtocolError::BadVersion(reply.to_string()))?;
+    // C's `serverVersion_` is a `float`.
+    let version = Cell::new(0f32);
+    if sscanf(
+        &reply.as_bytes()[start + VERSION_PREFIX.len()..],
+        "%f",
+        &[&version],
+    ) != 1
+    {
+        return Err(ProtocolError::BadVersion(reply.to_string()));
+    }
+    let version = f64::from(version.get());
     if version < MIN_SERVER_VERSION {
         return Err(ProtocolError::OldVersion(reply.to_string()));
     }
@@ -178,31 +184,21 @@ pub fn parse_ints(reply: &str) -> Vec<i32> {
     out
 }
 
-/// First floating-point number in a reply.
-pub fn parse_first_f64(reply: &str) -> Option<f64> {
-    let bytes: Vec<char> = reply.chars().collect();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() || bytes[i] == '-' || bytes[i] == '+' {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == '.') {
-                i += 1;
-            }
-            let s: String = bytes[start..i].iter().collect();
-            if let Ok(v) = s.parse::<f64>() {
-                return Some(v);
-            }
-        } else {
-            i += 1;
-        }
-    }
-    None
+/// C `sscanf(reply, format, &value)` for a `format` with one `%lf`.
+fn scan_f64(reply: &str, format: &str) -> Option<f64> {
+    let value = Cell::new(0f64);
+    (sscanf(reply.as_bytes(), format, &[&value]) == 1).then(|| value.get())
 }
 
-/// The `GetExposure` reply, in seconds (C scales `Millisec` and `Microsec`).
+/// The `GetChipGain` reply (C `sscanf(pStart, "%lf", &gain)`).
+pub fn parse_gain(reply: &str) -> Option<f64> {
+    scan_f64(reply, "%lf")
+}
+
+/// The `GetExposure` reply, in seconds (C `sscanf(pStart, "(%lf", &exposure)`,
+/// then C scales `Millisec` and `Microsec`).
 pub fn parse_exposure(reply: &str) -> Option<f64> {
-    let value = parse_first_f64(reply)?;
+    let value = scan_f64(reply, "(%lf")?;
     if reply.contains("Millisec") {
         Some(value / 1e3)
     } else if reply.contains("Microsec") {
@@ -421,8 +417,11 @@ mod tests {
 
     #[test]
     fn parse_version_accepts_a_supported_server() {
-        assert_eq!(parse_version("PSLViewer-4.3").unwrap(), 4.3);
-        assert_eq!(parse_version("PSLViewer-5.10 ready").unwrap(), 5.10);
+        assert_eq!(parse_version("PSLViewer-4.3").unwrap(), f64::from(4.3f32));
+        assert_eq!(
+            parse_version("PSLViewer-5.10 ready").unwrap(),
+            f64::from(5.1f32)
+        );
     }
 
     #[test]
@@ -530,6 +529,22 @@ mod tests {
         assert_eq!(parse_exposure("(5000000, 'Microsec')").unwrap(), 5.0);
         assert_eq!(parse_exposure("(250, 'Millisec')").unwrap(), 0.25);
         assert_eq!(parse_exposure("(2, 'Sec')").unwrap(), 2.0);
+    }
+
+    /// glibc's `%f` cannot push back the `x` of `0x`, an exponent marker
+    /// with no digit after it, or the `i` of `infi`: the scan fails there.
+    #[test]
+    fn a_float_cut_short_fails_the_scan() {
+        assert_eq!(parse_gain("0x"), None);
+        assert_eq!(parse_gain("1.0E"), None);
+        assert_eq!(parse_gain("infi"), None);
+        assert_eq!(parse_gain("inf"), Some(f64::INFINITY));
+        assert_eq!(parse_gain("0x1p3"), Some(8.0));
+        assert_eq!(parse_exposure("(0x, 'Sec')"), None);
+        assert!(matches!(
+            parse_version("PSLViewer-5.0E"),
+            Err(ProtocolError::BadVersion(_))
+        ));
     }
 
     #[test]

@@ -4,9 +4,10 @@
 //! Both are pure functions of their text, so the whole conversation can be
 //! tested without a server.
 
-use std::str::FromStr;
+use std::cell::Cell;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::{ScanNum, sscanf};
 
 use crate::types::FrameType;
 
@@ -74,14 +75,12 @@ pub struct StatusReport {
     pub shutter_open: Option<i32>,
 }
 
-/// The number that follows `key` (C's `strstr` + `sscanf` pairs).
-fn value_after<T: FromStr>(message: &str, key: &str) -> Option<T> {
-    let at = message.find(key)? + key.len();
-    let token: String = message[at..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || "+-.eE".contains(*c))
-        .collect();
-    token.parse().ok()
+/// C's `sscanf(strstr(message, key), format, &value)`, `key` being the text
+/// of `format` ahead of its one conversion.
+fn value_after<T: ScanNum + Default>(message: &str, format: &str) -> Option<T> {
+    let at = message.find(&format[..format.find('%')?])?;
+    let value = Cell::new(T::default());
+    (sscanf(&message.as_bytes()[at..], format, &[&value]) == 1).then(|| value.get())
 }
 
 /// Read one status message (C `statusTask`'s `strstr` chain).
@@ -91,12 +90,12 @@ pub fn parse_status(message: &str) -> StatusReport {
     if message.contains("[INSTRUMENTQUEUE /PROCESSING=0]") {
         report.processing_done = true;
     } else if message.contains("[CCDTEMPERATURE") {
-        report.temperature = value_after(message, "DEGREESC=");
+        report.temperature = value_after(message, "DEGREESC=%lf");
     } else if message.contains("[DETECTORSTATUS") {
-        report.frame_size = value_after(message, "FRAMESIZE=");
-        report.temperature = value_after(message, "CCDTEMP=");
+        report.frame_size = value_after(message, "FRAMESIZE=%d");
+        report.temperature = value_after(message, "CCDTEMP=%lf");
     } else if message.contains("[SHUTTERSTATUS") {
-        report.shutter_open = value_after(message, "STATUS=");
+        report.shutter_open = value_after(message, "STATUS=%d");
     }
 
     report
@@ -166,11 +165,38 @@ mod tests {
         assert_eq!(report.temperature, Some(-40.25));
     }
 
+    /// glibc's `%lf` cannot push back the `x` of `0x`, an exponent marker
+    /// with no digit after it, or the `i` of `infi`: the scan fails there.
+    #[test]
+    fn a_float_cut_short_fails_the_scan() {
+        let degrees =
+            |v: &str| parse_status(&format!("[CCDTEMPERATURE /DEGREESC={v}]")).temperature;
+        assert_eq!(degrees("0x"), None);
+        assert_eq!(degrees("1.0E"), None);
+        assert_eq!(degrees("infi"), None);
+        assert_eq!(degrees("inf"), Some(f64::INFINITY));
+        assert_eq!(degrees("0x1p3"), Some(8.0));
+    }
+
     #[test]
     fn a_detector_status_message_carries_the_frame_size_and_the_temperature() {
         let report = parse_status("[DETECTORSTATUS /FRAMESIZE=1024 /CCDTEMP=-39.5]");
         assert_eq!(report.frame_size, Some(1024));
         assert_eq!(report.temperature, Some(-39.5));
+    }
+
+    /// glibc's `%d` reads the integer ahead of a fraction and stops there.
+    #[test]
+    fn a_frame_size_scans_as_c_percent_d() {
+        let frame = |v: &str| {
+            parse_status(&format!("[DETECTORSTATUS /FRAMESIZE={v} /CCDTEMP=-39.5]")).frame_size
+        };
+        assert_eq!(frame("1024.0"), Some(1024));
+        assert_eq!(frame("big"), None);
+        assert_eq!(
+            parse_status("[DETECTORSTATUS /CCDTEMP=-39.5]").frame_size,
+            None
+        );
     }
 
     #[test]

@@ -312,7 +312,7 @@ impl PslDetector {
 
         if self.supports("ChipGain")
             && let Some(reply) = self.checked("GetChipGain")?
-            && let Some(gain) = protocol::parse_first_f64(protocol::numeric_field(&reply, multi))
+            && let Some(gain) = protocol::parse_gain(protocol::numeric_field(&reply, multi))
         {
             self.ad
                 .port_base

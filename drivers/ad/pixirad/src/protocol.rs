@@ -5,8 +5,10 @@
 //! Everything here is a pure function of bytes in and bytes out, so it is
 //! tested without a detector.
 
+use std::cell::Cell;
+
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::base::runtime::stdlib::{c_isspace, strtod};
+use epics_libcom_rs::runtime::scanf::sscanf;
 
 use crate::types::{
     CoolingStatus, DEW_POINT_ERROR, DEW_POINT_WARNING, FrameType, HVMode, SyncOutFunction,
@@ -186,31 +188,9 @@ pub fn parse_additional_info(reply: &[u8]) -> Option<&[u8]> {
 /// the datagram, into a `float`.
 pub fn status_value(message: &[u8], key: &str) -> Option<f64> {
     let message = c_string(message);
-    let rest = &message[find(message, key.as_bytes())? + key.len()..];
-    let s = &rest[rest.iter().take_while(|&&b| c_isspace(b as char)).count()..];
-    let parsed = strtod(s);
-    if parsed.len == 0 || scanf_cannot_back_out(s) {
-        return None;
-    }
-    // `strtof` rounds once; a decimal through `f64` could round twice.
-    let value = std::str::from_utf8(&s[..parsed.len])
-        .ok()
-        .and_then(|t| t.parse::<f32>().ok())
-        .unwrap_or(parsed.value as f32);
-    Some(f64::from(value))
-}
-
-/// Where glibc's `%f` refuses what `strtof` reads: having taken an `i` after
-/// `inf` or the `x` of `0x`, it cannot push them back, so the input must go on
-/// to `infinity`, or to a hex digit or point.
-fn scanf_cannot_back_out(s: &[u8]) -> bool {
-    let s = &s[usize::from(matches!(s.first(), Some(b'+' | b'-')))..];
-    let starts = |w: &[u8]| s.len() >= w.len() && s[..w.len()].eq_ignore_ascii_case(w);
-    (starts(b"infi") && !starts(b"infinity"))
-        || (starts(b"0x")
-            && !s
-                .get(2)
-                .is_some_and(|&b| b.is_ascii_hexdigit() || b == b'.'))
+    let at = find(message, key.as_bytes())?;
+    let value = Cell::new(0f32);
+    (sscanf(&message[at..], format!("{key} %f"), &[&value]) == 1).then(|| f64::from(value.get()))
 }
 
 /// The dew point of the box (Magnus formula, C `statusTask`), with C's
@@ -371,15 +351,15 @@ mod tests {
         assert_eq!(status_value(msg, "READ_TCOLD"), None);
         let msg = b"READ_THOT 2.5e1x READ_HV 3e READ_BOX_HUM 24.7 READ_TCOLD -.5, READ_BOX_TEMP .";
         assert_eq!(status_value(msg, "READ_THOT"), Some(25.0));
-        assert_eq!(status_value(msg, "READ_HV"), Some(3.0));
+        assert_eq!(status_value(msg, "READ_HV"), None);
         assert_eq!(status_value(msg, "READ_BOX_HUM"), Some(f64::from(24.7f32)));
         assert_eq!(status_value(msg, "READ_TCOLD"), Some(-0.5));
         assert_eq!(status_value(msg, "READ_BOX_TEMP"), None);
     }
 
-    /// glibc's `%f`, probed: `strtof` after any C space, hex included, but it
-    /// cannot back out of `inf` going on with an `i` short of `infinity`, nor
-    /// of a `0x` with no hex digit or point after it.
+    /// glibc's `%f`: `strtof` after any C space, hex included, but it cannot
+    /// back out of `inf` going on with an `i` short of `infinity`, of a `0x`
+    /// or `0x.` with no hex digit after it, nor of an empty exponent.
     #[test]
     fn status_values_scan_as_glibc_percent_f() {
         let value = |text: &str| status_value(format!("K{text}").as_bytes(), "K");
@@ -395,10 +375,22 @@ mod tests {
         assert_eq!(value(" -infi"), None);
         assert_eq!(value(" 0x"), None);
         assert_eq!(value(" 0xg"), None);
-        assert_eq!(value(" 0x.g"), Some(0.0));
+        assert_eq!(value(" 0x.g"), None);
         assert_eq!(value(" 00x1"), Some(0.0));
-        assert_eq!(value(" 1e+"), Some(1.0));
+        assert_eq!(value(" 1e+"), None);
         assert_eq!(value(" in"), None);
+    }
+
+    /// glibc's `%f` cannot push back the `x` of `0x`, an exponent marker
+    /// with no digit after it, or the `i` of `infi`: the scan fails there.
+    #[test]
+    fn a_float_cut_short_fails_the_scan() {
+        let value = |text: &str| status_value(format!("K {text}").as_bytes(), "K");
+        assert_eq!(value("0x"), None);
+        assert_eq!(value("1.0E"), None);
+        assert_eq!(value("infi"), None);
+        assert_eq!(value("inf"), Some(f64::INFINITY));
+        assert_eq!(value("0x1p3"), Some(8.0));
     }
 
     #[test]
