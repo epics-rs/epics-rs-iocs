@@ -409,18 +409,19 @@ impl AsynMotor for AgapAxis {
                     PidGainKind::Proportional => ("KP", KP_MAX),
                     _ => ("KI", KI_MAX),
                 };
-                // C ignores getClosedLoop's status (AGAP_CONEX.cpp:343/359).
+                // C ignores getClosedLoop's and setClosedLoop's statuses and
+                // returns the gain write's (AGAP_CONEX.cpp:337-362).
                 let was_closed = ctrl.read_closed_loop().0.unwrap_or(false);
-                ctrl.write(&format!("{id}MM0"))?;
-                ctrl.write(&format!(
+                let _ = ctrl.write(&format!("{id}MM0"));
+                let status = ctrl.write(&format!(
                     "{id}{letter}{}{:.6}",
                     self.axis_name,
                     CFloat(gain * max)
-                ))?;
+                ));
                 if was_closed {
-                    ctrl.write(&format!("{id}MM1"))?;
+                    let _ = ctrl.write(&format!("{id}MM1"));
                 }
-                Ok(())
+                status
             }
             // C setDGain: low-pass filter frequency LF, controller-wide (no
             // axis letter), with no closed-loop save/restore.
@@ -509,6 +510,34 @@ mod tests {
             .unwrap();
         let sent = line.sent();
         assert_eq!(sent.last().map(String::as_str), Some("1MM1"), "{sent:?}");
+    }
+
+    /// AGAP_CONEX.cpp:337-347: a refused MM0 or gain write still restores
+    /// the closed loop `MM?` reported, and the gain's status is returned.
+    #[test]
+    fn a_refused_gain_write_still_restores_the_closed_loop() {
+        use motor_common::testing::LineRig;
+        let (line, io) = LineRig::failing(
+            "agap_gain_refused",
+            |last| {
+                match last {
+                    "1VE" => "1VE CONEX-AGAP 1.0",
+                    "1MM?" => "1MM33",
+                    _ => "",
+                }
+                .to_string()
+            },
+            |cmd| cmd == "1MM0" || cmd.starts_with("1KP"),
+        );
+        let trace = MotorTrace::new("agap_gain_refused", 0);
+        let ctrl = Arc::new(Mutex::new(AgapController::new(io, 1, trace).unwrap()));
+        let mut axis = AgapAxis::new(ctrl, 1);
+        line.sent();
+        assert!(
+            axis.set_pid_gain(&AsynUser::default(), PidGainKind::Proportional, 0.5)
+                .is_err()
+        );
+        assert_eq!(line.sent(), ["1MM?", "1MM0", "1KPV15.500000", "1MM1"]);
     }
 
     /// AGAP_CONEX.cpp:398-407: a refused TS skips after TP's position is
