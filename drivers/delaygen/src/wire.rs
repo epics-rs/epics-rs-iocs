@@ -129,54 +129,18 @@ pub fn read_only(link: &OctetLink) -> AsynResult<String> {
 
 pub use epics_rs::base::types::c_parse::atoi;
 
-/// Extract the leading numeric token (sign, digits, optional `.digits`,
-/// optional exponent) that C `atof`/`sscanf("%e", ...)` would consume,
-/// shared by [`atof`] and [`atof_f32`] since they differ only in which
-/// float width parses that token.
-fn leading_float_token(s: &str) -> &str {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        let mut j = i + 1;
-        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
-            j += 1;
-        }
-        let exp_start = j;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j > exp_start {
-            i = j;
-        }
-    }
-    t.get(..i).unwrap_or("")
-}
-
-/// Mimic C `atof`: parse the leading numeric prefix as `f64`, `0.0` on junk.
+/// C `atof`: `strtod`'s value, `0.0` when nothing converts.
 pub fn atof(s: &str) -> f64 {
-    leading_float_token(s).parse::<f64>().unwrap_or(0.0)
+    epics_libcom_rs::runtime::stdlib::strtod(s.as_bytes()).value
 }
 
-/// Mimic C `sscanf(s, "%e", &float_var)`: parse the leading numeric prefix
-/// directly into a 32-bit `float`, `0.0` on junk. Distinct from [`atof`] —
-/// callers that store the result in a C `float` (single rounding,
-/// ASCII-to-`f32`) must use this rather than `atof(s) as f32` (which would
-/// round twice: ASCII-to-`f64`, then `f64`-to-`f32`).
+/// C `sscanf(s, "%e", &readback)` into a `float`, rounded once rather than
+/// through `atof(s) as f32`. `0.0` where nothing converts and C reads its
+/// uninitialised `readback`.
 pub fn atof_f32(s: &str) -> f32 {
-    leading_float_token(s).parse::<f32>().unwrap_or(0.0)
+    let v = std::cell::Cell::new(0f32);
+    epics_libcom_rs::runtime::scanf::sscanf(s, "%e", &[&v]);
+    v.get()
 }
 
 #[cfg(test)]
@@ -216,5 +180,19 @@ mod tests {
     fn atof_f32_parses_scientific_notation_and_ignores_junk() {
         assert!((atof_f32("5.000000E-09") - 5E-9_f32).abs() < 1e-15);
         assert_eq!(atof_f32("junk"), 0.0);
+    }
+
+    #[test]
+    fn atof_reads_what_strtod_reads() {
+        assert_eq!(atof("0x10"), 16.0);
+        assert_eq!(atof(" inf"), f64::INFINITY);
+        assert_eq!(atof("\u{a0}5"), 0.0);
+    }
+
+    #[test]
+    fn atof_f32_reads_what_sscanf_e_reads() {
+        assert_eq!(atof_f32("0x1p3"), 8.0);
+        assert_eq!(atof_f32("-inf"), f32::NEG_INFINITY);
+        assert!(atof_f32("nan").is_nan());
     }
 }
