@@ -48,7 +48,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
-use motor_common::util::nint;
+use motor_common::util::{leading_hex, nint};
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -67,15 +67,13 @@ fn micromo_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Parse a hex value from a reply of the form `"0001 000001F4"`: the field
-/// starts at byte offset 5 and is up to `nchars` long, parsed as `%x` (C
-/// `parseReply`). Values wrap through `u32` so negative positions decode
-/// correctly.
+/// C `parseReply`: `sscanf("%x")` of the at most `nchars` bytes `strncat`
+/// copies from `reply + 5`, as `i32` so negative positions decode. `None`
+/// where C leaves `val` unset, reads past a reply short of byte 5, or wraps
+/// a negated field.
 fn parse_hex_reply(reply: &str, nchars: usize) -> Option<i32> {
-    let tail = reply.get(5..)?;
-    let end = nchars.min(tail.len());
-    let field = tail[..end].trim();
-    u32::from_str_radix(field, 16).ok().map(|v| v as i32)
+    let field = reply.as_bytes().get(5..)?;
+    leading_hex(&String::from_utf8_lossy(&field[..field.len().min(nchars)])).map(|v| v as i32)
 }
 
 /// Max-current command value (C `NINT(maxCurrent * 0.865909 + 2103.431)`).
@@ -651,6 +649,18 @@ mod tests {
         assert_eq!(parse_hex_reply("0001 FFFFFFF4", 8), Some(-12));
         // Too short after the offset.
         assert_eq!(parse_hex_reply("0001", 4), None);
+    }
+
+    /// MVP2001Driver.cpp:147-148 `sscanf`s the `strncat`ed bytes with `%x`.
+    #[test]
+    fn parse_hex_reply_scans_as_c_sscanf() {
+        assert_eq!(parse_hex_reply("0001 1F x", 4), Some(0x1f));
+        assert_eq!(parse_hex_reply("0001 0x1F", 4), Some(0x1f));
+        assert_eq!(parse_hex_reply("0001 \u{a0}5", 4), None);
+        // A lossy-decoded bad byte straddles the field's end.
+        assert_eq!(parse_hex_reply("0001 800\u{fffd}", 4), Some(0x800));
+        // C wraps the negated `unsigned long` into `val`.
+        assert_eq!(parse_hex_reply("0001 -1", 8), None);
     }
 
     #[test]
