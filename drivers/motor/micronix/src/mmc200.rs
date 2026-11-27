@@ -25,6 +25,7 @@
 //!   as in C only its poll is disabled (returns an inert, done status). C does
 //!   not guard its motion methods against `999` and neither does this port.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
@@ -34,6 +35,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use motor_common::util::{atof, atoi};
 use motor_common::{AxisReport, ControllerParams, ControllerReport};
 
@@ -139,14 +141,13 @@ fn resolution(model: i32, closed_loop: i32, rez: i32, micro_steps: i32, encoder:
     }
 }
 
-/// Parse a `POS?` reply `#<theoretical>,<encoder>` into `(position, encoder)`
-/// in controller units (C `sscanf("#%lf,%lf")`). A missing encoder field reads 0.
+/// C `sscanf(reply, "#%lf,%lf")` of a `POS?` reply `#<theoretical>,<encoder>`
+/// into `(position, encoder)` in controller units. A field it does not
+/// convert reads 0.
 fn parse_position(reply: &str) -> (f64, f64) {
-    let body = reply.get(1..).unwrap_or("");
-    match body.split_once(',') {
-        Some((pos, enc)) => (atof(pos), atof(enc)),
-        None => (atof(body), 0.0),
-    }
+    let [pos, enc] = [0.0; 2].map(Cell::new);
+    sscanf(reply, "#%lf,%lf", &[&pos, &enc]);
+    (pos.get(), enc.get())
 }
 
 /// The controller's poll periods, in seconds, and `ignoreLimits_`, for its
@@ -935,6 +936,16 @@ mod tests {
         assert_eq!(parse_position("#-0.250000,-0.250000"), (-0.25, -0.25));
         // Missing encoder field: encoder reads 0.
         assert_eq!(parse_position("#3.000000"), (3.0, 0.0));
+    }
+
+    /// MMC200Driver.cpp:458 scans with `#%lf,%lf`: a field after the scan
+    /// stops reads 0, as one it never reaches.
+    #[test]
+    fn parse_position_scans_as_c_sscanf() {
+        assert_eq!(parse_position("#1.5x,2.0"), (1.5, 0.0));
+        assert_eq!(parse_position("#1.5 ,2.0"), (1.5, 0.0));
+        assert_eq!(parse_position("1.5,2.0"), (0.0, 0.0));
+        assert_eq!(parse_position("#1e,2"), (0.0, 0.0));
     }
 
     #[test]
