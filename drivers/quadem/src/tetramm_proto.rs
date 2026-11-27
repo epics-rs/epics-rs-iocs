@@ -4,7 +4,11 @@
 //! command strings in, byte slices out, no I/O — so every frame layout and
 //! scaling rule is covered by the tests at the bottom of this file.
 
+use std::cell::Cell;
+
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
+use epics_libcom_rs::runtime::stdlib::{strtod, strtoull_errno};
 
 use crate::drv_quad_em::{
     QE_MAX_INPUTS, QeAcquireMode, QeReadFormat, QeTriggerMode, QeTriggerPolarity,
@@ -128,8 +132,9 @@ pub enum AsciiRecord {
 }
 
 /// Parse one ASCII line. C++ tests `SEQNR` before `EOTRG` before falling
-/// through to `strtod`; a short line yields zeros for the missing channels
-/// because `strtod` returns 0.0 when it cannot convert.
+/// through to `strtod(inPtr, &inPtr)` per channel; a field `strtod` cannot
+/// convert reads 0.0 and leaves the pointer on it, so every later channel
+/// reads 0.0 too.
 pub fn parse_ascii_line(line: &str, num_channels: usize) -> AsciiRecord {
     if line.contains("SEQNR") {
         return AsciiRecord::TriggerStart;
@@ -138,12 +143,11 @@ pub fn parse_ascii_line(line: &str, num_channels: usize) -> AsciiRecord {
         return AsciiRecord::TriggerEnd;
     }
     let mut currents = [0.0f64; QE_MAX_INPUTS];
-    let mut fields = line.split_whitespace();
+    let mut rest = line.as_bytes();
     for slot in currents.iter_mut().take(num_channels.min(QE_MAX_INPUTS)) {
-        *slot = fields
-            .next()
-            .and_then(|f| f.parse::<f64>().ok())
-            .unwrap_or(0.0);
+        let read = strtod(rest);
+        *slot = read.value;
+        rest = &rest[read.len..];
     }
     AsciiRecord::Data(currents)
 }
@@ -273,51 +277,68 @@ pub fn cmd_bias_interlock(on: bool) -> &'static str {
 // Status responses
 // ===========================================================================
 
-/// `sscanf(inString_, "CHN:%d", …)` and friends: match a literal prefix then
-/// parse the tail.
-fn after_prefix<'a>(resp: &'a str, prefix: &str) -> Option<&'a str> {
-    resp.strip_prefix(prefix).map(str::trim)
+/// `sscanf(inString_, format, &n) == 1` for C's `%d`, read as `%lld` so that
+/// a value C would wrap into `int` is `None`.
+fn scan_int(resp: &str, format: &str) -> Option<i32> {
+    let value = Cell::new(0i64);
+    (sscanf(resp, format, &[&value]) == 1)
+        .then(|| i32::try_from(value.get()).ok())
+        .flatten()
 }
 
+/// `sscanf(inString_, format, &x) == 1` for C's `%lf`.
+fn scan_double(resp: &str, format: &str) -> Option<f64> {
+    let value = Cell::new(0.0f64);
+    (sscanf(resp, format, &[&value]) == 1).then(|| value.get())
+}
+
+/// `sscanf(inString_, "CHN:%d", …)`.
 pub fn parse_chn(resp: &str) -> Option<i32> {
-    after_prefix(resp, "CHN:")?.parse().ok()
+    scan_int(resp, "CHN:%lld")
 }
 
-/// `sscanf(inString_, "RNG:CH%*1c:%d", …)` — the channel digit is skipped.
+/// `sscanf(inString_, "RNG:CH%*1c:%d", …)` — the channel byte is skipped.
 pub fn parse_range(resp: &str) -> Option<i32> {
-    let rest = after_prefix(resp, "RNG:CH")?;
-    let mut chars = rest.chars();
-    chars.next()?; // %*1c
-    chars.as_str().strip_prefix(':')?.trim().parse().ok()
+    scan_int(resp, "RNG:CH%*1c:%lld")
 }
 
+/// `sscanf(inString_, "NRSAMP:%d", …)`.
 pub fn parse_nrsamp(resp: &str) -> Option<i32> {
-    after_prefix(resp, "NRSAMP:")?.parse().ok()
+    scan_int(resp, "NRSAMP:%lld")
 }
 
-/// `HVS:?` answers either `HVS:OFF` or `HVS:<volts>`.
+/// `HVS:?` answers either `HVS:OFF` or `HVS:<volts>`, read with
+/// `sscanf(inString_, "HVS:%lf", …)`.
 pub fn parse_hvs(resp: &str) -> Option<Option<f64>> {
     if resp == "HVS:OFF" {
         return Some(None);
     }
-    Some(Some(after_prefix(resp, "HVS:")?.parse().ok()?))
+    scan_double(resp, "HVS:%lf").map(Some)
 }
 
 pub fn parse_hvv(resp: &str) -> Option<f64> {
-    after_prefix(resp, "HVV:")?.parse().ok()
+    scan_double(resp, "HVV:%lf")
 }
 
 pub fn parse_hvi(resp: &str) -> Option<f64> {
-    after_prefix(resp, "HVI:")?.parse().ok()
+    scan_double(resp, "HVI:%lf")
 }
 
 pub fn parse_temp(resp: &str) -> Option<f64> {
-    after_prefix(resp, "TEMP:")?.parse().ok()
+    scan_double(resp, "TEMP:%lf")
 }
 
-/// `sscanf(inString_, "STATUS:%lx", …)`.
+/// `sscanf(inString_, "STATUS:%lx", …)`, except that a value C negates
+/// modulo 2^64 or saturates is `None`: `%lx` cannot report the `ERANGE`, so
+/// `strtoull` re-reads the number for it.
 pub fn parse_status(resp: &str) -> Option<u64> {
-    u64::from_str_radix(after_prefix(resp, "STATUS:")?, 16).ok()
+    let (start, value) = (Cell::new(0i32), Cell::new(0u64));
+    if sscanf(resp, "STATUS: %n%llx", &[&start, &value]) != 1 {
+        return None;
+    }
+    let number = resp.as_bytes().get(usize::try_from(start.get()).ok()?..)?;
+    let negated = number.first() == Some(&b'-') && value.get() != 0;
+    (!negated && strtoull_errno(number, 16).is_some()).then(|| value.get())
 }
 
 /// C++ `setIntegerParam(P_InterlockStatus, (unitStatus>>8)&0x80)` — the general
@@ -571,5 +592,116 @@ mod tests {
     fn version_strips_four_char_prefix() {
         assert_eq!(parse_version("VER:2.4.0"), "2.4.0");
         assert_eq!(parse_version("VER"), "");
+    }
+
+    /// C++ `strtod(inPtr, &inPtr)` per channel (drvTetrAMM.cpp:391): a field
+    /// it cannot convert parks the pointer, so every later channel reads 0.
+    #[test]
+    fn ascii_line_is_read_as_c_strtod() {
+        let inf = f64::INFINITY;
+        let cases = [
+            ("1.0 abc 2.0", 4, [1.0, 0.0, 0.0, 0.0]),
+            ("1.0,2.0", 2, [1.0, 0.0, 0.0, 0.0]),
+            ("1e-9A 2e-9", 2, [1e-9, 0.0, 0.0, 0.0]),
+            ("0x10 1", 2, [16.0, 1.0, 0.0, 0.0]),
+            ("1.0\x0b2.0", 2, [1.0, 2.0, 0.0, 0.0]),
+            ("1.0\u{a0}2.0", 2, [1.0, 0.0, 0.0, 0.0]),
+            ("inf -1e999 3", 3, [inf, -inf, 3.0, 0.0]),
+            ("  2.5\t-3.5\n", 2, [2.5, -3.5, 0.0, 0.0]),
+            ("1.0 2.0 3.0 4.0 5.0", 4, [1.0, 2.0, 3.0, 4.0]),
+            ("", 2, [0.0; 4]),
+        ];
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter(|&(line, n, want)| parse_ascii_line(line, n) != AsciiRecord::Data(want))
+            .map(|(line, n, want)| (line, parse_ascii_line(line, n), want))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// C++ `sscanf` with the formats of drvTetrAMM.cpp:794-843 as glibc reads
+    /// them, except that a `%d` C wraps into `int` and a `%lx` it negates or
+    /// saturates are `None`.
+    #[test]
+    fn status_replies_are_scanned_as_c_sscanf() {
+        type Parse<T> = fn(&str) -> Option<T>;
+        let ints: [(Parse<i32>, &str, Option<i32>); 21] = [
+            (parse_chn, "CHN:4", Some(4)),
+            (parse_chn, "CHN:4x", Some(4)),
+            (parse_chn, "CHN:0x10", Some(0)),
+            (parse_chn, "CHN:+4", Some(4)),
+            (parse_chn, "CHN:-4", Some(-4)),
+            (parse_chn, "CHN: 4", Some(4)),
+            (parse_chn, "CHN:\u{a0}4", None),
+            (parse_chn, "CHN:junk", None),
+            (parse_chn, "CHN:", None),
+            (parse_chn, "CHN:3000000000", None),
+            (parse_chn, "CHN:-3000000000", None),
+            (parse_range, "RNG:CH1:2", Some(2)),
+            (parse_range, "RNG:CH :3", Some(3)),
+            (parse_range, "RNG:CH1: 2", Some(2)),
+            (parse_range, "RNG:CH1:2x", Some(2)),
+            (parse_range, "RNG:CH12:3", None),
+            (parse_range, "RNG:CH\u{e9}:3", None),
+            (parse_range, "RNG:CH1:", None),
+            (parse_nrsamp, "NRSAMP:1000\r", Some(1000)),
+            (parse_nrsamp, "NRSAMP:1e3", Some(1)),
+            (parse_nrsamp, "NRSAMP:99999999999", None),
+        ];
+        let doubles: [(Parse<f64>, &str, Option<f64>); 8] = [
+            (parse_hvv, "HVV:99.5V", Some(99.5)),
+            (parse_hvv, "HVV:0x1p-1", Some(0.5)),
+            (parse_hvv, "HVV:.5", Some(0.5)),
+            (parse_hvi, "HVI:-2e-3 A", Some(-0.002)),
+            (parse_hvi, "HVI:", None),
+            (parse_temp, "TEMP:36.75C", Some(36.75)),
+            (parse_temp, "TEMP:+36.", Some(36.0)),
+            (parse_temp, "TEMP:\u{a0}36", None),
+        ];
+        let hvs = [
+            ("HVS:OFF", Some(None)),
+            ("HVS:1e2V", Some(Some(100.0))),
+            ("HVS:inf", Some(Some(f64::INFINITY))),
+            ("HVS:ON", None),
+            ("HVS: OFF", None),
+        ];
+        let status = [
+            ("STATUS:8000", Some(0x8000)),
+            ("STATUS:0x8000", Some(0x8000)),
+            ("STATUS:80zz", Some(0x80)),
+            ("STATUS: 8000", Some(0x8000)),
+            ("STATUS:+1", Some(1)),
+            ("STATUS:-0", Some(0)),
+            // A bare `0x` fails from glibc 2.42 on (BZ #12701).
+            ("STATUS:0xg", None),
+            ("STATUS:FFFFFFFFFFFFFFFF", Some(u64::MAX)),
+            ("STATUS:-1", None),
+            ("STATUS:\x0b-8000", None),
+            ("STATUS:1FFFFFFFFFFFFFFFF", None),
+            ("STATUS:", None),
+            ("STATUS:xyz", None),
+        ];
+        let mut wrong = Vec::new();
+        for (parse, reply, want) in ints {
+            if parse(reply) != want {
+                wrong.push(format!("{reply:?}: {:?} != {want:?}", parse(reply)));
+            }
+        }
+        for (parse, reply, want) in doubles {
+            if parse(reply) != want {
+                wrong.push(format!("{reply:?}: {:?} != {want:?}", parse(reply)));
+            }
+        }
+        for (reply, want) in hvs {
+            if parse_hvs(reply) != want {
+                wrong.push(format!("{reply:?}: {:?} != {want:?}", parse_hvs(reply)));
+            }
+        }
+        for (reply, want) in status {
+            if parse_status(reply) != want {
+                wrong.push(format!("{reply:?}: {:?} != {want:?}", parse_status(reply)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
