@@ -331,14 +331,14 @@ impl PslDetector {
 
         if self.supports("SubArea")
             && let Some(reply) = self.checked("GetSubArea")?
-            && let Some([min_x, min_y, right, bottom]) =
+            && let Some([min_x, min_y, size_x, size_y]) =
                 protocol::parse_sub_area(protocol::numeric_field(&reply, multi))
         {
             let base = &mut self.ad.port_base;
             base.set_int32_param(self.ad.params.min_x, 0, min_x)?;
             base.set_int32_param(self.ad.params.min_y, 0, min_y)?;
-            base.set_int32_param(self.ad.params.size_x, 0, right - min_x + 1)?;
-            base.set_int32_param(self.ad.params.size_y, 0, bottom - min_y + 1)?;
+            base.set_int32_param(self.ad.params.size_x, 0, size_x)?;
+            base.set_int32_param(self.ad.params.size_y, 0, size_y)?;
         }
 
         if self.supports("Fliplr")
@@ -523,7 +523,13 @@ impl PortDriver for PslDetector {
             let min_y = self.get_i32(p.min_y);
             let size_x = self.get_i32(p.size_x);
             let size_y = self.get_i32(p.size_y);
-            self.send(&protocol::set_sub_area(min_x, min_y, size_x, size_y))
+            match protocol::set_sub_area(min_x, min_y, size_x, size_y) {
+                Some(command) => self.send(&command),
+                None => Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "SetSubArea: an edge is past int".into(),
+                }),
+            }
         } else if reason == p.reverse_x {
             self.command(&protocol::set_fliplr(value)).map(drop)
         } else if reason == p.reverse_y {
@@ -1232,6 +1238,31 @@ mod tests {
         assert!(crate::task::has_new_data(&det.server).unwrap());
         let mut det = served_detector("PSL_CUT_VERSION", b"PSLViewer-5.0", true);
         assert!(!det.connect_to_server().unwrap());
+    }
+
+    /// C's `right - minX + 1` (PSL.cpp:433-434) overflows `int` on this
+    /// reply; getConfig leaves the sub-area as it was.
+    #[test]
+    fn a_sub_area_reply_past_int_is_not_stored() {
+        let mut det = served_detector("PSL_AREA_READ", b"(-2147483648,0,2147483647,0)", false);
+        let p = det.ad.params;
+        det.ad.port_base.set_int32_param(p.min_x, 0, 3).unwrap();
+        det.ad.port_base.set_int32_param(p.size_x, 0, 5).unwrap();
+        det.state.valid_options = ["SubArea".to_string()].into();
+        det.get_config().unwrap();
+        assert_eq!((det.get_i32(p.min_x), det.get_i32(p.size_x)), (3, 5));
+    }
+
+    /// C's `minX+sizeX-1` (PSL.cpp:772) overflows `int` here; the write
+    /// fails instead of sending a wrapped edge.
+    #[test]
+    fn a_sub_area_edge_past_int_fails_the_write() {
+        let mut det = served_detector("PSL_AREA_WRITE", b"OK", false);
+        let p = det.ad.params;
+        det.ad.port_base.set_int32_param(p.size_x, 0, 1).unwrap();
+        det.write_int32(&mut AsynUser::new(p.min_x), i32::MAX)
+            .unwrap();
+        assert!(det.write_int32(&mut AsynUser::new(p.size_x), 2).is_err());
     }
 
     /// A PSLViewer that answers its reads from `reads` in turn, each with

@@ -186,9 +186,13 @@ pub fn parse_pair(reply: &str) -> Option<[i32; 2]> {
     scan_ints(reply.as_bytes(), "(%lld,%lld)")
 }
 
-/// The `GetSubArea` reply (C `sscanf(pStart, "(%d,%d,%d,%d)", ...)`).
+/// The `GetSubArea` reply (C `sscanf(pStart, "(%d,%d,%d,%d)", ...)`) as
+/// `[min_x, min_y, size_x, size_y]`, a size being C's `right - minX + 1`.
+/// A size past `int`, which C's arithmetic overflows, refuses the reply.
 pub fn parse_sub_area(reply: &str) -> Option<[i32; 4]> {
-    scan_ints(reply.as_bytes(), "(%lld,%lld,%lld,%lld)")
+    let [min_x, min_y, right, bottom] = scan_ints(reply.as_bytes(), "(%lld,%lld,%lld,%lld)")?;
+    let size = |min: i32, edge: i32| i32::try_from(i64::from(edge) - i64::from(min) + 1).ok();
+    Some([min_x, min_y, size(min_x, right)?, size(min_y, bottom)?])
 }
 
 /// A one-number reply: `GetFliplr`, `GetFlipud`, `GetRecordNumber`
@@ -363,12 +367,11 @@ pub fn set_binning(bin_x: i32, bin_y: i32) -> String {
     format!("SetBinning;({bin_x},{bin_y})")
 }
 
-pub fn set_sub_area(min_x: i32, min_y: i32, size_x: i32, size_y: i32) -> String {
-    format!(
-        "SetSubArea;({min_x},{min_y},{},{})",
-        min_x + size_x - 1,
-        min_y + size_y - 1
-    )
+/// `None` where C's `minX+sizeX-1` overflows its `int`.
+pub fn set_sub_area(min_x: i32, min_y: i32, size_x: i32, size_y: i32) -> Option<String> {
+    let edge = |min: i32, size: i32| i32::try_from(i64::from(min) + i64::from(size) - 1).ok();
+    let (right, bottom) = (edge(min_x, size_x)?, edge(min_y, size_y)?);
+    Some(format!("SetSubArea;({min_x},{min_y},{right},{bottom})"))
 }
 
 pub fn set_fliplr(value: i32) -> String {
@@ -561,9 +564,13 @@ mod tests {
             }
         }
         let areas = [
-            ("(0,0,3999,2670)", Some([0, 0, 3999, 2670])),
-            ("(0, 0, 9, 9) junk", Some([0, 0, 9, 9])),
+            ("(0,0,3999,2670)", Some([0, 0, 4000, 2671])),
+            ("(0, 0, 9, 9) junk", Some([0, 0, 10, 10])),
+            ("(5,0,4,0)", Some([5, 0, 0, 1])),
             ("(0,0,3999)", None),
+            // C's `right - minX + 1` overflows `int` on both.
+            ("(-2147483648,0,2147483647,0)", None),
+            ("(0,0,0,2147483647)", None),
         ];
         for (reply, want) in areas {
             if parse_sub_area(reply) != want {
@@ -764,7 +771,17 @@ mod tests {
         assert_eq!(open("multiconf"), "Open;multiconf");
         assert_eq!(select("cam1"), "Select;cam1");
         assert_eq!(set_binning(2, 4), "SetBinning;(2,4)");
-        assert_eq!(set_sub_area(10, 20, 100, 200), "SetSubArea;(10,20,109,219)");
+        assert_eq!(
+            set_sub_area(10, 20, 100, 200).as_deref(),
+            Some("SetSubArea;(10,20,109,219)")
+        );
+        // C's `minX+sizeX-1` overflows `int` on the first two.
+        assert_eq!(set_sub_area(2147483647, 0, 2, 1), None);
+        assert_eq!(set_sub_area(0, -2147483648, 1, -1), None);
+        assert_eq!(
+            set_sub_area(1, 0, 2147483647, 1).as_deref(),
+            Some("SetSubArea;(1,0,2147483647,0)")
+        );
         assert_eq!(set_fliplr(1), "SetFliplr;1");
         assert_eq!(set_flipud(0), "SetFlipud;0");
         assert_eq!(set_trigger_mode("Software"), "SetTriggerMode;Software");
