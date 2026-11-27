@@ -37,8 +37,9 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_vprintf;
 
-use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
+use crate::util::{atof, atoi, is_unsolicited_limit_error};
 use motor_common::model1::{MoveStrings, init_poll, init_read};
+use motor_common::util::strtol;
 
 /// C `BUFF_SIZE`: the most one read takes.
 const READ_BUF: usize = 100;
@@ -217,7 +218,10 @@ impl Esp300Axis {
             // C reads the controller's EGU (SN?) only for its report(); issue
             // the query for startup wire fidelity and discard the reply.
             let _ = read(format!("{axis:02}SN?"));
-            let feedback = leading_hex(&read(format!("{axis:02}ZB?"))).unwrap_or(0);
+            // C `int feedback = strtol(buff, NULL, 16)`; a value past `int`,
+            // which C wraps, reads as 0.
+            let (feedback, _) = strtol(read(format!("{axis:02}ZB?")).as_bytes(), 16);
+            let feedback = i32::try_from(feedback).unwrap_or(0);
             let resolution = match feedback & 0x300 {
                 0x200 => {
                     let full_step = atof(&read(format!("{axis:02}FR?")));
@@ -1077,6 +1081,40 @@ mod tests {
                 comms_error: true,
                 ..prepared
             }
+        );
+    }
+
+    /// drvESP300.cc:774 reads `ZB?` with `strtol(buff, NULL, 16)`: a
+    /// negated value is two's complement, so `-1` is bits 9:8 `11` (`SU?`)
+    /// and `-200` is `10` (`FR?`/`QS?`), both with an encoder.
+    #[test]
+    fn zb_is_read_as_strtol_base_16() {
+        let (ctrl, _sent) = esp300_line(
+            "esp300ZbStrtol",
+            &[
+                ("TB?", "0, 0, NO ERROR DETECTED"),
+                ("01ZB?", "-1"),
+                ("01SU?", "0.5"),
+                ("02ZB?", "-200"),
+                ("02FR?", "0.01"),
+                ("02QS?", "4"),
+                ("03ZB?", "100000300"),
+                ("03FR?", "0.002"),
+            ],
+        );
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let su = Esp300Axis::new(ctrl.clone(), 1);
+        assert_eq!((su.drive_resolution, su.encoder_present), (0.5, true));
+        let fr_qs = Esp300Axis::new(ctrl.clone(), 2);
+        assert_eq!(
+            (fr_qs.drive_resolution, fr_qs.encoder_present),
+            (0.0025, true)
+        );
+        // C keeps the low 32 bits, 0x300; past `int` reads as 0 here.
+        let wide = Esp300Axis::new(ctrl, 3);
+        assert_eq!(
+            (wide.drive_resolution, wide.encoder_present),
+            (0.002, false)
         );
     }
 }
