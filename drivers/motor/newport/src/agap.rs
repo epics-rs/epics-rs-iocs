@@ -25,9 +25,11 @@
 //! IOC's MRES must therefore be `STEP_SIZE`. `JA` sends the record velocity
 //! unscaled, as C does.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -38,7 +40,7 @@ use epics_rs::motor::trace::MotorTrace;
 use motor_common::AxisReport;
 
 use crate::conex::LINUX_WRITE_DELAY;
-use crate::util::{leading_hex, parse_value_at};
+use crate::util::parse_value_at;
 
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
@@ -70,13 +72,20 @@ pub(crate) fn axis_name(axis_index: u8) -> char {
 /// Number of axes on an AGAP controller (fixed at 2: `U` and `V`).
 pub(crate) const NUM_AXES: u8 = 2;
 
+/// `sscanf(resp, fmt, &status) == 1` with the `%x` read at 64 bits, so a
+/// status C keeps the low 32 bits of (a negated or over-wide one) is `None`.
+fn scan_status(resp: &str, fmt: &str) -> Option<u32> {
+    let status = Cell::new(0u64);
+    (sscanf(resp, fmt, &[&status]) == 1)
+        .then(|| u32::try_from(status.get()).ok())
+        .flatten()
+}
+
 /// Parse the controller-wide `TS` reply into the moving flag. C
 /// `AGAP_CONEXAxis::poll`: `sscanf(inString_, "%*dTS%*4c%x", &status)`, then
 /// moving when `status & 0xff` is `0x28`, `0x29`, or `0x46`.
 fn parse_moving(resp: &str) -> Option<bool> {
-    let idx = resp.find("TS")?;
-    let status = leading_hex(resp.get(idx + 2 + 4..)?)?;
-    let state = status & 0xff;
+    let state = scan_status(resp, "%*dTS%*4c%llx")? & 0xff;
     Some(state == 0x28 || state == 0x29 || state == 0x46)
 }
 
@@ -84,8 +93,7 @@ fn parse_moving(resp: &str) -> Option<bool> {
 /// C `AGAP_CONEXAxis::getClosedLoop`: `sscanf(inString_, "%*dMM%x", &status)`,
 /// closed-loop when the state is in `0x28..=0x36`.
 fn parse_closed_loop(resp: &str) -> Option<bool> {
-    let idx = resp.find("MM")?;
-    let status = leading_hex(&resp[idx + 2..])?;
+    let status = scan_status(resp, "%*dMM%llx")?;
     Some((0x28..=0x36).contains(&status))
 }
 
@@ -584,6 +592,21 @@ mod tests {
     fn parse_moving_rejects_short_or_junk_reply() {
         assert_eq!(parse_moving("1TS12"), None);
         assert_eq!(parse_moving("garbage"), None);
+    }
+
+    /// AGAP_CONEX.cpp:332,411 scan `%*dTS%*4c%x` and `%*dMM%x`: the
+    /// controller ID must lead, and `%*4c` takes any four bytes.
+    #[test]
+    fn ts_and_mm_are_scanned_as_c_scans_them() {
+        assert_eq!(parse_moving("TS000028"), None);
+        assert_eq!(parse_moving("x1TS000028"), None);
+        assert_eq!(parse_moving(" 1TS 0x0 28"), Some(true));
+        assert_eq!(parse_closed_loop("MM28"), None);
+        assert_eq!(parse_closed_loop("1.5MM28"), None);
+        assert_eq!(parse_closed_loop(" -1MM 0x2a"), Some(true));
+        // glibc keeps the low 32 bits of these.
+        assert_eq!(parse_moving("1TS0000100000028"), None);
+        assert_eq!(parse_closed_loop("1MM-28"), None);
     }
 
     #[test]
