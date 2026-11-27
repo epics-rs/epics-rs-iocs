@@ -22,7 +22,10 @@
 //! only parse the leading segments as options, so the address text can never be
 //! mistaken for one.
 
+use std::cell::Cell;
 use std::fmt;
+
+use epics_libcom_rs::runtime::scanf::sscanf;
 
 use crate::ads::defs::AdsType;
 
@@ -179,12 +182,12 @@ impl DrvInfo {
                 value: value.to_string(),
             };
             match key {
-                "ADSPORT" => info.ams_port = value.parse().map_err(|_| bad())?,
-                "TS_MS" => info.sample_time_ms = value.parse().map_err(|_| bad())?,
-                "T_DLY_MS" => info.max_delay_time_ms = value.parse().map_err(|_| bad())?,
+                "ADSPORT" => info.ams_port = scan_port(value).ok_or_else(bad)?,
+                "TS_MS" => info.sample_time_ms = scan_f64(value).ok_or_else(bad)?,
+                "T_DLY_MS" => info.max_delay_time_ms = scan_f64(value).ok_or_else(bad)?,
                 "POLL_RATE" => {
                     info.is_bulk_read = true;
-                    info.poll_class = value.parse().map_err(|_| bad())?;
+                    info.poll_class = scan_f64(value).ok_or_else(bad)?;
                 }
                 "TIMEBASE" => {
                     info.time_base = match value {
@@ -226,28 +229,46 @@ impl DrvInfo {
     }
 }
 
-/// `16#<group>,16#<offset>,<size>,<type>` (C `sscanf("16#%x,16#%x,%u,%u")`).
+/// C `sscanf(value, "=%lf/")` after the `=`.
+fn scan_f64(value: &str) -> Option<f64> {
+    let v = Cell::new(0.0f64);
+    (sscanf(value, "%lf", &[&v]) == 1).then(|| v.get())
+}
+
+/// C `sscanf(value, "=%d/")` cast to `uint16_t`, read at 64 bits so that a
+/// port C would wrap is refused.
+fn scan_port(value: &str) -> Option<u16> {
+    let v = Cell::new(0i64);
+    (sscanf(value, "%lld", &[&v]) == 1)
+        .then(|| u16::try_from(v.get()).ok())
+        .flatten()
+}
+
 fn parse_adr_command(rest: &str) -> Option<PlcAddress> {
-    let mut parts = rest.split(',');
-    let group = parse_hex16(parts.next()?)?;
-    let offset = parse_hex16(parts.next()?)?;
-    let size: u32 = parts.next()?.trim().parse().ok()?;
-    let type_id: u32 = parts.next()?.trim().parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
+    let [index_group, index_offset, size, type_id] = scan_adr(rest)?;
     Some(PlcAddress::Absolute {
-        index_group: group,
-        index_offset: offset,
+        index_group,
+        index_offset,
         size,
         data_type: AdsType::from_u32(type_id),
     })
 }
 
-/// IEC `16#XXXX` hex literal.
-fn parse_hex16(s: &str) -> Option<u32> {
-    let hex = s.trim().strip_prefix("16#")?;
-    u32::from_str_radix(hex, 16).ok()
+/// The `.ADR.` fields `16#<group>,16#<offset>,<size>,<type>` as C reads them,
+/// `sscanf(s, "16#%x,16#%x,%u,%u") == 4` (adsAsynPortDriver.cpp:1614, :2279),
+/// each at 64 bits so that a field C would wrap is refused.
+pub(crate) fn scan_adr(s: &str) -> Option<[u32; 4]> {
+    let f: [Cell<u64>; 4] = Default::default();
+    if sscanf(
+        s,
+        "16#%llx,16#%llx,%llu,%llu",
+        &[&f[0], &f[1], &f[2], &f[3]],
+    ) != 4
+    {
+        return None;
+    }
+    let [group, offset, size, type_id] = f.map(|v| u32::try_from(v.get()).ok());
+    Some([group?, offset?, size?, type_id?])
 }
 
 #[cfg(test)]
@@ -372,7 +393,6 @@ mod tests {
         // returns the error. Rejecting outright cannot leave that state.
         for bad in [
             ".ADR.16#4020,16#0,2?",         // too few fields
-            ".ADR.16#4020,16#0,2,2,3?",     // too many
             ".ADR.4020,16#0,2,2?",          // missing 16# prefix
             ".ADR.16#XYZ,16#0,2,2?",        // bad hex
             ".ADR.16#4020,16#0,notanum,2?", // bad size
@@ -424,5 +444,85 @@ mod tests {
     #[test]
     fn symbolic_address_has_no_declared_type() {
         assert_eq!(parse("Main.fTest?").declared_type(), None);
+    }
+
+    /// gcc/glibc `sscanf("=%lf/")` and `("=%d/")` (adsAsynPortDriver.cpp:1647,
+    /// :1764), except that a port C wraps to `uint16_t` is refused and `1e`
+    /// fails as in glibc 2.42.
+    #[test]
+    fn options_read_as_sscanf() {
+        let cases = [
+            ("TS_MS=5ms/Main.x?", Some((851, 5.0, 100.0, 1.0))),
+            ("TS_MS= 2.5/Main.x?", Some((851, 2.5, 100.0, 1.0))),
+            ("TS_MS=0x10/Main.x?", Some((851, 16.0, 100.0, 1.0))),
+            (
+                "T_DLY_MS=inf/Main.x?",
+                Some((851, 50.0, f64::INFINITY, 1.0)),
+            ),
+            ("T_DLY_MS=1e/Main.x?", None),
+            ("POLL_RATE=.5/Main.x?", Some((851, 50.0, 100.0, 0.5))),
+            ("POLL_RATE=/Main.x?", None),
+            ("ADSPORT=852x/Main.x?", Some((852, 50.0, 100.0, 1.0))),
+            ("ADSPORT= 853/Main.x?", Some((853, 50.0, 100.0, 1.0))),
+            ("ADSPORT=+854/Main.x?", Some((854, 50.0, 100.0, 1.0))),
+            ("ADSPORT=0x10/Main.x?", Some((0, 50.0, 100.0, 1.0))),
+            ("ADSPORT=65535/Main.x?", Some((65535, 50.0, 100.0, 1.0))),
+            ("ADSPORT=70000/Main.x?", None),       // C: 4464
+            ("ADSPORT=-1/Main.x?", None),          // C: 65535
+            ("ADSPORT=99999999999/Main.x?", None), // C: 59391
+            ("ADSPORT=/Main.x?", None),
+        ];
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(raw, want)| {
+                let got = DrvInfo::parse(raw, defaults()).ok().map(|d| {
+                    (
+                        d.ams_port,
+                        d.sample_time_ms,
+                        d.max_delay_time_ms,
+                        d.poll_class,
+                    )
+                });
+                (got != want).then_some((raw, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// gcc/glibc `sscanf("16#%x,16#%x,%u,%u") == 4` (adsAsynPortDriver.cpp:1614),
+    /// except that a field C wraps to 32 bits is refused. C's 22-byte length
+    /// pre-check, which rejects well-formed short commands, is not kept.
+    #[test]
+    fn adr_command_reads_as_sscanf() {
+        let cases: &[(&str, Option<[u32; 4]>)] = &[
+            (".ADR.16#4020,16#0,2,18?", Some([0x4020, 0, 2, 18])),
+            (".ADR.16#0x1F,16#a,4,3?", Some([31, 10, 4, 3])),
+            (".ADR.16#1F,16#A,4,3,99?", Some([31, 10, 4, 3])),
+            (".ADR.16#1,16#2, 4, 3?", Some([1, 2, 4, 3])),
+            (".ADR.16#+f,16#2,4,3?", Some([15, 2, 4, 3])),
+            (".ADR.16#1,16#2,4,3junk?", Some([1, 2, 4, 3])),
+            (".ADR. 16#1,16#2,4,3?", None),
+            (".ADR.16#1 ,16#2,4,3?", None),
+            (".ADR.16#1,16#2,3junk,4?", None),
+            (".ADR.16#g,16#2,4,3?", None),
+            (".ADR.16#-1,16#0,4,3?", None),         // C: 4294967295
+            (".ADR.16#100000000,16#0,4,3?", None),  // C: 0
+            (".ADR.16#1,16#2,4,-1?", None),         // C: 4294967295
+            (".ADR.16#1,16#2,4,4294967296?", None), // C: 0
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|&(raw, want)| {
+                let got = DrvInfo::parse(raw, defaults()).ok().map(|d| d.address);
+                let want = want.map(|[g, o, size, t]| PlcAddress::Absolute {
+                    index_group: g,
+                    index_offset: o,
+                    size,
+                    data_type: AdsType::from_u32(t),
+                });
+                (got != want).then_some((raw, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
