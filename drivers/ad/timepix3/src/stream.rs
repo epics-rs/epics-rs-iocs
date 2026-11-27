@@ -698,24 +698,13 @@ pub fn parse_tcp_path(path: &str) -> Result<(String, u16), Option<String>> {
     }
 }
 
-/// `std::stoi`: leading C whitespace, an optional sign, at least one digit,
-/// and anything after the digits ignored; `None` where it throws.
+/// `std::stoi`: `strtol` base 10, throwing when nothing converts or the
+/// value is out of `int` range.
 fn stoi(s: &str) -> Option<i32> {
-    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
-    let (negative, s) = match s.as_bytes().first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 {
-        return None;
+    match epics_libcom_rs::runtime::stdlib::strtol_errno(s, 10)? {
+        (_, 0) => None,
+        (v, _) => i32::try_from(v).ok(),
     }
-    let mut n: i64 = 0;
-    for d in s[..digits].bytes() {
-        n = n.checked_mul(10)?.checked_add(i64::from(d - b'0'))?;
-    }
-    i32::try_from(if negative { -n } else { n }).ok()
 }
 
 #[cfg(test)]
@@ -1214,6 +1203,19 @@ mod tests {
         assert_eq!(
             parse_tcp_path("tcp://h:2147483648"),
             Err(Some("Failed to parse port: 2147483648".into()))
+        );
+        assert_eq!(parse_tcp_path("tcp://h:\x0b\x0c\r+8089"), ok("h", 8089));
+        assert_eq!(
+            parse_tcp_path("tcp://h:\u{a0}8089"),
+            Err(Some("Failed to parse port: \u{a0}8089".into()))
+        );
+        assert_eq!(
+            parse_tcp_path("tcp://h:+-8089"),
+            Err(Some("Failed to parse port: +-8089".into()))
+        );
+        assert_eq!(
+            parse_tcp_path("tcp://h:-9223372036854775808"),
+            Err(Some("Failed to parse port: -9223372036854775808".into()))
         );
     }
 }
