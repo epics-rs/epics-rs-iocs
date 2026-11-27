@@ -219,7 +219,7 @@ impl PslDetector {
         self.command(&protocol::select(&name))?;
 
         let reply = self.command("GetCamNum")?;
-        self.state.n_cameras = protocol::parse_ints(&reply).first().copied().unwrap_or(1);
+        self.state.n_cameras = protocol::parse_cam_num(&reply);
 
         let model = self.command("GetCam")?;
         let model = model.split_whitespace().next().unwrap_or("").to_string();
@@ -231,11 +231,10 @@ impl PslDetector {
         let (reply, status) = self.command_status("GetMaximumSize")?;
         // C bug not copied: a reply sscanf cannot parse publishes the
         // uninitialised maxSizeX/maxSizeY (PSL.cpp:231-233).
-        let size = protocol::parse_ints(&reply);
-        if size.len() >= 2 {
+        if let Some([x, y]) = protocol::parse_pair(&reply) {
             let base = &mut self.ad.port_base;
-            base.set_int32_param(self.ad.params.max_size_x, 0, size[0])?;
-            base.set_int32_param(self.ad.params.max_size_y, 0, size[1])?;
+            base.set_int32_param(self.ad.params.max_size_x, 0, x)?;
+            base.set_int32_param(self.ad.params.max_size_y, 0, y)?;
         }
 
         self.state.valid_options = self.get_choices("GetOptions")?;
@@ -256,13 +255,12 @@ impl PslDetector {
         let multi = self.state.multi_camera();
 
         // Every exchange here parses only a successful reply, as C does.
-        if let Some(reply) = self.checked("GetSize")? {
-            let size = protocol::parse_ints(protocol::numeric_field(&reply, multi));
-            if size.len() >= 2 {
-                let base = &mut self.ad.port_base;
-                base.set_int32_param(self.ad.params.base.array_size_x, 0, size[0])?;
-                base.set_int32_param(self.ad.params.base.array_size_y, 0, size[1])?;
-            }
+        if let Some(reply) = self.checked("GetSize")?
+            && let Some([x, y]) = protocol::parse_pair(protocol::numeric_field(&reply, multi))
+        {
+            let base = &mut self.ad.port_base;
+            base.set_int32_param(self.ad.params.base.array_size_x, 0, x)?;
+            base.set_int32_param(self.ad.params.base.array_size_y, 0, y)?;
         }
 
         // GetMode is always supported. C sets Mono on every reply, before it
@@ -324,45 +322,41 @@ impl PslDetector {
         base.set_int32_param(self.ad.params.bin_y, 0, 1)?;
         if self.supports("Binning")
             && let Some(reply) = self.checked("GetBinning")?
+            && let Some([x, y]) = protocol::parse_pair(protocol::numeric_field(&reply, multi))
         {
-            let bin = protocol::parse_ints(protocol::numeric_field(&reply, multi));
-            if bin.len() >= 2 {
-                let base = &mut self.ad.port_base;
-                base.set_int32_param(self.ad.params.bin_x, 0, bin[0])?;
-                base.set_int32_param(self.ad.params.bin_y, 0, bin[1])?;
-            }
+            let base = &mut self.ad.port_base;
+            base.set_int32_param(self.ad.params.bin_x, 0, x)?;
+            base.set_int32_param(self.ad.params.bin_y, 0, y)?;
         }
 
         if self.supports("SubArea")
             && let Some(reply) = self.checked("GetSubArea")?
+            && let Some([min_x, min_y, right, bottom]) =
+                protocol::parse_sub_area(protocol::numeric_field(&reply, multi))
         {
-            let area = protocol::parse_ints(protocol::numeric_field(&reply, multi));
-            if area.len() >= 4 {
-                let (min_x, min_y, right, bottom) = (area[0], area[1], area[2], area[3]);
-                let base = &mut self.ad.port_base;
-                base.set_int32_param(self.ad.params.min_x, 0, min_x)?;
-                base.set_int32_param(self.ad.params.min_y, 0, min_y)?;
-                base.set_int32_param(self.ad.params.size_x, 0, right - min_x + 1)?;
-                base.set_int32_param(self.ad.params.size_y, 0, bottom - min_y + 1)?;
-            }
+            let base = &mut self.ad.port_base;
+            base.set_int32_param(self.ad.params.min_x, 0, min_x)?;
+            base.set_int32_param(self.ad.params.min_y, 0, min_y)?;
+            base.set_int32_param(self.ad.params.size_x, 0, right - min_x + 1)?;
+            base.set_int32_param(self.ad.params.size_y, 0, bottom - min_y + 1)?;
         }
 
         if self.supports("Fliplr")
             && let Some(reply) = self.checked("GetFliplr")?
-            && let Some(v) = protocol::parse_ints(protocol::numeric_field(&reply, multi)).first()
+            && let Some(v) = protocol::parse_int(protocol::numeric_field(&reply, multi))
         {
             self.ad
                 .port_base
-                .set_int32_param(self.ad.params.reverse_x, 0, *v)?;
+                .set_int32_param(self.ad.params.reverse_x, 0, v)?;
         }
 
         if self.supports("Flipud")
             && let Some(reply) = self.checked("GetFlipud")?
-            && let Some(v) = protocol::parse_ints(protocol::numeric_field(&reply, multi)).first()
+            && let Some(v) = protocol::parse_int(protocol::numeric_field(&reply, multi))
         {
             self.ad
                 .port_base
-                .set_int32_param(self.ad.params.reverse_y, 0, *v)?;
+                .set_int32_param(self.ad.params.reverse_y, 0, v)?;
         }
 
         if self.supports("RecordPath")
@@ -385,11 +379,11 @@ impl PslDetector {
 
         if self.supports("RecordNumber")
             && let Some(reply) = self.checked("GetRecordNumber")?
-            && let Some(n) = protocol::parse_ints(protocol::numeric_field(&reply, multi)).first()
+            && let Some(n) = protocol::parse_int(protocol::numeric_field(&reply, multi))
         {
             self.ad
                 .port_base
-                .set_int32_param(self.ad.params.base.file_number, 0, *n)?;
+                .set_int32_param(self.ad.params.base.file_number, 0, n)?;
         }
 
         if self.supports("RecordFormat")

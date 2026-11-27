@@ -13,7 +13,8 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_libcom_rs::runtime::scanf::sscanf;
+use epics_libcom_rs::runtime::scanf::{ScanTarget, sscanf};
+use epics_libcom_rs::runtime::stdlib::strtol;
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::ndarray::NDDataType;
 
@@ -164,24 +165,42 @@ pub fn numeric_field(reply: &str, multi_camera: bool) -> &str {
     reply.get(1..).unwrap_or("")
 }
 
-/// Pull the integers out of a `(a,b)` or `(a,b,c,d)` reply.
-pub fn parse_ints(reply: &str) -> Vec<i32> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for c in reply.chars() {
-        if c.is_ascii_digit() || (c == '-' && cur.is_empty()) {
-            cur.push(c);
-        } else if !cur.is_empty() {
-            if let Ok(v) = cur.parse() {
-                out.push(v);
-            }
-            cur.clear();
-        }
+/// C `sscanf(reply, format, ...) == N` for a `format` of `N` `%d`s, written
+/// `%lld` so that a value C would wrap into its `int` is `None`.
+fn scan_ints<const N: usize>(reply: &[u8], format: &str) -> Option<[i32; N]> {
+    let wide: [Cell<i64>; N] = std::array::from_fn(|_| Cell::new(0));
+    let out: Vec<&dyn ScanTarget> = wide.iter().map(|v| v as &dyn ScanTarget).collect();
+    if sscanf(reply, format, &out) != N as i32 {
+        return None;
     }
-    if let Ok(v) = cur.parse() {
-        out.push(v);
+    let mut values = [0; N];
+    for (value, wide) in values.iter_mut().zip(&wide) {
+        *value = i32::try_from(wide.get()).ok()?;
     }
-    out
+    Some(values)
+}
+
+/// A `(x,y)` reply: `GetMaximumSize`, `GetSize`, `GetBinning`
+/// (C `sscanf(pStart, "(%d,%d)", ...)`).
+pub fn parse_pair(reply: &str) -> Option<[i32; 2]> {
+    scan_ints(reply.as_bytes(), "(%lld,%lld)")
+}
+
+/// The `GetSubArea` reply (C `sscanf(pStart, "(%d,%d,%d,%d)", ...)`).
+pub fn parse_sub_area(reply: &str) -> Option<[i32; 4]> {
+    scan_ints(reply.as_bytes(), "(%lld,%lld,%lld,%lld)")
+}
+
+/// A one-number reply: `GetFliplr`, `GetFlipud`, `GetRecordNumber`
+/// (C `sscanf(pStart, "%d", ...)`).
+pub fn parse_int(reply: &str) -> Option<i32> {
+    scan_ints(reply.as_bytes(), "%lld").map(|[v]| v)
+}
+
+/// The `GetCamNum` reply (C `nCameras_ = atoi(fromServer_)`). A count past
+/// `int`, which `atoi` wraps, reads as no count, 0, as junk does.
+pub fn parse_cam_num(reply: &str) -> i32 {
+    i32::try_from(strtol(reply, 10).0).unwrap_or(0)
 }
 
 /// C `sscanf(reply, format, &value)` for a `format` with one `%lf`.
@@ -290,31 +309,32 @@ pub fn parse_image_header(reply: &[u8]) -> Result<ImageHeader, ProtocolError> {
             ProtocolError::UnknownImageMode(String::from_utf8_lossy(seen).to_string())
         })?;
 
-    // Three ';'-terminated decimal fields follow the mode.
-    let mut fields = [0usize; 3];
-    let mut pos = prefix_len;
-    for field in fields.iter_mut() {
-        let start = pos;
-        while pos < reply.len() && reply[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        if pos == start || pos >= reply.len() || reply[pos] != b';' {
-            return Err(ProtocolError::BadImageHeader);
-        }
-        *field = std::str::from_utf8(&reply[start..pos])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or(ProtocolError::BadImageHeader)?;
-        pos += 1; // the ';'
+    // C `sscanf(fromServer_ + prefixLen, "%d;%d;%d;%n", ...)`, which left
+    // the header length unset when the scan stopped short.
+    let fields: [Cell<i64>; 3] = std::array::from_fn(|_| Cell::new(0));
+    let text_len = Cell::new(-1i32);
+    let out: [&dyn ScanTarget; 4] = [&fields[0], &fields[1], &fields[2], &text_len];
+    let body = &reply[prefix_len..];
+    if sscanf(body, "%lld;%lld;%lld;%n", &out) != 3 {
+        return Err(ProtocolError::BadImageHeader);
     }
+    let text_len = usize::try_from(text_len.get()).map_err(|_| ProtocolError::BadImageHeader)?;
+    let [width, height, data_len] = fields.map(|v| {
+        i32::try_from(v.get())
+            .ok()
+            .and_then(|v| usize::try_from(v).ok())
+    });
+    let (Some(width), Some(height), Some(data_len)) = (width, height, data_len) else {
+        return Err(ProtocolError::BadImageHeader);
+    };
 
     let header = ImageHeader {
         data_type,
         color_mode,
-        width: fields[0],
-        height: fields[1],
-        data_len: fields[2],
-        header_len: pos,
+        width,
+        height,
+        data_len,
+        header_len: prefix_len + text_len,
     };
     if header.width == 0 || header.height == 0 {
         return Err(ProtocolError::BadImageHeader);
@@ -517,11 +537,89 @@ mod tests {
 
     // --- values -----------------------------------------------------------
 
+    /// PSL.cpp scans each reply with its own `sscanf` format, and the
+    /// `GetCamNum` reply with `atoi`, so a number ends where C's conversion
+    /// stops. A value C wraps into its `int` is refused.
     #[test]
-    fn parse_ints_reads_pairs_and_quads() {
-        assert_eq!(parse_ints("(4,4)"), vec![4, 4]);
-        assert_eq!(parse_ints("(0,0,3999,2670)"), vec![0, 0, 3999, 2670]);
-        assert_eq!(parse_ints("(-1,2)"), vec![-1, 2]);
+    fn replies_are_scanned_as_c_sscanf() {
+        let mut wrong = Vec::new();
+        let pairs = [
+            ("(4,4)", Some([4, 4])),
+            ("( 4, 4)", Some([4, 4])),
+            ("(+4,-4)", Some([4, -4])),
+            ("(-1,2)", Some([-1, 2])),
+            ("(4.5,4)", None),
+            ("(1e3,2)", None),
+            ("(0x10,2)", None),
+            ("4,4", None),
+            ("(4,", None),
+            ("(3000000000,2)", None),
+        ];
+        for (reply, want) in pairs {
+            if parse_pair(reply) != want {
+                wrong.push(format!("pair {reply:?}: {:?}", parse_pair(reply)));
+            }
+        }
+        let areas = [
+            ("(0,0,3999,2670)", Some([0, 0, 3999, 2670])),
+            ("(0, 0, 9, 9) junk", Some([0, 0, 9, 9])),
+            ("(0,0,3999)", None),
+        ];
+        for (reply, want) in areas {
+            if parse_sub_area(reply) != want {
+                wrong.push(format!("area {reply:?}: {:?}", parse_sub_area(reply)));
+            }
+        }
+        let ints = [
+            ("1", Some(1)),
+            (" 7", Some(7)),
+            ("-1x", Some(-1)),
+            ("1.9", Some(1)),
+            ("x5", None),
+            ("True", None),
+            ("", None),
+        ];
+        for (reply, want) in ints {
+            if parse_int(reply) != want {
+                wrong.push(format!("int {reply:?}: {:?}", parse_int(reply)));
+            }
+        }
+        let cams = [
+            ("2", 2),
+            (" 2", 2),
+            ("2.5", 2),
+            ("+3", 3),
+            ("[2]", 0),
+            ("abc", 0),
+            ("4294967298", 0),
+        ];
+        for (reply, want) in cams {
+            if parse_cam_num(reply) != want {
+                wrong.push(format!("cams {reply:?}: {}", parse_cam_num(reply)));
+            }
+        }
+        let headers: [(&[u8], _); 8] = [
+            (b"I;16; 4;3;24;", Some((4, 3, 24, 13))),
+            (b"I;16;+4;3;24;", Some((4, 3, 24, 13))),
+            (b"L;2;\t2; 4;", Some((2, 2, 4, 10))),
+            (b"I;16;4;3;24;\x01", Some((4, 3, 24, 12))),
+            (b"I;16;4;3;24", None),
+            (b"I;16;4x;3;24;", None),
+            (b"I;16;-4;3;24;", None),
+            (b"I;16;4294967300;3;24;", None),
+        ];
+        for (reply, want) in headers {
+            let got = parse_image_header(reply)
+                .ok()
+                .map(|h| (h.width, h.height, h.data_len, h.header_len));
+            if got != want {
+                wrong.push(format!(
+                    "header {:?}: {got:?}",
+                    String::from_utf8_lossy(reply)
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
