@@ -236,6 +236,20 @@ mod tests {
     #[cfg(all(unix, not(feature = "sftp")))]
     #[test]
     fn a_curl_upload_to_a_server_that_never_answers_times_out() {
+        // A curl built without libssh2, as Apple's is, exits 1 on `scp://`.
+        let has_scp = std::process::Command::new("curl")
+            .arg("-V")
+            .output()
+            .is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("Protocols:"))
+                    .any(|list| list.split_whitespace().any(|p| p == "scp"))
+            });
+        if !has_scp {
+            println!("skipped: `curl -V` lists no scp protocol");
+            return;
+        }
         let file = std::env::temp_dir().join(format!("xps-sftp-{}.trj", std::process::id()));
         std::fs::write(&file, "0.5, 1, 2\n").unwrap();
         let (addr, _log) = silent_server(false);
