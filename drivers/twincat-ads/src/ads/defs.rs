@@ -3,8 +3,11 @@
 //! Ported from Beckhoff `AdsLib/standalone/AdsDef.h` (MIT). Only the subset the
 //! twincat-ads driver actually uses is reproduced here — no C/C++ linking.
 
+use std::cell::Cell;
 use std::fmt;
 use std::str::FromStr;
+
+use epics_libcom_rs::runtime::scanf::sscanf;
 
 /// TCP port of the AMS router on a TwinCAT system.
 pub const ADS_TCP_SERVER_PORT: u16 = 0xBF02; // 48898
@@ -93,23 +96,23 @@ impl std::error::Error for AmsNetIdParseError {}
 impl FromStr for AmsNetId {
     type Err = AmsNetIdParseError;
 
-    /// Mirrors the C constructor's `sscanf("%hhu.%hhu.%hhu.%hhu.%hhu.%hhu")`
-    /// (adsAsynPortDriver.cpp:343): exactly six decimal octets.
+    /// The C constructor's `sscanf("%hhu.%hhu.%hhu.%hhu.%hhu.%hhu") == 6`
+    /// (adsAsynPortDriver.cpp:343), each octet read at 64 bits so that one C
+    /// would wrap (`256` → 0) is refused.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut out = [0u8; 6];
-        let mut n = 0;
-        for part in s.split('.') {
-            let v: u8 = part
-                .parse()
-                .map_err(|_| AmsNetIdParseError(s.to_string()))?;
-            if n == 6 {
-                return Err(AmsNetIdParseError(s.to_string()));
-            }
-            out[n] = v;
-            n += 1;
+        let err = || AmsNetIdParseError(s.to_string());
+        let o: [Cell<u64>; 6] = Default::default();
+        if sscanf(
+            s,
+            "%llu.%llu.%llu.%llu.%llu.%llu",
+            &[&o[0], &o[1], &o[2], &o[3], &o[4], &o[5]],
+        ) != 6
+        {
+            return Err(err());
         }
-        if n != 6 {
-            return Err(AmsNetIdParseError(s.to_string()));
+        let mut out = [0u8; 6];
+        for (b, v) in out.iter_mut().zip(&o) {
+            *b = u8::try_from(v.get()).map_err(|_| err())?;
         }
         Ok(AmsNetId(out))
     }
@@ -420,14 +423,40 @@ mod tests {
     #[test]
     fn net_id_rejects_wrong_octet_count() {
         assert!("192.168.88.44.1".parse::<AmsNetId>().is_err());
-        assert!("192.168.88.44.1.1.1".parse::<AmsNetId>().is_err());
         assert!("".parse::<AmsNetId>().is_err());
     }
 
     #[test]
     fn net_id_rejects_out_of_range_octet() {
-        // C `%hhu` would silently truncate 256 to 0; Rust's u8 parse rejects it.
+        // C `%hhu` would silently truncate 256 to 0.
         assert!("192.168.88.256.1.1".parse::<AmsNetId>().is_err());
+    }
+
+    /// gcc/glibc `sscanf("%hhu.%hhu.%hhu.%hhu.%hhu.%hhu") == 6`
+    /// (adsAsynPortDriver.cpp:343), except that an octet C wraps is refused.
+    #[test]
+    fn net_id_reads_as_sscanf() {
+        let cases: &[(&str, Option<[u8; 6]>)] = &[
+            ("192.168.88.44.1.1", Some([192, 168, 88, 44, 1, 1])),
+            ("1.2.3.4.5.6.7", Some([1, 2, 3, 4, 5, 6])),
+            ("1.2.3.4.5.6x", Some([1, 2, 3, 4, 5, 6])),
+            (" 1. 2.3.4.5.6", Some([1, 2, 3, 4, 5, 6])),
+            ("+1.2.3.4.5.6", Some([1, 2, 3, 4, 5, 6])),
+            ("256.1.1.1.1.1", None), // C: 0.1.1.1.1.1
+            ("1.2.3.4.5.-1", None),  // C: 1.2.3.4.5.255
+            ("1.2.3.4.5", None),
+            ("1..2.3.4.5", None),
+            ("0x1.2.3.4.5.6", None),
+            ("", None),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|&(s, want)| {
+                let got = s.parse::<AmsNetId>().ok().map(|id| id.0);
+                (got != want).then_some((s, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
