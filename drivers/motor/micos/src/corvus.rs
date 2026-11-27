@@ -36,6 +36,7 @@
 //!   C, which avoids polling switches mid-move to keep the interpreter
 //!   responsive); while moving they are reported as not-triggered / powered.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -45,6 +46,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 
 use motor_common::util::{atof, atoi};
 
@@ -55,6 +57,23 @@ const READ_BUF: usize = 128;
 
 /// `st` status-word bit set while any axis is moving.
 const STATUS_MOVING: i32 = 0x1;
+
+/// C's `sscanf(inString_, "%lf %lf %lf", &pos1, &pos2, &pos3)`, one `%lf`
+/// per axis (SMCcorvusDriver.cpp:258-264): the positions it converted.
+fn positions(reply: &str, num_axes: usize) -> Vec<f64> {
+    let Some(fmt) = num_axes
+        .checked_sub(1)
+        .and_then(|i| ["%lf", "%lf %lf", "%lf %lf %lf"].get(i))
+    else {
+        return Vec::new();
+    };
+    let pos = [0.0; 3].map(Cell::new);
+    let n = sscanf(reply, fmt, &[&pos[0], &pos[1], &pos[2]]);
+    pos[..usize::try_from(n).unwrap_or(0)]
+        .iter()
+        .map(Cell::get)
+        .collect()
+}
 
 fn corvus_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
@@ -114,15 +133,12 @@ impl CorvusController {
 
     /// Read every axis position (`pos`) as a vector of exactly `num_axes`
     /// engineering-unit values. C `sscanf`s the reply whatever the exchange
-    /// returned (SMCcorvusDriver.cpp:258-264, :340-346); a reply short of
-    /// `num_axes` values fails here, where C would send the uninitialised
-    /// positions.
+    /// returned (SMCcorvusDriver.cpp:258-264, :340-346); a reply its scan
+    /// stops short of `num_axes` in fails here, where C would send the
+    /// uninitialised positions.
     fn read_positions(&self) -> AsynResult<Vec<f64>> {
         let (reply, status) = self.exchange("pos");
-        let values: Vec<f64> = reply
-            .split_whitespace()
-            .filter_map(|tok| tok.parse::<f64>().ok())
-            .collect();
+        let values = positions(&reply, self.num_axes);
         if values.len() < self.num_axes {
             status?;
             return Err(corvus_err(format!(
@@ -131,7 +147,7 @@ impl CorvusController {
                 self.num_axes
             )));
         }
-        Ok(values[..self.num_axes].to_vec())
+        Ok(values)
     }
 
     /// Join a target vector and append `verb` (`move`, `rmove`, or `setpos`).
@@ -382,11 +398,7 @@ impl AsynMotor for CorvusAxis {
 
         // C sscanf's into locals: a short reply leaves the position unset.
         let reply = ctrl.query("pos")?;
-        if let Some(position) = reply
-            .split_whitespace()
-            .filter_map(|tok| tok.parse::<f64>().ok())
-            .nth(self.axis_no())
-        {
+        if let Some(&position) = positions(&reply, self.num_axes).get(self.axis_no()) {
             status.set_position(position / self.axis_res());
             status.set_encoder_position(position / self.axis_res());
         }
@@ -404,15 +416,16 @@ impl AsynMotor for CorvusAxis {
             let sw = ctrl.query(&format!("{} getsw", self.axis_no() + 1))?;
             let (ignore_low, ignore_high) = self.members.read_limit_config(&sw);
 
-            // Switch state: "low high", 0=inactive 1=active.
+            // Switch state: "low high", 0=inactive 1=active, scanned into
+            // locals that a switch it does not convert leaves unset.
             let st = ctrl.query(&format!("{} getswst", self.axis_no() + 1))?;
-            let state: Vec<i32> = st
-                .split_whitespace()
-                .filter_map(|tok| tok.parse::<i32>().ok())
-                .collect();
-            if let [low, high, ..] = state.as_slice() {
-                status.low_limit = !ignore_low && *low != 0;
-                status.high_limit = !ignore_high && *high != 0;
+            let [low, high] = [0i64; 2].map(Cell::new);
+            let n = sscanf(&st, "%lli %lli", &[&low, &high]);
+            if n >= 1 {
+                status.low_limit = !ignore_low && low.get() != 0;
+            }
+            if n >= 2 {
+                status.high_limit = !ignore_high && high.get() != 0;
             }
 
             let drive_on = atoi(&ctrl.query(&format!("{} getmp", self.axis_no() + 1))?);
@@ -658,6 +671,83 @@ mod tests {
                 "2 nrm"
             ]
         );
+    }
+
+    /// Axis `axis_no` of `num_axes` whose `pos` and `getswst` replies are
+    /// these; pitch 4 over one pole pair makes `axisRes` 1.
+    fn scan_rig(
+        name: &str,
+        num_axes: usize,
+        axis_no: usize,
+        pos: &'static str,
+        swst: &'static str,
+    ) -> (motor_common::testing::LineRig, CorvusAxis) {
+        use motor_common::testing::LineRig;
+        let (line, handle) = LineRig::new(name, move |cmd| {
+            match cmd.trim_end().rsplit(' ').next().unwrap_or_default() {
+                "getpitch" => "4".into(),
+                "getpolepairs" | "getmp" => "1".into(),
+                "pos" => pos.into(),
+                "st" => "0".into(),
+                "getsw" => "0 0".into(),
+                "getswst" => swst.into(),
+                _ => String::new(),
+            }
+        });
+        let controller = Arc::new(Mutex::new(CorvusController::new(handle, num_axes)));
+        (line, CorvusAxis::new(controller, axis_no, "").unwrap())
+    }
+
+    fn scan_poll(
+        name: &str,
+        num_axes: usize,
+        axis_no: usize,
+        pos: &'static str,
+        swst: &'static str,
+    ) -> MotorStatus {
+        let (_line, mut axis) = scan_rig(name, num_axes, axis_no, pos, swst);
+        let mut status = MotorStatus::default();
+        axis.poll(&AsynUser::default(), &mut status).unwrap();
+        status
+    }
+
+    /// SMCcorvusDriver.cpp:403-408 scans `pos` with one `%lf` per axis: a
+    /// value is read by prefix, and none past where the scan stops.
+    #[test]
+    fn pos_is_scanned_as_c_sscanf() {
+        let s = scan_poll("corvusPosPrefix", 2, 0, "1.5x 2.0", "0 0");
+        assert_eq!(s.position(), 1.5);
+        let s = scan_poll("corvusPosHex", 2, 1, "0x10 0x1p3", "0 0");
+        assert_eq!(s.position(), 8.0);
+        let s = scan_poll("corvusPosStop", 2, 1, "1.5x 2.0 3.0", "0 0");
+        assert_eq!(s.position(), 0.0);
+    }
+
+    /// A move refuses a `pos` reply whose scan stops short of `num_axes`
+    /// (SMCcorvusDriver.cpp:258-264) rather than reading past the stop.
+    #[test]
+    fn a_move_refuses_a_pos_reply_its_scan_stops_in() {
+        let (line, mut axis) = scan_rig("corvusPosMove", 2, 1, "1.0x 2.0 3.0", "0 0");
+        line.sent();
+        assert!(
+            axis.move_absolute(&AsynUser::default(), 6.0, 0.0, 2.0, 4.0)
+                .is_err()
+        );
+        let sent = line.sent();
+        assert!(
+            !sent.iter().any(|s| s.trim_end().ends_with("move")),
+            "{sent:?}"
+        );
+    }
+
+    /// SMCcorvusDriver.cpp:455 scans `getswst` with `%i %i`: hex and octal
+    /// read, and a low switch read before the scan stops is set.
+    #[test]
+    fn getswst_is_scanned_as_c_sscanf() {
+        let s = scan_poll("corvusSwstBase", 1, 0, "0", "0x1 010");
+        assert_eq!((s.low_limit, s.high_limit), (true, true));
+        let s = scan_poll("corvusSwstStop", 1, 0, "0", "1 x");
+        assert_eq!((s.low_limit, s.high_limit), (true, false));
     }
 
     #[test]
