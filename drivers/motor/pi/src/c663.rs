@@ -91,9 +91,11 @@
 //!   in the C source — a vestige of the C-862 copy-paste): not ported.
 //! - **`no_motion_count`**: pure poll-rate scheduling counter, not tracked.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage,
@@ -147,17 +149,19 @@ fn decode_regs(regs: &[u16; 3]) -> StatusBits {
     }
 }
 
-/// Parse a `TS` reply's 3 two-hex-digit registers (`sscanf(buff,
-/// "S:%2hx %2hx %2hx")`); `None` if the `"S:"` prefix or all 3
-/// whitespace-separated hex fields aren't present.
+/// A `TS` reply's 3 registers as C `sscanf(buff, "S:%2hx %2hx %2hx\n")`
+/// reads them, at 64 bits so that a negated register C wraps into its
+/// `epicsUInt16` is `None`.
 fn parse_ts_reply(reply: &str) -> Option<[u16; 3]> {
-    let body = reply.strip_prefix("S:")?;
-    let mut regs = [0u16; 3];
-    let mut fields = body.split_whitespace();
-    for reg in regs.iter_mut() {
-        *reg = u16::from_str_radix(fields.next()?, 16).ok()?;
+    let [a, b, c] = [(); 3].map(|()| Cell::new(0u64));
+    if sscanf(reply, "S:%2llx %2llx %2llx\n", &[&a, &b, &c]) != 3 {
+        return None;
     }
-    Some(regs)
+    Some([
+        a.get().try_into().ok()?,
+        b.get().try_into().ok()?,
+        c.get().try_into().ok()?,
+    ])
 }
 
 /// Decoded result of one successful `TS`+`TP` exchange.
@@ -640,6 +644,19 @@ mod tests {
         assert_eq!(parse_ts_reply("S:02 05 00"), Some([0x02, 0x05, 0x00]));
         assert_eq!(parse_ts_reply("S:02"), None);
         assert_eq!(parse_ts_reply("garbage"), None);
+    }
+
+    /// drvPIC663.cc:220 scans `TS` with `"S:%2hx %2hx %2hx\n"`: at most two
+    /// hex digits a register, read by prefix.
+    #[test]
+    fn ts_reply_is_scanned_as_c_sscanf() {
+        assert_eq!(parse_ts_reply("S:020500"), Some([0x02, 0x05, 0x00]));
+        assert_eq!(parse_ts_reply("S:123 05"), Some([0x12, 0x03, 0x05]));
+        assert_eq!(parse_ts_reply("S:02 05 0Fz"), Some([0x02, 0x05, 0x0f]));
+        assert_eq!(parse_ts_reply("S:02 05"), None);
+        assert_eq!(parse_ts_reply(" S:02 05 00"), None);
+        // C wraps this into the `epicsUInt16` as 0xffff.
+        assert_eq!(parse_ts_reply("S:-1 05 00"), None);
     }
 
     #[test]
