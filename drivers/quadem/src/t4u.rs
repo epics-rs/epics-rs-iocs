@@ -1068,8 +1068,7 @@ fn middle_data_iteration(ctx: &DataContext, reader: &mut StreamReader) -> AsynRe
                 reader.flush();
                 return Ok(());
             };
-            let line = format!("r{}", String::from_utf8_lossy(&rest));
-            match proto::parse_read_line(&line) {
+            match proto::parse_read_line(&rest) {
                 Some(sample) => ctx.publish(vec![sample]),
                 None => reader.flush(),
             }
