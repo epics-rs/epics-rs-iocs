@@ -30,6 +30,7 @@
 //!   and send it as such through `setnlimit` and the jog `nm`. This port scales
 //!   the record limit by `axisRes`, so the cache stays in controller units.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -42,6 +43,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 
 use motor_common::util::{atof, atoi};
 
@@ -100,19 +102,19 @@ impl TaurusController {
         // C parses inString_ whatever writeReadController returned
         // (SMCTaurusAxis.cpp:186-187).
         let (reply, _) = self.exchange(&format!("{addr} getsw"));
-        let types: Vec<i32> = reply
-            .split_whitespace()
-            .map_while(|tok| tok.parse::<i32>().ok())
-            .take(2)
-            .collect();
-        if types.len() != 2 {
+        let types = [0i64; 2].map(Cell::new);
+        if sscanf(&reply, "%lli %lli", &[&types[0], &types[1]]) != 2 {
             println!("Could not parse getsw response.");
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("could not parse getsw response {reply:?}"),
             });
         }
-        Ok(types[index])
+        // C wraps a type past `int`; refused here.
+        i32::try_from(types[index].get()).map_err(|_| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("getsw response {reply:?} is past int"),
+        })
     }
 
     /// Write a query and read one reply line.
@@ -393,19 +395,13 @@ impl AsynMotor for TaurusAxis {
         let sw = ctrl.query(&format!("{addr} getsw"))?;
         let (ignore_low, ignore_high) = self.members.read_limit_config(&sw);
 
-        // Switch state: "low high", 0=inactive 1=active.
+        // Switch state: "low high", 0=inactive 1=active. A switch the scan
+        // does not convert, an unset local in C, is inactive.
         let st = ctrl.query(&format!("{addr} getswst"))?;
-        let state: Vec<i32> = st
-            .split_whitespace()
-            .filter_map(|tok| tok.parse::<i32>().ok())
-            .collect();
-        let (mut low_limit, mut high_limit) = (false, false);
-        if let [low, high, ..] = state.as_slice() {
-            low_limit = !ignore_low && *low != 0;
-            high_limit = !ignore_high && *high != 0;
-        }
-        status.low_limit = low_limit;
-        status.high_limit = high_limit;
+        let [low, high] = [0i64; 2].map(Cell::new);
+        sscanf(&st, "%lli %lli", &[&low, &high]);
+        status.low_limit = !ignore_low && low.get() != 0;
+        status.high_limit = !ignore_high && high.get() != 0;
 
         status.powered = (axis_status & STATUS_POWER_OFF) == 0;
         Ok(())
@@ -440,6 +436,50 @@ mod tests {
         assert_eq!((state.axis_res, state.travel_limits), (0.5, (-10.0, 20.0)));
         let ctrl = controller.lock().unwrap();
         assert_eq!(ctrl.limit_switches(1, 1).unwrap(), 3);
+    }
+
+    /// A Taurus axis whose `getsw`/`getswst` reply `sw`/`swst`.
+    fn switch_rig(
+        name: &str,
+        sw: &'static str,
+        swst: &'static str,
+    ) -> (motor_common::testing::LineRig, TaurusAxis) {
+        use motor_common::testing::LineRig;
+        let (line, handle) = LineRig::new(name, move |cmd| match cmd.trim_end() {
+            "1 getclperiod" => "1".into(),
+            "1 np" | "1 nst" => "0".into(),
+            "1 getsw" => sw.into(),
+            "1 getswst" => swst.into(),
+            _ => String::new(),
+        });
+        let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
+        (line, TaurusAxis::new(controller, 0, ""))
+    }
+
+    /// SMCTaurusAxis.cpp:188 scans `getsw` with `%i %i` and needs both.
+    #[test]
+    fn getsw_types_are_scanned_as_c_sscanf() {
+        let types = |name, sw| {
+            let (_line, axis) = switch_rig(name, sw, "0 0");
+            let ctrl = axis.lock();
+            [0, 1].map(|i| ctrl.limit_switches(1, i).ok())
+        };
+        assert_eq!(types("taurusSwBase", "0x2 010"), [Some(2), Some(8)]);
+        assert_eq!(types("taurusSwStop", "2x 3"), [None, None]);
+        assert_eq!(types("taurusSwWide", "4294967298 3"), [None, Some(3)]);
+    }
+
+    /// SMCTaurusAxis.cpp:321 scans `getswst` with `%i %i`: hex and octal
+    /// read, and a low switch read before the scan stops is set.
+    #[test]
+    fn getswst_is_scanned_as_c_sscanf() {
+        let limits = |name, swst| {
+            let (_line, mut axis) = switch_rig(name, "0 0", swst);
+            let s = axis.polled(&AsynUser::default()).unwrap();
+            (s.low_limit, s.high_limit)
+        };
+        assert_eq!(limits("taurusSwstBase", "0x1 010"), (true, true));
+        assert_eq!(limits("taurusSwstStop", "1 x"), (true, false));
     }
 
     /// C's poll prints the `nst` limit, e-stop and busy bits, and
