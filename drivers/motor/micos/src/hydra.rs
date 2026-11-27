@@ -26,6 +26,7 @@
 //!   later (a latent bug that discards it). This port honours the intent and
 //!   reports bit `0x200` as a problem.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -39,6 +40,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 
 use motor_common::util::{atof, atoi};
 
@@ -379,19 +381,13 @@ impl AsynMotor for HydraAxis {
         let sw = ctrl.query(&format!("{addr} getsw"))?;
         let (ignore_low, ignore_high) = self.members.read_limit_config(&sw);
 
-        // Switch state: "low high", 0=inactive 1=active.
+        // Switch state: "low high", 0=inactive 1=active. A switch the scan
+        // does not convert, an unset local in C, is inactive.
         let st = ctrl.query(&format!("{addr} getswst"))?;
-        let state: Vec<i32> = st
-            .split_whitespace()
-            .filter_map(|tok| tok.parse::<i32>().ok())
-            .collect();
-        let (mut low_limit, mut high_limit) = (false, false);
-        if let [low, high, ..] = state.as_slice() {
-            low_limit = !ignore_low && *low != 0;
-            high_limit = !ignore_high && *high != 0;
-        }
-        status.low_limit = low_limit;
-        status.high_limit = high_limit;
+        let [low, high] = [0i64; 2].map(Cell::new);
+        sscanf(&st, "%lli %lli", &[&low, &high]);
+        status.low_limit = !ignore_low && low.get() != 0;
+        status.high_limit = !ignore_high && high.get() != 0;
 
         status.powered = (axis_status & STATUS_POWER_OFF) == 0;
         Ok(())
@@ -435,6 +431,28 @@ mod tests {
                  acceleration=4.000000",
             ]
         );
+    }
+
+    /// SMChydraAxis.cpp:340 scans `getswst` with `%i %i`: hex and octal
+    /// read, and a low switch read before the scan stops is set.
+    #[test]
+    fn getswst_is_scanned_as_c_sscanf() {
+        use motor_common::testing::LineRig;
+        let poll = |name: &str, swst: &'static str| {
+            let (_line, handle) = LineRig::new(name, move |cmd| match cmd.trim_end() {
+                "1 getmotor" | "1 getpitch" | "1 getpolepairs" => "1".into(),
+                "1 np" | "1 nst" => "0".into(),
+                "1 getsw" => "0 0".into(),
+                "1 getswst" => swst.into(),
+                _ => String::new(),
+            });
+            let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+            let mut axis = HydraAxis::new(controller, 0, Arc::default(), "");
+            let s = axis.polled(&AsynUser::default()).unwrap();
+            (s.low_limit, s.high_limit)
+        };
+        assert_eq!(poll("hydraSwstBase", "0x1 010"), (true, true));
+        assert_eq!(poll("hydraSwstStop", "1 x"), (true, false));
     }
 
     /// A failed `nst` skips the rest of C's poll, but the position it read
