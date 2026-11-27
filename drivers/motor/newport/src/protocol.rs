@@ -15,6 +15,8 @@
 
 use epics_libcom_rs::cfmt::CFloat;
 
+use crate::util::atof;
+
 /// `<axis>VA<velocity>` — set moving velocity (controller EGU/sec).
 pub fn cmd_set_velocity(axis: u8, velocity_egu: f64) -> String {
     format!(
@@ -130,39 +132,6 @@ pub fn parse_status(resp: &str) -> Option<TsStatus> {
     })
 }
 
-/// Parse the leading floating-point number of `s`, in the manner of C `atof`:
-/// leading whitespace is skipped, the longest leading numeric run
-/// (`[+-]? digits '.' digits ('e'/'E' [+-]? digits)?`) is parsed, and any
-/// trailing bytes (e.g. a stray CR the port did not strip) are ignored.
-/// Returns `0.0` when no number is present, as `atof` does.
-fn atof(s: &str) -> f64 {
-    let s = s.trim_start();
-    let bytes = s.as_bytes();
-    let mut end = 0;
-    let mut seen_dot = false;
-    let mut seen_exp = false;
-    while end < bytes.len() {
-        let c = bytes[end];
-        let ok = match c {
-            b'0'..=b'9' => true,
-            b'+' | b'-' => end == 0 || bytes[end - 1] == b'e' || bytes[end - 1] == b'E',
-            b'.' => !seen_dot && !seen_exp,
-            b'e' | b'E' => !seen_exp && end > 0,
-            _ => false,
-        };
-        if !ok {
-            break;
-        }
-        match c {
-            b'.' => seen_dot = true,
-            b'e' | b'E' => seen_exp = true,
-            _ => {}
-        }
-        end += 1;
-    }
-    s[..end].parse().unwrap_or(0.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +169,14 @@ mod tests {
         assert_eq!(parse_value("1TP-0.123\r"), Some(-0.123));
         // Non-numeric tail yields 0.0, as C atof does.
         assert_eq!(parse_value("1TPxyz"), Some(0.0));
+    }
+
+    /// C `atof` reads the well-formed prefix of an exponent cut short.
+    #[test]
+    fn parse_value_reads_a_cut_short_exponent_as_atof() {
+        assert_eq!(parse_value("1TP1.5e"), Some(1.5));
+        assert_eq!(parse_value("1TP1.5e+"), Some(1.5));
+        assert_eq!(parse_value("1TP-2E"), Some(-2.0));
     }
 
     #[test]
