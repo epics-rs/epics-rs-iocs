@@ -4,7 +4,10 @@
 //! TCP data port. Commands are single letters with one argument, answered with
 //! a line that starts `OK>`; the data port streams one ASCII sample per line.
 
+use std::cell::Cell;
 use std::time::Duration;
+
+use epics_libcom_rs::runtime::scanf::sscanf;
 
 /// `BROADCAST_TIMEOUT` — how long discovery collects replies (`:34`).
 pub const BROADCAST_TIMEOUT: Duration = Duration::from_millis(200);
@@ -68,31 +71,43 @@ pub struct ModuleInfo {
 /// The discovery request (`:169`).
 pub const DISCOVER_COMMAND: &[u8] = b"i\n";
 
-/// Parse the broadcast replies: every `id: <n> ip: <addr>` pair in the buffer
-/// (`drvNSLS_EM.cpp:176-187`).
+/// Parse the broadcast replies as C++ walks them (`drvNSLS_EM.cpp:184-192`):
+/// `strstr` for `id:`, then `sscanf("id: %d%n")` and `sscanf(" ip: %s%n")`,
+/// each from where the last ended.
 ///
 /// C++ writes each pair into `moduleInfo_[numModules_++]`, a [`MAX_MODULES`]
 /// long array, with no bound on the loop: a network answering with more than
 /// 16 modules writes past the end of the member. Nothing is capped here — the
 /// list simply grows, so a module beyond the seventeenth is still found rather
-/// than dropped or overwriting memory.
+/// than dropped or overwriting memory. A scan that fails, which C++ steps
+/// past with a stale `count` and records anyway, adds no module.
 pub fn parse_discovery(buffer: &str) -> Vec<ModuleInfo> {
     let mut modules = Vec::new();
-    for chunk in buffer.split("id:").skip(1) {
-        let mut fields = chunk.split_whitespace();
-        let Some(module_id) = fields.next().and_then(|t| t.trim_matches(',').parse().ok()) else {
+    let mut ptr = buffer.split('\0').next().unwrap_or_default().as_bytes();
+    while let Some(at) = ptr.windows(3).position(|w| w == b"id:") {
+        ptr = &ptr[at..];
+        let (id, count) = (Cell::new(0i64), Cell::new(0i32));
+        if sscanf(ptr, "id: %lld%n", &[&id, &count]) != 1 {
+            ptr = &ptr[3..];
             continue;
-        };
-        // "ip:" then the address.
-        let ip = fields
-            .by_ref()
-            .skip_while(|t| *t != "ip:")
-            .nth(1)
-            .map(|t| t.trim_matches(',').to_string());
-        let Some(ip) = ip else { continue };
-        modules.push(ModuleInfo { module_id, ip });
+        }
+        ptr = &ptr[offset(&count)..];
+        let (start, end) = (Cell::new(0i32), Cell::new(0i32));
+        if sscanf(ptr, " ip: %n%s%n", &[&start, &(), &end]) != 1 {
+            continue;
+        }
+        let ip = String::from_utf8_lossy(&ptr[offset(&start)..offset(&end)]).into_owned();
+        ptr = &ptr[offset(&end)..];
+        if let Ok(module_id) = i32::try_from(id.get()) {
+            modules.push(ModuleInfo { module_id, ip });
+        }
     }
     modules
+}
+
+/// A `%n` count as an index into the scanned text.
+fn offset(count: &Cell<i32>) -> usize {
+    usize::try_from(count.get()).unwrap_or(0)
 }
 
 /// `setMode` (`:414-431`): bit 0 is *stopped*, bit 7 says the meter should tag
@@ -167,20 +182,37 @@ pub struct Sample {
     pub raw: [i32; 4],
 }
 
-/// `sscanf(ASCIIData, "%d: %d %d %d %d")` when the line carries a phase,
-/// `sscanf(ASCIIData, "%d %d %d %d")` when it does not.
+/// `sscanf(ASCIIData, "%d: %d %d %d %d")` when the line holds a `:`,
+/// `sscanf(ASCIIData, "%d %d %d %d")` when it does not (`:370-374`).
+///
+/// C++ ignores the count, so a short line keeps the previous line's counts;
+/// that and a count C++ would wrap into `int` are `None` here.
 pub fn parse_sample(line: &str) -> Option<Sample> {
-    let line = line.trim();
-    let (phase, rest) = match line.split_once(':') {
-        Some((phase, rest)) => (Some(phase.trim().parse().ok()?), rest),
-        None => (None, line),
+    let fields: [Cell<i64>; 5] = Default::default();
+    let [phase, raw @ ..] = &fields;
+    let tagged = line.contains(':');
+    let items = if tagged {
+        sscanf(
+            line,
+            "%lld: %lld %lld %lld %lld",
+            &[phase, &raw[0], &raw[1], &raw[2], &raw[3]],
+        )
+    } else {
+        sscanf(
+            line,
+            "%lld %lld %lld %lld",
+            &[&raw[0], &raw[1], &raw[2], &raw[3]],
+        )
     };
-    let mut counts = rest.split_whitespace();
-    let mut raw = [0i32; 4];
-    for slot in raw.iter_mut() {
-        *slot = counts.next()?.parse().ok()?;
+    if items != 4 + i32::from(tagged) {
+        return None;
     }
-    Some(Sample { phase, raw })
+    let int = |v: &Cell<i64>| i32::try_from(v.get()).ok();
+    let [a, b, c, d] = raw.each_ref().map(int);
+    Some(Sample {
+        phase: if tagged { Some(int(phase)?) } else { None },
+        raw: [a?, b?, c?, d?],
+    })
 }
 
 /// Should this sample be published, given the meter's ping-pong setting
@@ -214,16 +246,6 @@ pub struct Status {
     pub period_us: f64,
 }
 
-fn labelled<'a>(reply: &'a str, label: &str) -> Option<&'a str> {
-    let rest = reply.split_once(label)?.1;
-    let token = rest.split_whitespace().next()?;
-    Some(token.trim_matches(|c| c == ',' || c == '"'))
-}
-
-fn labelled_number<T: std::str::FromStr>(reply: &str, label: &str) -> Option<T> {
-    labelled(reply, label)?.parse().ok()
-}
-
 /// C++ requires all seven items; a short reply is an error and nothing is
 /// written back to the parameter library.
 pub fn parse_status(reply: &str) -> Option<Status> {
@@ -233,58 +255,67 @@ pub fn parse_status(reply: &str) -> Option<Status> {
     }
 }
 
-/// C++'s `sscanf` of the `s` reply: how many items it assigned before the
-/// first miss, and the values, the unassigned ones zero — the `numItems` and
-/// fields of `getStatus`'s error line.
+/// C++'s `sscanf` of the `s` reply (`:522-532`): how many items it assigned
+/// before the first miss, and the values, the unassigned ones zero — the
+/// `numItems` and fields of `getStatus`'s error line. With all seven read,
+/// the last byte of the address is cut, the comma C++ drops. An id or setting
+/// C++ would wrap into `int` ends the items there.
 pub fn scan_status(reply: &str) -> (usize, Status) {
-    let mut s = Status {
-        ip: String::new(),
-        module_id: 0,
-        firmware: String::new(),
-        mode: 0,
-        values_per_read: 0,
-        range: 0,
-        period_us: 0.0,
+    let spans: [Cell<i32>; 4] = Default::default();
+    let ints: [Cell<i64>; 4] = Default::default();
+    let period = Cell::new(0.0f64);
+    let [ip_start, ip_end, ver_start, ver_end] = &spans;
+    let [id, mode, values, range] = &ints;
+    let scanned = sscanf(
+        reply,
+        "OK> \"ip: %n%s%n id: %lld, ver: %n%s%n { m = %lld, n = %lld, r = %lld, p = %lf }\"",
+        &[
+            ip_start,
+            &(),
+            ip_end,
+            id,
+            ver_start,
+            &(),
+            ver_end,
+            mode,
+            values,
+            range,
+            &period,
+        ],
+    );
+    let scanned = usize::try_from(scanned).unwrap_or(0);
+    let items = [(2, id), (4, mode), (5, values), (6, range)]
+        .into_iter()
+        .find(|&(item, v)| item <= scanned && i32::try_from(v.get()).is_err())
+        .map_or(scanned, |(item, _)| item - 1);
+    let int = |item, v: &Cell<i64>| {
+        if item <= items {
+            i32::try_from(v.get()).unwrap_or(0)
+        } else {
+            0
+        }
     };
-    let mut items = 0;
-    'scan: {
-        let Some(v) = labelled(reply, "ip: ") else {
-            break 'scan;
-        };
-        s.ip = v.to_string();
-        items += 1;
-        let Some(v) = labelled_number(reply, "id: ") else {
-            break 'scan;
-        };
-        s.module_id = v;
-        items += 1;
-        let Some(v) = labelled(reply, "ver: ") else {
-            break 'scan;
-        };
-        s.firmware = v.to_string();
-        items += 1;
-        let Some(v) = labelled_number(reply, "m = ") else {
-            break 'scan;
-        };
-        s.mode = v;
-        items += 1;
-        let Some(v) = labelled_number(reply, "n = ") else {
-            break 'scan;
-        };
-        s.values_per_read = v;
-        items += 1;
-        let Some(v) = labelled_number(reply, "r = ") else {
-            break 'scan;
-        };
-        s.range = v;
-        items += 1;
-        let Some(v) = labelled_number(reply, "p = ") else {
-            break 'scan;
-        };
-        s.period_us = v;
-        items += 1;
+    let text = |item, start, end| {
+        if item <= items {
+            String::from_utf8_lossy(&reply.as_bytes()[offset(start)..offset(end)]).into_owned()
+        } else {
+            String::new()
+        }
+    };
+    let mut ip = text(1, ip_start, ip_end);
+    if items == 7 {
+        ip.pop();
     }
-    (items, s)
+    let status = Status {
+        ip,
+        module_id: int(2, id),
+        firmware: text(3, ver_start, ver_end),
+        mode: int(4, mode),
+        values_per_read: int(5, values),
+        range: int(6, range),
+        period_us: if items == 7 { period.get() } else { 0.0 },
+    };
+    (items, status)
 }
 
 /// `readStatus` (`:539-543`): the sample time doubles when only one phase of
@@ -429,5 +460,183 @@ mod tests {
     fn the_sample_time_doubles_for_a_single_phase() {
         assert_eq!(sample_time(400e-6, 5, PingPong::Both), 400e-6 * 5.0);
         assert_eq!(sample_time(400e-6, 1, PingPong::Phase0), 400e-6 * 2.0);
+    }
+
+    /// C++ `findModules` (drvNSLS_EM.cpp:184-192): `strstr` for `id:`, then
+    /// `sscanf("id: %d%n")` and `sscanf(" ip: %s%n")` from where each ended.
+    /// A scan C++ steps past with a stale `count` and an unwritten module,
+    /// and an id it would wrap into `int`, drop the module instead.
+    #[test]
+    fn discovery_replies_are_walked_as_c_sscanf() {
+        let cases: [(&str, &[(i32, &str)]); 13] = [
+            ("id:3 ip:10.0.0.1", &[(3, "10.0.0.1")]),
+            (
+                "id: 3 ip: 1.2.3.4, id: 4 ip: 5.6.7.8",
+                &[(3, "1.2.3.4,"), (4, "5.6.7.8")],
+            ),
+            (
+                "id: 3 ip: 10.0.0.1 junk id: 4 ip: 10.0.0.2",
+                &[(3, "10.0.0.1"), (4, "10.0.0.2")],
+            ),
+            ("xid: 5 ip: 1.1.1.1", &[(5, "1.1.1.1")]),
+            ("id: 3 ip: 1.2.3.4id: 4 ip: 5.6.7.8", &[(3, "1.2.3.4id:")]),
+            ("id: 3\nip: 1.2.3.4", &[(3, "1.2.3.4")]),
+            ("id: -2 ip: 1.1.1.1", &[(-2, "1.1.1.1")]),
+            (
+                "id: 3 ip: 255.255.255.255abcd",
+                &[(3, "255.255.255.255abcd")],
+            ),
+            ("id: +0x7 ip: 1.1.1.1", &[]),
+            ("id: 3000000000 ip: 1.1.1.1", &[]),
+            ("id: x id: 4 ip: 1.1.1.1", &[(4, "1.1.1.1")]),
+            ("id: 3", &[]),
+            ("id: 3 ip: 1.1.1.1\0id: 4 ip: 2.2.2.2", &[(3, "1.1.1.1")]),
+        ];
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(reply, want)| {
+                let want: Vec<_> = want
+                    .iter()
+                    .map(|&(module_id, ip)| ModuleInfo {
+                        module_id,
+                        ip: ip.into(),
+                    })
+                    .collect();
+                let got = parse_discovery(reply);
+                (got != want).then_some((reply, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// C++ `readThread` (drvNSLS_EM.cpp:370-374). It ignores the count, so a
+    /// short line keeps the previous line's counts; that and a count C would
+    /// wrap into `int` are `None` here.
+    #[test]
+    fn data_lines_are_scanned_as_c_sscanf() {
+        let cases = [
+            ("1 2 3 4x", Some((None, [1, 2, 3, 4]))),
+            ("1 2 3 0x5", Some((None, [1, 2, 3, 0]))),
+            ("  3: 1 2 3 4", Some((Some(3), [1, 2, 3, 4]))),
+            ("3:1 2 3 4", Some((Some(3), [1, 2, 3, 4]))),
+            ("+1: 2 3 4 5", Some((Some(1), [2, 3, 4, 5]))),
+            ("1 2 3 4 5", Some((None, [1, 2, 3, 4]))),
+            ("1\t2\n3\x0b4", Some((None, [1, 2, 3, 4]))),
+            ("3 : 1 2 3 4", None),
+            ("1 2 3 4 :", None),
+            ("1\u{a0}2 3 4", None),
+            ("1 2 3 3000000000", None),
+            ("1 2 3", None),
+            ("1: 2 3 4", None),
+            ("", None),
+        ];
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(line, want)| {
+                let want = want.map(|(phase, raw)| Sample { phase, raw });
+                let got = parse_sample(line);
+                (got != want).then_some((line, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// C++ `readStatus` (drvNSLS_EM.cpp:522-532): one `sscanf`, then the last
+    /// byte of `ipAddress_` dropped once all seven items are read. An id or
+    /// setting C would wrap into `int` ends the items there.
+    #[test]
+    fn the_status_reply_is_scanned_as_c_sscanf() {
+        #[allow(clippy::too_many_arguments)]
+        fn status(
+            ip: &str,
+            module_id: i32,
+            firmware: &str,
+            mode: i32,
+            values_per_read: i32,
+            range: i32,
+            period_us: f64,
+        ) -> Status {
+            Status {
+                ip: ip.into(),
+                module_id,
+                firmware: firmware.into(),
+                mode,
+                values_per_read,
+                range,
+                period_us,
+            }
+        }
+        let tail = "ver: 1.2.3 { m = 1, n = 5, r = 2, p = 400 }\"";
+        let cases = [
+            (
+                format!("OK>\"ip: 10.0.0.5, id: 3, {tail}"),
+                7,
+                status("10.0.0.5", 3, "1.2.3", 1, 5, 2, 400.0),
+            ),
+            (
+                "OK> \"ip: 10.0.0.5, id: 3, ver: 1.2.3 { m = 1, n = 5, r = 2, p = 4e2us }\"".into(),
+                7,
+                status("10.0.0.5", 3, "1.2.3", 1, 5, 2, 400.0),
+            ),
+            (
+                format!("OK> \"ip: 10.0.0.5 id: 3, {tail}"),
+                7,
+                status("10.0.0.", 3, "1.2.3", 1, 5, 2, 400.0),
+            ),
+            (
+                "OK> \"ip: 10.0.0.5, id: 3, ver: \"1.2\" { m = 1, n = 5, r = -2, p = -1.5 }\""
+                    .into(),
+                7,
+                status("10.0.0.5", 3, "\"1.2\"", 1, 5, -2, -1.5),
+            ),
+            (
+                "OK> \"ip: 10.0.0.5, id: 3, ver: 1.2.3 { m = 0x1, n = 5, r = 2, p = 400 }\"".into(),
+                4,
+                status("10.0.0.5,", 3, "1.2.3", 0, 0, 0, 0.0),
+            ),
+            (
+                "OK> \"ip: 10.0.0.5, id: 3, ver: 1.2.3 { m = 1, n = 5x, r = 2, p = 400 }\"".into(),
+                5,
+                status("10.0.0.5,", 3, "1.2.3", 1, 5, 0, 0.0),
+            ),
+            (
+                "OK> \"ip: 10.0.0.5, id:3,ver:1.2.3{m=1,n=5,r=2,p=400}\"".into(),
+                3,
+                status("10.0.0.5,", 3, "1.2.3{m=1,n=5,r=2,p=400}\"", 0, 0, 0, 0.0),
+            ),
+            (
+                "OK> \"ip: 10.0.0.5, id: 3\"".into(),
+                2,
+                status("10.0.0.5,", 3, "", 0, 0, 0, 0.0),
+            ),
+            (
+                "OK> \"ip: 10.0.0.5,\"".into(),
+                1,
+                status("10.0.0.5,\"", 0, "", 0, 0, 0, 0.0),
+            ),
+            (
+                format!("OK> \"ip: 10.0.0.5, id: 3000000000, {tail}"),
+                1,
+                status("10.0.0.5,", 0, "", 0, 0, 0, 0.0),
+            ),
+            (
+                format!("OK> \"id: 3, ip: 10.0.0.5, {tail}"),
+                0,
+                status("", 0, "", 0, 0, 0, 0.0),
+            ),
+            (
+                "OK \"ip: 10.0.0.5, id: 3\"".into(),
+                0,
+                status("", 0, "", 0, 0, 0, 0.0),
+            ),
+        ];
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(reply, items, want)| {
+                let got = scan_status(&reply);
+                (got != (items, want.clone())).then_some((reply, got, (items, want)))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
