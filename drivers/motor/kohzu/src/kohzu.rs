@@ -48,7 +48,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::scanf::{ScanTarget, sscanf};
 
 use motor_common::model1::{MoveStrings, init_poll, init_read};
-use motor_common::util::{long_to_int, nint, strtol};
+use motor_common::util::nint;
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 160;
@@ -91,27 +91,18 @@ enum CommState {
 
 /// The model and version an IDN reply names: C's `sscanf(buff,
 /// "C\tIDN0\t<model>\t%d", &version) == 1` for 800, 400 and 200
-/// (drvSC800.cc:565-567), each `\t` taking any run of blanks, none included.
+/// (drvSC800.cc:565-567), the version read at 64 bits so that one C would
+/// wrap to `int` is refused.
 fn identify(reply: &str) -> AsynResult<(i32, i32)> {
-    fn literal<'a>(s: &'a [u8], lit: &str) -> Option<&'a [u8]> {
-        let blanks = s
-            .iter()
-            .take_while(|&&c| matches!(c, b' ' | b'\t'..=b'\r'))
-            .count();
-        s[blanks..].strip_prefix(lit.as_bytes())
-    }
-    let idn = reply
-        .as_bytes()
-        .strip_prefix(b"C")
-        .and_then(|s| literal(s, "IDN0"));
     [800, 400, 200]
         .into_iter()
-        .find_map(
-            |model| match strtol(literal(idn?, &model.to_string())?, 10) {
-                (_, 0) => None,
-                (version, _) => Some((model, long_to_int(version))),
-            },
-        )
+        .find_map(|model| {
+            let version = Cell::new(0i64);
+            let fmt = format!("C\tIDN0\t{model}\t%lld");
+            (sscanf(reply, fmt.as_str(), &[&version]) == 1)
+                .then(|| Some((model, i32::try_from(version.get()).ok()?)))
+                .flatten()
+        })
         .ok_or_else(|| kohzu_err(format!("SC800: unrecognized IDN reply '{reply}'")))
 }
 
@@ -611,6 +602,8 @@ mod tests {
         );
         assert!(ident("kohzuIdnText", "C\tIDN0\t200\tVer1").is_err());
         assert!(ident("kohzuIdnLead", " C\tIDN0\t200\t1").is_err());
+        // C's `(int)` keeps the low 32 bits, Ver1.
+        assert!(ident("kohzuIdnWrap", "C\tIDN0\t800\t4294967297").is_err());
     }
 
     fn post(text: &[u8]) -> PostMessage {
