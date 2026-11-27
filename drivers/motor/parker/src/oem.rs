@@ -32,6 +32,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::stdlib::strtoll_errno;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, PortSets,
@@ -45,7 +46,7 @@ use epics_rs::motor::controller_port::{
     ControllerParams, FinishedWrite, WriteHook, WriteOutcome, WriteValue,
 };
 
-use motor_common::util::{atof, leading_hex};
+use motor_common::util::atof;
 use motor_common::{ControllerReport, controller_status};
 
 /// Response buffer size.
@@ -438,7 +439,7 @@ impl AsynMotor for OemAxis {
         } else {
             // Live step count in hex (skip the leading char); "*F" flags negative.
             let (w3, _) = ctrl.query(&format!("{addr}W3"))?;
-            let mut step = leading_hex(w3.get(1..).unwrap_or("")).unwrap_or(0) as f64;
+            let mut step = w3_count(&w3);
             status.direction = !w3.contains("*F");
             if !status.direction {
                 step -= TWO_POW_32;
@@ -483,6 +484,14 @@ impl AsynMotor for OemAxis {
         status.problem = read.is_err();
         read
     }
+}
+
+/// The live step count C++ reads from `W3` with `std::stol(inString_+1,
+/// nullptr, 16)` (OEMMotorDriver.cpp:369), at 64 bits so that a 32-bit
+/// `long` does not overflow on the `*F` counts; 0 where `stol` throws.
+fn w3_count(w3: &str) -> f64 {
+    let digits = w3.as_bytes().get(1..).unwrap_or_default();
+    strtoll_errno(digits, 16).map_or(0.0, |(count, _)| count as f64)
 }
 
 /// Decode the `IS` reply into a detected-switch code: 1 if the flag at offset 6
@@ -928,6 +937,18 @@ mod tests {
         assert_eq!(ramp_time(10.0, 2.0, 4.0), 2.0);
         // Zero acceleration must not divide by zero.
         assert_eq!(ramp_time(10.0, 0.0, 0.0), 0.0);
+    }
+
+    /// OEMMotorDriver.cpp:369 reads `W3` with the signed `std::stol(.., 16)`.
+    #[test]
+    fn w3_count_reads_as_stol() {
+        assert_eq!(w3_count("*-5"), -5.0);
+        assert_eq!(w3_count("*100000000"), 4_294_967_296.0);
+        assert_eq!(w3_count("*FFFFFF00"), 4_294_967_040.0);
+        assert_eq!(w3_count("* 0x1Fz"), 31.0);
+        // `stol` throws on these.
+        assert_eq!(w3_count("*"), 0.0);
+        assert_eq!(w3_count("*8000000000000000"), 0.0);
     }
 
     #[test]
