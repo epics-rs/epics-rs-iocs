@@ -35,9 +35,12 @@
 //!   commands within one line, so a long name followed by a short one leaves the
 //!   previous name's tail attached. Slicing cannot reproduce the class of bug.
 
+use std::cell::Cell;
 use std::fmt;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
+use epics_libcom_rs::runtime::stdlib::{strtoll_errno, strtoull_errno};
 
 use crate::ads::defs::AdsType;
 
@@ -337,9 +340,8 @@ pub fn ascii_to_binary(text: &str, plc: AdsType, buf_size: usize) -> Result<Vec<
 
     let mut out = Vec::new();
     for field in text.split(',') {
-        let t = field.trim();
-        let bytes = parse_element(plc, t).ok_or_else(|| OctetError::BadValue {
-            text: t.to_string(),
+        let bytes = parse_element(plc, field).ok_or_else(|| OctetError::BadValue {
+            text: field.trim().to_string(),
             plc,
         })?;
         if out.len() + elem > buf_size {
@@ -353,22 +355,54 @@ pub fn ascii_to_binary(text: &str, plc: AdsType, buf_size: usize) -> Result<Vec<
     Ok(out)
 }
 
-fn parse_element(plc: AdsType, t: &str) -> Option<Vec<u8>> {
+/// One element as C's `sscanf(field, "%" SCNd8, …)` and its siblings read
+/// it. An integer is read at 64 bits and must fit `plc`, so a value C would
+/// wrap into it is `None`.
+fn parse_element(plc: AdsType, field: &str) -> Option<Vec<u8>> {
     Some(match plc {
-        AdsType::Int8 => t.parse::<i8>().ok()?.to_le_bytes().to_vec(),
-        AdsType::UInt8 => t.parse::<u8>().ok()?.to_le_bytes().to_vec(),
+        AdsType::Int8 => i8::try_from(scan_i64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::UInt8 => u8::try_from(scan_u64(field)?).ok()?.to_le_bytes().to_vec(),
         // C reads a BIT with "%hhu": the text is a number, not "true"/"false".
-        AdsType::Bit => vec![u8::from(t.parse::<u8>().ok()? != 0)],
-        AdsType::Int16 => t.parse::<i16>().ok()?.to_le_bytes().to_vec(),
-        AdsType::UInt16 => t.parse::<u16>().ok()?.to_le_bytes().to_vec(),
-        AdsType::Int32 => t.parse::<i32>().ok()?.to_le_bytes().to_vec(),
-        AdsType::UInt32 => t.parse::<u32>().ok()?.to_le_bytes().to_vec(),
-        AdsType::Int64 => t.parse::<i64>().ok()?.to_le_bytes().to_vec(),
-        AdsType::UInt64 => t.parse::<u64>().ok()?.to_le_bytes().to_vec(),
-        AdsType::Real32 => t.parse::<f32>().ok()?.to_le_bytes().to_vec(),
-        AdsType::Real64 => t.parse::<f64>().ok()?.to_le_bytes().to_vec(),
+        AdsType::Bit => vec![u8::from(u8::try_from(scan_u64(field)?).ok()? != 0)],
+        AdsType::Int16 => i16::try_from(scan_i64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::UInt16 => u16::try_from(scan_u64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::Int32 => i32::try_from(scan_i64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::UInt32 => u32::try_from(scan_u64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::Int64 => scan_i64(field)?.to_le_bytes().to_vec(),
+        AdsType::UInt64 => scan_u64(field)?.to_le_bytes().to_vec(),
+        AdsType::Real32 => {
+            let v = Cell::new(0f32);
+            (sscanf(field, "%f", &[&v]) == 1).then(|| v.get().to_le_bytes().to_vec())?
+        }
+        AdsType::Real64 => {
+            let v = Cell::new(0f64);
+            (sscanf(field, "%lf", &[&v]) == 1).then(|| v.get().to_le_bytes().to_vec())?
+        }
         _ => return None,
     })
+}
+
+/// `sscanf(field, "%lld")`, except that a value it saturates is `None`:
+/// `sscanf` cannot report the `ERANGE`, so `strtoll` re-reads the number.
+fn scan_i64(field: &str) -> Option<i64> {
+    let (start, v) = (Cell::new(0i32), Cell::new(0i64));
+    if sscanf(field, " %n%lld", &[&start, &v]) != 1 {
+        return None;
+    }
+    strtoll_errno(&field.as_bytes()[start.get() as usize..], 10)?;
+    Some(v.get())
+}
+
+/// `sscanf(field, "%llu")`, except that a value it negates modulo 2^64 or
+/// saturates is `None`.
+fn scan_u64(field: &str) -> Option<u64> {
+    let (start, v) = (Cell::new(0i32), Cell::new(0u64));
+    if sscanf(field, " %n%llu", &[&start, &v]) != 1 {
+        return None;
+    }
+    let number = &field.as_bytes()[start.get() as usize..];
+    let negated = number.first() == Some(&b'-') && v.get() != 0;
+    (!negated && strtoull_errno(number, 10).is_some()).then(|| v.get())
 }
 
 /// `DUT_AxisStatus_v0_01`, as the C octet layer renders it.
@@ -700,6 +734,79 @@ mod tests {
             ascii_to_binary("70000", AdsType::UInt16, 2),
             Err(OctetError::BadValue { .. })
         ));
+    }
+
+    /// Each element is C's `sscanf` prefix after C whitespace, as gcc/glibc
+    /// read these; a value C wraps, saturates or negates is still refused.
+    #[test]
+    fn ascii_to_binary_reads_elements_as_sscanf() {
+        use AdsType as T;
+        let some = |b: &[u8]| Some(b.to_vec());
+        let cases: &[(&str, AdsType, Option<Vec<u8>>)] = &[
+            ("5x", T::Int8, some(&[5])),
+            ("\t-3 ", T::Int8, some(&(-3i8).to_le_bytes())),
+            ("+3", T::Int8, some(&[3])),
+            ("0x10", T::Int8, some(&[0])),
+            ("1.9", T::Int8, some(&[1])),
+            ("5\u{a0}", T::Int8, some(&[5])),
+            ("\u{a0}5", T::Int8, None),
+            ("-", T::Int8, None),
+            ("", T::Int8, None),
+            ("200", T::Int8, None),
+            (" 42z", T::UInt8, some(&[42])),
+            ("1e2", T::UInt8, some(&[1])),
+            ("-0", T::UInt8, some(&[0])),
+            ("-5", T::UInt8, None),
+            ("256", T::UInt8, None),
+            ("+9", T::Bit, some(&[1])),
+            ("-5", T::Bit, None),
+            ("65535x", T::UInt16, some(&u16::MAX.to_le_bytes())),
+            ("70000", T::UInt16, None),
+            ("-32769", T::Int16, None),
+            ("-2147483648", T::Int32, some(&i32::MIN.to_le_bytes())),
+            ("2147483648", T::Int32, None),
+            ("-1", T::UInt32, None),
+            ("12ab", T::Int64, some(&12i64.to_le_bytes())),
+            (
+                "9223372036854775807",
+                T::Int64,
+                some(&i64::MAX.to_le_bytes()),
+            ),
+            ("9223372036854775808", T::Int64, None),
+            ("-9223372036854775809", T::Int64, None),
+            (
+                "18446744073709551615",
+                T::UInt64,
+                some(&u64::MAX.to_le_bytes()),
+            ),
+            ("-0", T::UInt64, some(&0u64.to_le_bytes())),
+            ("18446744073709551616", T::UInt64, None),
+            ("-5", T::UInt64, None),
+            ("1.5x", T::Real32, some(&1.5f32.to_le_bytes())),
+            ("0x1p3", T::Real32, some(&8f32.to_le_bytes())),
+            (
+                "1.25e-3junk",
+                T::Real32,
+                some(&0x3aa3_d70a_u32.to_le_bytes()),
+            ),
+            ("-nan", T::Real32, some(&0xffc0_0000_u32.to_le_bytes())),
+            ("1e40", T::Real32, some(&f32::INFINITY.to_le_bytes())),
+            ("e5", T::Real32, None),
+            // glibc >= 2.42 (BZ #12701) refuses the bare exponent.
+            ("1e", T::Real32, None),
+            ("0x1.8p1", T::Real64, some(&3f64.to_le_bytes())),
+            ("1.25e-3junk", T::Real64, some(&1.25e-3f64.to_le_bytes())),
+            ("INFINITY", T::Real64, some(&f64::INFINITY.to_le_bytes())),
+            ("1x,2y", T::Int16, some(&[1, 0, 2, 0])),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(text, plc, want)| {
+                let got = ascii_to_binary(text, *plc, 8).ok();
+                (got != *want).then_some((text, plc, got))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
