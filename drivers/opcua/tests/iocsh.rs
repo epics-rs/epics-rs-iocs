@@ -30,6 +30,8 @@ fn registry() -> Arc<Registry> {
 
 /// The errlog lines `f` prints.
 fn lines(f: impl FnOnce()) -> Vec<String> {
+    // Lines still queued from before are not `f`'s.
+    errlog_flush();
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let id = errlog_add_listener({
         let lines = lines.clone();
