@@ -32,10 +32,12 @@
 //! - The ANC150 reports no home/limit switches (C `axisStatus` is never set),
 //!   so those status bits are always clear.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::manager::PortManager;
@@ -337,9 +339,13 @@ impl Anc150Axis {
     }
 }
 
-/// Parse a `getf` reply `frequency = %d` into the step rate.
+/// C `sscanf(reply, "frequency = %d", &f) == 1` on a `getf` reply, read
+/// at `long long` so that a value C would truncate to `int` is `None`.
 fn parse_frequency(reply: &str) -> Option<i64> {
-    reply.strip_prefix("frequency = ")?.trim().parse().ok()
+    let f = Cell::new(0i64);
+    (sscanf(reply, "frequency = %lld", &[&f]) == 1)
+        .then(|| i32::try_from(f.get()).ok().map(i64::from))
+        .flatten()
 }
 
 impl AsynMotor for Anc150Axis {
@@ -703,6 +709,17 @@ mod tests {
         assert_eq!(parse_frequency("frequency = 400"), Some(400));
         assert_eq!(parse_frequency("frequency = 1000 "), Some(1000));
         assert_eq!(parse_frequency("mode = stp"), None);
+    }
+
+    /// drvANC150Asyn.cc:889 `"frequency = %d"`: a blank matches any run of
+    /// white space, and the number ends where `%d` stops.
+    #[test]
+    fn parse_frequency_reads_as_sscanf() {
+        assert_eq!(parse_frequency("frequency = 1000 Hz"), Some(1000));
+        assert_eq!(parse_frequency("frequency=\t5"), Some(5));
+        assert_eq!(parse_frequency(" frequency = 5"), None);
+        // C keeps the low 32 bits.
+        assert_eq!(parse_frequency("frequency = 3000000000"), None);
     }
 
     /// drvANC150Asyn.cc:532-546: a GET_INFO's motorAxisforceCallback prints
