@@ -78,8 +78,8 @@ use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::recgbl::alarm_status;
 
 use crate::ads::defs::{
-    ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, ADSIGRP_SYM_VERSION, GLOBALERR_TARGET_PORT,
-    LOCAL_PORT_BASE, error_to_string,
+    ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, ADSIGRP_SYM_VERSION, AmsNetIdParseError,
+    GLOBALERR_TARGET_PORT, LOCAL_PORT_BASE, error_to_string,
 };
 use crate::ads::sumup::{self, SumEntry};
 use crate::ads::{
@@ -2177,9 +2177,21 @@ static LOCAL_NET_ID: Mutex<AmsNetId> = Mutex::new(AmsNetId([0; 6]));
 /// `adsAsynPortObj`; this driver allows several PLCs in one IOC).
 static PORTS: Mutex<Vec<(String, Arc<AdsShared>)>> = Mutex::new(Vec::new());
 
-/// iocsh `adsSetLocalAddress` — the AMS Net Id this IOC answers to.
-pub fn set_local_address(net_id: AmsNetId) {
+/// iocsh `adsSetLocalAddress` (adsAsynPortDriver.cpp:5296-5306) — the AMS
+/// Net Id this IOC answers to.
+pub fn set_local_address(text: &str) -> Result<AmsNetId, AmsNetIdParseError> {
+    let net_id = parse_local_address(text)?;
     *LOCAL_NET_ID.lock() = net_id;
+    Ok(net_id)
+}
+
+/// C refuses text under eleven bytes, then reads it with `AmsNetId`'s string
+/// constructor, not the remote id's `sscanf`.
+fn parse_local_address(text: &str) -> Result<AmsNetId, AmsNetIdParseError> {
+    (text.len() >= 11)
+        .then(|| AmsNetId::from_dotted(text))
+        .flatten()
+        .ok_or_else(|| AmsNetIdParseError(text.to_string()))
 }
 
 fn local_net_id() -> AmsNetId {
@@ -2262,6 +2274,36 @@ mod tests {
     use epics_rs::base::server::ioc_app::init_hook_announce;
 
     use super::*;
+
+    /// C's `adsSetLocalAddress` length gate and `AmsNetId(const std::string&)`:
+    /// each field is `atoi`'s, so blank, junk-led and junk-tailed fields read
+    /// as C reads them. Refused where C stores the empty id (field count) or
+    /// wraps a field (`% 256`, `atoi`'s `int`).
+    #[test]
+    fn local_address_reads_as_c() {
+        let cases: &[(&str, Option<[u8; 6]>)] = &[
+            ("1.2.3.4.5.6", Some([1, 2, 3, 4, 5, 6])),
+            ("10..2.3.4.5", Some([10, 0, 2, 3, 4, 5])),
+            ("1x.2.3.4.5.6", Some([1, 2, 3, 4, 5, 6])),
+            ("1 .2.3.4.5.6", Some([1, 2, 3, 4, 5, 6])),
+            ("0x1.2.3.4.5.6", Some([0, 2, 3, 4, 5, 6])),
+            ("a.b.c.d.e.f", Some([0; 6])),
+            (" +1.2.3.4.5.6.", Some([1, 2, 3, 4, 5, 6])),
+            ("1.2.3.4.5.6.7", None),        // C: 0.0.0.0.0.0
+            ("1.2.3.4.5.6..", None),        // C: 0.0.0.0.0.0
+            ("1.2.3.4.5.-1", None),         // C: 1.2.3.4.5.255
+            ("1.2.3.4.5.4294967297", None), // C: 1.2.3.4.5.1
+            ("1..2.3.4.5", None),           // under eleven bytes
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|&(s, want)| {
+                let got = parse_local_address(s).ok().map(|id| id.0);
+                (got != want).then_some((s, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     fn driver() -> AdsPortDriver {
         let cfg = AdsConfig::new("ADS1", "10.0.0.1", AmsNetId([10, 0, 0, 1, 1, 1]), 851);

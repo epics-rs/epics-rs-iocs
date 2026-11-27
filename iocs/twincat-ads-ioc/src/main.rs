@@ -73,9 +73,7 @@ async fn main() -> CaResult<()> {
             "adsSetLocalAddress localAmsNetId",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let text = arg_string(args, 0)?.ok_or("localAmsNetId required")?;
-                let net_id =
-                    AmsNetId::from_str(&text).map_err(|e| format!("localAmsNetId: {e}"))?;
-                twincat_ads::set_local_address(net_id);
+                twincat_ads::set_local_address(&text).map_err(|e| format!("localAmsNetId: {e}"))?;
                 Ok(CommandOutcome::Continue)
             },
         ));

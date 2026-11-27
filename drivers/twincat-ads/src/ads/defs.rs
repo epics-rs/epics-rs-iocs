@@ -8,6 +8,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use epics_libcom_rs::runtime::scanf::sscanf;
+use epics_libcom_rs::runtime::stdlib::strtol;
 
 /// TCP port of the AMS router on a TwinCAT system.
 pub const ADS_TCP_SERVER_PORT: u16 = 0xBF02; // 48898
@@ -65,6 +66,18 @@ impl AmsNetId {
     pub fn from_ipv4(ip: std::net::Ipv4Addr) -> Self {
         let o = ip.octets();
         Self([o[0], o[1], o[2], o[3], 1, 1])
+    }
+
+    /// C's `AmsNetId(const std::string&)` (AmsNetId.cpp:31-46): `getline` on
+    /// `.`, each field read by `atoi`, six fields exactly. `None` where C
+    /// stores the empty id instead, or where its `% 256` wraps a field.
+    pub fn from_dotted(addr: &str) -> Option<Self> {
+        let mut b = [0u8; 6];
+        let mut fields = addr.split_terminator('.');
+        for o in &mut b {
+            *o = u8::try_from(strtol(fields.next()?, 10).0).ok()?;
+        }
+        fields.next().is_none().then_some(Self(b))
     }
 
     /// `true` for the all-zero id — C's `AmsNetId::operator bool`, used to mean
