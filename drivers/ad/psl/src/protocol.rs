@@ -274,15 +274,15 @@ impl ImageHeader {
         }
     }
 
-    /// Bytes the announced geometry actually occupies.
-    pub fn expected_bytes(&self) -> usize {
+    /// Bytes the announced geometry actually occupies, `None` past `usize`.
+    pub fn expected_bytes(&self) -> Option<usize> {
         let per_pixel = self.data_type.element_size()
             * if self.color_mode == NDColorMode::RGB1 {
                 3
             } else {
                 1
             };
-        self.width * self.height * per_pixel
+        self.width.checked_mul(self.height)?.checked_mul(per_pixel)
     }
 }
 
@@ -343,7 +343,9 @@ pub fn parse_image_header(reply: &[u8]) -> Result<ImageHeader, ProtocolError> {
     if header.width == 0 || header.height == 0 {
         return Err(ProtocolError::BadImageHeader);
     }
-    let expected = header.expected_bytes();
+    let expected = header
+        .expected_bytes()
+        .ok_or(ProtocolError::BadImageHeader)?;
     if header.data_len != expected {
         return Err(ProtocolError::ImageSizeMismatch {
             announced: header.data_len,
@@ -719,7 +721,7 @@ mod tests {
         let h = parse_image_header(b"RGB;2;2;12;").unwrap();
         assert_eq!(h.color_mode, NDColorMode::RGB1);
         assert_eq!(h.dims(), vec![3, 2, 2]);
-        assert_eq!(h.expected_bytes(), 12);
+        assert_eq!(h.expected_bytes(), Some(12));
     }
 
     #[test]
@@ -762,6 +764,41 @@ mod tests {
                 expected: 24,
             })
         );
+    }
+
+    /// 65536 x 65536 16-bit pixels are 2^33 bytes: a size mismatch with any
+    /// announced count on a 64-bit host, a bad header where `usize` is 32
+    /// bits and the product does not fit.
+    #[test]
+    fn parse_image_header_handles_a_geometry_past_u32_max() {
+        let reply = b"I;16;65536;65536;8;";
+        let h = ImageHeader {
+            data_type: NDDataType::UInt16,
+            color_mode: NDColorMode::Mono,
+            width: 65536,
+            height: 65536,
+            data_len: 8,
+            header_len: 19,
+        };
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(h.expected_bytes(), Some(1 << 33));
+            assert_eq!(
+                parse_image_header(reply),
+                Err(ProtocolError::ImageSizeMismatch {
+                    announced: 8,
+                    expected: 1 << 33,
+                })
+            );
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            assert_eq!(h.expected_bytes(), None);
+            assert_eq!(
+                parse_image_header(reply),
+                Err(ProtocolError::BadImageHeader)
+            );
+        }
     }
 
     // --- commands ---------------------------------------------------------
