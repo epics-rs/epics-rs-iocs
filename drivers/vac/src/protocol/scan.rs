@@ -1,124 +1,59 @@
-//! Minimal C `sscanf` conversion primitives.
+//! C `sscanf` conversions one at a time.
 //!
 //! The vac device supports parse fixed-layout replies with `sscanf` format
-//! strings such as `"%f%c%x"`, `"%2d%c%x"` and `"%3d%c%2d"`. Reproducing the
-//! wire parse faithfully means reproducing C's conversion rules, not Rust's
-//! `str::parse` rules:
-//!
-//! * numeric conversions (`%d`, `%x`, `%e`, `%f`) skip leading whitespace;
-//!   `%c` does not;
-//! * a conversion consumes the longest valid prefix and leaves the rest for
-//!   the next conversion — `"1.23-7"` under `"%f%c%x"` yields `1.23`, `'-'`,
-//!   `7`;
-//! * a failed conversion leaves the caller's variable untouched. Callers get
-//!   `None` here and keep the previous value themselves.
-//!
-//! Widths (`%2d`, `%3d`) cap the number of characters the conversion may
-//! consume after the whitespace skip, as in C.
+//! strings such as `"%f%c%x"`, `"%2d%c%x"` and `"%3d%c%2d"`. Each primitive
+//! here is one [`sscanf`] call with the conversion, its width and `%n`, so
+//! blanks, widths and the longest valid prefix are glibc's: `"1.23-7"` under
+//! `"%f%c%x"` yields `1.23`, `'-'`, `7`. A failed conversion is `None`, and
+//! the caller keeps its previous value as C leaves its variable untouched.
 
-/// C's `isspace` for the "C" locale.
-fn is_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+use std::cell::Cell;
+
+use epics_libcom_rs::runtime::scanf::{ScanNum, sscanf};
+use epics_libcom_rs::runtime::stdlib::strtoll_errno;
+
+/// `sscanf(s, "%<width><conv>%n", &v, &n) == 1`: the value and the bytes read.
+fn scan<T: ScanNum + Default>(s: &[u8], width: Option<usize>, conv: &str) -> Option<(T, usize)> {
+    let fmt = match width {
+        Some(w) => format!("%{w}{conv}%n"),
+        None => format!("%{conv}%n"),
+    };
+    let (v, n) = (Cell::new(T::default()), Cell::new(0i32));
+    (sscanf(s, fmt, &[&v, &n]) == 1).then(|| (v.get(), n.get() as usize))
 }
 
-fn skip_ws(s: &[u8]) -> &[u8] {
-    let n = s.iter().take_while(|&&b| is_space(b)).count();
-    &s[n..]
-}
-
-/// Bytes a width-limited conversion may look at, after the whitespace skip.
-fn window(s: &[u8], width: Option<usize>) -> &[u8] {
-    match width {
-        Some(w) => &s[..w.min(s.len())],
-        None => s,
-    }
+/// The field `conv` reads, valued by `strtoll` so that one past `long long`,
+/// which glibc saturates, is `None`.
+fn integer<'a>(
+    s: &'a [u8],
+    width: Option<usize>,
+    conv: &str,
+    base: u32,
+) -> Option<(i64, &'a [u8])> {
+    let (_, n) = scan::<i64>(s, width, conv)?;
+    let (v, _) = strtoll_errno(&s[..n], base)?;
+    Some((v, &s[n..]))
 }
 
 /// C `%c`: take exactly one character, no whitespace skip.
 pub fn scan_char(s: &[u8]) -> Option<(u8, &[u8])> {
-    s.split_first().map(|(&c, rest)| (c, rest))
-}
-
-/// Consume an optional `+`/`-` sign, returning `(negative, rest)`.
-fn sign(s: &[u8]) -> (bool, &[u8]) {
-    match s.split_first() {
-        Some((b'-', rest)) => (true, rest),
-        Some((b'+', rest)) => (false, rest),
-        _ => (false, s),
-    }
+    scan(s, None, "c").map(|(c, n)| (c, &s[n..]))
 }
 
 /// C `%d` (optionally width-limited). Returns the value and the unconsumed
-/// tail of the *original* slice.
+/// tail.
 pub fn scan_int(s: &[u8], width: Option<usize>) -> Option<(i64, &[u8])> {
-    let after_ws = skip_ws(s);
-    let win = window(after_ws, width);
-    let (neg, digits) = sign(win);
-    let n = digits.iter().take_while(|b| b.is_ascii_digit()).count();
-    if n == 0 {
-        return None;
-    }
-    let mag: i64 = std::str::from_utf8(&digits[..n]).ok()?.parse().ok()?;
-    let consumed = (win.len() - digits.len()) + n;
-    Some((if neg { -mag } else { mag }, &after_ws[consumed..]))
+    integer(s, width, "lld", 10)
 }
 
 /// C `%x` (optionally width-limited).
 pub fn scan_hex(s: &[u8], width: Option<usize>) -> Option<(i64, &[u8])> {
-    let after_ws = skip_ws(s);
-    let win = window(after_ws, width);
-    let (neg, digits) = sign(win);
-    let n = digits.iter().take_while(|b| b.is_ascii_hexdigit()).count();
-    if n == 0 {
-        return None;
-    }
-    let mag = i64::from_str_radix(std::str::from_utf8(&digits[..n]).ok()?, 16).ok()?;
-    let consumed = (win.len() - digits.len()) + n;
-    Some((if neg { -mag } else { mag }, &after_ws[consumed..]))
+    integer(s, width, "llx", 16)
 }
 
 /// C `%e` / `%f` / `%le` / `%lf` (optionally width-limited).
-///
-/// Accepts `[+-]?digits[.digits][(e|E)[+-]?digits]`. An exponent marker with
-/// no following digits is not part of the number (C backs up), so `"1.2e"`
-/// converts `1.2` and leaves `"e"`.
 pub fn scan_float(s: &[u8], width: Option<usize>) -> Option<(f64, &[u8])> {
-    let after_ws = skip_ws(s);
-    let win = window(after_ws, width);
-
-    let mut i = 0;
-    if matches!(win.first(), Some(b'+' | b'-')) {
-        i += 1;
-    }
-    let int_digits = win[i..].iter().take_while(|b| b.is_ascii_digit()).count();
-    i += int_digits;
-    let mut frac_digits = 0;
-    if win.get(i) == Some(&b'.') {
-        let after_dot = i + 1;
-        frac_digits = win[after_dot..]
-            .iter()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
-        i = after_dot + frac_digits;
-    }
-    if int_digits == 0 && frac_digits == 0 {
-        return None;
-    }
-
-    // Exponent, only if it is complete.
-    if matches!(win.get(i), Some(b'e' | b'E')) {
-        let mut j = i + 1;
-        if matches!(win.get(j), Some(b'+' | b'-')) {
-            j += 1;
-        }
-        let exp_digits = win[j..].iter().take_while(|b| b.is_ascii_digit()).count();
-        if exp_digits > 0 {
-            i = j + exp_digits;
-        }
-    }
-
-    let value: f64 = std::str::from_utf8(&win[..i]).ok()?.parse().ok()?;
-    Some((value, &after_ws[i..]))
+    scan(s, width, "lf").map(|(v, n)| (v, &s[n..]))
 }
 
 #[cfg(test)]
@@ -174,12 +109,21 @@ mod tests {
         assert_eq!(scan_char(b" f").unwrap().0, b' ');
     }
 
+    /// glibc 2.43's `%f` fails an exponent cut short, where `strtod` would
+    /// back up to the mantissa.
     #[test]
-    fn scientific_notation_parses_and_incomplete_exponent_backs_up() {
+    fn scientific_notation_parses_and_a_cut_short_exponent_fails() {
         assert_eq!(scan_float(b"1.23E-07", None).unwrap().0, 1.23e-7);
-        let (v, rest) = scan_float(b"1.2e", None).unwrap();
-        assert_eq!(v, 1.2);
-        assert_eq!(rest, b"e");
+        assert!(scan_float(b"1.2e", None).is_none());
+        assert!(scan_float(b"1.2e+", None).is_none());
+    }
+
+    #[test]
+    fn conversions_read_what_glibc_sscanf_reads() {
+        assert_eq!(scan_hex(b"0x1f", None), Some((31, &b""[..])));
+        assert_eq!(scan_float(b"inf", None), Some((f64::INFINITY, &b""[..])));
+        assert_eq!(scan_float(b"0x1p3V", None), Some((8.0, &b"V"[..])));
+        assert_eq!(scan_hex(b" -5", None), Some((-5, &b""[..])));
     }
 
     #[test]
