@@ -10,6 +10,10 @@
 //! position and derives the following error `actual - setpoint`; positions are
 //! device/positioner units.
 
+use std::cell::Cell;
+
+use epics_libcom_rs::runtime::scanf::sscanf;
+
 /// Gathering values sampled per axis (`SetpointPosition` + `CurrentPosition`,
 /// C `NUM_GATHERING_ITEMS`).
 pub const NUM_GATHERING_ITEMS: usize = 2;
@@ -38,9 +42,9 @@ impl GatheringReadback {
 }
 
 /// Append the lines of one `GatheringDataMultipleLinesGet` buffer to
-/// `readback`, expecting [`NUM_GATHERING_ITEMS`] `;`-separated doubles per
-/// axis on every line (C parses `"%lf;%lf"` per axis and fails the readback on
-/// a short line). Returns the number of lines consumed.
+/// `readback`, scanning each axis as C does with `sscanf("%lf;%lf%n")` and
+/// stepping one byte past it; a scan short of [`NUM_GATHERING_ITEMS`] fails
+/// the readback. Returns the number of lines consumed.
 pub fn parse_gathering_buffer(
     buffer: &str,
     num_axes: usize,
@@ -52,25 +56,20 @@ pub fn parse_gathering_buffer(
         if line.is_empty() {
             continue;
         }
-        let mut fields = line
-            .split(';')
-            .filter(|f| !f.trim().is_empty())
-            .map(|f| f.trim().parse::<f64>().ok());
+        let mut rest = line.as_bytes();
         let mut sample = Vec::with_capacity(num_axes);
         for _ in 0..num_axes {
-            // C `sscanf("%lf;%lf")` per axis: nitems is how many leading
-            // values parsed.
-            let setpoint = fields.next().flatten();
-            let actual = setpoint.and(fields.next().flatten());
-            match (setpoint, actual) {
-                (Some(setpoint), Some(actual)) => sample.push((setpoint, actual)),
-                _ => {
-                    let nitems = usize::from(setpoint.is_some());
-                    return Err(format!(
-                        "Error reading Gathering.dat file, nitems={nitems}, should be {NUM_GATHERING_ITEMS}"
-                    ));
-                }
+            let [setpoint, actual] = [0.0; 2].map(Cell::new);
+            let end = Cell::new(0i32);
+            let nitems = sscanf(rest, "%lf;%lf%n", &[&setpoint, &actual, &end]);
+            if nitems != NUM_GATHERING_ITEMS as i32 {
+                return Err(format!(
+                    "Error reading Gathering.dat file, nitems={nitems}, should be {NUM_GATHERING_ITEMS}"
+                ));
             }
+            // Past the line end C reads on into the next line; here nothing.
+            rest = rest.get(end.get() as usize + 1..).unwrap_or_default();
+            sample.push((setpoint.get(), actual.get()));
         }
         for (axis, (setpoint, actual)) in sample.into_iter().enumerate() {
             readback.actuals[axis].push(actual);
@@ -119,13 +118,36 @@ mod tests {
 
     #[test]
     fn short_line_is_an_error() {
-        // C: nitems != NUM_GATHERING_ITEMS fails the readback.
+        // C scans past the line end, where the last line holds nothing.
         let mut rb = GatheringReadback::new(2);
         let err = parse_gathering_buffer("1.0;1.5\n", 2, &mut rb).unwrap_err();
         assert_eq!(
             err,
-            "Error reading Gathering.dat file, nitems=0, should be 2"
+            "Error reading Gathering.dat file, nitems=-1, should be 2"
         );
+    }
+
+    /// XPSController.cpp:1270 scans each axis with `sscanf("%lf;%lf%n")` and
+    /// steps one byte past it.
+    #[test]
+    fn axes_are_scanned_as_c_sscanf() {
+        let parse = |buf: &str, axes| {
+            let mut rb = GatheringReadback::new(axes);
+            parse_gathering_buffer(buf, axes, &mut rb).map(|_| rb.actuals)
+        };
+        let nitems = |n: i32| {
+            Err(format!(
+                "Error reading Gathering.dat file, nitems={n}, should be 2"
+            ))
+        };
+        assert_eq!(parse("1.0;1.5abc", 1), Ok(vec![vec![1.5]]));
+        assert_eq!(parse("0x1p1;2", 1), Ok(vec![vec![2.0]]));
+        assert_eq!(parse("1;2 3;4", 2), Ok(vec![vec![2.0], vec![4.0]]));
+        assert_eq!(parse("1.0 ;1.5", 1), nitems(1));
+        assert_eq!(parse("1.0;;1.5", 1), nitems(1));
+        assert_eq!(parse("1;2;;3;4", 2), nitems(0));
+        // C reads the second axis from the next line.
+        assert_eq!(parse("1.0;1.5\n2.0;2.5", 2), nitems(-1));
     }
 
     #[test]
