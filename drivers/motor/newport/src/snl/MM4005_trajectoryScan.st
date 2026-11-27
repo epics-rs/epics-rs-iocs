@@ -86,6 +86,10 @@ int buildTimeMode;
 int buildMoveAxis[MAX_AXES];
 int buildMoved;
 int buildAxes;
+/* State build's times: its copy of timeTrajectory, which no monitor writes.
+ * Upstream padded and sent timeTrajectory itself, where the monitor of its
+ * own first pvPut could restore the unpadded times before the DT lines. */
+double buildTime[MAX_ELEMENTS];
 int dir;
 double dtime;
 double dpos;
@@ -239,6 +243,7 @@ ss trajectoryScan {
                 buildMoveAxis[j] = moveAxis[j];
                 if (buildMoveAxis[j]) buildMoved = 1;
             }
+            %%memcpy(pVar->buildTime, pVar->timeTrajectory, sizeof(pVar->buildTime));
             if (buildMode == MOVE_MODE_RELATIVE) {
                 if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
                 if (buildElements < 0 && buildElements % 4 != 0) buildElements = 0;
@@ -249,10 +254,6 @@ ss trajectoryScan {
                     if (buildElements > MAX_ELEMENTS) buildElements = MAX_ELEMENTS;
                 } else if (buildElements > MAX_ELEMENTS+1) buildElements = MAX_ELEMENTS+1;
                 if (buildElements < 1 && (buildElements-1) % 4 != 0) buildElements = 1;
-            }
-            if (buildElements != nelements) {
-                nelements = buildElements;
-                pvPut(nelements);
             }
             /* Initialize new trajectory */
             strcpy(stringOut, "NC");
@@ -265,12 +266,10 @@ ss trajectoryScan {
             /* Set acceleration time */
             sprintf(stringOut, "UC%f", accel);
             %%writeOnly(ssId, pVar, pVar->stringOut);
-            /* If time mode is TIME_MODE_TOTAL then construct timeTrajectory 
-             * and post it */
+            /* If time mode is TIME_MODE_TOTAL then construct the times */
             if (buildTimeMode == TIME_MODE_TOTAL) {
                 dtime = time_PV/buildElements;
-                for (i=0; i<buildElements; i++) timeTrajectory[i] = dtime;
-                pvPut(timeTrajectory);
+                for (i=0; i<buildElements; i++) buildTime[i] = dtime;
             }
 
             /* Make sure number of trajectory elements is a multiple of 4.
@@ -288,18 +287,18 @@ ss trajectoryScan {
                 /* Compute the increment to move the motors during these
                  * padding elements, keeping velocity constant */
                 for (i=0; i<nextra; i++) {
-                    timeTrajectory[npoints+i] = PAD_TIME;
+                    buildTime[npoints+i] = PAD_TIME;
                     for (j=0; j<buildAxes; j++) {
                         if (!buildMoveAxis[j]) continue;
                         if (buildMode == MOVE_MODE_RELATIVE) {
-                            motorTrajectory[j][buildElements+i] = 
+                            motorTrajectory[j][buildElements+i] =
                                         motorTrajectory[j][buildElements-1] *
-                                        PAD_TIME / timeTrajectory[buildElements-1];
+                                        PAD_TIME / buildTime[buildElements-1];
                         } else {
                             dpos = (motorTrajectory[j][buildElements-1] -
                                             motorTrajectory[j][buildElements-2]) *
-                                        PAD_TIME / timeTrajectory[buildElements-2];
-                            motorTrajectory[j][buildElements+i] = 
+                                        PAD_TIME / buildTime[buildElements-2];
+                            motorTrajectory[j][buildElements+i] =
                                         motorTrajectory[j][buildElements-1] +
                                                                 dpos*(i+1);
                         }
@@ -307,9 +306,18 @@ ss trajectoryScan {
                 }
                 buildElements += nextra;
                 npoints += nextra;
+            }
+            /* Post the count and the times built once each: the monitor of a
+             * first pvPut can land between a second write and its pvPut. */
+            if (buildElements != nelements) {
                 nelements = buildElements;
                 pvPut(nelements);
+            }
+            if (buildTimeMode == TIME_MODE_TOTAL || nextra != 0) {
+                %%memcpy(pVar->timeTrajectory, pVar->buildTime, sizeof(pVar->timeTrajectory));
                 pvPut(timeTrajectory);
+            }
+            if (nextra != 0) {
                 /* Post the new trajectory position arrays */
                 for (j=0; j<buildAxes; j++) {
                    pvPut(motorTrajectory[j]);
@@ -317,13 +325,13 @@ ss trajectoryScan {
             }
             /* Compute expected time for trajectory */
             expectedTime=0;
-            for (i=0; i<npoints; i++) 
-                                expectedTime += timeTrajectory[i];
+            for (i=0; i<npoints; i++)
+                                expectedTime += buildTime[i];
             /* Define each element in trajectory */
             for (i=0; i<npoints; i++) {
                 sprintf(buildMessage, "Building element %d/%d", i+1, buildElements);
                 pvPut(buildMessage);
-                sprintf(stringOut, "%dDT%f", i+1, timeTrajectory[i]);
+                sprintf(stringOut, "%dDT%f", i+1, buildTime[i]);
                 %%writeOnly(ssId, pVar, pVar->stringOut);
                 for (j=0; j<buildAxes; j++) {
                     if (!buildMoveAxis[j]) continue;
