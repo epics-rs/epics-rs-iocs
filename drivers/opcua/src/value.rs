@@ -21,6 +21,7 @@ use async_opcua::types::{
     VariantTypeId, XmlElement,
 };
 use epics_libcom_rs::cfmt::CFloat;
+use epics_rs::base::runtime::stdlib::strtod;
 use epics_rs::base::types::c_parse::{atoi, strtol_errno, strtoll_errno, strtoul_errno};
 
 use crate::print::ua_print;
@@ -231,8 +232,10 @@ impl ScalarTarget for f64 {
         })
     }
 
+    /// `std::stod(s, 0)`, which throws on no conversion and on `ERANGE`.
     fn from_text(s: &str) -> Option<Self> {
-        s.trim().parse().ok()
+        let r = strtod(s.as_bytes());
+        (r.len != 0 && !r.erange).then_some(r.value)
     }
 
     fn to_number(self) -> Number {
@@ -719,7 +722,11 @@ pub fn write_string(value: &str, incoming: &Variant, choices: Option<&EnumChoice
         };
     }
 
-    let float = || value.trim().parse::<f64>().map_err(|_| out_of_range());
+    // `strtod(value, &end)` and `end != value`.
+    let float = || match strtod(value.as_bytes()) {
+        r if r.len != 0 => Ok(r.value),
+        _ => Err(out_of_range()),
+    };
 
     Ok(match incoming {
         Variant::String(_) => Variant::String(UAString::from(value)),
