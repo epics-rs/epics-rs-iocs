@@ -617,14 +617,15 @@ pub(crate) mod tests {
         let mut det = driver("MAR345_NAME_PATH", 0);
         let base = det.ad.params.base;
         let dir = std::env::temp_dir();
-        let dir = dir.to_str().unwrap().trim_end_matches('/');
+        let sep = std::path::MAIN_SEPARATOR;
+        let dir = dir.to_str().unwrap().trim_end_matches(sep);
         det.set_str(base.file_path, dir);
         det.set_str(base.file_name, "img");
         det.set_str(base.file_template, "%s%s_%3.3d");
         det.set_i32(base.file_number, 5);
         det.set_i32(base.file_path_exists, 0);
-        assert_eq!(det.create_file_name(), format!("{dir}/img_005"));
-        assert_eq!(det.get_str(base.file_path, 256), format!("{dir}/"));
+        assert_eq!(det.create_file_name(), format!("{dir}{sep}img_005"));
+        assert_eq!(det.get_str(base.file_path, 256), format!("{dir}{sep}"));
         assert_eq!(det.get_i32(base.file_path_exists), 1);
     }
 

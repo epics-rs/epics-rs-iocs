@@ -942,10 +942,11 @@ mod tests {
     #[test]
     fn a_file_name_checks_the_path_first() {
         let dir = std::env::temp_dir();
-        let dir = dir.to_str().unwrap().trim_end_matches('/');
+        let sep = std::path::MAIN_SEPARATOR;
+        let dir = dir.to_str().unwrap().trim_end_matches(sep);
         let (full, path, exists, number) = file_name_on("PILATUS_NAME_PATH", dir, "%s%s_%3.3d");
-        assert_eq!(full, format!("{dir}/img_005"));
-        assert_eq!(path, format!("{dir}/"));
+        assert_eq!(full, format!("{dir}{sep}img_005"));
+        assert_eq!(path, format!("{dir}{sep}"));
         assert_eq!((exists, number), (1, 6));
     }
 
