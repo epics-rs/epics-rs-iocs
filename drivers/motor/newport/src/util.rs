@@ -5,53 +5,7 @@
 //! prefix). These helpers reproduce those C semantics faithfully so the
 //! per-driver modules can share one implementation.
 
-/// Mimic C `atof`: parse the leading numeric prefix as `f64`, returning `0.0`
-/// on junk (as C `atof` does).
-pub(crate) fn atof(s: &str) -> f64 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        let mut j = i + 1;
-        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
-            j += 1;
-        }
-        let exp_start = j;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j > exp_start {
-            i = j;
-        }
-    }
-    t.get(..i)
-        .and_then(|p| p.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
-pub(crate) use motor_common::util::atoi;
-
-/// Parse leading hex digits as `u32` (C `sscanf` `%x`); `None` if there is no
-/// hex digit (C `sscanf` count `!= 1`).
-pub(crate) fn leading_hex(s: &str) -> Option<u32> {
-    let n = s.bytes().take_while(u8::is_ascii_hexdigit).count();
-    if n == 0 {
-        return None;
-    }
-    u32::from_str_radix(&s[..n], 16).ok()
-}
+pub(crate) use motor_common::util::{atof, atoi, leading_hex};
 
 /// `atof(&resp[offset..])`; `None` only when `offset` is past the reply.
 pub(crate) fn parse_value_at(resp: &str, offset: usize) -> Option<f64> {
@@ -81,9 +35,12 @@ pub(crate) fn max_digits(step_size: f64) -> usize {
 
 /// Shared ESP300/MM3000 `recv_mess` retry predicate: a reply longer than 3
 /// characters starting with `E` whose number is a hard-travel-limit code
-/// (35..=42) is an unsolicited error message to flush with a re-read.
+/// (35..=42), read by `strtol(&com[1], NULL, 0)`, is an unsolicited error
+/// message to flush with a re-read.
 pub(crate) fn is_unsolicited_limit_error(reply: &str) -> bool {
-    reply.len() > 3 && reply.starts_with('E') && (35..=42).contains(&atoi(&reply[1..]))
+    reply.len() > 3
+        && reply.starts_with('E')
+        && (35..=42).contains(&motor_common::util::strtol(&reply[1..], 0).0)
 }
 
 #[cfg(test)]
@@ -127,6 +84,14 @@ mod tests {
         assert!(!is_unsolicited_limit_error("1"));
     }
 
+    /// C reads the code with `strtol(&com[1], NULL, 0)`: `035` is octal 29.
+    #[test]
+    fn unsolicited_limit_error_reads_strtol_base_0() {
+        assert!(!is_unsolicited_limit_error("E035 x"));
+        assert!(is_unsolicited_limit_error("E0x23 x"));
+        assert!(is_unsolicited_limit_error("E043 x"));
+    }
+
     #[test]
     fn atof_parses_leading_numeric_prefix() {
         assert_eq!(atof("-0.1234junk"), -0.1234);
@@ -138,11 +103,27 @@ mod tests {
     }
 
     #[test]
+    fn atof_reads_what_strtod_reads() {
+        assert_eq!(atof("0x1A"), 26.0);
+        assert_eq!(atof(" -inf"), f64::NEG_INFINITY);
+        assert!(atof("nan").is_nan());
+        assert_eq!(atof("\u{a0}5"), 0.0);
+    }
+
+    #[test]
     fn leading_hex_reads_hex_digits_or_none() {
         assert_eq!(leading_hex("1e"), Some(0x1e));
         assert_eq!(leading_hex("ffXY"), Some(0xff));
         assert_eq!(leading_hex("xy"), None);
         assert_eq!(leading_hex(""), None);
+    }
+
+    #[test]
+    fn leading_hex_reads_what_sscanf_x_reads() {
+        assert_eq!(leading_hex(" 1e"), Some(0x1e));
+        assert_eq!(leading_hex("0x1F"), Some(31));
+        assert_eq!(leading_hex("+5"), Some(5));
+        assert_eq!(leading_hex("-5"), None);
     }
 
     #[test]
