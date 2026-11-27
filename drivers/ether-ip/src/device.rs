@@ -266,13 +266,8 @@ fn size_t_from_double(v: f64) -> u64 {
 /// C `strtod`: the value and how many bytes it took, `(0.0, 0)` when it
 /// takes nothing.
 fn strtod(text: &str) -> (f64, usize) {
-    let t = text.trim_start();
-    let skipped = text.len() - t.len();
-    (1..=t.len())
-        .rev()
-        .filter(|&n| t.is_char_boundary(n))
-        .find_map(|n| t[..n].parse::<f64>().ok().map(|v| (v, skipped + n)))
-        .unwrap_or((0.0, 0))
+    let r = epics_libcom_rs::runtime::stdlib::strtod(text.as_bytes());
+    (r.value, r.len)
 }
 
 // ---------------------------------------------------------------------------
@@ -2751,6 +2746,15 @@ mod tests {
         assert_eq!(parse_link("@plc1 A[010]", 1, 0).unwrap().element, 8);
         assert_eq!(parse_link("@plc1 A[3x]", 1, 0).unwrap().element, 3);
         assert_eq!(parse_link("@plc1 Cnt S 0.5", 1, 0).unwrap().period, 0.5);
+    }
+
+    /// devEtherIP.c reads the S and B flags with glibc `strtod`.
+    #[test]
+    fn strtod_reads_hex_and_only_c_blanks() {
+        assert_eq!(strtod("0x10"), (16.0, 4));
+        assert_eq!(strtod(" 0x1p3 x"), (8.0, 6));
+        assert_eq!(strtod("\u{a0}5"), (0.0, 0));
+        assert_eq!(parse_link("@plc1 Cnt B 0x3", 1, 0).unwrap().mask, 8);
     }
 
     /// devEtherIP.c:1055's strtol is glibc's with `_GNU_SOURCE`: `0b` is
