@@ -6,6 +6,9 @@
 //! `pmacAsynCoord.c`. Keeping the parsers here — free functions over `&str` —
 //! is what makes the wire formats testable without a controller.
 
+use std::cell::Cell;
+
+use epics_rs::base::runtime::scanf::{ScanTarget, sscanf};
 use epics_rs::base::runtime::stdlib::strtod;
 
 /// Motor status word 1 (`#n ?`, first 6 hex digits).
@@ -66,71 +69,23 @@ pub const CS_STATUS2_AMP_FAULT: u32 = 1 << 20;
 pub const CS_STATUS2_RUNTIME_ERR: u32 = 1 << 22;
 pub const CS_STATUS3_LIMIT: u32 = 1 << 1;
 
-/// Token scanner over a PMAC response. PMAC separates the values of a
-/// multi-command query with CR, and C reads them with `sscanf` conversions
-/// that all skip leading whitespace — so whitespace-separated tokens are an
-/// exact model of the C parse for every format except the run-together
-/// `%6x%6x` status pair, which [`take_status_pair`] handles.
-struct Scanner<'a> {
-    rest: &'a str,
+/// C `sscanf(resp, fmt, ...)` filling every target. The formats are C's
+/// with `ll` on the integer conversions, so that a value C would wrap into
+/// its `int` or `unsigned` is refused by the caller's `try_from`.
+fn scan(resp: &str, fmt: &str, targets: &[&dyn ScanTarget]) -> Option<()> {
+    (sscanf(resp, fmt, targets) == targets.len() as i32).then_some(())
 }
 
-impl<'a> Scanner<'a> {
-    fn new(s: &'a str) -> Self {
-        Self { rest: s }
-    }
-
-    fn token(&mut self) -> Option<&'a str> {
-        let s = self.rest.trim_start();
-        if s.is_empty() {
-            return None;
-        }
-        let end = s.find(char::is_whitespace).unwrap_or(s.len());
-        let (tok, rest) = s.split_at(end);
-        self.rest = rest;
-        Some(tok)
-    }
-
-    /// `%d` — a decimal integer.
-    fn int(&mut self) -> Option<i64> {
-        self.token()?.parse().ok()
-    }
-
-    /// `%lf` — a floating-point value.
-    fn double(&mut self) -> Option<f64> {
-        self.token()?.parse().ok()
-    }
-
-    /// `$%x` — a `$`-prefixed hex value, the form the PMAC returns for
-    /// I-variables when it is in hex-reporting mode (I9=2, which the C driver
-    /// assumes throughout).
-    fn dollar_hex(&mut self) -> Option<u32> {
-        let tok = self.token()?;
-        u32::from_str_radix(tok.strip_prefix('$')?, 16).ok()
-    }
+/// C `sscanf(resp, "%d", &v) == 1`.
+fn scan_int(resp: &str) -> Option<i32> {
+    let v = Cell::new(0i64);
+    scan(resp, "%lld", &[&v])?;
+    v.get().try_into().ok()
 }
 
-/// Take up to `max` hex digits from the front of `s` (after leading
-/// whitespace), as C's `%<max>x` does. Returns the value and the remainder.
-fn take_hex(s: &str, max: usize) -> Option<(u32, &str)> {
-    let s = s.trim_start();
-    let end = s
-        .char_indices()
-        .take(max)
-        .take_while(|(_, c)| c.is_ascii_hexdigit())
-        .map(|(i, c)| i + c.len_utf8())
-        .last()?;
-    let value = u32::from_str_radix(&s[..end], 16).ok()?;
-    Some((value, &s[end..]))
-}
-
-/// The run-together status pair at the head of a `#n ?` / `&n ??` response:
-/// C `sscanf(response, "%6x%6x...")`. Each word is up to 6 hex digits with no
-/// separator between them.
-fn take_status_pair(s: &str) -> Option<(u32, u32, &str)> {
-    let (s0, rest) = take_hex(s, 6)?;
-    let (s1, rest) = take_hex(rest, 6)?;
-    Some((s0, s1, rest))
+/// A C `int` read at 64 bits.
+fn c_int(v: impl TryInto<i32>) -> Option<i64> {
+    v.try_into().ok().map(i64::from)
 }
 
 /// One axis's poll response: C `pmacAxis::getAxisStatus`,
@@ -142,22 +97,28 @@ fn take_status_pair(s: &str) -> Option<(u32, u32, &str)> {
 /// them to recover the commanded position. For the encoder-axis command
 /// (`#n ? P #e P`) they are the axis position and the encoder axis's position.
 pub fn parse_axis_status(resp: &str) -> Option<(u32, u32, f64, f64)> {
-    let (s0, s1, rest) = take_status_pair(resp)?;
-    let mut sc = Scanner::new(rest);
-    let a = sc.double()?;
-    let b = sc.double()?;
-    Some((s0, s1, a, b))
+    let (s0, s1) = (Cell::new(0u64), Cell::new(0u64));
+    let (a, b) = (Cell::new(0f64), Cell::new(0f64));
+    scan(resp, "%6llx%6llx %lf %lf", &[&s0, &s1, &a, &b])?;
+    Some((
+        s0.get().try_into().ok()?,
+        s1.get().try_into().ok()?,
+        a.get(),
+        b.get(),
+    ))
 }
 
 /// The global status word: C `pmacController::getGlobalStatus`,
 /// `sscanf(response, "%6x", globalStatus)` on the `???` reply.
 pub fn parse_global_status(resp: &str) -> Option<u32> {
-    take_hex(resp, 6).map(|(v, _)| v)
+    let v = Cell::new(0u64);
+    scan(resp, "%6llx", &[&v])?;
+    v.get().try_into().ok()
 }
 
 /// The global feed rate: C `sscanf(response, "%d", feedrate)` on the `%` reply.
 pub fn parse_feedrate(resp: &str) -> Option<i32> {
-    Scanner::new(resp).int()?.try_into().ok()
+    scan_int(resp)
 }
 
 /// The initial axis poll: C `pmacAxis::getAxisInitialStatus`,
@@ -174,13 +135,19 @@ pub struct InitialStatus {
 }
 
 pub fn parse_initial_status(resp: &str) -> Option<InitialStatus> {
-    let mut sc = Scanner::new(resp);
+    let v: [Cell<f64>; 5] = Default::default();
+    scan(
+        resp,
+        "%lf %lf %lf %lf %lf",
+        &[&v[0], &v[1], &v[2], &v[3], &v[4]],
+    )?;
+    let [high_limit, low_limit, pgain, dgain, igain] = v.map(Cell::into_inner);
     Some(InitialStatus {
-        high_limit: sc.double()?,
-        low_limit: sc.double()?,
-        pgain: sc.double()?,
-        dgain: sc.double()?,
-        igain: sc.double()?,
+        high_limit,
+        low_limit,
+        pgain,
+        dgain,
+        igain,
     })
 }
 
@@ -189,12 +156,14 @@ pub fn parse_initial_status(resp: &str) -> Option<InitialStatus> {
 /// simply fails and the value is untouched), i.e. "limits not disabled" — so
 /// `None` here means the same thing to the caller.
 pub fn parse_ix24(resp: &str) -> Option<u32> {
-    Scanner::new(resp).dollar_hex()
+    let v = Cell::new(0u64);
+    scan(resp, "$%llx", &[&v])?;
+    v.get().try_into().ok()
 }
 
 /// The controller type from `cid`: C `sscanf(response, "%d", &controller_type)`.
 pub fn parse_cid(resp: &str) -> Option<i64> {
-    Scanner::new(resp).int()
+    scan_int(resp).map(i64::from)
 }
 
 /// The home-flag block read by `pmacAxis::home` before deciding whether it may
@@ -215,13 +184,22 @@ pub struct HomeFlags {
 
 /// Geobrick home-flag reply: C `sscanf(response, "%d %d $%x %lf %d", ...)`.
 pub fn parse_home_flags_geobrick(resp: &str) -> Option<HomeFlags> {
-    let mut sc = Scanner::new(resp);
+    let (home_type, home_flag, home_offset) = (Cell::new(0i64), Cell::new(0i64), Cell::new(0i64));
+    let (flag_mode, home_velocity) = (Cell::new(0u64), Cell::new(0f64));
+    let out: [&dyn ScanTarget; 5] = [
+        &home_type,
+        &home_flag,
+        &flag_mode,
+        &home_velocity,
+        &home_offset,
+    ];
+    scan(resp, "%lld %lld $%llx %lf %lld", &out)?;
     Some(HomeFlags {
-        home_type: sc.int()?,
-        home_flag: sc.int()?,
-        flag_mode: sc.dollar_hex()?,
-        home_velocity: sc.double()?,
-        home_offset: sc.int()?,
+        home_type: c_int(home_type.get())?,
+        home_flag: c_int(home_flag.get())?,
+        flag_mode: flag_mode.get().try_into().ok()?,
+        home_velocity: home_velocity.get(),
+        home_offset: c_int(home_offset.get())?,
     })
 }
 
@@ -229,13 +207,22 @@ pub fn parse_home_flags_geobrick(resp: &str) -> Option<HomeFlags> {
 /// the two macro-station variables come back `$`-prefixed hex here, decimal on
 /// the Geobrick.
 pub fn parse_home_flags_pmac(resp: &str) -> Option<HomeFlags> {
-    let mut sc = Scanner::new(resp);
+    let (home_type, home_flag, flag_mode) = (Cell::new(0u64), Cell::new(0u64), Cell::new(0u64));
+    let (home_velocity, home_offset) = (Cell::new(0f64), Cell::new(0i64));
+    let out: [&dyn ScanTarget; 5] = [
+        &home_type,
+        &home_flag,
+        &flag_mode,
+        &home_velocity,
+        &home_offset,
+    ];
+    scan(resp, "$%llx $%llx $%llx %lf %lld", &out)?;
     Some(HomeFlags {
-        home_type: sc.dollar_hex()? as i64,
-        home_flag: sc.dollar_hex()? as i64,
-        flag_mode: sc.dollar_hex()?,
-        home_velocity: sc.double()?,
-        home_offset: sc.int()?,
+        home_type: c_int(home_type.get())?,
+        home_flag: c_int(home_flag.get())?,
+        flag_mode: flag_mode.get().try_into().ok()?,
+        home_velocity: home_velocity.get(),
+        home_offset: c_int(home_offset.get())?,
     })
 }
 
@@ -263,15 +250,17 @@ pub fn parse_cs_status(resp: &str) -> Option<(u32, u32, u32)> {
 /// C `sscanf(resp, "%6x%6x%6x", ...)`: overwrites the words it reads, in
 /// order, and returns how many.
 pub fn scan_cs_status(resp: &str, status: &mut [u32; 3]) -> usize {
-    let mut rest = resp;
-    for (n, word) in status.iter_mut().enumerate() {
-        let Some((value, tail)) = take_hex(rest, 6) else {
+    let words: [Cell<u64>; 3] = Default::default();
+    let read = sscanf(resp, "%6llx%6llx%6llx", &[&words[0], &words[1], &words[2]]);
+    let read = usize::try_from(read).unwrap_or(0);
+    // A word C would wrap into its `unsigned` ends the count instead.
+    for (n, (slot, word)) in status.iter_mut().zip(&words).take(read).enumerate() {
+        let Ok(value) = u32::try_from(word.get()) else {
             return n;
         };
-        *word = value;
-        rest = tail;
+        *slot = value;
     }
-    status.len()
+    read
 }
 
 /// The coordinate-system position block: C `drvPmacGetAxesStatus` walks the
@@ -422,6 +411,104 @@ mod tests {
         assert_eq!(s1, 0x020000);
         assert_eq!(s2, 2);
         assert!(parse_cs_status("000001020000").is_none());
+    }
+
+    fn check<T: PartialEq + std::fmt::Debug>(wrong: &mut Vec<String>, resp: &str, got: T, want: T) {
+        if got != want {
+            wrong.push(format!("{resp:?}: {got:?}, C {want:?}"));
+        }
+    }
+
+    /// The replies as C's `sscanf` formats read them (pmacAxis.cpp:133, :247,
+    /// :269, :276, :494, :580; pmacController.cpp:677, :692;
+    /// pmacAsynCoord.c:587). A value C wraps into its `int` or `unsigned` is
+    /// refused.
+    #[test]
+    fn replies_are_scanned_as_c_sscanf() {
+        let mut wrong = Vec::new();
+        let w = &mut wrong;
+        // A dangling exponent fails `%lf`, as from glibc 2.42 (BZ #12701).
+        for (resp, want) in [
+            ("812000000001 0.5 1.5e", None),
+            (
+                "812000000001 0.5 1000.25junk",
+                Some((0x812000, 1, 0.5, 1000.25)),
+            ),
+            ("0x1234000001 0 0", Some((0x1234, 1, 0.0, 0.0))),
+            ("-00001000001 0 0", None),
+        ] {
+            check(w, resp, parse_axis_status(resp), want);
+        }
+        for (resp, want) in [
+            ("+80000", Some(0x80000)),
+            ("0x8000", Some(0x8000)),
+            ("-1", None),
+        ] {
+            check(w, resp, parse_global_status(resp), want);
+        }
+        for (resp, want) in [
+            ("100abc", Some(100)),
+            ("0x10", Some(0)),
+            ("3000000000", None),
+        ] {
+            check(w, resp, parse_feedrate(resp), want);
+        }
+        for (resp, want) in [
+            ("1.5e 0 0 0 0", None),
+            (
+                "100 -100 2000 1000 500junk",
+                Some([100.0, -100.0, 2000.0, 1000.0, 500.0]),
+            ),
+            ("0x10 0 0 0 0", Some([16.0, 0.0, 0.0, 0.0, 0.0])),
+        ] {
+            let got = parse_initial_status(resp)
+                .map(|s| [s.high_limit, s.low_limit, s.pgain, s.dgain, s.igain]);
+            check(w, resp, got, want);
+        }
+        for (resp, want) in [
+            (" $20000", None),
+            ("$20000\x06", Some(0x20000)),
+            ("$0x20000", Some(0x20000)),
+            ("$123456789", None),
+            ("$-1", None),
+        ] {
+            check(w, resp, parse_ix24(resp), want);
+        }
+        for (resp, want) in [("603382\x06", Some(CID_GEOBRICK)), ("3000000000", None)] {
+            check(w, resp, parse_cid(resp), want);
+        }
+        let flags = |f: HomeFlags| {
+            (
+                f.home_type,
+                f.home_flag,
+                f.flag_mode,
+                f.home_velocity,
+                f.home_offset,
+            )
+        };
+        for (resp, want) in [
+            ("2 1 $20000 32.0 0junk", Some((2, 1, 0x20000, 32.0, 0))),
+            ("2 1 $20000 32.0 3000000000", None),
+        ] {
+            check(w, resp, parse_home_flags_geobrick(resp).map(flags), want);
+        }
+        for (resp, want) in [
+            ("$2 $1 $0 -32.0 0\x06", Some((2, 1, 0, -32.0, 0))),
+            ("$2 $1 $0 1.5e 0", None),
+            ("$FFFFFFFF $1 $0 1 0", None),
+        ] {
+            check(w, resp, parse_home_flags_pmac(resp).map(flags), want);
+        }
+        for (resp, want) in [
+            ("0x0001020000000002", (3, [1, 0x20000, 2])),
+            ("000001 020000 -00002", (2, [1, 0x20000, 7])),
+            ("", (0, [7, 7, 7])),
+        ] {
+            let mut status = [7; 3];
+            let n = scan_cs_status(resp, &mut status);
+            check(w, resp, (n, status), want);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
