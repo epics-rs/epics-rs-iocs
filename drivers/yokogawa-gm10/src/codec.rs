@@ -6,7 +6,8 @@
 //! from the frame start).
 
 use epics_libcom_rs::cfmt::CFloat;
-use epics_rs::base::types::c_parse::atoi;
+use epics_libcom_rs::runtime::stdlib::strtod;
+use epics_rs::base::types::c_parse::{atoi, strtol};
 
 use crate::cache::ModuleType;
 
@@ -317,14 +318,6 @@ fn find_byte(payload: &[u8], from: usize, target: u8) -> Option<usize> {
         .map(|i| from + i)
 }
 
-fn scan_digits(payload: &[u8], from: usize) -> usize {
-    let mut i = from;
-    while i < payload.len() && payload[i].is_ascii_digit() {
-        i += 1;
-    }
-    i
-}
-
 /// `atoi(ptr) - 1` from `payload[from..]`. C indexes its arrays with an
 /// address of 0 or less too (`array[-1]`, undefined); that is refused here.
 fn parse_1based_index(payload: &[u8], from: usize) -> Option<usize> {
@@ -404,11 +397,9 @@ pub fn parse_fchinfo(payload: &[u8]) -> Vec<ChannelInfoLine> {
             break;
         };
         let scale_start = comma + 1;
-        let scale_end = scan_digits(payload, scale_start);
-        let scale = std::str::from_utf8(&payload[scale_start..scale_end])
-            .ok()
-            .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(0);
+        // C `char scale = atoi(ptr)`, read at `long` width so a value C
+        // would wrap into the `char` is 0.
+        let scale = u8::try_from(strtol(&payload[scale_start..], 10).0).unwrap_or(0);
 
         out.push(ChannelInfoLine {
             family,
@@ -418,7 +409,7 @@ pub fn parse_fchinfo(payload: &[u8]) -> Vec<ChannelInfoLine> {
             scale,
         });
 
-        let Some(nl) = find_byte(payload, scale_end, b'\n') else {
+        let Some(nl) = find_byte(payload, scale_start, b'\n') else {
             break;
         };
         p = nl + 1;
@@ -652,12 +643,8 @@ pub fn parse_const_lines(payload: &[u8]) -> Vec<ConstLine> {
         let Some(nl) = find_byte(after_comma, 0, b'\n') else {
             break;
         };
-        let Some(value) = std::str::from_utf8(&after_comma[..nl])
-            .ok()
-            .and_then(|s| s.trim_end_matches('\r').parse::<f64>().ok())
-        else {
-            break;
-        };
+        // C `atof(p)` reads on past this line's newline.
+        let value = strtod(after_comma).value;
         out.push(ConstLine { index, value });
         rest = &after_comma[nl + 1..];
     }
@@ -833,6 +820,33 @@ mod tests {
         assert_eq!(lines[0].scale, 3);
     }
 
+    /// gcc/glibc `char scale = atoi(ptr)` (`drvGM10.c:764`). C keeps `-1`,
+    /// `300` and `4294967299` as -1, 44 and 3 and indexes `scaler` with
+    /// them; they stay 0 here.
+    #[test]
+    fn fchinfo_scale_reads_as_atoi() {
+        let cases = [
+            ("3", 3),
+            (" 3", 3),
+            ("+3", 3),
+            ("3x", 3),
+            ("x", 0),
+            ("", 0),
+            ("-1", 0),
+            ("300", 0),
+            ("4294967299", 0),
+        ];
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(v, want)| {
+                let payload = format!("N 0001 DEGC ,{v}\nE");
+                let got = parse_fchinfo(payload.as_bytes()).first().map(|l| l.scale);
+                (got != Some(want)).then_some((v, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn fchinfo_skip_line_uses_sentinel_unit() {
         let payload = b"S 0001 \nE";
@@ -925,6 +939,42 @@ mod tests {
                 index: 0,
                 value: 12.5
             }]
+        );
+    }
+
+    /// gcc/glibc `atof(p)` (`drvGM10.c:1112,1140`): the value's leading
+    /// number, 0 on junk, and the reply goes on either way.
+    #[test]
+    fn const_lines_read_the_value_as_atof() {
+        let cases = [
+            ("1.5", 1.5),
+            ("1.5 \r", 1.5),
+            (" 2.5", 2.5),
+            ("1.5e", 1.5),
+            ("3V", 3.0),
+            ("0x10", 16.0),
+            ("inf", f64::INFINITY),
+            ("1e999", f64::INFINITY),
+            ("junk", 0.0),
+        ];
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(v, want)| {
+                let payload = format!("aaaaaaaa001,{v}\nbbbbbbbb002,9\nE");
+                let got: Vec<f64> = parse_const_lines(payload.as_bytes())
+                    .iter()
+                    .map(|l| l.value)
+                    .collect();
+                (got != [want, 9.0]).then_some((v, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // A blank value: C's atof skips the newline, stops at the next
+        // line's prefix and stores 0.
+        let lines = parse_const_lines(b"aaaaaaaa001,\nbbbbbbbb002,9\nE");
+        assert_eq!(
+            lines.iter().map(|l| l.value).collect::<Vec<_>>(),
+            [0.0, 9.0]
         );
     }
 
