@@ -1452,7 +1452,7 @@ pub(crate) mod test_support {
         let cache = instrument.cache();
         // C sizes meas_* at MAX_MEAS_CHAN = 1000, so address 1000 is stored.
         assert_eq!(cache.meas_type[999], ChannelType::InputAnalog);
-        assert_eq!(cache.meas_info[999].scale, 1);
+        assert_eq!(cache.meas_info[999].scale.get(), 1);
     }
 
     #[test]

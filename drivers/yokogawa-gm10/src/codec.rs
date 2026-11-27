@@ -9,7 +9,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_libcom_rs::runtime::stdlib::strtod;
 use epics_rs::base::types::c_parse::{atoi, strtol};
 
-use crate::cache::ModuleType;
+use crate::cache::{ModuleType, Scale};
 
 // ---------------------------------------------------------------------
 // Command builders
@@ -302,7 +302,7 @@ pub struct ChannelInfoLine {
     pub index: usize,
     pub status: u8, // CH_STATUS_{SKIP=0,NORMAL=1,DIFF=2,UNKNOWN=3}
     pub unit: Vec<u8>,
-    pub scale: u8,
+    pub scale: Scale,
 }
 
 pub const CH_STATUS_SKIP: u8 = 0;
@@ -376,7 +376,7 @@ pub fn parse_fchinfo(payload: &[u8]) -> Vec<ChannelInfoLine> {
                 index,
                 status,
                 unit: b"----".to_vec(),
-                scale: 0,
+                scale: Scale::default(),
             });
             p = nl + 1;
             continue;
@@ -398,8 +398,11 @@ pub fn parse_fchinfo(payload: &[u8]) -> Vec<ChannelInfoLine> {
         };
         let scale_start = comma + 1;
         // C `char scale = atoi(ptr)`, read at `long` width so a value C
-        // would wrap into the `char` is 0.
-        let scale = u8::try_from(strtol(&payload[scale_start..], 10).0).unwrap_or(0);
+        // would wrap into the `char`, or index past `scaler` with, is 0.
+        let scale = u8::try_from(strtol(&payload[scale_start..], 10).0)
+            .ok()
+            .and_then(Scale::new)
+            .unwrap_or_default();
 
         out.push(ChannelInfoLine {
             family,
@@ -817,12 +820,12 @@ mod tests {
         assert_eq!(lines[0].index, 0);
         assert_eq!(lines[0].status, CH_STATUS_NORMAL);
         assert_eq!(lines[0].unit, b"DEGC");
-        assert_eq!(lines[0].scale, 3);
+        assert_eq!(lines[0].scale.get(), 3);
     }
 
     /// gcc/glibc `char scale = atoi(ptr)` (`drvGM10.c:764`). C keeps `-1`,
-    /// `300` and `4294967299` as -1, 44 and 3 and indexes `scaler` with
-    /// them; they stay 0 here.
+    /// `300` and `4294967299` as -1, 44 and 3, and reads its seven-entry
+    /// `scaler` at -1, 7 and 44; a scale outside 0-6 stays 0 here.
     #[test]
     fn fchinfo_scale_reads_as_atoi() {
         let cases = [
@@ -835,12 +838,18 @@ mod tests {
             ("-1", 0),
             ("300", 0),
             ("4294967299", 0),
+            ("6", 6),
+            ("7", 0),
+            ("8", 0),
+            ("127", 0),
         ];
         let wrong: Vec<_> = cases
             .into_iter()
             .filter_map(|(v, want)| {
                 let payload = format!("N 0001 DEGC ,{v}\nE");
-                let got = parse_fchinfo(payload.as_bytes()).first().map(|l| l.scale);
+                let got = parse_fchinfo(payload.as_bytes())
+                    .first()
+                    .map(|l| l.scale.get());
                 (got != Some(want)).then_some((v, got, want))
             })
             .collect();
@@ -855,7 +864,7 @@ mod tests {
         assert_eq!(lines[0].index, 0);
         assert_eq!(lines[0].status, CH_STATUS_SKIP);
         assert_eq!(lines[0].unit, b"----");
-        assert_eq!(lines[0].scale, 0);
+        assert_eq!(lines[0].scale.get(), 0);
     }
 
     #[test]
