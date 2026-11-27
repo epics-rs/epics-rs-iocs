@@ -1,9 +1,11 @@
 //! What the SMC hydra, corvus and Taurus axes share: the C members their
 //! `report` prints.
 
+use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard};
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::motor::trace::MotorTrace;
 
@@ -142,21 +144,21 @@ impl AxisReport for SmcMembers {
 /// sscanf does not convert is 0 here; C leaves the member uninitialized, a
 /// defect not copied.
 pub(crate) fn travel_limits(reply: &str) -> (f64, f64) {
-    let mut values = reply
-        .split_whitespace()
-        .map_while(|tok| tok.parse::<f64>().ok());
-    let neg = values.next().unwrap_or(0.0);
-    (neg, values.next().unwrap_or(0.0))
+    let [neg, pos] = [0.0; 2].map(Cell::new);
+    sscanf(reply, "%lf %lf", &[&neg, &pos]);
+    (neg.get(), pos.get())
 }
 
 /// `sscanf(reply, "%i %i", &lowLimitConfig_, &highLimitConfig_)`: a value
-/// sscanf does not convert keeps the last.
-fn limit_config(reply: &str, (low, high): (i32, i32)) -> (i32, i32) {
-    let mut values = reply
-        .split_whitespace()
-        .map_while(|tok| tok.parse::<i32>().ok());
-    let low = values.next().unwrap_or(low);
-    (low, values.next().unwrap_or(high))
+/// sscanf does not convert keeps the last, and so does one C would wrap to
+/// `int`.
+fn limit_config(reply: &str, last: (i32, i32)) -> (i32, i32) {
+    let [low, high] = [last.0, last.1].map(|v| Cell::new(i64::from(v)));
+    sscanf(reply, "%lli %lli", &[&low, &high]);
+    (
+        i32::try_from(low.get()).unwrap_or(last.0),
+        i32::try_from(high.get()).unwrap_or(last.1),
+    )
 }
 
 /// The lines `run` prints on port `port` under `mask`, less asynPrint's
@@ -191,6 +193,10 @@ mod tests {
         assert_eq!(travel_limits("-100.0 100.0"), (-100.0, 100.0));
         assert_eq!(travel_limits("-5 x"), (-5.0, 0.0));
         assert_eq!(travel_limits(""), (0.0, 0.0));
+        // `%lf` reads a prefix and hex; a no-break space is no C blank.
+        assert_eq!(travel_limits("-1.5e2x 7"), (-150.0, 0.0));
+        assert_eq!(travel_limits("0x10 -0x1p3"), (16.0, -8.0));
+        assert_eq!(travel_limits("-5\u{a0}5"), (-5.0, 0.0));
     }
 
     #[test]
@@ -198,6 +204,11 @@ mod tests {
         assert_eq!(limit_config("2 3", (0, 0)), (2, 3));
         assert_eq!(limit_config("2 x", (0, 1)), (2, 1));
         assert_eq!(limit_config("", (4, 5)), (4, 5));
+        // `%i` reads hex, octal and a prefix; a value past `int` keeps the
+        // last.
+        assert_eq!(limit_config("0x2 010", (0, 0)), (2, 8));
+        assert_eq!(limit_config("3x 1", (0, 1)), (3, 1));
+        assert_eq!(limit_config("4294967298 3", (0, 1)), (0, 3));
     }
 
     /// C's `%f` spells a non-finite member as glibc does.
