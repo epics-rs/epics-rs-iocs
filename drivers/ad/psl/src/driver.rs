@@ -255,8 +255,10 @@ impl PslDetector {
         let multi = self.state.multi_camera();
 
         // Every exchange here parses only a successful reply, as C does.
+        // GetSize, GetFliplr and GetFlipud are read whole on any server
+        // (PSL.cpp:356,442,449).
         if let Some(reply) = self.checked("GetSize")?
-            && let Some([x, y]) = protocol::parse_pair(protocol::numeric_field(&reply, multi))
+            && let Some([x, y]) = protocol::parse_pair(&reply)
         {
             let base = &mut self.ad.port_base;
             base.set_int32_param(self.ad.params.base.array_size_x, 0, x)?;
@@ -343,7 +345,7 @@ impl PslDetector {
 
         if self.supports("Fliplr")
             && let Some(reply) = self.checked("GetFliplr")?
-            && let Some(v) = protocol::parse_int(protocol::numeric_field(&reply, multi))
+            && let Some(v) = protocol::parse_int(&reply)
         {
             self.ad
                 .port_base
@@ -352,7 +354,7 @@ impl PslDetector {
 
         if self.supports("Flipud")
             && let Some(reply) = self.checked("GetFlipud")?
-            && let Some(v) = protocol::parse_int(protocol::numeric_field(&reply, multi))
+            && let Some(v) = protocol::parse_int(&reply)
         {
             self.ad
                 .port_base
@@ -1263,6 +1265,28 @@ mod tests {
         det.write_int32(&mut AsynUser::new(p.min_x), i32::MAX)
             .unwrap();
         assert!(det.write_int32(&mut AsynUser::new(p.size_x), 2).is_err());
+    }
+
+    /// A multi-camera getConfig reads GetSize, GetFliplr and GetFlipud
+    /// without the one-character skip its other numeric replies get
+    /// (PSL.cpp:356,442,449).
+    #[test]
+    fn multi_camera_size_and_flips_are_read_whole() {
+        let mut det = served_detector("PSL_MULTI_SIZE", b"(640,480)", false);
+        let p = det.ad.params;
+        det.state.n_cameras = 2;
+        det.get_config().unwrap();
+        let size = (
+            det.get_i32(p.base.array_size_x),
+            det.get_i32(p.base.array_size_y),
+        );
+        assert_eq!(size, (640, 480));
+
+        let mut det = served_detector("PSL_MULTI_FLIP", b"1", false);
+        det.state.n_cameras = 2;
+        det.state.valid_options = ["Fliplr".to_string(), "Flipud".to_string()].into();
+        det.get_config().unwrap();
+        assert_eq!((det.get_i32(p.reverse_x), det.get_i32(p.reverse_y)), (1, 1));
     }
 
     /// A PSLViewer that answers its reads from `reads` in turn, each with
