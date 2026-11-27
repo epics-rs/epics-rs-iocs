@@ -35,11 +35,13 @@
 //! - `set_pid_gain(Derivative)` on CC/DL emits a `KI` command (C sends `KI`
 //!   with `KDMax`, `AG_CONEX.cpp:480`), not `KD`.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     AsynMotor, MotorStatus, PidGainKind, PollFailure, StatusWrite,
@@ -51,7 +53,7 @@ use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::AxisReport;
 
-use crate::util::{leading_hex, parse_int_at, parse_value_at};
+use crate::util::{parse_int_at, parse_value_at};
 
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
@@ -184,6 +186,15 @@ fn compute_step_size(
     }
 }
 
+/// `sscanf(resp, fmt, &status) == 1` with the `%x` read at 64 bits, so a
+/// status C keeps the low 32 bits of (a negated or over-wide one) is `None`.
+fn scan_status(resp: &str, fmt: &str) -> Option<u32> {
+    let status = Cell::new(0u64);
+    (sscanf(resp, fmt, &[&status]) == 1)
+        .then(|| u32::try_from(status.get()).ok())
+        .flatten()
+}
+
 /// Decoded `TS` status: motion done + soft-limit flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct TsStatus {
@@ -200,11 +211,12 @@ struct TsStatus {
 ///   `0x100`/`0x200` limit bits — which the 2-char read can never set, so they
 ///   stay inert exactly as in C.
 fn parse_ts(model: ConexModel, resp: &str) -> Option<TsStatus> {
-    let idx = resp.find("TS")?;
-    let after = &resp[idx + 2..];
-    let skip = if model == ConexModel::Dl { 6 } else { 4 };
-    let hex_part = after.get(skip..)?;
-    let status = leading_hex(hex_part)?;
+    let fmt = if model == ConexModel::Dl {
+        "%*dTS%*6c%llx"
+    } else {
+        "%*dTS%*4c%llx"
+    };
+    let status = scan_status(resp, fmt)?;
 
     let done = if model == ConexModel::Dl {
         status != 0x3c
@@ -233,8 +245,7 @@ fn parse_ts(model: ConexModel, resp: &str) -> Option<TsStatus> {
 /// `AG_CONEXAxis::getClosedLoop`: `sscanf(inString_, "%*dMM%x", &status)`, then
 /// closed-loop when the state is in `0x1e..=0x34`.
 fn parse_closed_loop(resp: &str) -> Option<bool> {
-    let idx = resp.find("MM")?;
-    let status = leading_hex(&resp[idx + 2..])?;
+    let status = scan_status(resp, "%*dMM%llx")?;
     Some((0x1e..=0x34).contains(&status))
 }
 
@@ -1128,6 +1139,28 @@ mod tests {
     fn parse_ts_rejects_reply_too_short_to_hold_state() {
         assert_eq!(parse_ts(ConexModel::Cc, "1TS12"), None);
         assert_eq!(parse_ts(ConexModel::Cc, "garbage"), None);
+    }
+
+    /// AG_CONEX.cpp:430,529,533 scan `%*dMM%x`, `%*dTS%*6c%x` and
+    /// `%*dTS%*4c%x`: the controller ID must lead, and `%*Nc` takes any
+    /// N bytes.
+    #[test]
+    fn ts_and_mm_are_scanned_as_c_scans_them() {
+        let moving = Some(TsStatus {
+            done: false,
+            low_limit: false,
+            high_limit: false,
+        });
+        assert_eq!(parse_ts(ConexModel::Cc, "TS000028"), None);
+        assert_eq!(parse_ts(ConexModel::Dl, "x1TS0000003c"), None);
+        assert_eq!(parse_ts(ConexModel::Cc, " 1TS 0x0 28"), moving);
+        assert_eq!(parse_ts(ConexModel::Dl, "-1TS 0x0 0 3c"), moving);
+        assert_eq!(parse_closed_loop("MM1e"), None);
+        assert_eq!(parse_closed_loop("1.5MM1e"), None);
+        assert_eq!(parse_closed_loop(" 1MM 0x1e"), Some(true));
+        // glibc keeps the low 32 bits of these.
+        assert_eq!(parse_ts(ConexModel::Cc, "1TS0000100000028"), None);
+        assert_eq!(parse_closed_loop("1MM-1e"), None);
     }
 
     #[test]

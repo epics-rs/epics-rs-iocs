@@ -1,11 +1,11 @@
 //! Numeric parsing helpers shared by the Newport controller drivers.
 //!
-//! The C drivers parse controller replies with `atof`/`atoi`/`sscanf("%x")`
+//! The C drivers parse controller replies with `atof`/`atoi`
 //! applied at a fixed byte offset into the reply (skipping the echoed command
 //! prefix). These helpers reproduce those C semantics faithfully so the
 //! per-driver modules can share one implementation.
 
-pub(crate) use motor_common::util::{atof, atoi, leading_hex};
+pub(crate) use motor_common::util::{atof, atoi};
 
 /// `atof(&resp[offset..])`; `None` only when `offset` is past the reply.
 pub(crate) fn parse_value_at(resp: &str, offset: usize) -> Option<f64> {
@@ -108,22 +108,6 @@ mod tests {
         assert_eq!(atof(" -inf"), f64::NEG_INFINITY);
         assert!(atof("nan").is_nan());
         assert_eq!(atof("\u{a0}5"), 0.0);
-    }
-
-    #[test]
-    fn leading_hex_reads_hex_digits_or_none() {
-        assert_eq!(leading_hex("1e"), Some(0x1e));
-        assert_eq!(leading_hex("ffXY"), Some(0xff));
-        assert_eq!(leading_hex("xy"), None);
-        assert_eq!(leading_hex(""), None);
-    }
-
-    #[test]
-    fn leading_hex_reads_what_sscanf_x_reads() {
-        assert_eq!(leading_hex(" 1e"), Some(0x1e));
-        assert_eq!(leading_hex("0x1F"), Some(31));
-        assert_eq!(leading_hex("+5"), Some(5));
-        assert_eq!(leading_hex("-5"), None);
     }
 
     #[test]
