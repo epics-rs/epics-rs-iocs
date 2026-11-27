@@ -968,8 +968,9 @@ fn f32_from_number(n: Number) -> Option<f32> {
         Number::Uint(v) => v as f64,
         Number::Float(v) => v,
     };
-    // `isWithinRange<UA_Float>` rejects a double outside the float range.
-    if v.is_finite() && (v < f64::from(f32::MIN) || v > f64::from(f32::MAX)) {
+    // `isWithinRange<UA_Float>` rejects a double outside the float range,
+    // ±inf included; NaN compares false both ways and is written.
+    if v < f64::from(f32::MIN) || v > f64::from(f32::MAX) {
         return None;
     }
     Some(v as f32)

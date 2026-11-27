@@ -864,6 +864,38 @@ fn an_outgoing_value_that_does_not_fit_the_node_is_out_of_range() {
     ));
 }
 
+/// `isWithinRange<UA_Float>` (DataElementOpen62541Leaf.h:48) refuses ±inf
+/// for a FLOAT node, from a double (:1049) or a string (.cpp:1059); NaN
+/// compares false both ways and is written. A DOUBLE node takes ±inf.
+#[test]
+fn an_infinite_value_is_out_of_range_for_a_float_node() {
+    let float = Variant::Float(0.0);
+    for v in [f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            write_scalar(v, &float, None),
+            Err(WriteError::OutOfRange { .. })
+        ));
+        assert_eq!(
+            write_scalar(v, &Variant::Double(0.0), None),
+            Ok(Variant::Double(v))
+        );
+    }
+    for text in ["inf", "-inf"] {
+        assert!(matches!(
+            write_string(text, &float, None),
+            Err(WriteError::OutOfRange { .. })
+        ));
+    }
+    assert!(matches!(
+        write_scalar(f64::NAN, &float, None),
+        Ok(Variant::Float(x)) if x.is_nan()
+    ));
+    assert!(matches!(
+        write_string("nan", &float, None),
+        Ok(Variant::Float(x)) if x.is_nan()
+    ));
+}
+
 #[test]
 fn an_outgoing_enum_value_must_be_one_of_the_choices() {
     let c = choices();
