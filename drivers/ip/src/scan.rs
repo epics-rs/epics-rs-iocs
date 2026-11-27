@@ -1,7 +1,11 @@
 //! C `sscanf` over a device reply, one conversion at a time, for the formats
 //! `devTPG261.c` and `devTelevac.c` scan.
 
-use crate::fmt::scan_f64_prefix;
+use std::cell::Cell;
+use std::ffi::c_long;
+
+use epics_libcom_rs::runtime::scanf::{ScanNum, sscanf};
+use epics_libcom_rs::runtime::stdlib::scanf_long;
 
 /// A failed conversion stops the scan and leaves the rest unassigned.
 pub struct Scan<'a> {
@@ -17,87 +21,47 @@ impl<'a> Scan<'a> {
         }
     }
 
-    /// `%d`.
-    pub fn int(&mut self) -> Option<i32> {
-        if self.failed {
-            return None;
-        }
-        let s = self.rest.trim_ascii_start();
-        let sign = usize::from(matches!(s.first(), Some(b'-' | b'+')));
-        let digits = s[sign..].iter().take_while(|b| b.is_ascii_digit()).count();
-        if digits == 0 {
-            self.failed = true;
-            return None;
-        }
-        let end = sign + digits;
-        self.rest = &s[end..];
-        // Out-of-range input is undefined in C; saturate.
-        let text = std::str::from_utf8(&s[..end]).unwrap_or("0");
-        Some(
-            text.parse::<i64>()
-                .map_or(0, |v| v.clamp(i32::MIN.into(), i32::MAX.into()) as i32),
+    /// One `sscanf` conversion, `fmt` ending in `%n`.
+    fn conv<T: ScanNum + Default>(&mut self, fmt: &str) -> Option<T> {
+        let (v, n) = (Cell::new(T::default()), Cell::new(0i32));
+        self.take(
+            (!self.failed && sscanf(self.rest, fmt, &[&v, &n]) == 1)
+                .then(|| (v.get(), n.get() as usize)),
         )
     }
 
-    /// `%x` into an `int`: an optional sign and `0x`, then hex digits.
-    pub fn hex(&mut self) -> Option<i32> {
-        if self.failed {
-            return None;
-        }
-        let s = self.rest.trim_ascii_start();
-        let negative = s.first() == Some(&b'-');
-        let mut at = usize::from(matches!(s.first(), Some(b'-' | b'+')));
-        if s[at..].len() > 2
-            && s[at] == b'0'
-            && matches!(s[at + 1], b'x' | b'X')
-            && s[at + 2].is_ascii_hexdigit()
-        {
-            at += 2;
-        }
-        let digits = s[at..].iter().take_while(|b| b.is_ascii_hexdigit()).count();
-        if digits == 0 {
+    fn take<T>(&mut self, read: Option<(T, usize)>) -> Option<T> {
+        let Some((v, n)) = read else {
             self.failed = true;
             return None;
-        }
-        self.rest = &s[at + digits..];
-        let text = std::str::from_utf8(&s[at..at + digits]).unwrap_or("0");
-        // C stores the conversion's low 32 bits.
-        let value = u64::from_str_radix(text, 16).unwrap_or(u64::MAX) as u32 as i32;
-        Some(if negative {
-            value.wrapping_neg()
-        } else {
-            value
-        })
+        };
+        self.rest = &self.rest[n..];
+        Some(v)
+    }
+
+    /// `%d`, read at `long` and saturated to `int` where glibc keeps the low
+    /// 32 bits.
+    pub fn int(&mut self) -> Option<i32> {
+        let read = (!self.failed).then(|| scanf_long(self.rest, 10)).flatten();
+        self.take(read.map(|(v, n)| {
+            let v = v.clamp(c_long::from(i32::MIN), c_long::from(i32::MAX));
+            (v as i32, n)
+        }))
+    }
+
+    /// `%x` into an `int`.
+    pub fn hex(&mut self) -> Option<i32> {
+        self.conv("%x%n")
     }
 
     /// `%E` / `%f` into a `float`.
     pub fn float(&mut self) -> Option<f32> {
-        if self.failed {
-            return None;
-        }
-        let Some((value, len)) = scan_f64_prefix(self.rest) else {
-            self.failed = true;
-            return None;
-        };
-        self.rest = &self.rest[len..];
-        Some(value as f32)
+        self.conv("%E%n")
     }
 
     /// `%c`: the next byte, whitespace included.
     pub fn char(&mut self) -> Option<u8> {
-        if self.failed {
-            return None;
-        }
-        match self.rest.split_first() {
-            Some((&c, rest)) => {
-                self.rest = rest;
-                Some(c)
-            }
-            None => {
-                self.failed = true;
-                None
-            }
-        }
+        self.conv("%c%n")
     }
 
     /// A literal byte in the format.
@@ -169,5 +133,22 @@ mod tests {
         let mut s = Scan::new(b" 0x1p3,5");
         assert_eq!(s.float(), Some(8.0));
         assert_eq!(s.comma().int(), Some(5));
+    }
+
+    /// glibc's blanks include `\v`.
+    #[test]
+    fn conversions_skip_a_vertical_tab() {
+        assert_eq!(Scan::new(b"\x0b7").int(), Some(7));
+        assert_eq!(Scan::new(b"\x0b1f").hex(), Some(31));
+    }
+
+    /// `%E` into a `float` rounds the decimal once; through a `double` this
+    /// one lands on a float tie and rounds to 1.0.
+    #[test]
+    fn a_float_rounds_once() {
+        assert_eq!(
+            Scan::new(b"1.0000000596046448").float(),
+            Some(1.0 + f32::EPSILON)
+        );
     }
 }
