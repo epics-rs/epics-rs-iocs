@@ -15,7 +15,10 @@
 //! that buffer by absolute offset. [`ResponseBuf`] is the buffer, [`decode`] the
 //! decoder.
 
+use std::cell::Cell;
+
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 
 use super::scan::{scan_char, scan_float, scan_int};
 use super::{CBuf, cstr};
@@ -678,6 +681,13 @@ fn scan_two_floats(s: &[u8], a: &mut f64, b: &mut f64) -> usize {
     2
 }
 
+/// C `%e` into a `float`: `strtof` rounds the text once, where narrowing
+/// what [`scan_float`] reads rounds it twice.
+fn scan_e(s: &[u8]) -> Option<(f32, &[u8])> {
+    let (v, n) = (Cell::new(0f32), Cell::new(0i32));
+    (sscanf(s, "%e%n", &[&v, &n]) == 1).then(|| (v.get(), &s[n.get() as usize..]))
+}
+
 /// C `sscanf(s, "%d,%d,%e,%e,%d", ...)` — note `%e` targets are `float`.
 fn scan_setpoint(s: &[u8], t: &mut [i64; 3], val1: &mut f32, val2: &mut f32) -> usize {
     let mut p = s;
@@ -705,17 +715,17 @@ fn scan_setpoint(s: &[u8], t: &mut [i64; 3], val1: &mut f32, val2: &mut f32) -> 
         None => return 1,
     }
     comma!(2);
-    match scan_float(p, None) {
+    match scan_e(p) {
         Some((v, rest)) => {
-            *val1 = v as f32;
+            *val1 = v;
             p = rest;
         }
         None => return 2,
     }
     comma!(3);
-    match scan_float(p, None) {
+    match scan_e(p) {
         Some((v, rest)) => {
-            *val2 = v as f32;
+            *val2 = v;
             p = rest;
         }
         None => return 3,
@@ -873,14 +883,14 @@ pub fn decode(cfg: &Config, buf: &ResponseBuf, prev: &Readings) -> Readings {
         }
 
         pv.strncpy(buf.slice(30, 8), 8);
-        if let Some((v, _)) = scan_float(pv.s(), None) {
-            val1 = v as f32;
+        if let Some((v, _)) = scan_e(pv.s()) {
+            val1 = v;
         }
         r.val = val1 as f64;
 
         pv.strncpy(buf.slice(60, 7), 7);
-        if let Some((v, _)) = scan_float(pv.s(), None) {
-            val2 = v as f32;
+        if let Some((v, _)) = scan_e(pv.s()) {
+            val2 = v;
         }
         r.crnt = val2 as f64;
 
@@ -1587,6 +1597,24 @@ mod tests {
         b.strcpy_at(318, b"1.35A");
         let r = decode(&qpc(1), &b, &Readings::default());
         assert_eq!(r.vers.unwrap(), b"1.35A");
+    }
+
+    /// C reads every `%e` straight into `float val1`/`val2`. Narrowing a
+    /// double lands 1.0000001788139343, just under a float tie, on the tie's
+    /// even side, and drops a `nan(n)` payload `strtod` keeps in the low bits.
+    #[test]
+    fn mpc_pressures_are_read_into_the_float_once() {
+        let widened = |bits: u32| f64::from(f32::from_bits(bits)).to_bits();
+        let mut b = mpc_buf();
+        b.strcpy_at(30, b"nan(1)");
+        b.strcpy_at(60, b"nan(2)");
+        b.strcpy_at(150, b"1,1,1.0000001788139343,0,1");
+        b.strcpy_at(180, b"3,1,0,1.0000001788139343,1");
+        let r = decode(&mpc(1), &b, &Readings::default());
+        assert_eq!(r.val.to_bits(), widened(0x7fc0_0001));
+        assert_eq!(r.crnt.to_bits(), widened(0x7fc0_0002));
+        assert_eq!(r.spr[0].to_bits(), widened(0x3f80_0001));
+        assert_eq!(r.shr[1].to_bits(), widened(0x3f80_0001));
     }
 
     #[test]
