@@ -770,15 +770,9 @@ impl XpsProfile {
                 done.message = "Error reading gathering data, numInBuffer = 0".into();
                 return done;
             }
-            match parse_gathering_buffer(&buffer, num_axes, &mut done.samples) {
-                Ok(lines) if lines as i32 == num_in_buffer => num_read += num_in_buffer,
-                // C's sscanf past the last line answers EOF.
-                Ok(_) => {
-                    done.ok = false;
-                    done.message =
-                        "Error reading Gathering.dat file, nitems=-1, should be 2".into();
-                    return done;
-                }
+            let lines = num_in_buffer as usize;
+            match parse_gathering_buffer(&buffer, lines, num_axes, &mut done.samples) {
+                Ok(()) => num_read += num_in_buffer,
                 Err(message) => {
                     done.ok = false;
                     done.message = message;
