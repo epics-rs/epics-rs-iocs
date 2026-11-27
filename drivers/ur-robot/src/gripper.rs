@@ -27,6 +27,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use epics_libcom_rs::runtime::stdlib::strtol_errno;
+
 use crate::error::{UrError, UrResult};
 
 /// Robotiq URCap listen port (`RobotiqGripper`'s `Port = 63352` default).
@@ -339,11 +341,16 @@ impl RobotiqGripper {
                 "reading gripper values is not possible in the current device state".into(),
             ));
         }
-        value.parse::<i32>().map_err(|_| {
-            UrError::Protocol(format!(
-                "gripper sent a non-integer '{var}' value: {value:?}"
-            ))
-        })
+        // `std::stoi`: strtol's prefix, throwing where nothing converts, on
+        // ERANGE or outside `int`.
+        strtol_errno(value, 10)
+            .filter(|&(_, len)| len > 0)
+            .and_then(|(v, _)| i32::try_from(v).ok())
+            .ok_or_else(|| {
+                UrError::Protocol(format!(
+                    "gripper sent a non-integer '{var}' value: {value:?}"
+                ))
+            })
     }
 
     /// `SET <var> <val> ...` — the reply must be `ack`.
@@ -882,6 +889,48 @@ mod tests {
         assert_eq!(g.object_detection_status().unwrap(), ObjectStatus::AtDest);
         g.disconnect();
         jh.join().unwrap();
+    }
+
+    /// g++/libstdc++ `std::stoi` (robotiq_gripper.cpp:226): the value's
+    /// leading integer, an error where it throws.
+    #[test]
+    fn get_var_reads_the_value_as_stoi() {
+        let cases = [
+            ("77", Some(77)),
+            ("77junk", Some(77)),
+            ("+77", Some(77)),
+            ("0x10", Some(0)),
+            ("1.5", Some(1)),
+            ("-2147483648", Some(i32::MIN)),
+            ("2147483648", None),           // out_of_range
+            ("99999999999999999999", None), // out_of_range
+            ("-", None),                    // invalid_argument
+            ("x7", None),                   // invalid_argument
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let replies: Vec<String> = cases.iter().map(|(v, _)| format!("POS {v}\n")).collect();
+        let jh = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut w = sock.try_clone().unwrap();
+            let mut r = BufReader::new(sock);
+            for reply in replies {
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                w.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let mut g = gripper_on(port);
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(v, want)| {
+                let got = g.get_var("POS").ok();
+                (got != want).then_some((v, got, want))
+            })
+            .collect();
+        g.disconnect();
+        jh.join().unwrap();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
