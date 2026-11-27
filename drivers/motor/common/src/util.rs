@@ -6,54 +6,22 @@
 //! "parse the leading numeric prefix, `0` on junk" behaviour of `atof`/`atoi`,
 //! which controller reply parsing relies on.
 
-/// Mimic C `atof`: parse the leading numeric prefix as `f64`, returning `0.0`
-/// on junk (as C `atof` does).
+/// C `atof`: `strtod`'s value, `0.0` when nothing converts.
 pub fn atof(s: &str) -> f64 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        let mut j = i + 1;
-        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
-            j += 1;
-        }
-        let exp_start = j;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j > exp_start {
-            i = j;
-        }
-    }
-    t.get(..i)
-        .and_then(|p| p.parse::<f64>().ok())
-        .unwrap_or(0.0)
+    epics_libcom_rs::runtime::stdlib::strtod(s.as_bytes()).value
 }
 
 /// C `strtol`, `atoi` (`(int) strtol(s, NULL, 10)`) and `atol` at this
 /// platform's `long`, as glibc reads them under `_GNU_SOURCE`.
 pub use epics_rs::base::types::c_parse::{atoi, atol, long_to_int, strtol};
 
-/// Parse leading hex digits as `u32` (C `sscanf` `%x`); `None` if there is no
-/// hex digit (C `sscanf` count `!= 1`).
+/// C `sscanf(s, "%x", &u) == 1`, read at 64 bits so that a value C would
+/// keep the low 32 bits of (a negated or over-wide one) is `None`.
 pub fn leading_hex(s: &str) -> Option<u32> {
-    let n = s.bytes().take_while(u8::is_ascii_hexdigit).count();
-    if n == 0 {
-        return None;
-    }
-    u32::from_str_radix(&s[..n], 16).ok()
+    let v = std::cell::Cell::new(0u64);
+    (epics_libcom_rs::runtime::scanf::sscanf(s, "%llx", &[&v]) == 1)
+        .then(|| u32::try_from(v.get()).ok())
+        .flatten()
 }
 
 /// `atof(&resp[offset..])`; `None` only when `offset` is past the reply.
@@ -95,6 +63,14 @@ mod tests {
         assert_eq!(atof("1.5e-3x"), 1.5e-3);
         assert_eq!(atof("abc"), 0.0);
         assert_eq!(atof("+"), 0.0);
+    }
+
+    #[test]
+    fn atof_reads_what_strtod_reads() {
+        assert_eq!(atof("0x1A"), 26.0);
+        assert_eq!(atof(" -inf"), f64::NEG_INFINITY);
+        assert!(atof("nan").is_nan());
+        assert_eq!(atof("\u{a0}5"), 0.0);
     }
 
     #[test]
@@ -155,6 +131,16 @@ mod tests {
         assert_eq!(leading_hex("ffXY"), Some(0xff));
         assert_eq!(leading_hex("xy"), None);
         assert_eq!(leading_hex(""), None);
+    }
+
+    #[test]
+    fn leading_hex_reads_what_sscanf_x_reads() {
+        assert_eq!(leading_hex(" 1e"), Some(0x1e));
+        assert_eq!(leading_hex("0x1F"), Some(31));
+        assert_eq!(leading_hex("+5"), Some(5));
+        // glibc keeps the low 32 bits of these.
+        assert_eq!(leading_hex("-5"), None);
+        assert_eq!(leading_hex("123456789"), None);
     }
 
     #[test]
