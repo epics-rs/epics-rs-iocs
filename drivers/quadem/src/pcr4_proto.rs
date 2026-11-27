@@ -243,57 +243,12 @@ pub fn parse_sample(line: &str, num_channels: i32) -> [f64; QE_MAX_INPUTS] {
     raw
 }
 
-/// `strtod(nptr, &endptr)` restricted to what the meter emits: optional
-/// whitespace, optional sign, digits with an optional fraction and an optional
-/// decimal exponent.
-///
-/// Returns the value and the bytes consumed. As in C, "no conversion" leaves
-/// the pointer parked (`0` consumed) and yields `0.0`, which makes every later
-/// field of the same line read `0.0` as well.
+/// C `strtod(nptr, &endptr)`: the value and the bytes consumed. As in C,
+/// "no conversion" leaves the pointer parked (`0` consumed) and yields
+/// `0.0`, which makes every later field of the same line read `0.0` as well.
 pub fn strtod(s: &str) -> (f64, usize) {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let start = i;
-    if matches!(b.get(i), Some(b'+') | Some(b'-')) {
-        i += 1;
-    }
-    let mut digits = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-        digits += 1;
-    }
-    if b.get(i) == Some(&b'.') {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-            digits += 1;
-        }
-    }
-    if digits == 0 {
-        return (0.0, 0);
-    }
-    // The exponent only counts if it is complete; otherwise strtod backs up to
-    // the end of the mantissa.
-    if matches!(b.get(i), Some(b'e') | Some(b'E')) {
-        let mut j = i + 1;
-        if matches!(b.get(j), Some(b'+') | Some(b'-')) {
-            j += 1;
-        }
-        let exp_start = j;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j > exp_start {
-            i = j;
-        }
-    }
-    match s[start..i].parse::<f64>() {
-        Ok(v) => (v, i),
-        Err(_) => (0.0, 0),
-    }
+    let r = epics_libcom_rs::runtime::stdlib::strtod(s.as_bytes());
+    (r.value, r.len)
 }
 
 #[cfg(test)]
@@ -477,6 +432,13 @@ mod tests {
         // No conversion: value 0, pointer parked.
         assert_eq!(strtod("abc"), (0.0, 0));
         assert_eq!(strtod(""), (0.0, 0));
+    }
+
+    #[test]
+    fn strtod_reads_what_glibc_strtod_reads() {
+        assert_eq!(strtod("\x0b5"), (5.0, 2));
+        assert_eq!(strtod("inf 1"), (f64::INFINITY, 3));
+        assert_eq!(strtod("0x10"), (16.0, 4));
     }
 
     #[test]
