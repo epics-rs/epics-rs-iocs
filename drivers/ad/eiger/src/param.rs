@@ -11,11 +11,13 @@
 //! into `PortDriverBase`, the background tasks push them through a
 //! `PortHandle`). One codec, two sinks — no duplicated encode/decode logic.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use serde_json::Value;
 
 use crate::rest::{DEFAULT_TIMEOUT, RestApi, RestError, RestResult, Sys};
@@ -220,8 +222,8 @@ pub fn parse_meta(
         Kind::Int | Kind::UInt | Kind::Double => {
             let (min, max) = (body.get("min"), body.get("max"));
             if numeric_char == 'i' || numeric_char == 'u' {
-                meta.min_int = min.and_then(json_as_i32);
-                meta.max_int = max.and_then(json_as_i32);
+                meta.min_int = min.map(raw_value_text).as_deref().and_then(scan_int);
+                meta.max_int = max.map(raw_value_text).as_deref().and_then(scan_int);
                 if let (Some(v), None) = (min, meta.min_int) {
                     return Err(limit_err("min", v, "integer"));
                 }
@@ -229,8 +231,8 @@ pub fn parse_meta(
                     return Err(limit_err("max", v, "integer"));
                 }
             } else if numeric_char == 'f' {
-                meta.min_f64 = min.and_then(json_as_f64);
-                meta.max_f64 = max.and_then(json_as_f64);
+                meta.min_f64 = min.map(raw_value_text).as_deref().and_then(scan_double);
+                meta.max_f64 = max.map(raw_value_text).as_deref().and_then(scan_double);
                 if let (Some(v), None) = (min, meta.min_f64) {
                     return Err(limit_err("min", v, "double"));
                 }
@@ -258,22 +260,19 @@ pub struct MetaError {
     pub summary: &'static str,
 }
 
-/// Accept a JSON number, or a JSON string holding a number, as C's `sscanf`
-/// against the raw token text does.
-fn json_as_i32(v: &Value) -> Option<i32> {
-    match v {
-        Value::Number(n) => n.as_i64().map(|i| i as i32),
-        Value::String(s) => s.trim().parse::<i32>().ok(),
-        _ => None,
-    }
+/// C `sscanf(raw, "%d", &v) == 1`, read at 64 bits so that a value C would
+/// wrap into its `int` is `None`.
+fn scan_int(raw: &str) -> Option<i32> {
+    let v = Cell::new(0i64);
+    (sscanf(raw, "%lld", &[&v]) == 1)
+        .then(|| i32::try_from(v.get()).ok())
+        .flatten()
 }
 
-fn json_as_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim().parse::<f64>().ok(),
-        _ => None,
-    }
+/// C `sscanf(raw, "%lf", &v) == 1`.
+fn scan_double(raw: &str) -> Option<f64> {
+    let v = Cell::new(0f64);
+    (sscanf(raw, "%lf", &[&v]) == 1).then(|| v.get())
 }
 
 /// Index of an enum value (C `EigerParam::getEnumIndex`).
@@ -625,9 +624,7 @@ impl ParamOps {
                         "false" => 0,
                         _ => return Err(bad("boolean")),
                     },
-                    Kind::Int | Kind::UInt => {
-                        raw.trim().parse::<i32>().map_err(|_| bad("integer"))?
-                    }
+                    Kind::Int | Kind::UInt => scan_int(raw).ok_or_else(|| bad("integer"))?,
                     other => {
                         let msg = format!("[param={name}] unexpected type {}", other as i32);
                         self.trace.param_err(name, "fetch<int>", &msg);
@@ -640,7 +637,7 @@ impl ParamOps {
                 // The detector can return integers larger than 2^31, so int and
                 // uint parameters are allowed to feed a Float64 (C fetch<double>,
                 // eigerParam.cpp:626-632).
-                let mut v: f64 = raw.trim().parse().map_err(|_| bad("double"))?;
+                let mut v = scan_double(raw).ok_or_else(|| bad("double"))?;
                 // FW_FREE units depend on the API version: 1.6.0 reports KB,
                 // 1.8.0 reports bytes; both are published as GB
                 // (C fetch<double>, eigerParam.cpp:645-653).
@@ -849,10 +846,13 @@ impl ParamOps {
             "put<double>",
             format_args!("{value:.6}", value = CFloat(value)),
         );
-        let def = self.ensure_meta(index)?;
+        // The epsilon is local, so a no-op write succeeds before the first
+        // touch's metadata fetch can fail it (eigerParam.cpp:861-871).
+        let def = self.def(index)?;
         if def.epsilon != 0.0 && (current - value).abs() < def.epsilon {
             return Ok(Vec::new());
         }
+        let def = self.ensure_meta(index)?;
 
         let mut value = value;
         let mut updates = Vec::new();
@@ -972,6 +972,33 @@ mod tests {
         assert_eq!(ops.enum_index_of(7, "disabled"), Some(0));
         assert_eq!(ops.enum_index_of(7, "4M"), Some(1));
         assert_eq!(ops.enum_index_of(7, "nonesuch"), None);
+    }
+
+    /// C `put(double)` checks the epsilon before the first touch's fetch
+    /// (eigerParam.cpp:861-871): a write within it succeeds with the detector
+    /// unreachable.
+    #[test]
+    fn a_write_within_epsilon_succeeds_before_any_fetch() {
+        let mut reg = ParamRegistry::new();
+        reg.add(
+            3,
+            "WAVELENGTH",
+            AsynType::Float64,
+            Sys::DetConfig,
+            "wavelength",
+        );
+        reg.set_epsilon(3, 0.0005);
+        let ops = ParamOps::new(
+            RestApi::new("127.0.0.1", DEAD_PORT),
+            reg,
+            Trace::new("EIGTEST"),
+        );
+
+        assert!(ops.put_f64(3, 1.0001, 1.0).unwrap().is_empty());
+        assert!(
+            ops.put_f64(3, 1.1, 1.0).is_err(),
+            "outside it, the fetch fails"
+        );
     }
 
     /// `fetch_all` used to hold the registry lock across the loop body, and
@@ -1103,6 +1130,95 @@ mod tests {
     fn meta_unknown_value_type_is_an_error() {
         let v: Value = serde_json::from_str(r#"{"value_type": "quaternion"}"#).unwrap();
         assert!(parse_meta(&v, Sys::DetConfig, false, &Meta::default()).is_err());
+    }
+
+    /// C `parseValue` and `parseMinMax` scan the token text with `sscanf`
+    /// `%d` / `%lf` (eigerParam.cpp:150-219), so a number ends where the
+    /// conversion stops. A value C wraps into its `int` is refused.
+    #[test]
+    fn values_and_limits_are_scanned_as_c_sscanf() {
+        let mut reg = ParamRegistry::new();
+        reg.add(1, "NIMAGES", AsynType::Int32, Sys::DetConfig, "nimages");
+        reg.add(
+            2,
+            "WAVELENGTH",
+            AsynType::Float64,
+            Sys::DetConfig,
+            "wavelength",
+        );
+        let ops = ParamOps::new(
+            RestApi::new("127.0.0.1", DEAD_PORT),
+            reg,
+            Trace::new("EIGTEST"),
+        );
+        let int_meta = Meta {
+            kind: Kind::Int,
+            ..Meta::default()
+        };
+        let f64_meta = Meta {
+            kind: Kind::Double,
+            ..Meta::default()
+        };
+        let fetched = |index: usize, meta: &Meta, raw: &str| {
+            let def = ops.def(index).unwrap();
+            ops.decode_into_updates(&def, meta, raw).ok()
+        };
+        let mut wrong = Vec::new();
+        let ints = [
+            ("42", Some(42)),
+            (" 7", Some(7)),
+            ("1.5", Some(1)),
+            ("5abc", Some(5)),
+            ("0x10", Some(0)),
+            ("+5", Some(5)),
+            ("-2147483648", Some(i32::MIN)),
+            ("3000000000", None),
+            ("abc", None),
+            ("", None),
+        ];
+        for (raw, want) in ints {
+            let got = fetched(1, &int_meta, raw);
+            if got != want.map(|v| vec![ParamUpdate::Int32(1, v)]) {
+                wrong.push(format!("fetch<int> {raw:?}: {got:?}"));
+            }
+        }
+        let doubles = [
+            ("0.5", Some(0.5)),
+            ("2.5x", Some(2.5)),
+            ("0x10", Some(16.0)),
+            ("inf", Some(f64::INFINITY)),
+            (" 3", Some(3.0)),
+            // A dangling exponent fails `%lf`, as from glibc 2.42 (BZ #12701).
+            ("1.5e", None),
+            ("abc", None),
+            ("", None),
+        ];
+        for (raw, want) in doubles {
+            let got = fetched(2, &f64_meta, raw);
+            if got != want.map(|v| vec![ParamUpdate::Float64(2, v)]) {
+                wrong.push(format!("fetch<double> {raw:?}: {got:?}"));
+            }
+        }
+        let limits = [
+            (r#""int", "min": "1.5""#, Some(1), None),
+            (r#""int", "min": "5abc""#, Some(5), None),
+            (r#""int", "min": 1.5"#, Some(1), None),
+            (r#""uint", "min": 3000000000"#, None, None),
+            (r#""float", "min": "0x10""#, None, Some(16.0)),
+            (r#""float", "min": "2.5x""#, None, Some(2.5)),
+        ];
+        for (fields, int, double) in limits {
+            let body = format!(r#"{{"value": 1, "value_type": {fields}}}"#);
+            let v: Value = serde_json::from_str(&body).unwrap();
+            let got = parse_meta(&v, Sys::DetConfig, false, &Meta::default())
+                .ok()
+                .map(|m| (m.min_int, m.min_f64));
+            let want = (int.is_some() || double.is_some()).then_some((int, double));
+            if got != want {
+                wrong.push(format!("min {fields}: {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

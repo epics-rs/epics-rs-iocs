@@ -34,7 +34,13 @@ pub(crate) struct SimTaskContext {
 }
 
 pub(crate) fn start_sim_task(ctx: SimTaskContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("SimDetTask", move || sim_task(ctx))
+    // As C creates it (simDetector.cpp:1147-1151).
+    rt::run_thread_named(
+        "SimDetTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || sim_task(ctx),
+    )
 }
 
 /// Outcome of a timed wait on the stop event.

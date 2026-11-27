@@ -71,15 +71,15 @@ const MAX_ERROR_DRAIN: usize = 32;
 const STATUS_PROBLEM: usize = index::STATUS_DIRECTION + 9;
 
 // MCS2 channel status-word bits (C header).
-const ACTIVELY_MOVING: i64 = 0x0001;
-const CLOSED_LOOP_ACTIVE: i64 = 0x0002;
-const SENSOR_PRESENT: i64 = 0x0020;
-const IS_CALIBRATED: i64 = 0x0040;
-const IS_REFERENCED: i64 = 0x0080;
-const END_STOP_REACHED: i64 = 0x0100;
-const FOLLOWING_LIMIT_REACHED: i64 = 0x0400;
-const MOVEMENT_FAILED: i64 = 0x0800;
-const REFERENCE_MARK: i64 = 0x8000;
+const ACTIVELY_MOVING: i32 = 0x0001;
+const CLOSED_LOOP_ACTIVE: i32 = 0x0002;
+const SENSOR_PRESENT: i32 = 0x0020;
+const IS_CALIBRATED: i32 = 0x0040;
+const IS_REFERENCED: i32 = 0x0080;
+const END_STOP_REACHED: i32 = 0x0100;
+const FOLLOWING_LIMIT_REACHED: i32 = 0x0400;
+const MOVEMENT_FAILED: i32 = 0x0800;
+const REFERENCE_MARK: i32 = 0x8000;
 
 // MCS2 reference options (C header).
 const START_DIRECTION: i64 = 0x0001;
@@ -512,8 +512,8 @@ impl Mcs2Axis {
     ) -> AsynResult<()> {
         let c = self.channel;
         let r = ctrl.reasons.unwrap_or_default();
-        let state = atof(&ctrl.query(&format!(":CHAN{c}:STAT?"))?) as i64;
-        set.push((r.pstat, state as i32));
+        let state = atoi(&ctrl.query(&format!(":CHAN{c}:STAT?"))?);
+        set.push((r.pstat, state));
         let done = (state & ACTIVELY_MOVING) == 0;
         let end_stop = (state & END_STOP_REACHED) != 0;
         status.moving = !done;
@@ -537,7 +537,7 @@ impl Mcs2Axis {
             status.set_position(atof(&targ) / PULSES_PER_STEP);
         }
         // Drive power-on status (amplitude non-zero).
-        status.powered = atof(&ctrl.query(&format!(":CHAN{c}:AMPL?"))?) as i64 != 0;
+        status.powered = atoi(&ctrl.query(&format!(":CHAN{c}:AMPL?"))?) != 0;
         set.push((r.ptyp_rb, atoi(&ctrl.query(&format!(":CHAN{c}:PTYP?"))?)));
         if done {
             set.push((r.cal, i32::from(state & IS_CALIBRATED != 0)));
@@ -1184,15 +1184,68 @@ mod tests {
         );
     }
 
+    /// smarActMCS2MotorDriver.cpp:483 and :535 read STAT? and AMPL? with
+    /// `atoi`, so a decimal prefix counts and `0x`, `.` or `e` ends it.
+    #[test]
+    fn stat_and_ampl_are_read_with_atoi() {
+        use epics_rs::asyn::interfaces::motor::PortSet;
+        use motor_common::testing::LineRig;
+        /// (moving, has_encoder, powered, PSTAT).
+        type Polled = (bool, bool, bool, i32);
+        // (STAT?, AMPL?) -> what the poll sets.
+        const CASES: [(&str, &str, Polled); 5] = [
+            ("0x21", "0", (false, false, false, 0)),
+            ("1e5", "0", (true, false, false, 1)),
+            ("33.9", "0", (true, true, false, 33)),
+            ("0", "1e-3", (false, false, true, 0)),
+            ("0", "0x1", (false, false, false, 0)),
+        ];
+        let replies = Arc::new(Mutex::new(("", "")));
+        let shared = replies.clone();
+        let (_rig, io) = LineRig::new("mcs2AtoiPoll", move |cmd| {
+            let (stat, ampl) = *shared.lock().unwrap();
+            match cmd.trim_end() {
+                ":CHAN0:STAT?" => format!("{stat}\r\n"),
+                ":CHAN0:AMPL?" => format!("{ampl}\r\n"),
+                _ => "0\r\n".to_string(),
+            }
+        });
+        let mut ctrl = Mcs2Controller::new(io, MotorTrace::new("mcs2AtoiPoll", 0), no_port());
+        ctrl.set_reasons(Mcs2Reasons::from_slice([10, 11, 12, 13, 14, 15]));
+        let mut axis = Mcs2Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        let mut wrong = Vec::new();
+        for (stat, ampl, want) in CASES {
+            *replies.lock().unwrap() = (stat, ampl);
+            let status = axis.polled(&AsynUser::default()).unwrap();
+            let pstat = axis.take_port_sets().into_iter().find_map(|set| match set {
+                PortSet::Axis {
+                    reason: 12,
+                    value: ParamValue::Int32(v),
+                } => Some(v),
+                _ => None,
+            });
+            let got = (
+                status.moving,
+                status.has_encoder,
+                status.powered,
+                pstat.unwrap_or(i32::MIN),
+            );
+            if got != want {
+                wrong.push((stat, ampl, got));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
+
     #[test]
     fn status_bits_decode() {
         // Moving + sensor present + closed loop.
-        let state: i64 = ACTIVELY_MOVING | SENSOR_PRESENT | CLOSED_LOOP_ACTIVE;
+        let state: i32 = ACTIVELY_MOVING | SENSOR_PRESENT | CLOSED_LOOP_ACTIVE;
         assert_eq!(state & ACTIVELY_MOVING, ACTIVELY_MOVING);
         assert!((state & SENSOR_PRESENT) != 0);
         assert!((state & CLOSED_LOOP_ACTIVE) != 0);
         // Idle + referenced + at reference mark.
-        let idle: i64 = IS_REFERENCED | REFERENCE_MARK;
+        let idle: i32 = IS_REFERENCED | REFERENCE_MARK;
         assert_eq!(idle & ACTIVELY_MOVING, 0);
         assert!((idle & IS_REFERENCED) != 0);
     }

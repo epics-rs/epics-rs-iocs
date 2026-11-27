@@ -63,37 +63,6 @@ const MAX_ENTRIES: usize = 10;
 /// `DppSocket.cpp:493`).
 const MAX_RECV_ITERATIONS: usize = 50;
 
-/// Whether a UDP discovery/probe `recv` error means "nothing valid
-/// replied", i.e. the same outcome as a timeout.
-///
-/// On Unix an unanswered `recv_from` simply times out (`WouldBlock` /
-/// `TimedOut`). On Windows the OS defers the ICMP error from an
-/// unanswered datagram to the *next* `recv` rather than timing out, and
-/// which ICMP shape it is depends on why nothing replied:
-/// - a live host with no listener on the port → port-unreachable →
-///   `WSAECONNRESET` (`ConnectionReset`; `ConnectionRefused` on a
-///   connected socket);
-/// - no host / no route at the target address at all (the common case
-///   when probing an IP where no DP5 is currently plugged in) →
-///   host/network-unreachable or network-down → `HostUnreachable` /
-///   `NetworkUnreachable` / `NetworkDown`.
-///
-/// For NetFinder discovery and the direct-connect probe every one of
-/// these means the same thing — no device answered — so they are treated
-/// identically to a timeout.
-fn is_no_response(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::WouldBlock
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::HostUnreachable
-            | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::NetworkDown
-    )
-}
-
 /// `osiSockDiscoverBroadcastAddresses` with a wildcard match address, as
 /// the `CDppSocket` ctor calls it (`DppSocket.cpp:25-27`): one entry per
 /// eligible interface, not deduplicated, at the NetFinder port.
@@ -111,13 +80,6 @@ fn interface_broadcast_list() -> Vec<SocketAddrV4> {
 fn ip_addr_to_a_port0(ip: Ipv4Addr) -> String {
     let addr = SocketAddr::V4(SocketAddrV4::new(ip, 0));
     String::from_utf8_lossy(&ip_addr_to_a(addr)).into_owned()
-}
-
-/// A send and one `UDPRecvFrom` on C's invalid descriptor: the failed send
-/// is followed by the 50 ms settle, and the failed `recvfrom` by the
-/// timeout sleep before its failed retry (`DppSocket.cpp:186-200`).
-fn no_socket_exchange() {
-    std::thread::sleep(Duration::from_millis(50) + READ_TIMEOUT);
 }
 
 pub struct AmptekUdpTransport {
@@ -182,26 +144,34 @@ impl AmptekUdpTransport {
         }
     }
 
+    /// `UDPSendTo` of `packet` to `target:10001` and the 50 ms settle, with
+    /// the socket to read the reply from. `None` when it was not sent (no
+    /// socket, or `sendto` failed), after the time C's failed `recvfrom`
+    /// retry takes (`DppSocket.cpp:197-201`). C reads on after a failed
+    /// `sendto` (`DppSocket.cpp:463-465`); here nothing can answer an
+    /// unsent request, so no earlier request's late reply is taken for it.
+    fn send_request(&self, target: Ipv4Addr, packet: &[u8]) -> Option<&UdpSocket> {
+        let sent = self.socket.as_ref().filter(|socket| {
+            socket.send_to(packet, (target, self.command_port)).is_ok()
+                && socket.set_read_timeout(Some(READ_TIMEOUT)).is_ok()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        if sent.is_none() {
+            std::thread::sleep(READ_TIMEOUT);
+        }
+        sent
+    }
+
     /// `CConsoleHelper::doAmptekNetFinderPacket` (`ConsoleHelper.cpp:199-261`):
     /// send the NetFinder direct query to `target:10001`, sleep 50 ms, read
     /// one reply. Returns the address the reply carries, `None` when no
     /// acceptable reply arrived (C's `iNumDevices == 0`).
-    fn amptek_net_finder_packet(&self, target: Ipv4Addr) -> io::Result<Option<Ipv4Addr>> {
-        let request = net_finder::build_direct_request();
-        let Some(socket) = &self.socket else {
-            no_socket_exchange();
-            return Ok(None);
-        };
-        socket.send_to(&request, (target, self.command_port))?;
-        std::thread::sleep(Duration::from_millis(50));
-        socket.set_read_timeout(Some(READ_TIMEOUT))?;
+    fn amptek_net_finder_packet(&self, target: Ipv4Addr) -> Option<Ipv4Addr> {
+        let socket = self.send_request(target, &net_finder::build_direct_request())?;
         let mut buf = [0u8; RECV_CHUNK_SIZE];
-        let n = match socket.recv_from(&mut buf) {
-            Ok((n, _from)) => n,
-            Err(e) if is_no_response(e.kind()) => 0,
-            Err(e) => return Err(e),
-        };
-        Ok(net_finder::parse_direct_response(&mut buf, n))
+        // `UDPRecvFrom` returns 0 on any error (`DppSocket.cpp:203-210`).
+        let n = socket.recv_from(&mut buf).map_or(0, |(n, _from)| n);
+        net_finder::parse_direct_response(&mut buf, n)
     }
 
     /// `CConsoleHelper::DppSocket_Connect_Direct_DPP`
@@ -209,22 +179,22 @@ impl AmptekUdpTransport {
     /// reply is accepted, then one address comparison against the last
     /// accepted reply (`ulNetFinderAddr`, reset to 0 first). Returns
     /// `(connected, NumDevices)`.
-    pub fn connect_direct(&self, target: Ipv4Addr) -> io::Result<(bool, usize)> {
+    pub fn connect_direct(&self, target: Ipv4Addr) -> (bool, usize) {
         let mut reported = None;
         for attempt in 0..3 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_secs(1));
             }
-            reported = self.amptek_net_finder_packet(target)?;
+            reported = self.amptek_net_finder_packet(target);
             if reported.is_some() {
                 break;
             }
         }
         let num_devices = usize::from(reported.is_some());
-        Ok((
+        (
             reported.unwrap_or(Ipv4Addr::UNSPECIFIED) == target,
             num_devices,
-        ))
+        )
     }
 
     /// `CDppSocket::UDPRecvFromNfAddr` (`DppSocket.cpp:217-243`): one
@@ -296,7 +266,7 @@ impl AmptekUdpTransport {
     /// found (an empty address compares as `inet_addr("")`, i.e.
     /// `INADDR_NONE`). On a match C sleeps 1 s and sends one direct query,
     /// whose result it ignores. Returns `(connected, NumDevices)`.
-    pub fn connect_default(&self, target: Ipv4Addr) -> io::Result<(bool, usize)> {
+    pub fn connect_default(&self, target: Ipv4Addr) -> (bool, usize) {
         let mut found = self.net_finder_broadcast();
         for _ in 0..2 {
             if found.is_empty() {
@@ -309,34 +279,28 @@ impl AmptekUdpTransport {
             .any(|addr| addr.unwrap_or(Ipv4Addr::BROADCAST) == target);
         if connected {
             std::thread::sleep(Duration::from_secs(1));
-            self.amptek_net_finder_packet(target)?;
+            self.amptek_net_finder_packet(target);
         }
-        Ok((connected, found.len()))
+        (connected, found.len())
     }
 
     /// `CDppSocket::SendPacketInet` (`DppSocket.cpp:452-506`): send
     /// `packet` to `target:10001`, sleep 50 ms, then accumulate up to
     /// `MAX_RESPONSE_SIZE` bytes across up to `MAX_RECV_ITERATIONS`
     /// receives, stopping early once exactly `expected_size` bytes have
-    /// arrived (`iTotal == iRequestedSize`) or a receive times out
-    /// (`iSize <= 0`). Errors (not "no response") only for actual socket
-    /// I/O failures; "device never replied" is `Ok(Vec::new())`, mirrored
-    /// from C's `success = iTotal; return iTotal > 0`.
+    /// arrived (`iTotal == iRequestedSize`) or a receive gets nothing
+    /// (`iSize <= 0`). The bytes received, empty when nothing replied,
+    /// are all C reports (`success = iTotal; return iTotal > 0`).
     pub fn send_packet_inet(
         &self,
         target: Ipv4Addr,
         packet: &[u8],
         expected_size: usize,
-    ) -> io::Result<Vec<u8>> {
-        let Some(socket) = &self.socket else {
-            no_socket_exchange();
-            return Ok(Vec::new());
-        };
-        socket.send_to(packet, (target, self.command_port))?;
-        std::thread::sleep(Duration::from_millis(50));
-        socket.set_read_timeout(Some(READ_TIMEOUT))?;
-
+    ) -> Vec<u8> {
         let mut total = Vec::new();
+        let Some(socket) = self.send_request(target, packet) else {
+            return total;
+        };
         for _ in 0..MAX_RECV_ITERATIONS {
             let mut chunk = [0u8; RECV_CHUNK_SIZE];
             match socket.recv_from(&mut chunk) {
@@ -349,12 +313,11 @@ impl AmptekUdpTransport {
                         break;
                     }
                 }
-                Ok(_) => break,
-                Err(e) if is_no_response(e.kind()) => break,
-                Err(e) => return Err(e),
+                // `UDPRecvFrom` returns 0 on any error (`DppSocket.cpp:203-210`).
+                Ok(_) | Err(_) => break,
             }
         }
-        Ok(total)
+        total
     }
 }
 
@@ -405,7 +368,7 @@ mod tests {
     fn connect_direct_confirms_on_matching_response() {
         let (transport, handle) =
             transport_with_responder(|_req, _from| direct_reply([127, 0, 0, 1]));
-        assert_eq!(transport.connect_direct(LOOPBACK).unwrap(), (true, 1));
+        assert_eq!(transport.connect_direct(LOOPBACK), (true, 1));
         handle.join().unwrap();
     }
 
@@ -415,14 +378,14 @@ mod tests {
     fn connect_direct_does_not_retry_past_a_mismatched_reply() {
         let (transport, handle) =
             transport_with_responder(|_req, _from| direct_reply([10, 0, 0, 99]));
-        assert_eq!(transport.connect_direct(LOOPBACK).unwrap(), (false, 1));
+        assert_eq!(transport.connect_direct(LOOPBACK), (false, 1));
         handle.join().unwrap();
     }
 
     #[test]
     fn amptek_net_finder_packet_times_out_with_no_responder() {
         let transport = AmptekUdpTransport::bind_on_command_port(DEAD_PORT).unwrap();
-        assert_eq!(transport.amptek_net_finder_packet(LOOPBACK).unwrap(), None);
+        assert_eq!(transport.amptek_net_finder_packet(LOOPBACK), None);
     }
 
     /// A NetFinder broadcast reply of `len` bytes for the request `req`,
@@ -501,7 +464,7 @@ mod tests {
                 vec![]
             }
         });
-        assert_eq!(transport.connect_default(LOOPBACK).unwrap(), (true, 1));
+        assert_eq!(transport.connect_default(LOOPBACK), (true, 1));
         assert_eq!(requests.load(Ordering::Relaxed), 2);
     }
 
@@ -509,14 +472,14 @@ mod tests {
     fn connect_default_rejects_when_target_is_not_among_responses() {
         let (transport, _) =
             transport_with_netfinder(1, |req| vec![broadcast_reply(req, 68, [10, 0, 0, 99])]);
-        assert_eq!(transport.connect_default(LOOPBACK).unwrap(), (false, 1));
+        assert_eq!(transport.connect_default(LOOPBACK), (false, 1));
     }
 
     #[test]
     fn send_packet_inet_accumulates_until_expected_size() {
         let (transport, handle) = transport_with_responder(|_req, _from| vec![0xABu8; 72]);
         let packet = protocol::build_command(protocol::TransmitPacketType::SendStatus);
-        let result = transport.send_packet_inet(LOOPBACK, &packet, 72).unwrap();
+        let result = transport.send_packet_inet(LOOPBACK, &packet, 72);
         assert_eq!(result, vec![0xABu8; 72]);
         handle.join().unwrap();
     }
@@ -525,7 +488,7 @@ mod tests {
     fn send_packet_inet_returns_empty_when_unreachable() {
         let transport = AmptekUdpTransport::bind_on_command_port(DEAD_PORT).unwrap();
         let packet = protocol::build_command(protocol::TransmitPacketType::SendStatus);
-        let result = transport.send_packet_inet(LOOPBACK, &packet, 72).unwrap();
+        let result = transport.send_packet_inet(LOOPBACK, &packet, 72);
         assert!(result.is_empty());
     }
 }

@@ -207,6 +207,13 @@ fn wait_epics_motors(env: &Env) {
     post();
 }
 
+/// C `memcpy` of one array variable into another: one read of `from`
+/// under its lock, so a monitor writing it lands wholly before or after.
+fn copy_array<const N: usize>(from: &SeqVar<[f64; N]>, to: &SeqVar<[f64; N]>) {
+    let a = from.modify(|a| a.to_vec());
+    to.modify(|b| b.copy_from_slice(&a));
+}
+
 macro_rules! seqg_escaped {
     (r#"#include <stdlib.h>"#) => {};
     (r#"#include <string.h>"#) => {};
@@ -249,6 +256,12 @@ macro_rules! seqg_escaped {
     };
     ($env:ident, r#"pVar->anyMoving = getMotorMoving(ssId, pVar);"#) => {
         $env.var().anyMoving.set(get_motor_moving($env.var()))
+    };
+    ($env:ident, r#"memcpy(pVar->buildTime, pVar->timeTrajectory, sizeof(pVar->buildTime));"#) => {
+        copy_array(&$env.var().timeTrajectory, &$env.var().buildTime)
+    };
+    ($env:ident, r#"memcpy(pVar->timeTrajectory, pVar->buildTime, sizeof(pVar->timeTrajectory));"#) => {
+        copy_array(&$env.var().buildTime, &$env.var().timeTrajectory)
     };
 }
 

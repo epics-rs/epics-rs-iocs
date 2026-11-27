@@ -12,9 +12,9 @@ use ad_csimdetector::{CSimDetectorRuntime, MAX_SIGNALS, create_c_sim_detector};
 /// Signature matches the C iocsh command (ADCSimDetector.cpp:412-450):
 ///   `ADCSimDetectorConfig(portName, numTimePoints, dataType, maxBuffers, maxMemory, priority, stackSize)`
 ///
-/// DEVIATION: `priority` and `stackSize` configure `epicsThreadCreate`; the
-/// Rust simulation task runs on a `run_thread_named` worker with no equivalent
-/// knobs, so both are accepted and ignored.
+/// DEVIATION: `priority` and `stackSize` set C's asyn port thread
+/// (ADCSimDetector.cpp:53-60); the runtime schedules the port itself, so both
+/// are accepted and ignored.
 pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
     epics_rs::base::runtime::env::set_default_path("ADCSIMDETECTOR", env!("CARGO_MANIFEST_DIR"));
 

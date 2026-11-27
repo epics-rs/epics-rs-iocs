@@ -2,7 +2,6 @@
 //! one variant per `DppInterface_t`, each holding that interface's
 //! connection state.
 
-use std::io;
 use std::net::Ipv4Addr;
 
 use crate::transport::AmptekUdpTransport;
@@ -43,15 +42,15 @@ impl DppLink {
     /// `CConsoleHelper::SendCommand`/`SendCommand_Config`
     /// (`ConsoleHelper.cpp:85-125`): the reply to `packet`, empty for C's
     /// `false`. `expected_size` ends an Ethernet receive early.
-    pub(crate) fn send(&mut self, packet: &[u8], expected_size: usize) -> io::Result<Vec<u8>> {
+    pub(crate) fn send(&mut self, packet: &[u8], expected_size: usize) -> Vec<u8> {
         match self {
             DppLink::Ethernet {
                 udp,
                 dpp_addr: Some(addr),
                 ..
             } => udp.send_packet_inet(*addr, packet, expected_size),
-            DppLink::Usb(usb) => Ok(usb.send_packet(packet)),
-            DppLink::Ethernet { dpp_addr: None, .. } | DppLink::Serial => Ok(Vec::new()),
+            DppLink::Usb(usb) => usb.send_packet(packet),
+            DppLink::Ethernet { dpp_addr: None, .. } | DppLink::Serial => Vec::new(),
         }
     }
 

@@ -907,10 +907,15 @@ mod tests {
             // it would post everything the port has set, in the order it was
             // first set.
             let flushed = handle.clone();
-            epics_rs::ad_core::runtime::run_thread(move || async move {
-                gate.jobs_settled().await;
-                flushed.interrupts().edge_sweeps().cleared().await;
-            })
+            epics_rs::ad_core::runtime::run_thread_named(
+                "openFlushWait",
+                epics_rs::ad_core::runtime::ThreadPriority::Medium,
+                epics_rs::ad_core::runtime::StackSizeClass::Medium,
+                move || async move {
+                    gate.jobs_settled().await;
+                    flushed.interrupts().edge_sweeps().cleared().await;
+                },
+            )
             .join()
             .unwrap();
             std::mem::forget(runtime);
@@ -1160,6 +1165,34 @@ mod tests {
         t.send_frame();
         let second = t.arrays.blocking_recv().unwrap();
         assert!(second.timestamp.as_f64() > first.timestamp.as_f64());
+    }
+
+    /// C calls updateTimeStamp for every finished image, ahead of the
+    /// ArrayCallbacks test (pixirad.cpp:1063-1067).
+    #[test]
+    fn an_unpublished_image_still_moves_the_port_time() {
+        let t = DataTask::start("PIXI_TS_OFF", 1 << 20);
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        t.handle
+            .with_driver_blocking(move |d: &mut PixiradDetector| {
+                d.ad.port_base.register_timestamp_source(move || at)
+            })
+            .unwrap();
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 0)
+            .unwrap();
+        t.send_frame();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while t.counter() != 1 {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let stamp = t
+            .handle
+            .with_driver_blocking(|d: &mut PixiradDetector| d.ad.port_base.get_time_stamp())
+            .unwrap();
+        assert_eq!(stamp, at);
+        assert_eq!(t.arrays.pending(), 0);
     }
 
     /// dataTask stores no array size, dimension or time-stamp param per

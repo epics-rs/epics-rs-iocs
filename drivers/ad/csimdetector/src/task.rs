@@ -36,7 +36,13 @@ pub(crate) struct CSimTaskContext {
 }
 
 pub(crate) fn start_sim_task(ctx: CSimTaskContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("SimDetTask", move || sim_task(ctx))
+    // As C creates it (ADCSimDetector.cpp:112-116).
+    rt::run_thread_named(
+        "SimDetTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || sim_task(ctx),
+    )
 }
 
 fn int32(reason: usize, addr: i32, value: i32) -> ParamSetValue {

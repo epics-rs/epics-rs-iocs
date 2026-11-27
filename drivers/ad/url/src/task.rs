@@ -50,7 +50,13 @@ impl AcquisitionContext {
 
 /// Start the acquisition task thread via the `rt` facade.
 pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("URLTask", move || acquisition_loop_async(ctx))
+    // As C creates URLDriverTask (URLDriver.cpp:421-425).
+    rt::run_thread_named(
+        "URLTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || acquisition_loop_async(ctx),
+    )
 }
 
 /// Async equivalent of C++ `ADDriver::setShutter()`. Mirrors

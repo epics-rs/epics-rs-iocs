@@ -359,7 +359,13 @@ pub(crate) struct ImageTask {
 
 impl ImageTask {
     pub fn start(self) -> std::thread::JoinHandle<()> {
-        rt::run_thread_named("PylonImageTask", move || self.run())
+        // As C creates it (ADPylon.cpp:256-259).
+        rt::run_thread_named(
+            "PylonImageTask",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || self.run(),
+        )
     }
 
     async fn run(mut self) {

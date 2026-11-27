@@ -61,8 +61,7 @@ pub struct ChannelInfo {
     /// sentinel both C enums use.
     pub ch_mode: i32,
     pub unit: Vec<u8>,
-    /// 0-6, indexes `scaled_value`'s `scaler` table.
-    pub scale: u8,
+    pub scale: Scale,
 }
 
 /// Discriminants are C's `VL_*` values (`drvGM10.c:55-57`); `VAL_STATUS`
@@ -111,10 +110,26 @@ pub struct ChannelData {
     pub value: i32,
 }
 
+const SCALER: [f64; 7] = [1.0, 0.1, 0.01, 1.0e-3, 1.0e-4, 1.0e-5, 1.0e-6];
+
+/// An index into `scaled_value`'s table, which C indexes unchecked
+/// ("scale is only allowed to be 0-6").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Scale(u8);
+
+impl Scale {
+    pub fn new(scale: u8) -> Option<Self> {
+        (usize::from(scale) < SCALER.len()).then_some(Self(scale))
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
 /// `scaled_value` (`drvGM10.c:83-89`).
-pub fn scaled_value(value: i32, scale: u8) -> f64 {
-    const SCALER: [f64; 7] = [1.0, 0.1, 0.01, 1.0e-3, 1.0e-4, 1.0e-5, 1.0e-6];
-    f64::from(value) * SCALER[scale as usize & 0x7]
+pub fn scaled_value(value: i32, scale: Scale) -> f64 {
+    f64::from(value) * SCALER[usize::from(scale.0)]
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,6 +170,10 @@ pub struct Cache {
 
     pub error_flag: bool,
     pub error: ErrorState,
+
+    /// Test only: the queue thread panics in the next command it runs.
+    #[cfg(test)]
+    pub panic_in_next_command: bool,
 }
 
 impl Default for Cache {
@@ -177,6 +196,8 @@ impl Default for Cache {
             alarm_flag: false,
             error_flag: false,
             error: ErrorState::default(),
+            #[cfg(test)]
+            panic_in_next_command: false,
         }
     }
 }
@@ -187,9 +208,12 @@ mod tests {
 
     #[test]
     fn scaled_value_matches_c_table() {
-        assert_eq!(scaled_value(12345, 0), 12345.0);
-        assert_eq!(scaled_value(12345, 3), 12.345);
-        assert_eq!(scaled_value(-500, 2), -5.0);
+        let s = |v| Scale::new(v).unwrap();
+        assert_eq!(scaled_value(12345, s(0)), 12345.0);
+        assert_eq!(scaled_value(12345, s(3)), 12.345);
+        assert_eq!(scaled_value(-500, s(2)), -5.0);
+        assert_eq!(scaled_value(1, s(6)), 1.0e-6);
+        assert_eq!(Scale::new(7), None);
     }
 
     #[test]

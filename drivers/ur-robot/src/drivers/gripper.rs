@@ -173,7 +173,7 @@ impl GripperDriver {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             INTERFACES,
             INTERRUPTS,
@@ -591,6 +591,21 @@ fn grasp_state(
 mod tests {
     use super::*;
     use crate::registry::DashboardState;
+
+    /// C registers the port without `ASYN_DESTRUCTIBLE`
+    /// (`gripper_driver.cpp:59`), so `asynShutdownPort` is refused and the
+    /// port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        use epics_rs::asyn::error::AsynStatus;
+
+        let dash = DashboardHandle::new("127.0.0.1");
+        registry::register_dashboard("GRIP_SHUT_DASH", dash).expect("fresh port name");
+        let mut drv = GripperDriver::new("GRIP_SHUT", "GRIP_SHUT_DASH").expect("driver");
+        let refused = drv.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(drv.base.is_enabled());
+    }
 
     #[test]
     fn the_position_unit_choices_map_to_the_four_units() {

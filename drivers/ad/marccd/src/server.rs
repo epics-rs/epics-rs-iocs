@@ -10,6 +10,7 @@
 
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::ad_core::driver::ADStatus;
+use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::trace::TraceMask;
 
@@ -311,8 +312,22 @@ impl MarccdDriver {
         ))
     }
 
-    /// C `asynNDArrayDriver::createFileName`.
+    /// C `asynNDArrayDriver::checkPath()` (asynNDArrayDriver.cpp:98-109).
+    fn check_path(&mut self) {
+        let base = self.ad.params.base;
+        let mut path = self.get_str(base.file_path, usize::MAX);
+        if path.is_empty() {
+            return;
+        }
+        let exists = check_path_str(&mut path);
+        self.set_str(base.file_path, &path);
+        self.set_i32(base.file_path_exists, i32::from(exists));
+    }
+
+    /// C `asynNDArrayDriver::createFileName`: a template that cannot be
+    /// formatted names nothing and leaves FileNumber alone (:212-215).
     pub fn create_file_name(&mut self) -> String {
+        self.check_path();
         let base = self.ad.params.base;
         let file_path = self.get_str(base.file_path, MAX_FILENAME_LEN);
         let file_name = self.get_str(base.file_name, MAX_FILENAME_LEN);
@@ -320,8 +335,10 @@ impl MarccdDriver {
         let file_number = self.get_i32(base.file_number);
         let auto_increment = self.get_i32(base.auto_increment);
 
-        let full = format_file_template(&template, &file_path, &file_name, file_number)
-            .unwrap_or_default();
+        let Some(full) = format_file_template(&template, &file_path, &file_name, file_number)
+        else {
+            return String::new();
+        };
         if auto_increment != 0 {
             self.set_i32(base.file_number, file_number + 1);
         }

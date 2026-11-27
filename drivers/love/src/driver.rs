@@ -613,7 +613,7 @@ impl LoveDriver {
             PortFlags {
                 multi_device: true,
                 can_block: serial.can_block(),
-                destructible: true,
+                destructible: false,
             },
             INTERFACES,
             INTERRUPTS,
@@ -1067,6 +1067,25 @@ mod tests {
         let serial = runtime.port_handle().clone();
         LoveDriver::new(name, "SER", serial, 0, Duration::from_millis(100), models)
             .expect("love driver")
+    }
+
+    /// C registers the port without `ASYN_DESTRUCTIBLE` (`drvLove.c:362-363`),
+    /// so `asynShutdownPort` is refused and the port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let serial = TimeoutSerial {
+            base: PortDriverBase::new(
+                "LOVESHUTSER",
+                1,
+                PortFlags::default(),
+                InterfaceMask::OCTET_TRANSPORT,
+                InterfaceMask::OCTET,
+            ),
+        };
+        let mut love = love_on(serial, "LOVESHUT");
+        let refused = love.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(love.base.is_enabled());
     }
 
     /// Every timed-out attempt prints C's sendCommand and executeCommand

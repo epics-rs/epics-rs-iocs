@@ -40,9 +40,11 @@
 //! - **Homing is a no-op**, exactly as C: `HOME_FOR`/`HOME_REV` send no
 //!   command (the `FIN`/`RIN` paths are commented out upstream).
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{
@@ -137,51 +139,38 @@ struct AxisDef {
     motor_num: i32,
 }
 
-/// Parse `A{driver}=0x{hex}` (C `sscanf(pStr, "A%d=0x%x", ...)`); returns the
-/// status byte.
+/// `sscanf(reply, fmt, &a, &b) == 2` with both fields read at 64 bits
+/// (`%lld`/`%llx`), so the caller refuses a value C would wrap into `int`.
+fn scan_two(reply: &str, fmt: &str) -> Option<(i64, i64)> {
+    let [a, b] = [0i64; 2].map(Cell::new);
+    (sscanf(reply, fmt, &[&a, &b]) == 2).then(|| (a.get(), b.get()))
+}
+
+/// C `sscanf(pStr, "A%d=0x%x", ...) == 2` (drvPMNC87xx.cc:356,372): the
+/// status byte, `None` where C would truncate the value into it.
 fn parse_status_byte(reply: &str) -> Option<u8> {
-    let hex = reply.split_once("=0x")?.1;
-    let n = hex.bytes().take_while(u8::is_ascii_hexdigit).count();
-    if n == 0 {
-        return None;
-    }
-    u8::from_str_radix(&hex[..n], 16).ok()
+    u8::try_from(scan_two(reply, "A%lld=0x%llx")?.1).ok()
 }
 
-/// Parse `A{driver}={int}` (C `sscanf(pStr, "A%d=%ld", ...)`); returns the
-/// integer after `=`.
+/// C `sscanf(pStr, "A%d=%ld", ...) == 2` (drvPMNC87xx.cc:389): the position,
+/// `None` at the `i64` bounds an overflow saturates to.
 fn parse_int_after_eq(reply: &str) -> Option<i64> {
-    let rest = reply.split_once('=')?.1;
-    let s = rest.trim_start();
-    let end = s
-        .char_indices()
-        .skip_while(|(i, c)| *i == 0 && (*c == '+' || *c == '-'))
-        .find(|(_, c)| !c.is_ascii_digit())
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    s.get(..end)?.parse().ok()
+    let v = scan_two(reply, "A%lld=%lld")?.1;
+    (v != i64::MIN && v != i64::MAX).then_some(v)
 }
 
-/// Parse a `DRT` line `A{driver}={type}` (C `sscanf(buff, "A%d=%d", …)`).
+/// A `DRT` line, C `sscanf(buff, "A%d=%d", ...)` (drvPMNC87xx.cc:979). C
+/// ignores the count and reuses stale fields; a short scan skips the line.
 fn parse_drt_line(line: &str) -> Option<(i32, i32)> {
-    let (a, rest) = line.split_once('=')?;
-    let driver: i32 = a.trim().trim_start_matches('A').trim().parse().ok()?;
-    Some((driver, rest.trim().parse().ok()?))
+    let (driver, kind) = scan_two(line, "A%lld=%lld")?;
+    Some((driver.try_into().ok()?, kind.try_into().ok()?))
 }
 
-/// Parse an `MPV` line `A{driver} M{motor}=...` into (driver, motor)
-/// (C `sscanf(buff, "A%d M%d", ...)`).
+/// An `MPV` line `A{driver} M{motor}=...`, C `sscanf(buff, "A%d M%d", ...)`
+/// (drvPMNC87xx.cc:959), short scans skipped as for [`parse_drt_line`].
 fn parse_mpv_line(line: &str) -> Option<(i32, i32)> {
-    let mut it = line.split_whitespace();
-    let driver: i32 = it.next()?.trim_start_matches('A').parse().ok()?;
-    let motor: i32 = it
-        .next()?
-        .trim_start_matches('M')
-        .split('=')
-        .next()?
-        .parse()
-        .ok()?;
-    Some((driver, motor))
+    let (driver, motor) = scan_two(line, "A%lld M%lld")?;
+    Some((driver.try_into().ok()?, motor.try_into().ok()?))
 }
 
 /// Firmware digit after [`VER_STR`] → model, plus the changeEOS flag
@@ -1161,6 +1150,36 @@ mod tests {
         assert_eq!(parse_mpv_line("A2 M1=250"), Some((2, 1)));
         assert_eq!(parse_mpv_line("junk"), None);
     }
+
+    /// drvPMNC87xx.cc:356-389 and :959-979 scan with `A%d=0x%x`, `A%d=%ld`,
+    /// `A%d M%d` and `A%d=%d`: a literal `A` first, each field read by
+    /// prefix.
+    #[test]
+    fn replies_are_scanned_as_c_sscanf() {
+        assert_eq!(parse_status_byte("Ax=0x1f"), None);
+        assert_eq!(parse_status_byte("garbage=0x1f"), None);
+        assert_eq!(parse_status_byte("A2=0x 1f"), Some(0x1f));
+        // C truncates these into the status byte.
+        assert_eq!(parse_status_byte("A2=0x1ff"), None);
+        assert_eq!(parse_status_byte("A2=0x-1"), None);
+
+        assert_eq!(parse_int_after_eq("=5"), None);
+        assert_eq!(parse_int_after_eq("B2=5"), None);
+        assert_eq!(parse_int_after_eq("A2= +5x"), Some(5));
+        // C saturates this at LONG_MAX.
+        assert_eq!(parse_int_after_eq("A2=99999999999999999999"), None);
+
+        assert_eq!(parse_drt_line("A0=1 x"), Some((0, 1)));
+        assert_eq!(parse_drt_line("AA1=2"), None);
+        assert_eq!(parse_drt_line("1=2"), None);
+        // C wraps this into `int`.
+        assert_eq!(parse_drt_line("A0=4294967297"), None);
+
+        assert_eq!(parse_mpv_line("A0M1=100"), Some((0, 1)));
+        assert_eq!(parse_mpv_line("A0 M1x"), Some((0, 1)));
+        assert_eq!(parse_mpv_line("0 1"), None);
+    }
+
     /// A 1.5.4 controller with one 8753 module, on a port with no EOS support
     /// of its own, so every EOS set is refused.
     struct Pmnc {

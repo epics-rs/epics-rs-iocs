@@ -10,7 +10,10 @@
 //! kept as the C had them and no new one is invented. One consequence is
 //! documented on [`Header::word_order`].
 
+use std::cell::Cell;
 use std::fmt;
+
+use epics_rs::base::runtime::scanf::{ScanTarget, sscanf};
 
 /// One header line (C `lineLen`).
 const LINE_LEN: usize = 80;
@@ -71,36 +74,49 @@ pub struct Image {
     pub data: Vec<u32>,
 }
 
-/// The numbers on header line `line` (C's `sscanf(buffer + line*80 + 8, ...)`).
+/// The `N` numbers on header line `line`: C's `sscanf(buffer + line*80 + 8,
+/// "%d...")` with `N` conversions.
 ///
-/// C let `sscanf` run past the end of the line into the next key, and left the
-/// caller's variables uninitialised when it matched nothing. Here a line that
-/// does not hold `count` numbers is an error.
-fn numbers(header: &[u8], line: usize, count: usize) -> Result<Vec<i64>, SfrmError> {
+/// C let `sscanf` run past the end of the line into the next key, left the
+/// caller's variables uninitialised when it matched nothing, and wrapped a
+/// number past `int`. Here the scan stops at the line's end, and a line that
+/// does not hold `N` numbers, or holds one past `int`, is an error.
+fn numbers<const N: usize>(header: &[u8], line: usize) -> Result<[i32; N], SfrmError> {
     let from = line * LINE_LEN + DATA_OFFSET;
     let to = (line + 1) * LINE_LEN;
     if header.len() < to {
         return err(format!("the header stops before line {line}"));
     }
-    let text = String::from_utf8_lossy(&header[from..to]);
-    let values: Vec<i64> = text
-        .split_whitespace()
-        .map_while(|t| t.parse::<i64>().ok())
-        .collect();
-    if values.len() < count {
+    let bytes = &header[from..to];
+    let wide: [Cell<i64>; N] = std::array::from_fn(|_| Cell::new(0));
+    let out: Vec<&dyn ScanTarget> = wide.iter().map(|v| v as &dyn ScanTarget).collect();
+    let read = sscanf(bytes, "%lld".repeat(N), &out);
+    let text = || String::from_utf8_lossy(bytes).trim().to_string();
+    if read < N as i32 {
         return err(format!(
-            "header line {line} holds {} numbers, {count} were expected: '{}'",
-            values.len(),
-            text.trim()
+            "header line {line} holds {} numbers, {N} were expected: '{}'",
+            read.max(0),
+            text()
         ));
+    }
+    let mut values = [0; N];
+    for (value, wide) in values.iter_mut().zip(&wide) {
+        let Ok(v) = i32::try_from(wide.get()) else {
+            return err(format!(
+                "header line {line} holds {}, past int: '{}'",
+                wide.get(),
+                text()
+            ));
+        };
+        *value = v;
     }
     Ok(values)
 }
 
 pub fn parse_header(bytes: &[u8]) -> Result<Header, SfrmError> {
-    let format = numbers(bytes, 0, 1)?[0] as i32;
-    let version = numbers(bytes, 1, 1)?[0] as i32;
-    let header_blocks = numbers(bytes, 2, 1)?[0];
+    let [format] = numbers(bytes, 0)?;
+    let [version] = numbers(bytes, 1)?;
+    let [header_blocks] = numbers(bytes, 2)?;
 
     if format != 100 || version < 11 {
         return err(format!("unsupported format={format} or version={version}"));
@@ -120,12 +136,12 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header, SfrmError> {
         ));
     }
 
-    let counts = numbers(bytes, 20, 3)?;
-    let widths = numbers(bytes, 39, 2)?;
-    let rows = numbers(bytes, 40, 1)?[0];
-    let cols = numbers(bytes, 41, 1)?[0];
-    let word_order = numbers(bytes, 42, 1)?[0] as i32;
-    let frame = numbers(bytes, 79, 5)?;
+    let [num_underflows, num_overflows1, num_overflows2] = numbers(bytes, 20)?;
+    let [bytes_per_pixel, underflow_bytes_per_pixel] = numbers(bytes, 39)?;
+    let [rows] = numbers(bytes, 40)?;
+    let [cols] = numbers(bytes, 41)?;
+    let [word_order] = numbers(bytes, 42)?;
+    let [num_exposures, bias, baseline_offset, orientation, overscan] = numbers(bytes, 79)?;
 
     if word_order != 0 {
         // C read longOrder from the same header line (BISDetector.cpp:213-216).
@@ -137,11 +153,9 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header, SfrmError> {
     // C's switch on bytesPerPixel had no default: any other width left the
     // pixel buffer unwritten and the byte count uninitialised, and the frame
     // was published anyway.
-    let bytes_per_pixel = widths[0];
     if !matches!(bytes_per_pixel, 1 | 2 | 4) {
         return err(format!("unsupported pixel width {bytes_per_pixel}"));
     }
-    let underflow_bytes_per_pixel = widths[1];
     if !matches!(underflow_bytes_per_pixel, 1 | 2 | 4) {
         return err(format!(
             "unsupported underflow width {underflow_bytes_per_pixel}"
@@ -155,19 +169,19 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header, SfrmError> {
         format,
         version,
         header_blocks,
-        num_underflows: counts[0] as i32,
-        num_overflows1: counts[1] as i32,
-        num_overflows2: counts[2] as i32,
+        num_underflows,
+        num_overflows1,
+        num_overflows2,
         bytes_per_pixel: bytes_per_pixel as usize,
         underflow_bytes_per_pixel: underflow_bytes_per_pixel as usize,
         rows: rows as usize,
         cols: cols as usize,
         word_order,
-        num_exposures: frame[0] as i32,
-        bias: frame[1] as i32,
-        baseline_offset: frame[2] as i32,
-        orientation: frame[3] as i32,
-        overscan: frame[4] as i32,
+        num_exposures,
+        bias,
+        baseline_offset,
+        orientation,
+        overscan,
     })
 }
 
@@ -349,6 +363,39 @@ mod tests {
         while !table.len().is_multiple_of(16) {
             table.push(0);
         }
+    }
+
+    /// BISDetector.cpp:194-224 reads each line with `sscanf("%d...")`, so a
+    /// number ends where `%d` stops. A value C wraps into its `int` is an
+    /// error.
+    #[test]
+    fn header_lines_are_scanned_as_c_sscanf() {
+        let base = parse_header(&HeaderBuilder::new(2, 1, 1).build()).unwrap();
+        let cases = [
+            (1, "VERSION:11.2", Some(base)),
+            (2, "HDRBLKS:13x", Some(base)),
+            (39, "NPIXELB:2 2.0", Some(base)),
+            (
+                79,
+                "LINEAR :1 0 32 0 0junk",
+                Some(Header {
+                    baseline_offset: 32,
+                    ..base
+                }),
+            ),
+            (20, "NOVERFL:4294967296 0 0", None),
+            (0, "FORMAT :4294967396", None),
+            (40, "NROWS  :", None),
+        ];
+        let mut wrong = Vec::new();
+        for (line, text, want) in cases {
+            let file = HeaderBuilder::new(2, 1, 1).set(line, text).build();
+            let got = parse_header(&file).ok();
+            if got != want {
+                wrong.push((text, got));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

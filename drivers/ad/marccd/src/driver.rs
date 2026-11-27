@@ -1162,4 +1162,36 @@ pub(crate) mod tests {
         );
         std::mem::forget(det);
     }
+
+    /// C `createFileName` runs `checkPath` first (asynNDArrayDriver.cpp:203):
+    /// the name carries the separator and FilePathExists is refreshed.
+    #[test]
+    fn a_file_name_checks_the_path_first() {
+        let mut det = driver("MARCCD_NAME_PATH");
+        let base = det.ad.params.base;
+        let dir = std::env::temp_dir();
+        let sep = std::path::MAIN_SEPARATOR;
+        let dir = dir.to_str().unwrap().trim_end_matches(sep);
+        det.set_str(base.file_path, dir);
+        det.set_str(base.file_name, "img");
+        det.set_str(base.file_template, "%s%s_%3.3d");
+        det.set_i32(base.file_number, 5);
+        det.set_i32(base.file_path_exists, 0);
+        assert_eq!(det.create_file_name(), format!("{dir}{sep}img_005"));
+        assert_eq!(det.get_str(base.file_path, 256), format!("{dir}{sep}"));
+        assert_eq!(det.get_i32(base.file_path_exists), 1);
+    }
+
+    /// A template C cannot format leaves FileNumber alone
+    /// (asynNDArrayDriver.cpp:212-215).
+    #[test]
+    fn a_failed_template_leaves_the_file_number() {
+        let mut det = driver("MARCCD_NAME_FAIL");
+        let base = det.ad.params.base;
+        det.set_str(base.file_template, "%f");
+        det.set_i32(base.file_number, 5);
+        det.set_i32(base.auto_increment, 1);
+        assert_eq!(det.create_file_name(), "");
+        assert_eq!(det.get_i32(base.file_number), 5);
+    }
 }

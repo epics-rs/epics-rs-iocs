@@ -598,16 +598,13 @@ pub fn pixel_depth_from_json(v: &Value) -> i32 {
     raw.map_or(12, pixel_depth_normalize)
 }
 
-/// `std::stoi`: optional leading whitespace and sign, then at least one
-/// digit; trailing text is ignored, out of `int` range throws.
+/// `std::stoi`: `strtol` base 10, throwing when nothing converts or the
+/// value is out of `int` range.
 fn stoi(s: &str) -> Option<i32> {
-    let t = s.trim_start();
-    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
-    let n = digits.bytes().take_while(u8::is_ascii_digit).count();
-    if n == 0 {
-        return None;
+    match epics_libcom_rs::runtime::stdlib::strtol_errno(s, 10)? {
+        (_, 0) => None,
+        (v, _) => i32::try_from(v).ok(),
     }
-    t[..t.len() - digits.len() + n].parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2022,6 +2019,14 @@ mod tests {
         }
         assert_eq!(gain_mode_from_string("LGM"), 2);
         assert_eq!(gain_mode_from_string("lgm"), 0);
+    }
+
+    /// C `isspace` leaves a no-break space unskipped, so `stoi` throws.
+    #[test]
+    fn stoi_skips_only_c_whitespace() {
+        assert_eq!(pixel_depth_from_json(&json!("\u{a0}24")), 12);
+        assert_eq!(parse_threshold_list("1,\u{a0}5"), None);
+        assert_eq!(parse_threshold_list("\x0b6, -2x"), Some(vec![6, -2]));
     }
 
     #[test]

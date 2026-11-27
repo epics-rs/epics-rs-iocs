@@ -607,9 +607,14 @@ mod tests {
                 stop.clone(),
             );
             let (tx, rx) = std::sync::mpsc::channel();
-            rt::run_thread_named("PilatusWriteStatusTest", move || async move {
-                tx.send(ctx.cam_write("version", 1.0) as i32).unwrap();
-            })
+            rt::run_thread_named(
+                "PilatusWriteStatusTest",
+                rt::ThreadPriority::Medium,
+                rt::StackSizeClass::Medium,
+                move || async move {
+                    tx.send(ctx.cam_write("version", 1.0) as i32).unwrap();
+                },
+            )
             .join()
             .unwrap();
             assert_eq!(rx.recv().unwrap(), status as i32, "{status:?}");
@@ -728,10 +733,15 @@ mod tests {
             stop,
         );
         let (tx, rx) = std::sync::mpsc::channel();
-        rt::run_thread_named("PilatusCamReadTest", move || async move {
-            let status = ctx.cam_read(timeout) as i32;
-            tx.send((status, ctx.from().to_string())).unwrap();
-        })
+        rt::run_thread_named(
+            "PilatusCamReadTest",
+            rt::ThreadPriority::Medium,
+            rt::StackSizeClass::Medium,
+            move || async move {
+                let status = ctx.cam_read(timeout) as i32;
+                tx.send((status, ctx.from().to_string())).unwrap();
+            },
+        )
         .join()
         .unwrap();
         std::mem::forget(cam);

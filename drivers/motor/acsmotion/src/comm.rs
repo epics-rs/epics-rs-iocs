@@ -530,7 +530,7 @@ pub fn register_comm_port(
         PortFlags {
             multi_device: true,
             can_block: true,
-            destructible: true,
+            destructible: false,
         },
         INTERFACES,
         INTERRUPTS,

@@ -8,8 +8,10 @@
 //! This is the plain-FTP path, xps_ftp.c itself, which `buildProfile` and the
 //! trajectory SNL programs call; the XPS-D upload is [`super::sftp`].
 
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
+
+use super::UPLOAD_TIMEOUT;
 
 /// The XPS FTP control port.
 const XPS_FTP_PORT: u16 = 21;
@@ -41,9 +43,18 @@ fn ftp_port() -> u16 {
     FTP_PORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A connection to `addr` whose connect, reads and writes each give up
+/// after [`UPLOAD_TIMEOUT`]; C's block until the server acts.
+fn open(addr: SocketAddr) -> io::Result<TcpStream> {
+    let sock = TcpStream::connect_timeout(&addr, UPLOAD_TIMEOUT)?;
+    sock.set_read_timeout(Some(UPLOAD_TIMEOUT))?;
+    sock.set_write_timeout(Some(UPLOAD_TIMEOUT))?;
+    Ok(sock)
+}
+
 /// [`ftp_connect`] to `addr`.
 fn ftp_connect_to(addr: SocketAddr, login: &str, password: &str) -> Result<TcpStream, i32> {
-    let mut sock = TcpStream::connect(addr).map_err(|_| -1)?;
+    let mut sock = open(addr).map_err(|_| -1)?;
     // C loops on recv until the banner holds a newline, forever once the
     // server closes; here the close fails the connect.
     let mut banner = Vec::new();
@@ -83,7 +94,7 @@ pub fn ftp_change_dir(sock: &mut TcpStream, destination: &str) -> i32 {
 /// over a `PASV` data connection, then the transfer reply read; -1 when
 /// the data connection, the `STOR` or the local file fails.
 pub fn ftp_store_file(sock: &mut TcpStream, filename: &str) -> i32 {
-    let Some(mut data) = get_port(sock).and_then(|addr| TcpStream::connect(addr).ok()) else {
+    let Some(mut data) = get_port(sock).and_then(|addr| open(addr).ok()) else {
         epics_rs::base::stderr_println!(
             "Cound not connect to FTP server to retrieve file {filename}"
         );
@@ -105,12 +116,26 @@ pub fn ftp_store_file(sock: &mut TcpStream, filename: &str) -> i32 {
     0
 }
 
-/// One C `recv` of up to `RETURN_SIZE` bytes; `None` is its -1.
+/// One C `recv` of up to `RETURN_SIZE` bytes; `None` is its -1. A reply
+/// that stalls past [`UPLOAD_TIMEOUT`] also closes the session, or it would
+/// answer the next command when it comes.
 fn recv(sock: &mut TcpStream) -> Option<Vec<u8>> {
     let mut buf = vec![0; RETURN_SIZE];
-    let n = sock.read(&mut buf).ok()?;
-    buf.truncate(n);
-    Some(buf)
+    match sock.read(&mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            Some(buf)
+        }
+        Err(e) => {
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) {
+                let _ = sock.shutdown(Shutdown::Both);
+            }
+            None
+        }
+    }
 }
 
 /// C `code`: the reply's three-digit code, `atoi` of its first three bytes.
@@ -259,6 +284,69 @@ pub(crate) mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A server that takes the connection and reads what comes but never
+    /// writes, except the banner when `banner`; the commands it got, then
+    /// `CLOSE`, sent down the log.
+    pub(crate) fn silent_server(banner: bool) -> (SocketAddr, mpsc::Receiver<String>) {
+        let control = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = control.local_addr().unwrap();
+        let (log, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut sock, _) = control.accept().unwrap();
+            if banner {
+                sock.write_all(b"220 ready\r\n").unwrap();
+            }
+            for line in BufReader::new(sock).lines() {
+                let Ok(line) = line else { break };
+                let _ = log.send(line);
+            }
+            let _ = log.send("CLOSE".into());
+        });
+        (addr, rx)
+    }
+
+    /// What `upload` answers, or `None` while it is still waiting after
+    /// many times [`UPLOAD_TIMEOUT`].
+    pub(crate) fn within<T: Send + 'static>(
+        upload: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (done, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = done.send(upload());
+        });
+        rx.recv_timeout(UPLOAD_TIMEOUT * 10).ok()
+    }
+
+    /// buildProfile's session (XPSController.cpp:722-747) with `addr`'s
+    /// server: the first failing status, or 0.
+    fn upload(addr: SocketAddr) -> Option<i32> {
+        within(move || match ftp_connect_to(addr, "u", "p") {
+            Err(status) => status,
+            Ok(mut sock) => match ftp_change_dir(&mut sock, "/d") {
+                0 => ftp_store_file(&mut sock, "never-read.trj"),
+                status => status,
+            },
+        })
+    }
+
+    /// A server that takes the connection and never answers fails the
+    /// connect, where C's ftpConnect waits on its banner forever.
+    #[test]
+    fn an_upload_to_a_server_that_never_answers_fails() {
+        let (addr, _log) = silent_server(false);
+        assert_eq!(upload(addr), Some(-1));
+    }
+
+    /// A server that stops answering after its banner fails the upload, and
+    /// the session ends at the first reply it misses, so no later command
+    /// takes that late reply for its own.
+    #[test]
+    fn an_upload_whose_server_stops_answering_ends_at_the_missed_reply() {
+        let (addr, log) = silent_server(true);
+        assert_eq!(upload(addr), Some(-1));
+        assert_eq!(log.iter().collect::<Vec<_>>(), ["USER u", "CLOSE"]);
     }
 
     /// ftpConnect's -2 is a 530 or 421 `USER` reply, and -1 no server.

@@ -5,10 +5,12 @@
 //! `bc`, `tr`, and the device's `rr`/`tr` replies — and publish the same data
 //! samples; they differ in the transport (see [`crate::t4u`]).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 
 use crate::drv_quad_em::QE_MAX_INPUTS;
 
@@ -337,18 +339,13 @@ pub fn parse_cmd_name(name: &str) -> CmdName {
 // Data stream
 // ===========================================================================
 
-/// C++ `readTextCurrVals`: `sscanf(InData, "ead %lf , %lf , %lf , %lf ")`,
-/// where the leading `r` was consumed by the caller.
-///
-/// Takes the whole line, `r` included.
-pub fn parse_read_line(line: &str) -> Option<[f64; QE_MAX_INPUTS]> {
-    let rest = line.trim_start().strip_prefix("read")?;
-    let mut out = [0.0f64; QE_MAX_INPUTS];
-    let mut fields = rest.split(',');
-    for slot in out.iter_mut() {
-        *slot = fields.next()?.trim().parse::<f64>().ok()?;
-    }
-    Some(out)
+/// C++ `readTextCurrVals`: `sscanf(InData, "ead %lf , %lf , %lf , %lf ")`
+/// of the line after the `r` its caller consumed.
+pub fn parse_read_line(in_data: &[u8]) -> Option<[f64; QE_MAX_INPUTS]> {
+    let vals: [Cell<f64>; QE_MAX_INPUTS] = Default::default();
+    let [a, b, c, d] = &vals;
+    (sscanf(in_data, "ead %lf , %lf , %lf , %lf ", &[a, b, c, d]) == 4)
+        .then(|| vals.map(Cell::into_inner))
 }
 
 /// The header of the middle-layer driver's binary data frame: `B\x01`, then
@@ -650,20 +647,8 @@ fn calibration_line(range: usize, channel: usize, slope: f32, offset: f32) -> St
 /// C++ `sscanf(curr_val.c_str(), " \" %f , %f \" ")`: the opening quote must
 /// be there, and whatever follows the second number is not looked at.
 fn parse_cal_pair(value: &str) -> Option<(f32, f32)> {
-    let rest = value.trim_start().strip_prefix('"')?;
-    let (slope, rest) = scan_float(rest)?;
-    let rest = rest.trim_start().strip_prefix(',')?;
-    let (offset, _) = scan_float(rest)?;
-    Some((slope, offset))
-}
-
-/// `%f`: leading whitespace, then the longest prefix `strtof` takes.
-fn scan_float(s: &str) -> Option<(f32, &str)> {
-    let s = s.trim_start();
-    (1..=s.len())
-        .rev()
-        .filter(|&end| s.is_char_boundary(end))
-        .find_map(|end| Some((s[..end].parse::<f32>().ok()?, &s[end..])))
+    let (slope, offset) = (Cell::new(0f32), Cell::new(0f32));
+    (sscanf(value, " \" %f , %f \" ", &[&slope, &offset]) == 2).then(|| (slope.get(), offset.get()))
 }
 
 /// The calibration file as `inicpp` holds it: section → key → value, a later
@@ -878,11 +863,11 @@ mod tests {
     #[test]
     fn text_data_line_parses_four_currents() {
         assert_eq!(
-            parse_read_line("read 1.0,-2.5, 3e-9 ,4\n"),
+            parse_read_line(b"ead 1.0,-2.5, 3e-9 ,4\n"),
             Some([1.0, -2.5, 3e-9, 4.0])
         );
-        assert_eq!(parse_read_line("read 1.0,2.0"), None);
-        assert_eq!(parse_read_line("B\x01"), None);
+        assert_eq!(parse_read_line(b"ead 1.0,2.0"), None);
+        assert_eq!(parse_read_line(b"B\x01"), None);
     }
 
     #[test]
@@ -1161,5 +1146,73 @@ ChannelD=\"0.9527919082805758, 1.4346421308430505e-05\"
             calibration_line(0, 0, f32::NAN, -f32::NAN),
             "Calibration Range 0 Channel 0 Slope nan Offset -nan"
         );
+    }
+
+    /// C++ `readTextCurrVals` (drvT4U_EM.cpp:1194, drvT4UDirect_EM.cpp:1626):
+    /// `sscanf(InData, "ead %lf , %lf , %lf , %lf ")` must assign all four.
+    #[test]
+    fn a_read_line_is_scanned_as_c_sscanf() {
+        let read = |in_data: &str| parse_read_line(in_data.as_bytes());
+        let nan = -f64::NAN;
+        let cases = [
+            ("ead1,2,3,4", Some([1.0, 2.0, 3.0, 4.0])),
+            ("ead 1,2,3,4x", Some([1.0, 2.0, 3.0, 4.0])),
+            ("ead 1,2,3,4 5", Some([1.0, 2.0, 3.0, 4.0])),
+            ("ead 0x1p3,2,3,4", Some([8.0, 2.0, 3.0, 4.0])),
+            ("ead inf,-nan,1,2", Some([f64::INFINITY, nan, 1.0, 2.0])),
+            ("ead  +1,2,3,4,5", Some([1.0, 2.0, 3.0, 4.0])),
+            ("ead 1,2,3,4\r\n", Some([1.0, 2.0, 3.0, 4.0])),
+            ("ead .5,2,3,4", Some([0.5, 2.0, 3.0, 4.0])),
+            ("ead 1e400,2,3,4", Some([f64::INFINITY, 2.0, 3.0, 4.0])),
+            ("ead 1x,2,3,4", None),
+            ("ead 1,,2,3", None),
+            ("ead 1,2,3e2x,4", None),
+            ("ead\u{a0}1,2,3,4", None),
+            ("ead 1,2,3,\u{a0}4", None),
+            ("ead 1 2 3 4", None),
+            ("", None),
+        ];
+        let bits = |v: Option<[f64; QE_MAX_INPUTS]>| v.map(|v| v.map(f64::to_bits));
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(in_data, want)| {
+                let got = read(in_data);
+                (bits(got) != bits(want)).then_some((in_data, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// C++ `loadCalFile` (drvT4UDirect_EM.cpp:393):
+    /// `sscanf(curr_val.c_str(), " \" %f , %f \" ")` must assign both.
+    #[test]
+    fn a_calibration_pair_is_scanned_as_c_sscanf() {
+        let cases = [
+            ("\"1.0, 0.1\"", Some((1.0, 0.1))),
+            ("\"0x1p-2, 1\"", Some((0.25, 1.0))),
+            ("\"infinity, -nan\"", Some((f32::INFINITY, -f32::NAN))),
+            ("\"1, 2", Some((1.0, 2.0))),
+            ("\"3.4028236e38, 1\"", Some((f32::INFINITY, 1.0))),
+            (
+                "\"1.00000005960464477539062500000001, 0\"",
+                Some((f32::from_bits(0x3f80_0001), 0.0)),
+            ),
+            ("\"  -1 , +2 \"", Some((-1.0, 2.0))),
+            ("\"1.0 0.1\"", None),
+            ("\"1e5f, 2\"", None),
+            ("\"\u{a0}1, 2\"", None),
+            ("\"1,\u{a0}2\"", None),
+            ("\"\"", None),
+            ("\"", None),
+        ];
+        let bits = |v: Option<(f32, f32)>| v.map(|(a, b)| (a.to_bits(), b.to_bits()));
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(value, want)| {
+                let got = parse_cal_pair(value);
+                (bits(got) != bits(want)).then_some((value, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

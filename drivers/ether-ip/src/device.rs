@@ -16,7 +16,7 @@ use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::error::{CaError, CaResult, LinkRefusal};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
-use epics_rs::base::server::database::{AsyncDbHandle, DeviceDoneSource, ProcessCallback};
+use epics_rs::base::server::database::{AsyncDbHandle, DeviceDoneSource};
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, IoIntrAction,
     WriteStart,
@@ -266,13 +266,8 @@ fn size_t_from_double(v: f64) -> u64 {
 /// C `strtod`: the value and how many bytes it took, `(0.0, 0)` when it
 /// takes nothing.
 fn strtod(text: &str) -> (f64, usize) {
-    let t = text.trim_start();
-    let skipped = text.len() - t.len();
-    (1..=t.len())
-        .rev()
-        .filter(|&n| t.is_char_boundary(n))
-        .find_map(|n| t[..n].parse::<f64>().ok().map(|v| (v, skipped + n)))
-        .unwrap_or((0.0, 0))
+    let r = epics_libcom_rs::runtime::stdlib::strtod(text.as_bytes());
+    (r.value, r.len)
 }
 
 // ---------------------------------------------------------------------------
@@ -358,8 +353,6 @@ pub struct EtherIpDevice {
     alarm: Option<(u16, u16)>,
     /// The database an output's PLC callback runs in.
     db: Option<AsyncDbHandle>,
-    /// C's `rset->process` from an output's PLC callback that finds no data.
-    process: Option<ProcessCallback>,
 }
 
 impl EtherIpDevice {
@@ -376,7 +369,6 @@ impl EtherIpDevice {
             io_intr_rx: None,
             alarm: None,
             db: None,
-            process: None,
         }
     }
 
@@ -547,7 +539,6 @@ impl DeviceSupport for EtherIpDevice {
     }
 
     fn bind_database(&mut self, db: AsyncDbHandle) {
-        self.process = Some(db.process_callback(&self.name));
         self.db = Some(db);
     }
 
@@ -609,17 +600,11 @@ impl DeviceSupport for EtherIpDevice {
         }
         match self.check_callback(record, common) {
             Callback::ScanOnce => IoIntrAction::ScanOnce,
-            // C calls `rset->process` under the record's lock, past every
-            // dbProcess gate (devEtherIP.c:347-354). This callback holds the
-            // lock, so the record's ProcessCallback runs it on the record's
-            // band as an async completion re-enters: past the PACT and TPRO
-            // gates, not the DISA one.
-            Callback::Process => {
-                if let Some(process) = &self.process {
-                    let _ = process.request(common.callback_priority());
-                }
-                IoIntrAction::Skip
-            }
+            // C calls `rset->process` under the record's lock on the scan
+            // task (devEtherIP.c:347-354), where no full queue can drop the
+            // once-per-outage pass. Unlike C it goes through dbProcess, so a
+            // disabled record stays disabled and TPRO traces the pass.
+            Callback::Process => IoIntrAction::Process,
             Callback::Leave => IoIntrAction::Skip,
         }
     }
@@ -734,31 +719,53 @@ impl DeviceSupport for EtherIpDevice {
         }
     }
 
-    fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        self.stage_write(record, None).map(|_| ())
+    // The framework calls write_common and write_begin_common, which see
+    // the record's UDF.
+    fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+        Ok(())
+    }
+
+    fn write_common(&mut self, record: &mut dyn Record, common: &mut CommonFields) -> CaResult<()> {
+        self.stage_write(record, common, None).map(|_| ())
     }
 
     /// C's `*_write` first pass: a staged write leaves the record PACT until
     /// the driver's next transfer ends it, without a readback.
-    fn write_begin(
+    fn write_begin_common(
         &mut self,
         record: &mut dyn Record,
+        common: &mut CommonFields,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
-        Ok(if self.stage_write(record, Some(done))? {
+        Ok(if self.stage_write(record, common, Some(done))? {
             WriteStart::Pending
         } else {
             WriteStart::Completed
         })
+    }
+
+    /// C's second `*_write` pass. C ends it without an alarm whatever became
+    /// of the write (devEtherIP.c:1937-1943); one that never reached the PLC,
+    /// or that the PLC refused, takes the alarm of a write C cannot stage.
+    fn async_write_completed(&mut self, _record: &mut dyn Record) {
+        if self
+            .listener
+            .as_ref()
+            .is_some_and(|l| l.take_failed_write())
+        {
+            self.write_alarm();
+        }
     }
 }
 
 impl EtherIpDevice {
     /// Stage the record's value in the tag buffer and flag the write; true
     /// when a write was flagged and `done` now waits on the next transfer.
+    /// A write the tag takes defines the record.
     fn stage_write(
         &mut self,
         record: &mut dyn Record,
+        common: &mut CommonFields,
         done: Option<&DeviceDoneSource<'_>>,
     ) -> CaResult<bool> {
         let Some((tag, link)) = self.bound() else {
@@ -779,22 +786,22 @@ impl EtherIpDevice {
         // Stage the record's value in the tag buffer, but only when it differs
         // from what the PLC last reported -- otherwise every process would
         // queue a redundant write (C ao_write/bo_write/... all compare first).
-        let changed = match rtype {
+        let stage = match rtype {
             "ao" => match cip::typecode(&data.buf) {
                 Some(CipType::Real) | Some(CipType::Lreal) => {
                     let val = f64_field(record, "VAL");
                     match cip::get_double(&data.buf, element) {
-                        Some(cur) if cur == val => false,
-                        Some(_) => cip::put_double(&mut data.buf, element, val),
-                        None => false,
+                        Some(cur) if cur == val => Stage::Skipped,
+                        Some(_) => Stage::put(cip::put_double(&mut data.buf, element, val)),
+                        None => Stage::Skipped,
                     }
                 }
                 _ => {
                     let rval = i32_field(record, "RVAL");
                     match cip::get_dint(&data.buf, element) {
-                        Some(cur) if cur == rval => false,
-                        Some(_) => cip::put_dint(&mut data.buf, element, rval),
-                        None => false,
+                        Some(cur) if cur == rval => Stage::Skipped,
+                        Some(_) => Stage::put(cip::put_dint(&mut data.buf, element, rval)),
+                        None => Stage::Skipped,
                     }
                 }
             },
@@ -804,44 +811,65 @@ impl EtherIpDevice {
                     _ => 0,
                 };
                 match cip::get_lint(&data.buf, element) {
-                    Some(cur) if cur == val => false,
-                    Some(_) => cip::put_lint(&mut data.buf, element, val),
-                    None => false,
+                    Some(cur) if cur == val => Stage::Skipped,
+                    Some(_) => Stage::put(cip::put_lint(&mut data.buf, element, val)),
+                    None => Stage::Failed,
                 }
             }
             "bo" | "mbbo" | "mbboDirect" => {
                 let bits = if rtype == "bo" { 1 } else { nobt(record) };
                 let rval = i32_field(record, "RVAL") as u32;
                 match get_bits(&data.buf, element, mask, bits) {
-                    Some(cur) if cur == rval => false,
-                    Some(_) => put_bits(&mut data.buf, element, mask, bits, rval),
-                    None => false,
+                    Some(cur) if cur == rval => Stage::Skipped,
+                    Some(_) => Stage::put(put_bits(&mut data.buf, element, mask, bits, rval)),
+                    None => Stage::Skipped,
                 }
             }
             "stringout" | "lso" => {
                 let val = string_val(record);
                 match cip::get_string(&data.buf, element, string_size(record)) {
-                    Some(cur) if cur == val => false,
-                    Some(_) => cip::put_string(&mut data.buf, &val),
-                    None => false,
+                    Some(cur) if cur == val => Stage::Skipped,
+                    Some(_) => Stage::put(cip::put_string(&mut data.buf, &val)),
+                    None => Stage::Failed,
                 }
             }
-            _ => {
+            _ => Stage::Failed,
+        };
+
+        match stage {
+            Stage::Failed => {
                 drop(data);
                 self.write_alarm();
                 return Ok(false);
             }
-        };
-
-        if changed {
-            tag.request_write(&mut data, &self.name);
-            if let (Some(done), Some(listener)) = (done, &self.listener) {
-                *listener.write_done.lock() = Some((done.device_done(), done.priority()));
+            Stage::Staged => {
+                let carrier = tag.request_write(&mut data, &self.name);
+                if let (Some(done), Some(listener)) = (done, &self.listener) {
+                    listener.stage_write(done.device_done(), carrier);
+                }
             }
+            Stage::Skipped => {}
         }
         drop(data);
         self.no_alarm();
-        Ok(changed && done.is_some())
+        common.udf = 0;
+        Ok(matches!(stage, Stage::Staged) && done.is_some())
+    }
+}
+
+/// What a write pass did with the record's value.
+enum Stage {
+    /// Nothing to write: the tag holds the value already, or the C
+    /// ao/bo/mbbo write skips an element it cannot read.
+    Skipped,
+    Staged,
+    /// C's `ok = false`: WRITE_ALARM.
+    Failed,
+}
+
+impl Stage {
+    fn put(ok: bool) -> Self {
+        if ok { Stage::Staged } else { Stage::Failed }
     }
 }
 
@@ -876,11 +904,7 @@ impl EtherIpDevice {
     fn check_callback(&self, record: &mut dyn Record, common: &mut CommonFields) -> Callback {
         // C's `if (rec->pact)` pass: a write in flight ends on the driver's
         // transfer callback.
-        if self
-            .listener
-            .as_ref()
-            .is_some_and(|l| l.write_done.lock().is_some())
-        {
+        if self.listener.as_ref().is_some_and(|l| l.write_pending()) {
             return Callback::Leave;
         }
         let refresh = common.udf != 0 || common.sevr == AlarmSeverity::Invalid;
@@ -1224,8 +1248,10 @@ const OUTPUT_TYPES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::WriteEnd;
     use epics_rs::base::server::database::{ProcStack, PvDatabase, RecordLoad};
     use epics_rs::base::server::records::bo::BoRecord;
+    use std::sync::mpsc;
 
     /// devEtherIP.c mbbo_write / check_mbbo_callback: a staged write leaves
     /// the record PACT, and the next transfer ends it without the check
@@ -1263,20 +1289,22 @@ mod tests {
 
         record.put_field("RVAL", EpicsValue::Long(3)).unwrap();
         assert!(matches!(
-            dev.write_begin(&mut record, &source).unwrap(),
+            dev.write_begin_common(&mut record, &mut CommonFields::default(), &source)
+                .unwrap(),
             WriteStart::Pending
         ));
         assert!(tag.data.lock().do_write);
-        tag.notify();
+        tag.transfer();
         assert!(!checked(), "the write's transfer runs no check");
-        tag.notify();
+        tag.transfer();
         assert!(checked(), "later transfers check again");
         assert!(rx.try_recv().is_err(), "an output is never pulsed");
 
         // The 3 just written reads back as 3, so the next pass has nothing
         // to write.
         assert!(matches!(
-            dev.write_begin(&mut record, &source).unwrap(),
+            dev.write_begin_common(&mut record, &mut CommonFields::default(), &source)
+                .unwrap(),
             WriteStart::Completed
         ));
     }
@@ -1302,8 +1330,8 @@ mod tests {
         assert_eq!(b.string_tag, "DSXT_B");
 
         old.del_record().unwrap();
-        a.notify();
-        b.notify();
+        a.notify(WriteEnd::Read);
+        b.notify(WriteEnd::Read);
         assert!(old_rx.try_recv().is_err(), "the old tag still calls back");
         assert!(new_rx.try_recv().is_ok());
     }
@@ -1321,7 +1349,7 @@ mod tests {
         dev.set_record_info("AI", ScanType::Passive);
         dev.init(&mut record).unwrap();
         let mut rx = dev.io_intr_receiver().unwrap();
-        dev.tag.clone().unwrap().notify();
+        dev.tag.clone().unwrap().notify(WriteEnd::Read);
         assert!(rx.try_recv().is_ok());
     }
 
@@ -1447,9 +1475,11 @@ mod tests {
         static AO: [DevSup; 1] = [row("devAoEtherIP", 6)];
         static BO: [DevSup; 1] = [row("devBoEtherIP", 6)];
         static MBBO: [DevSup; 1] = [row("devMbboEtherIP", 5)];
+        static SO: [DevSup; 1] = [row("devSoEtherIP", 5)];
         register_device_menu("ao", &AO);
         register_device_menu("bo", &BO);
         register_device_menu("mbbo", &MBBO);
+        register_device_menu("stringout", &SO);
         define_plc(plc, "127.0.0.1", 0);
         let db = PvDatabase::new();
         db.install_device_support_resolver(Arc::new(device_factory));
@@ -1486,7 +1516,7 @@ mod tests {
     /// One transfer's callbacks as the scan thread runs them, then whatever
     /// they queued on scanOnce, whose ring runs in order on one thread.
     fn pulse(tag: &TagInfo) {
-        tag.notify();
+        tag.notify(WriteEnd::Read);
         flush_scan_once();
     }
 
@@ -1511,6 +1541,107 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    /// Holds the low band's one worker until `open`.
+    #[derive(Clone, Default)]
+    struct Hold(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Hold {
+        fn wait(&self) {
+            let (open, wake) = &*self.0;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+        }
+
+        fn open(&self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    /// Hold the low band's one worker, then take its one ring slot with
+    /// ad-hoc requests until one is refused (a `CallbackCell` never is), in
+    /// a process that gave the band one worker and a queue of one.
+    fn fill_low_band() -> Hold {
+        use epics_rs::base::runtime::task::{
+            CallbackPriority, background_callback_stats, spawn_blocking_background,
+        };
+        let low_overflows = || {
+            background_callback_stats(false).unwrap()[CallbackPriority::Low.index()].num_overflow
+        };
+        let hold = Hold::default();
+        let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let holder = hold.clone();
+        drop(spawn_blocking_background(
+            CallbackPriority::Low,
+            move |_| {
+                running_tx.send(()).unwrap();
+                holder.wait();
+            },
+        ));
+        running_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let refused = low_overflows() + 1;
+        let full = (0..64).any(|_| {
+            let filler = hold.clone();
+            drop(spawn_blocking_background(
+                CallbackPriority::Low,
+                move |_| filler.wait(),
+            ));
+            low_overflows() >= refused
+        });
+        assert!(full, "the low band never filled");
+        hold
+    }
+
+    /// devEtherIP.c:2074-2077: a write the tag takes, staged or already
+    /// current, defines the record; one with no data to stage alarms and
+    /// leaves it undefined.
+    #[test]
+    fn a_write_the_tag_takes_clears_udf() {
+        let rt = current_thread();
+        let db = eip_db("boudf");
+        let tag = load_output(
+            &rt,
+            &db,
+            "BOUDF",
+            Box::new(BoRecord::default()),
+            "boudf",
+            "BOOLs[300]",
+        );
+        set_words(&tag, &[0; 10]);
+        load_output(
+            &rt,
+            &db,
+            "BONODATA",
+            Box::new(BoRecord::default()),
+            "boudf",
+            "EMPTY[300]",
+        );
+        let after_udf_then_proc = |name: &str| {
+            for (f, v) in [
+                ("UDF", EpicsValue::UChar(1)),
+                ("PROC", EpicsValue::Short(1)),
+            ] {
+                rt.block_on(db.put_record_field_from_ca_no_notify(name, f, v))
+                    .unwrap();
+            }
+            ["UDF", "STAT", "SEVR"].map(|f| db.get_pv(format!("{name}.{f}")).unwrap())
+        };
+        assert_eq!(
+            after_udf_then_proc("BOUDF"),
+            [
+                EpicsValue::UChar(0),
+                EpicsValue::Short(0),
+                EpicsValue::Short(0)
+            ]
+        );
+        let [udf, _, sevr] = after_udf_then_proc("BONODATA");
+        assert_eq!([udf, sevr], [EpicsValue::UChar(1), EpicsValue::Short(3)]);
     }
 
     /// devEtherIP.c:326-437: check_ao_callback copies the PLC's value and
@@ -1671,7 +1802,7 @@ mod tests {
         let mut words = [0; 10];
         words[9] = 3 << 12;
         set_words(&tag, &words);
-        tag.notify();
+        tag.notify(WriteEnd::Read);
         // The periodic scan, in the gap a follow on another thread left.
         rt.block_on(db.process_record_with_links("STALE", &mut ProcStack::new()))
             .unwrap();
@@ -1716,6 +1847,58 @@ mod tests {
         set_tag(tag, CipType::Struct, &bytes);
     }
 
+    /// devEtherIP.c:2238-2257: so_write's `ok = false`, from a tag it cannot
+    /// read a string from or a put it refuses, raises WRITE_ALARM and leaves
+    /// the record undefined; a string already current and bo_write's skip of
+    /// an element it cannot read raise nothing.
+    #[test]
+    fn a_refused_write_raises_write_alarm_and_leaves_udf() {
+        use epics_rs::base::server::records::stringout::StringoutRecord;
+        let rt = current_thread();
+        let db = eip_db("sofail");
+        let load = |name: &str, record: Box<dyn Record>, tag: &str| {
+            load_output(&rt, &db, name, record, "sofail", tag)
+        };
+        let so = Box::<StringoutRecord>::default;
+        // get_CIP_STRING reads a plain CIP STRING; put_CIP_STRING takes only
+        // a Logix one.
+        set_tag(&load("SOPUT", so(), "PLAIN"), CipType::String, b"\0\0PLC");
+        set_words(&load("SOGET", so(), "WORDS"), &[0; 2]);
+        set_string_tag(&load("SOSAME", so(), "LOGIX"), "");
+        set_string_tag(
+            &load("BOSKIP", Box::<BoRecord>::default(), "TEXT[0]"),
+            "PLC",
+        );
+        // UDFS NO_ALARM keeps UDF_ALARM, raised first, from hiding the
+        // write's alarm.
+        let after_proc = |name: &str| {
+            for (f, v) in [
+                ("UDFS", EpicsValue::Short(0)),
+                ("UDF", EpicsValue::UChar(1)),
+                ("PROC", EpicsValue::Short(1)),
+            ] {
+                rt.block_on(db.put_record_field_from_ca_no_notify(name, f, v))
+                    .unwrap();
+            }
+            ["UDF", "STAT", "SEVR"].map(|f| db.get_pv(format!("{name}.{f}")).unwrap())
+        };
+        let refused = [
+            EpicsValue::UChar(1),
+            EpicsValue::Short(alarm_status::WRITE_ALARM as i16),
+            EpicsValue::Short(AlarmSeverity::Invalid as i16),
+        ];
+        assert_eq!(after_proc("SOPUT"), refused, "refused put");
+        assert_eq!(after_proc("SOGET"), refused, "unreadable tag");
+        for name in ["SOSAME", "BOSKIP"] {
+            let [_, stat, sevr] = after_proc(name);
+            assert_eq!(
+                [stat, sevr],
+                [EpicsValue::Short(0), EpicsValue::Short(0)],
+                "{name}"
+            );
+        }
+    }
+
     /// check_so_callback and so_write compare the PLC's string cut to
     /// MAX_STRING_SIZE, so a longer one is taken once, cut to fit, and not
     /// written back.
@@ -1739,7 +1922,7 @@ mod tests {
             record.get_field("VAL"),
             Some(EpicsValue::String(long[..MAX_STRING_SIZE - 1].into()))
         );
-        dev.write(&mut record).unwrap();
+        dev.write_common(&mut record, &mut common).unwrap();
         assert!(!tag.data.lock().do_write);
         assert_eq!(
             dev.check_callback(&mut record, &mut common),
@@ -1767,7 +1950,7 @@ mod tests {
             Callback::ScanOnce
         );
         assert_eq!(string_val(&record), long);
-        dev.write(&mut record).unwrap();
+        dev.write_common(&mut record, &mut common).unwrap();
         assert!(!tag.data.lock().do_write, "lso wrote back");
         assert_eq!(
             dev.check_callback(&mut record, &mut common),
@@ -1885,7 +2068,7 @@ mod tests {
             );
             assert_eq!(f64_field(&record, "VAL"), want_val, "udf={udf}");
             // ao_write, in the process that follows.
-            dev.write(&mut record).unwrap();
+            dev.write_common(&mut record, &mut common).unwrap();
             assert_eq!(tag.data.lock().do_write, want_write, "udf={udf}");
         }
     }
@@ -1928,19 +2111,24 @@ mod tests {
         assert!(device_factory(&ctx("ao", DTYP_RESET)).is_none());
     }
 
-    /// check_ao_callback's no-data branch calls `rset->process` itself
-    /// (devEtherIP.c:347-354): a TPRO record prints no dbProcess line for
-    /// it, and still ends in WRITE_ALARM. Run in a child, whose stdout the
-    /// trace goes to.
+    /// check_ao_callback's no-data branch processes the record on the scan
+    /// task (devEtherIP.c:347-354), and invalidate_PLC_tags runs it once per
+    /// outage (drvEtherIP.c:448-474), so a full callback band must not keep
+    /// a disconnected output out of WRITE_ALARM. In a child process: the
+    /// band's size and threads are set before it arms.
     #[test]
-    fn a_no_data_pulse_processes_past_dbprocess() {
+    fn a_no_data_pulse_raises_write_alarm_while_its_band_is_full() {
+        use epics_rs::base::runtime::background::callback_executor::{
+            set_parallel_threads, set_queue_size,
+        };
+        use epics_rs::base::runtime::task::CallbackPriority;
         use epics_rs::base::server::records::ao::AoRecord;
         use std::time::{Duration, Instant};
-        const CHILD: &str = "EIP_NO_DATA_CHILD";
+        const CHILD: &str = "EIP_NO_DATA_FULL_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
-                    "device::tests::a_no_data_pulse_processes_past_dbprocess",
+                    "device::tests::a_no_data_pulse_raises_write_alarm_while_its_band_is_full",
                     "--exact",
                     "--nocapture",
                 ])
@@ -1951,30 +2139,483 @@ mod tests {
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(out.status.success(), "{stdout}{stderr}");
             assert!(stdout.contains("1 passed"), "{stdout}");
-            assert!(!stdout.contains("dbProcess of 'AONODATA'"), "{stdout}");
             return;
         }
+        // The record's PRIO is LOW.
+        set_queue_size(1);
+        set_parallel_threads(1, Some(CallbackPriority::Low));
         epics_rs::base::runtime::task::background_arm();
         let rt = current_thread();
-        let db = eip_db("nodatapulse");
+        let db = eip_db("nodatafull");
         let tag = load_output(
             &rt,
             &db,
             "AONODATA",
             Box::new(AoRecord::default()),
-            "nodatapulse",
+            "nodatafull",
             "R",
         );
-        rt.block_on(db.put_pv_no_process("AONODATA.TPRO", EpicsValue::Char(1)))
-            .unwrap();
         let stat = || db.get_record("AONODATA").unwrap().read().common.stat;
         assert_ne!(stat(), alarm_status::WRITE_ALARM);
-        pulse(&tag);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while stat() != alarm_status::WRITE_ALARM {
-            assert!(Instant::now() < deadline, "no WRITE_ALARM");
+        let hold = fill_low_band();
+        // The tag holds no data, as after invalidate_tags.
+        tag.notify(WriteEnd::Dropped);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while stat() != alarm_status::WRITE_ALARM && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
+        let alarmed = stat() == alarm_status::WRITE_ALARM;
+        hold.open();
+        assert!(alarmed, "no WRITE_ALARM while the band is full");
+    }
+
+    /// The scan task's callback loop runs a pending write's `process`
+    /// itself (drvEtherIP.c:819-823, devEtherIP.c:336-344), not through
+    /// `callbackRequest`, so a full callback band cannot leave it PACT. In
+    /// a child process: the band's size and threads are set before it arms.
+    #[test]
+    fn a_pending_write_ends_on_its_transfer_while_its_band_is_full() {
+        use epics_rs::base::runtime::background::callback_executor::{
+            set_parallel_threads, set_queue_size,
+        };
+        use epics_rs::base::runtime::task::CallbackPriority;
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "EIP_FULL_BAND_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "device::tests::a_pending_write_ends_on_its_transfer_while_its_band_is_full",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+
+        // The record's PRIO is LOW.
+        set_queue_size(1);
+        set_parallel_threads(1, Some(CallbackPriority::Low));
+        epics_rs::base::runtime::task::background_arm();
+        let rt = current_thread();
+        let db = eip_db("fullband");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AOFULL",
+            Box::new(AoRecord::default()),
+            "fullband",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        let hold = fill_low_band();
+
+        rt.block_on(db.put_record_field_from_ca_no_notify(
+            "AOFULL",
+            "VAL",
+            EpicsValue::Double(3.0),
+        ))
+        .unwrap();
+        let pact = || db.get_record("AOFULL").unwrap().read().is_processing();
+        assert!(pact(), "the write is pending");
+        // The transfer that sent it, as scan_pass announces it.
+        tag.transfer();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pact() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ended = !pact();
+        hold.open();
+        assert!(ended, "PACT after the write's transfer");
+    }
+
+    /// A scan thread that panics ends the write it left pending, and
+    /// `drvEtherIP_restart`, which launches a scan task only for a PLC
+    /// without one (drvEtherIP.c:1389), launches the PLC a new one.
+    #[test]
+    fn a_scan_thread_that_panics_ends_the_pending_write_and_can_be_relaunched() {
+        use epics_rs::base::server::ioc_app::InitHookState;
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        let rt = current_thread();
+        let db = eip_db("panics");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AOPANIC",
+            Box::new(AoRecord::default()),
+            "panics",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        rt.block_on(db.put_record_field_from_ca_no_notify(
+            "AOPANIC",
+            "VAL",
+            EpicsValue::Double(3.0),
+        ))
+        .unwrap();
+        let pact = || db.get_record("AOPANIC").unwrap().read().is_processing();
+        assert!(pact(), "the write is pending");
+
+        driver::find_plc("panics").unwrap().panic_in_next_pass();
+        driver::init_hook(InitHookState::AfterScanInit);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pact() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pact(), "PACT after the scan thread panicked");
+        assert_eq!(driver::restart(), 1, "scan threads restart launched");
+        driver::stop_scan_tasks();
+    }
+
+    /// What a [`fake_plc`] does with a scan request.
+    enum Answer {
+        Reply(Vec<u8>),
+        HangUp,
+        Silent,
+    }
+
+    /// A PLC on a free 127.0.0.1 port: it registers a session, refuses the
+    /// identity read and answers the tag's probe with a REAL. It does what
+    /// `answer` says with each scan request, given the request's body.
+    fn fake_plc(mut answer: impl FnMut(&[u8]) -> Answer + Send + 'static) -> u16 {
+        use crate::encap;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            drop(listener);
+            let mut probe = vec![0xCC, 0, 0, 0];
+            probe.extend_from_slice(&CipType::Real.code().to_le_bytes());
+            probe.extend_from_slice(&1.0f32.to_le_bytes());
+            let mut rr_data = 0;
+            let mut header = [0u8; encap::HEADER_SIZE];
+            while s.read_exact(&mut header).is_ok() {
+                let length = u16::from_le_bytes([header[2], header[3]]) as usize;
+                let mut body = vec![0u8; length];
+                if s.read_exact(&mut body).is_err() {
+                    return;
+                }
+                let command = u16::from_le_bytes([header[0], header[1]]);
+                let tid = encap::TransactionId(header[12..20].try_into().unwrap());
+                let (status, data) = match command {
+                    encap::EC_LIST_SERVICES => {
+                        let mut d = vec![1, 0, 0x00, 0x01, 20, 0, 1, 0, 0x20, 0];
+                        d.extend_from_slice(b"Communications\0\0");
+                        (0, d)
+                    }
+                    encap::EC_REGISTER_SESSION => (0, vec![1, 0, 0, 0]),
+                    encap::EC_SEND_RR_DATA => {
+                        rr_data += 1;
+                        let cip = match rr_data {
+                            // The identity read.
+                            1 => (1, Vec::new()),
+                            2 => (0, probe.clone()),
+                            _ => match answer(&body) {
+                                Answer::Reply(scan) => (0, scan),
+                                Answer::HangUp => return,
+                                Answer::Silent => continue,
+                            },
+                        };
+                        if cip.0 == 0 {
+                            let reply = encap::encode_send_rr_data(1, tid, &cip.1);
+                            if s.write_all(&reply).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        cip
+                    }
+                    _ => return,
+                };
+                let mut reply = Vec::new();
+                encap::encode_header(&mut reply, command, data.len() as u16, 1, tid, 0);
+                reply[8..12].copy_from_slice(&u32::to_le_bytes(status));
+                reply.extend_from_slice(&data);
+                if s.write_all(&reply).is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
+    /// The STAT and SEVR an ao's write of 3.0 to a PLC holding 1.0 ends
+    /// with, the PLC being a [`fake_plc`] answering `scan`.
+    fn write_through_fake_plc(plc: &str, scan: Option<Vec<u8>>) -> (u16, AlarmSeverity) {
+        use epics_rs::base::server::ioc_app::InitHookState;
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        if !driver::initialized() {
+            driver::init();
+        }
+        let mut first = Some(scan);
+        driver::define_plc_on_port(
+            plc,
+            fake_plc(move |_| match first.take() {
+                Some(Some(scan)) => Answer::Reply(scan),
+                Some(None) => Answer::HangUp,
+                None => Answer::Silent,
+            }),
+        );
+        let rt = current_thread();
+        let db = eip_db(plc);
+        let tag = load_output(&rt, &db, "AO", Box::new(AoRecord::default()), plc, "R");
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        rt.block_on(db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(3.0)))
+            .unwrap();
+        let record = db.get_record("AO").unwrap();
+        assert!(record.read().is_processing(), "the write is pending");
+
+        driver::init_hook(InitHookState::AfterScanInit);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while record.read().is_processing() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ended = {
+            let r = record.read();
+            assert!(!r.is_processing(), "PACT after the write's transfer");
+            (r.common.stat, r.common.sevr)
+        };
+        driver::stop_scan_tasks();
+        ended
+    }
+
+    /// A write the PLC's connection drops before it answers never reached
+    /// the PLC: `invalidate_tags` ends it in the alarm of a write devEtherIP
+    /// cannot stage, where C's second ao_write pass ends it without one.
+    #[test]
+    fn a_write_the_plc_hangs_up_on_ends_in_write_alarm() {
+        assert_eq!(
+            write_through_fake_plc("hangsup", None),
+            (alarm_status::WRITE_ALARM, AlarmSeverity::Invalid)
+        );
+    }
+
+    /// A write the PLC refuses ends the same way.
+    #[test]
+    fn a_write_the_plc_refuses_ends_in_write_alarm() {
+        // A MultiRequest reply holding one CIP_WriteData reply whose general
+        // status is 0x05, "path destination unknown".
+        let refused = vec![0x8A, 0, 0, 0, 1, 0, 4, 0, 0xCD, 0, 0x05, 0];
+        assert_eq!(
+            write_through_fake_plc("refuses", Some(refused)),
+            (alarm_status::WRITE_ALARM, AlarmSeverity::Invalid)
+        );
+    }
+
+    /// A write the PLC takes ends without an alarm.
+    #[test]
+    fn a_write_the_plc_takes_ends_without_an_alarm() {
+        let taken = vec![0x8A, 0, 0, 0, 1, 0, 4, 0, 0xCD, 0, 0, 0];
+        assert_eq!(
+            write_through_fake_plc("takes", Some(taken)),
+            (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm)
+        );
+    }
+
+    /// The REAL a scan request writes to tag `R`, if it writes one.
+    fn written_to_r(body: &[u8]) -> Option<f32> {
+        let write = [0x4D, 2, 0x91, 1, b'R', 0, 0xCA, 0, 1, 0];
+        let at = body.windows(write.len()).position(|w| w == write)? + write.len();
+        Some(f32::from_le_bytes(body.get(at..at + 4)?.try_into().ok()?))
+    }
+
+    /// A MultiRequest reply holding one CIP reply.
+    fn multi_reply(item: &[u8]) -> Vec<u8> {
+        let mut r = vec![0x8A, 0, 0, 0, 1, 0, 4, 0];
+        r.extend_from_slice(item);
+        r
+    }
+
+    /// A [`fake_plc`] for tag `R` that reports what each scan request
+    /// writes, then waits for the test to let it answer: a read with 1.0, a
+    /// write by taking it.
+    fn gated_plc(plc: &str) -> (mpsc::Receiver<Option<f32>>, mpsc::Sender<()>) {
+        let (seen_tx, seen) = mpsc::channel();
+        let (answer, answer_rx) = mpsc::channel::<()>();
+        let port = fake_plc(move |body| {
+            let written = written_to_r(body);
+            let _ = seen_tx.send(written);
+            if answer_rx.recv().is_err() {
+                return Answer::Silent;
+            }
+            Answer::Reply(match written {
+                Some(_) => multi_reply(&[0xCD, 0, 0, 0]),
+                None => {
+                    let mut read = vec![0xCC, 0, 0, 0, 0xCA, 0];
+                    read.extend_from_slice(&1.0f32.to_le_bytes());
+                    multi_reply(&read)
+                }
+            })
+        });
+        if !driver::initialized() {
+            driver::init();
+        }
+        driver::define_plc_on_port(plc, port);
+        (seen, answer)
+    }
+
+    /// C ends a PACT write on any callback of its tag (devEtherIP.c:1937),
+    /// so a read in flight when the write was staged ends it before it is
+    /// sent; here the record stays PACT until the PLC answers its write.
+    #[test]
+    fn a_write_staged_during_a_read_ends_when_the_plc_answers_the_write() {
+        use epics_rs::base::server::ioc_app::InitHookState;
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        let (seen, answer) = gated_plc("midread");
+        let rt = current_thread();
+        let db = eip_db("midread");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AO",
+            Box::new(AoRecord::default()),
+            "midread",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        let record = db.get_record("AO").unwrap();
+        let wait = Duration::from_secs(10);
+
+        driver::init_hook(InitHookState::AfterScanInit);
+        assert_eq!(seen.recv_timeout(wait), Ok(None), "the first scan reads");
+        rt.block_on(db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(3.0)))
+            .unwrap();
+        answer.send(()).unwrap();
+        assert_eq!(
+            seen.recv_timeout(wait),
+            Ok(Some(3.0)),
+            "the next scan writes"
+        );
+        let pact_while_unanswered = record.read().is_processing();
+        answer.send(()).unwrap();
+        let deadline = Instant::now() + wait;
+        while record.read().is_processing() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let r = record.read();
+        let ended = (
+            pact_while_unanswered,
+            r.is_processing(),
+            r.common.stat,
+            r.common.sevr,
+        );
+        drop(r);
+        driver::stop_scan_tasks();
+        assert_eq!(
+            ended,
+            (true, false, alarm_status::NO_ALARM, AlarmSeverity::NoAlarm),
+            "PACT until the write is answered, then the write's end"
+        );
+    }
+
+    /// Of two records writing one tag, the one staged while the other's
+    /// write is in flight stays PACT until the PLC answers its own.
+    #[test]
+    fn a_write_staged_during_another_write_ends_when_the_plc_answers_it() {
+        use epics_rs::base::server::ioc_app::InitHookState;
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        let (seen, answer) = gated_plc("midwrite");
+        let rt = current_thread();
+        let db = eip_db("midwrite");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AO1",
+            Box::new(AoRecord::default()),
+            "midwrite",
+            "R",
+        );
+        load_output(
+            &rt,
+            &db,
+            "AO2",
+            Box::new(AoRecord::default()),
+            "midwrite",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        let pact = |name: &str| db.get_record(name).unwrap().read().is_processing();
+        let wait = Duration::from_secs(10);
+
+        rt.block_on(db.put_record_field_from_ca_no_notify("AO1", "VAL", EpicsValue::Double(3.0)))
+            .unwrap();
+        driver::init_hook(InitHookState::AfterScanInit);
+        assert_eq!(
+            seen.recv_timeout(wait),
+            Ok(Some(3.0)),
+            "the first scan writes AO1's"
+        );
+        rt.block_on(db.put_record_field_from_ca_no_notify("AO2", "VAL", EpicsValue::Double(5.0)))
+            .unwrap();
+        answer.send(()).unwrap();
+        assert_eq!(
+            seen.recv_timeout(wait),
+            Ok(Some(5.0)),
+            "the next scan writes AO2's"
+        );
+        let while_unanswered = (pact("AO1"), pact("AO2"));
+        answer.send(()).unwrap();
+        let deadline = Instant::now() + wait;
+        while pact("AO2") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ended = pact("AO2");
+        driver::stop_scan_tasks();
+        assert_eq!(
+            (while_unanswered, ended),
+            ((false, true), false),
+            "(AO1, AO2) PACT while AO2's write is unanswered, then AO2's"
+        );
+    }
+
+    /// A write whose request alone outgrows the buffer limit never reaches
+    /// the PLC, so the pass that cannot send it ends it in WRITE_ALARM.
+    #[test]
+    fn a_write_too_large_to_send_ends_in_write_alarm() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        use std::time::{Duration, Instant};
+        let rt = current_thread();
+        let db = eip_db("toolarge");
+        let tag = load_output(
+            &rt,
+            &db,
+            "AOBIG",
+            Box::new(AoRecord::default()),
+            "toolarge",
+            "R",
+        );
+        set_tag(&tag, CipType::Real, &1.0f32.to_le_bytes());
+        {
+            let mut d = tag.data.lock();
+            (d.r_request, d.r_response) = (10, 10);
+            (d.w_request, d.w_response) = (10_000, 10);
+        }
+        rt.block_on(db.put_record_field_from_ca_no_notify("AOBIG", "VAL", EpicsValue::Double(3.0)))
+            .unwrap();
+        let record = db.get_record("AOBIG").unwrap();
+        assert!(record.read().is_processing(), "the write is pending");
+
+        let (items, _) = driver::build_multi_request(500, &[tag], 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while record.read().is_processing() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let r = record.read();
+        assert_eq!(
+            (items.len(), r.is_processing(), r.common.stat, r.common.sevr),
+            (0, false, alarm_status::WRITE_ALARM, AlarmSeverity::Invalid)
+        );
     }
 
     /// A disconnected tag leaves an output in WRITE_ALARM, as C's ao_write.
@@ -1989,7 +2630,8 @@ mod tests {
             dev.check_callback(&mut record, &mut CommonFields::default()),
             Callback::Process
         );
-        dev.write(&mut record).unwrap();
+        dev.write_common(&mut record, &mut CommonFields::default())
+            .unwrap();
         let alarm = dev.last_alarm().unwrap();
         assert_eq!(alarm.stat, alarm_status::WRITE_ALARM);
     }
@@ -2104,6 +2746,15 @@ mod tests {
         assert_eq!(parse_link("@plc1 A[010]", 1, 0).unwrap().element, 8);
         assert_eq!(parse_link("@plc1 A[3x]", 1, 0).unwrap().element, 3);
         assert_eq!(parse_link("@plc1 Cnt S 0.5", 1, 0).unwrap().period, 0.5);
+    }
+
+    /// devEtherIP.c reads the S and B flags with glibc `strtod`.
+    #[test]
+    fn strtod_reads_hex_and_only_c_blanks() {
+        assert_eq!(strtod("0x10"), (16.0, 4));
+        assert_eq!(strtod(" 0x1p3 x"), (8.0, 6));
+        assert_eq!(strtod("\u{a0}5"), (0.0, 0));
+        assert_eq!(parse_link("@plc1 Cnt B 0x3", 1, 0).unwrap().mask, 8);
     }
 
     /// devEtherIP.c:1055's strtol is glibc's with `_GNU_SOURCE`: `0b` is

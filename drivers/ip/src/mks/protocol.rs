@@ -8,6 +8,8 @@
 //! Rn   pressure of gauge n (1..5), or a status word such as "H " / "NO"
 //! ```
 
+use epics_libcom_rs::runtime::stdlib::strtod;
+
 /// Gauges an MKS 937 can carry (`devAiMKS.c:136`).
 pub const MAX_GAUGES: usize = 5;
 
@@ -107,11 +109,8 @@ pub fn parse_reading(reply: &str) -> Reading {
     let text = reply.trim_end_matches(['\r', '\n']);
     let first = text.chars().next();
     if first.is_some_and(|c| c.is_ascii_digit() || c == ' ') {
-        // The C uses atof(), which takes the leading number and ignores the rest.
-        return match text.trim().parse::<f64>() {
-            Ok(value) => Reading::Pressure(value),
-            Err(_) => Reading::Unknown,
-        };
+        // C `atof(response)`.
+        return Reading::Pressure(strtod(text.as_bytes()).value);
     }
     if text.starts_with("H ") || text.starts_with("A ") {
         Reading::AboveRange
@@ -175,5 +174,32 @@ mod tests {
         assert_eq!(parse_reading("SYNTAX!"), Reading::Spurious);
         assert_eq!(parse_reading("NotCMD!"), Reading::Spurious);
         assert_eq!(parse_reading("garbage"), Reading::Unknown);
+    }
+
+    /// C reads a reply that starts with a digit or a blank with `atof`, so
+    /// the pressure is the number the reply begins with, and 0 for none.
+    #[test]
+    fn pressures_are_read_as_c_atof() {
+        let cases = [
+            ("1.2E-06", Reading::Pressure(1.2e-6)),
+            ("1.2E-6X", Reading::Pressure(1.2e-6)),
+            ("5.0E-3 ", Reading::Pressure(5.0e-3)),
+            ("       ", Reading::Pressure(0.0)),
+            ("1.0E-  ", Reading::Pressure(1.0)),
+            (" 1.5 T ", Reading::Pressure(1.5)),
+            ("0x1A   ", Reading::Pressure(26.0)),
+            (" -1.0E0", Reading::Pressure(-1.0)),
+            ("9 9 9  ", Reading::Pressure(9.0)),
+            ("1E+999 ", Reading::Pressure(f64::INFINITY)),
+            ("1,5E-03", Reading::Pressure(1.0)),
+            (" +2.0E1", Reading::Pressure(20.0)),
+            (".5E-3  ", Reading::Unknown),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter(|(reply, want)| parse_reading(reply) != *want)
+            .map(|(reply, want)| (*reply, parse_reading(reply), *want))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

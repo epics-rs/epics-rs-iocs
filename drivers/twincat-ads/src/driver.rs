@@ -78,8 +78,8 @@ use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::recgbl::alarm_status;
 
 use crate::ads::defs::{
-    ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, ADSIGRP_SYM_VERSION, GLOBALERR_TARGET_PORT,
-    LOCAL_PORT_BASE, error_to_string,
+    ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, ADSIGRP_SYM_VERSION, AmsNetIdParseError,
+    GLOBALERR_TARGET_PORT, LOCAL_PORT_BASE, error_to_string,
 };
 use crate::ads::sumup::{self, SumEntry};
 use crate::ads::{
@@ -428,6 +428,18 @@ impl AdsShared {
         };
         if let Some(iv) = fire {
             self.interrupts.notify(iv);
+        }
+    }
+
+    /// C `fireAllCallbacksLock` (adsAsynPortDriver.cpp:4677-4690): fire every
+    /// cached value, for the records that registered after its sample. Under
+    /// the lock, so a racing `publish` cannot be overtaken by its older value.
+    fn fire_all_callbacks(&self) {
+        let params = self.params.lock();
+        for (reason, p) in params.iter().enumerate() {
+            if let Some(iv) = p.as_ref().and_then(|p| interrupt_for(reason, p)) {
+                self.interrupts.notify(iv);
+            }
         }
     }
 
@@ -1136,7 +1148,7 @@ impl AdsPortDriver {
                 multi_device: false,
                 // Every parameter bind and every write goes to the PLC over TCP.
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             INTERFACES,
             INTERRUPTS,
@@ -1929,7 +1941,7 @@ pub fn create_ads_port(claim: &PortClaim, cfg: AdsConfig) -> AsynResult<AdsRunti
     })
 }
 
-/// C `initHook`'s `getEpicsState` lines; registered once, as C's
+/// C `initHook`'s `getEpicsState`; registered once, as C's
 /// `initHookRegister` drops a repeated function.
 fn register_init_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1946,6 +1958,12 @@ fn register_init_hook() {
                 );
             }
             InitHookState::AfterScanInit => println!("Begin polling PLC!"),
+            // C replays at AfterScanInit, while interruptAccept still drops it.
+            InitHookState::AfterInterruptAccept => {
+                for (_, shared) in PORTS.lock().iter() {
+                    shared.fire_all_callbacks();
+                }
+            }
             _ => {}
         }));
     });
@@ -2159,9 +2177,21 @@ static LOCAL_NET_ID: Mutex<AmsNetId> = Mutex::new(AmsNetId([0; 6]));
 /// `adsAsynPortObj`; this driver allows several PLCs in one IOC).
 static PORTS: Mutex<Vec<(String, Arc<AdsShared>)>> = Mutex::new(Vec::new());
 
-/// iocsh `adsSetLocalAddress` — the AMS Net Id this IOC answers to.
-pub fn set_local_address(net_id: AmsNetId) {
+/// iocsh `adsSetLocalAddress` (adsAsynPortDriver.cpp:5296-5306) — the AMS
+/// Net Id this IOC answers to.
+pub fn set_local_address(text: &str) -> Result<AmsNetId, AmsNetIdParseError> {
+    let net_id = parse_local_address(text)?;
     *LOCAL_NET_ID.lock() = net_id;
+    Ok(net_id)
+}
+
+/// C refuses text under eleven bytes, then reads it with `AmsNetId`'s string
+/// constructor, not the remote id's `sscanf`.
+fn parse_local_address(text: &str) -> Result<AmsNetId, AmsNetIdParseError> {
+    (text.len() >= 11)
+        .then(|| AmsNetId::from_dotted(text))
+        .flatten()
+        .ok_or_else(|| AmsNetIdParseError(text.to_string()))
 }
 
 fn local_net_id() -> AmsNetId {
@@ -2241,12 +2271,54 @@ mod tests {
     use std::sync::mpsc;
 
     use asyn_rs::interrupt::InterruptFilter;
+    use epics_rs::base::server::ioc_app::init_hook_announce;
 
     use super::*;
+
+    /// C's `adsSetLocalAddress` length gate and `AmsNetId(const std::string&)`:
+    /// each field is `atoi`'s, so blank, junk-led and junk-tailed fields read
+    /// as C reads them. Refused where C stores the empty id (field count) or
+    /// wraps a field (`% 256`, `atoi`'s `int`).
+    #[test]
+    fn local_address_reads_as_c() {
+        let cases: &[(&str, Option<[u8; 6]>)] = &[
+            ("1.2.3.4.5.6", Some([1, 2, 3, 4, 5, 6])),
+            ("10..2.3.4.5", Some([10, 0, 2, 3, 4, 5])),
+            ("1x.2.3.4.5.6", Some([1, 2, 3, 4, 5, 6])),
+            ("1 .2.3.4.5.6", Some([1, 2, 3, 4, 5, 6])),
+            ("0x1.2.3.4.5.6", Some([0, 2, 3, 4, 5, 6])),
+            ("a.b.c.d.e.f", Some([0; 6])),
+            (" +1.2.3.4.5.6.", Some([1, 2, 3, 4, 5, 6])),
+            ("1.2.3.4.5.6.7", None),        // C: 0.0.0.0.0.0
+            ("1.2.3.4.5.6..", None),        // C: 0.0.0.0.0.0
+            ("1.2.3.4.5.-1", None),         // C: 1.2.3.4.5.255
+            ("1.2.3.4.5.4294967297", None), // C: 1.2.3.4.5.1
+            ("1..2.3.4.5", None),           // under eleven bytes
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|&(s, want)| {
+                let got = parse_local_address(s).ok().map(|id| id.0);
+                (got != want).then_some((s, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     fn driver() -> AdsPortDriver {
         let cfg = AdsConfig::new("ADS1", "10.0.0.1", AmsNetId([10, 0, 0, 1, 1, 1]), 851);
         AdsPortDriver::new(cfg).unwrap()
+    }
+
+    /// C registers the port with `ASYN_CANBLOCK` alone
+    /// (`adsAsynPortDriver.cpp:293`), so `asynShutdownPort` is refused and the
+    /// port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let mut d = driver();
+        let refused = d.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(d.base.is_enabled());
     }
 
     /// Bind one record. `.ADR.` links carry the PLC type and size in the link
@@ -2349,6 +2421,44 @@ mod tests {
         assert_eq!(iface, Some(InterfaceType::Float64));
         assert_eq!(severity, NO_ALARM_SEV);
         assert_eq!(d.read_float64(&user(reason)).unwrap(), 2.5);
+    }
+
+    /// The bind-time first sample fires before any I/O Intr record has
+    /// registered; a PLC variable that never changes again must still reach
+    /// the record once interrupts are accepted. One never sampled stays UDF.
+    #[test]
+    fn interrupt_accept_replays_each_sampled_value_to_a_late_subscriber() {
+        let mut d = driver();
+        let sampled = bind(
+            &mut d,
+            "ADSPORT=851/.ADR.16#4020,16#0,8,5?",
+            InterfaceType::Float64,
+        );
+        let _unsampled = bind(
+            &mut d,
+            "ADSPORT=851/.ADR.16#4020,16#8,8,5?",
+            InterfaceType::Float64,
+        );
+        // What `create_ads_port` wires up for every port.
+        register_port(&d.shared);
+        register_init_hook();
+        d.shared.publish(sampled, &2.5f64.to_le_bytes(), 0);
+
+        let (tx, rx) = mpsc::channel();
+        let _sub = d
+            .shared
+            .interrupts
+            .register_sync_callback(InterruptFilter::default(), move |iv| {
+                let _ = tx.send((iv.reason, iv.value.clone()));
+            })
+            .unwrap();
+        init_hook_announce(InitHookState::AfterInterruptAccept);
+
+        let fired: Vec<_> = rx.try_iter().collect();
+        assert!(
+            matches!(fired.as_slice(), [(r, ParamValue::Float64(v))] if *r == sampled && *v == 2.5),
+            "{fired:?}"
+        );
     }
 
     #[test]

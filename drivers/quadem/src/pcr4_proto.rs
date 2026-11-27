@@ -5,9 +5,11 @@
 //! stream is one `\r\n`-terminated line of space-separated floating-point
 //! currents per sample.
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::base::types::c_parse::{atoi, long_to_int, strtol};
 
 use crate::drv_quad_em::{QE_MAX_INPUTS, QeTriggerPolarity};
@@ -174,14 +176,14 @@ fn parse_int_after(resp: &str, prefix: &str) -> Option<i32> {
 }
 
 /// C++ `readStatus`: `"BIASSTATUS:OFF"` means the bias is off, anything else
-/// carries the voltage. `Some(None)` is bias off, `Some(Some(v))` is bias on.
+/// carries the voltage, `sscanf(inString_, "BIASSTATUS:%lf")`. `Some(None)` is
+/// bias off, `Some(Some(v))` is bias on.
 pub fn parse_bias_status(resp: &str) -> Option<Option<f64>> {
     if resp.starts_with("BIASSTATUS:OFF") {
         return Some(None);
     }
-    let rest = resp.strip_prefix("BIASSTATUS:")?;
-    let (value, consumed) = strtod(rest);
-    (consumed > 0).then_some(Some(value))
+    let value = Cell::new(0.0);
+    (sscanf(resp, "BIASSTATUS:%lf", &[&value]) == 1).then(|| Some(value.get()))
 }
 
 /// C++ `setAcquire(0)`'s resynchronisation loop: it re-reads until a line ends
@@ -241,57 +243,12 @@ pub fn parse_sample(line: &str, num_channels: i32) -> [f64; QE_MAX_INPUTS] {
     raw
 }
 
-/// `strtod(nptr, &endptr)` restricted to what the meter emits: optional
-/// whitespace, optional sign, digits with an optional fraction and an optional
-/// decimal exponent.
-///
-/// Returns the value and the bytes consumed. As in C, "no conversion" leaves
-/// the pointer parked (`0` consumed) and yields `0.0`, which makes every later
-/// field of the same line read `0.0` as well.
+/// C `strtod(nptr, &endptr)`: the value and the bytes consumed. As in C,
+/// "no conversion" leaves the pointer parked (`0` consumed) and yields
+/// `0.0`, which makes every later field of the same line read `0.0` as well.
 pub fn strtod(s: &str) -> (f64, usize) {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let start = i;
-    if matches!(b.get(i), Some(b'+') | Some(b'-')) {
-        i += 1;
-    }
-    let mut digits = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-        digits += 1;
-    }
-    if b.get(i) == Some(&b'.') {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-            digits += 1;
-        }
-    }
-    if digits == 0 {
-        return (0.0, 0);
-    }
-    // The exponent only counts if it is complete; otherwise strtod backs up to
-    // the end of the mantissa.
-    if matches!(b.get(i), Some(b'e') | Some(b'E')) {
-        let mut j = i + 1;
-        if matches!(b.get(j), Some(b'+') | Some(b'-')) {
-            j += 1;
-        }
-        let exp_start = j;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j > exp_start {
-            i = j;
-        }
-    }
-    match s[start..i].parse::<f64>() {
-        Ok(v) => (v, i),
-        Err(_) => (0.0, 0),
-    }
+    let r = epics_libcom_rs::runtime::stdlib::strtod(s.as_bytes());
+    (r.value, r.len)
 }
 
 #[cfg(test)]
@@ -412,6 +369,20 @@ mod tests {
         assert_eq!(parse_bias_status("ACK"), None);
     }
 
+    /// `sscanf(inString_, "BIASSTATUS:%lf")` (drvPCR4.cpp:668): the whole
+    /// `%lf` grammar, and nothing from a float glibc reads only part of.
+    #[test]
+    fn bias_status_scans_as_sscanf_lf() {
+        assert_eq!(
+            parse_bias_status("BIASSTATUS: inf"),
+            Some(Some(f64::INFINITY))
+        );
+        assert_eq!(parse_bias_status("BIASSTATUS:0x1p4"), Some(Some(16.0)));
+        assert_eq!(parse_bias_status("BIASSTATUS:0x"), None);
+        assert_eq!(parse_bias_status("BIASSTATUS:2e"), None);
+        assert_eq!(parse_bias_status("BIASSTATUS:infi"), None);
+    }
+
     #[test]
     fn ack_is_matched_at_the_end_of_a_line() {
         assert!(ends_with_ack(b"ACK"));
@@ -461,6 +432,13 @@ mod tests {
         // No conversion: value 0, pointer parked.
         assert_eq!(strtod("abc"), (0.0, 0));
         assert_eq!(strtod(""), (0.0, 0));
+    }
+
+    #[test]
+    fn strtod_reads_what_glibc_strtod_reads() {
+        assert_eq!(strtod("\x0b5"), (5.0, 2));
+        assert_eq!(strtod("inf 1"), (f64::INFINITY, 3));
+        assert_eq!(strtod("0x10"), (16.0, 4));
     }
 
     #[test]

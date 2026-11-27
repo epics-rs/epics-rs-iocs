@@ -9,9 +9,12 @@
 //! [`quoted_field`] and [`numeric_field`], but bounded: a reply shorter than
 //! the skip no longer reads past its end.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::{ScanTarget, sscanf};
+use epics_libcom_rs::runtime::stdlib::strtol;
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::ndarray::NDDataType;
 
@@ -73,13 +76,17 @@ pub fn parse_version(reply: &str) -> Result<f64, ProtocolError> {
     let start = reply
         .find(VERSION_PREFIX)
         .ok_or_else(|| ProtocolError::BadVersion(reply.to_string()))?;
-    let tail = &reply[start + VERSION_PREFIX.len()..];
-    let end = tail
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .unwrap_or(tail.len());
-    let version: f64 = tail[..end]
-        .parse()
-        .map_err(|_| ProtocolError::BadVersion(reply.to_string()))?;
+    // C's `serverVersion_` is a `float`.
+    let version = Cell::new(0f32);
+    if sscanf(
+        &reply.as_bytes()[start + VERSION_PREFIX.len()..],
+        "%f",
+        &[&version],
+    ) != 1
+    {
+        return Err(ProtocolError::BadVersion(reply.to_string()));
+    }
+    let version = f64::from(version.get());
     if version < MIN_SERVER_VERSION {
         return Err(ProtocolError::OldVersion(reply.to_string()));
     }
@@ -158,51 +165,63 @@ pub fn numeric_field(reply: &str, multi_camera: bool) -> &str {
     reply.get(1..).unwrap_or("")
 }
 
-/// Pull the integers out of a `(a,b)` or `(a,b,c,d)` reply.
-pub fn parse_ints(reply: &str) -> Vec<i32> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    for c in reply.chars() {
-        if c.is_ascii_digit() || (c == '-' && cur.is_empty()) {
-            cur.push(c);
-        } else if !cur.is_empty() {
-            if let Ok(v) = cur.parse() {
-                out.push(v);
-            }
-            cur.clear();
-        }
+/// C `sscanf(reply, format, ...) == N` for a `format` of `N` `%d`s, written
+/// `%lld` so that a value C would wrap into its `int` is `None`.
+fn scan_ints<const N: usize>(reply: &[u8], format: &str) -> Option<[i32; N]> {
+    let wide: [Cell<i64>; N] = std::array::from_fn(|_| Cell::new(0));
+    let out: Vec<&dyn ScanTarget> = wide.iter().map(|v| v as &dyn ScanTarget).collect();
+    if sscanf(reply, format, &out) != N as i32 {
+        return None;
     }
-    if let Ok(v) = cur.parse() {
-        out.push(v);
+    let mut values = [0; N];
+    for (value, wide) in values.iter_mut().zip(&wide) {
+        *value = i32::try_from(wide.get()).ok()?;
     }
-    out
+    Some(values)
 }
 
-/// First floating-point number in a reply.
-pub fn parse_first_f64(reply: &str) -> Option<f64> {
-    let bytes: Vec<char> = reply.chars().collect();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() || bytes[i] == '-' || bytes[i] == '+' {
-            let start = i;
-            i += 1;
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == '.') {
-                i += 1;
-            }
-            let s: String = bytes[start..i].iter().collect();
-            if let Ok(v) = s.parse::<f64>() {
-                return Some(v);
-            }
-        } else {
-            i += 1;
-        }
-    }
-    None
+/// A `(x,y)` reply: `GetMaximumSize`, `GetSize`, `GetBinning`
+/// (C `sscanf(pStart, "(%d,%d)", ...)`).
+pub fn parse_pair(reply: &str) -> Option<[i32; 2]> {
+    scan_ints(reply.as_bytes(), "(%lld,%lld)")
 }
 
-/// The `GetExposure` reply, in seconds (C scales `Millisec` and `Microsec`).
+/// The `GetSubArea` reply (C `sscanf(pStart, "(%d,%d,%d,%d)", ...)`) as
+/// `[min_x, min_y, size_x, size_y]`, a size being C's `right - minX + 1`.
+/// A size past `int`, which C's arithmetic overflows, refuses the reply.
+pub fn parse_sub_area(reply: &str) -> Option<[i32; 4]> {
+    let [min_x, min_y, right, bottom] = scan_ints(reply.as_bytes(), "(%lld,%lld,%lld,%lld)")?;
+    let size = |min: i32, edge: i32| i32::try_from(i64::from(edge) - i64::from(min) + 1).ok();
+    Some([min_x, min_y, size(min_x, right)?, size(min_y, bottom)?])
+}
+
+/// A one-number reply: `GetFliplr`, `GetFlipud`, `GetRecordNumber`
+/// (C `sscanf(pStart, "%d", ...)`).
+pub fn parse_int(reply: &str) -> Option<i32> {
+    scan_ints(reply.as_bytes(), "%lld").map(|[v]| v)
+}
+
+/// The `GetCamNum` reply (C `nCameras_ = atoi(fromServer_)`). A count past
+/// `int`, which `atoi` wraps, reads as no count, 0, as junk does.
+pub fn parse_cam_num(reply: &str) -> i32 {
+    i32::try_from(strtol(reply, 10).0).unwrap_or(0)
+}
+
+/// C `sscanf(reply, format, &value)` for a `format` with one `%lf`.
+fn scan_f64(reply: &str, format: &str) -> Option<f64> {
+    let value = Cell::new(0f64);
+    (sscanf(reply.as_bytes(), format, &[&value]) == 1).then(|| value.get())
+}
+
+/// The `GetChipGain` reply (C `sscanf(pStart, "%lf", &gain)`).
+pub fn parse_gain(reply: &str) -> Option<f64> {
+    scan_f64(reply, "%lf")
+}
+
+/// The `GetExposure` reply, in seconds (C `sscanf(pStart, "(%lf", &exposure)`,
+/// then C scales `Millisec` and `Microsec`).
 pub fn parse_exposure(reply: &str) -> Option<f64> {
-    let value = parse_first_f64(reply)?;
+    let value = scan_f64(reply, "(%lf")?;
     if reply.contains("Millisec") {
         Some(value / 1e3)
     } else if reply.contains("Microsec") {
@@ -255,15 +274,15 @@ impl ImageHeader {
         }
     }
 
-    /// Bytes the announced geometry actually occupies.
-    pub fn expected_bytes(&self) -> usize {
+    /// Bytes the announced geometry actually occupies, `None` past `usize`.
+    pub fn expected_bytes(&self) -> Option<usize> {
         let per_pixel = self.data_type.element_size()
             * if self.color_mode == NDColorMode::RGB1 {
                 3
             } else {
                 1
             };
-        self.width * self.height * per_pixel
+        self.width.checked_mul(self.height)?.checked_mul(per_pixel)
     }
 }
 
@@ -294,36 +313,39 @@ pub fn parse_image_header(reply: &[u8]) -> Result<ImageHeader, ProtocolError> {
             ProtocolError::UnknownImageMode(String::from_utf8_lossy(seen).to_string())
         })?;
 
-    // Three ';'-terminated decimal fields follow the mode.
-    let mut fields = [0usize; 3];
-    let mut pos = prefix_len;
-    for field in fields.iter_mut() {
-        let start = pos;
-        while pos < reply.len() && reply[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        if pos == start || pos >= reply.len() || reply[pos] != b';' {
-            return Err(ProtocolError::BadImageHeader);
-        }
-        *field = std::str::from_utf8(&reply[start..pos])
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or(ProtocolError::BadImageHeader)?;
-        pos += 1; // the ';'
+    // C `sscanf(fromServer_ + prefixLen, "%d;%d;%d;%n", ...)`, which left
+    // the header length unset when the scan stopped short.
+    let fields: [Cell<i64>; 3] = std::array::from_fn(|_| Cell::new(0));
+    let text_len = Cell::new(-1i32);
+    let out: [&dyn ScanTarget; 4] = [&fields[0], &fields[1], &fields[2], &text_len];
+    let body = &reply[prefix_len..];
+    if sscanf(body, "%lld;%lld;%lld;%n", &out) != 3 {
+        return Err(ProtocolError::BadImageHeader);
     }
+    let text_len = usize::try_from(text_len.get()).map_err(|_| ProtocolError::BadImageHeader)?;
+    let [width, height, data_len] = fields.map(|v| {
+        i32::try_from(v.get())
+            .ok()
+            .and_then(|v| usize::try_from(v).ok())
+    });
+    let (Some(width), Some(height), Some(data_len)) = (width, height, data_len) else {
+        return Err(ProtocolError::BadImageHeader);
+    };
 
     let header = ImageHeader {
         data_type,
         color_mode,
-        width: fields[0],
-        height: fields[1],
-        data_len: fields[2],
-        header_len: pos,
+        width,
+        height,
+        data_len,
+        header_len: prefix_len + text_len,
     };
     if header.width == 0 || header.height == 0 {
         return Err(ProtocolError::BadImageHeader);
     }
-    let expected = header.expected_bytes();
+    let expected = header
+        .expected_bytes()
+        .ok_or(ProtocolError::BadImageHeader)?;
     if header.data_len != expected {
         return Err(ProtocolError::ImageSizeMismatch {
             announced: header.data_len,
@@ -347,12 +369,11 @@ pub fn set_binning(bin_x: i32, bin_y: i32) -> String {
     format!("SetBinning;({bin_x},{bin_y})")
 }
 
-pub fn set_sub_area(min_x: i32, min_y: i32, size_x: i32, size_y: i32) -> String {
-    format!(
-        "SetSubArea;({min_x},{min_y},{},{})",
-        min_x + size_x - 1,
-        min_y + size_y - 1
-    )
+/// `None` where C's `minX+sizeX-1` overflows its `int`.
+pub fn set_sub_area(min_x: i32, min_y: i32, size_x: i32, size_y: i32) -> Option<String> {
+    let edge = |min: i32, size: i32| i32::try_from(i64::from(min) + i64::from(size) - 1).ok();
+    let (right, bottom) = (edge(min_x, size_x)?, edge(min_y, size_y)?);
+    Some(format!("SetSubArea;({min_x},{min_y},{right},{bottom})"))
 }
 
 pub fn set_fliplr(value: i32) -> String {
@@ -421,8 +442,11 @@ mod tests {
 
     #[test]
     fn parse_version_accepts_a_supported_server() {
-        assert_eq!(parse_version("PSLViewer-4.3").unwrap(), 4.3);
-        assert_eq!(parse_version("PSLViewer-5.10 ready").unwrap(), 5.10);
+        assert_eq!(parse_version("PSLViewer-4.3").unwrap(), f64::from(4.3f32));
+        assert_eq!(
+            parse_version("PSLViewer-5.10 ready").unwrap(),
+            f64::from(5.1f32)
+        );
     }
 
     #[test]
@@ -518,11 +542,99 @@ mod tests {
 
     // --- values -----------------------------------------------------------
 
+    /// PSL.cpp scans each reply with its own `sscanf` format, and the
+    /// `GetCamNum` reply with `atoi`, so a number ends where C's conversion
+    /// stops. A value C wraps into its `int` is refused.
     #[test]
-    fn parse_ints_reads_pairs_and_quads() {
-        assert_eq!(parse_ints("(4,4)"), vec![4, 4]);
-        assert_eq!(parse_ints("(0,0,3999,2670)"), vec![0, 0, 3999, 2670]);
-        assert_eq!(parse_ints("(-1,2)"), vec![-1, 2]);
+    fn replies_are_scanned_as_c_sscanf() {
+        let mut wrong = Vec::new();
+        let pairs = [
+            ("(4,4)", Some([4, 4])),
+            ("( 4, 4)", Some([4, 4])),
+            ("(+4,-4)", Some([4, -4])),
+            ("(-1,2)", Some([-1, 2])),
+            ("(4.5,4)", None),
+            ("(1e3,2)", None),
+            ("(0x10,2)", None),
+            ("4,4", None),
+            ("(4,", None),
+            ("(3000000000,2)", None),
+        ];
+        for (reply, want) in pairs {
+            if parse_pair(reply) != want {
+                wrong.push(format!("pair {reply:?}: {:?}", parse_pair(reply)));
+            }
+        }
+        let areas = [
+            ("(0,0,3999,2670)", Some([0, 0, 4000, 2671])),
+            ("(0, 0, 9, 9) junk", Some([0, 0, 10, 10])),
+            ("(5,0,4,0)", Some([5, 0, 0, 1])),
+            ("(0,0,3999)", None),
+            // C's `right - minX + 1` overflows `int` on both.
+            ("(-2147483648,0,2147483647,0)", None),
+            ("(0,0,0,2147483647)", None),
+        ];
+        for (reply, want) in areas {
+            if parse_sub_area(reply) != want {
+                wrong.push(format!("area {reply:?}: {:?}", parse_sub_area(reply)));
+            }
+        }
+        let ints = [
+            ("1", Some(1)),
+            (" 7", Some(7)),
+            ("-1x", Some(-1)),
+            ("1.9", Some(1)),
+            ("x5", None),
+            ("True", None),
+            ("", None),
+        ];
+        for (reply, want) in ints {
+            if parse_int(reply) != want {
+                wrong.push(format!("int {reply:?}: {:?}", parse_int(reply)));
+            }
+        }
+        // `atoi` past `int` with a 32-bit `long` saturates at LONG_MAX.
+        let wide_cams = if std::ffi::c_long::BITS == 64 {
+            0
+        } else {
+            i32::MAX
+        };
+        let cams = [
+            ("2", 2),
+            (" 2", 2),
+            ("2.5", 2),
+            ("+3", 3),
+            ("[2]", 0),
+            ("abc", 0),
+            ("4294967298", wide_cams),
+        ];
+        for (reply, want) in cams {
+            if parse_cam_num(reply) != want {
+                wrong.push(format!("cams {reply:?}: {}", parse_cam_num(reply)));
+            }
+        }
+        let headers: [(&[u8], _); 8] = [
+            (b"I;16; 4;3;24;", Some((4, 3, 24, 13))),
+            (b"I;16;+4;3;24;", Some((4, 3, 24, 13))),
+            (b"L;2;\t2; 4;", Some((2, 2, 4, 10))),
+            (b"I;16;4;3;24;\x01", Some((4, 3, 24, 12))),
+            (b"I;16;4;3;24", None),
+            (b"I;16;4x;3;24;", None),
+            (b"I;16;-4;3;24;", None),
+            (b"I;16;4294967300;3;24;", None),
+        ];
+        for (reply, want) in headers {
+            let got = parse_image_header(reply)
+                .ok()
+                .map(|h| (h.width, h.height, h.data_len, h.header_len));
+            if got != want {
+                wrong.push(format!(
+                    "header {:?}: {got:?}",
+                    String::from_utf8_lossy(reply)
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
@@ -530,6 +642,22 @@ mod tests {
         assert_eq!(parse_exposure("(5000000, 'Microsec')").unwrap(), 5.0);
         assert_eq!(parse_exposure("(250, 'Millisec')").unwrap(), 0.25);
         assert_eq!(parse_exposure("(2, 'Sec')").unwrap(), 2.0);
+    }
+
+    /// glibc's `%f` cannot push back the `x` of `0x`, an exponent marker
+    /// with no digit after it, or the `i` of `infi`: the scan fails there.
+    #[test]
+    fn a_float_cut_short_fails_the_scan() {
+        assert_eq!(parse_gain("0x"), None);
+        assert_eq!(parse_gain("1.0E"), None);
+        assert_eq!(parse_gain("infi"), None);
+        assert_eq!(parse_gain("inf"), Some(f64::INFINITY));
+        assert_eq!(parse_gain("0x1p3"), Some(8.0));
+        assert_eq!(parse_exposure("(0x, 'Sec')"), None);
+        assert!(matches!(
+            parse_version("PSLViewer-5.0E"),
+            Err(ProtocolError::BadVersion(_))
+        ));
     }
 
     #[test]
@@ -599,7 +727,7 @@ mod tests {
         let h = parse_image_header(b"RGB;2;2;12;").unwrap();
         assert_eq!(h.color_mode, NDColorMode::RGB1);
         assert_eq!(h.dims(), vec![3, 2, 2]);
-        assert_eq!(h.expected_bytes(), 12);
+        assert_eq!(h.expected_bytes(), Some(12));
     }
 
     #[test]
@@ -644,6 +772,41 @@ mod tests {
         );
     }
 
+    /// 65536 x 65536 16-bit pixels are 2^33 bytes: a size mismatch with any
+    /// announced count on a 64-bit host, a bad header where `usize` is 32
+    /// bits and the product does not fit.
+    #[test]
+    fn parse_image_header_handles_a_geometry_past_u32_max() {
+        let reply = b"I;16;65536;65536;8;";
+        let h = ImageHeader {
+            data_type: NDDataType::UInt16,
+            color_mode: NDColorMode::Mono,
+            width: 65536,
+            height: 65536,
+            data_len: 8,
+            header_len: 19,
+        };
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(h.expected_bytes(), Some(1 << 33));
+            assert_eq!(
+                parse_image_header(reply),
+                Err(ProtocolError::ImageSizeMismatch {
+                    announced: 8,
+                    expected: 1 << 33,
+                })
+            );
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            assert_eq!(h.expected_bytes(), None);
+            assert_eq!(
+                parse_image_header(reply),
+                Err(ProtocolError::BadImageHeader)
+            );
+        }
+    }
+
     // --- commands ---------------------------------------------------------
 
     #[test]
@@ -651,7 +814,17 @@ mod tests {
         assert_eq!(open("multiconf"), "Open;multiconf");
         assert_eq!(select("cam1"), "Select;cam1");
         assert_eq!(set_binning(2, 4), "SetBinning;(2,4)");
-        assert_eq!(set_sub_area(10, 20, 100, 200), "SetSubArea;(10,20,109,219)");
+        assert_eq!(
+            set_sub_area(10, 20, 100, 200).as_deref(),
+            Some("SetSubArea;(10,20,109,219)")
+        );
+        // C's `minX+sizeX-1` overflows `int` on the first two.
+        assert_eq!(set_sub_area(2147483647, 0, 2, 1), None);
+        assert_eq!(set_sub_area(0, -2147483648, 1, -1), None);
+        assert_eq!(
+            set_sub_area(1, 0, 2147483647, 1).as_deref(),
+            Some("SetSubArea;(1,0,2147483647,0)")
+        );
         assert_eq!(set_fliplr(1), "SetFliplr;1");
         assert_eq!(set_flipud(0), "SetFlipud;0");
         assert_eq!(set_trigger_mode("Software"), "SetTriggerMode;Software");

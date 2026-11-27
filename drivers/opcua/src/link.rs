@@ -497,8 +497,8 @@ fn check_consistency(pinfo: &LinkInfo) -> Result<(), LinkError> {
     }
 
     // The C's other consistency check — `monitor=y` on a structure element whose
-    // item record is not monitored — needs the item, so it runs when the tree is
-    // wired (`item::check_element_monitor`).
+    // item record is not monitored — needs the item, so it runs when the element
+    // joins it (`registry::check_element_monitor`).
     Ok(())
 }
 

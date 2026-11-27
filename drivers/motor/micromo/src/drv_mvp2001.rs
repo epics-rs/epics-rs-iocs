@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::sleep;
 use std::time::Duration;
 
+use epics_libcom_rs::runtime::stdlib::strtoul;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{
     Model1Motor, MotorStatus, PidGainKind, PollFailure, PostMessage, RecordFields,
@@ -89,16 +90,13 @@ impl Mvp2001Chain {
     }
 }
 
-/// `strtoul(reply + 5, 16)` over at most `width` characters, 0 when none.
+/// C's `strtoul` of the at most `width` bytes `strncat` copies from
+/// `reply + 5`, 0 when none convert. A negated field, which C wraps from
+/// `unsigned long`, is 0 too.
 fn hex_at(reply: &str, width: usize) -> u32 {
-    let field = reply.get(5..).unwrap_or("");
-    let field = &field[..field.len().min(width)];
-    let digits: String = field
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_hexdigit)
-        .collect();
-    u32::from_str_radix(&digits, 16).unwrap_or(0)
+    let field = reply.as_bytes().get(5..).unwrap_or_default();
+    let value = strtoul(&field[..field.len().min(width)], 16).0;
+    u32::try_from(u128::from(value)).unwrap_or(0)
 }
 
 /// `motor_init`'s probe and set-up of one chain: the number of answering
@@ -471,6 +469,24 @@ mod tests {
         assert_eq!(hex_at("0001 FFFFFFF6", 8) as i32, -10);
         assert_eq!(hex_at("0001 00000010junk", 8), 16);
         assert_eq!(hex_at("", 8), 0);
+    }
+
+    /// drvMVP2001.cc:338-353 and :694-703 `strtoul` the `strncat`ed bytes.
+    #[test]
+    fn hex_fields_are_read_as_c_strtoul() {
+        assert_eq!(hex_at("0001 0x1F", 4), 0x1f);
+        assert_eq!(hex_at("0001 +10", 4), 0x10);
+        assert_eq!(hex_at("0001 \u{a0}5", 4), 0);
+        // A lossy-decoded bad byte straddles the field's end.
+        assert_eq!(hex_at("0001 800\u{fffd}", 4), 0x800);
+        // C wraps the negated `unsigned long` into the field; a 32-bit one
+        // fits it.
+        let negated = if std::ffi::c_ulong::BITS == 64 {
+            0
+        } else {
+            u32::MAX
+        };
+        assert_eq!(hex_at("0001 -1", 8), negated);
     }
 
     /// drvMVP2001.cc:675-720: a failed `motor_init` read stores the

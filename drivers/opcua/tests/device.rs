@@ -149,7 +149,6 @@ fn defined() -> ProcessContext {
         tse: 0,
         time: SystemTime::UNIX_EPOCH.into(),
         soft: None,
-        callback_priority: epics_rs::base::runtime::task::CallbackPriority::Low,
         scan: epics_rs::base::server::record::ScanType::Passive,
         proc_field: 0,
         tpro: 0,

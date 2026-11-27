@@ -37,6 +37,7 @@
 //! - `HOME_FOR`/`HOME_REV` both emit the same `ORG…/3/1` sequence as in C, so
 //!   the requested home direction does not change the command.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -44,9 +45,10 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{Model1Motor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::scanf::{ScanTarget, sscanf};
 
 use motor_common::model1::{MoveStrings, init_poll, init_read};
-use motor_common::util::{long_to_int, nint, strtol};
+use motor_common::util::nint;
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 160;
@@ -89,27 +91,18 @@ enum CommState {
 
 /// The model and version an IDN reply names: C's `sscanf(buff,
 /// "C\tIDN0\t<model>\t%d", &version) == 1` for 800, 400 and 200
-/// (drvSC800.cc:565-567), each `\t` taking any run of blanks, none included.
+/// (drvSC800.cc:565-567), the version read at 64 bits so that one C would
+/// wrap to `int` is refused.
 fn identify(reply: &str) -> AsynResult<(i32, i32)> {
-    fn literal<'a>(s: &'a [u8], lit: &str) -> Option<&'a [u8]> {
-        let blanks = s
-            .iter()
-            .take_while(|&&c| matches!(c, b' ' | b'\t'..=b'\r'))
-            .count();
-        s[blanks..].strip_prefix(lit.as_bytes())
-    }
-    let idn = reply
-        .as_bytes()
-        .strip_prefix(b"C")
-        .and_then(|s| literal(s, "IDN0"));
     [800, 400, 200]
         .into_iter()
-        .find_map(
-            |model| match strtol(literal(idn?, &model.to_string())?, 10) {
-                (_, 0) => None,
-                (version, _) => Some((model, long_to_int(version))),
-            },
-        )
+        .find_map(|model| {
+            let version = Cell::new(0i64);
+            let fmt = format!("C\tIDN0\t{model}\t%lld");
+            (sscanf(reply, fmt.as_str(), &[&version]) == 1)
+                .then(|| Some((model, i32::try_from(version.get()).ok()?)))
+                .flatten()
+        })
         .ok_or_else(|| kohzu_err(format!("SC800: unrecognized IDN reply '{reply}'")))
 }
 
@@ -183,18 +176,18 @@ impl KohzuController {
 }
 
 /// C's `sscanf(buff, "C\tSTR%d\t1\t%d\t%d\t%d\t%d\t%d\t%d\t%d", ..) == 8`:
-/// the move, norg, orgg, cw, ccw, swng and err fields, each a whitespace
-/// directive apart as scanf reads `\t`.
+/// the move, norg, orgg, cw, ccw, swng and err fields, read at 64 bits so
+/// that a field C would wrap to `int` is `None`.
 fn parse_str(reply: &str) -> Option<[i32; 7]> {
-    let rest = reply.strip_prefix('C')?.trim_start().strip_prefix("STR")?;
-    let mut words = rest.split_whitespace();
-    words.next()?.parse::<i32>().ok()?;
-    if words.next()? != "1" {
+    let scanned: [Cell<i64>; 8] = Default::default();
+    let targets = scanned.each_ref().map(|c| c as &dyn ScanTarget);
+    let fmt = "C\tSTR%lld\t1\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld";
+    if sscanf(reply, fmt, &targets) != 8 {
         return None;
     }
     let mut fields = [0; 7];
-    for f in &mut fields {
-        *f = words.next()?.parse().ok()?;
+    for (f, c) in fields.iter_mut().zip(&scanned[1..]) {
+        *f = i32::try_from(c.get()).ok()?;
     }
     Some(fields)
 }
@@ -474,12 +467,15 @@ impl KohzuAxis {
         let minus_ls = sf[4] == 1; // ccw limit
         let done = str_move == 0;
 
-        // Position: "C\tRDP<a>\t<position>"
+        // Position: "C\tRDP<a>\t<position>". Where C reads an unset
+        // `motorData` (:261), the last position stands.
         let position = pos_reply
             .ok()
             .and_then(|r| {
-                let f: Vec<&str> = r.split('\t').collect();
-                f.get(2).and_then(|s| s.trim().parse::<i32>().ok())
+                let [axis, pos] = [0i64; 2].map(Cell::new);
+                (sscanf(r, "C\tRDP%lld\t%lld", &[&axis, &pos]) == 2)
+                    .then(|| i32::try_from(pos.get()).ok())
+                    .flatten()
             })
             .unwrap_or(self.prev_position);
         let direction = cdir.unwrap_or(if position != self.prev_position {
@@ -489,15 +485,13 @@ impl KohzuAxis {
         });
         self.prev_position = position;
 
-        // Torque: "C\tRSY<a>\t21\t<torque>" (0 = enabled).
-        let powered = torque_reply
-            .ok()
-            .and_then(|r| {
-                let f: Vec<&str> = r.split('\t').collect();
-                f.get(3).and_then(|s| s.trim().parse::<i32>().ok())
-            })
-            .map(|v| v == 0)
-            .unwrap_or(false);
+        // Torque: "C\tRSY<a>\t21\t<torque>" (0 = enabled), scanned over
+        // C's `str_move` (:290), so an unread reply leaves STR's move flag.
+        let torque = Cell::new(i64::from(str_move));
+        if let Ok(r) = &torque_reply {
+            sscanf(r, "C\tRSY%lld\t21\t%lld", &[&Cell::new(0i64), &torque]);
+        }
+        let powered = torque.get() == 0;
 
         // drvSC800.cc:325-332, reading the reply C leaves for the next
         // command's flush.
@@ -608,6 +602,8 @@ mod tests {
         );
         assert!(ident("kohzuIdnText", "C\tIDN0\t200\tVer1").is_err());
         assert!(ident("kohzuIdnLead", " C\tIDN0\t200\t1").is_err());
+        // C's `(int)` keeps the low 32 bits, Ver1.
+        assert!(ident("kohzuIdnWrap", "C\tIDN0\t800\t4294967297").is_err());
     }
 
     fn post(text: &[u8]) -> PostMessage {
@@ -834,5 +830,57 @@ mod tests {
         assert_eq!(parse_str("C\tSTR1\t2\t1\t0\t0\t1\t0\t0\t2"), None);
         assert_eq!(parse_str("C\tSTR1\t1\t1\t0\t0\t1\t0\t0"), None);
         assert_eq!(parse_str("C\tSTR1\t1\tx\t0\t0\t1\t0\t0\t2"), None);
+        // `%d` reads a prefix; a no-break space is no C blank.
+        assert_eq!(
+            parse_str("C\tSTR1\t1\t1\t0\t0\t1\t0\t0\t2x"),
+            Some([1, 0, 0, 1, 0, 0, 2])
+        );
+        assert_eq!(parse_str("C\tSTR1\t1\t1\t0\t0\t1\t0\t0\u{a0}2"), None);
+        assert_eq!(parse_str("C\tSTR1\t1\t1\t0\t0\t1\t0\t0\t3000000000"), None);
+    }
+
+    /// One poll of an SC-200's axis 1 whose STR, RDP and RSY replies are
+    /// `replies`.
+    fn poll_replies(name: &str, replies: [&'static str; 3]) -> MotorStatus {
+        let (_line, io) = LineRig::new(name, move |last| match last.trim_start_matches('\u{2}') {
+            "IDN" => "C\tIDN0\t200\t1".into(),
+            "STR1/1" => replies[0].into(),
+            "RDP1/0" => replies[1].into(),
+            "RSY1/21" => replies[2].into(),
+            c => format!("C\t{c}"),
+        });
+        let ctrl = KohzuController::new(io).unwrap();
+        KohzuAxis::new(Arc::new(Mutex::new(ctrl)), 0)
+            .polled(&AsynUser::default())
+            .unwrap()
+    }
+
+    const STR_IDLE: &str = "C\tSTR1\t1\t0\t0\t0\t0\t0\t0\t0";
+
+    /// drvSC800.cc:261 and :290 scan `C\tRDP%d\t%d` and
+    /// `C\tRSY%d\t21\t%d`: a `\t` takes any blank run, `%d` a prefix.
+    #[test]
+    fn rdp_and_rsy_are_scanned_as_c_sscanf() {
+        let s = poll_replies("sc800RdpRsy", [STR_IDLE, "C RDP1 1234x", "C RSY1 21 0"]);
+        assert_eq!((s.position(), s.powered), (1234.0, true));
+        let s = poll_replies("sc800RsyOff", [STR_IDLE, "C\tRDP1\t-5", "C\tRSY1\t21\t1"]);
+        assert_eq!((s.position(), s.powered), (-5.0, false));
+    }
+
+    /// drvSC800.cc:290 scans the torque into `str_move`, so an RSY reply it
+    /// cannot read leaves STR's move flag there.
+    #[test]
+    fn an_unread_rsy_leaves_the_str_move_flag() {
+        let idle = poll_replies("sc800RsyIdle", [STR_IDLE, "C\tRDP1\t0", "C\tRSY1\t21"]);
+        assert!(idle.powered);
+        let moving = poll_replies(
+            "sc800RsyMoving",
+            [
+                "C\tSTR1\t1\t1\t0\t0\t0\t0\t0\t0",
+                "C\tRDP1\t0",
+                "C\tRSY1\t22\t0",
+            ],
+        );
+        assert!(!moving.powered);
     }
 }

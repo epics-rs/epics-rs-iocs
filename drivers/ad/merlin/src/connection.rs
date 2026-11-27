@@ -295,12 +295,9 @@ impl MpxConnection {
         Ok(())
     }
 
-    /// `GET <name>` parsed as a float, or `None` if the device refused.
+    /// `GET <name>` read with C `atof`, or `None` if the device refused.
     pub fn get_f64(&self, ad: &mut ADDriverBase, name: &str, timeout: Duration) -> Option<f64> {
-        match self.get(ad, name, timeout) {
-            Ok(v) => v.trim().parse().ok(),
-            Err(_) => None,
-        }
+        self.get(ad, name, timeout).ok().map(|v| protocol::atof(&v))
     }
 
     /// `GET <name>` read with C `atoi`, or `None` if the device refused.
@@ -334,6 +331,7 @@ mod is_timeout_tests {
     /// sends, each read takes what is queued, up to its buffer.
     struct Mpx {
         base: epics_rs::asyn::port::PortDriverBase,
+        reply: &'static str,
         queued: Vec<u8>,
     }
 
@@ -349,9 +347,8 @@ mod is_timeout_tests {
             _user: &mut AsynUser,
             data: &[u8],
         ) -> epics_rs::asyn::error::AsynResult<usize> {
-            let body = b"GET,X,1,0";
-            self.queued = format!("MPX,{:010},", body.len() + 1).into_bytes();
-            self.queued.extend_from_slice(body);
+            let body = self.reply;
+            self.queued = format!("MPX,{:010},{body}", body.len() + 1).into_bytes();
             Ok(data.len())
         }
         fn io_read_octet(
@@ -389,6 +386,7 @@ mod is_timeout_tests {
                     InterfaceMask::OCTET_TRANSPORT,
                     InterfaceMask::OCTET,
                 ),
+                reply: "GET,X,1,0",
                 queued: Vec::new(),
             },
             RuntimeConfig::default(),
@@ -435,6 +433,69 @@ mod is_timeout_tests {
         assert!(text.contains("asynOctetSyncIO wrote:\nMPX,"), "{text}");
         assert!(text.contains("asynOctetSyncIO read:\nMPX\n"), "{text}");
         std::mem::forget(rt);
+    }
+
+    /// C sets every float readback from a successful GET with `atof`
+    /// (merlinDetector.cpp:783-834), so an empty value reads 0 and a number
+    /// with a tail reads the number; only a refused GET sets nothing.
+    #[test]
+    fn a_float_get_reads_its_value_with_atof() {
+        use epics_rs::asyn::port::{InterfaceMask, PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        for (i, (reply, want)) in [
+            ("GET,X,,0", Some(0.0)),
+            ("GET,X,12.5ms,0", Some(12.5)),
+            ("GET,X,12.5,1", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("MERLIN_ATOF_{i}");
+            let (rt, _) = create_port_runtime(
+                &claim_port(&name).unwrap(),
+                Mpx {
+                    base: PortDriverBase::new(
+                        &name,
+                        1,
+                        Default::default(),
+                        InterfaceMask::OCTET_TRANSPORT,
+                        InterfaceMask::OCTET,
+                    ),
+                    reply,
+                    queued: Vec::new(),
+                },
+                RuntimeConfig::default(),
+            )
+            .unwrap();
+            let conn = MpxConnection::new(
+                SyncIOHandle::from_handle(
+                    rt.port_handle().clone(),
+                    0,
+                    Duration::ZERO,
+                    InterfaceType::Octet,
+                )
+                .unwrap(),
+                1 << 20,
+            );
+            let mut ad = ADDriverBase::new(
+                &format!("{name}_DET"),
+                1,
+                1 << 20,
+                PortFlags::default(),
+                InterfaceMask::OCTET,
+                InterfaceMask::OCTET,
+            )
+            .unwrap();
+            assert_eq!(
+                conn.get_f64(&mut ad, "X", Duration::from_secs(1)),
+                want,
+                "{reply}"
+            );
+            std::mem::forget(rt);
+        }
     }
 
     #[test]

@@ -9,18 +9,15 @@
 //! every command and splits replies on `\n`. The strings below carry no
 //! terminator.
 
+use std::cell::Cell;
+
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 // ---------------------------------------------------------------------------
 // scanf-style primitives
 // ---------------------------------------------------------------------------
-
-/// Skip the characters a `' '` directive (and the implicit skip before `%d`)
-/// consumes in a scanf format.
-fn skip_ws(s: &str) -> &str {
-    s.trim_start_matches(|c: char| c.is_ascii_whitespace())
-}
 
 /// Match a literal that a scanf format matches verbatim (no whitespace skip).
 fn expect_lit<'a>(s: &'a str, lit: &str) -> Option<&'a str> {
@@ -33,22 +30,6 @@ fn scan_i32(s: &str) -> Option<(i32, &str)> {
         (_, 0) => None,
         (v, end) => Some((long_to_int(v), &s[end..])),
     }
-}
-
-/// `%lf`: skip leading whitespace, then read the longest prefix `strtod` would
-/// accept, backtracking on a trailing exponent marker the way `strtod` does.
-fn scan_f64(s: &str) -> Option<(f64, &str)> {
-    let s = skip_ws(s);
-    let candidate_len = s
-        .bytes()
-        .take_while(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'))
-        .count();
-    for end in (1..=candidate_len).rev() {
-        if let Ok(v) = s[..end].parse::<f64>() {
-            return Some((v, &s[end..]));
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +210,8 @@ pub fn parse_pair(reply: &str) -> Option<(i32, i32)> {
 
 /// C `sscanf(fromServer, "%lf", &value)`. `None` when no float converts.
 pub fn parse_f64(reply: &str) -> Option<f64> {
-    scan_f64(reply).map(|(v, _)| v)
+    let value = Cell::new(0f64);
+    (sscanf(reply.as_bytes(), "%lf", &[&value]) == 1).then(|| value.get())
 }
 
 #[cfg(test)]
@@ -402,6 +384,18 @@ mod tests {
         assert_eq!(parse_f64("0.5"), Some(0.5));
         assert_eq!(parse_f64("  1.25 "), Some(1.25));
         assert_eq!(parse_f64("-3.0 C"), Some(-3.0));
-        assert_eq!(parse_f64("nan-ish"), None);
+        assert!(parse_f64("nan-ish").unwrap().is_nan());
+        assert_eq!(parse_f64("ok"), None);
+    }
+
+    /// glibc's `%lf` cannot push back the `x` of `0x`, an exponent marker
+    /// with no digit after it, or the `i` of `infi`: the scan fails there.
+    #[test]
+    fn a_float_cut_short_fails_the_scan() {
+        assert_eq!(parse_f64("0x"), None);
+        assert_eq!(parse_f64("1.0E"), None);
+        assert_eq!(parse_f64("infi"), None);
+        assert_eq!(parse_f64("inf"), Some(f64::INFINITY));
+        assert_eq!(parse_f64("0x1p3"), Some(8.0));
     }
 }

@@ -14,14 +14,13 @@ use std::time::Duration;
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port::QueuePriority;
-use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
 use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
-use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
 };
@@ -32,6 +31,7 @@ use epics_rs::base::types::EpicsValue;
 
 use crate::scan::Scan;
 use crate::user_param::c_str;
+use crate::{Reentry, Refused};
 use protocol::Command;
 
 /// `device(ai|bi,INST_IO,dev<Type>Televac,"asyn Televac")` (`ipSupport.dbd`).
@@ -84,8 +84,7 @@ struct Job {
     command: Command,
     handle: PortHandle,
     exchange: Mutex<Exchange>,
-    /// The record's completion and band.
-    reentry: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+    reentry: Reentry,
 }
 
 impl Job {
@@ -146,6 +145,8 @@ impl CellBody for Job {
                 String::from_utf8_lossy(&ex.rec_buf)
             ),
         );
+        drop(ex);
+        self.reentry.end();
     }
 
     /// No `timeoutUser`, so only a port shutting down with the request queued
@@ -154,15 +155,12 @@ impl CellBody for Job {
         let mut ex = self.exchange.lock().unwrap();
         ex.rec_buf.clear();
         ex.alarm = true;
+        drop(ex);
+        self.reentry.end();
     }
 
-    /// `dbScanLock(pr); prset->process(pr)` at the end of the callback.
-    fn done(self: Arc<Self>) {
-        let armed = self.reentry.lock().unwrap().clone();
-        if let Some((done, prio)) = armed {
-            let _ = done.reprocess(prio);
-        }
-    }
+    /// `process` and `unrun` end the pass.
+    fn done(self: Arc<Self>) {}
 
     /// `createAsynUser(devTelevacCallback, 0)` (`devTelevac.c:117`).
     fn timeout_user(&self) -> bool {
@@ -215,15 +213,12 @@ impl DevTelevac {
         );
     }
 
-    /// The `pact == 0` half of `readAi` / `readBi`, then `startIOCommon`. The
-    /// wrong-type arm still queues its empty `sendBuf`, as C does; a refused
-    /// `queueRequest` returns -1 with PACT already set, so the record stays
-    /// active.
-    fn start(&mut self, done: &DeviceDoneSource<'_>) {
+    /// The `pact == 0` half of `readAi` / `readBi`, then `startIOCommon`, or
+    /// `None` with no port. The wrong-type arm still queues its empty
+    /// `sendBuf`, as C does.
+    fn start(&mut self, done: &DeviceDoneSource<'_>) -> Option<Result<QueueOutcome, Refused>> {
         self.alarm = false;
-        let Some(live) = self.live.as_ref() else {
-            return;
-        };
+        let live = self.live.as_ref()?;
         let send = live
             .job
             .command
@@ -244,17 +239,18 @@ impl DevTelevac {
             ),
         );
         live.job.exchange.lock().unwrap().send = send;
-        {
-            let mut slot = live.job.reentry.lock().unwrap();
-            match &mut *slot {
-                Some((_, prio)) => *prio = done.priority(),
-                None => *slot = Some((done.device_done(), done.priority())),
-            }
-        }
         let user = AsynUser::new(0)
             .with_addr(ADDR)
             .with_priority(QueuePriority::Low);
-        let _ = live.job.handle.queue_request(&live.cell, &user);
+        Some(
+            live.job
+                .reentry
+                .queue(&live.job.handle, &live.cell, &user, done, false),
+        )
+    }
+
+    fn refused(&self) -> Option<Refused> {
+        self.live.as_ref().and_then(|l| l.job.reentry.refused())
     }
 }
 
@@ -331,7 +327,7 @@ impl DeviceSupport for DevTelevac {
             command,
             handle: handle.clone(),
             exchange: Mutex::new(Exchange::default()),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let cell = handle.new_cell(job.clone());
         self.live = Some(Live {
@@ -347,11 +343,13 @@ impl DeviceSupport for DevTelevac {
         _record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        if done.pact() || self.live.is_none() {
+        if done.pact() {
             return Ok(ReadStart::Synchronous);
         }
-        self.start(done);
-        Ok(ReadStart::Pending)
+        Ok(match self.start(done) {
+            Some(Ok(QueueOutcome::Queued)) => ReadStart::Pending,
+            Some(Ok(QueueOutcome::Ran) | Err(_)) | None => ReadStart::Synchronous,
+        })
     }
 
     /// C `TelevacConvert`, devAiTelevac's slot; devBiTelevac has none.
@@ -369,6 +367,9 @@ impl DeviceSupport for DevTelevac {
         let Some(live) = self.live.as_ref() else {
             return Ok(DeviceReadOutcome::ok());
         };
+        if live.job.reentry.refused().is_some() {
+            return Ok(DeviceReadOutcome::failed());
+        }
         let rec_buf = {
             let mut ex = live.job.exchange.lock().unwrap();
             self.alarm = std::mem::take(&mut ex.alarm);
@@ -395,6 +396,9 @@ impl DeviceSupport for DevTelevac {
     }
 
     fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        if let Some(refused) = self.refused() {
+            return Some(refused.alarm());
+        }
         self.alarm.then_some(DeviceAlarm {
             stat: READ_ALARM,
             sevr: AlarmSeverity::Invalid as u16,
@@ -431,7 +435,7 @@ mod tests {
             command,
             handle: handle.clone(),
             exchange: Mutex::new(Exchange::default()),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let mut dev = DevTelevac::new(ai, "");
         dev.live = Some(Live {

@@ -21,15 +21,14 @@ use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::QueuePriority;
-use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
 use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
-use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
 };
@@ -38,7 +37,7 @@ use epics_rs::base::server::recgbl::alarm_status::READ_ALARM;
 use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
-use crate::Unconnected;
+use crate::{Reentry, Unconnected};
 use protocol::{GaugeType, Reading};
 
 /// `device(ai,INST_IO,devAiMKS,"HPS SensaVac 937")` (`ipSupport.dbd`).
@@ -95,28 +94,6 @@ fn write_read_once(port: &str, data: &[u8]) -> (Vec<u8>, bool) {
     (reply, status.is_ok())
 }
 
-/// The pass a queued request's callback re-enters — C's `dbScanLock(pai);
-/// prset->process(pai)` at the end of `callbackAi`.
-#[derive(Default)]
-struct Reentry(Mutex<Option<(DeviceDone, CallbackPriority)>>);
-
-impl Reentry {
-    fn arm(&self, done: &DeviceDoneSource<'_>) {
-        let mut slot = self.0.lock().unwrap();
-        match &mut *slot {
-            Some((_, prio)) => *prio = done.priority(),
-            None => *slot = Some((done.device_done(), done.priority())),
-        }
-    }
-
-    fn reprocess(&self) {
-        let armed = self.0.lock().unwrap().clone();
-        if let Some((done, prio)) = armed {
-            let _ = done.reprocess(prio);
-        }
-    }
-}
-
 /// The queued request's body — C `callbackAi`'s I/O half.
 struct Job {
     name: String,
@@ -158,17 +135,19 @@ impl CellBody for Job {
             ),
         );
         *self.reply.lock().unwrap() = ok.then_some(data);
+        // `dbScanLock(pai); prset->process(pai)` at the end of `callbackAi`.
+        self.reentry.end();
     }
 
     /// No `timeoutUser`, so only a port shutting down with the request queued
     /// lands here; the pass reads it as a failed read.
     fn unrun(&self, _why: Unrun) {
         *self.reply.lock().unwrap() = None;
+        self.reentry.end();
     }
 
-    fn done(self: Arc<Self>) {
-        self.reentry.reprocess();
-    }
+    /// `process` and `unrun` end the pass.
+    fn done(self: Arc<Self>) {}
 
     /// `createAsynUser(callbackAi, 0)` (`devAiMKS.c:118`).
     fn timeout_user(&self) -> bool {
@@ -179,7 +158,7 @@ impl CellBody for Job {
 struct Live {
     job: Arc<Job>,
     cell: Arc<RequestCell>,
-    /// Whether this cycle's request was queued, so `read` has a reply.
+    /// Whether this cycle's request was queued or ran, so `read` has a reply.
     queued: bool,
 }
 
@@ -379,16 +358,18 @@ impl DeviceSupport for DevAiMks {
         let Some(live) = self.live.as_mut().filter(|_| !done.pact()) else {
             return Ok(ReadStart::Synchronous);
         };
-        live.job.reentry.arm(done);
         let user = AsynUser::new(0)
             .with_addr(ADDR)
             .with_timeout(TIMEOUT)
             .with_priority(QueuePriority::Low);
-        live.queued = live.job.handle.queue_request(&live.cell, &user).is_ok();
-        Ok(if live.queued {
-            ReadStart::Pending
-        } else {
-            ReadStart::Synchronous
+        let outcome = live
+            .job
+            .reentry
+            .queue(&live.job.handle, &live.cell, &user, done, false);
+        live.queued = outcome.is_ok();
+        Ok(match outcome {
+            Ok(QueueOutcome::Queued) => ReadStart::Pending,
+            Ok(QueueOutcome::Ran) | Err(_) => ReadStart::Synchronous,
         })
     }
 

@@ -471,6 +471,11 @@ impl AsynMotor for PmacAxis {
     fn poll(&mut self, _user: &AsynUser, out: &mut MotorStatus) -> AsynResult<()> {
         let axis = self.axis;
         let mut controller = lock(&self.controller);
+        if !controller.connected() {
+            // C returns before callParamCallbacks (pmacAxis.cpp:428-431).
+            out.comms_error = true;
+            return Err(pmac_err("no low level asynOctetSyncIO port"));
+        }
         let config = controller.axis_config(axis);
         let controller_problem = controller.controller_problem();
         let print_errors = self.throttle.print_errors();
@@ -489,17 +494,14 @@ impl AsynMotor for PmacAxis {
         let (response, read) = controller.exchange(&query);
         let parsed = read.is_ok().then(|| parse_axis_status(&response)).flatten();
         let Some((status1, status2, first, second)) = parsed else {
-            // C's poll returns before the read with no low-level user.
-            if controller.connected() {
-                let status = read.as_ref().map_or_else(|e| e.c_status_code(), |()| 0);
-                controller.trace().print_self(
-                    TraceMask::ERROR,
-                    format_args!(
-                        "drvPmacAxisGetStatus: not all status values returned. Status: \
-                         {status}\nCommand :{query}\nResponse:{response}"
-                    ),
-                );
-            }
+            let status = read.as_ref().map_or_else(|e| e.c_status_code(), |()| 0);
+            controller.trace().print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "drvPmacAxisGetStatus: not all status values returned. Status: \
+                     {status}\nCommand :{query}\nResponse:{response}"
+                ),
+            );
             // C keeps every status parameter but the power-on bit, which it
             // reads from the zeroed status words, and returns success
             // (pmacAxis.cpp:494-498, 606-613).
@@ -683,6 +685,29 @@ mod tests {
         fail.store(true, Ordering::SeqCst);
         axis.poll(&user, &mut status).unwrap();
         assert!(!status.done && !status.powered);
+    }
+
+    /// pmacAxis.cpp:428-431: without a low-level port the poll fails with
+    /// COMM_ERR raised and the rest of the status as it was.
+    #[test]
+    fn a_poll_without_a_low_level_port_raises_comm_err() {
+        let controller = PmacController::new("pmacNoLowPoll", "pmacNoLowPollLow", 0, None);
+        let mut axis = PmacAxis::new(Arc::new(Mutex::new(controller)), 1);
+        let user = AsynUser::new(0).with_addr(1);
+        let before = MotorStatus {
+            done: true,
+            powered: true,
+            ..MotorStatus::default()
+        };
+        let mut status = before.clone();
+        assert!(axis.poll(&user, &mut status).is_err());
+        assert_eq!(
+            status,
+            MotorStatus {
+                comms_error: true,
+                ..before
+            }
+        );
     }
 
     /// pmacAxis.cpp:148: the constructor sets GAIN_SUPPORT on a real axis

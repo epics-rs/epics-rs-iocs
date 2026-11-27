@@ -3590,6 +3590,45 @@ mod xps_profile_tests {
         );
     }
 
+    /// readbackProfile scans the numInBuffer lines it asked for
+    /// (XPSController.cpp:1264): a blank one fails, one past them is not read.
+    #[test]
+    fn readback_profile_reads_the_lines_it_asked_for() {
+        for (name, buffer, status, message) in [
+            (
+                "XpsProfBlank",
+                "0,1;1.5;2;2.25\n\n2;2.5;3;3.5",
+                epics_rs::motor::controller_port::PROFILE_STATUS_FAILURE,
+                "Error reading Gathering.dat file, nitems=-1, should be 2",
+            ),
+            (
+                "XpsProfExtra",
+                "0,1;1.5;2;2.25\n2;2.5;3;3.5\n\nx",
+                PROFILE_STATUS_SUCCESS,
+                "",
+            ),
+        ] {
+            let rig = rig(name);
+            rig.int(index::PROFILE_NUM_PULSES, 0, 2);
+            rig.line
+                .replies
+                .lock()
+                .unwrap()
+                .insert("GatheringDataMultipleLinesGet", buffer.into());
+            rig.int(index::PROFILE_READBACK, 0, 1);
+            assert_eq!(
+                rig.read_int(index::PROFILE_READBACK_STATUS),
+                status,
+                "{name}"
+            );
+            assert_eq!(
+                rig.message(index::PROFILE_READBACK_MESSAGE),
+                message,
+                "{name}"
+            );
+        }
+    }
+
     /// XPSController.cpp:642-648: a trajectory file that cannot be created
     /// fails the build with C's message.
     #[test]

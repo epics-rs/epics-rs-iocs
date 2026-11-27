@@ -5,11 +5,12 @@
 //! [`ConfigFields`]/[`ScaFields`], these functions only build/parse the
 //! wire strings.
 
+use std::cell::Cell;
 use std::fmt::Write as _;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::asyn::drivers::option_parse::sscanf_int;
-use epics_rs::base::runtime::stdlib::strtod;
 
 use crate::status::DppType;
 
@@ -166,9 +167,9 @@ fn parse_config_double(cfg: &str, key: &str) -> Result<f64, String> {
     if rest.starts_with("OFF") {
         return Ok(0.0);
     }
-    let parsed = strtod(rest.as_bytes());
-    if parsed.len > 0 {
-        Ok(parsed.value)
+    let value = Cell::new(0.0);
+    if sscanf(rest, "%lf", &[&value]) == 1 {
+        Ok(value.get())
     } else {
         Err(value_not_found(key, "parseConfigDouble"))
     }
@@ -421,6 +422,26 @@ mod tests {
         assert_eq!(parse_config_double("GAIN=.;", "GAIN=").ok(), None);
         assert_eq!(parse_config_int("MCAC= 12.5;", "MCAC=").ok(), Some(12));
         assert_eq!(parse_config_int("MCAC=x;", "MCAC=").ok(), None);
+    }
+
+    /// `sscanf(pos, "%lf")` (`drvAmptek.cpp:680`) converts nothing from a
+    /// float glibc reads only part of, so the field is an error.
+    #[test]
+    fn parse_configuration_fails_a_float_cut_short() {
+        let (parsed, errors) =
+            parse_configuration("TPEA=0x;GAIN=1.0E;THSL=infi;THFA=0x1p4;", DppType::Dp5);
+        assert_eq!(
+            (
+                parsed.peaking_time,
+                parsed.gain,
+                parsed.slow_threshold,
+                parsed.fast_threshold
+            ),
+            (None, None, None, Some(16.0))
+        );
+        assert!(errors.contains(
+            &"drvAmptek::parseConfigDouble value for GAIN= not found in configuration".into()
+        ));
     }
 
     /// C's two error prints (`drvAmptek.cpp:671-684,744-746`).

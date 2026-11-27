@@ -162,10 +162,9 @@ impl URLRuntime {
 ///
 /// `max_memory` is C++ `URLDriverConfig`'s `maxMemory` argument. C++'s
 /// `maxBuffers`/`priority`/`stackSize` arguments have no equivalent in this
-/// framework (`ADDriverBase::new` takes only a byte budget, and the
-/// acquisition task always runs on its own `rt::run_thread_named` OS thread
-/// at default priority/stack size) — accepted but unused, same framework
-/// limitation as the rest of this workspace's AD ports (e.g. d435i).
+/// framework: `ADDriverBase::new` takes only a byte budget, and C gives
+/// `priority`/`stackSize` to the asyn port thread, which the runtime
+/// schedules itself.
 pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<URLRuntime> {
     let port_name = claim.name();
     let (acq_tx, acq_rx) = rt::command_channel::<AcqCommand>(16);

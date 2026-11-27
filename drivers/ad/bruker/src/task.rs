@@ -55,11 +55,23 @@ pub(crate) struct StatusContext {
 }
 
 pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("BISDetTask", move || acquisition_loop(ctx))
+    // As C creates it (BISDetector.cpp:781-785).
+    rt::run_thread_named(
+        "BISDetTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || acquisition_loop(ctx),
+    )
 }
 
 pub(crate) fn start_status_task(ctx: StatusContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("BISStatusTask", move || status_loop(ctx))
+    // As C creates it (BISDetector.cpp:793-797).
+    rt::run_thread_named(
+        "BISStatusTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || status_loop(ctx),
+    )
 }
 
 /// Why an acquisition ended before it had taken every frame.

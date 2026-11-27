@@ -662,18 +662,23 @@ impl Task {
 /// driver call made next lands after its first pass.
 pub(crate) fn start_task(w: Worker) -> std::thread::JoinHandle<()> {
     let (held, holding) = std::sync::mpsc::sync_channel(1);
-    let task = rt::run_thread_named("specsAnalyserTask", move || async move {
-        let hold = w.self_handle.hold_driver_blocking().ok();
-        let _ = held.send(());
-        Task {
-            w,
-            hold,
-            last_status_ok: true,
-            l: Locals::C,
-        }
-        .run()
-        .await
-    });
+    let task = rt::run_thread_named(
+        "specsAnalyserTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || async move {
+            let hold = w.self_handle.hold_driver_blocking().ok();
+            let _ = held.send(());
+            Task {
+                w,
+                hold,
+                last_status_ok: true,
+                l: Locals::C,
+            }
+            .run()
+            .await
+        },
+    );
     let _ = holding.recv();
     task
 }

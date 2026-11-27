@@ -216,8 +216,14 @@ pub fn format_c_int(format: &str, value: i32) -> Result<String, String> {
 /// C's `sscanf(text, "%lf", &v)`, glibc's scan: `None` when the conversion
 /// fails.
 pub fn scan_f64(text: &str) -> Option<f64> {
-    let v = std::cell::Cell::new(0f64);
-    (epics_libcom_rs::runtime::scanf::sscanf(text, "%lf", &[&v]) == 1).then(|| v.get())
+    scan_f64_prefix(text.as_bytes()).map(|(v, _)| v)
+}
+
+/// [`scan_f64`] with a trailing `%n`: the value and the bytes it read.
+pub fn scan_f64_prefix(text: &[u8]) -> Option<(f64, usize)> {
+    let (v, n) = (std::cell::Cell::new(0f64), std::cell::Cell::new(0i32));
+    (epics_libcom_rs::runtime::scanf::sscanf(text, "%lf%n", &[&v, &n]) == 1)
+        .then(|| (v.get(), n.get() as usize))
 }
 
 #[cfg(test)]

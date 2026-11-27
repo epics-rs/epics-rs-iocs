@@ -129,7 +129,13 @@ pub(crate) struct DataContext {
 }
 
 pub(crate) fn start_data_task(ctx: DataContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PixiradDataTask", move || data_loop(ctx))
+    // As C creates it (pixirad.cpp:671-674).
+    rt::run_thread_named(
+        "PixiradDataTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || data_loop(ctx),
+    )
 }
 
 /// The image being built out of one frame per colour.
@@ -273,12 +279,20 @@ async fn data_loop(ctx: DataContext) {
                 0,
                 ParamValue::Int32(images_taken),
             ));
+            // C moves the port's stamp for every finished image, published
+            // or not (pixirad.cpp:1063-1064).
+            let epics_ts: EpicsTimestamp = ctx
+                .handle
+                .update_time_stamp()
+                .await
+                .unwrap_or_else(|_| std::time::SystemTime::now())
+                .into();
             if sync
                 .read_int32(ctx.ad_params.base.array_callbacks)
                 .unwrap_or(1)
                 != 0
             {
-                publish(&ctx, array, colors, unique_id).await;
+                publish(&ctx, array, colors, unique_id, epics_ts).await;
             }
             if images_taken >= sync.read_int32(ctx.ad_params.num_images).unwrap_or(1) {
                 updates.push(ParamSetValue::new(
@@ -304,7 +318,13 @@ async fn data_loop(ctx: DataContext) {
     }
 }
 
-async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, unique_id: i32) {
+async fn publish(
+    ctx: &DataContext,
+    mut array: DriverArray,
+    colors: usize,
+    unique_id: i32,
+    epics_ts: EpicsTimestamp,
+) {
     let ts = array.timestamp;
 
     let mut attributes = NDAttributeList::new();
@@ -318,14 +338,7 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
 
     let mut frame = array.fill();
     frame.set_unique_id(unique_id);
-    // C: timeStamp is the first colour's startTime, epicsTS the port's
-    // updateTimeStamp (pixirad.cpp:1063-1064).
-    let epics_ts: EpicsTimestamp = ctx
-        .handle
-        .update_time_stamp()
-        .await
-        .unwrap_or_else(|_| std::time::SystemTime::now())
-        .into();
+    // C: timeStamp is the first colour's startTime, epicsTS the port's.
     frame.set_timestamp(epics_ts);
     frame.set_time_stamp(ts.as_f64());
     *frame.attributes_mut() = attributes;
@@ -359,14 +372,20 @@ pub(crate) fn start_status_task(
     status_port: u16,
     ctx: StatusContext,
 ) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PixiradStatusTask", move || async move {
-        match udp::bind_status_socket(status_port) {
-            Ok(socket) => status_loop(socket, ctx).await,
-            // C returns here still holding the port lock, which wedges the
-            // port; only the task stops.
-            Err(e) => ctx.trace_error(&format!("pixirad:statusTask: {e}\n")),
-        }
-    })
+    // As C creates it (pixirad.cpp:665-668).
+    rt::run_thread_named(
+        "PixiradStatusTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || async move {
+            match udp::bind_status_socket(status_port) {
+                Ok(socket) => status_loop(socket, ctx).await,
+                // C returns here still holding the port lock, which wedges the
+                // port; only the task stops.
+                Err(e) => ctx.trace_error(&format!("pixirad:statusTask: {e}\n")),
+            }
+        },
+    )
 }
 
 /// The status task on a socket the caller already holds, so no other socket
@@ -376,7 +395,12 @@ pub(crate) fn start_status_task_on(
     socket: std::net::UdpSocket,
     ctx: StatusContext,
 ) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PixiradStatusTask", move || status_loop(socket, ctx))
+    rt::run_thread_named(
+        "PixiradStatusTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || status_loop(socket, ctx),
+    )
 }
 
 /// Read the environmental broadcast, work out the dew point, and switch the

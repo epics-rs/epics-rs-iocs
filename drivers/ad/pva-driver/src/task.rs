@@ -41,7 +41,14 @@ pub(crate) struct MonitorContext {
 
 /// Start the monitor task thread via the `rt` facade.
 pub(crate) fn start_pva_task(ctx: MonitorContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("PVATask", move || pva_loop_async(ctx))
+    // C's monitorEvent runs on the pvAccess client's TCP-rx thread
+    // (clientContextImpl.cpp:2015), CAServerLow with a big stack (codec.cpp:1223-1226).
+    rt::run_thread_named(
+        "PVATask",
+        rt::ThreadPriority::CaServerLow,
+        rt::StackSizeClass::Big,
+        move || pva_loop_async(ctx),
+    )
 }
 
 /// One live PV connection's adopted state: the connect-watcher (drives

@@ -22,7 +22,12 @@ pub(crate) struct PublisherContext {
 }
 
 pub(crate) fn start_publisher_task(ctx: PublisherContext) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("NDSAPublish", move || publisher_task(ctx))
+    rt::run_thread_named(
+        "NDSAPublish",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || publisher_task(ctx),
+    )
 }
 
 async fn publisher_task(mut ctx: PublisherContext) {

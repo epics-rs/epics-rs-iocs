@@ -23,6 +23,12 @@ pub mod profile_move;
 pub mod rpc;
 pub mod sftp;
 
+/// How long a trajectory upload ([`ftp`], [`sftp`]) waits on one connect or
+/// one stalled reply. C sets none: xps_ftp.c and the libssh2 body wait
+/// forever, and curl, in the other two bodies, only its 300 s to connect.
+pub(crate) const UPLOAD_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(test) { 1 } else { 10 });
+
 pub use axis::XpsAxis;
 pub use controller::{SetPositionFailure, XpsController, XpsParams};
 pub use corrector::{CorrectorType, PidFailure, XpsCorrectorInfo};

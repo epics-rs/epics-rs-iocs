@@ -2,24 +2,38 @@
 //! serializing every wire operation through one OS thread (mirrors C's
 //! single-consumer `queue_func`/`qmesg` pair, `drvGM10.c:1311-1375` —
 //! `qmesg` enqueues from any EPICS scan thread, `queue_func` is the sole
-//! socket owner). Writes queue through [`Instrument::enqueue`] and complete
-//! the record from the actor, as C does. Reads block on
-//! [`Instrument::submit`]: the framework has no asynchronous read completion.
+//! socket owner). Writes and non-I/O-Intr reads queue through
+//! [`Instrument::submit_write`] and [`Instrument::channel_start`] and the
+//! actor ends their record's pass, as C does; no scan thread waits on it.
 
 use crate::cache::*;
 use crate::codec::*;
 use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
+use epics_rs::base::server::database::DeviceDone;
 use epics_rs::base::server::driver_support::DriverSupport;
 use epics_rs::base::types::c_parse::strtoul_errno;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::io;
 use std::net::TcpStream;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 const PORT: u16 = 34434;
+
+/// How long a reply, or a connect to the unit again, may take. C reads with
+/// no bound (`TODO: add timeout`, drvGM10_comm.c:31, :58), so a unit that
+/// stops answering holds its queue thread and every record queued on it.
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 5 });
+
+/// How long the queue thread waits, once it lost the connection or failed
+/// to load the unit on a new one, before it connects again. C connects once,
+/// in `init_gm10`, so a unit that restarts stays lost until the IOC does.
+const RECONNECT_HOLDOFF: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 5000 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptCategory {
@@ -56,6 +70,10 @@ impl Interrupts {
         rx
     }
 
+    fn attach(&self, category: InterruptCategory, tx: tokio::sync::mpsc::Sender<()>) {
+        self.slot(category).lock().push(tx);
+    }
+
     /// Coalescing wake, matching `scanIoRequest`: a `Full` error just means
     /// a scan is already pending, which is fine to drop; only a `Closed`
     /// receiver (record torn down) gets pruned.
@@ -67,6 +85,13 @@ impl Interrupts {
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
             )
         });
+    }
+
+    fn fire_all(&self) {
+        use InterruptCategory::*;
+        for category in [Channel, Misc, Info, Status, Error] {
+            self.fire(category);
+        }
     }
 }
 
@@ -93,12 +118,60 @@ pub enum Command {
 }
 
 /// Run by the actor once its command was processed — C `queue_func`'s
-/// `rset->process` call (`drvGM10.c:1327-1332`).
-pub type Completion = Box<dyn FnOnce() + Send>;
+/// `rset->process` call (`drvGM10.c:1327-1332`); its argument says whether
+/// the command got the reply it asked for.
+type Completion = Box<dyn FnOnce(bool) + Send>;
+
+/// Whether a record's latest queued read went without the data it asked
+/// for: written before its pass re-enters, taken by that pass.
+#[derive(Default)]
+pub struct ReadFailure(AtomicBool);
+
+impl ReadFailure {
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::Acquire)
+    }
+}
+
+/// A queued job's pass, ended once, on the queue thread: by
+/// [`Pass::end`] after the command ran, or by its drop when the [`Link`]
+/// holding it drops.
+struct Pass(Option<Completion>);
+
+impl Pass {
+    fn end(mut self, answered: bool) {
+        if let Some(done) = self.0.take() {
+            done(answered);
+        }
+    }
+
+    /// The job never queued; its caller ends the pass instead.
+    fn defuse(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Pass {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            done(false);
+        }
+    }
+}
 
 struct Job {
     command: Command,
-    done: Completion,
+    pass: Pass,
+}
+
+/// A record's setup, deferred to the unit's first load.
+type Settle = Box<dyn FnOnce() + Send>;
+
+/// Whether the unit has ever loaded. Until it has, the setups of the
+/// records on it wait here; the first load takes them and runs them.
+enum Setup {
+    Waiting(Vec<Settle>),
+    Loaded,
 }
 
 /// One `gm10Init` handle (C `struct devqueue`), looked up by name from the
@@ -106,64 +179,150 @@ struct Job {
 pub struct Instrument {
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
-    /// The `queue_func` thread's queue; unset when `init_gm10` failed after
-    /// registering, which leaves C's `dq` with no thread to drain it.
-    tx: OnceLock<mpsc::Sender<Job>>,
+    /// The `queue_func` thread's queue.
+    tx: mpsc::Sender<Job>,
+    /// [`Instrument::online`], written only through the queue thread's
+    /// [`Link`].
+    reachable: Arc<AtomicBool>,
+    /// Written only by the queue thread's first load.
+    setup: Arc<Mutex<Setup>>,
     /// `gm10_system_info(which=0, ...)` (`drvGM10.c:1620-1631`): the
     /// configured address, as `inet_ntop` prints it.
     pub peer_address: String,
 }
 
-impl Instrument {
-    fn new(peer_address: String) -> Arc<Self> {
-        Arc::new(Self {
-            cache: Arc::new(Mutex::new(Cache::default())),
-            interrupts: Arc::new(Interrupts::default()),
-            tx: OnceLock::new(),
-            peer_address,
+/// The queue thread's hold on [`Instrument::online`], its one writer, and
+/// on every job it has yet to finish. Its drop, when the thread ends or
+/// unwinds, marks the unit offline before its fields drop, so each pass
+/// they hold ends on an offline unit.
+struct Link {
+    reachable: Arc<AtomicBool>,
+    interrupts: Arc<Interrupts>,
+    /// The job whose command is running.
+    running: Option<Pass>,
+    /// Jobs taken off `rx` ahead of one the actor queued itself, in order.
+    backlog: VecDeque<Job>,
+    rx: mpsc::Receiver<Job>,
+}
+
+impl Link {
+    /// C posts no scan when the link changes, so its I/O Intr records keep
+    /// their last value unalarmed. Each change posts every one here: the
+    /// passes alarm on a lost unit and clear on its return.
+    fn set(&self, reachable: bool) {
+        if self.reachable.swap(reachable, Ordering::AcqRel) != reachable {
+            self.interrupts.fire_all();
+        }
+    }
+
+    /// The next job; with `due`, [`mpsc::RecvTimeoutError::Timeout`] once
+    /// that passes first.
+    fn next_job(&mut self, due: Option<Instant>) -> Result<Job, mpsc::RecvTimeoutError> {
+        if let Some(job) = self.backlog.pop_front() {
+            return Ok(job);
+        }
+        match due {
+            Some(due) => self
+                .rx
+                .recv_timeout(due.saturating_duration_since(Instant::now())),
+            None => self
+                .rx
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        }
+    }
+}
+
+/// The queue thread's connection to the unit.
+enum Conn {
+    /// Connected; `loaded` once the load on it completed. Until then no
+    /// exchange puts the unit online.
+    Open { stream: TcpStream, loaded: bool },
+    /// Lost; the next connect is due at `retry_at`.
+    Down { retry_at: Instant },
+}
+
+impl Conn {
+    /// A new connection, its reads bounded by [`READ_TIMEOUT`].
+    fn open(stream: TcpStream) -> io::Result<Self> {
+        stream.set_read_timeout(Some(READ_TIMEOUT))?;
+        Ok(Conn::Open {
+            stream,
+            loaded: false,
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn connect_to(addr: std::net::SocketAddr) -> io::Result<Arc<Self>> {
-        let instrument = Self::new(addr.ip().to_string());
-        instrument.start(TcpStream::connect(addr)?)?;
-        Ok(instrument)
+    fn stream(&mut self) -> io::Result<&mut TcpStream> {
+        match self {
+            Conn::Open { stream, .. } => Ok(stream),
+            Conn::Down { .. } => Err(io::ErrorKind::NotConnected.into()),
+        }
     }
 
-    /// The tail of `init_gm10` (`drvGM10.c:1446-1461`): read the unsolicited
-    /// post-connect `E0` greeting, run the fixed load sequence (modules
-    /// first, everything else indexes off it), then start the queue thread.
-    fn start(&self, stream: TcpStream) -> io::Result<()> {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let mut actor = Actor {
-            stream,
-            cache: self.cache.clone(),
-            interrupts: self.interrupts.clone(),
-            requeue: tx.clone(),
-        };
-
-        match actor.read_response()? {
-            RawResponse::Ok => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "no initial E0 greeting after connect",
-                ));
-            }
+    /// When the next connect is due, on a lost connection.
+    fn due(&self) -> Option<Instant> {
+        match self {
+            Conn::Down { retry_at } => Some(*retry_at),
+            Conn::Open { .. } => None,
         }
+    }
+}
 
-        actor.load_modules()?;
-        actor.load_status()?;
-        actor.load_infos()?;
-        actor.load_data_values(None)?;
-        actor.load_misc_values(true, true, None)?;
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
 
-        std::thread::Builder::new()
+impl Instrument {
+    /// Start the queue thread for the unit at `peer` and wait for its first
+    /// connect and load, which C's `init_gm10` makes before it starts the
+    /// thread; true when the unit loaded. The thread keeps connecting while
+    /// it has not, and whenever it loses the unit.
+    fn spawn(peer: SocketAddrV4) -> (Arc<Self>, bool) {
+        let (tx, rx) = mpsc::channel::<Job>();
+        let instrument = Arc::new(Self {
+            cache: Arc::default(),
+            interrupts: Arc::default(),
+            tx,
+            reachable: Arc::default(),
+            setup: Arc::new(Mutex::new(Setup::Waiting(Vec::new()))),
+            peer_address: peer.ip().to_string(),
+        });
+        let actor = Actor {
+            link: Link {
+                reachable: instrument.reachable.clone(),
+                interrupts: instrument.interrupts.clone(),
+                running: None,
+                backlog: VecDeque::new(),
+                rx,
+            },
+            conn: Conn::Down {
+                retry_at: Instant::now(),
+            },
+            peer: SocketAddr::V4(peer),
+            cache: instrument.cache.clone(),
+            interrupts: instrument.interrupts.clone(),
+            setup: instrument.setup.clone(),
+        };
+        let (booted_tx, booted) = mpsc::sync_channel(1);
+        // A thread that never started drops `booted_tx`: not loaded.
+        let _ = std::thread::Builder::new()
             .name("gm10-instrument".to_string())
-            .spawn(move || actor.run(rx))?;
-        let _ = self.tx.set(tx);
-        Ok(())
+            .spawn(move || actor.run(booted_tx));
+        let loaded = booted.recv().unwrap_or(false);
+        (instrument, loaded)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connect_to(addr: SocketAddr) -> io::Result<Arc<Self>> {
+        let SocketAddr::V4(peer) = addr else {
+            return Err(io::ErrorKind::Unsupported.into());
+        };
+        match Self::spawn(peer) {
+            (instrument, true) => Ok(instrument),
+            (_, false) => Err(io::Error::other("the unit did not load")),
+        }
     }
 
     pub fn register_interrupt(
@@ -173,22 +332,99 @@ impl Instrument {
         self.interrupts.register(category)
     }
 
-    /// C `qmesg` (`drvGM10.c:1342-1373`): queue `command` behind every
-    /// earlier one; `done` runs after it. A gone actor drops `done` un-run.
-    pub fn enqueue(&self, command: Command, done: Completion) {
-        if let Some(tx) = self.tx.get() {
-            let _ = tx.send(Job { command, done });
+    /// [`Self::register_interrupt`] for a receiver handed out before the
+    /// category could be known.
+    pub fn attach_interrupt(&self, category: InterruptCategory, tx: tokio::sync::mpsc::Sender<()>) {
+        self.interrupts.attach(category, tx);
+    }
+
+    /// Run `settle` on the queue thread once the unit's first load
+    /// completed, before that load puts it online. False when the unit has
+    /// loaded already: `settle` is dropped, and the cache holds the load.
+    pub fn after_first_load(&self, settle: impl FnOnce() + Send + 'static) -> bool {
+        match &mut *self.setup.lock() {
+            Setup::Waiting(settles) => {
+                settles.push(Box::new(settle));
+                true
+            }
+            Setup::Loaded => false,
         }
     }
 
-    /// Block until the actor thread has finished processing `command`. C's
-    /// `command_process` discards every handler's status (`drvGM10.c:1263-1309`),
-    /// so there is none to return.
-    pub fn submit(&self, command: Command) {
+    /// C `qmesg` (`drvGM10.c:1342-1373`): queue `command` behind every
+    /// earlier one; `done` runs after it. False when nothing was queued: a
+    /// gone actor drops `done` un-run.
+    fn enqueue(&self, command: Command, done: Completion) -> bool {
+        let pass = Pass(Some(done));
+        match self.tx.send(Job { command, pass }) {
+            Ok(()) => true,
+            Err(mpsc::SendError(job)) => {
+                job.pass.defuse();
+                false
+            }
+        }
+    }
+
+    /// C `qmesg(dq, precord, ...)`: queue `command` and return at once; the
+    /// actor ends `done`'s pass once it has run. C's `command_process`
+    /// discards every handler's status (`drvGM10.c:1263-1309`), so a device
+    /// error cannot alarm; a wire error shows in [`Instrument::online`].
+    /// False as [`Instrument::enqueue`].
+    pub fn submit_write(&self, command: Command, done: DeviceDone) -> bool {
+        // queue_func's `dbScanLock; process; dbScanUnlock` on the actor
+        // thread (drvGM10.c:1327-1332), which holds no lock set, not through
+        // a callback band that can refuse it.
+        self.enqueue(command, Box::new(move |_| done.complete_now()))
+    }
+
+    /// The unit is reachable now: the queue thread's latest exchange read a
+    /// whole frame on a connection the unit loaded on. False until the first
+    /// load completes, from a wire error to the next whole frame or reload,
+    /// and once the thread is gone. C has no such state and serves an
+    /// unreachable unit's cache as current.
+    pub fn online(&self) -> bool {
+        self.reachable.load(Ordering::Acquire)
+    }
+
+    /// Test only: queue a job that panics the queue thread once the
+    /// returned sender fires.
+    #[cfg(test)]
+    pub(crate) fn queue_panic(&self) -> mpsc::Sender<()> {
+        let (fire, panic) = mpsc::channel::<()>();
+        // `set_mode` takes 0 or 1, so `SetOpMode(2)` sends nothing.
+        assert!(self.enqueue(
+            Command::SetOpMode(2),
+            Box::new(move |_| {
+                let _ = panic.recv();
+                panic!("the queue thread panics, for a test");
+            }),
+        ));
+        fire
+    }
+
+    /// Test only: the queue thread panics in the next command it runs,
+    /// with that command's job as the running one.
+    #[cfg(test)]
+    pub(crate) fn panic_in_next_command(&self) {
+        self.cache.lock().panic_in_next_command = true;
+    }
+
+    /// Test only: panic the queue thread; returns once it is gone.
+    #[cfg(test)]
+    pub(crate) fn panic_queue_thread(&self) {
+        let _ = self.queue_panic().send(());
+        while self.enqueue(Command::SetOpMode(2), Box::new(|_| {})) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Test only: block until the actor has processed `command`.
+    #[cfg(test)]
+    fn submit(&self, command: Command) {
         let (done_tx, done_rx) = mpsc::channel();
         self.enqueue(
             command,
-            Box::new(move || {
+            Box::new(move |_| {
                 let _ = done_tx.send(());
             }),
         );
@@ -417,17 +653,27 @@ impl Instrument {
         }
     }
 
-    /// `gm10_channel_start` (`drvGM10.c:1725-1760`): the first-scan async
-    /// read-refresh for a single channel, collapsed to a blocking round
-    /// trip. Signal channels with no recognized type are a silent no-op.
-    pub fn channel_start(&self, family: ChannelFamily, channel: u32) {
+    /// `gm10_channel_start` (`drvGM10.c:1725-1760`): queue the refresh of
+    /// one channel; the actor re-runs `done`'s pass once it has run, as
+    /// [`Self::submit_write`] ends a write's. False when nothing was queued:
+    /// a Signal channel with no recognized type, which C leaves PACT with no
+    /// packet, or a queue thread that is gone; this port ends either pass at
+    /// once. `failure` is set when the unit answers with anything but the
+    /// data.
+    pub fn channel_start(
+        &self,
+        family: ChannelFamily,
+        channel: u32,
+        done: DeviceDone,
+        failure: &Arc<ReadFailure>,
+    ) -> bool {
         if family == ChannelFamily::Signal
             && matches!(
                 self.channel_type(channel),
                 ChannelType::None | ChannelType::Unknown
             )
         {
-            return;
+            return false;
         }
         let command = match family {
             ChannelFamily::Signal => Command::ReadSignal(channel),
@@ -436,27 +682,135 @@ impl Instrument {
             ChannelFamily::Const => Command::ReadConst(channel),
             ChannelFamily::VarConst => Command::ReadVarConst(channel),
         };
-        self.submit(command)
+        let failure = failure.clone();
+        self.enqueue(
+            command,
+            Box::new(move |answered| {
+                failure.0.store(!answered, Ordering::Release);
+                done.reprocess_now();
+            }),
+        )
     }
 }
 
 pub struct Actor {
-    stream: TcpStream,
+    link: Link,
+    conn: Conn,
+    /// Where `conn` connects.
+    peer: SocketAddr,
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
-    /// Its own queue, for the record-less `qmesg` of `load_status`.
-    requeue: mpsc::Sender<Job>,
+    setup: Arc<Mutex<Setup>>,
 }
 
 impl Actor {
-    fn run(mut self, rx: mpsc::Receiver<Job>) {
-        while let Ok(job) = rx.recv() {
-            let _ = self.process(job.command);
-            (job.done)();
+    /// The boot connect and load, whose outcome `booted` takes back to
+    /// [`Instrument::spawn`], then `queue_func`, connecting again whenever
+    /// the connection is down and its holdoff has passed.
+    fn run(mut self, booted: mpsc::SyncSender<bool>) {
+        let _ = booted.send(self.reconnect());
+        loop {
+            if self.conn.due().is_some_and(|due| due <= Instant::now()) {
+                self.reconnect();
+            }
+            let Job { command, pass } = match self.link.next_job(self.conn.due()) {
+                Ok(job) => job,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            self.link.running = Some(pass);
+            let answered = self.process(command).is_ok();
+            if let Some(pass) = self.link.running.take() {
+                pass.end(answered);
+            }
         }
     }
 
+    /// `init_gm10`'s connect and load (`drvGM10.c:1445-1457`); true when
+    /// the unit loaded.
+    fn reconnect(&mut self) -> bool {
+        match TcpStream::connect_timeout(&self.peer, READ_TIMEOUT).and_then(Conn::open) {
+            Ok(conn) => {
+                self.conn = conn;
+                self.load_connection()
+            }
+            Err(_) => {
+                self.lose();
+                false
+            }
+        }
+    }
+
+    /// [`Actor::load`] on a new connection: the unit is online once it
+    /// loaded, after the setups that waited for its first load ran, and a
+    /// connection it failed to load on is dropped.
+    fn load_connection(&mut self) -> bool {
+        let load = self.load();
+        match (load, &mut self.conn) {
+            (Ok(()), Conn::Open { loaded, .. }) => {
+                *loaded = true;
+                // Taken before any runs: a record's init asks this lock
+                // under its record's, and a setup takes that record's.
+                let first = std::mem::replace(&mut *self.setup.lock(), Setup::Loaded);
+                if let Setup::Waiting(settles) = first {
+                    settles.into_iter().for_each(|settle| settle());
+                }
+                self.link.set(true);
+                true
+            }
+            _ => {
+                self.lose();
+                false
+            }
+        }
+    }
+
+    /// Drop the connection, offline, and connect again after
+    /// [`RECONNECT_HOLDOFF`].
+    fn lose(&mut self) {
+        self.conn = Conn::Down {
+            retry_at: Instant::now() + RECONNECT_HOLDOFF,
+        };
+        self.link.set(false);
+    }
+
+    /// C `qmesg(dq, NULL, ...)` from the queue thread: the job goes behind
+    /// everything already queued.
+    fn queue_self(&mut self, command: Command) {
+        let link = &mut self.link;
+        link.backlog.extend(link.rx.try_iter());
+        link.backlog.push_back(Job {
+            command,
+            pass: Pass(Some(Box::new(|_| {}))),
+        });
+    }
+
+    /// The tail of `init_gm10` (`drvGM10.c:1446-1461`): read the unsolicited
+    /// post-connect `E0` greeting, run the fixed load sequence (modules
+    /// first, everything else indexes off it).
+    fn load(&mut self) -> io::Result<()> {
+        match self.read_response()? {
+            RawResponse::Ok => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "no initial E0 greeting after connect",
+                ));
+            }
+        }
+
+        self.load_modules()?;
+        self.load_status()?;
+        self.load_infos()?;
+        self.load_data_values(None)?;
+        self.load_misc_values(true, true, None)
+    }
+
     fn process(&mut self, command: Command) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.cache.lock().panic_in_next_command) {
+            panic!("the queue thread panics running a command, for a test");
+        }
         match command {
             Command::ReadAllData => self.load_data_values(None),
             Command::ReadSignal(ch) => self.load_data_values(Some((ChannelFamily::Signal, ch))),
@@ -481,15 +835,38 @@ impl Actor {
         }
     }
 
+    /// With [`Actor::read_frame`], the only use of the stream.
     fn write_command(&mut self, command: &str) -> io::Result<()> {
-        wire::write_command(&mut self.stream, command)
+        let sent = wire::write_command(self.conn.stream()?, command);
+        if sent.is_err() {
+            self.lose();
+        }
+        sent
+    }
+
+    /// A whole frame on a loaded connection is a good exchange. A frame
+    /// that does not parse leaves the unit offline on the same connection
+    /// until the next one. Any other error loses the connection: a reply
+    /// still in flight on it would answer the next command.
+    fn read_frame(&mut self) -> io::Result<RawResponse> {
+        let frame = wire::read_response(self.conn.stream()?);
+        match &frame {
+            Ok(_) => {
+                if let Conn::Open { loaded: true, .. } = self.conn {
+                    self.link.set(true);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => self.link.set(false),
+            Err(_) => self.lose(),
+        }
+        frame
     }
 
     /// `response_reader` (`drvGM10.c:360-413`): reset the transient error
     /// flag on every round trip; on an error frame, run the `_ERR,<code>`
     /// follow-up and populate `Cache::error`.
     fn read_response(&mut self) -> io::Result<RawResponse> {
-        let raw = wire::read_response(&mut self.stream)?;
+        let raw = self.read_frame()?;
         {
             self.cache.lock().error_flag = false;
         }
@@ -510,7 +887,7 @@ impl Actor {
                 }
             }
             self.write_command(&cmd_err_query(code))?;
-            let follow = wire::read_response(&mut self.stream)?;
+            let follow = self.read_frame()?;
             let RawResponse::Ascii(ascii_raw) = follow else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -640,10 +1017,7 @@ impl Actor {
 
         if was_settings_mode && !self.cache.lock().settings_mode {
             // `qmesg(dq, NULL, CMD_READ_ALL_INFOS, ..)` (`drvGM10.c:646`).
-            let _ = self.requeue.send(Job {
-                command: Command::ReadAllInfos,
-                done: Box::new(|| {}),
-            });
+            self.queue_self(Command::ReadAllInfos);
         }
         Ok(())
     }
@@ -906,8 +1280,9 @@ impl Actor {
 }
 
 /// `init_gm10` (`drvGM10.c:1376-1465`), the `gm10Init` command. Every
-/// failure is silent, as in C. The handle is registered before the connect,
-/// so a unit that fails to connect or load still resolves for records.
+/// failure is silent, as in C. A unit that fails to connect or load stays
+/// registered, as in C, and its queue thread keeps connecting, where C's
+/// never starts: the records on it finish their setup at its first load.
 pub fn gm10_init(registry: &Registry, device: Option<&[u8]>, address: Option<&[u8]>) {
     init_on_port(registry, device, address, PORT);
 }
@@ -926,11 +1301,8 @@ fn init_on_port(registry: &Registry, device: Option<&[u8]>, address: Option<&[u8
     let Some(ip) = address.and_then(inet_aton) else {
         return;
     };
-    let instrument = Instrument::new(ip.to_string());
-    let _ = registry.insert(name, instrument.clone());
-    if let Ok(stream) = TcpStream::connect(SocketAddrV4::new(ip, port)) {
-        let _ = instrument.start(stream);
-    }
+    let (instrument, _) = Instrument::spawn(SocketAddrV4::new(ip, port));
+    let _ = registry.insert(name, instrument);
 }
 
 /// A letter, then letters, digits or underscores (`drvGM10.c:1389-1400`).
@@ -1080,7 +1452,7 @@ pub(crate) mod test_support {
         let cache = instrument.cache();
         // C sizes meas_* at MAX_MEAS_CHAN = 1000, so address 1000 is stored.
         assert_eq!(cache.meas_type[999], ChannelType::InputAnalog);
-        assert_eq!(cache.meas_info[999].scale, 1);
+        assert_eq!(cache.meas_info[999].scale.get(), 1);
     }
 
     #[test]
@@ -1100,7 +1472,7 @@ pub(crate) mod test_support {
 
     #[test]
     fn channel_get_expr_cuts_at_byte_39() {
-        let instrument = Instrument::new("127.0.0.1".into());
+        let (instrument, _) = Instrument::spawn(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1));
         let expr = format!("{}\u{b0}C", "x".repeat(38)).into_bytes();
         instrument.cache().calc_expr[0].expr = expr.clone();
         assert_eq!(instrument.channel_get_expr(1), &expr[..39]);
@@ -1170,27 +1542,65 @@ pub(crate) mod test_support {
         listener: TcpListener,
         responses: Vec<Vec<u8>>,
     ) -> std::thread::JoinHandle<Vec<String>> {
+        spawn_gated_fake_device(listener, responses, None)
+    }
+
+    /// [`spawn_fake_device`], holding reply `n` back until `gate` fires or
+    /// its sender drops. It stops once the driver closes the connection.
+    pub(crate) fn spawn_gated_fake_device(
+        listener: TcpListener,
+        responses: Vec<Vec<u8>>,
+        gate: Option<(usize, mpsc::Receiver<()>)>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        std::thread::spawn(move || play(listener.accept().unwrap().0, responses, gate))
+    }
+
+    /// Plays the device for one connection per entry of `sessions`, each as
+    /// [`spawn_fake_device`] plays its one, and returns what each received.
+    pub(crate) fn spawn_fake_device_sessions(
+        listener: TcpListener,
+        sessions: Vec<Vec<Vec<u8>>>,
+    ) -> std::thread::JoinHandle<Vec<Vec<String>>> {
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.write_all(b"E0\r\n").unwrap();
-            let mut received = Vec::new();
-            for response in responses {
-                let mut line = Vec::new();
-                let mut byte = [0u8; 1];
-                loop {
-                    if stream.read(&mut byte).unwrap() == 0 {
-                        return received;
-                    }
-                    line.push(byte[0]);
-                    if line.ends_with(b"\r\n") {
-                        break;
-                    }
-                }
-                received.push(String::from_utf8(line).unwrap());
-                stream.write_all(&response).unwrap();
-            }
-            received
+            sessions
+                .into_iter()
+                .map(|responses| play(listener.accept().unwrap().0, responses, None))
+                .collect()
         })
+    }
+
+    fn play(
+        mut stream: TcpStream,
+        responses: Vec<Vec<u8>>,
+        gate: Option<(usize, mpsc::Receiver<()>)>,
+    ) -> Vec<String> {
+        let mut received = Vec::new();
+        if stream.write_all(b"E0\r\n").is_err() {
+            return received;
+        }
+        for (n, response) in responses.into_iter().enumerate() {
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                if !matches!(stream.read(&mut byte), Ok(1)) {
+                    return received;
+                }
+                line.push(byte[0]);
+                if line.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            received.push(String::from_utf8(line).unwrap());
+            if let Some((at, gate)) = &gate
+                && *at == n
+            {
+                let _ = gate.recv();
+            }
+            if stream.write_all(&response).is_err() {
+                return received;
+            }
+        }
+        received
     }
 
     /// The replies `connect_default_fixture`'s init sequence consumes.
@@ -1207,6 +1617,47 @@ pub(crate) mod test_support {
             ascii_frame(b"aaaaaaaa001,12.5\nE"), // SKConst?
             ascii_frame(b"aaaaaaaa001,-7.5\nE"), // SWConst?
         ]
+    }
+
+    /// A registry listing `name`, a unit whose boot connect was refused and
+    /// whose queue thread keeps being refused. Nothing can listen on
+    /// privileged port 1.
+    pub(crate) fn registry_with_offline(name: &str) -> Arc<Registry> {
+        let registry = Arc::new(Registry::new());
+        init_on_port(&registry, Some(name.as_bytes()), Some(b"127.0.0.1"), 1);
+        registry
+    }
+
+    /// A unit that hangs up on the boot connect before its greeting, so the
+    /// boot load fails, and once `appear` fires plays `responses` on the
+    /// first connection that takes its greeting.
+    pub(crate) fn absent_at_boot(
+        responses: Vec<Vec<u8>>,
+    ) -> (
+        Arc<Instrument>,
+        mpsc::Sender<()>,
+        std::thread::JoinHandle<Vec<String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let SocketAddr::V4(peer) = listener.local_addr().unwrap() else {
+            unreachable!("bound to an IPv4 address");
+        };
+        let (appear, gate) = mpsc::channel();
+        let device = std::thread::spawn(move || {
+            drop(listener.accept().unwrap());
+            let _ = gate.recv();
+            // Connections the queue thread gave up on wait ahead of its
+            // current one.
+            loop {
+                let received = play(listener.accept().unwrap().0, responses.clone(), None);
+                if !received.is_empty() {
+                    return received;
+                }
+            }
+        });
+        let (instrument, loaded) = Instrument::spawn(peer);
+        assert!(!loaded, "the boot load fails");
+        (instrument, appear, device)
     }
 
     /// One connected instrument: module 0 is a present `InputAnalog`
@@ -1348,7 +1799,7 @@ mod tests {
         let cache = instrument.cache.clone();
         instrument.enqueue(
             Command::ClearError,
-            Box::new(move || {
+            Box::new(move |_| {
                 let _ = tx.send(cache.lock().error.code);
             }),
         );
@@ -1444,25 +1895,23 @@ mod tests {
             .get("gm_1")
             .expect("registered despite the refused connect");
         assert_eq!(instrument.peer_address, "127.0.0.1");
-        assert!(instrument.tx.get().is_none());
+        assert!(!instrument.online());
         init_on_port(&registry, Some(b"gm_1"), Some(b"10.0.0.1"), DEAD_PORT);
         assert_eq!(registry.get("gm_1").unwrap().peer_address, "127.0.0.1");
-        // No queue thread: the command is dropped and submit returns.
+        // The queue thread runs it on the down connection and ends its pass.
         instrument.submit(Command::ReadAllData);
     }
 
     #[test]
     fn driver_report_lists_newest_first_with_modules_at_level_1() {
         let registry = Registry::new();
-        registry
-            .insert("first".into(), Instrument::new("10.0.0.1".into()))
-            .unwrap();
+        init_on_port(&registry, Some(b"first"), Some(b"127.1"), DEAD_PORT);
         registry
             .insert("second".into(), connect_default_fixture())
             .unwrap();
         assert_eq!(
             registry.report(0).unwrap(),
-            b"    Yokogawa GM10 #1: second @ 127.0.0.1\n    Yokogawa GM10 #2: first @ 10.0.0.1\n"
+            b"    Yokogawa GM10 #1: second @ 127.0.0.1\n    Yokogawa GM10 #2: first @ 127.0.0.1\n"
         );
         let level1 = String::from_utf8(registry.report(1).unwrap()).unwrap();
         assert!(level1.starts_with(
@@ -1563,8 +2012,8 @@ mod tests {
         let instrument = Instrument::connect_to(addr).unwrap();
         instrument.submit(Command::ReadStatus);
         // Both queued before the actor can finish the ReadStatus round trips.
-        instrument.enqueue(Command::ReadStatus, Box::new(|| {}));
-        instrument.enqueue(Command::ClearError, Box::new(|| {}));
+        instrument.enqueue(Command::ReadStatus, Box::new(|_| {}));
+        instrument.enqueue(Command::ClearError, Box::new(|_| {}));
         let received = device.join().unwrap();
         assert_eq!(
             received[received.len() - 7..],

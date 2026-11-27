@@ -38,11 +38,21 @@ pub mod televac;
 pub mod tpg261;
 pub mod user_param;
 
+use std::sync::{Arc, Mutex};
+
+use asyn_rs::error::{AsynError, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::manager::DeviceUser;
-use asyn_rs::port_handle::PortHandle;
-use epics_rs::base::error::CaResult;
-use epics_rs::base::server::record::Record;
+use asyn_rs::port_handle::{PortHandle, QueueOutcome};
+use asyn_rs::request::RequestCell;
+use asyn_rs::user::AsynUser;
+use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
+use epics_rs::base::server::device_support::DeviceAlarm;
+use epics_rs::base::server::recgbl::alarm_status::{
+    COMM_ALARM, DISABLE_ALARM, HW_LIMIT_ALARM, READ_ALARM, TIMEOUT_ALARM, WRITE_ALARM,
+};
+use epics_rs::base::server::record::{AlarmSeverity, Record};
 use epics_rs::base::types::EpicsValue;
 
 /// The module root, for an `st.cmd` that names `$(IP)/db/...`.
@@ -92,6 +102,127 @@ pub fn connect_octet(port: &str, addr: i32) -> Result<PortHandle, Unconnected> {
         return Err(Unconnected::NoOctet);
     }
     Ok(entry.handle.clone())
+}
+
+/// What became of the request the record's latest pass queued. Its armed
+/// state is the pass each callback here ends with, C's `dbScanLock(pr);
+/// (*prset->process)(pr); dbScanUnlock(pr)`: armed by [`Reentry::queue`] for
+/// a port that can block, ended once by that request's `process` or `unrun`.
+#[derive(Default)]
+pub(crate) struct Reentry(Mutex<Pass>);
+
+#[derive(Default)]
+enum Pass {
+    #[default]
+    Idle,
+    Armed {
+        done: DeviceDone,
+        /// The pass completes a write rather than re-entering a read.
+        write: bool,
+    },
+    /// The port refused the request; held until the record queues again.
+    Refused(Refused),
+}
+
+impl Reentry {
+    /// `queueRequest` of `cell`, whose body ends the pass armed here. A port
+    /// without `ASYN_CANBLOCK` runs the body inside this call, under the
+    /// record's lock set, so nothing is armed and [`QueueOutcome::Ran`] tells
+    /// the caller to finish in this pass; C processes the record a second
+    /// time from inside the first instead. A refusal is kept for
+    /// [`Reentry::refused`] and the caller ends the pass now.
+    pub(crate) fn queue(
+        &self,
+        handle: &PortHandle,
+        cell: &Arc<RequestCell>,
+        user: &AsynUser,
+        done: &DeviceDoneSource<'_>,
+        write: bool,
+    ) -> Result<QueueOutcome, Refused> {
+        *self.0.lock().unwrap() = if handle.can_block() {
+            Pass::Armed {
+                done: done.device_done(),
+                write,
+            }
+        } else {
+            Pass::Idle
+        };
+        handle.queue_request(cell, user).map_err(|e| {
+            let refused = Refused::new(&e, write);
+            *self.0.lock().unwrap() = Pass::Refused(refused);
+            refused
+        })
+    }
+
+    /// The refusal of the latest pass's request, for its `read` and
+    /// `last_alarm`.
+    pub(crate) fn refused(&self) -> Option<Refused> {
+        match *self.0.lock().unwrap() {
+            Pass::Refused(refused) => Some(refused),
+            Pass::Idle | Pass::Armed { .. } => None,
+        }
+    }
+
+    /// From the request's `process` or `unrun`. On a port that can block
+    /// both run on its thread, which holds no lock set, so the pass runs
+    /// there, as C's does, and no full callback band can refuse it.
+    pub(crate) fn end(&self) {
+        let (done, write) = {
+            let mut pass = self.0.lock().unwrap();
+            match std::mem::take(&mut *pass) {
+                Pass::Armed { done, write } => (done, write),
+                other => {
+                    *pass = other;
+                    return;
+                }
+            }
+        };
+        if write {
+            done.complete_now();
+        } else {
+            done.reprocess_now();
+        }
+    }
+}
+
+/// A `queueRequest` the port refused: the pass ends now, a read with no
+/// value and a write failed, under `asynStatusToEpicsAlarm(status,
+/// READ_ALARM or WRITE_ALARM, INVALID)`, as devAsynInt32's `processAi` ends
+/// one (devAsynInt32.c:836-846, asynEpicsUtils.c:234-266). C's ip drivers
+/// return -1 with PACT still set, and the record never processes again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Refused {
+    stat: u16,
+}
+
+impl Refused {
+    fn new(e: &AsynError, write: bool) -> Self {
+        let stat = match e.status() {
+            AsynStatus::Timeout => TIMEOUT_ALARM,
+            AsynStatus::Overflow => HW_LIMIT_ALARM,
+            AsynStatus::Disconnected => COMM_ALARM,
+            AsynStatus::Disabled => DISABLE_ALARM,
+            AsynStatus::Success | AsynStatus::Error if write => WRITE_ALARM,
+            AsynStatus::Success | AsynStatus::Error => READ_ALARM,
+        };
+        Self { stat }
+    }
+
+    /// The device's `last_alarm` for the pass.
+    pub(crate) fn alarm(self) -> DeviceAlarm<'static> {
+        DeviceAlarm {
+            stat: self.stat,
+            sevr: AlarmSeverity::Invalid as u16,
+            msg: "",
+        }
+    }
+}
+
+/// A refused write's `write_begin` error.
+impl From<Refused> for CaError {
+    fn from(_: Refused) -> Self {
+        CaError::LinkError("queueRequest refused".into())
+    }
 }
 
 /// A registered port without `asynOctet`, as `findInterface` sees it.

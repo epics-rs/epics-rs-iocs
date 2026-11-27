@@ -33,9 +33,13 @@ pub struct Server {
     pub refuse: bool,
     /// How long a connect attempt and a disconnect take.
     pub latency: Duration,
-    /// What each node holds; a read of any other node fails
+    /// What each node holds; a read or a monitor of any other node fails
     /// `BadNodeIdUnknown`.
     pub nodes: Vec<(NodeId, Variant)>,
+    /// Every node a Read asked for, in order.
+    pub reads: Mutex<Vec<NodeId>>,
+    /// The CreateMonitoredItems service calls.
+    pub monitors: AtomicUsize,
     /// The Write service calls, in order.
     pub writes: Mutex<Vec<Vec<WriteValue>>>,
 }
@@ -75,6 +79,10 @@ struct Connection(Arc<Server>);
 #[async_trait]
 impl UaConnection for Connection {
     async fn read(&self, nodes: &[ReadValueId]) -> (u32, Result<Vec<DataValue>, StatusCode>) {
+        self.0
+            .reads
+            .lock()
+            .extend(nodes.iter().map(|node| node.node_id.clone()));
         let results = nodes
             .iter()
             .map(|node| {
@@ -127,7 +135,25 @@ impl UaConnection for Connection {
         _subscription_id: u32,
         items: Vec<MonitoredItemCreateRequest>,
     ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode> {
-        Ok(vec![MonitoredItemCreateResult::default(); items.len()])
+        self.0.monitors.fetch_add(1, Ordering::SeqCst);
+        Ok(items
+            .iter()
+            .map(|item| {
+                let known = self
+                    .0
+                    .nodes
+                    .iter()
+                    .any(|(id, _)| *id == item.item_to_monitor.node_id);
+                MonitoredItemCreateResult {
+                    status_code: if known {
+                        StatusCode::Good
+                    } else {
+                        StatusCode::BadNodeIdUnknown
+                    },
+                    ..Default::default()
+                }
+            })
+            .collect())
     }
     async fn disconnect(&self) {
         tokio::time::sleep(self.0.latency).await;

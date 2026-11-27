@@ -7,7 +7,7 @@ use std::time::Duration;
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::InterfaceType;
-use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
 use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::error::{CaError, CaResult};
@@ -185,8 +185,8 @@ impl Job {
 
 impl CellBody for Job {
     fn process(&self, port: &mut dyn PortCalls) {
-        let mut ex = self.exchange.lock().unwrap();
-        let ex = &mut *ex;
+        let mut guard = self.exchange.lock().unwrap();
+        let ex = &mut *guard;
         let (name, dev) = (&self.name, self.cfg.dev);
         let mut response = ResponseBuf::default();
         ex.read_alarm = false;
@@ -271,6 +271,8 @@ impl CellBody for Job {
         // C `finish`: unlike `devVacSen`, the copy is unconditional — `recBuf`
         // holds whatever the (possibly partial) read produced.
         ex.recbuf = response;
+        drop(guard);
+        self.reentry.end();
     }
 
     /// Nothing cancels the request and it has no timeout callback, so only a
@@ -282,11 +284,12 @@ impl CellBody for Job {
         let mut ex = self.exchange.lock().unwrap();
         ex.read_alarm = false;
         ex.recbuf = ResponseBuf::default();
+        drop(ex);
+        self.reentry.end();
     }
 
-    fn done(self: Arc<Self>) {
-        self.reentry.reprocess();
-    }
+    /// `process` and `unrun` end the pass.
+    fn done(self: Arc<Self>) {}
 
     /// `createAsynUser(callback, 0)` (devDigitelPump.c:123): a request on a disconnected
     /// device runs.
@@ -458,14 +461,16 @@ impl DeviceSupport for DigitelPump {
         );
         drop(ex);
 
-        job.reentry.arm(done);
         match job
-            .handle
-            .queue_request(&live.cell, &user(job.addr, IO_TIMEOUT))
+            .reentry
+            .queue(&job.handle, &live.cell, &user(job.addr, IO_TIMEOUT), done)
         {
-            Ok(_) => {
+            Ok(outcome) => {
                 live.pass = Pass::Queued;
-                Ok(ReadStart::Pending)
+                Ok(match outcome {
+                    QueueOutcome::Queued => ReadStart::Pending,
+                    QueueOutcome::Ran => ReadStart::Synchronous,
+                })
             }
             Err(e) => {
                 job.trace(

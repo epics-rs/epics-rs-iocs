@@ -4,7 +4,7 @@
 //! Structurally this mirrors `yokogawa-gm10`'s `device_support.rs` (one
 //! shared DTYP string, `resolve_operation` as the single owner of every
 //! `devMW100_*.c::init_record`'s command/address grammar, lazy resolution in
-//! `DeviceSupport::init` since only there is the concrete record type
+//! `DeviceSupport::init_common` since only there is the concrete record type
 //! known) — but the grammar itself is NOT a copy of GM10's: every rule below
 //! was re-derived from the actual MW100 C sources, and two things are
 //! genuinely different:
@@ -23,15 +23,18 @@
 //!   one dispatcher, reused everywhere the C source reuses it.
 
 use crate::codec;
-use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
+use crate::instrument::{Command, Instrument, InterruptCategory, ReadFailure, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::sync::mpsc::{self, Receiver, Sender};
-use epics_rs::base::server::database::DeviceDoneSource;
+use epics_rs::base::server::database::{AsyncDbHandle, DeviceDoneSource};
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
+    DeviceAlarm, DeviceInitOutcome, DevicePost, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+    DsetInit, IoIntrAction, ReadStart, WriteStart,
 };
-use epics_rs::base::server::record::{Record, ScanType};
+use epics_rs::base::server::recgbl::alarm_status::{COMM_ALARM, READ_ALARM};
+use epics_rs::base::server::recgbl::{AlarmResetResult, EventMask};
+use epics_rs::base::server::record::{AlarmSeverity, CommonFields, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 use epics_rs::ca::server::ioc_app::DeviceSupportContext;
 use std::sync::Arc;
@@ -90,6 +93,14 @@ enum Operation {
     Unit(ChannelAddress),
     ErrorText(u32),
     Expr(u32),
+}
+
+impl Operation {
+    /// False for the configured address, the one value that is not read
+    /// from the unit (`mw100_system_info`, drvMW100.c:1731-1742).
+    fn reads_the_unit(self) -> bool {
+        !matches!(self, Operation::IpAddr)
+    }
 }
 
 /// `mw100_channel_io_handler`'s family dispatch (`drvMW100.c:1643-1660`):
@@ -542,18 +553,55 @@ fn seed_initial_value(
     Ok(())
 }
 
-fn resolve_link(registry: &Registry, link_text: &str, record: &mut dyn Record) -> Option<Resolved> {
+/// The status a `devMW100_*.c::init_record` returns for a link it resolved
+/// and seeded: ao's 2 with the VAL it seeded defined (devMW100_ao.c:146-152),
+/// every other 0.
+fn init_outcome(op: Operation) -> DeviceInitOutcome {
+    match op {
+        Operation::AnalogSet(_) => DeviceInitOutcome::DoNotConvert(DeviceUdf::Defined),
+        _ => DeviceInitOutcome::ok(),
+    }
+}
+
+/// The record's side of iocInit after a dset `init_record` returned
+/// `outcome`, as the framework runs it: what a record whose unit was present
+/// at boot was left with.
+fn replay_init_tail(
+    record: &mut dyn Record,
+    common: &mut CommonFields,
+    outcome: DeviceInitOutcome,
+) {
+    record.after_dset_init();
+    let dset_init = match outcome {
+        DeviceInitOutcome::Ok(udf) => {
+            apply_udf(common, udf);
+            if let Some(udf) = record.dset_init_convert() {
+                common.udf = u8::from(udf);
+            }
+            DsetInit::Ok
+        }
+        DeviceInitOutcome::DoNotConvert(udf) => {
+            apply_udf(common, udf);
+            DsetInit::DoNotConvert
+        }
+        DeviceInitOutcome::Dead { .. } => DsetInit::Failed,
+    };
+    record.init_record_tail(common);
+    record.seed_deadband_tracking(dset_init);
+}
+
+fn apply_udf(common: &mut CommonFields, udf: DeviceUdf) {
+    match udf {
+        DeviceUdf::Untouched => {}
+        DeviceUdf::Defined => common.udf = 0,
+        DeviceUdf::Undefined => common.udf = 1,
+    }
+}
+
+/// The checks of the record's `init_record` against the loaded unit.
+fn check_link(link_text: &str, instrument: &Instrument, record_type: &str) -> Option<Operation> {
     let parsed = link::parse_link(link_text)?;
-    let instrument = registry.get(parsed.device)?;
-    let op = resolve_operation(
-        record.record_type(),
-        parsed.command,
-        parsed.arg,
-        &instrument,
-    )
-    .ok()?;
-    seed_initial_value(&instrument, op, record).ok()?;
-    Some(Resolved { instrument, op })
+    resolve_operation(record_type, parsed.command, parsed.arg, instrument).ok()
 }
 
 struct Resolved {
@@ -561,17 +609,53 @@ struct Resolved {
     op: Operation,
 }
 
+/// Where the record's link stands.
+enum Binding {
+    /// C's `invalid_flag` (devMW100_ai.c:94-160): read and write do nothing,
+    /// and an input scans on a dummy IOSCANPVT.
+    Inert,
+    /// The unit has not loaded since boot, so the link is unchecked.
+    Waiting(Waiting),
+    Bound(Resolved),
+}
+
+/// A record whose setup waits for its unit's first load.
+struct Waiting {
+    instrument: Arc<Instrument>,
+    /// The alarm iocInit left (iocInit.c:520-522), until a pass runs.
+    boot_alarm: Option<(u16, AlarmSeverity)>,
+    /// The I/O Intr sender handed out before the category could be known.
+    interrupt: Option<Sender<()>>,
+}
+
 /// Shared `DeviceSupport` for every MW100 record type. The link is parsed
-/// (and the device looked up / operation resolved) lazily in `init()`, since
-/// only there is the concrete record type known.
+/// (and the device looked up / operation resolved) lazily in
+/// `init_common()`, since only there is the concrete record type known.
 pub struct MwDevice {
     registry: Arc<Registry>,
     link_text: String,
+    name: String,
+    db: Option<AsyncDbHandle>,
     is_io_intr: bool,
-    resolved: Option<Resolved>,
+    binding: Binding,
     record_type: &'static str,
     /// Senders of the dummy IOSCANPVT an invalid input record scans on.
     dummy_scan: Vec<Sender<()>>,
+    /// Why the latest pass has no current value or its write never landed.
+    fault: Option<Fault>,
+    /// The outcome of this record's queued reads.
+    read_failure: Arc<ReadFailure>,
+    /// The posts of the setup that just ran.
+    posts: Vec<DevicePost>,
+}
+
+#[derive(Clone, Copy)]
+enum Fault {
+    /// The unit was unreachable: a read had only the stale cache, or a
+    /// write never reached it.
+    Offline,
+    /// The unit answered the pass's queued read with an error.
+    ReadFailed,
 }
 
 impl MwDevice {
@@ -579,12 +663,101 @@ impl MwDevice {
         Self {
             registry,
             link_text,
+            name: String::new(),
+            db: None,
             is_io_intr: false,
-            resolved: None,
+            binding: Binding::Inert,
             record_type: "",
             dummy_scan: Vec::new(),
+            fault: None,
+            read_failure: Arc::default(),
+            posts: Vec::new(),
         }
     }
+
+    /// The deferred `init_record`, on the queue thread under the record's
+    /// lock, once the unit's first load completed: the record is checked and
+    /// seeded as a present-at-boot init does it, so an output takes the
+    /// unit's starting value over a put that failed before. Its alarm stays
+    /// the one its last pass set, or the one iocInit left if none ran.
+    fn settle(&mut self, record: &mut dyn Record, common: &mut CommonFields) {
+        let Binding::Waiting(waiting) = std::mem::replace(&mut self.binding, Binding::Inert) else {
+            return;
+        };
+        let Waiting {
+            instrument,
+            boot_alarm,
+            interrupt,
+        } = waiting;
+        let op = check_link(&self.link_text, &instrument, self.record_type);
+        if let Some(tx) = interrupt {
+            match op.and_then(|op| operation_interrupt_category(op, &instrument)) {
+                Some(category) => instrument.attach_interrupt(category, tx),
+                None => self.dummy_scan.push(tx),
+            }
+        }
+        let val = record.get_field("VAL");
+        let op = op.filter(|&op| seed_initial_value(&instrument, op, record).is_ok());
+        if let Some(op) = op {
+            replay_init_tail(record, common, init_outcome(op));
+        }
+        self.post_setup(record, common, boot_alarm, val);
+        self.binding = match op {
+            Some(op) => Binding::Bound(Resolved { instrument, op }),
+            None => Binding::Inert,
+        };
+    }
+
+    /// The posts C's `monitor` makes for a VAL the setup moved from `val`
+    /// and for `boot_alarm`, the alarm init replaced, put back.
+    fn post_setup(
+        &mut self,
+        record: &dyn Record,
+        common: &mut CommonFields,
+        boot_alarm: Option<(u16, AlarmSeverity)>,
+        val: Option<EpicsValue>,
+    ) {
+        let (prev_stat, prev_sevr) = (common.stat, common.sevr);
+        let (stat, sevr) = boot_alarm.unwrap_or((prev_stat, prev_sevr));
+        (common.stat, common.sevr) = (stat, sevr);
+        let reset = AlarmResetResult {
+            alarm_changed: (prev_stat, prev_sevr) != (stat, sevr),
+            prev_sevr,
+            prev_stat,
+            amsg_changed: false,
+            acks_posted: false,
+        };
+        let now = record.get_field("VAL");
+        let mut mask = EventMask::NONE;
+        if now != val {
+            mask |= EventMask::VALUE | EventMask::LOG;
+        }
+        if reset.alarm_changed {
+            mask |= EventMask::ALARM;
+        }
+        if let Some(value) = now.filter(|_| !mask.is_empty()) {
+            self.posts.push(DevicePost {
+                field: "VAL",
+                mask,
+                value,
+            });
+        }
+        self.posts.extend(DevicePost::alarm_reset(common, &reset));
+    }
+}
+
+/// The queue thread's run of a record's [`MwDevice::settle`].
+fn settle_on_load(db: Option<AsyncDbHandle>, name: &str) {
+    let Some(db) = db else {
+        return;
+    };
+    let posts = db.with_held(name, |instance| {
+        instance.with_device(|record, common, dev| {
+            dev.io_intr_callback(record, common);
+            dev.take_device_posts()
+        })
+    });
+    db.post_events(name, posts.flatten().unwrap_or_default());
 }
 
 impl DeviceSupport for MwDevice {
@@ -594,75 +767,184 @@ impl DeviceSupport for MwDevice {
 
     // C init_record failures are a silent `return 1` that leave
     // `invalid_flag` set (devMW100_ai.c:94-160): read/write then return 0
-    // and get_ioint_info hands out a dummy IOSCANPVT. `resolved == None` is
-    // that flag; `Err` would print and alarm.
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+    // and get_ioint_info hands out a dummy IOSCANPVT. `Binding::Inert` is
+    // that flag; `Err` would print and alarm. C's status 1 converts nothing
+    // (boRecord.c:159, mbboRecord.c:143), and neither does a record whose
+    // unit has not loaded: its `settle` converts.
+    fn init_common(
+        &mut self,
+        record: &mut dyn Record,
+        common: &mut CommonFields,
+    ) -> CaResult<DeviceInitOutcome> {
         self.record_type = record.record_type();
-        self.resolved = resolve_link(&self.registry, &self.link_text, record);
-        let Some(Resolved { op, .. }) = self.resolved else {
-            // C's status 1 converts nothing (boRecord.c:159, mbboRecord.c:143).
-            return Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched));
+        let unconverted = Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched));
+        let Some(instrument) =
+            link::parse_link(&self.link_text).and_then(|parsed| self.registry.get(parsed.device))
+        else {
+            self.binding = Binding::Inert;
+            return unconverted;
         };
-        // devMW100_ao.c:146-152 returns 2 and defines the VAL it seeded.
-        if record.record_type() == "ao" {
-            let udf = match op {
-                Operation::AnalogSet(_) => DeviceUdf::Defined,
-                _ => DeviceUdf::Untouched,
-            };
-            return Ok(DeviceInitOutcome::DoNotConvert(udf));
+        // devMW100_stringin.c:101-104 checks nothing on IP_ADDR, so the
+        // configured address is served from boot, loaded or not.
+        if let Some(op) = check_link(&self.link_text, &instrument, self.record_type)
+            .filter(|op| !op.reads_the_unit())
+        {
+            self.binding = Binding::Bound(Resolved { instrument, op });
+            return Ok(init_outcome(op));
         }
-        Ok(DeviceInitOutcome::ok())
+        let settle = {
+            let (db, name) = (self.db.clone(), self.name.clone());
+            move || settle_on_load(db, &name)
+        };
+        if instrument.after_first_load(settle) {
+            self.binding = Binding::Waiting(Waiting {
+                instrument,
+                boot_alarm: Some((common.stat, common.sevr)),
+                interrupt: None,
+            });
+            (common.stat, common.sevr) = (COMM_ALARM, AlarmSeverity::Invalid);
+            return unconverted;
+        }
+        let op = check_link(&self.link_text, &instrument, self.record_type)
+            .filter(|&op| seed_initial_value(&instrument, op, record).is_ok());
+        let Some(op) = op else {
+            self.binding = Binding::Inert;
+            return unconverted;
+        };
+        self.binding = Binding::Bound(Resolved { instrument, op });
+        Ok(init_outcome(op))
     }
 
-    fn set_record_info(&mut self, _name: &str, scan: ScanType) {
+    fn set_record_info(&mut self, name: &str, scan: ScanType) {
+        self.name = name.to_string();
         self.is_io_intr = matches!(scan, ScanType::IoIntr);
     }
 
-    fn io_intr_receiver(&mut self) -> Option<Receiver<()>> {
-        let Some(resolved) = self.resolved.as_ref() else {
-            // The input dsets hand an invalid record `dummy_ioscanpvt`, which
-            // nothing requests (devMW100_ai.c:171-172); ao/bo/mbbo have no
-            // get_ioint_info at all.
-            if !matches!(
-                self.record_type,
-                "ai" | "bi" | "longin" | "mbbi" | "stringin"
-            ) {
-                return None;
-            }
-            let (tx, rx) = mpsc::channel(1);
-            self.dummy_scan.push(tx);
-            return Some(rx);
-        };
-        let category = operation_interrupt_category(resolved.op, &resolved.instrument)?;
-        Some(resolved.instrument.register_interrupt(category))
+    fn bind_database(&mut self, db: AsyncDbHandle) {
+        self.db = Some(db);
     }
 
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
-            return Ok(DeviceReadOutcome::ok());
+    // The settle is this device's only callback under its record's lock.
+    fn io_intr_callback(
+        &mut self,
+        record: &mut dyn Record,
+        common: &mut CommonFields,
+    ) -> IoIntrAction {
+        self.settle(record, common);
+        IoIntrAction::Skip
+    }
+
+    fn take_device_posts(&mut self) -> Vec<DevicePost> {
+        std::mem::take(&mut self.posts)
+    }
+
+    fn io_intr_receiver(&mut self) -> Option<Receiver<()>> {
+        let waiting = match &mut self.binding {
+            Binding::Bound(resolved) => {
+                let category = operation_interrupt_category(resolved.op, &resolved.instrument)?;
+                return Some(resolved.instrument.register_interrupt(category));
+            }
+            Binding::Waiting(waiting) => Some(waiting),
+            Binding::Inert => None,
         };
-        let is_io_intr = self.is_io_intr;
+        // The input dsets hand an invalid record `dummy_ioscanpvt`, which
+        // nothing requests (devMW100_ai.c:171-172); ao/bo/mbbo have no
+        // get_ioint_info at all. A waiting record's sender is placed when
+        // the link is checked.
+        if !matches!(
+            self.record_type,
+            "ai" | "bi" | "longin" | "mbbi" | "stringin"
+        ) {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel(1);
+        match waiting {
+            Some(waiting) => waiting.interrupt = Some(tx),
+            None => self.dummy_scan.push(tx),
+        }
+        Some(rx)
+    }
+
+    // A VAL read that is not I/O Intr queues the channel's refresh and
+    // stays PACT; its re-entered pass reads the cache (devMW100_ai.c:192-208,
+    // devMW100_bi.c:261-280, devMW100_longin.c:214-233). The scan thread
+    // never waits on the instrument.
+    fn read_begin(
+        &mut self,
+        _record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<ReadStart> {
+        let Binding::Bound(Resolved { instrument, op }) = &self.binding else {
+            return Ok(ReadStart::Synchronous);
+        };
+        if self.is_io_intr || done.pact() {
+            return Ok(ReadStart::Synchronous);
+        }
+        let queued = match *op {
+            Operation::AnalogVal(addr) => instrument.channel_start(
+                addr.family,
+                addr.index,
+                done.device_done(),
+                &self.read_failure,
+            ),
+            Operation::IntegerVal(channel) | Operation::BinaryVal(channel) => instrument
+                .channel_start(
+                    ChannelFamily::Signal,
+                    channel,
+                    done.device_done(),
+                    &self.read_failure,
+                ),
+            _ => false,
+        };
+        Ok(if queued {
+            ReadStart::Pending
+        } else {
+            ReadStart::Synchronous
+        })
+    }
+
+    // C serves the cache as if current on an offline unit, and after the
+    // unit answered the queued read with an error: `load_input_values` and
+    // `load_output_values` return 1 and `command_process` drops it
+    // (drvMW100.c:1074-1075, 1162-1163, 1349-1394). This pass keeps the
+    // record's value and alarms instead. The configured address is the one
+    // value not read from the unit.
+    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        let (instrument, op) = match &mut self.binding {
+            Binding::Bound(Resolved { instrument, op }) => (instrument, op),
+            Binding::Waiting(waiting) => {
+                waiting.boot_alarm = None;
+                self.fault = Some(Fault::Offline);
+                return Ok(DeviceReadOutcome::failed());
+            }
+            Binding::Inert => {
+                self.fault = None;
+                return Ok(DeviceReadOutcome::ok());
+            }
+        };
+        let read_failed = self.read_failure.take();
+        self.fault = if op.reads_the_unit() && !instrument.online() {
+            Some(Fault::Offline)
+        } else if read_failed {
+            Some(Fault::ReadFailed)
+        } else {
+            None
+        };
+        if self.fault.is_some() {
+            return Ok(DeviceReadOutcome::failed());
+        }
         match *op {
             Operation::AnalogVal(addr) => {
-                if !is_io_intr {
-                    instrument.channel_start(addr.family, addr.index);
-                }
                 let v = instrument.analog_get(addr.family, addr.index);
                 record.put_field("VAL", EpicsValue::Double(v))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::IntegerVal(channel) => {
-                if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel);
-                }
                 let v = instrument.integer_get(channel);
                 record.put_field("VAL", EpicsValue::Long(v))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::BinaryVal(channel) => {
-                if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel);
-                }
                 let v = instrument.binary_get(channel);
                 record.put_field("RVAL", EpicsValue::ULong(v as u32))?;
                 Ok(DeviceReadOutcome::ok())
@@ -791,32 +1073,69 @@ impl DeviceSupport for MwDevice {
 
     // C write_* queues the command with the record and returns PACT; the
     // queue thread re-processes the record once it ran (drvMW100.c:1418-1424).
+    // A command nothing queued fails the pass now, where C's `qmesg` leaves
+    // the record PACT for good on a unit `init_mw100` gave up on. A unit that
+    // has not loaded since boot is offline the same way, and writes nothing.
     fn write_begin(
         &mut self,
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
-        let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
-            return Ok(WriteStart::Completed);
+        let queued = match &mut self.binding {
+            Binding::Bound(Resolved { instrument, op }) => {
+                let command = output_command(*op, record)?;
+                instrument.submit_write(command, done.device_done())
+            }
+            Binding::Waiting(waiting) => {
+                waiting.boot_alarm = None;
+                false
+            }
+            Binding::Inert => {
+                self.fault = None;
+                return Ok(WriteStart::Completed);
+            }
         };
-        let command = output_command(*op, record)?;
-        instrument.submit_write(command, done.device_done());
+        self.fault = (!queued).then_some(Fault::Offline);
+        if !queued {
+            return Err(CaError::LinkError(
+                "MW100 device support: unit offline".into(),
+            ));
+        }
         Ok(WriteStart::Pending)
     }
 
-    // devMW100_bo.c:192-197: the completing pass drops a REC_TRIG or
-    // REC_ERROR bo's VAL back to 0.
-    fn async_write_completed(&mut self, record: &mut dyn Record) {
-        if let Some(Resolved {
-            op:
-                Operation::InputTrig
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        let stat = match self.fault? {
+            Fault::Offline => COMM_ALARM,
+            Fault::ReadFailed => READ_ALARM,
+        };
+        Some(DeviceAlarm {
+            stat,
+            sevr: AlarmSeverity::Invalid as u16,
+            msg: "",
+        })
+    }
+
+    // A write whose exchange the link lost ends its pass with the alarm; one
+    // that landed defines the record, which C does on every completing pass
+    // (devMW100_bo.c:199). devMW100_bo.c:192-197: the completing pass drops a
+    // REC_TRIG or REC_ERROR bo's VAL back to 0.
+    fn async_write_completed_common(&mut self, record: &mut dyn Record, common: &mut CommonFields) {
+        let Binding::Bound(Resolved { instrument, op }) = &self.binding else {
+            return;
+        };
+        self.fault = (!instrument.online()).then_some(Fault::Offline);
+        if self.fault.is_none() {
+            common.udf = 0;
+        }
+        if matches!(
+            op,
+            Operation::InputTrig
                 | Operation::OutputTrig
                 | Operation::InfoTrig
                 | Operation::StatTrig
-                | Operation::ErrorClearSet,
-            ..
-        }) = self.resolved
-        {
+                | Operation::ErrorClearSet
+        ) {
             let _ = record.put_field("VAL", EpicsValue::Enum(0));
         }
     }
@@ -928,9 +1247,12 @@ pub fn factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instrument::READ_TIMEOUT;
     use crate::instrument::test_support::{
-        ascii_frame, connect_default_fixture, connect_fixture_then, empty_fo1_binary,
-        fe1_one_signal_channel, is0_all_zero, one_record_fd1_binary, spawn_fake_device,
+        absent_at_boot, ascii_frame, connect_default_fixture, connect_fixture_holding_then,
+        connect_fixture_then, empty_fo1_binary, fd1_binary_channel_1, fe1_one_signal_channel,
+        is0_all_zero, load_responses, one_record_fd1_binary, registry_with_offline,
+        spawn_fake_device, spawn_fake_device_sessions,
     };
     use epics_rs::base::runtime::task::test_block_on;
     use epics_rs::base::server::database::{DeviceDone, PvDatabase};
@@ -1332,7 +1654,9 @@ mod tests {
         };
         let mut device = f(&ctx).unwrap();
         let mut record = FakeRecord::new("ai");
-        device.init(&mut record).unwrap();
+        device
+            .init_common(&mut record, &mut CommonFields::default())
+            .unwrap();
     }
 
     #[test]
@@ -1354,7 +1678,7 @@ mod tests {
             let mut device = f(&ctx).unwrap();
             let mut record = FakeRecord::new(record_type);
             assert!(matches!(
-                device.init(&mut record),
+                device.init_common(&mut record, &mut CommonFields::default()),
                 Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched))
             ));
             assert_eq!(
@@ -1383,7 +1707,9 @@ mod tests {
         };
         let mut device = f(&ctx).unwrap();
         let mut record = FakeRecord::new("ai");
-        device.init(&mut record).unwrap();
+        device
+            .init_common(&mut record, &mut CommonFields::default())
+            .unwrap();
         device.set_record_info("TEST:AI", ScanType::IoIntr);
 
         let outcome = device.read(&mut record).unwrap();
@@ -1503,6 +1829,80 @@ mod tests {
         });
     }
 
+    /// Put `val` to `TEST.field`, and the pass it starts settle; the put's
+    /// own result.
+    async fn put_and_settle(
+        db: &PvDatabase,
+        field: &str,
+        val: EpicsValue,
+    ) -> epics_rs::base::error::CaResult<()> {
+        let put = db
+            .put_record_field_from_ca_no_notify("TEST", field, val)
+            .await;
+        for _ in 0..500 {
+            if !db.get_record("TEST").unwrap().read().is_processing() {
+                return put;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the queued write never completed");
+    }
+
+    fn udf_and_alarm(db: &PvDatabase) -> [EpicsValue; 3] {
+        ["UDF", "STAT", "SEVR"].map(|f| db.get_pv(format!("TEST.{f}")).unwrap())
+    }
+
+    /// devMW100_bo.c:199: a write's completing pass defines the record, so a
+    /// bo a client marked undefined is clean from its next pass.
+    #[test]
+    fn a_landed_write_clears_udf() {
+        test_block_on(async {
+            let (db, _device) = wired_output(
+                Box::new(BoRecord::new(0)),
+                "mw100dev INP_TRIG",
+                vec![one_record_fd1_binary(), one_record_fd1_binary()],
+            )
+            .await;
+            put_and_settle(&db, "UDF", EpicsValue::UChar(1))
+                .await
+                .unwrap();
+            put_and_settle(&db, "PROC", EpicsValue::Short(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                udf_and_alarm(&db),
+                [
+                    EpicsValue::UChar(0),
+                    EpicsValue::Short(0),
+                    EpicsValue::Short(0)
+                ]
+            );
+        });
+    }
+
+    /// A write queued on a unit that hung up once it loaded never lands, and
+    /// the record stays undefined.
+    #[test]
+    fn a_write_the_unit_never_got_leaves_udf_set() {
+        test_block_on(async {
+            let (db, device) =
+                wired_output(Box::new(BoRecord::new(0)), "mw100dev INP_TRIG", Vec::new()).await;
+            device.join().unwrap();
+            put_and_settle(&db, "UDF", EpicsValue::UChar(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                udf_and_alarm(&db),
+                [
+                    EpicsValue::UChar(1),
+                    EpicsValue::Short(17),
+                    EpicsValue::Short(3)
+                ],
+                "UDF, then UDF_ALARM, INVALID"
+            );
+        });
+    }
+
     #[test]
     fn write_begin_queues_the_write() {
         test_block_on(async {
@@ -1516,7 +1916,9 @@ mod tests {
             };
             let mut device = f(&ctx).unwrap();
             let mut record = FakeRecord::new("bo");
-            device.init(&mut record).unwrap();
+            device
+                .init_common(&mut record, &mut CommonFields::default())
+                .unwrap();
             record.fields.insert("VAL", EpicsValue::Enum(1));
             let db = PvDatabase::new();
             let cell = DeviceDone::new(
@@ -1532,7 +1934,7 @@ mod tests {
             assert!(matches!(start, WriteStart::Pending));
             // VAL drops to 0 on the completing pass, not while PACT holds.
             assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(1)));
-            device.async_write_completed(&mut record);
+            device.async_write_completed_common(&mut record, &mut CommonFields::default());
             assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
             assert_eq!(
                 device_thread.join().unwrap().last().unwrap(),
@@ -1631,12 +2033,807 @@ mod tests {
                 out,
             };
             let mut device = f(&ctx).unwrap();
-            device.init(&mut FakeRecord::new(record_type)).unwrap()
+            device
+                .init_common(
+                    &mut FakeRecord::new(record_type),
+                    &mut CommonFields::default(),
+                )
+                .unwrap()
         };
         assert_eq!(
             init("ao", "mw100dev VAL:K1"),
             DeviceInitOutcome::DoNotConvert(DeviceUdf::Defined)
         );
         assert_eq!(init("bo", "mw100dev INP_TRIG"), DeviceInitOutcome::ok());
+    }
+
+    // -- queue_func ends the passes it ran (drvMW100.c:1418-1424) --
+
+    const FULL_BAND_CHILD: &str = "MW100_FULL_BAND_CHILD";
+
+    /// Holds the low band's one worker until its `FullBand` drops.
+    #[derive(Clone, Default)]
+    struct Hold(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Hold {
+        fn wait(&self) {
+            let (open, wake) = &*self.0;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+        }
+    }
+
+    struct FullBand(Hold);
+
+    impl Drop for FullBand {
+        fn drop(&mut self) {
+            let (open, wake) = &*(self.0).0;
+            *open.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    /// Runs `body` in a child that re-runs `test`, with the low callback
+    /// band refusing work: its size and threads are set once per process,
+    /// before it arms. The records' PRIO is LOW.
+    fn with_full_low_band(test: &str, body: impl FnOnce()) {
+        use epics_rs::base::runtime::background::callback_executor::{
+            set_parallel_threads, set_queue_size,
+        };
+        use epics_rs::base::runtime::task::{
+            CallbackPriority, background_arm, background_callback_stats, spawn_blocking_background,
+        };
+        if std::env::var_os(FULL_BAND_CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture"])
+                .env(FULL_BAND_CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+        set_queue_size(1);
+        set_parallel_threads(1, Some(CallbackPriority::Low));
+        background_arm();
+        // A cell is never refused, so the worker is held and its one ring
+        // slot taken by ad-hoc requests until one is refused.
+        let low_overflows = || {
+            background_callback_stats(false).unwrap()[CallbackPriority::Low.index()].num_overflow
+        };
+        let hold = Hold::default();
+        let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let holder = hold.clone();
+        drop(spawn_blocking_background(
+            CallbackPriority::Low,
+            move |_| {
+                running_tx.send(()).unwrap();
+                holder.wait();
+            },
+        ));
+        running_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let refused = low_overflows() + 1;
+        let _full = (0..64)
+            .find_map(|_| {
+                let filler = hold.clone();
+                drop(spawn_blocking_background(
+                    CallbackPriority::Low,
+                    move |_| filler.wait(),
+                ));
+                (low_overflows() >= refused).then(|| FullBand(hold.clone()))
+            })
+            .expect("the low band never filled");
+        body();
+    }
+
+    /// `AI` reads channel 1 and `AO` writes K1 of one instrument, whose
+    /// fixture then answers `extra`; `AO`'s FLNK is `flnk`.
+    async fn ai_and_ao(
+        flnk: &str,
+        extra: Vec<Vec<u8>>,
+    ) -> (Arc<PvDatabase>, std::thread::JoinHandle<Vec<String>>) {
+        let (instrument, device) = connect_fixture_then(extra);
+        (ai_and_ao_on(flnk, instrument).await, device)
+    }
+
+    /// [`ai_and_ao`] on `instrument`.
+    async fn ai_and_ao_on(flnk: &str, instrument: Arc<Instrument>) -> Arc<PvDatabase> {
+        ai_and_ao_with(flnk, "", instrument).await
+    }
+
+    /// [`ai_and_ao_on`] beside the records `more`.
+    async fn ai_and_ao_with(
+        flnk: &str,
+        more: &str,
+        instrument: Arc<Instrument>,
+    ) -> Arc<PvDatabase> {
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
+        // mw100Support.dbd's ai and ao rows, as yokogawa-mw100-ioc lists them.
+        static AI: &[DevSup] = &[DevSup {
+            name: "devMW100_ai",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 3, 4], false),
+        }];
+        static AO: &[DevSup] = &[DevSup {
+            name: "devMW100_ao",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }];
+        let records = format!(
+            r#"
+record(ai, "AI") {{
+    field(DTYP, "{DTYP}")
+    field(INP, "@mw100dev VAL:1")
+}}
+record(ao, "AO") {{
+    field(DTYP, "{DTYP}")
+    field(OUT, "@mw100dev VAL:K1")
+    field(FLNK, "{flnk}")
+}}
+{more}
+"#
+        );
+        let (db, _) = IocBuilder::new()
+            .register_dynamic_device_support(
+                &[("ai", AI), ("ao", AO)],
+                factory(registry_with("mw100dev", instrument)),
+            )
+            .db_string(&records, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db
+    }
+
+    /// Whether `AI` and `AO` are still PACT after up to two seconds.
+    async fn pact_after_settling(db: &PvDatabase) -> [bool; 2] {
+        let pact = |name: &str| db.get_record(name).unwrap().read().is_processing();
+        for _ in 0..400 {
+            if !pact("AI") && !pact("AO") {
+                break;
+            }
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+        [pact("AI"), pact("AO")]
+    }
+
+    /// `records` over a unit that never connected.
+    async fn offline_db(records: &str) -> Arc<PvDatabase> {
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+        use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
+        static AI: &[DevSup] = &[DevSup {
+            name: "devMW100_ai",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 3, 4], false),
+        }];
+        static AO: &[DevSup] = &[DevSup {
+            name: "devMW100_ao",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 4], false),
+        }];
+        static STRINGIN: &[DevSup] = &[DevSup {
+            name: "devMW100_stringin",
+            choice: DTYP,
+            link_type: DbLinkType::InstIo,
+            dset: Dset::new(6, &[2, 3, 4], false),
+        }];
+        let (db, _) = IocBuilder::new()
+            .register_dynamic_device_support(
+                &[("ai", AI), ("ao", AO), ("stringin", STRINGIN)],
+                factory(registry_with_offline("mw100dev")),
+            )
+            .db_string(records, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        db
+    }
+
+    /// (PACT, STAT, SEVR) of `name`.
+    fn pact_and_alarm(db: &PvDatabase, name: &str) -> (bool, EpicsValue, EpicsValue) {
+        (
+            db.get_record(name).unwrap().read().is_processing(),
+            db.get_pv(format!("{name}.STAT")).unwrap(),
+            db.get_pv(format!("{name}.SEVR")).unwrap(),
+        )
+    }
+
+    /// A read on a unit that has not loaded since boot has nothing current
+    /// to serve: the pass that starts it ends it, keeps VAL and fails with
+    /// COMM_ALARM, INVALID.
+    #[test]
+    fn a_read_on_an_offline_unit_ends_its_pass_with_comm_alarm() {
+        let records = format!(
+            r#"record(ai, "AI") {{ field(DTYP, "{DTYP}") field(INP, "@mw100dev VAL:K1") field(VAL, "7") }}"#
+        );
+        test_block_on(async {
+            let db = offline_db(&records).await;
+            let put = db
+                .put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                .await;
+            assert_eq!(
+                pact_and_alarm(&db, "AI"),
+                (false, EpicsValue::Short(9), EpicsValue::Short(3)),
+                "PACT, STAT, SEVR"
+            );
+            assert!(put.is_err(), "the put fails with the pass");
+            assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(7.0));
+        });
+    }
+
+    /// A unit that has not loaded since boot is offline: a put to an output
+    /// on it writes nothing, and the pass that starts it ends it with
+    /// COMM_ALARM, INVALID.
+    #[test]
+    fn a_put_to_a_unit_that_never_loaded_ends_its_pass_with_comm_alarm() {
+        let records = format!(
+            r#"record(ao, "AO") {{ field(DTYP, "{DTYP}") field(OUT, "@mw100dev VAL:K1") }}"#
+        );
+        test_block_on(async {
+            let db = offline_db(&records).await;
+            let put = db
+                .put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                .await;
+            assert_eq!(pact_and_alarm(&db, "AO"), COMM_INVALID, "PACT, STAT, SEVR");
+            assert!(put.is_err(), "the put fails with the pass");
+        });
+    }
+
+    /// The configured address is not read from the unit, so a record
+    /// serving it works from boot, whether its unit ever loads or not.
+    #[test]
+    fn the_configured_address_is_served_before_the_unit_loads() {
+        let records = format!(
+            r#"record(stringin, "IP") {{ field(DTYP, "{DTYP}") field(INP, "@mw100dev IP_ADDR") }}"#
+        );
+        test_block_on(async {
+            let db = offline_db(&records).await;
+            let at_boot = pact_and_alarm(&db, "IP");
+            let put = db
+                .put_record_field_from_ca_no_notify("IP", "PROC", EpicsValue::Short(1))
+                .await;
+            assert_eq!(
+                (
+                    at_boot,
+                    pact_and_alarm(&db, "IP"),
+                    db.get_pv("IP.VAL").unwrap()
+                ),
+                (
+                    (false, EpicsValue::Short(17), EpicsValue::Short(3)),
+                    NO_ALARM,
+                    EpicsValue::String("127.0.0.1".into())
+                ),
+                "(PACT, STAT, SEVR) at boot and after a read, then VAL"
+            );
+            assert!(put.is_ok(), "{put:?}");
+        });
+    }
+
+    /// Waits up to five seconds for `AO` to leave the COMM_ALARM its unit's
+    /// absence at boot set.
+    async fn until_ao_settles(db: &PvDatabase) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pact_and_alarm(db, "AO") == COMM_INVALID && std::time::Instant::now() < deadline {
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// What `device` received, once it ended within five seconds.
+    async fn received_within(device: std::thread::JoinHandle<Vec<String>>) -> Option<Vec<String>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !device.is_finished() && std::time::Instant::now() < deadline {
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+        }
+        device.is_finished().then(|| device.join().unwrap())
+    }
+
+    /// The commands of a present unit's boot load.
+    fn boot_load_commands() -> Vec<String> {
+        connect_fixture_then(Vec::new()).1.join().unwrap()
+    }
+
+    /// Records on a unit absent at boot start in COMM_ALARM, INVALID. Once
+    /// the unit loads, `AO` holds what a present unit's boot leaves it,
+    /// its starting value included, and both records are served.
+    #[test]
+    fn records_on_a_unit_absent_at_boot_are_served_once_it_loads() {
+        test_block_on(async {
+            let present = {
+                let db = ai_and_ao_on("", connect_default_fixture()).await;
+                (pact_and_alarm(&db, "AO"), db.get_pv("AO.VAL").unwrap())
+            };
+            let mut responses = load_responses();
+            responses.extend([fd1_binary_channel_1(5678), b"E0\r\n".to_vec()]);
+            let (instrument, appear, device) = absent_at_boot(responses);
+            let db = ai_and_ao_on("", instrument).await;
+            let before = [pact_and_alarm(&db, "AI"), pact_and_alarm(&db, "AO")];
+            appear.send(()).unwrap();
+            until_ao_settles(&db).await;
+            let loaded = (pact_and_alarm(&db, "AO"), db.get_pv("AO.VAL").unwrap());
+            let read = proc_ai(&db).await;
+            let _ = db
+                .put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                .await;
+            pact_after_settling(&db).await;
+            let written = pact_and_alarm(&db, "AO");
+            assert_eq!(
+                (before, loaded, read, written),
+                (
+                    [COMM_INVALID, COMM_INVALID],
+                    present,
+                    (NO_ALARM, EpicsValue::Double(5.678)),
+                    NO_ALARM
+                ),
+                "AI and AO before the load, AO after it, then a read of AI and a write of AO"
+            );
+            let mut wire = boot_load_commands();
+            wire.extend(["FD1,001,001\r\n".to_string(), "SKK01,2.5\r\n".to_string()]);
+            assert_eq!(received_within(device).await, Some(wire));
+        });
+    }
+
+    /// A channel the unit turns out not to have when it loads late leaves
+    /// its record as the boot check on a present unit leaves it: inert.
+    #[test]
+    fn a_link_the_late_load_rejects_leaves_its_record_inert() {
+        let bad = format!(
+            r#"record(ai, "BAD") {{ field(DTYP, "{DTYP}") field(INP, "@mw100dev VAL:7") }}"#
+        );
+        test_block_on(async {
+            let proc_bad = |db: Arc<PvDatabase>| async move {
+                let _ = db
+                    .put_record_field_from_ca_no_notify("BAD", "PROC", EpicsValue::Short(1))
+                    .await;
+                epics_rs::base::runtime::task::sleep(Duration::from_millis(50)).await;
+                (pact_and_alarm(&db, "BAD"), db.get_pv("BAD.VAL").unwrap())
+            };
+            let present = proc_bad(ai_and_ao_with("", &bad, connect_default_fixture()).await).await;
+            let (instrument, appear, _device) = absent_at_boot(load_responses());
+            let db = ai_and_ao_with("", &bad, instrument).await;
+            let before = proc_bad(db.clone()).await;
+            appear.send(()).unwrap();
+            until_ao_settles(&db).await;
+            let after = proc_bad(db.clone()).await;
+            assert_eq!(
+                [before, after],
+                [(COMM_INVALID, EpicsValue::Double(0.0)), present],
+                "(PACT, STAT, SEVR) and VAL after a read before the load and after it"
+            );
+        });
+    }
+
+    /// A put made before the unit's first load fails as on any offline unit
+    /// and never reaches it; the load then gives `AO` the unit's starting
+    /// value, as a present unit's boot does, and the next put is written.
+    #[test]
+    fn a_put_before_the_first_load_writes_nothing_and_the_load_seeds_val() {
+        test_block_on(async {
+            let starting_val = ai_and_ao_on("", connect_default_fixture())
+                .await
+                .get_pv("AO.VAL")
+                .unwrap();
+            let mut responses = load_responses();
+            responses.push(b"E0\r\n".to_vec());
+            let (instrument, appear, device) = absent_at_boot(responses);
+            let db = ai_and_ao_on("", instrument.clone()).await;
+            let early = db
+                .put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                .await;
+            let failed = pact_and_alarm(&db, "AO");
+            appear.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !instrument.online() && std::time::Instant::now() < deadline {
+                epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+            }
+            let loaded = (pact_and_alarm(&db, "AO"), db.get_pv("AO.VAL").unwrap());
+            let late = db
+                .put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(3.5))
+                .await;
+            pact_after_settling(&db).await;
+            assert_eq!(
+                (failed, loaded, pact_and_alarm(&db, "AO")),
+                (COMM_INVALID, (COMM_INVALID, starting_val), NO_ALARM),
+                "AO after the early put, after the load, after the late put"
+            );
+            assert!(early.is_err(), "the early put fails with its pass");
+            assert!(late.is_ok(), "{late:?}");
+            let mut wire = boot_load_commands();
+            wire.push("SKK01,3.5\r\n".to_string());
+            assert_eq!(received_within(device).await, Some(wire));
+        });
+    }
+
+    /// `AI` read and `AO` written once, then let settle. A put fails when
+    /// its pass ends at once, which is not what these tests look at.
+    async fn read_and_write(db: &PvDatabase) {
+        let _ = db
+            .put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+            .await;
+        let _ = db
+            .put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+            .await;
+        pact_after_settling(db).await;
+    }
+
+    /// (PACT, STAT, SEVR) and VAL of `AI` once a read of it settled.
+    async fn proc_ai(db: &PvDatabase) -> ((bool, EpicsValue, EpicsValue), EpicsValue) {
+        db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+            .await
+            .unwrap();
+        pact_after_settling(db).await;
+        (pact_and_alarm(db, "AI"), db.get_pv("AI.VAL").unwrap())
+    }
+
+    const COMM_INVALID: (bool, EpicsValue, EpicsValue) =
+        (false, EpicsValue::Short(9), EpicsValue::Short(3));
+    const NO_ALARM: (bool, EpicsValue, EpicsValue) =
+        (false, EpicsValue::Short(0), EpicsValue::Short(0));
+
+    /// The unit hangs up once it loaded: the read finds no reply and keeps
+    /// VAL, the write never lands, and both passes end with COMM_ALARM.
+    #[test]
+    fn a_link_lost_after_boot_ends_reads_and_writes_with_comm_alarm() {
+        test_block_on(async {
+            let (db, _device) = ai_and_ao("", Vec::new()).await;
+            read_and_write(&db).await;
+            assert_eq!(
+                [pact_and_alarm(&db, "AI"), pact_and_alarm(&db, "AO")],
+                [COMM_INVALID, COMM_INVALID],
+                "PACT, STAT, SEVR of AI and AO"
+            );
+            assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(0.0));
+        });
+    }
+
+    /// An I/O Intr record scans once on each change of the link: losing the
+    /// unit ends its pass with COMM_ALARM, INVALID, and the unit's return
+    /// clears that at once. A further exchange that changes nothing scans
+    /// nothing. `CNT` counts the record's passes; the unit's frames carry
+    /// the cached 1.234, so the value IN reads does not depend on timing.
+    #[test]
+    fn io_intr_records_scan_once_on_each_change_of_the_link() {
+        test_block_on(async {
+            let (instrument, _device) = connect_fixture_then(vec![
+                b"XX\r\n".to_vec(),
+                b"XX\r\n".to_vec(),
+                one_record_fd1_binary(),
+                one_record_fd1_binary(),
+            ]);
+            let more = format!(
+                r#"
+record(ai, "IN") {{
+    field(DTYP, "{DTYP}")
+    field(INP, "@mw100dev VAL:1")
+    field(SCAN, "I/O Intr")
+    field(FLNK, "CNT")
+}}
+record(calc, "CNT") {{ field(CALC, "A+1") field(INPA, "CNT") }}
+"#
+            );
+            let db = ai_and_ao_with("", &more, instrument).await;
+            // `iocRun`: I/O Intr pulses may now process.
+            db.scan_control().run();
+            let mut trace = Vec::new();
+            for passes in [1.0, 1.0, 2.0, 2.0] {
+                proc_ai(&db).await;
+                for _ in 0..400 {
+                    if db.get_pv("CNT.VAL").unwrap() == EpicsValue::Double(passes) {
+                        break;
+                    }
+                    epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+                }
+                epics_rs::base::runtime::task::sleep(Duration::from_millis(50)).await;
+                trace.push((
+                    pact_and_alarm(&db, "IN"),
+                    db.get_pv("IN.VAL").unwrap(),
+                    db.get_pv("CNT.VAL").unwrap(),
+                ));
+            }
+            let at =
+                |alarm, val, passes| (alarm, EpicsValue::Double(val), EpicsValue::Double(passes));
+            assert_eq!(
+                trace,
+                [
+                    at(COMM_INVALID, 0.0, 1.0),
+                    at(COMM_INVALID, 0.0, 1.0),
+                    at(NO_ALARM, 1.234, 2.0),
+                    at(NO_ALARM, 1.234, 2.0),
+                ],
+                "IN's (PACT, STAT, SEVR), VAL and passes after the read that loses \
+                 the unit, a second failed read, the read the unit answers, and one more"
+            );
+        });
+    }
+
+    /// A reply that is no frame alarms the read; the unit's next whole
+    /// frame clears it and serves the value it carried.
+    #[test]
+    fn a_good_exchange_after_a_wire_error_clears_the_alarm() {
+        test_block_on(async {
+            let (db, _device) =
+                ai_and_ao("", vec![b"XX\r\n".to_vec(), fd1_binary_channel_1(5678)]).await;
+            let after_wire_error = proc_ai(&db).await;
+            let after_good_frame = proc_ai(&db).await;
+            assert_eq!(
+                [after_wire_error, after_good_frame],
+                [
+                    (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (NO_ALARM, EpicsValue::Double(5.678))
+                ],
+                "(PACT, STAT, SEVR) and VAL after each read"
+            );
+        });
+    }
+
+    /// A unit that stops answering ends the read with COMM_ALARM once
+    /// READ_TIMEOUT passes, and the reply it sends after that answers no
+    /// later read.
+    #[test]
+    fn a_read_the_unit_never_answers_ends_with_comm_alarm() {
+        test_block_on(async {
+            let (late, gate) = std::sync::mpsc::channel();
+            let (instrument, _device) = connect_fixture_holding_then(
+                vec![fd1_binary_channel_1(5678), fd1_binary_channel_1(5678)],
+                gate,
+            );
+            let db = ai_and_ao_on("", instrument).await;
+            let mut ends = Vec::new();
+            for _ in 0..2 {
+                let _ = db
+                    .put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                    .await;
+                let deadline = std::time::Instant::now() + READ_TIMEOUT + Duration::from_secs(3);
+                while pact_and_alarm(&db, "AI").0 && std::time::Instant::now() < deadline {
+                    epics_rs::base::runtime::task::sleep(Duration::from_millis(5)).await;
+                }
+                ends.push((pact_and_alarm(&db, "AI"), db.get_pv("AI.VAL").unwrap()));
+                let _ = late.send(());
+            }
+            assert_eq!(
+                ends,
+                [
+                    (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (COMM_INVALID, EpicsValue::Double(0.0))
+                ],
+                "(PACT, STAT, SEVR) and VAL after the read with no reply and the next"
+            );
+        });
+    }
+
+    /// A reachable unit that answers the read with a device error has no
+    /// current value for it: the pass keeps VAL and ends with READ_ALARM,
+    /// INVALID. The next read the unit answers with data clears it.
+    /// `AI` over a unit that plays `sessions`, one per connection: (PACT,
+    /// STAT, SEVR) and VAL after the read right after the boot load, and
+    /// after the first later read that does not end with COMM_ALARM, if one
+    /// does within five seconds.
+    async fn reads_across_a_reconnect(
+        sessions: Vec<Vec<Vec<u8>>>,
+    ) -> (
+        [((bool, EpicsValue, EpicsValue), EpicsValue); 2],
+        std::thread::JoinHandle<Vec<Vec<String>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device_sessions(listener, sessions);
+        let db = ai_and_ao_on("", Instrument::connect_to(addr).unwrap()).await;
+        let read = || async {
+            let _ = db
+                .put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                .await;
+            pact_after_settling(&db).await;
+            (pact_and_alarm(&db, "AI"), db.get_pv("AI.VAL").unwrap())
+        };
+        let first = read().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut later = read().await;
+        while later.0 == COMM_INVALID && std::time::Instant::now() < deadline {
+            epics_rs::base::runtime::task::sleep(Duration::from_millis(50)).await;
+            later = read().await;
+        }
+        ([first, later], device)
+    }
+
+    /// A unit that hangs up after it loaded fails the next read with
+    /// COMM_ALARM; once it accepts a connection again it is loaded as at
+    /// boot and reads are answered again.
+    #[test]
+    fn a_unit_that_hangs_up_is_loaded_again_and_read() {
+        test_block_on(async {
+            let mut back = load_responses();
+            back.push(fd1_binary_channel_1(5678));
+            let (ends, device) = reads_across_a_reconnect(vec![load_responses(), back]).await;
+            assert_eq!(
+                ends,
+                [
+                    (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (NO_ALARM, EpicsValue::Double(5.678))
+                ],
+                "(PACT, STAT, SEVR) and VAL after the read the hang-up fails and the next answered"
+            );
+            let received = device.join().unwrap();
+            assert_eq!(
+                received[1][..received[0].len()],
+                received[0],
+                "the commands of the load at boot and of the load on the new connection"
+            );
+        });
+    }
+
+    /// A unit that hangs up again in the middle of the load on a new
+    /// connection is connected to and loaded once more.
+    #[test]
+    fn a_load_the_unit_cuts_short_is_tried_again() {
+        test_block_on(async {
+            let mut back = load_responses();
+            back.push(fd1_binary_channel_1(5678));
+            let (ends, _device) =
+                reads_across_a_reconnect(vec![load_responses(), Vec::new(), back]).await;
+            assert_eq!(
+                ends,
+                [
+                    (COMM_INVALID, EpicsValue::Double(0.0)),
+                    (NO_ALARM, EpicsValue::Double(5.678))
+                ],
+                "(PACT, STAT, SEVR) and VAL after the read the hang-up fails and the next answered"
+            );
+        });
+    }
+
+    #[test]
+    fn a_device_error_reply_to_a_read_ends_its_pass_with_read_alarm() {
+        test_block_on(async {
+            let (db, _device) = ai_and_ao(
+                "",
+                vec![b"E1 205 x\r\n".to_vec(), fd1_binary_channel_1(5678)],
+            )
+            .await;
+            let after_device_error = proc_ai(&db).await;
+            let after_data = proc_ai(&db).await;
+            assert_eq!(
+                [after_device_error, after_data],
+                [
+                    (
+                        (false, EpicsValue::Short(1), EpicsValue::Short(3)),
+                        EpicsValue::Double(0.0)
+                    ),
+                    (NO_ALARM, EpicsValue::Double(5.678))
+                ],
+                "(PACT, STAT, SEVR) and VAL after each read"
+            );
+        });
+    }
+
+    /// Nothing serves a unit whose queue thread panicked: its cache is
+    /// never refreshed again, so reads and writes end with COMM_ALARM.
+    #[test]
+    fn a_panicked_queue_thread_ends_reads_and_writes_with_comm_alarm() {
+        test_block_on(async {
+            let (instrument, _device) = connect_fixture_then(Vec::new());
+            let db = ai_and_ao_on("", instrument.clone()).await;
+            instrument.panic_queue_thread();
+            read_and_write(&db).await;
+            assert_eq!(
+                [pact_and_alarm(&db, "AI"), pact_and_alarm(&db, "AO")],
+                [COMM_INVALID, COMM_INVALID],
+                "PACT, STAT, SEVR of AI and AO"
+            );
+            assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(0.0));
+        });
+    }
+
+    /// A read and a write queued behind the job that panics the queue
+    /// thread never run, so their passes end with COMM_ALARM as it unwinds.
+    #[test]
+    fn records_queued_when_the_queue_thread_panics_end_their_passes_with_comm_alarm() {
+        test_block_on(async {
+            let (instrument, _device) = connect_fixture_then(Vec::new());
+            let db = ai_and_ao_on("", instrument.clone()).await;
+            let fire = instrument.queue_panic();
+            db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                .await
+                .unwrap();
+            db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                .await
+                .unwrap();
+            fire.send(()).unwrap();
+            pact_after_settling(&db).await;
+            assert_eq!(
+                [pact_and_alarm(&db, "AI"), pact_and_alarm(&db, "AO")],
+                [COMM_INVALID, COMM_INVALID],
+                "PACT, STAT, SEVR of AI and AO"
+            );
+            assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(0.0));
+        });
+    }
+
+    /// A read and a write whose command is running when the queue thread
+    /// panics end their passes with COMM_ALARM as it unwinds.
+    #[test]
+    fn records_running_when_the_queue_thread_panics_end_their_passes_with_comm_alarm() {
+        test_block_on(async {
+            let mut ends = Vec::new();
+            for (record, field, value) in [
+                ("AI", "PROC", EpicsValue::Short(1)),
+                ("AO", "VAL", EpicsValue::Double(2.5)),
+            ] {
+                let (instrument, _device) = connect_fixture_then(Vec::new());
+                let db = ai_and_ao_on("", instrument.clone()).await;
+                instrument.panic_in_next_command();
+                db.put_record_field_from_ca_no_notify(record, field, value)
+                    .await
+                    .unwrap();
+                pact_after_settling(&db).await;
+                ends.push((record, pact_and_alarm(&db, record)));
+            }
+            assert_eq!(
+                ends,
+                [("AI", COMM_INVALID), ("AO", COMM_INVALID)],
+                "each record's PACT, STAT, SEVR"
+            );
+        });
+    }
+
+    #[test]
+    fn a_read_and_a_write_end_on_the_queue_thread_while_their_band_is_full() {
+        with_full_low_band(
+            "device_support::tests::a_read_and_a_write_end_on_the_queue_thread_while_their_band_is_full",
+            || {
+                test_block_on(async {
+                    let (db, device) =
+                        ai_and_ao("", vec![fd1_binary_channel_1(5678), b"E0\r\n".to_vec()]).await;
+                    db.put_record_field_from_ca_no_notify("AI", "PROC", EpicsValue::Short(1))
+                        .await
+                        .unwrap();
+                    db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                        .await
+                        .unwrap();
+                    assert_eq!(pact_after_settling(&db).await, [false, false], "PACT");
+                    assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(5.678));
+                    assert_eq!(
+                        device.join().unwrap()[12..],
+                        ["FD1,001,001\r\n", "SKK01,2.5\r\n"]
+                    );
+                });
+            },
+        );
+    }
+
+    /// The write's completing pass runs on the queue thread, and its FLNK
+    /// reads the same instrument: that read must queue, not wait on the
+    /// thread running it.
+    #[test]
+    fn a_write_whose_flnk_reads_the_same_instrument_ends_both_passes() {
+        with_full_low_band(
+            "device_support::tests::a_write_whose_flnk_reads_the_same_instrument_ends_both_passes",
+            || {
+                test_block_on(async {
+                    let (db, device) =
+                        ai_and_ao("AI", vec![b"E0\r\n".to_vec(), fd1_binary_channel_1(5678)]).await;
+                    db.put_record_field_from_ca_no_notify("AO", "VAL", EpicsValue::Double(2.5))
+                        .await
+                        .unwrap();
+                    assert_eq!(pact_after_settling(&db).await, [false, false], "PACT");
+                    assert_eq!(db.get_pv("AI.VAL").unwrap(), EpicsValue::Double(5.678));
+                    assert_eq!(
+                        device.join().unwrap()[12..],
+                        ["SKK01,2.5\r\n", "FD1,001,001\r\n"]
+                    );
+                });
+            },
+        );
     }
 }

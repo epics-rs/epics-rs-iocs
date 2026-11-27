@@ -53,10 +53,19 @@ pub(crate) fn start_acquisition_task(
     let status_params = ctx.ad_params;
     let init_param = ctx.init_param;
 
-    let data = rt::run_thread_named("MerlinDataTask", move || data_loop(ctx));
-    let status = rt::run_thread_named("MerlinStatusTask", move || {
-        status_loop(status_handle, status_params, init_param)
-    });
+    // As C creates merlinTask and merlinStatus (merlinDetector.cpp:1516-1529).
+    let data = rt::run_thread_named(
+        "MerlinDataTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || data_loop(ctx),
+    );
+    let status = rt::run_thread_named(
+        "MerlinStatusTask",
+        rt::ThreadPriority::Medium,
+        rt::StackSizeClass::Medium,
+        move || status_loop(status_handle, status_params, init_param),
+    );
     (data, status)
 }
 
@@ -102,7 +111,7 @@ async fn status_loop(handle: PortHandle, ad: ADBaseParams, init_param: usize) {
     }
 }
 
-async fn data_loop(ctx: AcquisitionContext) {
+pub(crate) async fn data_loop(ctx: AcquisitionContext) {
     // Do not read the data channel before the IOC is up: the server can be
     // mid-flight with frames from a previous run.
     while ctx.shared.starting_up.load(Ordering::Acquire) {
@@ -116,6 +125,9 @@ async fn data_loop(ctx: AcquisitionContext) {
     let mut acquisition_header = String::new();
 
     loop {
+        // C takes the frame's timeStamp before it waits for the frame
+        // (merlinDetector.cpp:101-112).
+        let start = EpicsTimestamp::now();
         let body = match ctx.data.read_frame(timeout) {
             Ok(b) => b,
             // An idle detector sends nothing; that is not an error.
@@ -137,7 +149,7 @@ async fn data_loop(ctx: AcquisitionContext) {
             }
         };
 
-        handle_frame(&ctx, &body, &mut acquisition_header).await;
+        handle_frame(&ctx, &body, start, &mut acquisition_header).await;
     }
 }
 
@@ -162,12 +174,12 @@ fn step<R: Default + Send + 'static>(
 pub(crate) async fn handle_frame(
     ctx: &AcquisitionContext,
     body: &[u8],
+    start: EpicsTimestamp,
     acquisition_header: &mut String,
 ) {
     let Ok(mut held) = ctx.handle.hold_driver_blocking::<MerlinDetector>() else {
         return;
     };
-    let start = EpicsTimestamp::now();
     let header = protocol::data_header(body);
     let (ad, params) = (ctx.ad_params, ctx.params);
 

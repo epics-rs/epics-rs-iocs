@@ -38,10 +38,12 @@
 //! sensor type into `PTYP_RB`. `set_closed_loop`/`set_pid_gain` are no-ops
 //! (as in C).
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use epics_libcom_rs::runtime::scanf::{ScanTarget, sscanf};
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{
@@ -60,7 +62,6 @@ use epics_rs::motor::controller_port::{
 use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::connect::{connect_controller, set_eos_ignored};
-use motor_common::util::atoi;
 use motor_common::{ControllerParams, controller_status};
 
 /// Response buffer size.
@@ -163,39 +164,39 @@ fn mcs_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Parse a `:<CMD><axis>,<value>` reply into (is-error-command, last value).
-/// The MCS error convention is applied by callers: an `E` command with a
-/// non-zero value is an error, `E…,0` is an acknowledgement.
-fn parse_reply(reply: &str) -> Option<(bool, i32)> {
-    let s = reply.trim().strip_prefix(':')?;
-    let cmd_end = s.find(|c: char| !c.is_ascii_uppercase())?;
-    if cmd_end == 0 {
+/// C `sscanf(reply, fmt, cmd, ..)` over C's `char cmd[10]`: whether `cmd`
+/// starts with `E`, and the `N` numbers after it, read at 64 bits so that one
+/// C wraps into its `int` is `None`; `None` unless all `N` convert.
+fn scan_reply<const N: usize>(reply: &str, fmt: &str) -> Option<(bool, [i32; N])> {
+    let cmd = RefCell::new([0u8; 10]);
+    let nums = [(); N].map(|()| Cell::new(0i64));
+    let mut out: Vec<&dyn ScanTarget> = vec![&cmd];
+    out.extend(nums.iter().map(|n| n as &dyn ScanTarget));
+    if sscanf(reply, fmt, &out) != N as i32 + 1 {
         return None;
     }
-    let is_err = s.as_bytes()[0] == b'E';
-    let rest = &s[cmd_end..]; // "<axis>,<value>[,...]"
-    let comma = rest.find(',')?;
-    let tail = &rest[comma + 1..];
-    let val_end = tail.find(',').unwrap_or(tail.len());
-    Some((is_err, atoi(tail[..val_end].trim())))
+    let mut vals = [0; N];
+    for (val, num) in vals.iter_mut().zip(&nums) {
+        *val = num.get().try_into().ok()?;
+    }
+    Some((cmd.borrow()[0] == b'E', vals))
+}
+
+/// Parse a `:<CMD><axis>,<value>` reply into (is-error-command, value), as C
+/// `parseReply` scans it. The MCS error convention is applied by callers: an
+/// `E` command with a non-zero value is an error, `E…,0` is an
+/// acknowledgement.
+fn parse_reply(reply: &str) -> Option<(bool, i32)> {
+    let (is_err, [_axis, val]) = scan_reply(reply, ":%10[A-Z]%lli,%lli")?;
+    Some((is_err, val))
 }
 
 /// Parse a `:<CMD><axis>,<angle>,<rev>` rotary reply into (is-error-command,
-/// angle, revolutions). Returns `None` unless all three numbers are present
-/// (an error reply carries fewer fields and fails to parse, matching C).
+/// angle, revolutions), as C `parseAngle` scans it: an error reply carries
+/// fewer fields and fails to parse.
 fn parse_angle(reply: &str) -> Option<(bool, i32, i32)> {
-    let s = reply.trim().strip_prefix(':')?;
-    let cmd_end = s.find(|c: char| !c.is_ascii_uppercase())?;
-    if cmd_end == 0 {
-        return None;
-    }
-    let is_err = s.as_bytes()[0] == b'E';
-    let rest = &s[cmd_end..]; // "<axis>,<angle>,<rev>"
-    let parts: Vec<&str> = rest.splitn(3, ',').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    Some((is_err, atoi(parts[1].trim()), atoi(parts[2].trim())))
+    let (is_err, [_axis, angle, rev]) = scan_reply(reply, ":%10[A-Z]%lli,%lli,%lli")?;
+    Some((is_err, angle, rev))
 }
 
 /// What C keeps per axis that the controller's writes reach as well.
@@ -801,6 +802,28 @@ mod tests {
         assert_eq!(rev, 2);
         // An error reply has too few fields to be an angle.
         assert!(parse_angle(":E0,5").is_none());
+    }
+
+    /// smarActMCSMotorDriver.cpp:127 and :155 scan replies with
+    /// `":%10[A-Z]%i,%i"` and `":%10[A-Z]%i,%i,%i"`.
+    #[test]
+    fn replies_are_scanned_as_c_sscanf() {
+        // `%i` takes the base from the prefix.
+        assert_eq!(parse_reply(":P0,0x1F"), Some((false, 31)));
+        assert_eq!(parse_reply(":P0,010"), Some((false, 8)));
+        assert_eq!(parse_reply(":P0, 12x"), Some((false, 12)));
+        assert_eq!(parse_angle(":GA0,0x10,2"), Some((false, 16, 2)));
+        // The axis must convert, with the comma right after it.
+        assert_eq!(parse_reply(":P,5"), None);
+        assert_eq!(parse_reply(":Px,5"), None);
+        assert_eq!(parse_reply(":P0 ,5"), None);
+        assert_eq!(parse_angle(":GA,0,2"), None);
+        assert_eq!(parse_reply(" :P0,5"), None);
+        // `%10[A-Z]` stops at ten letters, so `%i` meets the eleventh.
+        assert_eq!(parse_reply(":ABCDEFGHIJ0,5"), Some((false, 5)));
+        assert_eq!(parse_reply(":ABCDEFGHIJK0,5"), None);
+        // C wraps this into its `int`.
+        assert_eq!(parse_reply(":P0,3000000000"), None);
     }
 
     #[test]

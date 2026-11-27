@@ -10,7 +10,10 @@
 //! every command and splits replies on the `0x18` (CAN) byte camserver sends
 //! after each reply. The strings below therefore carry no terminator.
 
+use std::cell::Cell;
+
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use crate::types::{GAIN_STRINGS, TriggerMode};
@@ -36,23 +39,6 @@ pub(crate) fn scan_i32(s: &str) -> Option<(i32, &str)> {
         (_, 0) => None,
         (v, end) => Some((long_to_int(v), &s[end..])),
     }
-}
-
-/// `%f`: skip leading whitespace, then read the longest prefix `strtod` would
-/// accept from the decimal grammar. Backtracks like `strtod` does, so
-/// `"31.4C"` yields `31.4` and leaves `"C"`.
-fn scan_f32(s: &str) -> Option<(f32, &str)> {
-    let s = skip_ws(s);
-    let candidate_len = s
-        .bytes()
-        .take_while(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'))
-        .count();
-    for end in (1..=candidate_len).rev() {
-        if let Ok(v) = s[..end].parse::<f32>() {
-            return Some((v, &s[end..]));
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -277,40 +263,13 @@ pub fn parse_version(reply: &str) -> Option<VersionInfo> {
 pub fn parse_thread_channel(reply: &str, channel: u8) -> Option<(Option<f32>, Option<f32>)> {
     let key = format!("Channel {channel}");
     let idx = reply.find(&key)?;
-    let s = &reply[idx + key.len()..];
-
-    let scan = || -> (Option<f32>, Option<f32>) {
-        let Some(s) = expect_lit(s, ":") else {
-            return (None, None);
-        };
-        let Some(s) = expect_lit(skip_ws(s), "Temperature") else {
-            return (None, None);
-        };
-        let Some(s) = expect_lit(skip_ws(s), "=") else {
-            return (None, None);
-        };
-        let Some((temp, s)) = scan_f32(s) else {
-            return (None, None);
-        };
-        let Some(s) = expect_lit(s, "C,") else {
-            return (Some(temp), None);
-        };
-        let Some(s) = expect_lit(skip_ws(s), "Rel.") else {
-            return (Some(temp), None);
-        };
-        let Some(s) = expect_lit(skip_ws(s), "Humidity") else {
-            return (Some(temp), None);
-        };
-        let Some(s) = expect_lit(skip_ws(s), "=") else {
-            return (Some(temp), None);
-        };
-        match scan_f32(s) {
-            Some((humid, _)) => (Some(temp), Some(humid)),
-            None => (Some(temp), None),
-        }
-    };
-
-    Some(scan())
+    let (temp, humid) = (Cell::new(0f32), Cell::new(0f32));
+    let n = sscanf(
+        &reply.as_bytes()[idx..],
+        format!("{key}: Temperature = %fC, Rel. Humidity = %f"),
+        &[&temp, &humid],
+    );
+    Some(((n >= 1).then(|| temp.get()), (n >= 2).then(|| humid.get())))
 }
 
 /// Resolve one thermistor channel's `(temperature, humidity)` from a `thread`
@@ -639,14 +598,23 @@ mod tests {
         assert_eq!(thread_channel_values(reply, 1), Some((25.8f32 as f64, 0.0)));
     }
 
+    /// glibc's `%f` cannot push back the `x` of `0x`, an exponent marker
+    /// with no digit after it, or the `i` of `infi`: the scan fails there.
     #[test]
-    fn scan_f32_backtracks_like_strtod() {
-        assert_eq!(scan_f32("31.4C").unwrap().0, 31.4);
-        assert_eq!(scan_f32("31.4C").unwrap().1, "C");
-        // Trailing 'e' has no exponent digits; strtod backtracks to "31.4".
-        assert_eq!(scan_f32("31.4eC").unwrap().0, 31.4);
-        assert_eq!(scan_f32("22.1%").unwrap().1, "%");
-        assert!(scan_f32("abc").is_none());
+    fn a_float_cut_short_fails_the_scan() {
+        let humid = |v: &str| {
+            let reply = format!("Channel 0: Temperature = 1C, Rel. Humidity = {v}%");
+            parse_thread_channel(&reply, 0).unwrap().1
+        };
+        assert_eq!(humid("0x"), None);
+        assert_eq!(humid("1.0E"), None);
+        assert_eq!(humid("infi"), None);
+        assert_eq!(humid("inf"), Some(f32::INFINITY));
+        assert_eq!(humid("0x1p3"), Some(8.0));
+        assert_eq!(
+            parse_thread_channel("Channel 0: Temperature = 31.4eC, Rel. Humidity = 1", 0),
+            Some((None, None))
+        );
     }
 
     /// glibc's `%d` stores `(int) strtol(s, &end, 10)`.

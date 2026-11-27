@@ -15,7 +15,11 @@
 //! offset 15 instead). `readWrite_vs` then decodes the buffer by absolute
 //! offset. [`ResponseBuf`] is that buffer; [`decode`] is that decoder.
 
-use super::scan::{scan_char, scan_float, scan_hex, scan_int};
+use std::cell::Cell;
+
+use epics_libcom_rs::runtime::scanf::sscanf;
+
+use super::scan::{scan_char, scan_hex, scan_int};
 use super::{CBuf, cstr};
 
 /// `vacSen_BUFFER_SIZE` — the assembled response buffer, and `recBuf`.
@@ -471,25 +475,24 @@ impl ScanState {
         self.value as u16
     }
 
-    /// C `sscanf(data, "%e", &fvalue)`.
+    /// C `sscanf(data, "%e", &fvalue)`, read straight into the `float`.
     fn scan_e(&mut self, data: &[u8]) -> f32 {
-        if let Some((v, _)) = scan_float(data, None) {
-            self.fvalue = v as f32;
-        }
+        let fvalue = Cell::new(self.fvalue);
+        sscanf(data, "%e", &[&fvalue]);
+        self.fvalue = fvalue.get();
         self.fvalue
     }
 
-    /// C `sscanf(data, "%f%c%x", &fvalue, &sign, &exp)`.
+    /// C `sscanf(data, "%f%c%x", &fvalue, &sign, &exp)`, with `%x` read at
+    /// 64 bits as [`scan_hex`] reads it.
     fn scan_f_c_x(&mut self, data: &[u8]) {
-        if let Some((f, rest)) = scan_float(data, None) {
-            self.fvalue = f as f32;
-            if let Some((c, rest)) = scan_char(rest) {
-                self.sign = c;
-                if let Some((e, _)) = scan_hex(rest, None) {
-                    self.exp = e;
-                }
-            }
-        }
+        let (fvalue, sign, exp) = (
+            Cell::new(self.fvalue),
+            Cell::new(self.sign),
+            Cell::new(self.exp),
+        );
+        sscanf(data, "%f%c%llx", &[&fvalue, &sign, &exp]);
+        (self.fvalue, self.sign, self.exp) = (fvalue.get(), sign.get(), exp.get());
     }
 
     /// C `sscanf(data, "%2d%c%x", &value, &sign, &exp)`.
@@ -1144,6 +1147,22 @@ mod tests {
         let r = decode(DevType::Mx200, 1, &buf, &Readings::default());
         // 0x20 = 32 -> 3.2, sign '+' (never overwritten), exp 0.
         assert!((r.val - 3.2).abs() < 1e-6);
+        assert_eq!(r.ig1r, 0);
+    }
+
+    /// C reads `%e`/`%f` straight into `float fvalue`. Read as a double and
+    /// narrowed, a `nan(n)` payload, which `strtod` keeps in the low bits, goes.
+    #[test]
+    fn pressures_are_read_into_the_float_once() {
+        let widened = |bits: u32| f64::from(f32::from_bits(bits)).to_bits();
+        let buf = buf_from(&[(20, b"1.00E-07"), (40, b"nan(1)"), (50, b"-nan(2)")]);
+        let r = decode(DevType::Gp307, 0, &buf, &Readings::default());
+        assert_eq!(r.cgap.to_bits(), widened(0x7fc0_0001));
+        assert_eq!(r.cgbp.to_bits(), widened(0xffc0_0002));
+
+        let buf = buf_from(&[(0, b"00"), (10, b"5=nan(1)T")]);
+        let r = decode(DevType::Mm200, 1, &buf, &Readings::default());
+        assert_eq!(r.val.to_bits(), widened(0x7fc0_0001));
         assert_eq!(r.ig1r, 0);
     }
 

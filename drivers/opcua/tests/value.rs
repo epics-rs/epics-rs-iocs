@@ -174,6 +174,41 @@ fn a_string_node_is_read_as_stoll() {
     assert!(read_scalar::<i64>(&s("99999999999999999999"), None).is_err());
 }
 
+/// The `epicsFloat64` overload is `std::stod(s, 0)`
+/// (`DataElementOpen62541Leaf.h:179-186`): `strtod`'s prefix read, which
+/// throws on no conversion and on `ERANGE`, an overflow or an underflow.
+#[test]
+fn a_string_node_is_read_as_stod() {
+    let cases = [
+        ("1.5", Some(1.5)),
+        (" 2.5", Some(2.5)),
+        ("1.5abc", Some(1.5)),
+        ("1.5e", Some(1.5)),
+        ("0x1p4", Some(16.0)),
+        ("-inf", Some(f64::NEG_INFINITY)),
+        ("1e999", None),
+        ("1e-400", None),
+        ("4.9e-324", None),
+        ("2.2250738585072014e-308", Some(f64::MIN_POSITIVE)),
+        ("1,5", Some(1.0)),
+        ("+.5", Some(0.5)),
+        ("\u{a0}5", None),
+        ("abc", None),
+        ("", None),
+        (" ", None),
+        (".", None),
+    ];
+    let wrong: Vec<_> = cases
+        .iter()
+        .map(|&(text, want)| {
+            let got = read_scalar::<f64>(&Variant::String(UAString::from(text)), None).ok();
+            (text, got, want)
+        })
+        .filter(|(_, got, want)| got != want)
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn a_type_with_no_numeric_meaning_is_unsupported() {
     let qn = Variant::QualifiedName(Box::new(QualifiedName::new(2, "Name")));
@@ -829,6 +864,38 @@ fn an_outgoing_value_that_does_not_fit_the_node_is_out_of_range() {
     ));
 }
 
+/// `isWithinRange<UA_Float>` (DataElementOpen62541Leaf.h:48) refuses ±inf
+/// for a FLOAT node, from a double (:1049) or a string (.cpp:1059); NaN
+/// compares false both ways and is written. A DOUBLE node takes ±inf.
+#[test]
+fn an_infinite_value_is_out_of_range_for_a_float_node() {
+    let float = Variant::Float(0.0);
+    for v in [f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            write_scalar(v, &float, None),
+            Err(WriteError::OutOfRange { .. })
+        ));
+        assert_eq!(
+            write_scalar(v, &Variant::Double(0.0), None),
+            Ok(Variant::Double(v))
+        );
+    }
+    for text in ["inf", "-inf"] {
+        assert!(matches!(
+            write_string(text, &float, None),
+            Err(WriteError::OutOfRange { .. })
+        ));
+    }
+    assert!(matches!(
+        write_scalar(f64::NAN, &float, None),
+        Ok(Variant::Float(x)) if x.is_nan()
+    ));
+    assert!(matches!(
+        write_string("nan", &float, None),
+        Ok(Variant::Float(x)) if x.is_nan()
+    ));
+}
+
 #[test]
 fn an_outgoing_enum_value_must_be_one_of_the_choices() {
     let c = choices();
@@ -856,6 +923,45 @@ fn a_string_record_writes_to_a_double_node() {
         write_string("nonsense", &Variant::Double(0.0), None),
         Err(WriteError::OutOfRange { .. })
     ));
+}
+
+/// The FLOAT and DOUBLE arms read the record's string with
+/// `strtod(value, &end)` and need only `end != value`
+/// (`DataElementOpen62541Leaf.cpp:1057-1073`); `errno` is not looked at.
+#[test]
+fn a_string_record_writes_a_float_node_as_strtod() {
+    let cases = [
+        ("1.5abc", Some(1.5)),
+        ("1.5e", Some(1.5)),
+        ("0x10", Some(16.0)),
+        (" 2", Some(2.0)),
+        ("1,5", Some(1.0)),
+        ("1e999", Some(f64::INFINITY)),
+        ("1e-400", Some(0.0)),
+        ("4.9e-324", Some(4.9e-324)),
+        ("\u{a0}5", None),
+        ("abc", None),
+        ("", None),
+        (".", None),
+    ];
+    let mut wrong = Vec::new();
+    for &(text, want) in &cases {
+        let got = write_string(text, &Variant::Double(0.0), None).ok();
+        if got != want.map(Variant::Double) {
+            wrong.push((text, got, want));
+        }
+    }
+    for (text, want) in [
+        ("1.5abc", Some(1.5f32)),
+        ("1e-400", Some(0.0)),
+        ("abc", None),
+    ] {
+        let got = write_string(text, &Variant::Float(0.0), None).ok();
+        if got != want.map(Variant::Float) {
+            wrong.push((text, got, want.map(f64::from)));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]

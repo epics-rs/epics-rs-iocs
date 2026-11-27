@@ -13,22 +13,21 @@ use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::port::QueuePriority;
-use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
 use epics_rs::asyn::request::{CellBody, OctetReadOp, PortCalls, RequestCell, RequestOp, Unrun};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::{AsynUser, timeout_from_secs};
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
-use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, ReadStart,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
-use crate::Unconnected;
+use crate::{Reentry, Refused, Unconnected};
 use protocol::{INVALID_VALUE, NCHAR, READ_COMMAND, TERM, parse_position};
 
 /// The `device(ai,INST_IO,devAiHeidND261,…)` line of `ipSupport.dbd`.
@@ -63,8 +62,7 @@ struct Exchange {
 struct Job {
     handle: PortHandle,
     exchange: Mutex<Exchange>,
-    /// The record's completion and band.
-    reentry: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+    reentry: Reentry,
 }
 
 fn user() -> AsynUser {
@@ -87,6 +85,8 @@ impl CellBody for Job {
         let mut ex = self.exchange.lock().unwrap();
         ex.read = read;
         ex.status = status.map_or_else(|e| e.c_status_code(), |()| 0);
+        drop(ex);
+        self.reentry.end();
     }
 
     /// No `timeoutUser`, so only a port shutting down with the request queued
@@ -98,15 +98,12 @@ impl CellBody for Job {
             Unrun::Refused(e) => e.c_status_code(),
             _ => AsynStatus::Error as i32,
         };
+        drop(ex);
+        self.reentry.end();
     }
 
-    /// `dbScanLock(pr); prset->process(pr)` at the end of the callback.
-    fn done(self: Arc<Self>) {
-        let armed = self.reentry.lock().unwrap().clone();
-        if let Some((done, prio)) = armed {
-            let _ = done.reprocess(prio);
-        }
-    }
+    /// `process` and `unrun` end the pass.
+    fn done(self: Arc<Self>) {}
 
     /// `createAsynUser(devAiHeidND261Callback, 0)`.
     fn timeout_user(&self) -> bool {
@@ -147,6 +144,10 @@ impl DevHeidNd261 {
             name: String::new(),
             live: None,
         }
+    }
+
+    fn refused(&self) -> Option<Refused> {
+        self.live.as_ref().and_then(|l| l.job.reentry.refused())
     }
 
     /// `completeIO`.
@@ -228,15 +229,14 @@ impl DeviceSupport for DevHeidNd261 {
         let job = Arc::new(Job {
             handle: handle.clone(),
             exchange: Mutex::new(Exchange::default()),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let cell = handle.new_cell(job.clone());
         self.live = Some(Live { job, cell });
         Ok(DeviceInitOutcome::ok())
     }
 
-    /// `io` with `pact == 0`. A refused `queueRequest` returns -1 with PACT
-    /// already set, so the record stays active, as in C.
+    /// `io` with `pact == 0`.
     fn read_begin(
         &mut self,
         _record: &mut dyn Record,
@@ -245,26 +245,34 @@ impl DeviceSupport for DevHeidNd261 {
         let Some(live) = self.live.as_ref().filter(|_| !done.pact()) else {
             return Ok(ReadStart::Synchronous);
         };
-        {
-            let mut slot = live.job.reentry.lock().unwrap();
-            match &mut *slot {
-                Some((_, prio)) => *prio = done.priority(),
-                None => *slot = Some((done.device_done(), done.priority())),
-            }
-        }
         let user = AsynUser::new(0)
             .with_addr(ADDR)
             .with_priority(QueuePriority::Low);
-        let _ = live.job.handle.queue_request(&live.cell, &user);
-        Ok(ReadStart::Pending)
+        Ok(
+            match live
+                .job
+                .reentry
+                .queue(&live.job.handle, &live.cell, &user, done, false)
+            {
+                Ok(QueueOutcome::Queued) => ReadStart::Pending,
+                Ok(QueueOutcome::Ran) | Err(_) => ReadStart::Synchronous,
+            },
+        )
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        if self.refused().is_some() {
+            return Ok(DeviceReadOutcome::failed());
+        }
         self.complete(record)
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         Ok(())
+    }
+
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        self.refused().map(Refused::alarm)
     }
 }
 
@@ -293,7 +301,7 @@ mod tests {
         let job = Arc::new(Job {
             handle: handle.clone(),
             exchange: Mutex::new(Exchange::default()),
-            reentry: Mutex::new(None),
+            reentry: Reentry::default(),
         });
         let mut dev = DevHeidNd261::new("");
         dev.live = Some(Live {

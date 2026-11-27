@@ -53,6 +53,7 @@
 //! - The poller does not refresh direction; it is set only by move/home/velocity
 //!   commands. This port stores the last commanded direction and reports it.
 
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -65,6 +66,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use motor_common::drv_motor_asyn::{DrvSet, function};
 use motor_common::model2::AxisLog;
 use motor_common::param_lib::Params;
@@ -516,16 +518,27 @@ impl A3200Axis {
         let payload = ctrl.rest().to_owned();
         drop(ctrl);
 
-        // C's sscanf leaves a field it could not parse at the value the
-        // previous axis left in the poller's local (:753); not copied, it
-        // is 0 here.
-        let mut it = payload.split_whitespace();
-        let axis_status = it.next().map(atol).unwrap_or(0) as u32;
-        let drive_status = it.next().map(atol).unwrap_or(0) as u32;
-        let axis_fault = it.next().map(atoi).unwrap_or(0);
-        let enc_pos = it.next().map(atof).unwrap_or(0.0);
-        let cmd_pos = it.next().map(atof).unwrap_or(0.0);
-        let act_vel = it.next().map(atof).unwrap_or(0.0);
+        // C's sscanf leaves a field it does not convert at what the previous
+        // axis left in the poller's local, uninitialised on the first
+        // (:713-714); 0 here.
+        let [axis_status, drive_status, axis_fault] = [0i32; 3].map(Cell::new);
+        let [enc_pos, cmd_pos, act_vel] = [0f64; 3].map(Cell::new);
+        sscanf(
+            &payload,
+            "%d %d %d %lf %lf %lf",
+            &[
+                &axis_status,
+                &drive_status,
+                &axis_fault,
+                &enc_pos,
+                &cmd_pos,
+                &act_vel,
+            ],
+        );
+        let axis_status = axis_status.get() as u32;
+        let drive_status = drive_status.get() as u32;
+        let axis_fault = axis_fault.get();
+        let (enc_pos, cmd_pos, act_vel) = (enc_pos.get(), cmd_pos.get(), act_vel.get());
 
         let params = self.params.clone();
         let bit = |f, v: bool| {
@@ -757,8 +770,11 @@ impl AsynMotor for A3200Axis {
             return sent;
         }
         // If the motion task is idle, re-init its queue before enabling.
-        let taskn_state = ctrl.rest().split_whitespace().next().map_or(0, atoi);
-        if taskn_state == TASKSTATE_IDLE {
+        // C's state is uninitialised when `%d` converts nothing (:401); 0
+        // here, not idle.
+        let [taskn_state, taskn1_state] = [0i32; 2].map(Cell::new);
+        sscanf(ctrl.rest(), "%d %d", &[&taskn_state, &taskn1_state]);
+        if taskn_state.get() == TASKSTATE_IDLE {
             let _ = ctrl.send(&format!("~INITQUEUE {task}"));
         }
 
@@ -1151,6 +1167,67 @@ mod tests {
             (good.high_limit, good.low_limit)
         );
         assert_eq!(virt.position(), 8.0);
+    }
+
+    /// drvA3200Asyn.cc:755: one sscanf over the reply, so a sign ends a
+    /// field and a field it cannot convert stops the rest.
+    #[test]
+    fn the_status_reply_is_read_as_one_sscanf() {
+        let user = AsynUser::new(0);
+        let reply = Arc::new(Mutex::new(String::new()));
+        let (_line, mut axis) = {
+            let reply = reply.clone();
+            rig_axis(
+                "a32ScanLine",
+                true,
+                move |cmd: &str| {
+                    if cmd.starts_with("~STATUS (X") {
+                        reply.lock().unwrap().clone()
+                    } else if cmd.starts_with("CountsPerUnit") {
+                        "%1".into()
+                    } else {
+                        "%0".into()
+                    }
+                },
+                |_| false,
+            )
+        };
+        let set = |r: String| *reply.lock().unwrap() = r;
+        set(format!("%{} 3 0 5-6 0", AXISSTATUS_NOT_VIRTUAL));
+        let s = axis.polled(&user).unwrap();
+        assert_eq!((s.encoder_position(), s.position()), (5.0, -6.0));
+        set(format!("%{} 3 0 5x 6 0", AXISSTATUS_NOT_VIRTUAL));
+        let s = axis.polled(&user).unwrap();
+        assert_eq!((s.encoder_position(), s.position()), (5.0, 0.0));
+    }
+
+    /// drvA3200Asyn.cc:422: TaskState is `%d`, which skips only C
+    /// whitespace; past any other, C's state is uninitialised and here 0.
+    #[test]
+    fn task_state_is_read_as_sscanf_d() {
+        let user = AsynUser::new(0);
+        let state = Arc::new(Mutex::new(String::new()));
+        let (line, mut axis) = {
+            let state = state.clone();
+            rig_axis(
+                "a32TaskLine",
+                true,
+                move |cmd: &str| {
+                    if cmd.starts_with("~STATUS (1, TaskState)") {
+                        state.lock().unwrap().clone()
+                    } else {
+                        "%0".into()
+                    }
+                },
+                |_| false,
+            )
+        };
+        for (reply, init) in [("%2 0", true), ("%\u{a0}2 0", false)] {
+            *state.lock().unwrap() = reply.into();
+            axis.set_closed_loop(&user, false).unwrap();
+            let sent = line.sent();
+            assert_eq!(sent.iter().any(|c| c == "~INITQUEUE 1"), init, "{reply:?}");
+        }
     }
 
     /// drvA3200Asyn.cc:414-466: enable and disable call back whatever

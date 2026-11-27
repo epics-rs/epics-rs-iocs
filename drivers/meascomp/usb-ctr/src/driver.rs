@@ -61,7 +61,7 @@ impl CtrDriver {
             PortFlags {
                 multi_device: true,
                 can_block: false,
-                destructible: true,
+                destructible: false,
             },
             USBCTR_INTERFACES,
             USBCTR_INTERRUPTS,
@@ -734,6 +734,18 @@ pub fn create_usb_ctr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C registers the port with `ASYN_MULTIDEVICE` alone (`drvUSBCTR.cpp:260`),
+    /// so `asynShutdownPort` is refused and the port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        use epics_rs::asyn::error::AsynStatus;
+
+        let mut drv = CtrDriver::new("CTRSHUT", DaqDevice::unconnected(), 16).unwrap();
+        let refused = drv.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(drv.base.is_enabled());
+    }
 
     #[test]
     fn the_port_carries_cs_interface_and_interrupt_masks() {

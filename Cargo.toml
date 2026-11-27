@@ -159,7 +159,7 @@ members = [
 # the epics-rs revision that carries it.
 [workspace.metadata.dylint]
 libraries = [
-    { git = "https://github.com/epics-rs/epics-rs", rev = "3718d7ea016481cef6e69b2af8b8afc2be9033e4", pattern = "lints/raw_float_format" },
+    { git = "https://github.com/epics-rs/epics-rs", rev = "5709ce463240045e9040869365a4de11a4597301", pattern = "lints/raw_float_format" },
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC
@@ -335,32 +335,41 @@ libraries = [
 # `put_field`; the two limit tests then run `init_record(1)`, which is what
 # arms special(), and read the limits back through `limits()`.
 #
+# 0.34.2 removes ad-core-rs `run_thread`; each driver thread passes
+# `run_thread_named` the band and stack class its C driver gives
+# `epicsThreadCreate`.
+#
+# 0.35.0's breaks reach no code here: ad-pva-driver's one
+# `pvmonitor_handle` callback already owns what it captures, and none of
+# the 15 `DeviceSupport` impls overrides `set_callback_priority` or the
+# removed init-link hooks. ad-plugins-rs moves to rust-hdf5 0.7.16.
+#
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.34.0"
-asyn-rs = "0.34.0"
-epics-libcom-rs = "0.34.0"
+epics-rs = "0.35.0"
+asyn-rs = "0.35.0"
+epics-libcom-rs = "0.35.0"
 # The sequencer. Run time is the `runtime` feature; a build.rs compiling its
 # src/snl/*.st takes `default-features = false, features = ["snc"]`.
-epics-seq-rs = { version = "0.34.0", default-features = false }
-ad-core-rs = "0.34.0"
-ad-plugins-rs = "0.34.0"
+epics-seq-rs = { version = "0.35.0", default-features = false }
+ad-core-rs = "0.35.0"
+ad-plugins-rs = "0.35.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.34.0", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.35.0", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c).
 # epics-rs's "mca" feature is `pub use mca_rs as mca` over this same
 # published crate, so drivers/mca keeps the direct dependency and the
 # version keeps being pinned in one place.
-mca-rs = "0.34.0"
+mca-rs = "0.35.0"
 # StreamDevice port (syringepump-ioc's Teledyne D/H).
-stream-rs = { version = "0.34.0", package = "epics-stream-rs" }
+stream-rs = { version = "0.35.0", package = "epics-stream-rs" }
 # float_roundtrip makes the parser correctly rounded, as C's strtod is;
 # without it some doubles parse 1 ULP off.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 # libssh2, as C's HAVE_LIBSSH2 build links; motor-newport's `sftp` feature.
 ssh2 = { version = "0.9", default-features = false }
 # Dev-only CFloat gate (tools/ioc-conventions/tests/cfloat.rs). Never
-# published; the patch below takes it from epics-rs at the v0.34.0 rev.
+# published; the patch below takes it from epics-rs at the v0.35.0 rev.
 cfloat-gate = "0.0.0"
 
 [patch.crates-io]
-cfloat-gate = { git = "https://github.com/epics-rs/epics-rs", rev = "3718d7ea016481cef6e69b2af8b8afc2be9033e4" }
+cfloat-gate = { git = "https://github.com/epics-rs/epics-rs", rev = "5709ce463240045e9040869365a4de11a4597301" }

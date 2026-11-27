@@ -18,7 +18,6 @@ use crate::encap::{self, ETHERIP_PORT};
 use chrono::TimeZone;
 use epics_libcom_rs::cfmt::CFloat;
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
 use epics_rs::base::server::database::{AsyncDbHandle, DeviceDone};
 use epics_rs::base::server::ioc_app::InitHookState;
 
@@ -73,6 +72,9 @@ pub struct TagData {
     pub do_write: bool,
     /// A write for this tag is in flight in the current scan pass.
     pub is_writing: bool,
+    /// How many writes the scan has taken from `do_write`; a write staged
+    /// now rides the next one.
+    writes_taken: u64,
     /// Round-trip time of the transfer this tag last took part in.
     pub transfer_time: f64,
     /// Sizes learned from the probe read at connect time; 0 = unusable tag.
@@ -85,6 +87,17 @@ pub struct TagData {
 impl TagData {
     pub fn has_value(&self) -> bool {
         self.valid_data_size > 0
+    }
+
+    /// The scan's half of the write handshake: take a staged write, and
+    /// name the write transfer this pass sends, if it sends one.
+    fn take_write(&mut self) -> Option<u64> {
+        if self.do_write {
+            self.do_write = false;
+            self.is_writing = true;
+            self.writes_taken += 1;
+        }
+        self.is_writing.then_some(self.writes_taken)
     }
 }
 
@@ -108,14 +121,82 @@ pub struct Listener {
     /// the device bound since. C walks the list under `plc->lock`, which
     /// the removal takes.
     fired: AtomicBool,
-    /// Set while the record's write is PACT; the next transfer completes it.
-    pub write_done: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+    write: Mutex<WriteSlot>,
+}
+
+/// A bound record's write, from its staging to the pass that ends it.
+#[derive(Default)]
+enum WriteSlot {
+    #[default]
+    Idle,
+    /// The record is PACT on it until the PLC answers `carrier`, the
+    /// write transfer that sends it.
+    Pending { done: DeviceDone, carrier: u64 },
+    /// Ended by a failed [`WriteEnd`]; its completion pass takes this.
+    Failed,
+}
+
+/// Which pending writes a tag's callback ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteEnd {
+    /// A read's: it sent no staged write, so it ends none.
+    Read,
+    /// Write transfer `seq`'s: it ends every write it or an earlier one
+    /// sent, with WRITE_ALARM unless the PLC took it.
+    Write { seq: u64, taken: bool },
+    /// `invalidate_tags`'s: every write, sent or not, with WRITE_ALARM.
+    Dropped,
 }
 
 impl Listener {
     /// Whether a transfer is running this listener's check, consumed.
     pub fn take_fired(&self) -> bool {
         self.fired.swap(false, Ordering::AcqRel)
+    }
+
+    /// Hold the record PACT on its staged write until write transfer
+    /// `carrier`, from [`TagInfo::request_write`], ends it.
+    pub fn stage_write(&self, done: DeviceDone, carrier: u64) {
+        *self.write.lock() = WriteSlot::Pending { done, carrier };
+    }
+
+    /// Whether the record is PACT on a staged write.
+    pub fn write_pending(&self) -> bool {
+        matches!(*self.write.lock(), WriteSlot::Pending { .. })
+    }
+
+    /// Take the pending write `end` ends, leaving `Failed` for its
+    /// completion pass when it failed.
+    fn end_write(&self, end: WriteEnd) -> Option<DeviceDone> {
+        let mut write = self.write.lock();
+        let failed = match (&*write, end) {
+            (WriteSlot::Pending { carrier, .. }, WriteEnd::Write { seq, taken })
+                if *carrier <= seq =>
+            {
+                !taken
+            }
+            (WriteSlot::Pending { .. }, WriteEnd::Dropped) => true,
+            _ => return None,
+        };
+        let after = if failed {
+            WriteSlot::Failed
+        } else {
+            WriteSlot::Idle
+        };
+        match std::mem::replace(&mut *write, after) {
+            WriteSlot::Pending { done, .. } => Some(done),
+            _ => None,
+        }
+    }
+
+    /// Whether the write whose completion pass is running failed, consumed.
+    pub fn take_failed_write(&self) -> bool {
+        let mut write = self.write.lock();
+        let failed = matches!(*write, WriteSlot::Failed);
+        if failed {
+            *write = WriteSlot::Idle;
+        }
+        failed
     }
 }
 
@@ -141,18 +222,20 @@ impl TagInfo {
     }
 
     /// C's callback loop after every transfer (drvEtherIP.c:819-823): a
-    /// record whose write is pending ends that write's cycle (`if
+    /// record whose write `end` ends finishes that write's cycle (`if
     /// (rec->pact) process`), an output runs its check here, an input gets
-    /// an I/O Intr pulse.
+    /// an I/O Intr pulse. C ends a PACT write on any callback of its tag,
+    /// so a read in flight when the write was staged ends it unsent.
     ///
     /// The list is copied first: a check takes the record's lock, under
-    /// which a device-link put adds and removes listeners.
-    pub(crate) fn notify(&self) {
+    /// which a device-link put adds and removes listeners. Every caller is a
+    /// scan thread or `drvEtherIP_restart`'s, holding no lock set, so a
+    /// pending write ends here, as C's does, and no full band can refuse it.
+    pub(crate) fn notify(&self, end: WriteEnd) {
         let listeners = self.listeners.lock().clone();
         for l in &listeners {
-            let done = l.write_done.lock().take();
-            if let Some((done, prio)) = done {
-                let _ = done.complete(prio);
+            if let Some(done) = l.end_write(end) {
+                done.complete_now();
                 continue;
             }
             match &l.on_transfer {
@@ -171,12 +254,25 @@ impl TagInfo {
         }
     }
 
+    /// One scan transfer of this tag, as `process_scan_list` runs it: the
+    /// staged write, which the PLC takes, or else a read.
+    #[cfg(test)]
+    pub(crate) fn transfer(&self) {
+        let seq = {
+            let mut d = self.data.lock();
+            let seq = d.take_write();
+            d.is_writing = false;
+            seq
+        };
+        self.notify(seq.map_or(WriteEnd::Read, |seq| WriteEnd::Write { seq, taken: true }));
+    }
+
     pub fn add_listener(&self, tx: Sender<()>, on_transfer: OnTransfer) -> Arc<Listener> {
         let l = Arc::new(Listener {
             tx,
             on_transfer,
             fired: AtomicBool::new(false),
-            write_done: Mutex::new(None),
+            write: Mutex::default(),
         });
         self.listeners.lock().push(l.clone());
         l
@@ -189,12 +285,25 @@ impl TagInfo {
 
     /// Device support side of the write handshake: stage the value in the tag
     /// buffer, then flag it. The scan thread clears `do_write` and sets
-    /// `is_writing` when it picks the write up.
-    pub fn request_write(&self, data: &mut TagData, record: &str) {
+    /// `is_writing` when it picks the write up. Returns the write transfer
+    /// that will send it.
+    pub fn request_write(&self, data: &mut TagData, record: &str) -> u64 {
         if data.do_write {
             crate::eip_printf!(6, "'{record}': already writing\n");
         } else {
             data.do_write = true;
+        }
+        data.writes_taken + 1
+    }
+
+    /// End with WRITE_ALARM the writes up to transfer `seq`, which the scan
+    /// took and cannot send; no other callback runs.
+    fn drop_writes(&self, seq: u64) {
+        let listeners = self.listeners.lock().clone();
+        for l in &listeners {
+            if let Some(done) = l.end_write(WriteEnd::Write { seq, taken: false }) {
+                done.complete_now();
+            }
         }
     }
 }
@@ -247,6 +356,8 @@ pub struct Plc {
     started: AtomicBool,
     /// C's `ETHERIP_PORT`; a test's fake PLC listens on a port of its own.
     port: u16,
+    #[cfg(test)]
+    panic_in_next_pass: AtomicBool,
 }
 
 impl Plc {
@@ -266,7 +377,14 @@ impl Plc {
             stop: AtomicBool::new(false),
             started: AtomicBool::new(false),
             port,
+            #[cfg(test)]
+            panic_in_next_pass: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_in_next_pass(&self) {
+        self.panic_in_next_pass.store(true, Ordering::SeqCst);
     }
 
     /// `drvEtherIP_add_tag`: register a tag for scanning at `period`,
@@ -341,7 +459,7 @@ impl Plc {
                     d.do_write = false;
                     d.valid_data_size = 0;
                 }
-                info.notify();
+                info.notify(WriteEnd::Dropped);
             }
         }
     }
@@ -379,6 +497,14 @@ pub fn define_plc(name: &str, ip_addr: &str, slot: u8) -> Arc<Plc> {
     let plc = Arc::new(Plc::new(name, ip_addr, slot));
     reg.push(plc.clone());
     plc
+}
+
+/// [`define_plc`] for a test's fake PLC on 127.0.0.1:`port`.
+#[cfg(test)]
+pub(crate) fn define_plc_on_port(name: &str, port: u16) {
+    REGISTRY
+        .lock()
+        .push(Arc::new(Plc::on_port(name, "127.0.0.1", 0, port)));
 }
 
 /// `drvEtherIP_find_PLC`.
@@ -537,6 +663,7 @@ pub fn stop_scan_tasks() {
 // ---------------------------------------------------------------------------
 
 fn scan_loop(plc: Arc<Plc>) {
+    let _exit = ScanExit(plc.clone());
     while !plc.stop.load(Ordering::Relaxed) {
         // The pass holds the connection the way C's PLC_scan_task holds
         // plc->lock; the sleep comes after it is released.
@@ -545,16 +672,32 @@ fn scan_loop(plc: Arc<Plc>) {
             std::thread::sleep(pause);
         }
     }
+}
 
-    if let Some(c) = plc.conn.lock().take() {
-        c.shutdown();
+/// The scan thread's exit, a panic's included: no write stays pending on
+/// a PLC without a scan thread, and `drvEtherIP_restart` may launch one.
+struct ScanExit(Arc<Plc>);
+
+impl Drop for ScanExit {
+    fn drop(&mut self) {
+        let plc = &self.0;
+        // Held until `started` is cleared: restart reads it under this lock.
+        let mut conn = plc.conn.lock();
+        if let Some(c) = conn.take() {
+            c.shutdown();
+        }
+        plc.connected.store(false, Ordering::Relaxed);
+        plc.invalidate_tags();
+        plc.started.store(false, Ordering::SeqCst);
     }
-    plc.connected.store(false, Ordering::Relaxed);
-    plc.started.store(false, Ordering::SeqCst);
 }
 
 /// One turn of C's `scan_loop:` label. Returns how long to sleep.
 fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> {
+    #[cfg(test)]
+    if plc.panic_in_next_pass.swap(false, Ordering::SeqCst) {
+        panic!("the scan thread panics, for a test");
+    }
     // -- connect ---------------------------------------------------------
     if conn.is_none() {
         let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
@@ -745,10 +888,10 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
 }
 
 /// A tag's contribution to the current MultiRequest.
-struct Item {
+pub(crate) struct Item {
     info: Arc<TagInfo>,
-    /// The write half of the handshake was taken for this pass.
-    writing: bool,
+    /// The write transfer this item sends; `None` for a read.
+    write: Option<u64>,
     request: Vec<u8>,
     /// The response size this item was budgeted at.
     response_size: usize,
@@ -762,7 +905,11 @@ struct Item {
 /// Returns the items and the index to resume the walk from. The two are
 /// returned together because a skipped (unusable) tag makes `items.len()` an
 /// invalid stride -- the C keeps a separate list cursor for the same reason.
-fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Vec<Item>, usize) {
+pub(crate) fn build_multi_request(
+    limit: usize,
+    tags: &[Arc<TagInfo>],
+    start: usize,
+) -> (Vec<Item>, usize) {
     let mut items: Vec<Item> = Vec::new();
     let mut requests_size = 0usize;
     let mut responses_size = 0usize;
@@ -782,11 +929,7 @@ fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Ve
             // Take the write half of the handshake here, under the same lock
             // that stages the data, so a record's write cannot be lost between
             // "value staged" and "request built".
-            if d.do_write {
-                d.do_write = false;
-                d.is_writing = true;
-            }
-            if d.is_writing {
+            if let Some(seq) = d.take_write() {
                 match cip::typecode(&d.buf) {
                     Some(cip_type) => {
                         let mut request = Vec::with_capacity(d.w_request);
@@ -802,7 +945,7 @@ fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Ve
                                 raw,
                             );
                         }
-                        (true, d.w_request, d.w_response, request)
+                        (Some(seq), None, d.w_request, d.w_response, request)
                     }
                     None => {
                         // No value staged -> nothing to write. Fall back to a
@@ -810,16 +953,19 @@ fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Ve
                         d.is_writing = false;
                         let mut request = Vec::with_capacity(d.r_request);
                         cip::encode_read_data(&mut request, &info.tag, elements);
-                        (false, d.r_request, d.r_response, request)
+                        (None, Some(seq), d.r_request, d.r_response, request)
                     }
                 }
             } else {
                 let mut request = Vec::with_capacity(d.r_request);
                 cip::encode_read_data(&mut request, &info.tag, elements);
-                (false, d.r_request, d.r_response, request)
+                (None, None, d.r_request, d.r_response, request)
             }
         };
-        let (writing, req, resp, request) = built;
+        let (write, unsent, req, resp, request) = built;
+        if let Some(seq) = unsent {
+            info.drop_writes(seq);
+        }
 
         let try_req = requests_size + req;
         let try_resp = responses_size + resp;
@@ -843,8 +989,9 @@ fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Ve
                 crate::eip_printf!(3, " Request   size: {try_req:>10} bytes\n");
                 crate::eip_printf!(3, " Response  size: {try_resp:>10} bytes\n");
                 // Give the write handshake back -- this pass will never send it.
-                if writing {
+                if let Some(seq) = write {
                     info.data.lock().is_writing = false;
+                    info.drop_writes(seq);
                 }
             }
             break;
@@ -854,7 +1001,7 @@ fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Ve
         responses_size = try_resp;
         items.push(Item {
             info: info.clone(),
-            writing,
+            write,
             request,
             response_size: resp,
         });
@@ -933,8 +1080,8 @@ fn process_scan_list(c: &mut Connection, list: &Arc<ScanList>) -> bool {
                 release_writes(&items);
                 return false;
             };
-            apply_response(item, sub, transfer_time);
-            item.info.notify();
+            let end = apply_response(item, sub, transfer_time);
+            item.info.notify(end);
         }
 
         start = next;
@@ -951,7 +1098,7 @@ fn process_scan_list(c: &mut Connection, list: &Arc<ScanList>) -> bool {
 /// in one place instead of leaving the flag set across an error path.
 fn release_writes(items: &[Item]) {
     for item in items {
-        if item.writing {
+        if item.write.is_some() {
             item.info.data.lock().is_writing = false;
         }
     }
@@ -965,17 +1112,18 @@ fn print_rejected(tag: &str, size: usize) {
     );
 }
 
-fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
+fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) -> WriteEnd {
     let mut d = item.info.data.lock();
     d.transfer_time = transfer_time;
 
-    if item.writing {
+    if let Some(seq) = item.write {
         d.is_writing = false;
-        if !cip::check_write_data_response(sub) {
+        let taken = cip::check_write_data_response(sub);
+        if !taken {
             crate::eip_printf_time!(0, "EIP: CIPWrite failed for '{}'\n", item.info.string_tag);
             d.valid_data_size = 0;
         }
-        return;
+        return WriteEnd::Write { seq, taken };
     }
 
     match cip::check_read_data_response(sub, sub.len()) {
@@ -999,6 +1147,7 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
         }
         _ => d.valid_data_size = 0,
     }
+    WriteEnd::Read
 }
 
 // ---------------------------------------------------------------------------

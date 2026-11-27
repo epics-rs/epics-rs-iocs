@@ -10,7 +10,7 @@
 //! The record drives the device half of its cycle through [`McaDset`]:
 //! `read_begin` runs [`McaRecord::device_read_begin`] on every ask, the
 //! ask again after a nested pass or `readValue`'s link reads included, and
-//! `read()` has nothing left.
+//! `read()` only raises the alarm of a read the port refused.
 //! As in C, every message is queued to the port (`devMcaAsyn.c:262-337`).
 //! Each read is its own request, reused from a free list, whose body is C's
 //! `asynCallback` (`:342-391`): on an `ASYN_CANBLOCK` port the pass ends PACT
@@ -21,19 +21,21 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::log::errlog_vprintf;
-use epics_rs::base::runtime::task::CallbackPriority;
 use epics_rs::base::server::database::{DeviceDone, DeviceDoneSource};
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, ReadStart,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, ReadStart,
+};
+use epics_rs::base::server::recgbl::alarm_status::{
+    COMM_ALARM, DISABLE_ALARM, HW_LIMIT_ALARM, READ_ALARM, TIMEOUT_ALARM,
 };
 use epics_rs::base::server::record::{
-    DbLinkType, DevSup, Dset, Record, ScanType, register_dbd_devices,
+    AlarmSeverity, DbLinkType, DevSup, Dset, Record, ScanType, register_dbd_devices,
 };
 use epics_rs::base::types::{EpicsValue, SharedArray};
 
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::asyn_record::get_port;
-use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::port_handle::{PortHandle, QueueOutcome};
@@ -57,6 +59,8 @@ pub struct DevMcaAsyn {
     /// `None` until `init` connects, and for good after it fails: C leaves
     /// that record in PACT (`devMcaAsyn.c:208-210`), so it never processes.
     port: Option<McaPort>,
+    /// The read the port refused in the pass `read` last ended.
+    alarm: Option<Lost>,
 }
 
 /// The port side of `mcaAsynPvt` (`devMcaAsyn.c:38-56`): where C's
@@ -91,13 +95,14 @@ struct McaPort {
     /// This pass's completion cell, on a port that can block: the read
     /// queued from it re-enters the record through it. Only `&mut self`
     /// touches it (`get_mut`); the `Mutex` makes the dset `Sync`.
-    reentry: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+    reentry: Mutex<Option<DeviceDone>>,
+    /// A read the port refused in the pass still running, for its `read`.
+    lost: Option<Lost>,
 }
 
 /// What C's `asynCallback` reads into `mcaAsynPvt` and the record copies
 /// out on the pass the callback re-enters.
 struct Reads {
-    name: String,
     addr: i32,
     reasons: [usize; McaReason::COUNT],
     /// C's `acquiring`/`elapsedLive`/`elapsedReal`/`totalCounts`/`dwellTime`:
@@ -108,6 +113,50 @@ struct Reads {
     /// `pmca->nuse`, the channel count C's `mcaData` callback reads
     /// (`devMcaAsyn.c:357`).
     nuse: AtomicI32,
+    /// Per [`McaRead`], a read the port refused after queueing it, for the
+    /// pass it re-enters.
+    lost: Mutex<[Option<Lost>; 2]>,
+}
+
+/// A read the port refused, at `queueRequest` or after it: the pass ends
+/// with NACK under `asynStatusToEpicsAlarm(status, READ_ALARM,
+/// INVALID_ALARM)` (asynEpicsUtils.c:234-266), as devAsynInt32's `processAi`
+/// ends one (devAsynInt32.c:836-846). C's request has no `timeoutUser`, so a
+/// read the port drops leaves the record PACT for good.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Lost {
+    stat: u16,
+}
+
+impl Lost {
+    fn refused(e: &AsynError) -> Self {
+        let stat = match e.status() {
+            AsynStatus::Timeout => TIMEOUT_ALARM,
+            AsynStatus::Overflow => HW_LIMIT_ALARM,
+            AsynStatus::Disconnected => COMM_ALARM,
+            AsynStatus::Disabled => DISABLE_ALARM,
+            AsynStatus::Success | AsynStatus::Error => READ_ALARM,
+        };
+        Self { stat }
+    }
+
+    fn unrun(why: &Unrun) -> Self {
+        match why {
+            Unrun::Refused(e) => Self::refused(e),
+            Unrun::TimedOut => Self {
+                stat: TIMEOUT_ALARM,
+            },
+            Unrun::Canceled => Self { stat: READ_ALARM },
+        }
+    }
+
+    fn alarm(self) -> DeviceAlarm<'static> {
+        DeviceAlarm {
+            stat: self.stat,
+            sevr: AlarmSeverity::Invalid as u16,
+            msg: "",
+        }
+    }
 }
 
 /// C `asynCallback` (`devMcaAsyn.c:342-391`) for one queued read.
@@ -122,7 +171,7 @@ struct Trip {
 
 struct Message {
     read: McaRead,
-    reentry: Option<(DeviceDone, CallbackPriority)>,
+    reentry: Option<DeviceDone>,
 }
 
 /// C `asynPrint(pasynUser, ASYN_TRACE_ERROR, ...)` for a user on `port`
@@ -145,6 +194,7 @@ impl DevMcaAsyn {
             inp: inp.to_owned(),
             name: String::new(),
             port: None,
+            alarm: None,
         }
     }
 
@@ -302,14 +352,14 @@ impl McaLink {
 }
 
 impl McaPort {
-    fn new(link: McaLink, name: &str) -> Self {
+    fn new(link: McaLink) -> Self {
         let reads = Arc::new(Reads {
-            name: name.to_owned(),
             addr: link.addr,
             reasons: link.reasons,
             status: Mutex::new(McaStatus::default()),
             data: Mutex::new(SharedArray::default()),
             nuse: AtomicI32::new(0),
+            lost: Mutex::new([None; 2]),
         });
         let mut port = McaPort {
             link,
@@ -317,6 +367,7 @@ impl McaPort {
             requests: Vec::new(),
             idle: Arc::new(Mutex::new(Vec::new())),
             reentry: Mutex::new(None),
+            lost: None,
         };
         // A cycle has at most a status and a data read out at once.
         for _ in 0..2 {
@@ -348,22 +399,30 @@ impl McaPort {
     /// C `send_msg`'s `duplicateAsynUser` and `queueRequest` of a read
     /// (`devMcaAsyn.c:263-337`), re-entering the record through `reentry`
     /// when it is queued.
-    fn queue(
-        &mut self,
-        read: McaRead,
-        reentry: Option<(DeviceDone, CallbackPriority)>,
-    ) -> Result<QueueOutcome, Nack> {
+    fn queue(&mut self, read: McaRead, reentry: Option<DeviceDone>) -> Result<QueueOutcome, Nack> {
         let free = self.idle.lock().unwrap().pop();
         let index = free.unwrap_or_else(|| self.add_request());
         let (cell, trip) = &self.requests[index];
         *trip.message.lock().unwrap() = Message { read, reentry };
         let user = AsynUser::new(0).with_addr(self.link.addr);
-        self.link.handle.queue_request(cell, &user).map_err(|_| {
+        self.link.handle.queue_request(cell, &user).map_err(|e| {
             // Never queued, so no `done` returns it.
             trip.message.lock().unwrap().reentry = None;
             self.idle.lock().unwrap().push(index);
+            self.lost = Some(Lost::refused(&e));
             Nack
         })
+    }
+
+    /// The `read` the port refused after queueing it, now in this pass.
+    fn take_lost(&mut self, read: McaRead) -> Result<(), Nack> {
+        match self.reads.lost.lock().unwrap()[read as usize].take() {
+            Some(lost) => {
+                self.lost = Some(lost);
+                Err(Nack)
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -439,15 +498,11 @@ impl CellBody for Trip {
             McaRead::Status => self.reads.read_status(port),
             McaRead::Data => self.reads.read_spectrum(port),
         }
-        // C's `dbScanLock; prset->process` (`:358-360`, `:378-380`).
+        // C's `dbScanLock; prset->process; dbScanUnlock` on this thread
+        // (`:359-361`, `:381-383`), which no full callback band can refuse.
         let reentry = self.message.lock().unwrap().reentry.take();
-        if let Some((done, band)) = reentry
-            && done.reprocess(band).is_err()
-        {
-            errlog_vprintf(format_args!(
-                "devMcaAsyn::asynCallback: {} callback queue full\n",
-                self.reads.name
-            ));
+        if let Some(done) = reentry {
+            done.reprocess_now();
         }
     }
 
@@ -457,10 +512,17 @@ impl CellBody for Trip {
         false
     }
 
-    /// C arms no queue timeout and keeps a request queued while its port is
-    /// disabled, so nothing here re-enters the record.
-    fn unrun(&self, _why: Unrun) {
-        self.message.lock().unwrap().reentry = None;
+    /// A queued read the port refused, at shutdown or on a cancel, ends the
+    /// pass waiting on it as [`Lost`].
+    fn unrun(&self, why: Unrun) {
+        let (read, reentry) = {
+            let mut message = self.message.lock().unwrap();
+            (message.read, message.reentry.take())
+        };
+        if let Some(done) = reentry {
+            self.reads.lost.lock().unwrap()[read as usize] = Some(Lost::unrun(&why));
+            done.reprocess_now();
+        }
     }
 
     /// C's `freeAsynUser` (`:391`): the request is free for the next send.
@@ -500,11 +562,13 @@ impl McaDset for McaPort {
     /// C's second `send_msg(mcaReadStatus)` copies what the callback read
     /// (`devMcaAsyn.c:245-260`).
     fn read_status(&mut self, _mca: &McaRecord) -> Result<McaStatus, Nack> {
+        self.take_lost(McaRead::Status)?;
         Ok(*self.reads.status.lock().unwrap())
     }
 
     /// C copies whatever the last `mcaData` callback left in its buffer.
     fn read_array(&mut self, mca: &mut McaRecord) -> Result<(), Nack> {
+        self.take_lost(McaRead::Data)?;
         let data = self.reads.data.lock().unwrap().clone();
         mca.land_spectrum_read(EpicsValue::LongArray(data))
             .map_err(|_| Nack)
@@ -573,7 +637,7 @@ impl DeviceSupport for DevMcaAsyn {
         let Connect::Resolved(link) = connect else {
             return Ok(DeviceInitOutcome::dead());
         };
-        self.port = Some(McaPort::new(link, &self.name));
+        self.port = Some(McaPort::new(link));
         Ok(DeviceInitOutcome::ok())
     }
 
@@ -590,17 +654,19 @@ impl DeviceSupport for DevMcaAsyn {
         };
         let mca = Self::mca(record)?;
         port.reads.nuse.store(mca.nuse, Ordering::Relaxed);
-        *port.reentry.get_mut().unwrap() = port
-            .link
-            .handle
-            .can_block()
-            .then(|| (done.device_done(), done.priority()));
+        *port.reentry.get_mut().unwrap() = port.link.handle.can_block().then(|| done.device_done());
         Ok(mca.device_read_begin(port, done))
     }
 
-    /// `read_begin` ran the whole device half.
+    /// `read_begin` ran the whole device half; the read it lost is this
+    /// pass's alarm.
     fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        self.alarm = self.port.as_mut().and_then(|port| port.lost.take());
         Ok(DeviceReadOutcome::ok())
+    }
+
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        self.alarm.map(Lost::alarm)
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -1301,6 +1367,119 @@ record(mca, "MCAHOLD") {
         drop(runtime);
     }
 
+    /// C's callbacks end a queued read with `dbScanLock; process;
+    /// dbScanUnlock` on the port thread (`devMcaAsyn.c:359-361`, `:381-383`),
+    /// never through `callbackRequest`: a READ on a blocking port ends with
+    /// the spectrum while the record's callback band is full.
+    #[test]
+    fn a_read_on_a_blocking_port_completes_while_its_callback_band_is_full() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use epics_rs::base::runtime::background::callback_executor::{
+            set_parallel_threads, set_queue_size,
+        };
+        use epics_rs::base::runtime::task::{
+            CallbackPriority, background_callback_stats, background_init, sleep,
+            spawn_blocking_background, test_block_on,
+        };
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+
+        /// Holds the low band's one worker until dropped.
+        #[derive(Clone, Default)]
+        struct Hold(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Hold {
+            fn wait(&self) {
+                let (open, wake) = &*self.0;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = wake.wait(open).unwrap();
+                }
+            }
+        }
+        struct FullBand(Hold);
+        impl Drop for FullBand {
+            fn drop(&mut self) {
+                let (open, wake) = &*(self.0).0;
+                *open.lock().unwrap() = true;
+                wake.notify_all();
+            }
+        }
+
+        // `callbackSetQueueSize` and `callbackParallelThreads` before
+        // `callbackInit`; the mca record's PRIO is LOW.
+        set_queue_size(1);
+        set_parallel_threads(1, Some(CallbackPriority::Low));
+        background_init();
+        let (runtime, _, array_reads, _) = driver_port("MCAFULL", true, None, None, None);
+        let db = r#"
+record(mca, "MCAFULL") {
+    field(DTYP, "asynMCA")
+    field(INP, "@asyn(MCAFULL)")
+    field(NMAX, "4")
+    field(NUSE, "4")
+}
+"#;
+        test_block_on(async {
+            let (name, factory) = mca_rs::mca_record_factory();
+            let (db, _) = IocBuilder::new()
+                .register_record_type(name, factory)
+                .register_dynamic_device_support(&[("mca", &MCA_DEVICES)], mca_device_support)
+                .db_string(db, &HashMap::new())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            // A cell is never refused, so the worker is held and its one
+            // ring slot taken by ad-hoc requests until one is refused.
+            let low_overflows = || {
+                background_callback_stats(false).unwrap()[CallbackPriority::Low.index()]
+                    .num_overflow
+            };
+            let hold = Hold::default();
+            let (running_tx, running_rx) = std::sync::mpsc::channel();
+            let holder = hold.clone();
+            drop(spawn_blocking_background(
+                CallbackPriority::Low,
+                move |_| {
+                    running_tx.send(()).unwrap();
+                    holder.wait();
+                },
+            ));
+            running_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let refused = low_overflows() + 1;
+            let _full = (0..64)
+                .find_map(|_| {
+                    let filler = hold.clone();
+                    drop(spawn_blocking_background(
+                        CallbackPriority::Low,
+                        move |_| filler.wait(),
+                    ));
+                    (low_overflows() >= refused).then(|| FullBand(hold.clone()))
+                })
+                .expect("the low band never filled");
+            db.put_record_field_from_ca("MCAFULL", "READ", EpicsValue::Enum(1))
+                .await
+                .unwrap();
+            for _ in 0..400 {
+                if !db.get_record("MCAFULL").unwrap().read().is_processing() {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                !db.get_record("MCAFULL").unwrap().read().is_processing(),
+                "the read left the record PACT"
+            );
+            assert_eq!(
+                db.get_pv("MCAFULL.VAL").unwrap(),
+                EpicsValue::LongArray(vec![1, 2, 3, 4].into())
+            );
+        });
+        assert_eq!(array_reads.load(Ordering::SeqCst), 1);
+        drop(runtime);
+    }
+
     /// C duplicates the asynUser for every read it queues
     /// (`devMcaAsyn.c:263-265`) and each callback re-enters the record only
     /// for its own message: a data read queued ahead of the status read does
@@ -1330,7 +1509,7 @@ record(mca, "MCAHOLD") {
                 .await
                 .unwrap();
             let done = DeviceDone::new(&db, &db.get_record("MCAOWNN").unwrap().read());
-            let reentry = || Some((done.clone(), done.priority()));
+            let reentry = || Some(done.clone());
             let reentered = || db.get_pv("MCAOWNN").unwrap().to_f64().unwrap();
             let run = async |n| {
                 gate.open(n);
@@ -1386,8 +1565,7 @@ record(mca, "MCAHOLD") {
                 .unwrap();
             let done = DeviceDone::new(&db, &db.get_record("MCADOWNN").unwrap().read());
             port.queue(McaRead::Data, None).unwrap();
-            port.queue(McaRead::Status, Some((done.clone(), done.priority())))
-                .unwrap();
+            port.queue(McaRead::Status, Some(done.clone())).unwrap();
             sleep(Duration::from_millis(200)).await;
             assert_eq!(array_reads.load(Ordering::SeqCst), 1);
             assert!(
@@ -1399,6 +1577,86 @@ record(mca, "MCAHOLD") {
             assert_eq!(db.get_pv("MCADOWNN").unwrap().to_f64(), Some(1.0));
         });
         drop(runtime);
+    }
+
+    /// A status read still queued when its port shuts down ends the pass
+    /// waiting on it with NACK and `asynStatusToEpicsAlarm`'s alarm, and so
+    /// does the read the disabled port refuses at `queueRequest` on the next
+    /// pass. MCALOSTB's status read holds the port thread, MCALOSTA's waits
+    /// behind it, and the port is disabled so it never runs.
+    #[test]
+    fn a_read_the_port_refuses_ends_its_pass_with_an_alarm() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use epics_rs::base::runtime::task::{sleep, test_block_on};
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+
+        let gate = Arc::new(Gate::default());
+        let (runtime, ..) = driver_port("MCALOST", true, None, Some(gate.clone()), None);
+        let db = ["MCALOSTA", "MCALOSTB"].map(|name| {
+            format!(
+                r#"record(mca, "{name}") {{ field(DTYP, "asynMCA") field(INP, "@asyn(MCALOST)")
+                field(NMAX, "4") field(NUSE, "4") }}"#
+            )
+        });
+        test_block_on(async {
+            let (name, factory) = mca_rs::mca_record_factory();
+            let (db, _) = IocBuilder::new()
+                .register_record_type(name, factory)
+                .register_dynamic_device_support(&[("mca", &MCA_DEVICES)], mca_device_support)
+                .db_string(&db.join("\n"), &HashMap::new())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let pact = |name: &str| db.get_record(name).unwrap().read().is_processing();
+            let ended = async |name: &str| {
+                for _ in 0..400 {
+                    if !pact(name) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(5)).await;
+                }
+            };
+            let process = async |name: &str| {
+                db.put_record_field_from_ca_no_notify(name, "PROC", EpicsValue::Short(1))
+                    .await
+                    .unwrap();
+            };
+            let pass = |name: &str| {
+                let get = |field: &str| db.get_pv(format!("{name}.{field}")).unwrap();
+                (pact(name), get("NACK"), get("STAT"), get("SEVR"))
+            };
+            process("MCALOSTB").await;
+            process("MCALOSTA").await;
+            runtime.port_handle().set_enable(-1, false).unwrap();
+            gate.open(1);
+            sleep(Duration::from_millis(100)).await;
+            runtime.shutdown();
+            ended("MCALOSTA").await;
+            // READ_ALARM, INVALID: the shutdown's asynError.
+            assert_eq!(
+                pass("MCALOSTA"),
+                (
+                    false,
+                    EpicsValue::Short(1),
+                    EpicsValue::Short(1),
+                    EpicsValue::Short(3)
+                )
+            );
+            process("MCALOSTA").await;
+            // DISABLE_ALARM, INVALID: asynDisabled.
+            assert_eq!(
+                pass("MCALOSTA"),
+                (
+                    false,
+                    EpicsValue::Short(1),
+                    EpicsValue::Short(18),
+                    EpicsValue::Short(3)
+                )
+            );
+        });
     }
 
     /// `mcaSupport.dbd:10-11`: "Soft Channel" is mca DTYP 0 and binds

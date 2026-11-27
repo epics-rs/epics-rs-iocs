@@ -35,11 +35,15 @@
 //!   commands within one line, so a long name followed by a short one leaves the
 //!   previous name's tail attached. Slicing cannot reproduce the class of bug.
 
+use std::cell::Cell;
 use std::fmt;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
+use epics_libcom_rs::runtime::stdlib::{strtoll_errno, strtoull_errno};
 
 use crate::ads::defs::AdsType;
+use crate::drvinfo::scan_adr;
 
 /// C `ADS_COM_ERROR_*` (adsAsynPortDriverUtils.h:37-40).
 pub const ERROR_INVALID_DATA_TYPE: i32 = 1004;
@@ -168,9 +172,10 @@ pub fn parse_command(arg: &str, default_ams_port: u16) -> Result<Command, OctetE
         let (port_txt, tail) = after
             .split_once('/')
             .ok_or_else(|| OctetError::BadAdsPort(arg.to_string()))?;
-        ams_port = port_txt
-            .parse()
-            .map_err(|_| OctetError::BadAdsPort(arg.to_string()))?;
+        // C `sscanf("%" SCNu16)`; a port C would wrap is refused.
+        ams_port = scan_u64(port_txt)
+            .and_then(|v| u16::try_from(v).ok())
+            .ok_or_else(|| OctetError::BadAdsPort(arg.to_string()))?;
         rest = tail;
     }
 
@@ -202,32 +207,21 @@ pub fn parse_command(arg: &str, default_ams_port: u16) -> Result<Command, OctetE
 
 fn parse_adr(adr: &str, ams_port: u16) -> Option<Command> {
     // `16#<g>,16#<o>,<len>,<type>` then either `=<value>` or `?`.
-    let (head, value) = match adr.split_once('=') {
-        Some((h, v)) => (h, Some(v.to_string())),
-        None => (adr.trim_end_matches('?'), None),
-    };
-    let mut parts = head.split(',');
-    let group = u32::from_str_radix(parts.next()?.trim().strip_prefix("16#")?, 16).ok()?;
-    let offset = u32::from_str_radix(parts.next()?.trim().strip_prefix("16#")?, 16).ok()?;
-    let length: u32 = parts.next()?.trim().parse().ok()?;
-    let type_id: u32 = parts.next()?.trim().parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
+    let [index_group, index_offset, length, type_id] = scan_adr(adr)?;
     let data_type = AdsType::from_u32(type_id);
-    Some(match value {
-        Some(value) => Command::WriteAdr {
+    Some(match adr.split_once('=') {
+        Some((_, value)) => Command::WriteAdr {
             ams_port,
-            index_group: group,
-            index_offset: offset,
+            index_group,
+            index_offset,
             length,
             data_type,
-            value,
+            value: value.to_string(),
         },
         None => Command::ReadAdr {
             ams_port,
-            index_group: group,
-            index_offset: offset,
+            index_group,
+            index_offset,
             length,
             data_type,
         },
@@ -337,9 +331,8 @@ pub fn ascii_to_binary(text: &str, plc: AdsType, buf_size: usize) -> Result<Vec<
 
     let mut out = Vec::new();
     for field in text.split(',') {
-        let t = field.trim();
-        let bytes = parse_element(plc, t).ok_or_else(|| OctetError::BadValue {
-            text: t.to_string(),
+        let bytes = parse_element(plc, field).ok_or_else(|| OctetError::BadValue {
+            text: field.trim().to_string(),
             plc,
         })?;
         if out.len() + elem > buf_size {
@@ -353,22 +346,54 @@ pub fn ascii_to_binary(text: &str, plc: AdsType, buf_size: usize) -> Result<Vec<
     Ok(out)
 }
 
-fn parse_element(plc: AdsType, t: &str) -> Option<Vec<u8>> {
+/// One element as C's `sscanf(field, "%" SCNd8, …)` and its siblings read
+/// it. An integer is read at 64 bits and must fit `plc`, so a value C would
+/// wrap into it is `None`.
+fn parse_element(plc: AdsType, field: &str) -> Option<Vec<u8>> {
     Some(match plc {
-        AdsType::Int8 => t.parse::<i8>().ok()?.to_le_bytes().to_vec(),
-        AdsType::UInt8 => t.parse::<u8>().ok()?.to_le_bytes().to_vec(),
+        AdsType::Int8 => i8::try_from(scan_i64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::UInt8 => u8::try_from(scan_u64(field)?).ok()?.to_le_bytes().to_vec(),
         // C reads a BIT with "%hhu": the text is a number, not "true"/"false".
-        AdsType::Bit => vec![u8::from(t.parse::<u8>().ok()? != 0)],
-        AdsType::Int16 => t.parse::<i16>().ok()?.to_le_bytes().to_vec(),
-        AdsType::UInt16 => t.parse::<u16>().ok()?.to_le_bytes().to_vec(),
-        AdsType::Int32 => t.parse::<i32>().ok()?.to_le_bytes().to_vec(),
-        AdsType::UInt32 => t.parse::<u32>().ok()?.to_le_bytes().to_vec(),
-        AdsType::Int64 => t.parse::<i64>().ok()?.to_le_bytes().to_vec(),
-        AdsType::UInt64 => t.parse::<u64>().ok()?.to_le_bytes().to_vec(),
-        AdsType::Real32 => t.parse::<f32>().ok()?.to_le_bytes().to_vec(),
-        AdsType::Real64 => t.parse::<f64>().ok()?.to_le_bytes().to_vec(),
+        AdsType::Bit => vec![u8::from(u8::try_from(scan_u64(field)?).ok()? != 0)],
+        AdsType::Int16 => i16::try_from(scan_i64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::UInt16 => u16::try_from(scan_u64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::Int32 => i32::try_from(scan_i64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::UInt32 => u32::try_from(scan_u64(field)?).ok()?.to_le_bytes().to_vec(),
+        AdsType::Int64 => scan_i64(field)?.to_le_bytes().to_vec(),
+        AdsType::UInt64 => scan_u64(field)?.to_le_bytes().to_vec(),
+        AdsType::Real32 => {
+            let v = Cell::new(0f32);
+            (sscanf(field, "%f", &[&v]) == 1).then(|| v.get().to_le_bytes().to_vec())?
+        }
+        AdsType::Real64 => {
+            let v = Cell::new(0f64);
+            (sscanf(field, "%lf", &[&v]) == 1).then(|| v.get().to_le_bytes().to_vec())?
+        }
         _ => return None,
     })
+}
+
+/// `sscanf(field, "%lld")`, except that a value it saturates is `None`:
+/// `sscanf` cannot report the `ERANGE`, so `strtoll` re-reads the number.
+fn scan_i64(field: &str) -> Option<i64> {
+    let (start, v) = (Cell::new(0i32), Cell::new(0i64));
+    if sscanf(field, " %n%lld", &[&start, &v]) != 1 {
+        return None;
+    }
+    strtoll_errno(&field.as_bytes()[start.get() as usize..], 10)?;
+    Some(v.get())
+}
+
+/// `sscanf(field, "%llu")`, except that a value it negates modulo 2^64 or
+/// saturates is `None`.
+fn scan_u64(field: &str) -> Option<u64> {
+    let (start, v) = (Cell::new(0i32), Cell::new(0u64));
+    if sscanf(field, " %n%llu", &[&start, &v]) != 1 {
+        return None;
+    }
+    let number = &field.as_bytes()[start.get() as usize..];
+    let negated = number.first() == Some(&b'-') && v.get() != 0;
+    (!negated && strtoull_errno(number, 10).is_some()).then(|| v.get())
 }
 
 /// `DUT_AxisStatus_v0_01`, as the C octet layer renders it.
@@ -549,6 +574,61 @@ mod tests {
         );
     }
 
+    /// gcc/glibc `sscanf("%" SCNu16)` and `(".ADR.16#%x,16#%x,%u,%u=")`
+    /// (adsAsynPortDriver.cpp:2189, :2279), except that a value C wraps is
+    /// refused.
+    #[test]
+    fn adsport_and_adr_read_as_sscanf() {
+        let sym = |ams_port| Command::ReadSymbol {
+            ams_port,
+            name: "Main.x".into(),
+        };
+        let read = |index_group, index_offset, length, t| Command::ReadAdr {
+            ams_port: 800,
+            index_group,
+            index_offset,
+            length,
+            data_type: AdsType::from_u32(t),
+        };
+        let cases = [
+            ("ADSPORT=852x/Main.x?", Some(sym(852))),
+            ("ADSPORT= 853/Main.x?", Some(sym(853))),
+            ("ADSPORT=+854/Main.x?", Some(sym(854))),
+            ("ADSPORT=-0/Main.x?", Some(sym(0))),
+            ("ADSPORT=0x10/Main.x?", Some(sym(0))),
+            ("ADSPORT=65535/Main.x?", Some(sym(65535))),
+            ("ADSPORT=70000/Main.x?", None), // C: 4464
+            ("ADSPORT=-1/Main.x?", None),    // C: 65535
+            ("ADSPORT=/Main.x?", None),
+            (".ADR.16#1,16#2,4,3?", Some(read(1, 2, 4, 3))),
+            (".ADR.16#0x1F,16#a,4,3?", Some(read(31, 10, 4, 3))),
+            (".ADR.16#1,16#2,4,3,9?", Some(read(1, 2, 4, 3))),
+            (
+                ".ADR.16#1,16#2,4,3junk=5",
+                Some(Command::WriteAdr {
+                    ams_port: 800,
+                    index_group: 1,
+                    index_offset: 2,
+                    length: 4,
+                    data_type: AdsType::Int32,
+                    value: "5".into(),
+                }),
+            ),
+            (".ADR.16#1,16#2=4,3", Some(Command::Bad)),
+            (".ADR.16#1 ,16#2,4,3?", Some(Command::Bad)),
+            (".ADR.16#-1,16#0,4,3?", Some(Command::Bad)), // C: 4294967295
+            (".ADR.16#1,16#2,4,4294967296?", Some(Command::Bad)), // C: 0
+        ];
+        let wrong: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(arg, want)| {
+                let got = parse_command(arg, 800).ok();
+                (got != want).then_some((arg, got, want))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn a_bad_command_is_reported_not_fatal() {
         assert_eq!(parse_command("gibberish", 851).unwrap(), Command::Bad);
@@ -700,6 +780,79 @@ mod tests {
             ascii_to_binary("70000", AdsType::UInt16, 2),
             Err(OctetError::BadValue { .. })
         ));
+    }
+
+    /// Each element is C's `sscanf` prefix after C whitespace, as gcc/glibc
+    /// read these; a value C wraps, saturates or negates is still refused.
+    #[test]
+    fn ascii_to_binary_reads_elements_as_sscanf() {
+        use AdsType as T;
+        let some = |b: &[u8]| Some(b.to_vec());
+        let cases: &[(&str, AdsType, Option<Vec<u8>>)] = &[
+            ("5x", T::Int8, some(&[5])),
+            ("\t-3 ", T::Int8, some(&(-3i8).to_le_bytes())),
+            ("+3", T::Int8, some(&[3])),
+            ("0x10", T::Int8, some(&[0])),
+            ("1.9", T::Int8, some(&[1])),
+            ("5\u{a0}", T::Int8, some(&[5])),
+            ("\u{a0}5", T::Int8, None),
+            ("-", T::Int8, None),
+            ("", T::Int8, None),
+            ("200", T::Int8, None),
+            (" 42z", T::UInt8, some(&[42])),
+            ("1e2", T::UInt8, some(&[1])),
+            ("-0", T::UInt8, some(&[0])),
+            ("-5", T::UInt8, None),
+            ("256", T::UInt8, None),
+            ("+9", T::Bit, some(&[1])),
+            ("-5", T::Bit, None),
+            ("65535x", T::UInt16, some(&u16::MAX.to_le_bytes())),
+            ("70000", T::UInt16, None),
+            ("-32769", T::Int16, None),
+            ("-2147483648", T::Int32, some(&i32::MIN.to_le_bytes())),
+            ("2147483648", T::Int32, None),
+            ("-1", T::UInt32, None),
+            ("12ab", T::Int64, some(&12i64.to_le_bytes())),
+            (
+                "9223372036854775807",
+                T::Int64,
+                some(&i64::MAX.to_le_bytes()),
+            ),
+            ("9223372036854775808", T::Int64, None),
+            ("-9223372036854775809", T::Int64, None),
+            (
+                "18446744073709551615",
+                T::UInt64,
+                some(&u64::MAX.to_le_bytes()),
+            ),
+            ("-0", T::UInt64, some(&0u64.to_le_bytes())),
+            ("18446744073709551616", T::UInt64, None),
+            ("-5", T::UInt64, None),
+            ("1.5x", T::Real32, some(&1.5f32.to_le_bytes())),
+            ("0x1p3", T::Real32, some(&8f32.to_le_bytes())),
+            (
+                "1.25e-3junk",
+                T::Real32,
+                some(&0x3aa3_d70a_u32.to_le_bytes()),
+            ),
+            ("-nan", T::Real32, some(&0xffc0_0000_u32.to_le_bytes())),
+            ("1e40", T::Real32, some(&f32::INFINITY.to_le_bytes())),
+            ("e5", T::Real32, None),
+            // glibc >= 2.42 (BZ #12701) refuses the bare exponent.
+            ("1e", T::Real32, None),
+            ("0x1.8p1", T::Real64, some(&3f64.to_le_bytes())),
+            ("1.25e-3junk", T::Real64, some(&1.25e-3f64.to_le_bytes())),
+            ("INFINITY", T::Real64, some(&f64::INFINITY.to_le_bytes())),
+            ("1x,2y", T::Int16, some(&[1, 0, 2, 0])),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(text, plc, want)| {
+                let got = ascii_to_binary(text, *plc, 8).ok();
+                (got != *want).then_some((text, plc, got))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

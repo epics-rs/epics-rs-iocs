@@ -494,6 +494,8 @@ pub async fn record_init(db: &str) -> Arc<epics_rs::base::server::database::PvDa
 pub async fn ioc_init_errlog(db: &str) -> Vec<String> {
     use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
 
+    // Lines the caller's commands left queued are not iocInit's.
+    errlog_flush();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let sink = lines.clone();
     let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.trim_end().to_owned()));

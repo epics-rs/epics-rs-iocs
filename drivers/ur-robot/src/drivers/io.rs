@@ -71,7 +71,7 @@ impl IoDriver {
             PortFlags {
                 multi_device: true,
                 can_block: true,
-                destructible: true,
+                destructible: false,
             },
             INTERFACES,
             INTERRUPTS,
@@ -225,5 +225,22 @@ impl PortDriver for IoDriver {
             })
         })();
         crate::drivers::flush_after(&mut self.base, addr, result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::error::AsynStatus;
+
+    /// C registers the port without `ASYN_DESTRUCTIBLE`
+    /// (`rtde_io_driver.cpp:34`), so `asynShutdownPort` is refused and the
+    /// port stays enabled.
+    #[test]
+    fn asyn_shutdown_port_is_refused() {
+        let mut drv = IoDriver::new("IO_SHUT", "127.0.0.1").expect("driver");
+        let refused = drv.base.shutdown_lifecycle().unwrap_err();
+        assert_eq!(refused.status(), AsynStatus::Error);
+        assert!(drv.base.is_enabled());
     }
 }

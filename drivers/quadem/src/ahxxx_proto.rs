@@ -5,9 +5,11 @@
 //! AH501BE, AH501C, AH501D), which reports big-endian 16- or 24-bit counts
 //! through a sign transform.
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use epics_libcom_rs::cfmt::CFloat;
+use epics_libcom_rs::runtime::scanf::sscanf;
 use epics_rs::base::types::c_parse::{long_to_int, strtol};
 
 use crate::drv_quad_em::{QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat};
@@ -108,10 +110,7 @@ pub fn cmd_bias_voltage(volts: f64) -> String {
 ///
 /// The AH401D answers with two ranges; only the first digit is parsed.
 pub fn parse_range(resp: &str) -> Option<i32> {
-    let rest = resp.strip_prefix("RNG")?;
-    let rest = rest.trim_start();
-    let c = rest.chars().next()?;
-    c.to_digit(10).map(|d| d as i32)
+    scan_int(resp, "RNG %1d")
 }
 
 /// C++ `strcmp("HLF ON", inString_)` / `strcmp("HLF OFF", inString_)`.
@@ -128,12 +127,7 @@ pub fn parse_hlf(resp: &str) -> Option<i32> {
 /// C++ `sscanf(inString_, "ITM %lf", &integrationTime)` followed by
 /// `integrationTime = integrationTime/10000.`
 pub fn parse_itm(resp: &str) -> Option<f64> {
-    let rest = resp.strip_prefix("ITM")?;
-    let rest = rest.trim_start();
-    let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'))
-        .unwrap_or(rest.len());
-    rest[..end].parse::<f64>().ok().map(|v| v / 10000.0)
+    scan_double(resp, "ITM %lf").map(|v| v / 10000.0)
 }
 
 /// C++ `readStatus`, AH401 branch: `sampleTime = pingPong ? integrationTime :
@@ -204,18 +198,24 @@ pub fn reads_bias_status(model: QeModel) -> bool {
 
 /// C++ `sscanf(inString_, "CHN %d", &numChannels)`.
 pub fn parse_chn(resp: &str) -> Option<i32> {
-    parse_int_after(resp, "CHN")
+    scan_int(resp, "CHN %d")
 }
 
 /// C++ `sscanf(inString_, "RES %d", &resolution)`.
 pub fn parse_res(resp: &str) -> Option<i32> {
-    parse_int_after(resp, "RES")
+    scan_int(resp, "RES %d")
 }
 
-fn parse_int_after(resp: &str, prefix: &str) -> Option<i32> {
-    let rest = resp.strip_prefix(prefix)?.trim_start();
-    let (value, consumed) = strtol(rest, 10);
-    (consumed > 0).then_some(long_to_int(value))
+/// C `sscanf(resp, format, &value) == 1` for a `format` with one `int`.
+fn scan_int(resp: &str, format: &str) -> Option<i32> {
+    let value = Cell::new(0i32);
+    (sscanf(resp, format, &[&value]) == 1).then(|| value.get())
+}
+
+/// C `sscanf(resp, format, &value) == 1` for a `format` with one `%lf`.
+fn scan_double(resp: &str, format: &str) -> Option<f64> {
+    let value = Cell::new(0.0f64);
+    (sscanf(resp, format, &[&value]) == 1).then(|| value.get())
 }
 
 /// C++ `readStatus`: `"HVS OFF"` means the bias is off; anything else carries
@@ -224,11 +224,7 @@ pub fn parse_hvs(resp: &str) -> Option<Option<f64>> {
     if resp == "HVS OFF" {
         return Some(None);
     }
-    let rest = resp.strip_prefix("HVS")?.trim_start();
-    let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'))
-        .unwrap_or(rest.len());
-    rest[..end].parse::<f64>().ok().map(Some)
+    scan_double(resp, "HVS %lf").map(Some)
 }
 
 /// C++ `readStatus`, AH501 branch: the sample time is a function of the
@@ -577,6 +573,86 @@ mod tests {
         assert_eq!(cmd_bias_voltage(12.5), "HVS 12.500000");
         assert_eq!(cmd_bias_voltage(f64::NAN), "HVS nan");
         assert_eq!(cmd_bias_voltage(-f64::NAN), "HVS -nan");
+    }
+
+    /// `readStatus` scans each reply with its own `sscanf` format, so the
+    /// literal's trailing space skips C whitespace only and a number ends
+    /// where C's conversion stops.
+    #[test]
+    fn status_replies_are_scanned_as_c_sscanf() {
+        use std::ffi::c_long;
+        // `%d` converts through `strtol`, which a 32-bit `long` saturates.
+        let wrapped = if c_long::BITS == 64 {
+            1215752191
+        } else {
+            i32::MAX
+        };
+        let mut wrong = Vec::new();
+        for (resp, want) in [
+            ("RNG 3", Some(3)),
+            ("RNG 12", Some(1)),
+            ("RNG3", Some(3)),
+            ("RNG\t7", Some(7)),
+            ("RNG -3", None),
+            ("RNG +3", None),
+            ("RNG\u{a0}3", None),
+            ("RNG", None),
+        ] {
+            if parse_range(resp) != want {
+                wrong.push(format!("{resp:?}: {:?} != {want:?}", parse_range(resp)));
+            }
+        }
+        for (resp, want) in [
+            ("CHN 4", Some(4)),
+            ("CHN4", Some(4)),
+            ("CHN 0x10", Some(0)),
+            ("CHN +2", Some(2)),
+            ("CHN 99999999999", Some(wrapped)),
+            ("CHN 99999999999999999999", Some(long_to_int(c_long::MAX))),
+            ("CHN\u{a0}4", None),
+            ("CHN x", None),
+        ] {
+            if parse_chn(resp) != want {
+                wrong.push(format!("{resp:?}: {:?} != {want:?}", parse_chn(resp)));
+            }
+        }
+        for (resp, want) in [("RES 24", Some(24)), ("RES\u{a0}16", None)] {
+            if parse_res(resp) != want {
+                wrong.push(format!("{resp:?}: {:?} != {want:?}", parse_res(resp)));
+            }
+        }
+        for (resp, want) in [
+            ("ITM 5000", Some(0.5)),
+            ("ITM5000", Some(0.5)),
+            ("ITM 1e3", Some(0.1)),
+            ("ITM 0x10", Some(0.0016)),
+            ("ITM 50.0.0", Some(0.005)),
+            ("ITM 1e-3", Some(1e-7)),
+            ("ITM inf", Some(f64::INFINITY)),
+            ("ITM\u{a0}5", None),
+            ("ITM +", None),
+            ("ITM", None),
+        ] {
+            if parse_itm(resp) != want {
+                wrong.push(format!("{resp:?}: {:?} != {want:?}", parse_itm(resp)));
+            }
+        }
+        for (resp, want) in [
+            ("HVS 12.500000", Some(Some(12.5))),
+            ("HVS\t5", Some(Some(5.0))),
+            ("HVS 1e2", Some(Some(100.0))),
+            ("HVS -0x1p1", Some(Some(-2.0))),
+            ("HVS 1,5", Some(Some(1.0))),
+            ("HVS OFF", Some(None)),
+            ("HVS  OFF", None),
+            ("HVS ON", None),
+            ("HVS\u{a0}5", None),
+        ] {
+            if parse_hvs(resp) != want {
+                wrong.push(format!("{resp:?}: {:?} != {want:?}", parse_hvs(resp)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

@@ -44,6 +44,7 @@
 //! offset (`position / STEPS_PER_EGU`) that is added to readback and subtracted
 //! from move targets, matching C `setPosition`/`positionOffset_`.
 
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -56,10 +57,13 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_libcom_rs::cfmt::CFloat;
-use motor_common::util::{atof, atoi};
+use epics_libcom_rs::runtime::scanf::{ScanTarget, sscanf};
 
 /// Response buffer size.
 const READ_BUF: usize = 64;
+
+/// C `REP_LEN`, the size of the `cmd` and `param` buffers replies scan into.
+const REP_LEN: usize = 50;
 
 /// Hold-target-forever time (ms) — used in closed-loop mode.
 const HOLD_FOREVER: u32 = 60000;
@@ -111,76 +115,53 @@ fn scu_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Split a `:<CMD><axis><PARAM><value>` reply into (command letters, value
-/// string). Returns `None` if the shape does not match.
-fn parse_kv(reply: &str) -> Option<(String, String)> {
-    let s = reply.trim().strip_prefix(':')?;
-    let b = s.as_bytes();
-    let mut i = 0;
-    let cmd_start = i;
-    while i < b.len() && b[i].is_ascii_uppercase() {
-        i += 1;
-    }
-    if i == cmd_start {
-        return None;
-    }
-    let cmd = s[cmd_start..i].to_string();
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    let dig_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == dig_start {
-        return None;
-    }
-    // Parameter letters (present for integer/double replies).
-    while i < b.len() && b[i].is_ascii_uppercase() {
-        i += 1;
-    }
-    Some((cmd, s[i..].trim().to_string()))
+/// C `sscanf(reply, fmt, cmd, &axis, ..)` over `cmd[REP_LEN]`, the reply's
+/// own targets `rest` after the axis: whether `cmd` starts with `E`, or
+/// `None` unless every conversion succeeds. The axis is read at 64 bits, so
+/// that one C wraps into its `int` is `None`.
+fn scan_reply(reply: &str, fmt: &str, rest: &[&dyn ScanTarget]) -> Option<bool> {
+    let cmd = RefCell::new([0u8; REP_LEN]);
+    let axis = Cell::new(0i64);
+    let mut out: Vec<&dyn ScanTarget> = vec![&cmd, &axis];
+    out.extend_from_slice(rest);
+    (sscanf(reply, fmt, &out) == out.len() as i32 && i32::try_from(axis.get()).is_ok())
+        .then(|| cmd.borrow()[0] == b'E')
 }
 
-/// Split a `:<CMD><axis><char>` reply (the move-status form, no parameter
-/// letters) into (command letters, the single status character).
-fn parse_char_reply(reply: &str) -> Option<(String, char)> {
-    let s = reply.trim().strip_prefix(':')?;
-    let b = s.as_bytes();
-    let mut i = 0;
-    let cmd_start = i;
-    while i < b.len() && b[i].is_ascii_uppercase() {
-        i += 1;
-    }
-    if i == cmd_start {
-        return None;
-    }
-    let cmd = s[cmd_start..i].to_string();
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    let dig_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == dig_start {
-        return None;
-    }
-    let value = s[i..].trim().chars().next()?;
-    Some((cmd, value))
+/// A `:<CMD><axis><PARAM><int>` reply as C `getIntegerVal` scans it, into
+/// (is-error-command, value), the value read at 64 bits as the axis is.
+fn parse_int_reply(reply: &str) -> Option<(bool, i32)> {
+    let (param, val) = (RefCell::new([0u8; REP_LEN]), Cell::new(0i64));
+    let is_err = scan_reply(reply, ":%10[A-Z]%lli%10[A-Z]%lli", &[&param, &val])?;
+    Some((is_err, val.get().try_into().ok()?))
 }
 
-/// Parse a `:A<axis>A<angle>R<rev>` rotary reply into (angle, revolutions).
+/// A `:<CMD><axis><PARAM><float>` reply as C `getDoubleVal` scans it.
+fn parse_double_reply(reply: &str) -> Option<(bool, f64)> {
+    let (param, val) = (RefCell::new([0u8; REP_LEN]), Cell::new(0f64));
+    let is_err = scan_reply(reply, ":%10[A-Z]%lli%10[A-Z]%lf", &[&param, &val])?;
+    Some((is_err, val.get()))
+}
+
+/// A `:<CMD><axis><char>` move-status reply as C `getCharVal` scans it: the
+/// character right after the axis.
+fn parse_char_reply(reply: &str) -> Option<(bool, char)> {
+    let val = Cell::new(0u8);
+    let is_err = scan_reply(reply, ":%10[A-Z]%lli%c", &[&val])?;
+    Some((is_err, val.get().into()))
+}
+
+/// A `:A<axis>A<angle>R<rev>` rotary reply as C `getAngle` scans it, into
+/// (angle, revolutions), the numbers read at 64 bits.
 // C getAngle tests `4 != sscanf` on a 3-conversion format, so C fails every
 // rotary poll; rs parses the reply.
 fn parse_angle(reply: &str) -> Option<(f64, i64)> {
-    let s = reply.trim().strip_prefix(":A")?;
-    let a = s.find('A')?;
-    let rest = &s[a + 1..];
-    let r = rest.find('R')?;
-    let angle = atof(rest[..r].trim());
-    let rev = atoi(rest[r + 1..].trim()) as i64;
-    Some((angle, rev))
+    let (axis, angle, rev) = (Cell::new(0i64), Cell::new(0f64), Cell::new(0i64));
+    if sscanf(reply, ":A%lliA%lfR%lli", &[&axis, &angle, &rev]) != 3 {
+        return None;
+    }
+    i32::try_from(axis.get()).ok()?;
+    Some((angle.get(), i32::try_from(rev.get()).ok()?.into()))
 }
 
 /// Shared SCU controller endpoint owning the asyn octet handle.
@@ -224,31 +205,31 @@ impl ScuController {
     /// Read an integer parameter (`:<parm><ch>` → `:<CMD><axis><PARAM><int>`).
     fn query_int(&self, io: &mut AxisIo, parm: &str, channel: i32) -> AsynResult<i32> {
         let reply = self.transact(io, &format!(":{parm}{channel}"))?;
-        let (cmd, value) =
-            parse_kv(&reply).ok_or_else(|| io.parse_error("getIntegerVal", &reply))?;
-        if cmd.starts_with('E') {
+        let (is_err, value) =
+            parse_int_reply(&reply).ok_or_else(|| io.parse_error("getIntegerVal", &reply))?;
+        if is_err {
             return Err(scu_err(format!("SCU: controller error {reply:?}")));
         }
-        Ok(atoi(&value))
+        Ok(value)
     }
 
     /// Read a double parameter (`:<parm><ch>` → `:<CMD><axis><PARAM><float>`).
     fn query_double(&self, io: &mut AxisIo, parm: &str, channel: i32) -> AsynResult<f64> {
         let reply = self.transact(io, &format!(":{parm}{channel}"))?;
-        let (cmd, value) =
-            parse_kv(&reply).ok_or_else(|| io.parse_error("getDoubleVal", &reply))?;
-        if cmd.starts_with('E') {
+        let (is_err, value) =
+            parse_double_reply(&reply).ok_or_else(|| io.parse_error("getDoubleVal", &reply))?;
+        if is_err {
             return Err(scu_err(format!("SCU: controller error {reply:?}")));
         }
-        Ok(atof(&value))
+        Ok(value)
     }
 
     /// Read the single-character move status (`:M<ch>`).
     fn query_char(&self, io: &mut AxisIo, parm: &str, channel: i32) -> AsynResult<char> {
         let reply = self.transact(io, &format!(":{parm}{channel}"))?;
-        let (cmd, value) =
+        let (is_err, value) =
             parse_char_reply(&reply).ok_or_else(|| io.parse_error("getCharVal", &reply))?;
-        if cmd.starts_with('E') {
+        if is_err {
             return Err(scu_err(format!("SCU: controller error {reply:?}")));
         }
         Ok(value)
@@ -691,26 +672,100 @@ mod tests {
     #[test]
     fn parses_integer_and_double_replies() {
         // :<CMD><axis><PARAM><value>
-        let (cmd, v) = parse_kv(":CLF0F1000").unwrap();
-        assert_eq!(cmd, "CLF");
-        assert_eq!(atoi(&v), 1000);
-        let (cmd, v) = parse_kv(":P0P-12.500").unwrap();
-        assert_eq!(cmd, "P");
-        assert_eq!(atof(&v), -12.5);
+        assert_eq!(parse_int_reply(":CLF0F1000"), Some((false, 1000)));
+        assert_eq!(parse_double_reply(":P0P-12.500"), Some((false, -12.5)));
         // Error replies begin with 'E'.
-        let (cmd, _) = parse_kv(":E0X0").unwrap();
-        assert!(cmd.starts_with('E'));
+        assert_eq!(parse_int_reply(":E0F5"), Some((true, 5)));
+        // `%i` reads `0X0` as a hex axis, leaving no parameter letters.
+        assert_eq!(parse_int_reply(":E0X0"), None);
     }
 
     #[test]
     fn parses_char_and_angle_replies() {
-        let (cmd, c) = parse_char_reply(":M0H").unwrap();
-        assert_eq!(cmd, "M");
+        let (is_err, c) = parse_char_reply(":M0H").unwrap();
+        assert!(!is_err);
         assert_eq!(c, 'H');
         assert_eq!(parse_moving_status(c), MovingStatus::Holding);
         let (angle, rev) = parse_angle(":A0A123.456R2").unwrap();
         assert_eq!(angle, 123.456);
         assert_eq!(rev, 2);
+    }
+
+    /// smarActSCUMotorDriver.cpp:232, :261, :288 and :315 scan replies with
+    /// `":%10[A-Z]%i%10[A-Z]%i"`, `":%10[A-Z]%i%10[A-Z]%lf"`,
+    /// `":%10[A-Z]%i%c"` and `":A%iA%lfR%i"`.
+    #[test]
+    fn replies_are_scanned_as_c_sscanf() {
+        // C wraps the last of these into its `int`.
+        const INTS: &[(&str, Option<i32>)] = &[
+            (":CLF0F0x10", Some(16)),
+            (":CLF0F010", Some(8)),
+            (":CLF0F", None),
+            (":CLF0-5", None),
+            (":CLF0ABCDEFGHIJK5", None),
+            (":CLF0F3000000000", None),
+        ];
+        const DOUBLES: &[(&str, Option<f64>)] = &[
+            (":P0P-12.500", Some(-12.5)),
+            (":P0Pjunk", None),
+            (":P0P", None),
+        ];
+        const CHARS: &[(&str, Option<char>)] = &[(":M0H", Some('H')), (":M0 H", Some(' '))];
+        const ANGLES: &[(&str, Option<(f64, i64)>)] = &[
+            (":A0A123.456R2", Some((123.456, 2))),
+            (":A0A1R0x10", Some((1.0, 16))),
+            (":AxA1R2", None),
+            (":A0AR2", None),
+            (":A0A1R", None),
+            (":A0A1R3000000000", None),
+        ];
+        let (_rig, handle) = motor_common::testing::LineRig::new("scuSscanf", |cmd| {
+            let cmd = cmd.trim_end();
+            let (kind, n) = match cmd.strip_prefix(":GA") {
+                Some(n) => ("GA", n),
+                None => cmd.split_at(2),
+            };
+            let n: usize = n.parse().unwrap();
+            match kind {
+                ":I" => INTS[n].0,
+                ":D" => DOUBLES[n].0,
+                ":C" => CHARS[n].0,
+                _ => ANGLES[n].0,
+            }
+            .to_string()
+        });
+        let ctrl = ScuController::new(handle);
+        let mut io = AxisIo {
+            port: "scuSscanf".into(),
+            addr: 0,
+            from_controller: String::new(),
+        };
+        let mut wrong = Vec::new();
+        for (n, &(reply, want)) in INTS.iter().enumerate() {
+            let got = ctrl.query_int(&mut io, "I", n as i32).ok();
+            if got != want {
+                wrong.push(format!("{reply:?} -> {got:?}"));
+            }
+        }
+        for (n, &(reply, want)) in DOUBLES.iter().enumerate() {
+            let got = ctrl.query_double(&mut io, "D", n as i32).ok();
+            if got != want {
+                wrong.push(format!("{reply:?} -> {got:?}"));
+            }
+        }
+        for (n, &(reply, want)) in CHARS.iter().enumerate() {
+            let got = ctrl.query_char(&mut io, "C", n as i32).ok();
+            if got != want {
+                wrong.push(format!("{reply:?} -> {got:?}"));
+            }
+        }
+        for (n, &(reply, want)) in ANGLES.iter().enumerate() {
+            let got = ctrl.query_angle(&mut io, n as i32).ok();
+            if got != want {
+                wrong.push(format!("{reply:?} -> {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
