@@ -593,6 +593,12 @@ mod tests {
                 wrong.push(format!("int {reply:?}: {:?}", parse_int(reply)));
             }
         }
+        // `atoi` past `int` with a 32-bit `long` saturates at LONG_MAX.
+        let wide_cams = if std::ffi::c_long::BITS == 64 {
+            0
+        } else {
+            i32::MAX
+        };
         let cams = [
             ("2", 2),
             (" 2", 2),
@@ -600,7 +606,7 @@ mod tests {
             ("+3", 3),
             ("[2]", 0),
             ("abc", 0),
-            ("4294967298", 0),
+            ("4294967298", wide_cams),
         ];
         for (reply, want) in cams {
             if parse_cam_num(reply) != want {

@@ -1100,6 +1100,7 @@ mod tests {
                 ("02QS?", "4"),
                 ("03ZB?", "100000300"),
                 ("03FR?", "0.002"),
+                ("03SU?", "0.25"),
             ],
         );
         let ctrl = Arc::new(Mutex::new(ctrl));
@@ -1110,11 +1111,14 @@ mod tests {
             (fr_qs.drive_resolution, fr_qs.encoder_present),
             (0.0025, true)
         );
-        // C keeps the low 32 bits, 0x300; past `int` reads as 0 here.
-        let wide = Esp300Axis::new(ctrl, 3);
-        assert_eq!(
-            (wide.drive_resolution, wide.encoder_present),
+        // C keeps the low 32 bits, 0x300; past `int` reads as 0 here. A
+        // 32-bit `long` saturates at LONG_MAX, bits 9:8 `11` (`SU?`).
+        let want = if std::ffi::c_long::BITS == 64 {
             (0.002, false)
-        );
+        } else {
+            (0.25, true)
+        };
+        let wide = Esp300Axis::new(ctrl, 3);
+        assert_eq!((wide.drive_resolution, wide.encoder_present), want);
     }
 }

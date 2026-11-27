@@ -479,8 +479,14 @@ mod tests {
         assert_eq!(hex_at("0001 \u{a0}5", 4), 0);
         // A lossy-decoded bad byte straddles the field's end.
         assert_eq!(hex_at("0001 800\u{fffd}", 4), 0x800);
-        // C wraps the negated `unsigned long` into the field.
-        assert_eq!(hex_at("0001 -1", 8), 0);
+        // C wraps the negated `unsigned long` into the field; a 32-bit one
+        // fits it.
+        let negated = if std::ffi::c_ulong::BITS == 64 {
+            0
+        } else {
+            u32::MAX
+        };
+        assert_eq!(hex_at("0001 -1", 8), negated);
     }
 
     /// drvMVP2001.cc:675-720: a failed `motor_init` read stores the

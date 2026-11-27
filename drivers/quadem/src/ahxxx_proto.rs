@@ -580,6 +580,13 @@ mod tests {
     /// where C's conversion stops.
     #[test]
     fn status_replies_are_scanned_as_c_sscanf() {
+        use std::ffi::c_long;
+        // `%d` converts through `strtol`, which a 32-bit `long` saturates.
+        let wrapped = if c_long::BITS == 64 {
+            1215752191
+        } else {
+            i32::MAX
+        };
         let mut wrong = Vec::new();
         for (resp, want) in [
             ("RNG 3", Some(3)),
@@ -600,8 +607,8 @@ mod tests {
             ("CHN4", Some(4)),
             ("CHN 0x10", Some(0)),
             ("CHN +2", Some(2)),
-            ("CHN 99999999999", Some(1215752191)),
-            ("CHN 99999999999999999999", Some(-1)),
+            ("CHN 99999999999", Some(wrapped)),
+            ("CHN 99999999999999999999", Some(long_to_int(c_long::MAX))),
             ("CHN\u{a0}4", None),
             ("CHN x", None),
         ] {
